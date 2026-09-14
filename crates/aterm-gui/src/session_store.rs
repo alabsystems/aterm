@@ -99,9 +99,8 @@ pub struct SessionRecord {
     /// tolerated): a sanitized projection of the operator-set title/
     /// description/icon/role/attention (`meta set …`) for manifest
     /// inspection. HONEST SCOPE: adoption re-seeds user meta from the LAYOUT
-    /// sidecar's restore leaves (`graft_restored_user_meta` for the session
-    /// already running in a window's first pane, `seed_restored_user_meta` for
-    /// every pane spawned or adopted after it), not from these fields — they
+    /// sidecar's restore leaves (`carry_restored_identity`, onto the shell
+    /// each leaf's `local_id` names), not from these fields — they
     /// are a write-side record, kept in lockstep with the leaf carrier so
     /// external readers of the manifest see the same identity.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -1111,9 +1110,12 @@ fn handle_alive(local_id: u64, parent: Option<SessionId>) -> SessionHandle {
     use aterm_session::sink::SinkWriter;
     let sid = SessionId::generate();
     let nonce = LaunchNonce::generate();
+    let term = Arc::new(Mutex::new(Terminal::new(24, 80)));
     let ctx = Arc::new(SessionCtx {
         sink: Arc::new(SinkWriter::new(-1)),
         output_echo: Arc::new(crate::app_input::OutputEchoTracker::default()),
+        modes: crate::mode_mirror_of(&term),
+        ui_waiting: Arc::default(),
         edges: Mutex::new(EdgeTable::new()),
         self_id: sid.clone(),
         nonce,
@@ -1138,7 +1140,7 @@ fn handle_alive(local_id: u64, parent: Option<SessionId>) -> SessionHandle {
         parent,
         state: SessionState::Alive,
         title: format!("tab-{local_id}"),
-        term: Arc::new(Mutex::new(Terminal::new(24, 80))),
+        term,
         master: -1,
         ctx,
     }

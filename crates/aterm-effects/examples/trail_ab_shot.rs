@@ -124,6 +124,7 @@ fn main() {
         pack: None,
         wake_persist_s: RAINBOW_WAKE_PERSIST,
         ribbon_tall: false,
+        ribbon_flat: false,
         classic_mono: GlowStyle::style_names_classic_mono(&raw),
     };
     let geom = Geom {

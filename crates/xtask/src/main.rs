@@ -78,19 +78,24 @@ fn main() -> ExitCode {
         ),
         Some("verify") => verify(&args[2..]),
         _ => {
-            // The roster is `gate.rs`'s own; a hand-typed subset sat here for months.
+            // Both lists are `gate.rs`'s own; a hand-typed subset sat here for
+            // months, and the opt-in half disagreed with gate.rs's own header
+            // (four there, five here) until 2026-09-13.
             let roster = gate::roster_names().join("|");
+            let opt_in = gate::opt_in_names().join("|");
             eprintln!(
                 "usage: xtask <harness-manifest|spec-link|gate <check>|verify [args…]>\n\
                  \n\
                  harness-manifest  enumerate #[kani::proof] fns -> target/trust/harness-manifest.json\n\
                  spec-link         lower the anchor graph + run `trust-ir spec-link --require-manifest`\n\
                  gate <check>      local enforcement gate (NO CI): all|{roster}|nonvacuity,\n\
-                                   plus the five `all` leaves out: linux|web|cells|certified|miri\n\
+                                   plus the ones `all` leaves out: {opt_in}\n\
                                    `gate lint [--no-fmt|--fmt-only]` — tippy + trustfmt +\n\
                                    guards; --no-fmt drops the formatter lane and\n\
                                    --fmt-only keeps only it (both passes, no compiler,\n\
                                    seconds), nothing else narrowed either way\n\
+                                   `gate help-surfaces --diff PATH` — not the gate: the\n\
+                                   prose PATH changed since its row's recorded read\n\
                                    see docs/EXCEED_GHOSTTY_PLAN.md\n\
                  verify [args…]    run THE gate, tools/verify.sh, forwarding every argument\n\
                                    (this is what the `cargo verify` alias dispatches to)"

@@ -49,6 +49,9 @@ libc = { workspace = true }
 [dev-dependencies]
 # Prove the producer↔client contract: sign here, verify + INSTALL with the ACTUAL client.
 atpkg = { path = "../atpkg" }
+# Tier-1 binds the real roster pair redo/snapshot-CAS filesystem transaction to
+# the same derived model that `cargo test -p aterm-spec` proves exhaustively.
+aterm-spec = { workspace = true }
 # The owner→client integration test builds a real `.tar.zst` to drive the client install.
 zstd = { workspace = true }
 

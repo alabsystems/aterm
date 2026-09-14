@@ -1175,6 +1175,13 @@ impl Grid {
         self.storage.damage.mark_cell(cursor.row, cursor.col);
     }
 
+    /// Mark a cell's changed content, including grapheme extras, as damaged.
+    /// Unlike cursor-only damage, this also invalidates content-keyed readers.
+    #[inline]
+    pub fn mark_content_cell(&mut self, row: u16, col: u16) {
+        self.storage.mark_content_cell(row, col);
+    }
+
     /// Damage the whole screen and bump `content_gen`, invalidating every
     /// content-keyed cache (search index, cross-session polls).
     ///

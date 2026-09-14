@@ -93,7 +93,7 @@ pub use ligature_shaping::{ColumnGlyph, ShapedRun};
 /// [`intern_parsed_font_keyed`]). Under `fontdue` the shared thing was a ~370 MB
 /// eager conversion of every outline; it is now ~1 MB of derived tables per
 /// broad face, and the file itself.
-type InternedFace = (std::sync::Arc<Vec<u8>>, std::sync::Arc<crate::font::Font>);
+type InternedFace = (crate::font::FaceBytes, std::sync::Arc<crate::font::Font>);
 
 /// Channel handle for a BACKGROUND lazy-fallback parse: the spawned thread sends
 /// the CHAIN of candidate faces that read + intern-parse OK (W8: the broad-fallback
@@ -176,7 +176,7 @@ pub const MISSING_FONT_CLASS_EMOJI: u8 = 1 << 1;
 /// same thread cost one copy". Discovery runs on short-lived worker threads, so a
 /// thread-local store is empty every time and each generation re-allocates a 23 MB
 /// blob. Keyed by byte equality, like every other intern here.
-static DISCOVERED_FONT_BYTES: std::sync::Mutex<Vec<std::sync::Arc<Vec<u8>>>> =
+static DISCOVERED_FONT_BYTES: std::sync::Mutex<Vec<crate::font::FaceBytes>> =
     std::sync::Mutex::new(Vec::new());
 
 /// Intern a just-READ font file in [`DISCOVERED_FONT_BYTES`], reusing an
@@ -214,14 +214,20 @@ static DISCOVERED_FONT_BYTES: std::sync::Mutex<Vec<std::sync::Arc<Vec<u8>>>> =
 /// strikes for the parsed store and [`shared_parsed_face_owned`] for the styled
 /// tier. There is deliberately no slice entry point left: a copying one is what
 /// this replaced, and every discovery caller reads its own file.
-fn intern_discovered_font_bytes(bytes: &std::sync::Arc<Vec<u8>>) -> std::sync::Arc<Vec<u8>> {
+///
+/// The handle is a [`crate::font::FaceBytes`] now, because on the discovery
+/// path it is usually a file MAPPING (`font_file::admit_font_file`): the seal's
+/// four macOS admissions — 192 MB of emoji, two 23 MB CJK/broad faces, STIX —
+/// are file-backed pages instead of anonymous heap. Equality goes through
+/// [`crate::font::FaceBytes::same_bytes`], which answers by identity (same
+/// handle, or two mappings of one inode) before it would compare bytes, so a
+/// second generation admitting the same system file converges on the first
+/// mapping without faulting 192 MB in to prove it.
+fn intern_discovered_font_bytes(bytes: &crate::font::FaceBytes) -> crate::font::FaceBytes {
     let mut store = DISCOVERED_FONT_BYTES
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner);
-    if let Some(existing) = store
-        .iter()
-        .find(|a| a.len() == bytes.len() && a.as_slice() == bytes.as_slice())
-    {
+    if let Some(existing) = store.iter().find(|a| a.same_bytes(bytes)) {
         return existing.clone();
     }
     store.push(bytes.clone());
@@ -242,7 +248,7 @@ fn discovered_font_bytes_contains(bytes: &[u8]) -> bool {
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner)
         .iter()
-        .any(|held| held.as_slice() == bytes)
+        .any(|held| held[..] == *bytes)
 }
 
 /// Parse a fallback [`crate::font::Font`] from `bytes`, sharing ONE parsed
@@ -256,7 +262,9 @@ fn discovered_font_bytes_contains(bytes: &[u8]) -> bool {
 /// A caller that already holds the store's own handle type wants
 /// [`intern_parsed_font_owned`], which hands that handle over instead.
 fn intern_parsed_font(bytes: &[u8]) -> Result<InternedFace, String> {
-    intern_parsed_font_keyed(bytes, || std::sync::Arc::new(bytes.to_vec()))
+    intern_parsed_font_keyed(bytes, || {
+        crate::font::FaceBytes::Vec(std::sync::Arc::new(bytes.to_vec()))
+    })
 }
 
 /// [`intern_parsed_font`] for a caller that ALREADY owns the source bytes in the
@@ -290,7 +298,7 @@ fn intern_parsed_font(bytes: &[u8]) -> Result<InternedFace, String> {
 /// Returns the parse alone: the caller's own handle IS the store's, so handing
 /// the bytes back would only invite a second name for one allocation.
 fn intern_parsed_font_owned(
-    bytes: &std::sync::Arc<Vec<u8>>,
+    bytes: &crate::font::FaceBytes,
 ) -> Result<std::sync::Arc<crate::font::Font>, String> {
     intern_parsed_font_keyed(bytes, || bytes.clone()).map(|(_, font)| font)
 }
@@ -309,7 +317,7 @@ fn intern_parsed_font_owned(
 /// the same font file at once, not a hot path.
 fn intern_parsed_font_keyed(
     bytes: &[u8],
-    key: impl FnOnce() -> std::sync::Arc<Vec<u8>>,
+    key: impl FnOnce() -> crate::font::FaceBytes,
 ) -> Result<InternedFace, String> {
     if let Some(face) = interned_parsed_font_lookup(bytes) {
         return Ok(face);
@@ -318,23 +326,27 @@ fn intern_parsed_font_keyed(
     // and holding the lock across it would block a concurrent render-thread lookup
     // behind a warm thread's parse.
     let src = key();
-    let parsed =
-        crate::font::Font::from_shared_vec(src.clone(), crate::font::FontSettings::default())
-            .map_err(|e| e.to_string())?;
+    let parsed = crate::font::Font::from_shared(src.clone(), crate::font::FontSettings::default())
+        .map_err(|e| e.to_string())?;
     let font = std::sync::Arc::new(parsed);
     let mut store = PARSED_FONT_INTERN
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner);
     // Re-check under the lock: a racing thread may have interned identical bytes
     // while we parsed; converge on ITS entry so identical faces share one parse.
-    if let Some((src, existing)) = store
-        .iter()
-        .find(|(s, _)| s.len() == bytes.len() && s.as_slice() == bytes)
-    {
+    if let Some((src, existing)) = store.iter().find(|(s, _)| same_slice(s, bytes)) {
         return Ok((src.clone(), existing.clone()));
     }
     store.push((src.clone(), font.clone()));
     Ok((src, font))
+}
+
+/// Byte equality with the identity fast path in front: the same address and
+/// length IS the same bytes, and on the discovery path the store's entry is a
+/// file MAPPING — a 23 MB compare against itself would fault the whole face in
+/// to learn nothing. Distinct blobs still compare by content, exactly as before.
+fn same_slice(a: &[u8], b: &[u8]) -> bool {
+    a.len() == b.len() && (std::ptr::eq(a.as_ptr(), b.as_ptr()) || a == b)
 }
 
 /// The already-interned parsed face for `bytes`, if any (byte-equality keyed;
@@ -346,7 +358,7 @@ fn interned_parsed_font_lookup(bytes: &[u8]) -> Option<InternedFace> {
         .unwrap_or_else(std::sync::PoisonError::into_inner);
     store
         .iter()
-        .find(|(src, _)| src.len() == bytes.len() && src.as_slice() == bytes)
+        .find(|(src, _)| same_slice(src, bytes))
         .map(|(src, font)| (src.clone(), font.clone()))
 }
 
@@ -1222,29 +1234,43 @@ type VarCoords = Option<std::sync::Arc<[(u32, f32)]>>;
 
 /// One immutable font blob retained by a prepared native font generation.
 ///
-/// Renderer internals historically use both `Arc<[u8]>` (primary/styled faces)
-/// and `Arc<Vec<u8>>` (large interned fallback/emoji faces).  Keeping both forms
-/// here avoids copying a multi-hundred-megabyte fallback merely to compare two
-/// generations.  Equality is deliberately byte-exact across the two storage
-/// forms; no hash or pathname identity can make a changed face look equal.
+/// Renderer internals use `Arc<[u8]>` for the primary/styled faces and the
+/// crate's discovered-bytes handle ([`crate::font::FaceBytes`] — a heap blob or
+/// a file MAPPING) for the large fallback/emoji faces. Keeping both forms here
+/// avoids copying a multi-hundred-megabyte fallback merely to compare two
+/// generations. Equality is deliberately byte-exact across the storage forms —
+/// no hash or pathname identity can make a CHANGED face look equal — with the
+/// one identity fast path that is sound: the same handle, or two mappings of
+/// one inode, are the same bytes, and saying so without touching a page is what
+/// keeps a config-reload comparison of two generations from faulting 192 MB of
+/// emoji in to prove they did not change.
 #[derive(Clone)]
 enum AdmittedFontBlob {
     Slice(std::sync::Arc<[u8]>),
-    Vec(std::sync::Arc<Vec<u8>>),
+    Face(crate::font::FaceBytes),
 }
 
 impl AdmittedFontBlob {
     fn bytes(&self) -> &[u8] {
         match self {
             Self::Slice(bytes) => bytes,
-            Self::Vec(bytes) => bytes.as_slice(),
+            Self::Face(bytes) => bytes,
         }
+    }
+
+    /// Whether this blob is a file mapping rather than anonymous heap.
+    fn is_mapped(&self) -> bool {
+        matches!(self, Self::Face(bytes) if bytes.is_mapped())
     }
 }
 
 impl PartialEq for AdmittedFontBlob {
     fn eq(&self, other: &Self) -> bool {
-        self.bytes() == other.bytes()
+        match (self, other) {
+            (Self::Face(a), Self::Face(b)) => a.same_bytes(b),
+            (Self::Slice(a), Self::Slice(b)) if std::sync::Arc::ptr_eq(a, b) => true,
+            _ => self.bytes() == other.bytes(),
+        }
     }
 }
 
@@ -1285,6 +1311,38 @@ pub struct AdmittedFontSources {
     fallback: Vec<AdmittedFaceSource>,
     symbol: Option<AdmittedFaceSource>,
     emoji: Option<AdmittedFaceSource>,
+}
+
+impl AdmittedFontSources {
+    /// How the DISCOVERED faces of this generation — the broad/CJK fallback
+    /// chain, the symbol slot and the colour-emoji face, the ones the seal
+    /// admits by path — are resident: `(mapped_bytes, copied_bytes)`, file
+    /// mapping against anonymous heap. The primary and styled faces are not
+    /// counted; they are small and were never the residency problem.
+    ///
+    /// Diagnostics: the seal's residency proof
+    /// (`tests/seal_maps_discovered_faces.rs`) asserts `copied_bytes == 0` on a
+    /// Mac, whose discovered faces all live on the system font volume
+    /// (`font_file::maps_in_place`).
+    #[must_use]
+    pub fn discovered_residency(&self) -> (u64, u64) {
+        let mut mapped = 0u64;
+        let mut copied = 0u64;
+        for source in self
+            .fallback
+            .iter()
+            .chain(self.symbol.iter())
+            .chain(self.emoji.iter())
+        {
+            let len = source.bytes.bytes().len() as u64;
+            if source.bytes.is_mapped() {
+                mapped += len;
+            } else {
+                copied += len;
+            }
+        }
+        (mapped, copied)
+    }
 }
 
 /// The top rows of the grid are host CHROME, not terminal content, and their
@@ -1641,6 +1699,17 @@ pub struct Renderer {
     /// `None` value caches a face that failed to build (don't retry every glyph).
     #[cfg(target_os = "macos")]
     ct_cache: FxHashMap<(usize, u32, u32, u8), Option<macos_coretext::CtFont>>,
+    /// CoreText's parse of each face FILE the `ct_cache` fonts are minted
+    /// from, keyed by the bytes' address like `ct_cache` itself: one
+    /// `CTFontManagerCreateFontDescriptorsFromData` per file, so a font at a
+    /// new pixel size or variation instance is one
+    /// `CTFontCreateWithFontDescriptor`, never a re-parse of a 23 MB collection
+    /// mid-frame. Cleared with the address-keyed caches when a face's bytes
+    /// are replaced (`clear_face_address_caches`), NOT on `set_px` /
+    /// `refresh_variations` — the parse is size- and instance-independent,
+    /// which is the point. `None` caches a file CoreText refused.
+    #[cfg(target_os = "macos")]
+    ct_descriptors: FxHashMap<usize, Option<macos_coretext::CtFaceDescriptors>>,
     /// Resolved primary font PATH (when loaded from disk), so [`ensure_styled_faces`]
     /// can find the `-Bold`/`-Italic` siblings. `None` for byte-loaded/embedded fonts.
     primary_path: Option<String>,
@@ -1764,7 +1833,7 @@ pub struct Renderer {
     /// large `sbix` font; sessions without emoji never pay it). Stored as raw
     /// bytes because a `ttf_parser::Face` borrows them — a fresh Face is parsed
     /// per emoji rasterization, which is rare and off the hot path.
-    color_font: Option<std::sync::Arc<Vec<u8>>>,
+    color_font: Option<crate::font::FaceBytes>,
     /// Candidate colour-emoji font paths, tried on first emoji; emptied once consumed.
     color_font_paths: Vec<String>,
     /// Runtime per-codepoint font fallback (M3 FONT-DISCOVERY): when a code point
@@ -3523,7 +3592,7 @@ impl LazyFontdue {
     /// and never held one twice (only `ATERM_RASTERIZER=fontdue` or the CoreText
     /// fail-safe reached this at all, and neither is measured).
     /// [`Self::get_at`] strikes the same bargain against the other store.
-    fn get(&self, bytes: &std::sync::Arc<Vec<u8>>) -> Option<&std::sync::Arc<crate::font::Font>> {
+    fn get(&self, bytes: &crate::font::FaceBytes) -> Option<&std::sync::Arc<crate::font::Font>> {
         if self.0.get().is_none() {
             // Parse OUTSIDE the cell, then publish; a racer's duplicate result is
             // dropped by `set`. See the type docs on why this is not `get_or_init`.
@@ -3593,7 +3662,7 @@ impl LazyFontdue {
 #[derive(Clone)]
 struct FallbackFace {
     font: LazyFontdue,
-    bytes: std::sync::Arc<Vec<u8>>,
+    bytes: crate::font::FaceBytes,
     /// Collection face index. Chain faces load fontdue's default face 0 today;
     /// carried so the ttf-parser/CoreText side can never drift from it.
     index: u32,
@@ -3633,13 +3702,15 @@ impl FallbackFace {
     /// faces on the machine. [`Renderer::retire_unparsable_fallback`] stays as
     /// the second line of defence if the two ever drift apart.
     ///
-    /// The bytes arrive as the READ's OWN handle (`&Arc<Vec<u8>>`), not a slice,
-    /// so a genuinely new face enters [`DISCOVERED_FONT_BYTES`] as the allocation
-    /// the caller already had. The slice form copied every file it was handed —
-    /// ~43 MB per launch on this platform's nine-file fallback chain, for a peak
-    /// of 5,063 kB — see [`intern_discovered_font_bytes`].
+    /// The bytes arrive as the ADMISSION's OWN handle (`&FaceBytes` — a file
+    /// mapping for a face on the system font volume, else the bounded
+    /// copy), not a slice, so a genuinely new face enters
+    /// [`DISCOVERED_FONT_BYTES`] as the allocation or mapping the caller already
+    /// had. The slice form copied every file it was handed — ~43 MB per launch
+    /// on this platform's nine-file fallback chain, for a peak of 5,063 kB —
+    /// see [`intern_discovered_font_bytes`].
     fn from_path_bytes(
-        bytes: &std::sync::Arc<Vec<u8>>,
+        bytes: &crate::font::FaceBytes,
         path: Option<String>,
     ) -> Result<FallbackFace, String> {
         // PROCESS-GLOBAL intern, not the thread-local one. `intern_font_bytes_slice`
@@ -4125,7 +4196,7 @@ impl RuntimeFallback {
         ch: char,
     ) -> Option<(
         Option<std::sync::Arc<crate::font::Font>>,
-        std::sync::Arc<Vec<u8>>,
+        crate::font::FaceBytes,
         u32,
         FaceNorm,
     )> {
@@ -4143,7 +4214,12 @@ impl RuntimeFallback {
             return None;
         };
         let f = self.faces.get(i)?;
-        Some((f.font.clone(), f.bytes.clone(), f.index, f.norm))
+        Some((
+            f.font.clone(),
+            crate::font::FaceBytes::Vec(f.bytes.clone()),
+            f.index,
+            f.norm,
+        ))
     }
 }
 
@@ -4290,7 +4366,13 @@ pub fn ct_face_can_render(bytes: &[u8], index: u32, ch: char) -> bool {
     if face.glyph_raster_image(gid, u16::MAX).is_some() || face.is_color_glyph(gid) {
         return false;
     }
-    let Some(ct) = macos_coretext::CtFont::new(bytes, index, RUNTIME_FALLBACK_PROBE_PX, &[]) else {
+    // An owned handle for CoreText to read in place: this probe is handed a
+    // borrowed slice (an adversarial corpus in `tests/fallback_harmony.rs`, a
+    // candidate's bytes on the unsealed lane), so it takes the one copy the
+    // old `CFDataCreate` took anyway. Unreachable in a sealed GUI process.
+    let handle = crate::font::FaceBytes::Slice(std::sync::Arc::from(bytes));
+    let Some(ct) = macos_coretext::CtFont::new(handle, index, RUNTIME_FALLBACK_PROBE_PX, &[])
+    else {
         return false;
     };
     matches!(
@@ -4408,9 +4490,47 @@ fn font_cmap_ranges(bytes: &[u8], cps: &mut Vec<u32>) -> Option<Vec<(u32, u32)>>
 /// stalling that frame. `OnceLock::get_or_init` means the warm and any concurrent
 /// render-thread lookup coordinate on one build, so warming can never double the work
 /// or race. Cheap no-op after the first call.
+///
+/// ONLY AN UNSEALED RENDERER CAN EVER READ THE INDEX. Its sole consumer is
+/// [`runtime_fallback_scan_candidates`], on the `Tier::RuntimeDecisions` lane,
+/// and [`font_chain::reachable_mask`] removes that tier from every SEALED
+/// policy — which every GUI generation is before its first pixel
+/// ([`Renderer::seal_admitted_font_sources`]). The GUI used to spawn an
+/// `aterm-font-warm` thread calling this after the first present: ~373 whole
+/// system-font reads (~700 MB on a Mac, the 192 MB emoji collection included)
+/// and as many cmap walks, per launch, for a table no sealed renderer could
+/// consult. That spawn is gone; this stays for the unsealed CLI renderers
+/// (`aterm show-face`, tests). `tests/sealed_never_consults_coverage_index.rs`
+/// pins the reachability argument through [`font_coverage_index_built`] and
+/// [`font_coverage_scan_queries`].
 pub fn warm_font_coverage_index() {
     let _ = font_coverage_index();
 }
+
+/// Whether [`font_coverage_index`] has been built in this process — the
+/// observable that a sealed generation never pays the whole-font-tree read.
+/// Diagnostics only.
+#[must_use]
+pub fn font_coverage_index_built() -> bool {
+    FONT_COVERAGE_INDEX.get().is_some()
+}
+
+/// How many times [`runtime_fallback_scan_candidates`] consulted the coverage
+/// index in this process (and therefore forced its build). Diagnostics only:
+/// the reachability pin asserts it stays `0` under a sealed generation.
+#[must_use]
+pub fn font_coverage_scan_queries() -> u64 {
+    FONT_COVERAGE_SCAN_QUERIES.load(std::sync::atomic::Ordering::Relaxed)
+}
+
+/// The one-time index cell behind [`font_coverage_index`]; a `static` at module
+/// level rather than inside the function so [`font_coverage_index_built`] can
+/// ask whether it was ever initialised without initialising it.
+static FONT_COVERAGE_INDEX: std::sync::OnceLock<Vec<FontCoverage>> = std::sync::OnceLock::new();
+
+/// [`font_coverage_scan_queries`]'s counter.
+static FONT_COVERAGE_SCAN_QUERIES: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(0);
 
 /// The FIRST candidate path whose bytes read AND pass admission, in order —
 /// first-success-wins, identical to the lazy `ensure_fallback` /
@@ -4419,9 +4539,10 @@ pub fn warm_font_coverage_index() {
 /// process-global parsed-face intern.
 fn first_interned_face(paths: &[String]) -> Option<FallbackFace> {
     paths.iter().find_map(|p| {
-        // The read's buffer goes STRAIGHT into the store: `Arc::new` moves the
-        // `Vec`, it does not copy the file. See `intern_discovered_font_bytes`.
-        let bytes = std::sync::Arc::new(font_file::read_font_file(std::path::Path::new(p)).ok()?);
+        // The admission's handle goes STRAIGHT into the store — a file MAPPING
+        // for a face on the system font volume, else the bounded copy
+        // (moved, never re-copied). See `intern_discovered_font_bytes`.
+        let bytes = font_file::admit_font_file(std::path::Path::new(p)).ok()?;
         FallbackFace::from_path_bytes(&bytes, Some(p.clone())).ok()
     })
 }
@@ -4515,9 +4636,10 @@ fn build_fallback_chain(paths: &[String], user_prefix: usize) -> Vec<FallbackFac
                 scope.spawn(move || {
                     // Straight into the store — this is the loop that had NINE
                     // files in flight at once on Windows, each one resident twice.
-                    let bytes = std::sync::Arc::new(
-                        font_file::read_font_file(std::path::Path::new(p)).ok()?,
-                    );
+                    // On unix a candidate on the system font volume is a
+                    // MAPPING here, not a read: the two 23 MB macOS chain faces
+                    // are file-backed and faulted in per glyph.
+                    let bytes = font_file::admit_font_file(std::path::Path::new(p)).ok()?;
                     FallbackFace::from_path_bytes(&bytes, Some(p.clone())).ok()
                 })
             })
@@ -4542,10 +4664,9 @@ fn build_fallback_chain(paths: &[String], user_prefix: usize) -> Vec<FallbackFac
     // Every speculatively-parsed candidate was additive or failed, so no broad
     // face has ended the scan yet. Continue serially through the remainder.
     for (i, p) in paths.iter().enumerate().skip(speculative) {
-        let Ok(bytes) = font_file::read_font_file(std::path::Path::new(p)) else {
+        let Ok(bytes) = font_file::admit_font_file(std::path::Path::new(p)) else {
             continue;
         };
-        let bytes = std::sync::Arc::new(bytes);
         let keep_scanning = additive(i, p.as_str());
         let Ok(face) = FallbackFace::from_path_bytes(&bytes, Some(p.clone())) else {
             continue;
@@ -4580,8 +4701,7 @@ fn build_fallback_chain(paths: &[String], user_prefix: usize) -> Vec<FallbackFac
 /// same files, same bytes, same index
 /// (`docs/measured/memory-footprint-2026-08-24.md` §14).
 fn font_coverage_index() -> &'static [FontCoverage] {
-    static INDEX: std::sync::OnceLock<Vec<FontCoverage>> = std::sync::OnceLock::new();
-    INDEX.get_or_init(|| {
+    FONT_COVERAGE_INDEX.get_or_init(|| {
         let mut idx: Vec<FontCoverage> = Vec::new();
         // Hoisted, not per-iteration: see the note above. `bytes` grows to the
         // largest font seen so far and is reused for every read after it; `cps`
@@ -4623,6 +4743,7 @@ fn font_coverage_index() -> &'static [FontCoverage] {
 /// backend's drawability probe, so a font whose cmap maps `ch` to a glyph the
 /// backend cannot draw is still rejected downstream.
 fn runtime_fallback_scan_candidates(ch: char, ctx: FallbackProbeCtx, out: &mut Vec<String>) {
+    FONT_COVERAGE_SCAN_QUERIES.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
     let cp = ch as u32;
     let mut hits: Vec<(u32, &FontCoverage)> = font_coverage_index()
         .iter()
@@ -5236,6 +5357,8 @@ pub fn fallback_weight_rank(
 mod macos_coretext {
     use std::ffi::c_void;
 
+    use crate::font::FaceBytes;
+
     /// Opaque CoreFoundation / CoreText object pointers (never dereferenced in
     /// Rust — handed back to the frameworks or released).
     type CFTypeRef = *const c_void;
@@ -5437,9 +5560,41 @@ mod macos_coretext {
         size: CGSize,
     }
 
+    /// `CFAllocatorContext`, per CFBase.h: the callback table a custom
+    /// allocator is created from. Only `deallocate` and `info` are used here
+    /// — this allocator exists to be a `CFData`'s `bytesDeallocator`, which
+    /// CoreFoundation invokes exactly once, with the byte pointer, when the
+    /// data object is destroyed.
+    #[repr(C)]
+    struct CFAllocatorContext {
+        version: isize,
+        info: *mut c_void,
+        retain: Option<unsafe extern "C" fn(*const c_void) -> *const c_void>,
+        release: Option<unsafe extern "C" fn(*const c_void)>,
+        copy_description: Option<unsafe extern "C" fn(*const c_void) -> CFStringRef>,
+        allocate: Option<unsafe extern "C" fn(isize, usize, *mut c_void) -> *mut c_void>,
+        reallocate:
+            Option<unsafe extern "C" fn(*mut c_void, isize, usize, *mut c_void) -> *mut c_void>,
+        deallocate: Option<unsafe extern "C" fn(*mut c_void, *mut c_void)>,
+        preferred_size: Option<unsafe extern "C" fn(isize, usize, *mut c_void) -> isize>,
+    }
+
     #[link(name = "CoreFoundation", kind = "framework")]
     unsafe extern "C" {
-        fn CFDataCreate(alloc: CFAllocatorRef, bytes: *const u8, length: isize) -> CFDataRef;
+        /// The NON-copying `CFData` constructor: the object presents `bytes`
+        /// in place and hands the pointer to `deallocator` when it dies.
+        fn CFDataCreateWithBytesNoCopy(
+            alloc: CFAllocatorRef,
+            bytes: *const u8,
+            length: isize,
+            deallocator: CFAllocatorRef,
+        ) -> CFDataRef;
+        fn CFAllocatorCreate(
+            alloc: CFAllocatorRef,
+            context: *mut CFAllocatorContext,
+        ) -> CFAllocatorRef;
+        #[cfg(test)]
+        fn CFDataGetBytePtr(data: CFDataRef) -> *const u8;
         fn CFArrayGetCount(arr: CFArrayRef) -> isize;
         fn CFArrayGetValueAtIndex(arr: CFArrayRef, idx: isize) -> *const c_void;
         /// `CFNumberCreate` — builds the axis-tag CFNumber for the variation
@@ -5534,36 +5689,176 @@ mod macos_coretext {
         pub bytes: Vec<u8>,
     }
 
+    /// The `bytesDeallocator` callback of the allocator [`CtFaceDescriptors`]
+    /// hands to `CFDataCreateWithBytesNoCopy`: CoreFoundation calls it once,
+    /// when the `CFData` is destroyed, and the boxed [`FaceBytes`] parked in
+    /// `info` — CF's own strong handle on the file — is dropped here. The
+    /// byte pointer itself is not freed: it is inside the Arc'd allocation or
+    /// mapping that handle owns.
+    unsafe extern "C" fn release_face_bytes(_bytes: *mut c_void, info: *mut c_void) {
+        if !info.is_null() {
+            // SAFETY: `info` is the `Box<FaceBytes>` `CtFaceDescriptors::new`
+            // leaked for exactly this call, and CF invokes a deallocator once.
+            drop(unsafe { Box::from_raw(info.cast::<FaceBytes>()) });
+        }
+    }
+
+    /// `CFAllocatorCreate` requires an allocate callback even for an allocator
+    /// that only ever deallocates; this one is never reached.
+    unsafe extern "C" fn never_allocate(
+        _size: isize,
+        _hint: usize,
+        _info: *mut c_void,
+    ) -> *mut c_void {
+        std::ptr::null_mut()
+    }
+
+    /// CoreText's parse of ONE font file — the `CFData` presenting the file's
+    /// bytes IN PLACE and the descriptor array (one per face of a collection)
+    /// minted from it — held so a font at a new pixel size is
+    /// `CTFontCreateWithFontDescriptor` off the cached array, never a re-parse
+    /// of a 23 MB collection mid-frame.
+    ///
+    /// # No copy, and who owns the bytes
+    ///
+    /// `CtFont::new` used to `CFDataCreate` — the COPYING constructor — so every
+    /// `(face, px, variation-slot)` font held a private copy of the whole face
+    /// file beside the Rust handle: MEASURED on this machine, +45 MiB of RSS the
+    /// moment the first CJK glyph built its font over the 23.5 MB Hiragino
+    /// collection (23.5 MB copied, and the copy faulting the whole mapping in),
+    /// and +23 MiB more for every additional pixel size. With the seal's
+    /// admissions now file MAPPINGS, the copy also defeated the mapping.
+    /// `CFDataCreateWithBytesNoCopy` presents the handle's bytes in place:
+    /// +0 at construction, +0 per raster, +0 per additional size.
+    ///
+    /// The bytes must then outlive every CoreText object that can reach them,
+    /// and CoreText caches fonts and descriptors internally beyond the lifetime
+    /// of the references it hands out — so an Arc held only by OUR objects is
+    /// not enough. The `CFData`'s `bytesDeallocator` is a one-purpose
+    /// `CFAllocator` whose `info` is a boxed clone of the [`FaceBytes`] handle:
+    /// CoreFoundation itself holds a strong reference to the file for as long
+    /// as any CF object references the data, and [`release_face_bytes`] drops
+    /// it when the data is finally destroyed, on whatever thread that happens.
+    /// `_keepalive` is our own handle on top, so a live `CtFaceDescriptors` or
+    /// `CtFont` also pins the bytes without asking CF anything.
+    pub struct CtFaceDescriptors {
+        data: CFDataRef,
+        descs: CFArrayRef,
+        _keepalive: FaceBytes,
+    }
+
+    // SAFETY: `data`/`descs` are IMMUTABLE Core Foundation objects (atomic
+    // retain/release, thread-safe reads) and `FaceBytes` is `Send + Sync`, so
+    // the parse may be moved or shared across threads exactly like `CtFont`.
+    unsafe impl Send for CtFaceDescriptors {}
+    unsafe impl Sync for CtFaceDescriptors {}
+
+    impl Drop for CtFaceDescriptors {
+        fn drop(&mut self) {
+            // SAFETY: both are live CF objects this value created; each is
+            // released exactly once. Releasing `data` here does not free the
+            // bytes: CF's boxed handle goes only when the data object's LAST
+            // reference (ours or CoreText's) is gone, via the deallocator.
+            unsafe {
+                CFRelease(self.descs);
+                CFRelease(self.data);
+            }
+        }
+    }
+
+    impl CtFaceDescriptors {
+        /// Parse `bytes` once. `None` if CoreText cannot read the data.
+        pub fn new(bytes: FaceBytes) -> Option<Self> {
+            // CF's own strong handle on the file (see the type docs). Leaked
+            // into the allocator's `info`; `release_face_bytes` drops it.
+            let cf_handle: *mut FaceBytes = Box::into_raw(Box::new(bytes.clone()));
+            let mut context = CFAllocatorContext {
+                version: 0,
+                info: cf_handle.cast(),
+                retain: None,
+                release: None,
+                copy_description: None,
+                allocate: Some(never_allocate),
+                reallocate: None,
+                deallocate: Some(release_face_bytes),
+                preferred_size: None,
+            };
+            // SAFETY: `context` outlives the `CFAllocatorCreate` call, which
+            // copies it. The CFData retains `deallocator` for its lifetime, so
+            // our reference is released as soon as the data exists; if the data
+            // cannot be created the boxed handle is reclaimed here instead. The
+            // byte pointer stays valid for the data's whole life because the
+            // boxed handle (and `_keepalive`) pin the allocation or mapping.
+            unsafe {
+                let deallocator = CFAllocatorCreate(std::ptr::null(), &raw mut context);
+                if deallocator.is_null() {
+                    drop(Box::from_raw(cf_handle));
+                    return None;
+                }
+                let data = CFDataCreateWithBytesNoCopy(
+                    std::ptr::null(),
+                    bytes.as_ptr(),
+                    bytes.len() as isize,
+                    deallocator,
+                );
+                if data.is_null() {
+                    CFRelease(deallocator);
+                    drop(Box::from_raw(cf_handle));
+                    return None;
+                }
+                CFRelease(deallocator);
+                let descs = CTFontManagerCreateFontDescriptorsFromData(data);
+                if descs.is_null() {
+                    CFRelease(data);
+                    return None;
+                }
+                Some(Self {
+                    data,
+                    descs,
+                    _keepalive: bytes,
+                })
+            }
+        }
+
+        /// TEST-ONLY: the address the `CFData` presents — equal to the
+        /// handle's own bytes when nothing was copied.
+        #[cfg(test)]
+        pub fn data_ptr(&self) -> *const u8 {
+            // SAFETY: `data` is a live CFData; the accessor only reads it.
+            unsafe { CFDataGetBytePtr(self.data) }
+        }
+    }
+
     /// A CoreText font handle for ONE face of some font bytes at a FIXED pixel size.
     /// Built from the exact bytes (+ collection index) the shaping/gid pipeline uses,
     /// so a `CGGlyph` id here equals the ttf-parser/rustybuzz glyph id — only the
-    /// rasterizer changes, not glyph selection. `_data` keeps the backing `CFData`
-    /// alive for the font. `Send`+`Sync` (see the impls below): CF/CT objects are
-    /// immutable + thread-safe, so a `Renderer` may be BUILT on a worker thread
-    /// (`new_with_family`) even though it is only ever RENDERED single-threaded.
+    /// rasterizer changes, not glyph selection. `_keepalive` is our handle on the
+    /// bytes the font draws from (CoreFoundation holds its own, see
+    /// [`CtFaceDescriptors`]). `Send`+`Sync` (see the impls below): CF/CT objects
+    /// are immutable + thread-safe, so a `Renderer` may be BUILT on a worker
+    /// thread (`new_with_family`) even though it is only ever RENDERED
+    /// single-threaded.
     pub struct CtFont {
         font: CTFontRef,
-        _data: CFDataRef,
+        _keepalive: FaceBytes,
     }
 
-    // SAFETY: `font` (CTFontRef) and `_data` (CFDataRef) are IMMUTABLE Core
-    // Foundation objects; CFRetain/CFRelease are atomic and read access is
-    // thread-safe, so a `CtFont` may be moved (Send) or shared (Sync) across
-    // threads. This lets `new_with_family` build the CPU `Renderer` on a worker
-    // thread (moved back via `join`, then only ever rendered single-threaded).
+    // SAFETY: `font` (CTFontRef) is an IMMUTABLE Core Foundation object;
+    // CFRetain/CFRelease are atomic and read access is thread-safe, and
+    // `FaceBytes` is `Send + Sync`, so a `CtFont` may be moved (Send) or shared
+    // (Sync) across threads. This lets `new_with_family` build the CPU
+    // `Renderer` on a worker thread (moved back via `join`, then only ever
+    // rendered single-threaded).
     unsafe impl Send for CtFont {}
     unsafe impl Sync for CtFont {}
 
     impl Drop for CtFont {
         fn drop(&mut self) {
-            // SAFETY: `font` and `_data` are live CF/CT objects we created; release
-            // each exactly once. See the block-level SAFETY note above.
+            // SAFETY: `font` is a live CT object we created; released exactly
+            // once. See the block-level SAFETY note above.
             unsafe {
                 if !self.font.is_null() {
                     CFRelease(self.font);
-                }
-                if !self._data.is_null() {
-                    CFRelease(self._data);
                 }
             }
         }
@@ -5578,26 +5873,39 @@ mod macos_coretext {
         /// matching ttf-parser/rustybuzz (variation changes outlines, never ids).
         /// `None` if the data is unreadable or has no such face; an axis Core
         /// Text rejects is skipped (the remaining coords still apply).
-        pub fn new(bytes: &[u8], index: u32, px: f32, variations: &[(u32, f32)]) -> Option<CtFont> {
-            // SAFETY: CFDataCreate copies `bytes`; descriptors (base + each derived
-            // variation copy) are released after use; the created font + its CFData
-            // are retained in `CtFont` and released once in `Drop`. Opaque pointers
-            // are never dereferenced.
+        ///
+        /// Parses the file once, here; a caller that mints several sizes or
+        /// instances from one file keeps the [`CtFaceDescriptors`] and uses
+        /// [`Self::from_descriptors`] (the renderer's `ct_descriptors` cache).
+        pub fn new(
+            bytes: FaceBytes,
+            index: u32,
+            px: f32,
+            variations: &[(u32, f32)],
+        ) -> Option<CtFont> {
+            let descs = CtFaceDescriptors::new(bytes)?;
+            Self::from_descriptors(&descs, index, px, variations)
+        }
+
+        /// [`Self::new`] off an already-parsed file: no data object, no parse,
+        /// one `CTFontCreateWithFontDescriptor` (plus the per-axis variation
+        /// copies).
+        pub fn from_descriptors(
+            descs: &CtFaceDescriptors,
+            index: u32,
+            px: f32,
+            variations: &[(u32, f32)],
+        ) -> Option<CtFont> {
+            // SAFETY: descriptors (base + each derived variation copy) are
+            // released after use; the created font is retained in `CtFont` and
+            // released once in `Drop`. Opaque pointers are never dereferenced.
             unsafe {
-                let data = CFDataCreate(std::ptr::null(), bytes.as_ptr(), bytes.len() as isize);
-                if data.is_null() {
-                    return None;
-                }
-                let descs = CTFontManagerCreateFontDescriptorsFromData(data);
-                if descs.is_null() {
-                    CFRelease(data);
-                    return None;
-                }
-                let count = CFArrayGetCount(descs);
+                let descs_ref = descs.descs;
+                let count = CFArrayGetCount(descs_ref);
                 let font = if (index as isize) < count {
                     // Borrowed from the array; the derived variation copies are
                     // OWNED and tracked in `owned` for release.
-                    let mut desc = CFArrayGetValueAtIndex(descs, index as isize);
+                    let mut desc = CFArrayGetValueAtIndex(descs_ref, index as isize);
                     let mut owned: CTFontDescriptorRef = std::ptr::null();
                     for &(tag, value) in variations {
                         let tag_i32 = tag as i32;
@@ -5629,12 +5937,13 @@ mod macos_coretext {
                 } else {
                     std::ptr::null()
                 };
-                CFRelease(descs);
                 if font.is_null() {
-                    CFRelease(data);
                     return None;
                 }
-                Some(CtFont { font, _data: data })
+                Some(CtFont {
+                    font,
+                    _keepalive: descs._keepalive.clone(),
+                })
             }
         }
 
@@ -6282,6 +6591,17 @@ mod pad_split_kani {
 /// Relative entries are joined with `$HOME` (per-user fonts). On Linux the system
 /// trees are NESTED (`…/truetype/<vendor>/x.ttf`), so the scan descends — see
 /// [`font_files`].
+///
+/// NO ENTRY MAY LIE INSIDE ANOTHER. The walk is recursive (8 levels) and keeps
+/// no seen-set, so a root that is also a subdirectory of an earlier root is
+/// visited twice and every file under it is listed twice — every full-read
+/// consumer (the name-table pass, `list-fonts`, the coverage index) then reads
+/// it twice. `/System/Library/Fonts/Supplemental` sat here beside its parent
+/// for exactly that cost: 290 faces / 131 MB enumerated and read twice per walk
+/// on a Mac. The parent's walk visits `Supplemental/` inline at its sorted
+/// position, so first-match consumers resolve identically without the entry.
+/// `font_catalog::tests::search_dirs_are_never_nested_so_the_walk_visits_a_
+/// file_once` refuses a nested root.
 const FONT_DIRS: &[&str] = &[
     // --- per-user (joined with $HOME), most-preferred first ---
     "Library/Fonts",      // macOS user fonts
@@ -6290,10 +6610,9 @@ const FONT_DIRS: &[&str] = &[
     // Windows per-user fonts (a store/right-click "install for me" target).
     #[cfg(windows)]
     "AppData/Local/Microsoft/Windows/Fonts",
-    // --- macOS system ---
+    // --- macOS system (`Supplemental/` is reached by the recursive walk) ---
     "/Library/Fonts",
     "/System/Library/Fonts",
-    "/System/Library/Fonts/Supplemental",
     // --- Linux system ---
     "/usr/share/fonts",
     "/usr/local/share/fonts",
@@ -6807,6 +7126,8 @@ impl Renderer {
             rasterizer: select_rasterizer(),
             #[cfg(target_os = "macos")]
             ct_cache: FxHashMap::default(),
+            #[cfg(target_os = "macos")]
+            ct_descriptors: FxHashMap::default(),
             primary_path: None,
             styled_loaded: false,
             styled_retire_pending: [None; 3],
@@ -7023,7 +7344,7 @@ impl Renderer {
     /// rasterization), so a bad blob fails loudly instead of yielding tofu later.
     pub fn set_color_font_bytes(&mut self, bytes: Vec<u8>) -> Result<(), String> {
         ttf_parser::Face::parse(&bytes, 0).map_err(|e| e.to_string())?;
-        self.install_color_font(intern_font_bytes(bytes));
+        self.install_color_font(crate::font::FaceBytes::Vec(intern_font_bytes(bytes)));
         Ok(())
     }
 
@@ -7032,11 +7353,11 @@ impl Renderer {
     /// build never re-allocates the ~190MB emoji face into the linear memory.
     pub fn set_color_font_arc(&mut self, bytes: std::sync::Arc<Vec<u8>>) -> Result<(), String> {
         ttf_parser::Face::parse(&bytes, 0).map_err(|e| e.to_string())?;
-        self.install_color_font(bytes);
+        self.install_color_font(crate::font::FaceBytes::Vec(bytes));
         Ok(())
     }
 
-    fn install_color_font(&mut self, bytes: std::sync::Arc<Vec<u8>>) {
+    fn install_color_font(&mut self, bytes: crate::font::FaceBytes) {
         self.color_font = Some(bytes);
         self.color_font_paths.clear();
         // Emoji already drawn from the OLD colour face survive as cached bitmaps in
@@ -8092,8 +8413,8 @@ impl Renderer {
             bytes: AdmittedFontBlob::Slice(std::sync::Arc::clone(bytes)),
             index,
         };
-        let vec = |bytes: &std::sync::Arc<Vec<u8>>, index| AdmittedFaceSource {
-            bytes: AdmittedFontBlob::Vec(std::sync::Arc::clone(bytes)),
+        let vec = |bytes: &crate::font::FaceBytes, index| AdmittedFaceSource {
+            bytes: AdmittedFontBlob::Face(bytes.clone()),
             index,
         };
         AdmittedFontSources {
@@ -8157,10 +8478,16 @@ impl Renderer {
         // It is also ALREADY overlapped: the two parses spawned above are only
         // joined below, and the whole seal MEASURED ~1.82 s at opt-level 0 on
         // this machine, so this read is ~0.5% of it and rides under them.
-        // What is NOT addressed here is the 183 MiB of unconditional resident
-        // bytes an ASCII-only session never draws from; a memory-mapped read
-        // would make those file-backed, which is a bigger change than the seal
-        // ordering and was deliberately left undone.
+        // The 183 MiB is no longer resident heap: `ensure_color_font` admits
+        // the face through `font_file::admit_font_file`, which MAPS a file
+        // on the system font volume (`PROT_READ`, `MAP_PRIVATE`) instead
+        // of reading it, so the admission is still eager — the fd is opened,
+        // validated and mapped HERE, inside the seal, and no pathname is
+        // touched after it — while the pages are file-backed, shared across
+        // every aterm process through the page cache, evictable, and faulted
+        // in only for the glyphs actually drawn. Same for the chain and symbol
+        // faces above. `tests/seal_maps_discovered_faces.rs` is the residency
+        // proof; the truncation caveat is on `font_file::MappedFontFile`.
         self.ensure_color_font();
         self.block_on_lazy_fallbacks();
 
@@ -8460,6 +8787,7 @@ impl Renderer {
         {
             self.rasterizer = RasterKind::Fontdue;
             self.ct_cache.clear();
+            self.ct_descriptors.clear();
             // Drop already-rasterized coverage: cached `glyphs` are rasterizer-
             // specific (CoreText vs fontdue bytes), so they must be re-rasterized on
             // the new backend — same discipline as `set_px`. (styled_keys map
@@ -8492,7 +8820,7 @@ impl Renderer {
     fn ct_glyph(
         &mut self,
         key_ptr: usize,
-        bytes: &[u8],
+        bytes: impl Into<crate::font::FaceBytes>,
         index: u32,
         gid: u16,
         px: f32,
@@ -8502,10 +8830,23 @@ impl Renderer {
         if self.rasterizer != RasterKind::CoreText {
             return None;
         }
+        // The bytes travel as their HANDLE (an `Arc<[u8]>` for the primary
+        // and styled faces, the discovery `FaceBytes` — usually a file
+        // mapping — for the chain), because CoreText reads them IN PLACE
+        // (`CtFaceDescriptors`: no `CFDataCreate` copy) and must be able to
+        // pin them for as long as its own caches reach them.
+        let descs = self
+            .ct_descriptors
+            .entry(key_ptr)
+            .or_insert_with(|| macos_coretext::CtFaceDescriptors::new(bytes.into()));
         let face = self
             .ct_cache
             .entry((key_ptr, index, px.to_bits(), var_slot))
-            .or_insert_with(|| macos_coretext::CtFont::new(bytes, index, px, variations));
+            .or_insert_with(|| {
+                descs.as_ref().and_then(|d| {
+                    macos_coretext::CtFont::from_descriptors(d, index, px, variations)
+                })
+            });
         let rg = face.as_ref()?.rasterize(gid, self.font_thicken)?;
         Some((rg.width, rg.height, rg.xmin, rg.ymin, rg.advance, rg.bytes))
     }
@@ -8546,7 +8887,7 @@ impl Renderer {
         {
             let gid = self.primary_unicode_gid(ch)?;
             let bytes = self.rb_primary_bytes.clone()?;
-            self.ct_glyph(bytes.as_ptr() as usize, &bytes, 0, gid, self.px, &coords, 2)
+            self.ct_glyph(bytes.as_ptr() as usize, bytes, 0, gid, self.px, &coords, 2)
         }
         #[cfg(not(target_os = "macos"))]
         {
@@ -8834,7 +9175,7 @@ impl Renderer {
         // path CoreText below draws from the bytes and the handle is never opened,
         // so recovering the face here must not be what triggers a 1.4-second parse.
         #[allow(clippy::type_complexity)]
-        let parts: Option<(Option<LazyFontdue>, std::sync::Arc<Vec<u8>>, u32, FaceNorm)> =
+        let parts: Option<(Option<LazyFontdue>, crate::font::FaceBytes, u32, FaceNorm)> =
             match source {
                 FaceId::Fallback => {
                     self.ensure_fallback();
@@ -8890,12 +9231,12 @@ impl Renderer {
                 .map(|g| g.0)
                 .filter(|&g| g != 0);
             gid.and_then(|g| {
-                let kp = bytes.as_slice().as_ptr() as usize;
+                let kp = bytes.as_ptr() as usize;
                 let b = bytes.clone();
                 // Fallback faces are never instantiated (W9 coords are the
                 // PRIMARY's): default instance, slot 0.
                 //
-                self.ct_glyph(kp, &b, index, g, eff_px, &[], 0)
+                self.ct_glyph(kp, b, index, g, eff_px, &[], 0)
             })
         };
         #[cfg(not(target_os = "macos"))]
@@ -8966,11 +9307,11 @@ impl Renderer {
     /// the last chain reference to those bytes, and a later allocation can alias
     /// the freed address and resurrect a `CtFont`/`HintingInstance` built for the
     /// retired face. (This clearing is new; the retire shipped without it.)
-    fn retire_unparsable_fallback(&mut self, bytes: &std::sync::Arc<Vec<u8>>) -> bool {
+    fn retire_unparsable_fallback(&mut self, bytes: &crate::font::FaceBytes) -> bool {
         let Some(i) = self
             .fallback_chain
             .iter()
-            .position(|f| std::sync::Arc::ptr_eq(&f.bytes, bytes))
+            .position(|f| f.bytes.ptr_eq(bytes))
         else {
             return false;
         };
@@ -9083,7 +9424,10 @@ impl Renderer {
     /// `HintingInstance` silently rasterizing the wrong outlines.
     fn clear_face_address_caches(&mut self) {
         #[cfg(target_os = "macos")]
-        self.ct_cache.clear();
+        {
+            self.ct_cache.clear();
+            self.ct_descriptors.clear();
+        }
         // The hint bank is pointer-keyed on Linux AND Windows — the Windows raster
         // grid-fits too (win/parity-grid-fit), and a stale HintingInstance for a
         // freed face is exactly the aliasing this helper exists to prevent.
@@ -9296,20 +9640,29 @@ impl Renderer {
         )
     }
 
-    /// Lazily load the colour-emoji font bytes the first time one is needed.
+    /// Lazily admit the colour-emoji font bytes the first time one is needed.
     /// After this runs once, `color_font_paths` is empty so we never re-try.
     /// Only the bytes are kept (a `ttf_parser::Face` borrows them); a Face is
     /// parsed per emoji rasterization.
+    ///
+    /// The bytes come from `font_file::admit_font_file`: for the built-in
+    /// candidates (all under the system font volume) that is a read-only
+    /// private MAPPING of the file, so the 192 MB Apple Color Emoji collection
+    /// costs a table-directory page here and one sbix strike per emoji drawn,
+    /// not 192 MB of anonymous heap per window. The handle is interned in the
+    /// process-global discovery store (not the thread-local injection intern
+    /// this used to publish into, which a fresh seal worker never hit), so a
+    /// later generation admitting the same file converges on the same mapping.
     fn ensure_color_font(&mut self) {
         if self.color_font.is_some() || self.color_font_paths.is_empty() {
             return;
         }
         let paths = std::mem::take(&mut self.color_font_paths);
         for p in paths {
-            if let Ok(bytes) = font_file::read_font_file(std::path::Path::new(&p)) {
+            if let Ok(bytes) = font_file::admit_font_file(std::path::Path::new(&p)) {
                 // Validate it parses as a colour (sbix) face before keeping it.
                 if ttf_parser::Face::parse(&bytes, 0).is_ok() {
-                    self.color_font = Some(intern_font_bytes(bytes));
+                    self.color_font = Some(intern_discovered_font_bytes(&bytes));
                     return;
                 }
             }
@@ -11465,17 +11818,33 @@ impl Renderer {
         &self.glyphs[&key]
     }
 
-    /// Pre-rasterize printable ASCII (U+0020..=U+007E) into the glyph cache so the
-    /// FIRST frame's atlas build pulls warm `GlyphImage`s instead of rasterizing on
-    /// the hot path. Intended to run OFF the critical path (the GPU backend spawns
-    /// it on the same background font thread that builds the renderer), so it adds
-    /// no serial cold-start time. Produces byte-identical glyphs to on-demand
-    /// rasterization — it only fills the cache early; rendered output is unchanged.
-    /// Box-drawing/block are procedural (free) and so are not warmed here.
+    /// Pre-rasterize printable ASCII (U+0020..=U+007E), REGULAR and BOLD, into
+    /// the glyph cache so the FIRST frame's atlas build pulls warm `GlyphImage`s
+    /// instead of rasterizing on the hot path. Produces byte-identical glyphs to
+    /// on-demand rasterization — it only fills the cache early; rendered output
+    /// is unchanged. Box-drawing/block are procedural (free) and so are not
+    /// warmed here.
+    ///
+    /// CALL IT AFTER [`Self::seal_admitted_font_sources`], NEVER BEFORE. The
+    /// seal ends with a wholesale `glyphs.clear()` (the memo drop the
+    /// font_chain seal-monotonicity argument leans on — see
+    /// [`Self::set_runtime_font_discovery`]), so a prewarm that runs first is
+    /// thrown away whole. That is exactly what the GPU backend's font thread
+    /// used to do: 95 CoreText rasters on the thread that builds the renderer,
+    /// discarded by the worker's seal a few milliseconds later, and then the
+    /// first frame re-rasterized every visible key on the UI thread anyway.
+    /// The backend worker now calls this right after the seal — the generation
+    /// is sealed there (no I/O is possible), and the worker already overlaps
+    /// the window-server round trip — so the first frame's `build_atlas` is a
+    /// pure copy for the prompt. BOLD is warmed because the default shell
+    /// prompt IS bold; the regular-only warm left it to the UI thread.
+    /// `prewarm_tests` pins both the coverage and the order.
     pub fn prewarm_ascii(&mut self) {
         for ch in '\u{20}'..='\u{7E}' {
             let key = self.glyph_key(ch);
             let _ = self.glyph_image(key);
+            let bold = self.glyph_key_styled(ch, StyleBits::BOLD);
+            let _ = self.glyph_image(bold);
         }
     }
 
@@ -11627,7 +11996,7 @@ impl Renderer {
                         // Styled sibling FILES are separate, non-instantiated
                         // faces (W9 coords belong to the primary): slot 0.
                         src.and_then(|(kp, b, idx, g)| {
-                            self.ct_glyph(kp, &b, idx, g, self.px, &[], 0)
+                            self.ct_glyph(kp, b, idx, g, self.px, &[], 0)
                         })
                     };
                     // NATIVE CRISPNESS: the grid-fitted raster is this arm's
@@ -11885,7 +12254,7 @@ impl Renderer {
                         };
                         self.ct_glyph(
                             kp,
-                            &b,
+                            b,
                             idx,
                             gid,
                             self.px,
@@ -22963,7 +23332,7 @@ mod tests {
     fn a_discovered_chain_face_adopts_the_readers_byte_handle() {
         let mut unique = embedded_font().to_vec();
         unique.extend_from_slice(format!("aterm-nonce-{:?}", std::time::Instant::now()).as_bytes());
-        let bytes = std::sync::Arc::new(unique);
+        let bytes = crate::font::FaceBytes::Vec(std::sync::Arc::new(unique));
         let handed_over = bytes.as_ptr();
         let face = FallbackFace::from_path_bytes(&bytes, Some("nonce".into()))
             .expect("a bundled face with trailing bytes is still admissible");
@@ -22974,7 +23343,7 @@ mod tests {
              whole Windows fallback chain resident twice"
         );
         assert!(
-            std::sync::Arc::ptr_eq(&face.bytes, &bytes),
+            face.bytes.ptr_eq(&bytes),
             "and it must be the same handle, not merely the same address"
         );
     }
@@ -22998,16 +23367,16 @@ mod tests {
         // `NoMaxpTable` — which is condition (1) of `face_admissible`, and the
         // cheapest honest way to build a file that reads as a font and is not
         // one.
-        let patched = std::sync::Arc::new(
+        let patched = crate::font::FaceBytes::Vec(std::sync::Arc::new(
             patch_num_glyphs(embedded_symbols_font(), 0)
                 .expect("the bundled symbols face has a maxp table"),
-        );
+        ));
         assert!(
             !face_admissible(&patched, 0),
             "fixture guard: admission must actually refuse this face"
         );
         assert!(
-            !discovered_font_bytes_contains(patched.as_slice()),
+            !discovered_font_bytes_contains(&patched),
             "fixture guard: this file must not already be in the store"
         );
         assert!(
@@ -23015,7 +23384,7 @@ mod tests {
             "the fixture must actually be refused, or this proves nothing"
         );
         assert!(
-            !discovered_font_bytes_contains(patched.as_slice()),
+            !discovered_font_bytes_contains(&patched),
             "a refused face must not leave its file in the un-evictable discovery store"
         );
     }
@@ -23042,11 +23411,11 @@ mod tests {
         // in `PARSED_FONT_INTERN` (the store is content-keyed, so a slice-path
         // intern of the same face by another test would legitimately win the
         // entry and the assertion would be about scheduling, not the change).
-        let bytes = std::sync::Arc::new(
+        let bytes = crate::font::FaceBytes::Vec(std::sync::Arc::new(
             display_face_bytes("pixel")
                 .expect("bundled display face")
                 .to_vec(),
-        );
+        ));
         let face = FallbackFace::from_path_bytes(&bytes, None)
             .expect("a bundled face is admissible on the discovery path");
         assert!(
@@ -23066,7 +23435,7 @@ mod tests {
             "the published parse must be the one the cell latched"
         );
         assert!(
-            std::sync::Arc::ptr_eq(&stored_bytes, &face.bytes),
+            stored_bytes.ptr_eq(&face.bytes),
             "materialising must ADOPT the face's own byte handle — a second copy \
              of the file is megabytes on any real chain face"
         );
@@ -24701,8 +25070,13 @@ mod tests {
         };
         let face = ttf_parser::Face::parse(&bytes, 0).expect("parse Menlo face 0");
         let a_gid = face.glyph_index('A').expect("Menlo has 'A'").0;
-        let ct =
-            macos_coretext::CtFont::new(&bytes, 0, 26.0, &[]).expect("CtFont builds from .ttc");
+        let ct = macos_coretext::CtFont::new(
+            crate::font::FaceBytes::Vec(std::sync::Arc::new(bytes.clone())),
+            0,
+            26.0,
+            &[],
+        )
+        .expect("CtFont builds from .ttc");
         let a = ct.rasterize(a_gid, false).expect("rasterize 'A'");
         assert!(
             a.width > 0 && a.height > 0,
@@ -24767,8 +25141,13 @@ mod tests {
             return;
         };
         let face = ttf_parser::Face::parse(&bytes, 0).expect("parse Menlo face 0");
-        let ct =
-            macos_coretext::CtFont::new(&bytes, 0, 13.7, &[]).expect("CtFont builds from .ttc");
+        let ct = macos_coretext::CtFont::new(
+            crate::font::FaceBytes::Vec(std::sync::Arc::new(bytes.clone())),
+            0,
+            13.7,
+            &[],
+        )
+        .expect("CtFont builds from .ttc");
         let mut fractional_seen = 0usize;
         for ch in ['A', 'g', 'j', '.', '(', 'W', 'i', '@'] {
             let Some(gid) = face.glyph_index(ch).map(|g| g.0) else {
@@ -27681,7 +28060,7 @@ mod tests {
         }
         assert!(
             FallbackFace::from_path_bytes(
-                &std::sync::Arc::new(patched.clone()),
+                &crate::font::FaceBytes::Vec(std::sync::Arc::new(patched.clone())),
                 Some("patched".into())
             )
             .is_ok(),
@@ -27717,7 +28096,7 @@ mod tests {
             .expect("bundled face is admissible");
         let bad = FallbackFace {
             font: LazyFontdue::failed_parse(),
-            bytes: intern_font_bytes_slice(embedded_symbols_font()),
+            bytes: crate::font::FaceBytes::Vec(intern_font_bytes_slice(embedded_symbols_font())),
             index: 0,
             path: Some("bad".into()),
             norm: FaceNorm::default(),
@@ -33144,6 +33523,181 @@ mod subpixel_seat_tests {
              against the hyphen's {}",
             ink(0),
             ink(1)
+        );
+    }
+}
+
+#[cfg(test)]
+mod prewarm_tests {
+    //! `Renderer::prewarm_ascii`: what it warms, and WHEN it must run.
+
+    use super::*;
+
+    fn renderer() -> Renderer {
+        Renderer::from_bytes(embedded_font(), 16.0, Theme::default()).expect("embedded font")
+    }
+
+    /// The warm covers REGULAR and BOLD printable ASCII, and a frame's first
+    /// look-ups of those keys find them resident: the cache does not grow when
+    /// the prompt's bold glyphs are asked for after the warm.
+    #[test]
+    fn prewarm_after_seal_warms_regular_and_bold_ascii() {
+        let mut r = renderer();
+        r.seal_admitted_font_sources();
+        assert_eq!(
+            r.glyph_cache_len(),
+            0,
+            "the seal leaves an empty raster memo"
+        );
+        r.prewarm_ascii();
+        let warmed = r.glyph_cache_len();
+        assert!(
+            warmed >= 2 * 95,
+            "95 printable ASCII code points x (regular, bold) must be resident; got {warmed}"
+        );
+        for ch in ['$', 'a', 'Z', '~', ' '] {
+            let regular = r.glyph_key(ch);
+            let bold = r.glyph_key_styled(ch, StyleBits::BOLD);
+            let _ = r.glyph_image(regular);
+            let _ = r.glyph_image(bold);
+        }
+        assert_eq!(
+            r.glyph_cache_len(),
+            warmed,
+            "a post-warm look-up of a regular or BOLD ASCII key must be a cache hit"
+        );
+    }
+
+    /// The ORDER is load-bearing: the seal's wholesale memo drop discards a
+    /// warm that ran before it — which is what the GPU backend's font-thread
+    /// prewarm did on every launch, and why the warm now lives after the seal.
+    #[test]
+    fn prewarm_before_seal_is_discarded_by_the_seal() {
+        let mut r = renderer();
+        r.prewarm_ascii();
+        assert!(
+            r.glyph_cache_len() >= 2 * 95,
+            "precondition: the warm filled the memo"
+        );
+        r.seal_admitted_font_sources();
+        assert_eq!(
+            r.glyph_cache_len(),
+            0,
+            "the seal drops every raster — a warm before it is wasted work"
+        );
+    }
+}
+
+#[cfg(all(test, target_os = "macos"))]
+mod ct_nocopy_tests {
+    //! `CtFont` reads the face bytes IN PLACE and pins them through
+    //! CoreFoundation itself; the renderer parses each face file once.
+
+    use super::*;
+
+    fn menlo() -> Option<crate::font::FaceBytes> {
+        font_file::admit_font_file(std::path::Path::new("/System/Library/Fonts/Menlo.ttc")).ok()
+    }
+
+    /// The `CFData` behind the descriptors presents the handle's own bytes —
+    /// `CFDataCreate` (the copying constructor this replaced) presented a
+    /// private copy at a different address: +45 MiB per face, +23 MiB per
+    /// extra px on the 23.5 MB Hiragino collection, MEASURED.
+    #[test]
+    fn the_cf_data_presents_the_handles_bytes_in_place() {
+        let Some(bytes) = menlo() else {
+            eprintln!("SKIP: Menlo not available");
+            return;
+        };
+        let descs = macos_coretext::CtFaceDescriptors::new(bytes.clone()).expect("Menlo parses");
+        assert_eq!(
+            descs.data_ptr(),
+            bytes.as_ptr(),
+            "CoreText was handed a COPY of the face bytes, not the mapping itself"
+        );
+    }
+
+    /// CoreFoundation holds its own strong handle on the bytes for as long as
+    /// the data object lives, and lets go of it when the last CF reference is
+    /// gone — so the bytes can never be freed under a font CoreText still
+    /// caches, and are not leaked once it is done.
+    #[test]
+    fn coreframework_owns_a_handle_until_the_data_dies() {
+        let Some(mapped) = menlo() else {
+            eprintln!("SKIP: Menlo not available");
+            return;
+        };
+        // A private heap copy so the strong count is this test's alone: the
+        // mapped handle above lives in the process-global discovery store.
+        let arc = std::sync::Arc::new(mapped.to_vec());
+        let bytes = crate::font::FaceBytes::Vec(std::sync::Arc::clone(&arc));
+        assert_eq!(std::sync::Arc::strong_count(&arc), 2);
+        let descs = macos_coretext::CtFaceDescriptors::new(bytes).expect("parses");
+        // CF's boxed clone + `_keepalive` (the `bytes` argument moved in).
+        assert_eq!(
+            std::sync::Arc::strong_count(&arc),
+            3,
+            "the CFData's deallocator must hold its own strong handle"
+        );
+        let font = macos_coretext::CtFont::from_descriptors(&descs, 0, 18.0, &[]).expect("font");
+        assert_eq!(
+            std::sync::Arc::strong_count(&arc),
+            4,
+            "a font pins the bytes too"
+        );
+        let glyph = font.rasterize(36, false).expect("draws");
+        assert!(
+            glyph.bytes.iter().any(|&b| b > 0),
+            "real ink through the in-place data"
+        );
+        drop(font);
+        drop(descs);
+        // Whatever CoreText still caches internally keeps CF's handle alive;
+        // once it is all gone the count is back to ours alone. Either way the
+        // bytes were never freed under a live CF object, which is the property.
+        let remaining = std::sync::Arc::strong_count(&arc);
+        assert!(
+            remaining == 1 || remaining == 2,
+            "after every handle of ours is gone only CF's (if it still caches the font) \
+             may remain, got {remaining}"
+        );
+        eprintln!("strong count after drop: {remaining} (2 = CoreText still caches the data font)");
+    }
+
+    /// One parse per face FILE: two pixel sizes of the same face mint two
+    /// fonts off ONE descriptor array. Before, each `(face, px, slot)` re-ran
+    /// `CTFontManagerCreateFontDescriptorsFromData` over a fresh copy.
+    #[test]
+    fn a_second_pixel_size_reuses_the_files_parse() {
+        let Some(mut r) = Renderer::from_system(16.0, Theme::default()) else {
+            eprintln!("SKIP: no system monospace font");
+            return;
+        };
+        if r.rasterizer != RasterKind::CoreText {
+            eprintln!("SKIP: CoreText rasterizer not selected");
+            return;
+        }
+        let bytes = r.rb_primary_bytes.clone().expect("system primary retained");
+        let gid = ttf_parser::Face::parse(&bytes, 0)
+            .ok()
+            .and_then(|f| f.glyph_index('A'))
+            .map(|g| g.0)
+            .expect("primary has 'A'");
+        let kp = bytes.as_ptr() as usize;
+        assert!(
+            r.ct_glyph(kp, bytes.clone(), 0, gid, 16.0, &[], 0)
+                .is_some()
+        );
+        assert!(
+            r.ct_glyph(kp, bytes.clone(), 0, gid, 24.0, &[], 0)
+                .is_some()
+        );
+        assert!(r.ct_glyph(kp, bytes, 0, gid, 24.0, &[], 0).is_some());
+        assert_eq!(r.ct_cache.len(), 2, "one CTFont per pixel size");
+        assert_eq!(
+            r.ct_descriptors.len(),
+            1,
+            "one CoreText parse per face file, shared by every size and instance"
         );
     }
 }

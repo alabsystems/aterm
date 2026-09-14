@@ -154,6 +154,8 @@ fn registered_session(local_id: u64, term: &Arc<Mutex<Terminal>>) -> SessionHand
     let ctx = Arc::new(SessionCtx {
         sink: Arc::new(SinkWriter::new(-1)),
         output_echo: Arc::new(crate::app_input::OutputEchoTracker::default()),
+        modes: crate::mode_mirror_of(term),
+        ui_waiting: Arc::default(),
         edges: Mutex::new(EdgeTable::new()),
         turn_lease: Mutex::new(None),
         self_id: sid.clone(),

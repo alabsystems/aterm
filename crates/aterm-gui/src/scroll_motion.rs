@@ -168,6 +168,37 @@ impl Glide {
         self.t0 = now;
     }
 
+    /// Move the target WITHOUT pushing the deadline out — the chained form for
+    /// a stream of precise (trackpad) deltas within one glide. The chosen form,
+    /// named as docs/DESIGN-selection-custody §5.6 asks: [`Self::end`] is kept
+    /// exactly; the ease is re-based from the CURRENT sample over the REMAINING
+    /// duration, so the position is continuous at the extension and the glide
+    /// still lands on the new target at the original end and disarms there.
+    ///
+    /// Why not [`Self::retarget`]: it sets `t0 = now`, so a 120 Hz stream of
+    /// deltas restarts the 180 ms ease every 8 ms; the ease never gets past its
+    /// first frame and the content settles ~6.9 intervals (~57 ms) behind the
+    /// finger at any constant speed, with a full 180 ms tail after the last
+    /// delta. Keeping the end bounded is what makes the ease PROGRESS. (Moving
+    /// `target_px` alone, with `t0`/`start_px` untouched, would jump the
+    /// position by `Δtarget · e(t)` at every extension — a visible step late in
+    /// the glide — which is why the re-base is from the sampled position.)
+    ///
+    /// The bounded-wakes / disarm-only-at-target invariants of the abstract
+    /// `scroll_glide_model` are untouched: the deadline is the ORIGINAL end, so
+    /// a chain of extensions arms no more wakes than the glide they extend.
+    pub(crate) fn extend_target(&mut self, target_px: i64, now: Instant) {
+        let end = self.end();
+        let (pos, _) = self.sample(now);
+        self.start_px = pos;
+        self.target_px = target_px;
+        self.t0 = now;
+        // Past the end (a delta landing on the very last frame) the remaining
+        // duration is zero and `sample` returns the target at once — the one
+        // bounded snap a fixed deadline implies; the next delta arms afresh.
+        self.dur = end.saturating_duration_since(now);
+    }
+
     /// The glide's current target (absolute px), for chained retargeting.
     #[must_use]
     pub(crate) fn target_px(&self) -> i64 {
@@ -551,6 +582,98 @@ mod tests {
                 "non-vacuity: the mid sample is a genuine intermediate"
             );
         }
+    }
+
+    /// G16 — `extend_target` is the NON-RESTARTING chain: (1) the deadline is
+    /// kept exactly (`end()` unchanged — no more wakes than the glide it
+    /// extends); (2) the position is continuous at the extension instant; (3)
+    /// the glide still lands EXACTLY on the new target at the original end and
+    /// reports done there; and (4) under a 120 Hz stream of precise deltas at
+    /// constant finger speed the content trails the finger by about HALF of
+    /// what the restarting `retarget` chain leaves it at (measured: 62.0 px →
+    /// 31.2 px at 8.5 px per 8 ms tick, i.e. ~58 ms → ~29 ms — the ~57 ms
+    /// steady-state lag the audit computed, halved); the bound asserted is
+    /// 0.6×, the numbers are printed.
+    #[test]
+    fn extend_target_keeps_the_deadline_stays_continuous_and_cuts_the_lag() {
+        let t0 = Instant::now();
+        let cell = 34i64; // Retina 2x, 15 px face
+        // (1)-(3): a mid-flight extension.
+        let mut g = Glide::new(0, cell, t0);
+        let end = g.end();
+        let at = t0 + Duration::from_millis(40);
+        let (before, done) = g.sample(at);
+        assert!(!done && before > 0 && before < cell, "mid-flight fixture");
+        g.extend_target(2 * cell, at);
+        assert_eq!(g.end(), end, "the deadline is not pushed out");
+        assert_eq!(g.target_px(), 2 * cell);
+        assert_eq!(g.sample(at).0, before, "continuous at the extension");
+        let (landed, done) = g.sample(end);
+        assert!(
+            done && landed == 2 * cell,
+            "lands exactly at the original end"
+        );
+        // A delta arriving ON the deadline: the remaining duration is zero and
+        // the sample is the target at once (the one bounded snap), still done.
+        g.extend_target(3 * cell, end);
+        assert_eq!(g.end(), end);
+        assert_eq!(g.sample(end), (3 * cell, true));
+
+        // (4) The lag model. Finger at constant speed, 8 ms ticks, one row
+        // banked every 4 ticks (as `wheel_notches` banks a precise delta into
+        // whole rows); each tick first samples the glide (dropping it when
+        // done, as `tick_scroll_glide` does), then applies the tick's delta the
+        // way `scroll_wheel_animated_with` joins it: onto an in-flight glide by
+        // the chain under test, else a fresh glide from the landed row.
+        let simulate = |extend: bool| -> f64 {
+            let tick = Duration::from_millis(8);
+            let mut now = t0;
+            let mut glide: Option<Glide> = None;
+            let mut landed = 0i64;
+            let mut pos = 0i64;
+            let mut target = 0i64;
+            let mut lag_sum = 0.0;
+            let mut samples = 0u32;
+            for i in 1..=150u32 {
+                now += tick;
+                if let Some(g) = glide.as_ref() {
+                    let (p, done) = g.sample(now);
+                    pos = p;
+                    if done {
+                        landed = g.target_px();
+                        glide = None;
+                    }
+                }
+                if i % 4 == 0 {
+                    target += cell;
+                    match glide.as_mut() {
+                        Some(g) if extend => g.extend_target(target, now),
+                        Some(g) => g.retarget(target, now),
+                        None => glide = Some(Glide::new(landed, target, now)),
+                    }
+                    pos = glide.as_ref().map_or(pos, |g| g.sample(now).0);
+                }
+                if i > 30 {
+                    lag_sum += (target - pos) as f64;
+                    samples += 1;
+                }
+            }
+            lag_sum / f64::from(samples)
+        };
+        let retarget_lag = simulate(false);
+        let extend_lag = simulate(true);
+        eprintln!(
+            "steady-state lag behind the finger: retarget {retarget_lag:.1} px, \
+             extend {extend_lag:.1} px (cell {cell} px, 8 ms ticks, a row per 4 ticks)"
+        );
+        assert!(
+            retarget_lag > 1.5 * cell as f64,
+            "control: the restarting chain trails by more than 1.5 rows ({retarget_lag:.1} px)"
+        );
+        assert!(
+            extend_lag < 0.6 * retarget_lag,
+            "the extending chain trails by about half ({extend_lag:.1} vs {retarget_lag:.1} px)"
+        );
     }
 
     /// PROVE (3) — spring overshoot-freedom + decay: over an amplitude ×

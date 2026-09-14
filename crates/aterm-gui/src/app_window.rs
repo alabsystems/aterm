@@ -634,10 +634,11 @@ impl App {
         // Clone the mirror Arcs BEFORE moving the session into the pool (the pool
         // then OWNS it; these are the window's active-tab mirror, source-of-truth in
         // the pool).
-        let (term, master, sink) = (
+        let (term, master, sink, ui_waiting) = (
             session.term.clone(),
             session.master,
             session.ctx.sink.clone(),
+            session.ctx.ui_waiting.clone(),
         );
         // P1.1: register in the process-wide registry. A new window's first tab has
         // no parent (it is a fresh root, like session 0) unless a connected spawn
@@ -655,6 +656,7 @@ impl App {
             term,
             master,
             sink,
+            ui_waiting,
             sid,
             rows,
             cols,
@@ -807,7 +809,7 @@ impl App {
             return;
         };
         let handle = handle.take().expect("finalize_backend re-entered mid-join");
-        let (backend, use_gpu) = handle.join().unwrap_or_else(|_| {
+        let (backend, use_gpu, font_family_admitted) = handle.join().unwrap_or_else(|_| {
             crate::logging::stderr_line!(
                 "aterm-gui: backend-build thread panicked; no renderer — exiting"
             );
@@ -819,6 +821,14 @@ impl App {
         );
         self.backend = BackendSlot::Ready(backend);
         self.use_gpu = use_gpu;
+        // The worker is the thread that resolved the configured family (the
+        // one resolve at startup); a family it rejected was seeded
+        // optimistically in `main_entry` and must not survive as the live
+        // rebuild source — `None` names the built-in candidate regime the
+        // published renderer actually uses.
+        if !font_family_admitted {
+            self.font_family = None;
+        }
         crate::metrics::set_backend_gpu(use_gpu);
         // Seed the interior padding at 1×, exactly as the old pre-`run_app` join
         // did; `attach_os_window` re-applies it at the window's real scale.
@@ -3614,8 +3624,11 @@ pub(crate) mod placement {
 /// deterministic: the same `scale` always yields a bit-identical `f32`, so a
 /// caller that stored a previous target into `font_px` can compare with `==` to
 /// detect "backend already at the target size" and skip the (expensive,
-/// first-pixel-blocking) font rebuild.
-fn hidpi_target_font_px(font_px_explicit: bool, scale: f64) -> Option<f32> {
+/// first-pixel-blocking) font rebuild. `pub(crate)` because the launch path's
+/// `first_window_prewarm_px` predicts the first window's size through THIS
+/// function, so the worker's glyph warm and the attach's activation cannot
+/// disagree about what 2× means.
+pub(crate) fn hidpi_target_font_px(font_px_explicit: bool, scale: f64) -> Option<f32> {
     (!font_px_explicit && scale > 1.0).then(|| {
         (FONT_PX * scale as f32)
             .round()

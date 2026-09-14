@@ -28,8 +28,8 @@
 //! the freshly damaged row spans it read at the deco-rescan seam. Four gates,
 //! all here rather than at the call site, decide whether that mints light:
 //!
-//! * **First observation BASELINES.** A cold engine (or one whose counter went
-//!   backwards — a session or tab switch) records the counter and mints nothing,
+//! * **First observation BASELINES.** A cold engine (or one explicitly rebased
+//!   for a session or tab switch) records the counter and mints nothing,
 //!   so attaching to a busy session never fires a burst of comets for history.
 //! * **ECHO DISCOUNT.** A delta within [`ECHO_DISCOUNT_MS`] of conclusively
 //!   accepted editor input, or one arriving while the host reports `input_hot`,
@@ -44,6 +44,11 @@
 //! * **Output never feeds the TYPING metric.** Output momentum is a separate
 //!   instance of the one [`TypingMomentum`] law; output must not read as
 //!   typing-earned drama anywhere else in the family.
+//!
+//! Hosts with a whole-frame token use [`OutputStreak::note_output_cells`], which
+//! derives fresh damage from retained glyph snapshots. A token change elsewhere
+//! does not license existing composer text, and sparse changed runs never join
+//! across unchanged ink or blank gaps.
 //!
 //! ## Why it cannot overwhelm
 //!
@@ -312,6 +317,42 @@ struct Pending {
     right: u16,
 }
 
+/// The glyph identity available in `RenderCell`, excluding theme/SGR colours.
+/// Grapheme tails live in separate `RenderInput` channels this API does not
+/// receive; a tail-only change cannot claim an output location here.
+#[derive(Clone, Copy, PartialEq, Eq)]
+struct ObservedGlyph {
+    ch: char,
+    presentation: u8,
+}
+
+impl ObservedGlyph {
+    const BLANK: Self = Self {
+        ch: ' ',
+        presentation: 0,
+    };
+
+    fn of(cell: &aterm_core::terminal::RenderCell) -> Self {
+        Self {
+            ch: cell.ch,
+            presentation: u8::from(cell.wide)
+                | (u8::from(cell.emoji_presentation) << 1)
+                | (u8::from(cell.text_presentation) << 2),
+        }
+    }
+
+    fn has_ink(self) -> bool {
+        self.ch != ' ' && self.ch != '\0'
+    }
+
+    fn same_row(old: &[Self], new: &[aterm_core::terminal::RenderCell]) -> bool {
+        (0..old.len().max(new.len())).all(|col| {
+            old.get(col).copied().unwrap_or(Self::BLANK)
+                == new.get(col).map_or(Self::BLANK, Self::of)
+        })
+    }
+}
+
 /// PRISM WAKE's state machine. ONE PER PANE — see the module docs for the law.
 ///
 /// Not one per window, and the difference is the design rather than a detail:
@@ -342,6 +383,15 @@ pub struct OutputStreak {
     /// hosts (whose snapshots carry only a synthetic, always-advancing frame
     /// seq) share this law with the hosts that have a real content clock.
     last_token: Option<u64>,
+    /// Exact prior visible glyphs for the cell-observation API. A changed
+    /// global token says some row changed, not that the parked caret's row
+    /// did. Refreshed even for discounted echoes; unchanged tokens skip the
+    /// entire walk. Storage is bounded by the supplied visible geometry and
+    /// reused while that geometry is stable.
+    observed_rows: Vec<Vec<ObservedGlyph>>,
+    /// The host's actual viewport dimensions, independent of sparse row
+    /// materialization. Width reflow moves old ink without printing new text.
+    observed_viewport: Option<(usize, usize)>,
     /// Last accepted editor-input stamp, for the echo discount.
     last_key: Option<Instant>,
     /// Newest licensed span awaiting a spawn decision.
@@ -452,6 +502,8 @@ impl OutputStreak {
     /// to call it; the single-engine window path does.
     pub fn rebase(&mut self) {
         self.last_token = None;
+        self.observed_rows.clear();
+        self.observed_viewport = None;
     }
 
     /// One conclusively accepted editor input at `now`, for the echo discount.
@@ -523,54 +575,92 @@ impl OutputStreak {
     /// the row above it otherwise: program output ends its lines with a
     /// newline, which parks the cursor at column 0 of a row with no ink in it
     /// yet, so anchoring naively on the live cursor would licence nothing for
-    /// the overwhelming majority of real output. The span is that row's true
-    /// ink extent, which is also how EMPTY DAMAGE MINTS NOTHING is enforced
-    /// here: a row carrying no ink yields no span at all.
-    /// `token` is the host's content-only generation/damage token and is
-    /// checked before that row walk, so unchanged frames do not scan cells.
+    /// the overwhelming majority of real output. The span is the rightmost
+    /// contiguous run of gained or replaced ink, including wide continuations,
+    /// since the previous observation. Unchanged gaps never join two sparse
+    /// changes into one ribbon. A timer changing elsewhere cannot decorate
+    /// an unchanged composer. Erasure alone and a row moved intact from an
+    /// old position are not new output.
+    /// `viewport` is the host's actual `(rows, cols)`, not the lengths of the
+    /// sparse row vectors. A dimension change establishes a fresh baseline and
+    /// retires old pending/resident geometry, even if the content token is
+    /// unchanged. Stable dimensions and token skip the entire glyph walk.
     ///
     /// Returns whether the observation was LICENSED (see [`Self::note_output`]).
     pub fn note_output_cells(
         &mut self,
         cells: &[Vec<aterm_core::terminal::RenderCell>],
         cursor: (usize, usize),
-        rows: usize,
+        viewport: (usize, usize),
         token: u64,
         now: Instant,
         input_hot: bool,
     ) -> bool {
-        // The caller already owns the content/damage clock that licensed this
-        // observation. Refuse a baseline or unchanged frame before touching a
-        // row: an idle enabled engine must cost one scalar comparison, not a
-        // full-width glyph scan on every repaint.
-        if self.last_token.is_none() || self.last_token == Some(token) {
+        // A token is an observation boundary, not attribution to the caret.
+        // Geometry can change before the terminal publishes another content
+        // token. Compare both scalar identities before skipping the grid walk.
+        if self.last_token == Some(token) && self.observed_viewport == Some(viewport) {
             return self.note_output(token, &[], now, input_hot);
         }
-        if input_hot || self.within_echo_window(now) {
-            // Still consume the changed token, but do not derive geometry for
-            // output the echo gate will reject regardless.
-            return self.note_output(token, &[], now, input_hot);
-        }
+        let (rows, _) = viewport;
+        let visible = &cells[..rows.min(cells.len())];
+        // Render rows are sparse materialized prefixes. Growing a row is
+        // ordinary output, not a viewport resize; its missing old tail is
+        // blank. Only the independently supplied dimensions identify reflow.
+        let baseline = self.last_token.is_none()
+            || self.observed_viewport != Some(viewport)
+            || self.observed_rows.len() != visible.len();
         let (cursor_row, cursor_col) = cursor;
         let anchor_row = if cursor_col > 0 {
             cursor_row
         } else {
             cursor_row.saturating_sub(1)
         };
-        let span = cells
+        let span = visible
             .get(anchor_row)
-            .filter(|_| anchor_row < rows)
+            .filter(|row| {
+                if baseline || input_hot || self.within_echo_window(now) {
+                    return false;
+                }
+                let changed_ink = row.iter().enumerate().any(|(col, new)| {
+                    let old = self.observed_rows[anchor_row]
+                        .get(col)
+                        .copied()
+                        .unwrap_or(ObservedGlyph::BLANK);
+                    let new = ObservedGlyph::of(new);
+                    new.has_ink() && old != new
+                });
+                if !changed_ink {
+                    return false;
+                }
+                // A TUI can move its input box, or scroll existing rows,
+                // without printing new text at the final caret. Treat an
+                // exact old row at another position conservatively as a move
+                // only if that source changed too. Repeated output lines may
+                // legitimately copy a row that remains where it was.
+                !self.observed_rows.iter().enumerate().any(|(index, old)| {
+                    index != anchor_row
+                        && ObservedGlyph::same_row(old, row)
+                        && !ObservedGlyph::same_row(old, &visible[index])
+                })
+            })
             .and_then(|row| {
-                // One forward pass owns BOTH ends of the ink extent. A
-                // `position` + `rposition` pair would rescan the row, while
-                // defaulting the left edge to zero charges leading blanks to
-                // both comet work and sound-pan geometry.
+                // One pending span is the engine's bounded admission unit.
+                // Keep the rightmost run rather than connecting remote
+                // particles across a static composer or charging old ink to
+                // an ordinary single-character progress rewrite.
                 let mut extent: Option<(usize, usize)> = None;
                 for (col, cell) in row.iter().enumerate() {
-                    if cell.ch != ' ' {
+                    let old = self.observed_rows[anchor_row]
+                        .get(col)
+                        .copied()
+                        .unwrap_or(ObservedGlyph::BLANK);
+                    let new = ObservedGlyph::of(cell);
+                    let continuation = cell.wide && extent.is_some_and(|(_, end)| end + 1 == col);
+                    if (new.has_ink() && old != new) || continuation {
                         extent = Some(match extent {
-                            Some((left, _)) => (left, col),
-                            None => (col, col),
+                            Some((left, end)) if end + 1 == col => (left, col),
+                            _ => (col, col),
                         });
                     }
                 }
@@ -583,6 +673,22 @@ impl OutputStreak {
                     u16::try_from(end).unwrap_or(u16::MAX),
                 )]
             });
+        // Retain every row, including unselected and echo-discounted rows:
+        // revisiting one later must not replay old output as a fresh arrival.
+        self.observed_rows.resize_with(visible.len(), Vec::new);
+        self.observed_viewport = Some(viewport);
+        for (old, row) in self.observed_rows.iter_mut().zip(visible) {
+            old.clear();
+            old.extend(row.iter().map(ObservedGlyph::of));
+        }
+        if baseline {
+            // Geometry/session history was lost. No resident coordinate may
+            // survive onto the new grid, and no old pending span may fire.
+            self.comets = Default::default();
+            self.ribbon = None;
+            self.pending = None;
+            self.drawing = false;
+        }
         self.note_output(
             token,
             span.as_ref().map_or(&[][..], |s| &s[..]),
@@ -911,7 +1017,10 @@ impl OutputStreak {
             // so a comet has no flash rate to bound.
             let life = 1.0 - c.progress;
             let head = c.from_col as f32 + (c.to_col - c.from_col) as f32 * c.progress;
-            let tail_start = head - f32::from(c.tail);
+            // The entire comet, including its tail, belongs to licensed ink.
+            // A one-cell rewrite must not sweep the nine unchanged cells to
+            // its left just because the configured tail is nine cells long.
+            let tail_start = (head - f32::from(c.tail)).max(c.from_col as f32);
             // `row_sweep_cells(from - 1, to)` is exactly this inclusive
             // same-row range. Emit it directly: no temporary Vec, no resident
             // scratch to clear, and the hot tick keeps its no-allocation law.
@@ -1198,28 +1307,42 @@ mod tests {
     /// The cell convenience path trusts the host's content clock before it
     /// derives geometry. Changing glyphs under an unchanged token is still an
     /// unchanged observation; advancing the token licenses the same row and
-    /// records its true ink extent.
+    /// records only the newly changed ink run.
     #[test]
     fn cell_observation_is_gated_by_the_host_token_before_geometry() {
         let t0 = Instant::now();
         let mut e = OutputStreak::new(9);
         let mut cells = vec![vec![aterm_core::terminal::RenderCell::default(); 8]; 3];
         cells[1][2].ch = 'a';
-        assert!(!e.note_output_cells(&cells, (2, 0), 3, 10, t0, false));
+        assert!(!e.note_output_cells(&cells, (2, 0), (3, 8), 10, t0, false));
 
         cells[1][6].ch = 'z';
         assert!(
-            !e.note_output_cells(&cells, (2, 0), 3, 10, t0 + Duration::from_millis(20), false,),
+            !e.note_output_cells(
+                &cells,
+                (2, 0),
+                (3, 8),
+                10,
+                t0 + Duration::from_millis(20),
+                false,
+            ),
             "glyph churn without a content-clock edge is only a repaint"
         );
         assert!(e.pending.is_none());
 
-        assert!(e.note_output_cells(&cells, (2, 0), 3, 11, t0 + Duration::from_millis(40), false,));
+        assert!(e.note_output_cells(
+            &cells,
+            (2, 0),
+            (3, 8),
+            11,
+            t0 + Duration::from_millis(40),
+            false,
+        ));
         let pending = e.pending.expect("changed token licenses the ink row");
         assert_eq!(
             (pending.row, pending.left, pending.right),
-            (1, 2, 6),
-            "leading/trailing blanks stay outside the sparse ink extent"
+            (1, 6, 6),
+            "unchanged ink and gaps stay outside the newly changed run"
         );
     }
 
@@ -1228,10 +1351,15 @@ mod tests {
         let t0 = Instant::now();
         let mut e = OutputStreak::new(9);
         let cells = vec![vec![aterm_core::terminal::RenderCell::default(); 8]; 3];
-        assert!(!e.note_output_cells(&cells, (2, 0), 3, 10, t0, false));
-        assert!(
-            !e.note_output_cells(&cells, (2, 0), 3, 11, t0 + Duration::from_millis(20), false,)
-        );
+        assert!(!e.note_output_cells(&cells, (2, 0), (3, 8), 10, t0, false));
+        assert!(!e.note_output_cells(
+            &cells,
+            (2, 0),
+            (3, 8),
+            11,
+            t0 + Duration::from_millis(20),
+            false,
+        ));
         assert!(e.pending.is_none(), "a blank anchor row has no ink extent");
     }
 

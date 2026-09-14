@@ -95,6 +95,21 @@ fn main() -> ExitCode {
 
     // --- the front door -----------------------------------------------------
 
+    // THE HIDDEN HELPER VERBS, routed by NAME and not by argv0. The untracked lane
+    // submits a launchd job that runs THIS binary on `__stage-payload` / `__lay-files`,
+    // and since the provenance fix it runs an untagged binary IN PLACE — under whatever
+    // name it has on disk, which for the shipped app is `…/Contents/MacOS/aterm`. The
+    // argv0 alias only fires for a binary literally named `atpkg` (a byte COPY is), so
+    // the in-place arm arrived here and died in the mode fork: measured 2026-09-13 on the
+    // installed bundle binary, exit 2 and `aterm-gui: unknown option '__lay-files'`, which
+    // made `aterm pkg install` from the shipped app refuse with a fresh message. They are
+    // dispatched above the verb match for the same reason `atpkg`'s own CLI dispatches
+    // them above its: they are unlisted, they are not `aterm_cli::Verb`s, and no roster
+    // or help surface may grow a row for them.
+    if first == atpkg::stage_helper::HIDDEN_VERB || first == atpkg::lay::HIDDEN_VERB {
+        return atpkg::cli::main_entry(rest.to_vec());
+    }
+
     // VERBS: the one command's own powers, routed HERE — ABOVE the mode fork, so a
     // verb answers identically at a terminal and through a pipe.
     //

@@ -1285,6 +1285,10 @@ pub(crate) const CURSOR_TRAIL_STYLES: &[&str] = &[
     "rainbow kitty flying",
     "rainbow kitty underline",
     "rainbow kitty tall",
+    // THE FLAT BODY (2026-09-13): the owner's A/B control against the default
+    // comet body and its vivid rail (`docs/design/RAINBOW-KITTY-V2.md` §30) —
+    // the same ribbon, the same resident pet, the body as it was before.
+    "rainbow kitty flat",
     "comet",
     "lumen",
     "sparkle",
@@ -1406,6 +1410,9 @@ pub(crate) const CURSOR_TRAIL_STYLE_ALIASES: &[(&str, &str)] = &[
     ("rainbow tall", "rainbow kitty tall"),
     ("tall rainbow", "rainbow kitty tall"),
     ("nyan tall", "rainbow kitty tall"),
+    ("rainbow flat", "rainbow kitty flat"),
+    ("flat rainbow", "rainbow kitty flat"),
+    ("nyan flat", "rainbow kitty flat"),
     ("sparkles", "sparkle"),
     ("phaser-sparkle", "sparkle"),
     ("rainbow-sparkle", "sparkle"),
@@ -4139,7 +4146,7 @@ pub(crate) fn editable_fields(cfg: &Config) -> Vec<EditField> {
             seed: cfg.cursor_trail_intensity.map(|v| v.to_string()),
             placeholder: match cfg.cursor_trail_intensity {
                 Some(v) => v.to_string(),
-                None => "0.7 (default)".to_string(),
+                None => "1.0 (default)".to_string(),
             },
         },
         EditField {
@@ -5273,6 +5280,10 @@ mod trail_style_tests {
             // the style — and therefore the momentum law, the starfield and the
             // sound palette — is the same one.
             "rainbow kitty tall" => GlowStyle::RainbowKitty,
+            // …and the FLAT body (2026-09-13), for the fourth time: the A/B
+            // control for the comet body and its vivid rail forks at
+            // `ribbon_flat`, at the one place that draws the body.
+            "rainbow kitty flat" => GlowStyle::RainbowKitty,
             "sparkle" => GlowStyle::Sparkle,
             "fire" => GlowStyle::Fire,
             "laser" => GlowStyle::Laser,
@@ -5320,7 +5331,13 @@ mod trail_style_tests {
                 // one appended geometry word swapped the animal on glass
                 // (`pet_active=true cat_active=false` tall vs
                 // `pet_active=false cat_active=true` underline, same input).
-                s == "rainbow kitty pet" || s == "rainbow kitty" || s == "rainbow kitty underline",
+                // …and `rainbow kitty flat` since 2026-09-13, the A/B twin of
+                // the default body: it must differ from the default in the
+                // body alone, so it draws the same resident.
+                s == "rainbow kitty pet"
+                    || s == "rainbow kitty"
+                    || s == "rainbow kitty underline"
+                    || s == "rainbow kitty flat",
                 "style {s:?}"
             );
         }
@@ -5381,7 +5398,8 @@ mod trail_style_tests {
                 s == "rainbow dog pet"
                     || s == "rainbow kitty pet"
                     || s == "rainbow kitty"
-                    || s == "rainbow kitty underline",
+                    || s == "rainbow kitty underline"
+                    || s == "rainbow kitty flat",
                 "any-pet union, style {s:?}"
             );
         }

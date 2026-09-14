@@ -24,6 +24,13 @@
 //! banner there is NO TTL — a security question does not answer itself — and no
 //! auto-dismiss: the banner stands until a key or click answers it (the window
 //! closing drops the parked text, which is the fail-closed answer).
+//!
+//! THE ANSWER IS BOUND TO THE SESSION THAT ASKED. The banner stands across event-
+//! loop turns, and a mouse click on the tab bar or an `aterm ctl tab` can change
+//! which session fronts the window while it does. The parked entry therefore
+//! carries the session that owned the paste gesture, and Enter delivers to THAT
+//! session — through the hidden-session seam if it is no longer in front — never
+//! to whichever tab happens to be front when the answer arrives.
 
 use aterm_core::terminal::RenderCell;
 use aterm_render::Theme;
@@ -51,6 +58,11 @@ pub(crate) struct PendingPaste {
     /// The window the paste targets — the banner splices into this window and
     /// only ITS keys answer it; the entry dies with the window.
     pub(crate) wid: crate::WindowId,
+    /// The terminal session that fronted `wid` when the paste gesture happened —
+    /// the one the question is ABOUT, and the only one the answer may reach.
+    /// `None` when the window fronted no terminal (native content), in which
+    /// case delivery keeps the ordinary front-content routing.
+    pub(crate) session: Option<u64>,
     text: String,
     source: crate::input::Source,
     /// The DEC 2004 reading the QUESTION was asked under. Parked with the text
@@ -67,28 +79,32 @@ impl PendingPaste {
     #[cfg(any(test, not(any(target_os = "macos", windows))))]
     pub(crate) fn new(
         wid: crate::WindowId,
+        session: Option<u64>,
         text: String,
         source: crate::input::Source,
         framing: crate::input::PasteFraming,
     ) -> Self {
         Self {
             wid,
+            session,
             text,
             source,
             framing,
         }
     }
 
-    /// Surrender the parked paste for CONFIRMED delivery.
+    /// Surrender the parked paste for CONFIRMED delivery: the window, the owning
+    /// session, the text, its source and the framing the question was asked under.
     pub(crate) fn take(
         self,
     ) -> (
         crate::WindowId,
+        Option<u64>,
         String,
         crate::input::Source,
         crate::input::PasteFraming,
     ) {
-        (self.wid, self.text, self.source, self.framing)
+        (self.wid, self.session, self.text, self.source, self.framing)
     }
 
     /// The parked text, for the row builder.
@@ -269,6 +285,7 @@ mod tests {
             .join("");
         let pending = PendingPaste::new(
             crate::WindowId(0),
+            Some(11),
             text.clone(),
             test_source(),
             test_framing(),
@@ -313,6 +330,7 @@ mod tests {
         let p = |text: &str| {
             PendingPaste::new(
                 crate::WindowId(0),
+                Some(11),
                 text.into(),
                 test_source(),
                 test_framing(),
@@ -327,12 +345,16 @@ mod tests {
     fn take_returns_the_parked_paste_untouched() {
         let pending = PendingPaste::new(
             crate::WindowId(7),
+            Some(41),
             "ls\nrm -rf ~\n".to_string(),
             test_source(),
             crate::input::PasteFraming::Gesture { bracketed: false },
         );
-        let (wid, text, _source, framing) = pending.take();
+        let (wid, session, text, _source, framing) = pending.take();
         assert_eq!(wid, crate::WindowId(7));
+        // The OWNER is part of "untouched": it is the session the question was
+        // asked about, and the answer must reach it and no other.
+        assert_eq!(session, Some(41));
         assert_eq!(text, "ls\nrm -rf ~\n");
         // The parked FRAMING is part of "untouched": it is the answer the banner's
         // question was asked under, and delivery must be framed by it.

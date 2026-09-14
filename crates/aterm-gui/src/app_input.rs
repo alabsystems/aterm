@@ -11,7 +11,7 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 
 use aterm_core::selection::SelectionType;
-use aterm_core::terminal::{CustodyTransition, Terminal};
+use aterm_core::terminal::{CustodyTransition, ModeMirror, Terminal};
 use aterm_effects::cursor_glow::InsertWidth;
 use aterm_effects::kitty_pet::PetInputKind;
 use aterm_session::sink::{AcceptedOrder, SinkWriter};
@@ -133,9 +133,11 @@ pub(crate) struct Deliveries {
     /// `(delivery instant on the frame's clock, ticket)`, oldest first.
     pub(crate) items: [Option<(std::time::Instant, DeliveryTicket)>; DELIVERY_RING],
     /// Receipts newer than the reader's baseline that the ring had already
-    /// overwritten before this read — lost, and said so. A frame that sees
-    /// a non-zero count logs it; the licences those receipts carried cannot
-    /// be reconstructed.
+    /// overwritten before this read — lost, and said so, ONCE: on the read
+    /// whose `latest` advances past them (a read a spill-held receipt holds
+    /// at its baseline reports zero, so the same loss is not re-logged every
+    /// frame). A frame that sees a non-zero count logs it; the licences
+    /// those receipts carried cannot be reconstructed.
     pub(crate) evicted: u64,
 }
 
@@ -251,9 +253,13 @@ impl OutputEchoTracker {
     }
 
     /// Publish one ticketed delivery. Called from the writer thread after
-    /// `publish`, under the same lock; the receipt's instant is the sink's
-    /// acceptance when the spill is already drained, else pending until the
-    /// reader sees it drain (the `sample()` rule for `last_accepted_us`).
+    /// `publish` returns, taking the same `published` lock a second time —
+    /// NOT atomic with it: a `sample()` / `deliveries_after` between the
+    /// two sees the acceptance one frame before its receipt, which the
+    /// engine's late-receipt path (`PendingHop`) covers. The receipt's
+    /// instant is the sink's acceptance when the spill is already drained,
+    /// else pending until the reader sees it drain (the `sample()` rule for
+    /// `last_accepted_us`).
     fn publish_delivery(&self, ticket: DeliveryTicket, stamp: u64, sink: &SinkWriter) {
         let mut published = self
             .published
@@ -325,31 +331,58 @@ impl OutputEchoTracker {
                 }
             }
         }
-        let mut pending: Vec<DeliveryReceipt> = published
-            .deliveries
-            .iter()
-            .flatten()
-            .filter(|r| r.serial > after)
-            .copied()
-            .collect();
-        pending.sort_by_key(|r| r.serial);
-        // The serials past the baseline the ring no longer holds: evicted
-        // unread. Counted here, per reader, rather than tracked in the
-        // register — two windows on one session read at their own pace.
-        out.evicted = (published.delivery_serial - after).saturating_sub(pending.len() as u64);
         let at = |stamp: u64| {
             now.checked_sub(std::time::Duration::from_micros(
                 clock_us.saturating_sub(stamp),
             ))
             .unwrap_or(now)
         };
-        for (slot, r) in out.items.iter_mut().zip(pending) {
+        // Read OLDEST FIRST straight off the ring, no sort: `publish_delivery`
+        // writes at `delivery_head` with a monotone serial, so a walk from
+        // the head wraps through the receipts in serial order. The apply
+        // stops at the first spill-held receipt (`delivered_us == 0`), which
+        // holds `latest` back until the spill drains.
+        let head = published.delivery_head;
+        let mut slots = out.items.iter_mut();
+        for r in published
+            .deliveries
+            .iter()
+            .cycle()
+            .skip(head)
+            .take(DELIVERY_RING)
+            .flatten()
+        {
+            if r.serial <= after {
+                continue;
+            }
             if r.delivered_us == 0 {
                 break;
             }
+            let Some(slot) = slots.next() else {
+                break;
+            };
             *slot = Some((at(r.delivered_us), r.ticket));
             out.latest = r.serial;
         }
+        // The serials past the baseline the ring no longer holds: evicted
+        // unread. One slot per serial and no holes, so the lost serials are
+        // those past `after` at or below `delivery_serial - DELIVERY_RING`.
+        // Counted here, per reader, rather than tracked in the register —
+        // two windows on one session read at their own pace — and reported
+        // ONCE, on the read that jumps past the hole (2026-09-13): while a
+        // spill-held receipt holds `latest` back the reader has not moved,
+        // and the same count would be re-reported on every frame until the
+        // spill drained (`delivery register overran` per cursor blink); the
+        // read that resolves the held receipts and advances reports it, and
+        // the next read at the new baseline reads zero.
+        out.evicted = if out.latest > after {
+            published
+                .delivery_serial
+                .saturating_sub(DELIVERY_RING as u64)
+                .saturating_sub(after)
+        } else {
+            0
+        };
         out
     }
 
@@ -402,7 +435,14 @@ impl OutputEchoTracker {
     /// Publish one state-affecting acceptance in sink order. A writer may be
     /// descheduled after the sink accepts its bytes and before it reaches this
     /// method; the opaque sink token makes a late older completion a no-op.
-    fn publish(&self, order: AcceptedOrder, kind: OutputEchoInput, stamp: u64, sink: &SinkWriter) {
+    fn publish(
+        &self,
+        order: AcceptedOrder,
+        kind: OutputEchoInput,
+        stamp: u64,
+        direct: bool,
+        sink: &SinkWriter,
+    ) {
         let mut published = self
             .published
             .lock()
@@ -426,8 +466,11 @@ impl OutputEchoTracker {
             }
             OutputEchoInput::Ignored => unreachable!("ignored input has no echo publication"),
         }
+        // A frame that went WHOLE to the kernel on the direct lane needs no
+        // spill-mutex probe to know it is drained: the sink's receipt says so.
+        // Only a spilled/split/legacy frame asks (non-parking `try_lock`).
         if published.spill_debt.is_some()
-            && sink.try_egress_drained_to_kernel() == Some(true)
+            && (direct || sink.try_egress_drained_to_kernel() == Some(true))
             && published.spill_debt.take() == Some(true)
         {
             published.last_accepted_us = stamp;
@@ -444,7 +487,8 @@ impl OutputEchoWrite<'_> {
             && let Some(order) = receipt.accepted_order()
         {
             let stamp = crate::metrics::now_us().max(1);
-            self.tracker.publish(order, self.kind, stamp, sink);
+            self.tracker
+                .publish(order, self.kind, stamp, receipt.is_direct(), sink);
             // THE DELIVERY EDGE: the bytes are provably on the wire (an
             // accepted order — a zero-byte or failed write publishes no
             // receipt, so a swallowed queued key stays revoked).
@@ -480,13 +524,14 @@ impl OutputEchoWrite<'_> {
 /// the sole byte authority.
 pub(crate) fn tracked_egress(
     term: &Mutex<Terminal>,
+    modes: &ModeMirror,
     sink: &SinkWriter,
     tracker: &OutputEchoTracker,
     ev: &InputEvent,
     mode: input::EgressMode,
 ) -> input::EgressReceipt {
     let write = tracker.begin_event(ev);
-    let receipt = input::seam_egress_receipt(term, sink, ev, mode);
+    let receipt = input::seam_egress_receipt(term, modes, sink, ev, mode);
     write.finish(receipt, sink);
     receipt
 }
@@ -612,11 +657,21 @@ mod output_echo_tracker_tests {
         // Two ticketed writes complete in REVERSE acceptance order (the real
         // race: an older writer descheduled after its acceptance).
         let first = tracker.begin_ticketed(OutputEchoInput::Echoable, Some(ticket(63)));
-        let first_receipt =
-            input::seam_egress_receipt(&term, &sink, &ev, input::EgressMode::Interactive);
+        let first_receipt = input::seam_egress_receipt(
+            &term,
+            &crate::mode_mirror_of(&term),
+            &sink,
+            &ev,
+            input::EgressMode::Interactive,
+        );
         let second = tracker.begin_ticketed(OutputEchoInput::Echoable, Some(ticket(41)));
-        let second_receipt =
-            input::seam_egress_receipt(&term, &sink, &ev, input::EgressMode::Interactive);
+        let second_receipt = input::seam_egress_receipt(
+            &term,
+            &crate::mode_mirror_of(&term),
+            &sink,
+            &ev,
+            input::EgressMode::Interactive,
+        );
         second.finish(second_receipt, &sink);
         first.finish(first_receipt, &sink);
         let batch = tracker.deliveries_after(&sink, Some(0), now);
@@ -646,8 +701,13 @@ mod output_echo_tracker_tests {
                 typed: true,
             }),
         );
-        let typed_receipt =
-            input::seam_egress_receipt(&term, &sink, &ev, input::EgressMode::Interactive);
+        let typed_receipt = input::seam_egress_receipt(
+            &term,
+            &crate::mode_mirror_of(&term),
+            &sink,
+            &ev,
+            input::EgressMode::Interactive,
+        );
         typed.finish(typed_receipt, &sink);
         let batch = tracker.deliveries_after(&sink, Some(2), now);
         assert_eq!(batch.latest, 3);
@@ -662,10 +722,22 @@ mod output_echo_tracker_tests {
         // An EMPTY ticket and an un-ticketed write publish nothing.
         let empty =
             tracker.begin_ticketed(OutputEchoInput::Echoable, Some(DeliveryTicket::default()));
-        let r = input::seam_egress_receipt(&term, &sink, &ev, input::EgressMode::Interactive);
+        let r = input::seam_egress_receipt(
+            &term,
+            &crate::mode_mirror_of(&term),
+            &sink,
+            &ev,
+            input::EgressMode::Interactive,
+        );
         empty.finish(r, &sink);
         let plain = tracker.begin_event(&ev);
-        let r = input::seam_egress_receipt(&term, &sink, &ev, input::EgressMode::Interactive);
+        let r = input::seam_egress_receipt(
+            &term,
+            &crate::mode_mirror_of(&term),
+            &sink,
+            &ev,
+            input::EgressMode::Interactive,
+        );
         plain.finish(r, &sink);
         assert_eq!(tracker.deliveries_after(&sink, Some(3), now).latest, 3);
 
@@ -673,7 +745,13 @@ mod output_echo_tracker_tests {
         // queued key stays revoked, a swallowed paste arms nothing.
         let dead = SinkWriter::new(-1);
         let failed = tracker.begin_ticketed(OutputEchoInput::Echoable, Some(ticket(8)));
-        let r = input::seam_egress_receipt(&term, &dead, &ev, input::EgressMode::Interactive);
+        let r = input::seam_egress_receipt(
+            &term,
+            &crate::mode_mirror_of(&term),
+            &dead,
+            &ev,
+            input::EgressMode::Interactive,
+        );
         failed.finish(r, &dead);
         assert_eq!(
             tracker.deliveries_after(&sink, Some(3), now).latest,
@@ -716,8 +794,13 @@ mod output_echo_tracker_tests {
                     typed: false,
                 }),
             );
-            let receipt =
-                input::seam_egress_receipt(&term, &sink, &ev, input::EgressMode::Interactive);
+            let receipt = input::seam_egress_receipt(
+                &term,
+                &crate::mode_mirror_of(&term),
+                &sink,
+                &ev,
+                input::EgressMode::Interactive,
+            );
             write.finish(receipt, &sink);
         };
         for cells in 1..=9u16 {
@@ -765,6 +848,147 @@ mod output_echo_tracker_tests {
         );
         unsafe {
             libc::close(pipe[0]);
+            libc::close(pipe[1]);
+        }
+    }
+
+    /// AN EVICTION IS REPORTED ONCE, ON THE READ THAT JUMPS PAST IT
+    /// (2026-09-13). A receipt whose bytes still sit in the spill holds
+    /// `latest` back; while it did, every read at that baseline recomputed
+    /// the same eviction count, and the prelude logged `delivery register
+    /// overran` on every frame — each cursor blink, each keypress redraw —
+    /// until the spill drained. The shape: a wedged foreground (Ctrl-S, a
+    /// stalled child) with more than `DELIVERY_RING` keys typed behind a
+    /// paste, each accepted into the spill under `SPILL_CAP` and published
+    /// held. Now a read whose `latest` cannot advance reports no loss; the
+    /// read that resolves the held receipts and advances reports the loss
+    /// exactly once; the next read at the new baseline reports none.
+    ///
+    /// A filled `O_NONBLOCK` pipe wedges the sink deterministically: one
+    /// non-parking byte seeds the spill (its `WouldBlock` arranges the
+    /// drainer), then `DELIVERY_RING + 1` ticketed blocking writes queue
+    /// behind it; reading the pipe out lets the drainer land them.
+    ///
+    /// RED-PROOF (2026-09-13): both held reads returned `evicted == 1`.
+    #[cfg(unix)]
+    #[test]
+    fn an_eviction_is_reported_once_on_the_read_that_advances_past_it() {
+        use aterm_effects::cursor_glow::InsertWidth;
+        use std::io::Read;
+        use std::os::fd::FromRawFd;
+
+        let mut pipe = [0; 2];
+        assert_eq!(unsafe { libc::pipe(pipe.as_mut_ptr()) }, 0, "pipe");
+        aterm_pty::set_nonblocking(pipe[1], true).expect("nonblocking pipe writer");
+        aterm_pty::set_nonblocking(pipe[0], true).expect("nonblocking pipe reader");
+        let mut filled = 0_usize;
+        loop {
+            match aterm_pty::write_some(pipe[1], &[b'.'; 4096]) {
+                Ok(n) if n > 0 => filled += n,
+                Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => break,
+                other => panic!("unexpected pipe fill result: {other:?}"),
+            }
+        }
+        assert!(filled > 0, "pipe must accept bytes before EAGAIN");
+        let sink = SinkWriter::new(pipe[1]);
+        sink.note_master_nonblocking(true);
+        let term = Mutex::new(Terminal::new(24, 80));
+        let tracker = OutputEchoTracker::default();
+        let now = std::time::Instant::now();
+        let ev = InputEvent::KeySequence(b"x".to_vec());
+
+        // One non-parking byte into the full pipe seeds the spill.
+        let seed = tracker.begin_event(&ev);
+        let receipt = input::seam_egress_receipt(
+            &term,
+            &crate::mode_mirror_of(&term),
+            &sink,
+            &ev,
+            input::EgressMode::Interactive,
+        );
+        seed.finish(receipt, &sink);
+        assert!(!sink.egress_drained_to_kernel(), "the sink is wedged");
+
+        // A frame's worth plus one, every receipt held behind the spill.
+        let depth = DELIVERY_RING as u16;
+        for cells in 1..=(depth + 1) {
+            let write = tracker.begin_ticketed(
+                OutputEchoInput::Echoable,
+                Some(DeliveryTicket {
+                    insert: Some(InsertWidth::Cells(cells)),
+                    typed: false,
+                }),
+            );
+            let receipt = input::seam_egress_receipt(
+                &term,
+                &crate::mode_mirror_of(&term),
+                &sink,
+                &ev,
+                input::EgressMode::Backpressured,
+            );
+            write.finish(receipt, &sink);
+        }
+        for _ in 0..2 {
+            let held = tracker.deliveries_after(&sink, Some(0), now);
+            assert!(held.items.iter().all(Option::is_none), "nothing resolved");
+            assert_eq!(
+                (held.latest, held.evicted),
+                (0, 0),
+                "a read that cannot advance reports no loss — it will be \
+                 reported by the read that does"
+            );
+        }
+
+        // Read the pipe out: the drainer lands the spill behind the fill.
+        // SAFETY: `pipe[0]` is ours and open; the `File` owns and closes it.
+        let mut reader = unsafe { std::fs::File::from_raw_fd(pipe[0]) };
+        let mut buf = vec![0_u8; 64 * 1024];
+        for _ in 0..10_000 {
+            if sink.egress_drained_to_kernel() {
+                break;
+            }
+            match reader.read(&mut buf) {
+                Ok(0) => break,
+                Ok(_) => {}
+                Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                    std::thread::sleep(std::time::Duration::from_millis(1));
+                }
+                Err(error) => panic!("pipe read: {error}"),
+            }
+        }
+        assert!(sink.egress_drained_to_kernel(), "the spill drained");
+
+        // The read that resolves the held receipts and jumps past the hole
+        // reports the loss, once (the drainer may still hold the spill lock
+        // for an instant after its last chunk: a non-parking probe then
+        // learns nothing and the read is retried, as a later frame would).
+        let mut resolved = tracker.deliveries_after(&sink, Some(0), now);
+        for _ in 0..1_000 {
+            if resolved.latest > 0 {
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(1));
+            resolved = tracker.deliveries_after(&sink, Some(0), now);
+        }
+        assert_eq!(
+            (resolved.latest, resolved.evicted),
+            (u64::from(depth + 1), 1),
+            "the loss is reported on the read that advances past it"
+        );
+        assert_eq!(
+            resolved.items[0].map(|(_, t)| t.insert),
+            Some(Some(InsertWidth::Cells(2))),
+            "the oldest survivor is the second"
+        );
+        assert_eq!(resolved.items.iter().flatten().count(), DELIVERY_RING);
+        let after = tracker.deliveries_after(&sink, Some(resolved.latest), now);
+        assert_eq!(
+            (after.latest, after.evicted),
+            (u64::from(depth + 1), 0),
+            "a reader that kept up has lost nothing"
+        );
+        drop(sink);
+        unsafe {
             libc::close(pipe[1]);
         }
     }
@@ -817,7 +1041,13 @@ mod output_echo_tracker_tests {
         let term = Mutex::new(Terminal::new(24, 80));
         let ev = InputEvent::KeySequence(b"x".to_vec());
         let write = tracker.begin(OutputEchoInput::of(&ev));
-        let receipt = input::seam_egress_receipt(&term, &sink, &ev, input::EgressMode::Interactive);
+        let receipt = input::seam_egress_receipt(
+            &term,
+            &crate::mode_mirror_of(&term),
+            &sink,
+            &ev,
+            input::EgressMode::Interactive,
+        );
         write.finish(receipt, &sink);
         assert!(tracker.sample(&sink, now).last_accepted_at.is_none());
     }
@@ -836,12 +1066,18 @@ mod output_echo_tracker_tests {
         // acceptance while Enter is accepted and published by another thread.
         let echo_event = InputEvent::KeySequence(b"x".to_vec());
         let echo_write = tracker.begin_event(&echo_event);
-        let echo_receipt =
-            input::seam_egress_receipt(&term, &sink, &echo_event, input::EgressMode::Interactive);
+        let echo_receipt = input::seam_egress_receipt(
+            &term,
+            &crate::mode_mirror_of(&term),
+            &sink,
+            &echo_event,
+            input::EgressMode::Interactive,
+        );
         let boundary_event = enter(TMods::empty(), KeyEventType::Press);
         let boundary_write = tracker.begin_event(&boundary_event);
         let boundary_receipt = input::seam_egress_receipt(
             &term,
+            &crate::mode_mirror_of(&term),
             &sink,
             &boundary_event,
             input::EgressMode::Interactive,
@@ -966,6 +1202,7 @@ mod output_echo_tracker_tests {
         let focus = InputEvent::Focus(true);
         tracked_egress(
             &term,
+            &crate::mode_mirror_of(&term),
             &sink,
             &tracker,
             &focus,
@@ -978,8 +1215,13 @@ mod output_echo_tracker_tests {
 
         let typed = InputEvent::KeySequence(b"x".to_vec());
         let write = tracker.begin(OutputEchoInput::of(&typed));
-        let receipt =
-            input::seam_egress_receipt(&term, &sink, &typed, input::EgressMode::Interactive);
+        let receipt = input::seam_egress_receipt(
+            &term,
+            &crate::mode_mirror_of(&term),
+            &sink,
+            &typed,
+            input::EgressMode::Interactive,
+        );
         write.finish(receipt, &sink);
         let now = std::time::Instant::now();
         let echo = tracker.sample(&sink, now);
@@ -988,8 +1230,13 @@ mod output_echo_tracker_tests {
 
         let paste = InputEvent::Paste("paste".into(), input::PasteFraming::AtDrain);
         let write = tracker.begin(OutputEchoInput::of(&paste));
-        let receipt =
-            input::seam_egress_receipt(&term, &sink, &paste, input::EgressMode::Backpressured);
+        let receipt = input::seam_egress_receipt(
+            &term,
+            &crate::mode_mirror_of(&term),
+            &sink,
+            &paste,
+            input::EgressMode::Backpressured,
+        );
         write.finish(receipt, &sink);
         let now = std::time::Instant::now();
         let paste_echo = tracker.sample(&sink, now);
@@ -998,8 +1245,13 @@ mod output_echo_tracker_tests {
 
         let boundary = enter(TMods::empty(), KeyEventType::Press);
         let write = tracker.begin(OutputEchoInput::of(&boundary));
-        let receipt =
-            input::seam_egress_receipt(&term, &sink, &boundary, input::EgressMode::Interactive);
+        let receipt = input::seam_egress_receipt(
+            &term,
+            &crate::mode_mirror_of(&term),
+            &sink,
+            &boundary,
+            input::EgressMode::Interactive,
+        );
         write.finish(receipt, &sink);
         let now = std::time::Instant::now();
         let turn = tracker.sample(&sink, now);
@@ -1033,10 +1285,11 @@ mod output_echo_tracker_tests {
 }
 
 /// The surface that OWNS the in-flight IME composition of one window — resolved
-/// per frame by [`App::preedit_owner`], mirroring [`App::on_ime_commit`]'s
-/// routing precedence, so where the composition PAINTS and where its commit
-/// LANDS can never disagree. The renderer consults this to pick which splice
-/// draws the marked text and which caret rect anchors the OS candidate window.
+/// per frame by [`App::preedit_owner`] through the same `App::ime_route` that
+/// [`App::on_ime_commit`] dispatches on, so where the composition PAINTS and
+/// where its commit LANDS can never disagree. The renderer consults this to
+/// pick which splice draws the marked text and which caret rect anchors the OS
+/// candidate window.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum PreeditOwner {
     /// No composition in flight — every splice is a zero-cost no-op.
@@ -1362,10 +1615,12 @@ pub(crate) mod paste_order {
     use super::{
         DeliveryTicket, InputEvent, OutputEchoInput, OutputEchoTracker, SinkWriter, Terminal,
     };
+    use aterm_core::terminal::ModeMirror;
 
     /// A deferred egress: run `seam_egress(term, sink, ev)` on the writer thread.
     struct Job {
         term: Arc<Mutex<Terminal>>,
+        modes: Arc<ModeMirror>,
         sink: Arc<SinkWriter>,
         echo: Arc<OutputEchoTracker>,
         echo_kind: OutputEchoInput,
@@ -1407,6 +1662,7 @@ pub(crate) mod paste_order {
             let write = job.echo.begin_ticketed(job.echo_kind, job.ticket);
             let receipt = crate::input::seam_egress_receipt(
                 &job.term,
+                &job.modes,
                 &job.sink,
                 &job.ev,
                 crate::input::EgressMode::Backpressured,
@@ -1483,6 +1739,7 @@ pub(crate) mod paste_order {
     /// back to an inline write.
     pub(super) fn enqueue(
         term: &Arc<Mutex<Terminal>>,
+        modes: &Arc<ModeMirror>,
         sink: &Arc<SinkWriter>,
         echo: &Arc<OutputEchoTracker>,
         ev: InputEvent,
@@ -1522,6 +1779,7 @@ pub(crate) mod paste_order {
         let echo_kind = OutputEchoInput::of(&ev);
         let job = Job {
             term: term.clone(),
+            modes: modes.clone(),
             sink: sink.clone(),
             echo: echo.clone(),
             echo_kind,
@@ -1556,6 +1814,7 @@ pub(crate) mod paste_order {
     /// path, never on the common inline one.
     pub(super) fn ordered_or_inline(
         term: &Arc<Mutex<Terminal>>,
+        modes: &Arc<ModeMirror>,
         sink: &Arc<SinkWriter>,
         echo: &Arc<OutputEchoTracker>,
         ev: &InputEvent,
@@ -1563,18 +1822,18 @@ pub(crate) mod paste_order {
         ticket: Option<DeliveryTicket>,
     ) -> (crate::input::EgressReceipt, bool) {
         if is_ordering(sink.master()) {
-            match enqueue(term, sink, echo, ev.clone(), ticket) {
+            match enqueue(term, modes, sink, echo, ev.clone(), ticket) {
                 Ok(_) => (crate::input::EgressReceipt::deferred_full(), false),
                 Err(ev) => {
                     let write = echo.begin(OutputEchoInput::of(&ev));
-                    let receipt = crate::input::seam_egress_receipt(term, sink, &ev, mode);
+                    let receipt = crate::input::seam_egress_receipt(term, modes, sink, &ev, mode);
                     write.finish(receipt, sink);
                     (receipt, true)
                 }
             }
         } else {
             let write = echo.begin(OutputEchoInput::of(ev));
-            let receipt = crate::input::seam_egress_receipt(term, sink, ev, mode);
+            let receipt = crate::input::seam_egress_receipt(term, modes, sink, ev, mode);
             write.finish(receipt, sink);
             (receipt, true)
         }
@@ -1654,14 +1913,13 @@ pub(crate) fn egress_to_outcome(e: input::Egress) -> InputOutcome {
 /// that granularity, but only by moving the multiplier back before the seam — the
 /// nine-lines-in-vim trap above. A sub-row wheel path is the real fix and belongs
 /// with the render-side sub-row translate the glide already wants.
-fn wheel_viewport_lines(notch_lines: i32, term: &Arc<Mutex<Terminal>>) -> i32 {
-    // `rows()` is read unconditionally even though it only MATTERS for the page
-    // sentinel: branching on the setting first would mean two cache probes for the
-    // common case. Safe to lock here — the only caller (`input_wheel`) holds no
-    // `term_lock` at the call site: `seam_egress` released its own on return, and
-    // the rain gate above it locked only for the length of its own `if let`.
-    let rows = term_lock(term).rows();
-    input::wheel_platform_lines(notch_lines, rows)
+///
+/// `page_rows` is the viewport height the seam read under its ONE lock
+/// ([`input::WheelViewport::rows`]); this used to take its own blocking
+/// acquisition to re-read `rows()` — on every non-Windows target for a value
+/// `wheel_platform_lines` then ignored.
+fn wheel_viewport_lines(notch_lines: i32, page_rows: u16) -> i32 {
+    input::wheel_platform_lines(notch_lines, page_rows)
 }
 
 /// The modifier-INDEPENDENT logical key of a winit event (the unshifted base
@@ -2269,6 +2527,36 @@ fn committed_text_cells(text: &str, ambiguous_width_double: bool) -> u16 {
     };
     u16::try_from(aterm_grapheme::grapheme_width_with_config(text, &shaping).display_width)
         .unwrap_or(u16::MAX)
+}
+
+/// The per-grapheme cell widths of one committed Text/IME event, in order,
+/// appended to `out` — the same clusters and widths [`committed_text_cells`]
+/// sums, kept apart so a Backspace can price the one glyph it erases
+/// ([`crate::cursor_glow::CursorGlow::note_backspace_erasing`]). A run that
+/// advances nothing (combining marks, selectors, joiners) records nothing,
+/// as it banks nothing. A zero-width cluster INSIDE a run that does advance
+/// (a base-less leading mark, a stray selector before a glyph) records a 0:
+/// a priced zero, which the engine distinguishes from an erase it was told
+/// nothing about — the one retires no cell of any press, the other the whole
+/// newest press.
+fn committed_grapheme_cells_into(text: &str, ambiguous_width_double: bool, out: &mut Vec<u16>) {
+    use aterm_types::text_shaping::{AmbiguousWidth, TextShapingConfig};
+
+    if aterm_grapheme::str_width(text) == 0 {
+        return;
+    }
+    let shaping = TextShapingConfig {
+        ambiguous_width: if ambiguous_width_double {
+            AmbiguousWidth::Double
+        } else {
+            AmbiguousWidth::Single
+        },
+        ..TextShapingConfig::default()
+    };
+    out.extend(
+        aterm_grapheme::split_graphemes_with_config(text, &shaping)
+            .map(|g| u16::try_from(g.width).unwrap_or(u16::MAX)),
+    );
 }
 
 fn committed_char_cells(ch: char, ambiguous_width_double: bool) -> u16 {
@@ -2931,10 +3219,18 @@ impl App {
     ///
     /// `Err` when there is no focused window to report on — an honest
     /// refusal, never a fabricated neutral row.
-    pub(crate) fn tone_status(&self) -> Result<String, String> {
+    pub(crate) fn tone_status(&mut self) -> Result<String, String> {
         let Some(wid) = self.frontmost_window else {
             return Err("no focused window".to_string());
         };
+        // The verb asks what the typing EARNED. The classifier runs at the
+        // render tick, never in the key handler (P06); a verdict keystrokes
+        // have marked due but no frame has drained yet is still the honest
+        // answer, so settle it here before reading.
+        if let Some(ws) = self.windows.get_mut(&wid) {
+            ws.tone_tracker
+                .drain_pending_inference(std::time::Instant::now());
+        }
         let Some(ws) = self.windows.get(&wid) else {
             return Err("no focused window".to_string());
         };
@@ -3348,6 +3644,14 @@ impl App {
     /// any window. Terminal-side semantics (snap live viewport, clear terminal
     /// selection, preserve paste FIFO ordering) still apply, but no visible
     /// window animator/predictor/cursor state may be touched by hidden input.
+    ///
+    /// A confirmed PASTE reaches here too, and for the same reason: a deferred
+    /// delivery (the X11 clipboard read, or the Linux banner / macOS sheet
+    /// answer) is pinned to the session that OWNED the gesture, and a tab or
+    /// pane switch in the meantime can leave that owner fronting no window.
+    /// The bytes must still land on it — never on whichever tab came to the
+    /// front — so it takes this seam, framed by the [`InputEvent::Paste`] the
+    /// gesture carried. A closed owner (`pool.get` misses) delivers nothing.
     fn input_to_hidden_session(
         &self,
         target_session: u64,
@@ -3356,13 +3660,17 @@ impl App {
     ) -> InputOutcome {
         debug_assert!(matches!(
             ev,
-            InputEvent::Key { .. } | InputEvent::Text(_) | InputEvent::KeySequence(_)
+            InputEvent::Key { .. }
+                | InputEvent::Text(_)
+                | InputEvent::KeySequence(_)
+                | InputEvent::Paste(..)
         ));
         let Some(session) = self.pool.get(target_session) else {
             return InputOutcome::Ok;
         };
-        let (term, sink, echo) = (
+        let (term, modes, sink, echo) = (
             session.term.clone(),
+            session.ctx.modes.clone(),
             session.ctx.sink.clone(),
             session.ctx.output_echo.clone(),
         );
@@ -3413,6 +3721,7 @@ impl App {
         }
         let (receipt, _) = paste_order::ordered_or_inline(
             &term,
+            &modes,
             &sink,
             &echo,
             &ev,
@@ -3547,8 +3856,17 @@ impl App {
             // every in-flight glyph echo at a submit/complete boundary — the
             // deterministic no-fresh-hint decline per Enter and the mid-band
             // Tab notch. Every other class still closes the cohort at entry.
-            let arms_own_license =
-                plain_typed_glyph || is_plain_enter(&ev) || class.tab_key || class.paste_chord_key;
+            // An INERT MODIFIER joins them for the opposite reason (2026-09-13,
+            // lockstep with `on_key`'s own gate): it arms no class because it
+            // expresses no intent — no glyph, no move, no PTY byte — so it has
+            // nothing to supersede, and wiping here revoked the nav licence a
+            // word key had stamped a moment earlier whenever the user rested
+            // or re-tapped Option while its echo was still in flight.
+            let arms_own_license = plain_typed_glyph
+                || is_plain_enter(&ev)
+                || class.tab_key
+                || class.paste_chord_key
+                || class.inert_modifier;
             if !arms_own_license {
                 self.clear_move_license(wid);
             }
@@ -3713,6 +4031,8 @@ impl App {
                     owner.term.clone(),
                     owner.ctx.sink.clone(),
                     owner.ctx.output_echo.clone(),
+                    owner.ctx.modes.clone(),
+                    owner.ctx.ui_waiting.clone(),
                     session,
                 )
             }),
@@ -3722,12 +4042,14 @@ impl App {
                         terminal.term,
                         terminal.sink,
                         owner.ctx.output_echo.clone(),
+                        owner.ctx.modes.clone(),
+                        owner.ctx.ui_waiting.clone(),
                         terminal.session,
                     )
                 })
             }),
         };
-        let Some((term, sink, output_echo, session)) = terminal else {
+        let Some((term, sink, output_echo, modes, ui_waiting, session)) = terminal else {
             return match ev {
                 InputEvent::Resize {
                     rows,
@@ -3891,6 +4213,11 @@ impl App {
                 let tty_swallows = input_now.is_some()
                     && typed_forward == Some(true)
                     && sink.tty_echo().is_some_and(|echo| echo.swallows_input());
+                // A press the typed arm below WITHHELD for that reason. Its
+                // `swallowed_no_echo=` tally is taken after the PTY write,
+                // not at the key: the count is of presses the tty swallowed,
+                // and a press whose write fails never reached it.
+                let mut swallowed_press = false;
                 // The LICENSE is stamped only on a press-like event; a
                 // release can neither grant one nor spend one.
                 if let Some(input_now) = input_now {
@@ -3993,7 +4320,10 @@ impl App {
                     // cursor/cols/alt sample. These were three separate acquisitions
                     // (snap_to_bottom, clear_selection, a sample lock), each queueing
                     // independently behind the PTY reader's 8 KiB process() bouts
-                    // during output floods. The redraw side-effects run AFTER the
+                    // during output floods. It is also the press's LAST acquisition:
+                    // the seam below encodes against the terminal's lock-free
+                    // `ModeMirror`, so a key pays exactly one queue position behind
+                    // the reader, not two. The redraw side-effects run AFTER the
                     // guard drops — never window calls under the term lock.
                     let (
                         scrolled,
@@ -4004,7 +4334,12 @@ impl App {
                         term_cols,
                         ambiguous_width_double,
                     ) = {
-                        let mut t = term_lock(&term);
+                        // Registered as a UI waiter while it blocks (P63), so the
+                        // reader hands its next slice boundary to this press. The
+                        // acquire closes on the binding line on purpose: the L0
+                        // freeze guard tracks `t` only from a same-line acquire.
+                        let site = crate::metrics::TermWaitSite::Press;
+                        let mut t = crate::term_lock_ui(&term, &ui_waiting, site);
                         // SELECTION CUSTODY (R1). The kind short-circuits BEFORE
                         // the two reads, so an inert modifier / repeat / release
                         // costs nothing extra inside a lock it is already holding
@@ -4108,7 +4443,14 @@ impl App {
                     // BOTH sources like the side-effects above, and OUTSIDE any term
                     // lock.
                     if let Some(ws) = self.windows.get_mut(&wid) {
-                        ws.input_hot = true;
+                        // A BARE MODIFIER IS NOT A KEYSTROKE (same law as
+                        // `last_key_at` below): it must not admit the next output
+                        // frame at the half-interval floor, stamp the input→present
+                        // slice, or heat the typing cadence. It reaches this arm only
+                        // under kitty report-all or from a controller verb.
+                        if !inert_modifier {
+                            ws.input_hot = true;
+                        }
                         // Every newer press of a DIFFERENT class closes the
                         // older license term (class-specific code below
                         // re-stamps the license its own class earns;
@@ -4135,7 +4477,23 @@ impl App {
                         // the 8-cell black notch behind every mid-burst Tab.
                         // The supersede still closes every contradicted class;
                         // modified chords, kills and raw input keep the wipe.
-                        if typed_press_supersede || typed_enter || tab_key || paste_chord_key {
+                        //
+                        // AN INERT MODIFIER CLOSES NOTHING AT ALL (2026-09-13,
+                        // the word hop that sounded only while Option stayed
+                        // down). macOS delivers a bare Option/Shift/Control/
+                        // Command keydown as its own `KeyboardInput`, and
+                        // `Named(Alt)` IS engine-mapped, so it reaches this
+                        // seam — where it was a press "of a DIFFERENT class"
+                        // and revoked the nav licence an Option+Left stamped a
+                        // moment earlier, declining that hop's echo
+                        // `no-fresh-hint`. It types nothing, moves nothing and
+                        // sends no bytes: there is no class for it to contradict
+                        // and no licence for it to earn, so it leaves both
+                        // engines exactly as it found them.
+                        if inert_modifier {
+                            // nothing to supersede
+                        } else if typed_press_supersede || typed_enter || tab_key || paste_chord_key
+                        {
                             ws.cursor_glow.supersede_typed_press(input_now);
                             ws.cursor_trail.supersede_typed_press();
                         } else {
@@ -4156,7 +4514,9 @@ impl App {
                         // (a password prompt, a swallowed chord) cannot pin it. Still
                         // half-interval paced by `hot_floor`, so the present rate stays
                         // bounded at 2x refresh — the pool-exhaustion guard is untouched.
-                        ws.input_hot_until = Some(input_now + INPUT_HOT_WINDOW);
+                        if !inert_modifier {
+                            ws.input_hot_until = Some(input_now + INPUT_HOT_WINDOW);
+                        }
                         // The classifier's typing evidence: a plain stamp, not
                         // a pacing deadline (see `WindowState::last_key_at`).
                         //
@@ -4171,8 +4531,8 @@ impl App {
                         // nothing".
                         if !inert_modifier {
                             ws.last_key_at = Some(input_now);
+                            crate::metrics::note_input();
                         }
-                        crate::metrics::note_input();
                         // Stamp the arrival for the `metrics` verb's input→present
                         // slice — the latency a human FEELS when typing. The same
                         // stamp drives `input_pending()`, which keeps the PTY reader
@@ -4193,7 +4553,7 @@ impl App {
                         // Ctrl-A/E scrubbing and line kills are not writing, so they
                         // must not ignite the comet, spin the rainbow cursor, or
                         // charge the phaser emitter's wings.
-                        if !navigation_key && !kill_key {
+                        if !navigation_key && !kill_key && !inert_modifier {
                             ws.typing_cadence.on_keystroke(input_now);
                         }
                         // THE WORD ENGINE'S "A HUMAN TYPED" WITNESS IS ARMED
@@ -4209,7 +4569,20 @@ impl App {
                         // deletion — deleting never stokes the fire. Style-agnostic
                         // to arm (cheap scalar bumps); only the fire style reads it.
                         if typed_forward == Some(false) {
-                            ws.cursor_glow.note_backspace(input_now);
+                            // THE GLYPH IT ERASES, priced by the host: the
+                            // newest width of the last typed dispatch (a
+                            // committed IME run is one press banking several
+                            // glyphs; a zero-width cluster in it is a priced
+                            // 0), or `None` — nothing remembered — for the
+                            // engine's whole-press retire.
+                            let erased = ws.typed_glyph_widths.pop();
+                            ws.cursor_glow.note_backspace_erasing(input_now, erased);
+                        } else if !inert_modifier {
+                            // Any other press closes the memory: a Backspace
+                            // after it erases something this dispatch did not
+                            // price (the typed arm below refills it for its
+                            // own graphemes).
+                            ws.typed_glyph_widths.clear();
                         }
                         // Feed only classifier/cadence state here. The
                         // LICENSE itself is stamped below, per class: plain
@@ -4261,7 +4634,8 @@ impl App {
                             if tty_swallows {
                                 // The tally is the only trace: a dark
                                 // password prompt reads as the rule working.
-                                ws.cursor_glow.note_typed_swallowed_no_echo();
+                                // Taken below, once the write has landed.
+                                swallowed_press = true;
                             } else {
                                 ws.cursor_glow.note_typed_glyph(
                                     input_now,
@@ -4269,6 +4643,19 @@ impl App {
                                     glyph_shifted && !spacebar,
                                     typed_class_for(typed),
                                 );
+                                // …and the widths BEHIND that one price, per
+                                // grapheme, for the Backspace that erases one
+                                // of them (`typed_glyph_widths`): an IME run
+                                // is banked as one press, and a Backspace
+                                // gives back one glyph of it, not the run.
+                                match ime {
+                                    Some(text) => committed_grapheme_cells_into(
+                                        text,
+                                        ambiguous_width_double,
+                                        &mut ws.typed_glyph_widths,
+                                    ),
+                                    None => ws.typed_glyph_widths.push(typed_cells),
+                                }
                             }
                             ws.cursor_trail.note_typed(input_now);
                             // CLICK AT THE KEY, not at the echo (touch-to-glass
@@ -4662,10 +5049,10 @@ impl App {
                     // and gives a conformance a guard inside which the before/after
                     // pair is real.
                     //
-                    // COST: one uncontended mutex acquisition per key RELEASE, on a
-                    // path that goes on to take the same lock again inside
-                    // `seam_egress` to read the keyboard mode and then writes to the
-                    // PTY. Releases are delivered only while the app has Kitty
+                    // COST: one uncontended mutex acquisition per key RELEASE — the
+                    // ONLY one on this path, since `seam_egress` reads the keyboard
+                    // mode from the lock-free mirror and then writes to the PTY.
+                    // Releases are delivered only while the app has Kitty
                     // `REPORT_EVENT_TYPES` enabled, at human key-up rates.
                     // `apply_press_custody` disturbs nothing for a `Release` kind —
                     // the two `&&` reads short-circuit exactly as before.
@@ -4699,6 +5086,7 @@ impl App {
                 .filter(|ticket| !ticket.is_empty());
                 let (receipt, wrote_inline) = paste_order::ordered_or_inline(
                     &term,
+                    &modes,
                     &sink,
                     &output_echo,
                     &ev,
@@ -4706,6 +5094,18 @@ impl App {
                     delivery_ticket,
                 );
                 let outcome = egress_to_outcome(receipt.egress);
+                // THE SWALLOWED-PRESS TALLY, at the write: a press the tty
+                // will not echo counts once it is on the wire (inline) or
+                // provably bound for it (queued behind a draining paste —
+                // the delivered-ticket law says a queued key reaches the
+                // wire). A failed inline write reached no tty to swallow it,
+                // and its cohort is revoked below.
+                if swallowed_press
+                    && outcome != InputOutcome::WriteFailed
+                    && let Some(ws) = self.windows.get_mut(&wid)
+                {
+                    ws.cursor_glow.note_typed_swallowed_no_echo();
+                }
                 // Successful FIFO admission commits an input INTENT, not a
                 // delivery or edit witness. Inline input needs an accepted
                 // non-empty frame. Neither this note nor its later PTY echo
@@ -4723,12 +5123,19 @@ impl App {
                 // This whole method is one event-loop turn, so effects cannot
                 // tick between the arm above and this timestamp-specific
                 // revoke; the safe cost is only missing cosmetics for the
-                // eventual queued echo.
+                // eventual queued echo. The PRESS CREDIT goes only with a
+                // FAILED write (2026-09-12): a queued key will reach the wire
+                // and echo, and its credit is what pays for that echo (its
+                // stamp is re-banked at delivery, `note_typed_stamp_delivered`).
                 if (!wrote_inline || outcome == InputOutcome::WriteFailed)
                     && let Some(armed_at) = input_now
                     && let Some(ws) = self.windows.get_mut(&wid)
                 {
-                    ws.cursor_glow.revoke_input_hints_at(armed_at);
+                    if outcome == InputOutcome::WriteFailed {
+                        ws.cursor_glow.revoke_failed_input_at(armed_at);
+                    } else {
+                        ws.cursor_glow.revoke_input_hints_at(armed_at);
+                    }
                     ws.cursor_trail.revoke_input_hints_at(armed_at);
                 }
                 // The PTY write has now RETURNED — close the key→write latency slice
@@ -4747,8 +5154,13 @@ impl App {
                 // write would never be measured. Disarm instead: this is precisely
                 // the documented "dispatch ended WITHOUT a PTY write" case, and it
                 // also stops the stamp being inherited by an unrelated later `send`.
+                //
+                // AND ONLY when bytes actually reached the sink (`accepted_order`):
+                // an inline dispatch that encoded to NOTHING (a bare modifier under
+                // kitty event-types-only, an unmapped key) is not a key→write and
+                // used to file its arrival→no-op time as one, dragging the p50 down.
                 if !is_release {
-                    if wrote_inline {
+                    if wrote_inline && receipt.accepted_order().is_some() {
                         crate::metrics::note_pty_write();
                     } else {
                         crate::metrics::clear_key_arrival();
@@ -4893,6 +5305,9 @@ impl App {
                     // ROBI's typed feed rides the same classified press (see
                     // `feed_robi_typed` below): PTY output and pastes can
                     // never summon him, exactly like the cats.
+                    // Pushed only while ROBI is enabled (default off): a feature
+                    // that is off must not cost a heap allocation per keystroke.
+                    let robi_on = self.config.robi_or_default();
                     let mut robi_typed: Vec<char> = Vec::new();
                     let summoned = {
                         let cosmetic_press = CosmeticFeedPress {
@@ -4981,7 +5396,9 @@ impl App {
                                     |kitty| kitty.note_break(),
                                     |kitty| kitty.note_backspace(session),
                                     |kitty, c| {
-                                        robi_typed.push(c);
+                                        if robi_on {
+                                            robi_typed.push(c);
+                                        }
                                         if let Some(lx) = lexicon.as_ref() {
                                             fired = fired.merge(
                                                 kitty.note_char(input_now, session, c, lx, &opts),
@@ -5019,7 +5436,9 @@ impl App {
                 outcome
             }
             // --- Mouse button: tracking-ON report else local gesture (a/b/d/i) -
-            ev @ InputEvent::MouseButton { .. } => self.input_mouse_button(wid, &ev, &term, &sink),
+            ev @ InputEvent::MouseButton { .. } => {
+                self.input_mouse_button(wid, &ev, &term, &modes, &sink)
+            }
             // --- Mouse motion: tracking-ON report else drag the selection (c) ---
             ev @ InputEvent::MouseMove { .. } => {
                 let (row, col, side) = if let InputEvent::MouseMove { row, col, side, .. } = ev {
@@ -5046,13 +5465,14 @@ impl App {
                 }
                 egress_to_outcome(input::seam_egress(
                     &term,
+                    &modes,
                     &sink,
                     &ev,
                     input::EgressMode::Interactive,
                 ))
             }
             // --- Wheel: N reports/line when tracking ON else scroll viewport (e) -
-            ev @ InputEvent::Wheel { .. } => self.input_wheel(wid, &ev, &term, &sink),
+            ev @ InputEvent::Wheel { .. } => self.input_wheel(wid, &ev, &term, &modes, &sink),
             // --- Explicit, tracking-agnostic scrollback nav (A.6) --------------
             InputEvent::ScrollView(intent) => self.input_scroll_view(wid, intent, &term),
             ev @ InputEvent::Paste(..) => {
@@ -5072,6 +5492,7 @@ impl App {
                     wid,
                     ev,
                     &term,
+                    &modes,
                     &sink,
                     &output_echo,
                     input_now.expect("paste dispatch owns an injected input timestamp"),
@@ -5102,7 +5523,7 @@ impl App {
                 // the engine's `encode_focus_state` (ESC[I / ESC[O), gated on DEC
                 // 1004. The GUI-visual blink/cursor-override side-effect stays in
                 // `on_focus`.
-                input::seam_egress(&term, &sink, &ev, input::EgressMode::Interactive);
+                input::seam_egress(&term, &modes, &sink, &ev, input::EgressMode::Interactive);
                 InputOutcome::Ok
             }
         }
@@ -5122,6 +5543,7 @@ impl App {
         wid: WindowId,
         ev: &InputEvent,
         term: &Arc<Mutex<Terminal>>,
+        modes: &Arc<ModeMirror>,
         sink: &Arc<SinkWriter>,
     ) -> InputOutcome {
         if let Some(ws) = self.windows.get_mut(&wid) {
@@ -5156,7 +5578,7 @@ impl App {
             } else {
                 unreachable!()
             };
-        let egress = input::seam_egress(term, sink, ev, input::EgressMode::Interactive);
+        let egress = input::seam_egress(term, modes, sink, ev, input::EgressMode::Interactive);
         if let input::Egress::TrackingOff { .. } = egress
             && button == aterm_types::mouse::MouseButton::Left
         {
@@ -5189,6 +5611,7 @@ impl App {
         wid: WindowId,
         ev: &InputEvent,
         term: &Arc<Mutex<Terminal>>,
+        modes: &Arc<ModeMirror>,
         sink: &Arc<SinkWriter>,
     ) -> InputOutcome {
         if let Some(ws) = self.windows.get_mut(&wid) {
@@ -5210,10 +5633,11 @@ impl App {
         {
             rain.note_alt_scroll();
         }
-        let egress = input::seam_egress(term, sink, ev, input::EgressMode::Interactive);
+        let egress = input::seam_egress(term, modes, sink, ev, input::EgressMode::Interactive);
         if let input::Egress::TrackingOff {
             wheel_lines,
             wheel_up,
+            viewport: Some(viewport),
         } = egress
         {
             // The seam counted DETENTS (one report per line while tracking); the
@@ -5221,10 +5645,16 @@ impl App {
             // reachable and meaningful — Windows' "lines to scroll" of 0 means the
             // wheel does not scroll — so it is honoured as no motion rather than
             // waking the glide and the scroll pill for a zero-row target.
-            let lines = wheel_viewport_lines(wheel_lines, term);
+            //
+            // Everything the scroll needs the seam read under its one lock:
+            // this arm takes NO terminal acquisition of its own (it used to
+            // take two — `rows()` here and `(display_offset, scrollback_lines)`
+            // in the glide arm — each a fresh queue position behind the reader).
+            let lines = wheel_viewport_lines(wheel_lines, viewport.rows);
             if lines != 0 {
                 let delta = if wheel_up { lines } else { -lines };
-                self.scroll_wheel_animated(wid, term, delta);
+                let precise = self.windows.get(&wid).is_some_and(|ws| ws.wheel_precise);
+                self.scroll_wheel_animated_with(wid, term, delta, Some(viewport), precise);
             }
         }
         egress_to_outcome(egress)
@@ -5367,11 +5797,49 @@ impl App {
     /// [`scroll_motion::decompose`] (the proven law) into whole rows for
     /// `scroll_display` — the fractional remainder is banked until the render
     /// path grows its sub-row translate.
+    ///
+    /// The production caller is `input_wheel`, which goes through
+    /// [`Self::scroll_wheel_animated_with`] with the facts the seam's one lock
+    /// carried; this notch-shaped wrapper (facts read here, under a short lock)
+    /// exists for the glide tests, which drive the reducer without a seam.
+    #[cfg(test)]
     pub(crate) fn scroll_wheel_animated(
         &mut self,
         wid: WindowId,
         term: &Arc<Mutex<Terminal>>,
         delta_rows: i32,
+    ) {
+        self.scroll_wheel_animated_with(wid, term, delta_rows, None, false);
+    }
+
+    /// [`Self::scroll_wheel_animated`] with the engine facts the caller already
+    /// holds and the delta's kind.
+    ///
+    /// `viewport` is the `(display_offset, scrollback_lines)` snapshot the seam
+    /// read under its one lock ([`input::WheelViewport`]); `None` reads them
+    /// here, under a short lock, for callers that come without one (the
+    /// tests). The glide's base and clamp are computed from these facts on
+    /// EVERY notch, chained or not — the clamp is not deferred to the tick,
+    /// because the tick's `scroll_frac_px` derives from the unclamped eased
+    /// position and a target past the top of history would translate the
+    /// sub-row band against a pinned engine for the rest of the ease.
+    ///
+    /// `precise` is whether the delta came from a trackpad / Magic Mouse
+    /// (`PixelDelta`) rather than a notch. It changes ONE thing: how a chained
+    /// delta joins an in-flight ease of the same engine. A notch RETARGETS
+    /// (`Glide::retarget` — the M1 180 ms brief, written for notch wheels: each
+    /// detent earns its own ease); a precise delta EXTENDS
+    /// (`Glide::extend_target`): the target moves, the deadline does not, so a
+    /// 120 Hz stream of deltas no longer restarts the ease every 8 ms and
+    /// settles the content ~57 ms behind the finger — the ease progresses and
+    /// lands, and the next delta arms afresh from where it landed.
+    pub(crate) fn scroll_wheel_animated_with(
+        &mut self,
+        wid: WindowId,
+        term: &Arc<Mutex<Terminal>>,
+        delta_rows: i32,
+        viewport: Option<input::WheelViewport>,
+        precise: bool,
     ) {
         let now = std::time::Instant::now();
         // W12: the glide's pixel domain belongs to the window that received the
@@ -5402,14 +5870,17 @@ impl App {
             }
             return;
         }
-        // The engine's current viewport + clamp bound, under ONE short lock.
-        let (cur_rows, max_rows) = {
-            let t = term_lock(term);
-            (
-                i64::try_from(t.grid().display_offset()).unwrap_or(i64::MAX),
-                i64::try_from(t.grid().scrollback_lines()).unwrap_or(i64::MAX),
-            )
+        // The engine's current viewport + clamp bound: the seam's snapshot when
+        // it has one, else ONE short lock.
+        let (display_offset, scrollback_lines) = match viewport {
+            Some(v) => (v.display_offset, v.scrollback_lines),
+            None => {
+                let t = term_lock(term);
+                (t.grid().display_offset(), t.grid().scrollback_lines())
+            }
         };
+        let cur_rows = i64::try_from(display_offset).unwrap_or(i64::MAX);
+        let max_rows = i64::try_from(scrollback_lines).unwrap_or(i64::MAX);
         let Some(ws) = self.windows.get_mut(&wid) else {
             return;
         };
@@ -5430,11 +5901,17 @@ impl App {
         let want_px = base_px + i64::from(delta_rows) * cell_h;
         let target_px = want_px.clamp(0, max_rows * cell_h);
         if same {
-            // A chained notch that still has room to move: retarget the ease and
-            // clear any stale bounce (we are no longer parked at an edge).
+            // A chained delta that still has room to move joins the ease — a
+            // notch by RETARGETING it (its own fresh 180 ms), a precise delta by
+            // EXTENDING it (same deadline, see the doc above) — and clears any
+            // stale bounce (we are no longer parked at an edge).
             ws.overscroll = None;
             if let Some(st) = ws.scroll_glide.as_mut() {
-                st.glide.retarget(target_px, now);
+                if precise {
+                    st.glide.extend_target(target_px, now);
+                } else {
+                    st.glide.retarget(target_px, now);
+                }
             }
         } else if target_px == cur_rows * cell_h {
             // Parked at a history end (the clamp ate the whole notch): nothing to
@@ -5704,11 +6181,18 @@ impl App {
     /// the one the gesture was judged under. The answer travels on the event
     /// ([`crate::input::PasteFraming`]); this path only moves it, and must never
     /// re-derive it.
+    #[allow(
+        clippy::too_many_arguments,
+        reason = "the paste lane carries the session's four capability handles (terminal, \
+                  mode mirror, sink, echo tracker) plus the injected clock explicitly, like \
+                  its mouse/wheel siblings — bundling them would add a per-event struct"
+    )]
     fn input_paste(
         &mut self,
         wid: WindowId,
         ev: InputEvent,
         term: &Arc<Mutex<Terminal>>,
+        modes: &Arc<ModeMirror>,
         sink: &Arc<SinkWriter>,
         echo: &Arc<OutputEchoTracker>,
         input_now: std::time::Instant,
@@ -5764,8 +6248,22 @@ impl App {
             }
             _ => None,
         };
+        // THE PASSWORD-MODE RULE, the paste half (2026-09-13): a paste into
+        // a tty in CANONICAL NO-ECHO mode (`read -s`, `sudo`, an `ssh`
+        // passphrase) will never be echoed, so there is no cell for an
+        // insert licence to pay for — the same verdict the press path reads
+        // off the master's termios (`tty_swallows`), read once per paste,
+        // and withholding only on POSITIVE evidence (`None` — a pipe sink,
+        // the `-1` sentinel, ConPTY — learns nothing and tickets as ever; a
+        // raw-mode program echoes for itself and keeps its ticket). Without
+        // this the paste armed a two-second same-row licence a program
+        // print on that row could spend as a phantom. The bytes, the
+        // gesture stamp, the up-strum and the pet note are unchanged.
+        let tty_swallows =
+            movement_capable && sink.tty_echo().is_some_and(|echo| echo.swallows_input());
         let ticket = insert
             .filter(|width| *width != InsertWidth::Cells(0))
+            .filter(|_| !tty_swallows)
             .map(|width| DeliveryTicket {
                 insert: Some(width),
                 typed: false,
@@ -5775,10 +6273,11 @@ impl App {
         // loop) AND any keystroke submitted while it drains queues BEHIND it, so
         // the child sees the paste before that later input. Falls back to a
         // detached write only if the FIFO writer thread could not be spawned.
-        match paste_order::enqueue(term, sink, echo, ev, ticket) {
+        match paste_order::enqueue(term, modes, sink, echo, ev, ticket) {
             Ok(_queued_behind_existing) => {}
             Err(ev) => {
                 let term = term.clone();
+                let modes = modes.clone();
                 let sink = sink.clone();
                 let echo = echo.clone();
                 std::thread::spawn(move || {
@@ -5788,6 +6287,7 @@ impl App {
                     let write = echo.begin_ticketed(OutputEchoInput::Echoable, ticket);
                     let receipt = input::seam_egress_receipt(
                         &term,
+                        &modes,
                         &sink,
                         &ev,
                         input::EgressMode::Backpressured,
@@ -6733,6 +7233,7 @@ impl App {
                 } else {
                     paste_order::ordered_or_inline(
                         &session.term,
+                        &session.ctx.modes,
                         &session.ctx.sink,
                         &session.ctx.output_echo,
                         &event,
@@ -7049,7 +7550,20 @@ impl App {
                 ws.cursor_glow.supersede_typed_press(at);
                 ws.cursor_trail.supersede_typed_press();
             }
-        } else {
+        } else if !keymap::press_is_inert(&ev) {
+            // A BARE MODIFIER IS NOT A SUPERSESSION (2026-09-13). macOS
+            // delivers `flags_changed` as a synthesized `KeyboardInput`
+            // Pressed for `Named(Alt|Shift|Control|Super)` and CapsLock/Fn, so
+            // resting or re-tapping Option between a word key and its echo
+            // landed here and revoked the nav licence the word key had just
+            // stamped — the echo then declined `no-fresh-hint` and the hop was
+            // silent, while the SAME gesture with Option held sounded every
+            // time. R1 already says a bare modifier "expresses no intent": it
+            // types nothing, moves nothing and produces no PTY bytes, so it
+            // has nothing to supersede. `press_is_inert` is the same authority
+            // the seam's `PressClass::inert_modifier` uses, so the two halves
+            // cannot disagree. Every intent-bearing chord (Backspace, Escape,
+            // a Cmd shortcut) still closes the cohort exactly as before.
             self.clear_move_license(wid);
         }
         // A repeat belongs to the physical PRESS epoch, not to the content,
@@ -7566,6 +8080,21 @@ impl App {
         // (kills divergences f/h; uniform g/k side-effects). The keymap is demoted
         // to a BUILDER (`build_key_input`) that fills `base_layout` from the
         // physical key for Kitty REPORT_ALTERNATE_KEYS.
+        // A BARE MODIFIER / LOCK PRESS WRITES NOTHING unless the front app has
+        // negotiated kitty `REPORT_ALL_KEYS_AS_ESC` — the encoder's own rule
+        // (`should_encode_kitty_event`: modifier keys report ONLY under that flag;
+        // legacy encodes them to nothing). So for every other mode the whole
+        // remainder of this ladder — the lock-state IOKit RPC below, the press
+        // scope's terminal-mutex acquisition, the encoder, the write receipt — runs
+        // to produce zero bytes, and on the way pollutes `input_hot`, the
+        // input→present stamp and the key→write histogram. Decide it HERE from the
+        // lock-free mode mirror and record the physical press as Consumed so its
+        // release pairs and is swallowed exactly as the un-encodable tail's are.
+        // Under report-all the modifier IS a reported key and takes the full path.
+        if inert && !self.front_kitty_reports_all_keys(wid) {
+            self.note_consumed_press(wid, &ev);
+            return;
+        }
         // Caps/Num Lock are not in winit's `ModifiersState`; fold the live
         // platform lock state into the Kitty modifier byte (WIRE-MODIFIERS).
         let km_mods = keymap::modifiers_from_winit(mods) | (self.lock_modifiers)();
@@ -7628,6 +8157,22 @@ impl App {
         // press, which is what a user means by "start typing and jump to the
         // prompt".
         self.note_consumed_press(wid, &ev);
+    }
+
+    /// Whether the front terminal's keyboard mode carries kitty
+    /// `REPORT_ALL_KEYS_AS_ESC` — the ONE flag under which a bare modifier press
+    /// produces bytes. Read lock-free from the session's `ModeMirror` (never the
+    /// terminal mutex). No front terminal (a native tab) ⇒ `false`: nothing
+    /// there could receive the report.
+    fn front_kitty_reports_all_keys(&self, wid: WindowId) -> bool {
+        self.front_terminal(wid)
+            .and_then(|t| self.pool.get(t.session))
+            .is_some_and(|s| {
+                s.ctx
+                    .modes
+                    .keyboard_mode()
+                    .contains(aterm_types::keyboard::KeyboardMode::REPORT_ALL_KEYS_AS_ESC)
+            })
     }
 
     /// Hardcoded Cmd-Shift chords of [`on_key`], handled FIRST among the Cmd combos
@@ -9564,7 +10109,11 @@ impl App {
     /// engine path (each grapheme encoded as a `Character` key, NOT `& 0x1f`), so
     /// it goes out exactly as typed text. Clears the selection like any typing.
     pub(crate) fn on_ime_commit(&mut self, wid: WindowId, text: String) {
-        // This fence must precede every early consumer below (native tabs,
+        // ONE routing decision (`ime_route`), read once and dispatched on
+        // below, so the fence and the consumer can never disagree about
+        // where the commit lands.
+        let route = self.ime_route(wid);
+        // This fence must precede every consumer below (native tabs,
         // rename/find fields, and the empty commit). A commit that REACHES
         // THE PTY is more typing, not a class change (2026-09-10): it stamps
         // its own typed licence in `App::input` below, and the banked stamps
@@ -9574,16 +10123,15 @@ impl App {
         // bank-preserving supersede the Text arm applies; a commit a native
         // view, the rename field or the find bar consumes keeps the full
         // fence, exactly as before.
-        let consumed_locally = text.is_empty()
-            || self.active_native_view(wid).is_some()
-            || self.inline_rename_edit(wid).is_some()
-            || self.windows.get(&wid).is_some_and(|ws| ws.search.is_some());
-        if consumed_locally {
+        let reaches_pty = !text.is_empty() && matches!(route, PreeditOwner::Grid);
+        if reaches_pty {
+            if let Some(ws) = self.windows.get_mut(&wid) {
+                ws.cursor_glow
+                    .supersede_typed_press(std::time::Instant::now());
+                ws.cursor_trail.supersede_typed_press();
+            }
+        } else {
             self.clear_move_license(wid);
-        } else if let Some(ws) = self.windows.get_mut(&wid) {
-            ws.cursor_glow
-                .supersede_typed_press(std::time::Instant::now());
-            ws.cursor_trail.supersede_typed_press();
         }
         // End the composition on the WINDOW even when a native tab consumes the
         // committed text — the same stale-preedit hazard as `on_ime_preedit`.
@@ -9591,67 +10139,65 @@ impl App {
             ws.preedit.clear();
             ws.preedit_caret = None;
         }
-        if self.active_native_view(wid).is_some() {
-            if !text.is_empty() {
-                let _ = self.dispatch_native_event(
-                    wid,
-                    crate::native_app::AppEvent::TextInput(
-                        crate::native_app::TextInputEvent::Commit(text),
-                    ),
-                );
+        match route {
+            PreeditOwner::Native => {
+                if !text.is_empty() {
+                    let _ = self.dispatch_native_event(
+                        wid,
+                        crate::native_app::AppEvent::TextInput(
+                            crate::native_app::TextInputEvent::Commit(text),
+                        ),
+                    );
+                }
+                if let Some(window) = self.windows.get(&wid).and_then(|ws| ws.os_window.as_ref()) {
+                    window.request_redraw();
+                }
             }
-            if let Some(window) = self.windows.get(&wid).and_then(|ws| ws.os_window.as_ref()) {
-                window.request_redraw();
+            _ if text.is_empty() => {}
+            // The INLINE RENAME field claims composed text, and ahead of
+            // find: it is the more deeply focused of the two (its key gate
+            // sits above find's in `on_key`). Without this, CJK input and
+            // every macOS ⌥-dead-key would type into the shell behind an
+            // open rename field.
+            PreeditOwner::Rename => {
+                self.rename_field_edit(wid, crate::app_search::SearchEdit::Insert(text));
             }
-            return;
-        }
-        if text.is_empty() {
-            return;
-        }
-        // The INLINE RENAME field claims composed text for the same reason, and
-        // ahead of find: it is the more deeply focused of the two (its key gate
-        // sits above find's in `on_key`). Without this, CJK input and every macOS
-        // ⌥-dead-key would type into the shell behind an open rename field.
-        if self.inline_rename_edit(wid).is_some() {
-            self.rename_field_edit(wid, crate::app_search::SearchEdit::Insert(text));
-            return;
-        }
-        // FIND MODE owns composed text too. On macOS the ⌥-dead-key sequences the find
-        // keymap deliberately leaves unbound (⌥e e → é, ⌥s → ß) arrive HERE as an IME
-        // commit, not as `KeyEvent::text` — without this they would land in the SHELL
-        // behind an open find bar, which is both a lost query character and a leak.
-        if self.windows.get(&wid).is_some_and(|ws| ws.search.is_some()) {
-            self.search_edit_in(wid, crate::app_search::SearchEdit::Insert(text));
-            if let Some(w) = self.windows.get(&wid).and_then(|ws| ws.os_window.as_ref()) {
-                w.request_redraw();
+            // FIND MODE owns composed text too. On macOS the ⌥-dead-key
+            // sequences the find keymap deliberately leaves unbound (⌥e e →
+            // é, ⌥s → ß) arrive HERE as an IME commit, not as
+            // `KeyEvent::text` — without this they would land in the SHELL
+            // behind an open find bar, which is both a lost query character
+            // and a leak.
+            PreeditOwner::Find => {
+                self.search_edit_in(wid, crate::app_search::SearchEdit::Insert(text));
+                if let Some(w) = self.windows.get(&wid).and_then(|ws| ws.os_window.as_ref()) {
+                    w.request_redraw();
+                }
             }
-            return;
-        }
-        // Phase 0.5: committed text goes through the seam's Text path (the sole
-        // keyboard-mode reader + `encode_committed_text` caller), converging with
-        // the controller's text egress.
-        self.input(wid, InputEvent::Text(text), Source::Human);
-        if let Some(w) = self.windows.get(&wid).and_then(|ws| ws.os_window.as_ref()) {
-            w.request_redraw();
+            // Phase 0.5: committed text goes through the seam's Text path
+            // (the sole keyboard-mode reader + `encode_committed_text`
+            // caller), converging with the controller's text egress. A
+            // window that is gone (`None`) reaches the seam's own refusal.
+            PreeditOwner::Grid | PreeditOwner::None => {
+                self.input(wid, InputEvent::Text(text), Source::Human);
+                if let Some(w) = self.windows.get(&wid).and_then(|ws| ws.os_window.as_ref()) {
+                    w.request_redraw();
+                }
+            }
         }
     }
 
-    /// Which surface OWNS the in-flight IME composition on window `wid` — the
-    /// render-time routing twin of [`Self::on_ime_commit`]'s dispatch, in the
-    /// SAME precedence order (native view, then the inline rename field, then
-    /// the find field, then the grid), so the composition always paints exactly
-    /// where its commit would land. Consulted by the redraw path to decide which
-    /// splice paints the preedit and which one anchors the IME candidate window
-    /// (`set_ime_cursor_area`). [`PreeditOwner::None`] with no composition in
-    /// flight keeps the common path zero-cost: one `is_empty()` on a resident
-    /// `String`, no allocation, no lock.
-    pub(crate) fn preedit_owner(&self, wid: WindowId) -> PreeditOwner {
+    /// WHERE composed text on window `wid` lands — the one routing
+    /// precedence [`Self::on_ime_commit`]'s dispatch and
+    /// [`Self::preedit_owner`]'s paint both read: a frontmost native view,
+    /// then the inline rename field, then the open find field, then the
+    /// grid. Says nothing about whether a composition is in flight
+    /// (`preedit_owner` adds that gate); [`PreeditOwner::None`] only when
+    /// the window is gone.
+    fn ime_route(&self, wid: WindowId) -> PreeditOwner {
         let Some(ws) = self.windows.get(&wid) else {
             return PreeditOwner::None;
         };
-        if ws.preedit.is_empty() {
-            return PreeditOwner::None;
-        }
         if self.active_native_view(wid).is_some() {
             return PreeditOwner::Native;
         }
@@ -9662,6 +10208,26 @@ impl App {
             return PreeditOwner::Find;
         }
         PreeditOwner::Grid
+    }
+
+    /// Which surface OWNS the in-flight IME composition on window `wid` — the
+    /// render-time twin of [`Self::on_ime_commit`]'s dispatch, through the
+    /// SAME [`Self::ime_route`] (native view, then the inline rename field,
+    /// then the find field, then the grid), so the composition always paints
+    /// exactly where its commit would land. Consulted by the redraw path to
+    /// decide which splice paints the preedit and which one anchors the IME
+    /// candidate window (`set_ime_cursor_area`). [`PreeditOwner::None`] with
+    /// no composition in flight keeps the common path zero-cost: one
+    /// `is_empty()` on a resident `String`, no allocation, no lock.
+    pub(crate) fn preedit_owner(&self, wid: WindowId) -> PreeditOwner {
+        if self
+            .windows
+            .get(&wid)
+            .is_none_or(|ws| ws.preedit.is_empty())
+        {
+            return PreeditOwner::None;
+        }
+        self.ime_route(wid)
     }
 
     /// Current keyboard modifiers as a mouse-report modifier mask (shift/alt/ctrl
@@ -13026,6 +13592,112 @@ mod smooth_scroll_tests {
         );
     }
 
+    /// G15 — a line-emitting wheel event at a shell prompt takes EXACTLY ONE
+    /// terminal acquisition through the real input funnel: the seam's route
+    /// decision. The viewport scroll consumes the facts that lock read
+    /// (`WheelViewport`) instead of re-locking for `rows()` (discarded on every
+    /// non-Windows target) and again for `(display_offset, scrollback_lines)` —
+    /// three blocking acquisitions per event before, one now, for a chained
+    /// notch and a fresh one alike.
+    #[test]
+    fn a_line_wheel_event_takes_exactly_one_terminal_lock() {
+        use crate::input::{InputEvent, PixelOffset, Source};
+        use aterm_types::mouse::WheelDir;
+        let mut app = App::headless_for_test();
+        let wid = WindowId(0);
+        let _term = seed_history(&app, wid);
+        let wheel = || InputEvent::Wheel {
+            dir: WheelDir::Up,
+            lines: 1,
+            row: 0,
+            col: 0,
+            mods: 0,
+            px_off: PixelOffset::CELL_ORIGIN,
+        };
+        let acq = crate::term_lock_acquisitions_on_this_thread;
+        let before = acq();
+        app.input(wid, wheel(), Source::Human);
+        assert_eq!(acq() - before, 1, "a fresh notch: the seam's one lock");
+        assert!(
+            app.windows[&wid].scroll_glide.is_some(),
+            "…and it armed the glide from the facts that lock carried"
+        );
+        let before = acq();
+        app.input(wid, wheel(), Source::Human);
+        assert_eq!(
+            acq() - before,
+            1,
+            "a chained notch: still the seam's one lock"
+        );
+        let cell_h = app.win_cell_size(wid).1.max(1) as i64;
+        assert_eq!(
+            app.windows[&wid]
+                .scroll_glide
+                .as_ref()
+                .map(|st| st.glide.target_px()),
+            Some(2 * cell_h),
+            "the chain retargeted to two rows from the carried facts"
+        );
+    }
+
+    /// G16 — how a chained delta joins an in-flight glide depends on its KIND:
+    /// a precise (trackpad) delta EXTENDS the ease — the target moves, the
+    /// deadline does not — while a notch RETARGETS it (its own fresh 180 ms,
+    /// the M1 brief). Both still land exactly and self-disarm.
+    #[test]
+    fn a_precise_chained_delta_extends_the_glide_and_a_notch_retargets_it() {
+        let mut app = App::headless_for_test();
+        let wid = WindowId(0);
+        let term = seed_history(&app, wid);
+        let cell_h = app.cell_size().1.max(1) as i64;
+        let end_of = |app: &App| {
+            app.windows[&wid]
+                .scroll_glide
+                .as_ref()
+                .map(|st| (st.glide.end(), st.glide.target_px()))
+                .expect("a glide is armed")
+        };
+
+        // PRECISE chain: the deadline is kept, the target grows.
+        app.scroll_wheel_animated_with(wid, &term, 1, None, true);
+        let (end, target) = end_of(&app);
+        assert_eq!(target, cell_h);
+        std::thread::sleep(Duration::from_millis(5));
+        app.scroll_wheel_animated_with(wid, &term, 1, None, true);
+        let (end_after, target_after) = end_of(&app);
+        assert_eq!(
+            end_after, end,
+            "a precise chain does not push the deadline out"
+        );
+        assert_eq!(target_after, 2 * cell_h, "…but moves the target");
+        app.tick_scroll_glide(wid, end + Duration::from_millis(1));
+        assert_eq!(
+            term_lock(&term).grid().display_offset(),
+            2,
+            "the extended ease lands exactly at the original deadline"
+        );
+        assert!(
+            app.windows[&wid].scroll_glide.is_none(),
+            "…and disarms there"
+        );
+
+        // NOTCH chain: the ease restarts (the deadline moves out with it).
+        app.scroll_wheel_animated(wid, &term, 1);
+        let (end, target) = end_of(&app);
+        assert_eq!(target, 3 * cell_h);
+        std::thread::sleep(Duration::from_millis(5));
+        app.scroll_wheel_animated(wid, &term, 1);
+        let (end_after, target_after) = end_of(&app);
+        assert!(
+            end_after > end,
+            "a notch chain retargets: a fresh 180 ms ease"
+        );
+        assert_eq!(target_after, 4 * cell_h);
+        app.tick_scroll_glide(wid, end_after + Duration::from_millis(1));
+        assert_eq!(term_lock(&term).grid().display_offset(), 4);
+        assert!(app.windows[&wid].scroll_glide.is_none());
+    }
+
     /// M1(b) regression — the wheel's tracking-OFF fallback GLIDES under a Full
     /// motion policy: the notch arms a self-disarming ease (no instant jump),
     /// chained notches RETARGET the same ease, the final tick lands the
@@ -14649,6 +15321,73 @@ mod press_path_lock_elision_tests {
     use aterm_core::terminal::Terminal;
     use winit::keyboard::ModifiersState;
 
+    /// P03 (a)+(b) — a BARE MODIFIER PRESS leaves `on_key` before the lock-state
+    /// RPC, the press scope and the encoder: no `lock_modifiers` call, no bytes,
+    /// the physical press recorded as Consumed (so its release pairs and is
+    /// swallowed), and `input_hot` left dark. Under kitty REPORT_ALL_KEYS_AS_ESC
+    /// the modifier IS a reported key: the RPC runs and `ESC[57441u` is written.
+    /// The old ladder ran everything for zero bytes — this fails red there on
+    /// the RPC count.
+    #[cfg(unix)]
+    #[test]
+    fn a_bare_modifier_press_skips_the_ladder_unless_kitty_reports_all_keys() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        static RPC: AtomicUsize = AtomicUsize::new(0);
+        fn counting_lock_modifiers() -> aterm_types::keyboard::Modifiers {
+            RPC.fetch_add(1, Ordering::Relaxed);
+            aterm_types::keyboard::Modifiers::empty()
+        }
+        let (mut app, pipe) = app_observing_pty();
+        app.lock_modifiers = counting_lock_modifiers;
+        let wid = WindowId(0);
+        let shift =
+            |state| modifier_event(winit::keyboard::NamedKey::Shift, KeyCode::ShiftLeft, state);
+
+        RPC.store(0, Ordering::Relaxed);
+        app.on_key(wid, shift(ElementState::Pressed));
+        assert_eq!(
+            RPC.load(Ordering::Relaxed),
+            0,
+            "legacy mode: no IOKit RPC for a bare Shift"
+        );
+        assert!(
+            drain(pipe).is_empty(),
+            "legacy mode: a bare Shift writes nothing"
+        );
+        assert!(
+            matches!(
+                app.physical_press_owners
+                    .get(&PhysicalKey::Code(KeyCode::ShiftLeft)),
+                Some(crate::PhysicalPressOwner::Consumed { .. })
+            ),
+            "the press must be recorded Consumed so its release pairs and is swallowed"
+        );
+        assert!(
+            !app.windows[&wid].input_hot,
+            "a bare modifier must not arm the keystroke-priority frame admission"
+        );
+        app.on_key(wid, shift(ElementState::Released));
+        assert!(drain(pipe).is_empty(), "…and its release is swallowed");
+
+        // Negotiate report-all on the front terminal (the reader would do this
+        // under the lock; the mirror republishes at the end of `process`).
+        let term = app.front_terminal(wid).expect("terminal").term.clone();
+        term_lock(&term).process(b"\x1b[>8u");
+        app.on_key(wid, shift(ElementState::Pressed));
+        assert_eq!(
+            RPC.load(Ordering::Relaxed),
+            1,
+            "report-all: the modifier is a real key"
+        );
+        // kitty reports a modifier key with its OWN modifier bit set: Shift is
+        // `57441` with mods `1+1 = 2` — `ESC [ 57441 ; 2 u`.
+        assert_eq!(
+            drain(pipe),
+            b"\x1b[57441;2u".to_vec(),
+            "report-all: the bare Shift press is reported"
+        );
+    }
+
     /// A bare MODIFIER or LOCK key as winit really delivers it.
     fn modifier_event(
         named: winit::keyboard::NamedKey,
@@ -14891,6 +15630,64 @@ mod press_path_lock_elision_tests {
                     "the copy has something to copy (settled_first={settled_first})"
                 );
             }
+        }
+    }
+
+    /// …AND INERT MEANS INERT ABOUT THE MOVE LICENCE TOO (2026-09-13, the
+    /// word hop that sounded only while Option stayed down).
+    ///
+    /// Option+Left/Right have NO key-time cue — the keyed seam opens only for
+    /// a typed glyph, and D11 vetoes a nav pre-cue so a no-op Ctrl-E stays
+    /// silent — so the whole sound of a word move is minted when the ECHO's
+    /// caret delta is licensed by the `nav_hint` the press stamped. macOS
+    /// delivers `flags_changed` as a synthesized `KeyboardInput` Pressed for
+    /// `Named(Alt|Shift|…)`, and `on_key` routed every non-plain-glyph press
+    /// to `clear_move_license` — so resting or re-tapping Option while the
+    /// previous hop's echo was still in flight revoked that hop's licence and
+    /// the echo declined `no-fresh-hint`: silent with Option tapped, audible
+    /// with Option held, same gesture.
+    ///
+    /// A bare modifier types nothing, moves nothing and writes no PTY bytes,
+    /// so it has nothing to supersede. Every intent-bearing press still does.
+    #[test]
+    fn a_bare_modifier_press_does_not_revoke_a_word_moves_licence() {
+        use std::time::Instant;
+
+        use winit::keyboard::NamedKey as WNamed;
+
+        let mut app = App::headless_for_test();
+        let wid = WindowId(0);
+
+        for (named, code, keeps) in [
+            (WNamed::Alt, KeyCode::AltLeft, true),
+            (WNamed::Shift, KeyCode::ShiftLeft, true),
+            (WNamed::Control, KeyCode::ControlLeft, true),
+            (WNamed::Super, KeyCode::SuperLeft, true),
+            (WNamed::CapsLock, KeyCode::CapsLock, true),
+            // The control: an intent-bearing press still closes the cohort.
+            (WNamed::Backspace, KeyCode::Backspace, false),
+            (WNamed::Escape, KeyCode::Escape, false),
+        ] {
+            let now = Instant::now();
+            {
+                let ws = app.windows.get_mut(&wid).expect("window");
+                // Option+Left: the press stamps the only licence a word move
+                // ever gets, and its echo has not landed yet.
+                ws.cursor_glow.note_motion(now);
+                ws.cursor_trail.note_navigation(now);
+                assert!(ws.cursor_glow.move_licensed(now));
+            }
+            app.on_key(wid, modifier_event(named, code, ElementState::Pressed));
+            let ws = &app.windows[&wid];
+            assert_eq!(
+                (
+                    ws.cursor_glow.move_licensed(now),
+                    ws.cursor_trail.move_licensed(now)
+                ),
+                (keeps, keeps),
+                "{named:?}: a bare modifier expresses no intent and must not \
+                 revoke the word move's licence, while a real chord must"
+            );
         }
     }
 
@@ -16109,6 +16906,122 @@ mod paste_cursor_gesture_tests {
         let (spawns, _, width) = delivered_paste_then_hop("a\tb", cap + 1, true);
         assert_eq!(width, Some(InsertWidth::Unknown));
         assert_eq!(spawns, 0, "…and an echo past the cap is not");
+    }
+
+    /// Drive the PRODUCTION delivery edge — the render prelude inside
+    /// [`App::tick_cursor_fx`] — rather than replicate it: a real paste
+    /// through `App::input`, the FIFO writer landing it, and one prelude
+    /// tick presenting the echo hop `(2, 2) → (2, 2 + hop)`. With
+    /// `baselined`, a seed tick first reads the register (the window's
+    /// `delivery_seen` baseline); without it the window's baseline is
+    /// forgotten before the paste (a session switch, a first read), the
+    /// shape the prelude must baseline silently. Returns `(spawns, the
+    /// ring's last licence token, `delivery_seen`)`.
+    #[cfg(unix)]
+    fn prelude_paste_then_hop(
+        text: &str,
+        hop: u16,
+        baselined: bool,
+    ) -> (u64, &'static str, Option<(u64, u64)>) {
+        use crate::app_render::CursorFxInputs;
+
+        let mut pipe = [0; 2];
+        assert_eq!(unsafe { libc::pipe(pipe.as_mut_ptr()) }, 0);
+        let sink = Arc::new(SinkWriter::new(pipe[1]));
+        let master = sink.master();
+        let mut app = App::headless_for_test_with_sink(sink.clone());
+        let wid = WindowId(0);
+        app.config.motion = Some("full".into());
+        app.config.cursor_trail = Some(true);
+        app.config.cursor_trail_style = Some("rainbow kitty".to_string());
+        app.config.trail_sounds = Some(false);
+        app.windows.get_mut(&wid).unwrap().focused = true;
+        app.frontmost_window = Some(wid);
+        let session = app.front_terminal(wid).unwrap().session;
+        // The seed tick: the engines learn the caret and the prelude reads
+        // the register for the first time — nothing to apply, and the
+        // window baselines at the tracker's newest serial (0).
+        let mut seed = CursorFxInputs::sample_for_test(Instant::now());
+        seed.cur = Some((2, 2));
+        app.tick_cursor_fx(wid, seed).expect("seed tick");
+        assert_eq!(
+            app.windows[&wid].delivery_seen,
+            Some((session, 0)),
+            "the first read baselines at the tracker's newest serial"
+        );
+        if !baselined {
+            app.windows.get_mut(&wid).unwrap().delivery_seen = None;
+        }
+        assert_eq!(
+            app.input(
+                wid,
+                InputEvent::Paste(text.to_string(), crate::input::PasteFraming::AtDrain),
+                Source::Human
+            ),
+            crate::input::InputOutcome::Ok
+        );
+        for _ in 0..400 {
+            if !super::paste_order::is_ordering(master) {
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(1));
+        }
+        assert!(!super::paste_order::is_ordering(master));
+        // The frame that first observes the echo: the prelude reads the
+        // receipt, arms the engine, and the tick judges the hop.
+        let mut live = CursorFxInputs::sample_for_test(Instant::now());
+        live.cur = Some((2, 2 + hop));
+        app.tick_cursor_fx(wid, live).expect("live tick");
+        let ws = &app.windows[&wid];
+        let licence = ws
+            .cursor_glow
+            .admission_log()
+            .last()
+            .map_or("no-row", |r| r.licence);
+        let out = (ws.cursor_glow.spawns(), licence, ws.delivery_seen);
+        drop(app);
+        drop(sink);
+        unsafe {
+            libc::close(pipe[0]);
+            libc::close(pipe[1]);
+        }
+        out
+    }
+
+    /// THE PRODUCTION DELIVERY EDGE IS PINNED (2026-09-13): the render
+    /// prelude's receipt application in `tick_cursor_fx` — the `(session,
+    /// serial)` baseline, the freshness skip, the Rainbow Kitty gate, the
+    /// `latest` advance — had no caller in any test; every host test
+    /// hand-applied the receipts it read. Here the prelude itself reads a
+    /// real paste's receipt on the frame that observes the echo and the hop
+    /// of exactly its width is laid `licence=insert`, and the window records
+    /// the serial as seen. The twin: a window with NO baseline (a session
+    /// switch, a first read) baselines at the newest serial and applies
+    /// nothing — the same hop is program output — and still records the
+    /// serial, so the receipt is neither applied late nor re-read.
+    ///
+    /// Fails under an inverted freshness gate, a baseline that applies on
+    /// the first read, or a `latest` that does not advance.
+    #[cfg(unix)]
+    #[test]
+    fn the_render_prelude_applies_a_delivered_paste_and_baselines_a_fresh_window() {
+        let (spawns, licence, seen) = prelude_paste_then_hop("foo bar ", 8, true);
+        assert_eq!(licence, "insert", "the prelude armed the engine");
+        assert_eq!(spawns, 1, "the delivered paste's echo is licensed");
+        let session = seen.map(|(session, _)| session).expect("the window read");
+        assert_eq!(seen, Some((session, 1)), "the receipt's serial is seen");
+
+        let (spawns, licence, seen) = prelude_paste_then_hop("foo bar ", 8, false);
+        assert_ne!(
+            licence, "insert",
+            "a window with no baseline applies nothing on its first read"
+        );
+        assert_eq!(spawns, 0, "the hop is program output to it");
+        assert_eq!(
+            seen,
+            Some((session, 1)),
+            "…and it baselines at the newest serial all the same"
+        );
     }
 
     /// TIER 1 for the delivery edge: the host's two decisions project onto
@@ -17475,6 +18388,354 @@ mod typed_kitty_summon_tests {
                 ws.cursor_glow.in_flight_tally().swallowed_no_echo,
                 if banks { 0 } else { 3 },
                 "{label}: the `swallowed_no_echo=` tally"
+            );
+            drop(app);
+            drop(sink);
+            // SAFETY: both fds are ours and open; the borrowed-fd sink did
+            // not close the master.
+            unsafe {
+                libc::close(slave);
+                libc::close(master);
+            }
+        }
+    }
+
+    /// A BACKSPACE INTO A COMMITTED IME RUN GIVES BACK ONE GLYPH'S CREDIT
+    /// (2026-09-13). The host banks an IME commit as ONE press priced at
+    /// its summed width, so the engine's whole-press retire at a Backspace
+    /// dropped a three-glyph CJK run's six credits for one erased glyph and
+    /// the surviving two glyphs' +4 echo went dark. The host now remembers
+    /// the last typed dispatch's per-grapheme widths and prices each
+    /// Backspace from them: `日本語` (6) ⌫ → 4 ⌫ → 2 ⌫ → 0. A plain key
+    /// still goes whole (`ab` ⌫ → 1 ⌫ → 0), and a press of another class
+    /// between the commit and the Backspace empties the memory so the erase
+    /// falls back to the whole-press retire. Real cooked pty: the writes
+    /// must land, or the failed-write revoke takes the credits itself.
+    #[cfg(unix)]
+    #[test]
+    fn a_backspace_into_an_ime_run_gives_back_one_glyphs_credit() {
+        use aterm_session::sink::SinkWriter;
+        use std::sync::Arc;
+
+        let (master, slave) = pty_pair_with_lflag(|_| {});
+        let sink = Arc::new(SinkWriter::new(master));
+        let mut app = App::headless_for_test_with_sink(sink.clone());
+        app.recompute_sparkle();
+        let wid = WindowId(0);
+        app.config.cursor_trail = Some(true);
+        app.config.cursor_trail_style = Some("rainbow kitty".to_string());
+        let glow_cfg = app.glow_config();
+        let geom = crate::cursor_glow::Geom {
+            cw: 8,
+            ch: 16,
+            rows: 24,
+            cols: 80,
+            origin_x: 0,
+            origin_y: 0,
+            win_w: 640,
+            win_h: 384,
+            head: 0,
+        };
+        let mut out = Vec::new();
+        let mut credits = |app: &mut App| {
+            let ws = app.windows.get_mut(&wid).unwrap();
+            ws.cursor_glow
+                .tick(Some((0, 0)), Instant::now(), &glow_cfg, geom, &mut out);
+            ws.cursor_glow.in_flight_tally().credits
+        };
+        // Seed the engine: the unseeded first draw drops every bank.
+        assert_eq!(credits(&mut app), 0);
+        let ok = crate::input::InputOutcome::Ok;
+
+        assert_eq!(
+            app.input(wid, InputEvent::Text("日本語".to_string()), Source::Human),
+            ok
+        );
+        assert_eq!(credits(&mut app), 6, "one press, three glyphs, six cells");
+        let mut expect = [4usize, 2, 0];
+        for want in &mut expect {
+            assert_eq!(
+                app.input(wid, named(NamedKey::Backspace), Source::Human),
+                ok
+            );
+            assert_eq!(credits(&mut app), *want, "one glyph's cells given back");
+        }
+        // A plain key is whole: the memory holds one width per press.
+        type_word(&mut app, wid, "ab");
+        assert_eq!(credits(&mut app), 2);
+        assert_eq!(
+            app.input(wid, named(NamedKey::Backspace), Source::Human),
+            ok
+        );
+        assert_eq!(credits(&mut app), 1);
+        assert_eq!(
+            app.input(wid, named(NamedKey::Backspace), Source::Human),
+            ok
+        );
+        assert_eq!(credits(&mut app), 0);
+        // Another class between the commit and the erase empties the memory:
+        // the arrow's own licence closes the row, and the Backspace after it
+        // prices nothing — the whole-press retire, as for a plain key.
+        assert_eq!(
+            app.input(wid, InputEvent::Text("日本".to_string()), Source::Human),
+            ok
+        );
+        assert_eq!(
+            app.input(wid, named(NamedKey::ArrowLeft), Source::Human),
+            ok
+        );
+        assert_eq!(
+            app.input(wid, named(NamedKey::Backspace), Source::Human),
+            ok
+        );
+        assert_eq!(
+            credits(&mut app),
+            0,
+            "unpriced: the whole newest press goes, as before"
+        );
+        drop(app);
+        drop(sink);
+        // SAFETY: both fds are ours and open; the borrowed-fd sink did not
+        // close the master.
+        unsafe {
+            libc::close(slave);
+            libc::close(master);
+        }
+    }
+
+    /// A BACKSPACE ERASING A ZERO-WIDTH GLYPH GIVES BACK A PRICED NOTHING
+    /// (2026-09-13). A committed run that advances is remembered per
+    /// grapheme, and a cluster in it can be zero wide: `\u{0301}日本` — a
+    /// base-less combining mark ahead of two CJK glyphs — prices 0, 2, 2
+    /// and banks ONE press of four cells. Popped for the Backspace that
+    /// erases the mark, that 0 used to be the same value as "nothing
+    /// remembered", and the engine's whole-press retire took the newest
+    /// press — which, the run paid out, is the key typed BEFORE it: `x`
+    /// lost its credit for a glyph the hand never erased. A priced zero now
+    /// retires nothing: `x` then the run (5) ⌫ → 3 ⌫ → 1 ⌫ → 1, and only
+    /// the fourth Backspace — the memory empty, the erase unpriced — takes
+    /// `x`. Real cooked pty, as the sibling above: the writes must land.
+    ///
+    /// RED before the fix: the third Backspace left 0, not 1.
+    #[cfg(unix)]
+    #[test]
+    fn a_backspace_erasing_a_zero_width_glyph_gives_back_a_priced_nothing() {
+        use aterm_session::sink::SinkWriter;
+        use std::sync::Arc;
+
+        let mut widths = Vec::new();
+        super::committed_grapheme_cells_into("\u{0301}日本", false, &mut widths);
+        assert_eq!(
+            widths,
+            [0, 2, 2],
+            "the mark is a priced zero inside the run"
+        );
+        assert_eq!(super::committed_text_cells("\u{0301}日本", false), 4);
+
+        let (master, slave) = pty_pair_with_lflag(|_| {});
+        let sink = Arc::new(SinkWriter::new(master));
+        let mut app = App::headless_for_test_with_sink(sink.clone());
+        app.recompute_sparkle();
+        let wid = WindowId(0);
+        app.config.cursor_trail = Some(true);
+        app.config.cursor_trail_style = Some("rainbow kitty".to_string());
+        let glow_cfg = app.glow_config();
+        let geom = crate::cursor_glow::Geom {
+            cw: 8,
+            ch: 16,
+            rows: 24,
+            cols: 80,
+            origin_x: 0,
+            origin_y: 0,
+            win_w: 640,
+            win_h: 384,
+            head: 0,
+        };
+        let mut out = Vec::new();
+        let mut credits = |app: &mut App| {
+            let ws = app.windows.get_mut(&wid).unwrap();
+            ws.cursor_glow
+                .tick(Some((0, 0)), Instant::now(), &glow_cfg, geom, &mut out);
+            ws.cursor_glow.in_flight_tally().credits
+        };
+        assert_eq!(credits(&mut app), 0, "seeded");
+        let ok = crate::input::InputOutcome::Ok;
+
+        type_word(&mut app, wid, "x");
+        assert_eq!(credits(&mut app), 1);
+        assert_eq!(
+            app.input(
+                wid,
+                InputEvent::Text("\u{0301}日本".to_string()),
+                Source::Human
+            ),
+            ok
+        );
+        assert_eq!(
+            credits(&mut app),
+            5,
+            "one key, then one press of four cells"
+        );
+        for (want, why) in [
+            (3, "本 given back"),
+            (1, "日 given back: the run is paid out"),
+            (1, "the mark: a priced zero, and `x` untouched"),
+            (0, "unpriced: the whole newest press — `x` — as ever"),
+        ] {
+            assert_eq!(
+                app.input(wid, named(NamedKey::Backspace), Source::Human),
+                ok
+            );
+            assert_eq!(credits(&mut app), want, "{why}");
+        }
+        drop(app);
+        drop(sink);
+        // SAFETY: both fds are ours and open; the borrowed-fd sink did not
+        // close the master.
+        unsafe {
+            libc::close(slave);
+            libc::close(master);
+        }
+    }
+
+    /// A SWALLOWED PRESS WHOSE WRITE FAILS IS NOT TALLIED (2026-09-13).
+    /// `swallowed_no_echo=` counts presses the host typed into a tty that
+    /// will never echo them — presses that REACHED the tty. The tally was
+    /// taken at the key, ahead of the PTY write, so a press whose inline
+    /// write then failed (revoked, never on the wire) still counted as one
+    /// the tty swallowed. Same canonical no-echo pty as the press rule's
+    /// test, its SLAVE closed before the key: the master still answers the
+    /// termios read (ECHO clear, ICANON set — the press IS withheld), the
+    /// write fails `EIO`, and the tally must read 0.
+    ///
+    /// RED before the fix: `swallowed_no_echo == 1` beside `WriteFailed`.
+    #[cfg(unix)]
+    #[test]
+    fn a_swallowed_press_whose_write_fails_is_not_tallied() {
+        use aterm_session::sink::SinkWriter;
+        use std::sync::Arc;
+
+        let (master, slave) = pty_pair_with_lflag(|l| *l &= !libc::ECHO);
+        // SAFETY: the slave is ours and open; closing it is the point.
+        unsafe {
+            libc::close(slave);
+        }
+        let sink = Arc::new(SinkWriter::new(master));
+        let echo = sink.tty_echo().expect("a slave-less master still answers");
+        assert!(echo.swallows_input(), "the press is withheld regardless");
+        let mut app = App::headless_for_test_with_sink(sink.clone());
+        app.recompute_sparkle();
+        let wid = WindowId(0);
+        app.config.cursor_trail = Some(true);
+        app.config.cursor_trail_style = Some("rainbow kitty".to_string());
+        assert_eq!(
+            app.input(wid, key('a'), Source::Human),
+            crate::input::InputOutcome::WriteFailed,
+            "no slave: the inline write fails"
+        );
+        let ws = app.windows.get(&wid).unwrap();
+        assert_eq!(
+            ws.cursor_glow.in_flight_tally().swallowed_no_echo,
+            0,
+            "a press that never reached the tty was not swallowed by it"
+        );
+        assert!(!ws.cursor_glow.move_licensed(Instant::now()));
+        drop(app);
+        drop(sink);
+        // SAFETY: the master is ours and open; the borrowed-fd sink did not
+        // close it.
+        unsafe {
+            libc::close(master);
+        }
+    }
+
+    /// A PASTE THE TTY WILL NOT ECHO CARRIES NO DELIVERY TICKET (2026-09-13,
+    /// the paste half of the password-mode rule). The press path withholds
+    /// its typed ticket when the master's termios says the kernel will not
+    /// echo (`tty_swallows`, above); the paste path priced and published its
+    /// insert ticket regardless, so a paste into `read -s` / `sudo` / an
+    /// `ssh` passphrase armed a two-second same-row insert licence that a
+    /// program print on that row inside the window (`read -s -p 'Password: '
+    /// pw; echo ' ok'`) could spend as a phantom — program output lit with no
+    /// echoed byte behind it, the exact shape the press rule closed. Same
+    /// three ptys, one paste into each: cooked and raw publish the priced
+    /// insert as ever; canonical no-echo publishes NO insert receipt. The
+    /// bytes reach the PTY in every case, and the gesture stamp, the
+    /// up-strum cue and the pet note are unchanged.
+    ///
+    /// RED before the paste gate: the middle pty published `Cells(8)`.
+    #[cfg(unix)]
+    #[test]
+    fn a_paste_the_tty_will_not_echo_publishes_no_insert_receipt() {
+        use aterm_effects::cursor_glow::InsertWidth;
+        use aterm_session::sink::SinkWriter;
+        use std::sync::Arc;
+
+        type Edit = fn(&mut libc::tcflag_t);
+        let cases: [(&str, Edit, bool); 3] = [
+            ("cooked (echo+icanon)", |_| {}, true),
+            ("canonical no-echo (read -s)", |l| *l &= !libc::ECHO, false),
+            (
+                "raw (a TUI echoes for itself)",
+                |l| *l &= !(libc::ECHO | libc::ICANON),
+                true,
+            ),
+        ];
+        for (label, edit, ticketed) in cases {
+            let (master, slave) = pty_pair_with_lflag(edit);
+            let sink = Arc::new(SinkWriter::new(master));
+            let echo = sink.tty_echo().expect("a pty master answers");
+            assert_eq!(
+                echo.swallows_input(),
+                !ticketed,
+                "{label}: the sink's verdict"
+            );
+            let mut app = App::headless_for_test_with_sink(sink.clone());
+            app.recompute_sparkle();
+            let wid = WindowId(0);
+            app.config.cursor_trail = Some(true);
+            app.config.cursor_trail_style = Some("rainbow kitty".to_string());
+            assert_eq!(
+                app.input(
+                    wid,
+                    InputEvent::Paste("foo bar ".to_string(), crate::input::PasteFraming::AtDrain),
+                    Source::Human
+                ),
+                crate::input::InputOutcome::Ok
+            );
+            // The FIFO drains: the writer thread's completed write is the
+            // delivery edge.
+            for _ in 0..400 {
+                if !super::paste_order::is_ordering(master) {
+                    break;
+                }
+                std::thread::sleep(Duration::from_millis(1));
+            }
+            assert!(
+                !super::paste_order::is_ordering(master),
+                "{label}: the FIFO drained"
+            );
+            let now = Instant::now();
+            let session = app.front_terminal(wid).unwrap().session;
+            let ctx = &app.pool.get(session).unwrap().ctx;
+            assert!(
+                ctx.output_echo
+                    .sample(&ctx.sink, now)
+                    .last_accepted_at
+                    .is_some(),
+                "{label}: the bytes reached the PTY regardless"
+            );
+            let batch = ctx.output_echo.deliveries_after(&ctx.sink, Some(0), now);
+            let insert = batch.items.iter().flatten().find_map(|(_, t)| t.insert);
+            assert_eq!(
+                insert,
+                ticketed.then_some(InsertWidth::Cells(8)),
+                "{label}: the insert receipt"
+            );
+            assert_eq!(
+                batch.latest,
+                u64::from(ticketed),
+                "{label}: a withheld ticket publishes no receipt at all"
             );
             drop(app);
             drop(sink);

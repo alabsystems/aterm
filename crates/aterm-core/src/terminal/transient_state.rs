@@ -88,6 +88,15 @@ pub(super) struct TransientState {
     /// level true (the ~1 present/timeout freeze). Never reset to 0 — the reset
     /// paths bump it instead, so any change means "at least one close".
     pub(super) sync_end_seq: u64,
+    /// Monotonic count of FULL RESETS (RIS `ESC c` and [`Terminal::reset`]) —
+    /// bumped by [`reset`](Self::reset), which both paths reach through
+    /// `reset_common_fields`, and never zeroed. The alt-screen archive compares it
+    /// at every commit point to learn that a reset wiped the screen it was
+    /// following, without the handler ever holding the archive (observation state
+    /// stays out of the handler, like `watchers`).
+    ///
+    /// [`Terminal::reset`]: super::Terminal::reset
+    pub(super) reset_generation: u64,
     /// Whether the CURRENT synchronized-output window has accepted any complete
     /// PTY action since its opening `?2026h`. A host may safely present a
     /// just-closed frame while the mode level already reads true again only
@@ -229,6 +238,7 @@ impl TransientState {
             vt52_cursor_state: Vt52CursorState::None,
             sync_start: None,
             sync_end_seq: 0,
+            reset_generation: 0,
             sync_open_dirty: false,
             // Placeholders; overwritten at the top of every process_at() before
             // any reader runs, so this value is never observed as state.
@@ -279,6 +289,8 @@ impl TransientState {
         if self.sync_start.is_some() {
             self.sync_end_seq += 1;
         }
+        // Never zeroed either: the alt-screen archive keys its wipe on a change.
+        self.reset_generation = self.reset_generation.wrapping_add(1);
         self.sync_start = None;
         self.sync_open_dirty = false;
         self.sgr_stack.clear();

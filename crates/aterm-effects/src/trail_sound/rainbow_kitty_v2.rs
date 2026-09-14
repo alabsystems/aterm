@@ -4824,6 +4824,22 @@ impl TrailSynth {
     /// meteor, and the sound a fizzled arm resolves into.
     fn v2_nav_tick(&mut self, ev: &SoundEvent) {
         let deg = i32::from(self.v2.walk) + i32::from(self.song_key);
+        let f = penta(TINE_BASE_HZ, deg);
+        // §9.5 LAW 5 — A SAME-PITCH RE-STRIKE DAMPS THE OLD VOICE FIRST, in
+        // the tune lane among others, and the nav tick is the ONE tune voice
+        // that is ALWAYS a same-pitch re-strike: navigation never advances the
+        // verse (§12.3, "melody untouched"), so every tick of a
+        // Option+Left/Right pair or a held-key repeat is this exact `f`.
+        //
+        // Two independently phased 81 ms sines at one frequency comb: measured
+        // over 32 seeds, the second tick of a 33 ms pair peaked −4.0 … +3.0 dB
+        // against a lone tick (−3.3 … +4.4 dB at 16 ms). On a voice this quiet
+        // (−24 dB re the step) a random −4 dB is the difference between a word
+        // hop heard and a word hop missed — the owner's "they don't always
+        // play" with the cue ledger reading a clean 20/20. Damping first makes
+        // a re-struck tick REPLACE rather than beat against its predecessor,
+        // exactly as `v2_typed`'s `plan.repeat` arm does for the lead.
+        self.v2_damp_same_pitch(LANE_TUNE, f);
         let voice = Voice {
             dur: NAV_DUR_S,
             attack: NAV_ATTACK_S,
@@ -4831,7 +4847,7 @@ impl TrailSynth {
             p: [
                 Partial {
                     lvl: P1_LVL,
-                    f0: penta(TINE_BASE_HZ, deg),
+                    f0: f,
                     ..Partial::default()
                 },
                 Partial::default(),
@@ -12839,5 +12855,129 @@ for it up front.\n\
             caught_old_gate >= 10,
             "hot lit knocks must exercise the old gate"
         );
+    }
+
+    // ---- THE WORD MOVE IS THE SAME LOUDNESS EVERY TIME (2026-09-13) --------
+
+    /// §9.5 LAW 5 IN THE TUNE LANE — "a same-pitch re-strike damps the old
+    /// voice first (12 ms)". The nav tick is the one tune voice that is ALWAYS
+    /// a same-pitch re-strike: navigation never advances the verse (§12.3,
+    /// "melody untouched"), so a word-hop pair and a held-key repeat re-strike
+    /// this exact frequency, and until 2026-09-13 the second one spawned with
+    /// its own seeded phase beside the first one's live 81 ms tail.
+    ///
+    /// Two independently phased sines at one frequency are a comb: measured
+    /// over 32 seeds, the second tick of a 33 ms pair peaked −3.9 … +2.9 dB
+    /// against a lone tick, and −3.0 … +4.6 dB at 16 ms. At −24 dB re the step
+    /// a random −4 dB is a word hop that reads as simply not having played —
+    /// the owner's "they don't always play" with the cue ledger clean.
+    #[test]
+    fn a_re_struck_nav_tick_replaces_its_predecessor_instead_of_combing() {
+        // THE LAW, structurally: after the second tick nothing at that pitch
+        // is left sounding undamped in the tune lane.
+        let mut s = synth();
+        s.push(event(SoundKind::Navigation, 0.0, false));
+        let mut buf = [0.0f32; 96];
+        for _ in 0..20 {
+            s.render(&mut buf);
+        }
+        let f = penta(TINE_BASE_HZ, i32::from(s.v2.walk) + i32::from(s.song_key));
+        let live_before = s
+            .voices
+            .iter()
+            .filter(|v| v.on && v.lane == LANE_TUNE && (v.p[0].f0 - f).abs() < SAME_PITCH_HZ)
+            .count();
+        assert_eq!(live_before, 1, "the first tick is still sounding");
+        s.push(event(SoundKind::Navigation, 0.0, false));
+        let undamped = s
+            .voices
+            .iter()
+            .filter(|v| {
+                v.on && v.lane == LANE_TUNE
+                    && (v.p[0].f0 - f).abs() < SAME_PITCH_HZ
+                    && v.damp <= 0.0
+            })
+            .count();
+        assert_eq!(
+            undamped, 1,
+            "§9.5 law 5: exactly the newcomer is undamped at that pitch"
+        );
+
+        // THE LAW, audibly: the second tick's own window must peak within a
+        // narrow band of a lone tick's, at every cadence a hand or a key
+        // repeat can produce.
+        fn second_window_peak(seed: u32, pair: bool, delta_ms: usize) -> f32 {
+            let mut s = TrailSynth::new(SR, seed);
+            let mut buf = [0.0f32; 96]; // 1 ms of stereo @ 48 kHz
+            if pair {
+                s.push(event(SoundKind::Navigation, 0.0, false));
+                for _ in 0..delta_ms {
+                    s.render(&mut buf);
+                }
+            }
+            s.push(event(SoundKind::Navigation, 0.0, false));
+            let mut peak = 0.0f32;
+            // The tick's whole life: NAV_DUR_S = 2.7 × 30 ms = 81 ms.
+            for _ in 0..90 {
+                s.render(&mut buf);
+                for sample in buf {
+                    peak = peak.max(sample.abs());
+                }
+            }
+            peak
+        }
+        for delta in [16usize, 33, 66] {
+            let (mut lo, mut hi) = (f32::MAX, f32::MIN);
+            for k in 0..32u32 {
+                let seed = 0x1000_0001u32.wrapping_mul(k + 1) ^ 0x5EED_BEEF;
+                let solo = second_window_peak(seed, false, delta);
+                let pair = second_window_peak(seed, true, delta);
+                let db = 20.0 * (pair / solo).log10();
+                lo = lo.min(db);
+                hi = hi.max(db);
+            }
+            // Pre-fix these read −3.00/+4.62 (16 ms), −3.93/+2.87 (33 ms) and
+            // −1.07/+1.13 (66 ms); the damped tail leaves at most a small
+            // SUM, and a re-struck tick is never QUIETER than a lone one.
+            assert!(
+                lo >= -1.0 && hi <= 3.0,
+                "{delta} ms pair: the re-struck tick swings {lo:.2} … {hi:.2} dB \
+                 against a lone tick — that is a comb, not a re-strike"
+            );
+        }
+    }
+
+    /// THE V1 GOVERNOR IS NOT A DROP PATH FOR A WORD HOP. The rainbow-kitty
+    /// ENGINE is engaged by the LOOK and the SYNTH by the VOICE, so a named
+    /// instrument under the rainbow kitty style sends `Navigation` — which
+    /// only that engine mints — down the v1 admission chain, where `MIN_GAP`
+    /// thinning silenced any hop arriving within 45 ms of the key before it.
+    /// The glow already rate-limits it at one cue per observed move.
+    #[test]
+    fn a_word_hop_is_never_thinned_by_the_typing_gap_under_a_named_instrument() {
+        for voice in [SoundVoice::Style, SoundVoice::Marimba] {
+            let mut s = synth();
+            let typed = SoundEvent {
+                voice,
+                ..event(SoundKind::Typed, 0.0, false)
+            };
+            let nav = SoundEvent {
+                voice,
+                ..event(SoundKind::Navigation, 0.0, false)
+            };
+            s.push(typed);
+            let after_key = s.voices.iter().filter(|v| v.on).count();
+            // 30 ms later — inside MIN_GAP (45 ms).
+            let mut buf = [0.0f32; 96];
+            for _ in 0..30 {
+                s.render(&mut buf);
+            }
+            s.push(nav);
+            let after_nav = s.voices.iter().filter(|v| v.on).count();
+            assert!(
+                after_nav > after_key,
+                "{voice:?}: a word hop 30 ms after a key must still sound"
+            );
+        }
     }
 }

@@ -62,7 +62,7 @@
 use std::sync::Mutex;
 
 use aterm_core::selection::SelectionSide;
-use aterm_core::terminal::Terminal;
+use aterm_core::terminal::{ModeMirror, Terminal};
 use aterm_session::Op;
 #[cfg(test)]
 use aterm_session::sink::ImmediateWrite;
@@ -445,10 +445,14 @@ fn delivered(res: std::io::Result<usize>, intended: usize) -> Delivery {
 fn delivered_receipt(
     result: Result<WriteReceipt, WriteReceiptError>,
     intended: usize,
-) -> (Delivery, Option<AcceptedOrder>) {
+) -> (Delivery, Option<AcceptedOrder>, bool) {
     match result {
-        Ok(receipt) => (delivered(Ok(receipt.accepted()), intended), receipt.order()),
-        Err(error) => (Delivery::Failed, error.order()),
+        Ok(receipt) => (
+            delivered(Ok(receipt.accepted()), intended),
+            receipt.order(),
+            receipt.is_direct(),
+        ),
+        Err(error) => (Delivery::Failed, error.order(), false),
     }
 }
 
@@ -465,7 +469,33 @@ pub enum Egress {
     Reported(Delivery),
     /// Mouse tracking is OFF: `App::input` must run the local fallback (selection
     /// gesture for a button/move, viewport scroll of `wheel_lines` for a wheel).
-    TrackingOff { wheel_lines: i32, wheel_up: bool },
+    /// A wheel's fallback also carries the engine facts the viewport scroll
+    /// needs ([`WheelViewport`]), read under the seam's ONE lock so the scroll
+    /// takes no second or third acquisition of its own; `None` from the
+    /// button/move arms, which scroll nothing.
+    TrackingOff {
+        wheel_lines: i32,
+        wheel_up: bool,
+        viewport: Option<WheelViewport>,
+    },
+}
+
+/// The engine facts a tracking-OFF wheel's local viewport scroll consumes,
+/// snapshotted under the seam's single `term_lock` at the instant the route
+/// was decided. `input_wheel` used to take TWO more blocking acquisitions per
+/// line-emitting event to re-read them — `rows()` for the platform's
+/// lines-per-detent (discarded on every non-Windows target), and
+/// `(display_offset, scrollback_lines)` for the glide's base and clamp — each a
+/// fresh queue position behind the PTY reader's `process()` slice, microseconds
+/// after this lock had the same values in hand.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct WheelViewport {
+    /// `Grid::display_offset()` — the viewport's current row into history.
+    pub display_offset: usize,
+    /// `Grid::scrollback_lines()` — the clamp bound for the glide's target.
+    pub scrollback_lines: usize,
+    /// `Terminal::rows()` — the page for Windows' "One screen at a time" detent.
+    pub rows: u16,
 }
 
 /// One egress verdict plus the order of its last conclusively accepted non-empty
@@ -477,6 +507,10 @@ pub enum Egress {
 pub(crate) struct EgressReceipt {
     pub(crate) egress: Egress,
     accepted_order: Option<AcceptedOrder>,
+    /// The accepted frame reached the kernel WHOLE on the sink's direct lane
+    /// (`WriteReceipt::is_direct`): the echo tracker can settle its spill debt
+    /// without probing the spill mutex. Conservative `false` everywhere else.
+    direct: bool,
 }
 
 impl EgressReceipt {
@@ -490,6 +524,7 @@ impl EgressReceipt {
         Self {
             egress: Egress::Reported(delivery),
             accepted_order,
+            direct: false,
         }
     }
 
@@ -501,6 +536,7 @@ impl EgressReceipt {
         Self {
             egress: Egress::Reported(Delivery::Full),
             accepted_order: None,
+            direct: false,
         }
     }
 
@@ -513,6 +549,12 @@ impl EgressReceipt {
     #[must_use]
     pub(crate) const fn accepted_nonempty(self) -> bool {
         self.accepted_order.is_some()
+    }
+
+    /// Whether the accepted frame went whole to the kernel on the direct lane.
+    #[must_use]
+    pub(crate) const fn is_direct(self) -> bool {
+        self.direct
     }
 
     /// Accepted sink order, or `None` when this event moved no bytes.
@@ -753,14 +795,9 @@ pub enum EgressMode {
 /// either way (see [`EgressMode`]); only the parking discipline differs.  The
 /// immediate mode retains the zero-vs-partial distinction needed by the durable
 /// actuator; ordinary modes preserve their existing `Full`/`Failed` contract.
-fn emit(
-    sink: &SinkWriter,
-    mode: EgressMode,
-    bytes: &[u8],
-    accepted_order: &mut Option<AcceptedOrder>,
-) -> Delivery {
+fn emit(sink: &SinkWriter, mode: EgressMode, bytes: &[u8], accepted: &mut Accepted) -> Delivery {
     debug_assert!(!bytes.is_empty());
-    let (delivery, order) = match mode {
+    let (delivery, order, direct) = match mode {
         EgressMode::Interactive => {
             delivered_receipt(sink.write_frame_nonparking_with_receipt(bytes), bytes.len())
         }
@@ -778,20 +815,31 @@ fn emit(
                     Delivery::PartialInDoubt { accepted }
                 }
             };
-            (delivery, order)
+            (delivery, order, false)
         }
     };
     if order.is_some() {
-        *accepted_order = order;
+        accepted.order = order;
+        accepted.direct = direct;
     }
     delivery
+}
+
+/// The seam's accepted-frame accumulator: the order of the LAST accepted
+/// non-empty frame and whether that frame went whole to the kernel directly.
+#[derive(Clone, Copy, Debug, Default)]
+struct Accepted {
+    order: Option<AcceptedOrder>,
+    direct: bool,
 }
 
 /// THE source-blind byte-producing core of the seam (design A.2 / A.7). It is the
 /// SOLE reader of `keyboard_mode()`/`mouse_tracking_enabled()` and the SOLE caller
 /// of `encode_key_with_layout` / the `encode_mouse_*` family / `encode_committed_
 /// text` / `format_paste_framed` / the focus-report egress, reading the relevant mode
-/// ONCE per event under a single `term_lock`, ending at the `mode`-selected
+/// ONCE per event — the keyboard mode LOCK-FREE from the terminal's published
+/// [`ModeMirror`] (Key/Text arms: no mutex on the press path at all), the mouse and
+/// paste modes under a single `term_lock` — ending at the `mode`-selected
 /// [`emit`] (`Interactive` = non-parking on the UI thread; `Backpressured` =
 /// blocking + `SPILL_CAP` on an expendable thread; `TryImmediate` = guarded,
 /// non-spilling actuator egress). Sole BYTE-PRODUCING reader:
@@ -813,12 +861,13 @@ fn emit(
 /// state) stay in `App::input`, which calls this and then runs those.
 pub fn seam_egress(
     term: &Mutex<Terminal>,
+    modes: &ModeMirror,
     sink: &SinkWriter,
     ev: &InputEvent,
     mode: EgressMode,
 ) -> Egress {
-    let mut accepted_order = None;
-    seam_egress_inner(term, sink, ev, mode, &mut accepted_order)
+    let mut accepted = Accepted::default();
+    seam_egress_inner(term, modes, sink, ev, mode, &mut accepted)
 }
 
 /// Receipt-bearing twin of [`seam_egress`]. The byte-producing decision remains
@@ -826,25 +875,40 @@ pub fn seam_egress(
 /// [`Egress`] intentionally erases for zero-byte and multi-frame contracts.
 pub(crate) fn seam_egress_receipt(
     term: &Mutex<Terminal>,
+    modes: &ModeMirror,
     sink: &SinkWriter,
     ev: &InputEvent,
     mode: EgressMode,
 ) -> EgressReceipt {
-    let mut accepted_order = None;
-    let egress = seam_egress_inner(term, sink, ev, mode, &mut accepted_order);
+    let mut accepted = Accepted::default();
+    let egress = seam_egress_inner(term, modes, sink, ev, mode, &mut accepted);
     EgressReceipt {
         egress,
-        accepted_order,
+        accepted_order: accepted.order,
+        direct: accepted.direct,
     }
 }
 
 fn seam_egress_inner(
     term: &Mutex<Terminal>,
+    modes: &ModeMirror,
     sink: &SinkWriter,
     ev: &InputEvent,
     mode: EgressMode,
-    accepted_order: &mut Option<AcceptedOrder>,
+    accepted_order: &mut Accepted,
 ) -> Egress {
+    // PAIRING OBLIGATION (debug builds): `modes` must be THIS terminal's mirror.
+    // A mirror derived from some other terminal (or a bare `Default`) would
+    // silently encode every key in legacy mode. Checked only when the mutex is
+    // free — the whole point of the mirror is never to wait on it — which is
+    // every unit test and most real presses; a busy reader just skips the check.
+    #[cfg(debug_assertions)]
+    if let Ok(t) = term.try_lock() {
+        debug_assert!(
+            std::ptr::eq(modes, &**t.mode_mirror()),
+            "seam handed a ModeMirror that is not this terminal's (see mode_mirror_of)"
+        );
+    }
     match ev {
         InputEvent::Key {
             key,
@@ -852,17 +916,17 @@ fn seam_egress_inner(
             base_layout,
             event_type,
         } => {
-            let bytes = {
-                let t = term_lock(term);
-                let mode = t.keyboard_mode();
-                aterm_types::keyboard::encode_key_with_layout(
-                    key,
-                    *mods,
-                    mode,
-                    *event_type,
-                    *base_layout,
-                )
-            };
+            // LOCK-FREE: the keyboard mode comes from the terminal's published
+            // mirror, not from a second `term_lock` behind the PTY reader's
+            // `process()` slice. `process()` republishes it before every hold
+            // ends, so this word is the mode the last completed batch left.
+            let bytes = aterm_types::keyboard::encode_key_with_layout(
+                key,
+                *mods,
+                modes.keyboard_mode(),
+                *event_type,
+                *base_layout,
+            );
             let d = if bytes.is_empty() {
                 Delivery::Full // faithful no-op (e.g. legacy release): nothing to deliver
             } else {
@@ -873,10 +937,8 @@ fn seam_egress_inner(
         InputEvent::Text(text) => {
             let mut d = Delivery::Full;
             if !text.is_empty() {
-                let out = {
-                    let mode = term_lock(term).keyboard_mode();
-                    crate::keymap::encode_committed_text(text, mode)
-                };
+                // Lock-free like the Key arm: the mirror, not a mutex round-trip.
+                let out = crate::keymap::encode_committed_text(text, modes.keyboard_mode());
                 if !out.is_empty() {
                     d = emit(sink, mode, &out, accepted_order);
                 }
@@ -930,6 +992,7 @@ fn seam_egress_inner(
                 None => Egress::TrackingOff {
                     wheel_lines: 0,
                     wheel_up: false,
+                    viewport: None,
                 },
             }
         }
@@ -961,6 +1024,7 @@ fn seam_egress_inner(
                 None => Egress::TrackingOff {
                     wheel_lines: 0,
                     wheel_up: false,
+                    viewport: None,
                 },
             }
         }
@@ -996,9 +1060,14 @@ fn seam_egress_inner(
             //               — by ZERO lines on the horizontal axis, which has no
             //               viewport to move (audit I7, see the Fallback arm).
             enum WheelPlan {
-                Write { bytes: Vec<u8>, repeat: i32 },
+                Write {
+                    bytes: Vec<u8>,
+                    repeat: i32,
+                },
                 Swallow,
-                Fallback,
+                /// …carrying the viewport facts read under THIS lock, so the
+                /// local scroll never re-locks for them.
+                Fallback(WheelViewport),
             }
             let plan = {
                 let t = term_lock(term);
@@ -1074,7 +1143,11 @@ fn seam_egress_inner(
                         }
                     }
                 } else {
-                    WheelPlan::Fallback
+                    WheelPlan::Fallback(WheelViewport {
+                        display_offset: t.grid().display_offset(),
+                        scrollback_lines: t.grid().scrollback_lines(),
+                        rows: t.rows(),
+                    })
                 }
             };
             match plan {
@@ -1101,9 +1174,10 @@ fn seam_egress_inner(
                 // the audit explicitly ruled CORRECT with tracking off. Feeding
                 // `lines` through here instead would resurrect the phantom
                 // scroll-DOWN that guard was added to fix.
-                WheelPlan::Fallback => Egress::TrackingOff {
+                WheelPlan::Fallback(viewport) => Egress::TrackingOff {
                     wheel_lines: if dir.is_horizontal() { 0 } else { lines },
                     wheel_up: dir.vertical_up().unwrap_or(false),
+                    viewport: Some(viewport),
                 },
             }
         }
@@ -1535,7 +1609,13 @@ mod tests {
     fn egress_bytes(term: &Mutex<Terminal>, ev: &InputEvent) -> Vec<u8> {
         let mut cap = CaptureSink::new();
         let sink = SinkWriter::new(cap.master());
-        seam_egress(term, &sink, ev, EgressMode::Interactive);
+        seam_egress(
+            term,
+            &crate::mode_mirror_of(term),
+            &sink,
+            ev,
+            EgressMode::Interactive,
+        );
         drop(sink);
         cap.drain()
     }
@@ -1561,6 +1641,7 @@ mod tests {
         let sink = SinkWriter::new(cap.master());
         let accepted = seam_egress_receipt(
             &term,
+            &crate::mode_mirror_of(&term),
             &sink,
             &InputEvent::KeySequence(b"x".to_vec()),
             EgressMode::Interactive,
@@ -1571,6 +1652,7 @@ mod tests {
 
         let empty = seam_egress_receipt(
             &term,
+            &crate::mode_mirror_of(&term),
             &SinkWriter::new(-1),
             &InputEvent::KeySequence(Vec::new()),
             EgressMode::Interactive,
@@ -1580,6 +1662,7 @@ mod tests {
 
         let failed = seam_egress_receipt(
             &term,
+            &crate::mode_mirror_of(&term),
             &SinkWriter::new(-1),
             &InputEvent::KeySequence(b"x".to_vec()),
             EgressMode::Interactive,
@@ -1593,31 +1676,28 @@ mod tests {
         let mut cap = CaptureSink::new();
         let good = SinkWriter::new(cap.master());
         let bad = SinkWriter::new(-1);
-        let mut accepted_order = None;
+        let mut accepted = Accepted::default();
         assert_eq!(
-            emit(
-                &good,
-                EgressMode::Interactive,
-                b"first",
-                &mut accepted_order,
-            ),
+            emit(&good, EgressMode::Interactive, b"first", &mut accepted),
             Delivery::Full,
         );
+        assert!(accepted.direct, "an uncontended whole frame is direct");
         assert_eq!(
-            emit(
-                &bad,
-                EgressMode::Interactive,
-                b"second",
-                &mut accepted_order,
-            ),
+            emit(&bad, EgressMode::Interactive, b"second", &mut accepted),
             Delivery::Failed,
         );
-        assert!(accepted_order.is_some());
+        assert!(accepted.order.is_some());
+        assert!(
+            accepted.direct,
+            "a later failed frame accepts nothing and leaves the earlier direct fact alone"
+        );
         let receipt = EgressReceipt {
             egress: Egress::Reported(Delivery::Failed),
-            accepted_order,
+            accepted_order: accepted.order,
+            direct: accepted.direct,
         };
         assert!(receipt.accepted_nonempty());
+        assert!(receipt.is_direct());
         drop(good);
         assert_eq!(cap.drain(), b"first");
     }
@@ -1640,7 +1720,13 @@ mod tests {
             event_type: KeyEventType::Press,
         };
         assert_eq!(
-            seam_egress(&term, &sink, &press, EgressMode::Interactive),
+            seam_egress(
+                &term,
+                &crate::mode_mirror_of(&term),
+                &sink,
+                &press,
+                EgressMode::Interactive
+            ),
             Egress::Reported(Delivery::Failed)
         );
 
@@ -1651,7 +1737,13 @@ mod tests {
             event_type: KeyEventType::Release, // legacy: encodes to nothing
         };
         assert_eq!(
-            seam_egress(&term, &sink, &release, EgressMode::Interactive),
+            seam_egress(
+                &term,
+                &crate::mode_mirror_of(&term),
+                &sink,
+                &release,
+                EgressMode::Interactive
+            ),
             Egress::Reported(Delivery::Full)
         );
     }
@@ -1680,6 +1772,7 @@ mod tests {
         assert_eq!(
             seam_egress(
                 &term,
+                &crate::mode_mirror_of(&term),
                 &sink,
                 &InputEvent::KeySequence(b"hi".to_vec()),
                 EgressMode::Interactive
@@ -1742,6 +1835,50 @@ mod tests {
         term
     }
 
+    /// P02 — the Key and Text arms encode against the terminal's LOCK-FREE mode
+    /// mirror, never a second `term_lock`. PROOF: this thread HOLDS the terminal
+    /// mutex (the PTY reader mid-`process()` slice) for the whole call and the
+    /// egress must still complete on another thread, byte-exact for the kitty
+    /// mode negotiated before the hold. On the old seam
+    /// (`term_lock(term).keyboard_mode()`) the worker parks behind our guard and
+    /// the receive times out — this test fails red there.
+    #[test]
+    fn key_and_text_egress_complete_while_the_terminal_mutex_is_held() {
+        use aterm_types::keyboard::{Key, KeyEventType, Modifiers, NamedKey};
+        let term = term_with(&[b"\x1b[>1u"]); // kitty disambiguate: a non-trivial mode
+        let modes = crate::mode_mirror_of(&term);
+        let mut cap = CaptureSink::new();
+        let sink = SinkWriter::new(cap.master());
+        let held = term_lock(&term); // the reader's hold — kept for the whole egress
+        let (tx, rx) = std::sync::mpsc::channel();
+        let worker = {
+            let term = term.clone();
+            std::thread::spawn(move || {
+                let press = InputEvent::Key {
+                    key: Key::Named(NamedKey::Enter),
+                    mods: Modifiers::SHIFT,
+                    base_layout: None,
+                    event_type: KeyEventType::Press,
+                };
+                let a = seam_egress(&term, &modes, &sink, &press, EgressMode::Interactive);
+                let text = InputEvent::Text("é".to_string());
+                let b = seam_egress(&term, &modes, &sink, &text, EgressMode::Interactive);
+                drop(sink);
+                let _ = tx.send((a, b));
+            })
+        };
+        let (a, b) = rx
+            .recv_timeout(std::time::Duration::from_secs(5))
+            .expect("the seam parked behind the terminal mutex to read keyboard_mode()");
+        drop(held);
+        worker.join().unwrap();
+        assert_eq!(a, Egress::Reported(Delivery::Full));
+        assert_eq!(b, Egress::Reported(Delivery::Full));
+        // Byte-exact against the negotiated mode: Shift+Enter under disambiguate is
+        // the CSI-u report, and the committed text follows it verbatim.
+        assert_eq!(cap.drain(), b"\x1b[13;2u\xc3\xa9".to_vec());
+    }
+
     /// A wheel event at the cell origin (row 0, col 0), no modifiers.
     fn wheel(dir: WheelDir, lines: i32) -> InputEvent {
         InputEvent::Wheel {
@@ -1771,7 +1908,13 @@ mod tests {
     fn egress_of(term: &Mutex<Terminal>, ev: &InputEvent) -> Egress {
         let cap = CaptureSink::new();
         let sink = SinkWriter::new(cap.master());
-        seam_egress(term, &sink, ev, EgressMode::Interactive)
+        seam_egress(
+            term,
+            &crate::mode_mirror_of(term),
+            &sink,
+            ev,
+            EgressMode::Interactive,
+        )
     }
 
     /// SELECTION CUSTODY Phase 2 — the LOCAL-SCROLL OVERRIDE, on EVERY platform.
@@ -1966,7 +2109,8 @@ mod tests {
             egress_of(&term, &shifted),
             Egress::TrackingOff {
                 wheel_lines: 2,
-                wheel_up: true
+                wheel_up: true,
+                ..
             }
         ));
         assert!(egress_bytes(&term, &shifted).is_empty());
@@ -1975,6 +2119,56 @@ mod tests {
             egress_bytes(&term, &wheel(WheelDir::Up, 1)),
             b"\x1b[<64;1;1M"
         );
+    }
+
+    /// G15 — a tracking-OFF wheel carries the viewport facts the seam read under
+    /// its ONE lock (`display_offset`, `scrollback_lines`, `rows`), so the local
+    /// scroll never re-locks for them. Pinned against the engine's own values at
+    /// the instant of the route, scrolled back so `display_offset` is non-zero.
+    #[test]
+    fn a_viewport_wheel_carries_the_engine_facts_from_its_one_lock() {
+        let term = term_with(&[]);
+        {
+            let mut t = term.lock().unwrap();
+            for i in 0..40 {
+                t.process(format!("line {i}\r\n").as_bytes());
+            }
+            t.scroll_display(3);
+        }
+        let expected = {
+            let t = term.lock().unwrap();
+            WheelViewport {
+                display_offset: t.grid().display_offset(),
+                scrollback_lines: t.grid().scrollback_lines(),
+                rows: t.rows(),
+            }
+        };
+        assert!(expected.display_offset == 3 && expected.scrollback_lines >= 16);
+        assert_eq!(
+            egress_of(&term, &wheel(WheelDir::Up, 2)),
+            Egress::TrackingOff {
+                wheel_lines: 2,
+                wheel_up: true,
+                viewport: Some(expected),
+            }
+        );
+        // The button/move arms scroll nothing and carry nothing.
+        let release = InputEvent::MouseButton {
+            button: aterm_types::mouse::MouseButton::Left,
+            pressed: false,
+            row: 0,
+            col: 0,
+            mods: 0,
+            click_count: 1,
+            side: aterm_core::selection::SelectionSide::Left,
+            block: false,
+            suppress_copy_on_select: false,
+            px_off: PixelOffset::CELL_ORIGIN,
+        };
+        assert!(matches!(
+            egress_of(&term, &release),
+            Egress::TrackingOff { viewport: None, .. }
+        ));
     }
 
     /// Alternate scroll applies only on the ALT screen: on the main screen the wheel
@@ -1986,7 +2180,8 @@ mod tests {
             egress_of(&term, &wheel(WheelDir::Up, 1)),
             Egress::TrackingOff {
                 wheel_lines: 1,
-                wheel_up: true
+                wheel_up: true,
+                ..
             }
         ));
         assert!(egress_bytes(&term, &wheel(WheelDir::Up, 1)).is_empty());
@@ -2007,29 +2202,53 @@ mod tests {
             let tracking = term_with(&[b"\x1b[?1000h", b"\x1b[?1006h"]);
             assert!(
                 matches!(
-                    seam_egress(&tracking, &sink, &wheel(dir, 2), EgressMode::Interactive),
+                    seam_egress(
+                        &tracking,
+                        &crate::mode_mirror_of(&tracking),
+                        &sink,
+                        &wheel(dir, 2),
+                        EgressMode::Interactive
+                    ),
                     Egress::Reported(_)
                 ),
                 "{dir:?} must reach a tracking app"
             );
             let idle = term_with(&[]);
-            assert_eq!(
-                seam_egress(&idle, &sink, &wheel(dir, 2), EgressMode::Interactive),
-                Egress::TrackingOff {
-                    wheel_lines: 0,
-                    wheel_up: false
-                },
+            assert!(
+                matches!(
+                    seam_egress(
+                        &idle,
+                        &crate::mode_mirror_of(&idle),
+                        &sink,
+                        &wheel(dir, 2),
+                        EgressMode::Interactive
+                    ),
+                    Egress::TrackingOff {
+                        wheel_lines: 0,
+                        wheel_up: false,
+                        ..
+                    }
+                ),
                 "{dir:?} must move nothing locally"
             );
             // …and the same with the alt screen + DEC 1007 armed: alternate scroll
             // is a VERTICAL substitute (arrows), never a horizontal one.
             let pager = term_with(&[b"\x1b[?1049h", b"\x1b[?1007h"]);
-            assert_eq!(
-                seam_egress(&pager, &sink, &wheel(dir, 2), EgressMode::Interactive),
-                Egress::TrackingOff {
-                    wheel_lines: 0,
-                    wheel_up: false
-                },
+            assert!(
+                matches!(
+                    seam_egress(
+                        &pager,
+                        &crate::mode_mirror_of(&pager),
+                        &sink,
+                        &wheel(dir, 2),
+                        EgressMode::Interactive
+                    ),
+                    Egress::TrackingOff {
+                        wheel_lines: 0,
+                        wheel_up: false,
+                        ..
+                    }
+                ),
                 "{dir:?} must not synthesize arrows for a pager"
             );
             // …and under the I12 Shift bypass, which asks aterm to take the
@@ -2043,30 +2262,41 @@ mod tests {
                 px_off: PixelOffset::CELL_ORIGIN,
             };
             let tracking = term_with(&[b"\x1b[?1000h", b"\x1b[?1006h"]);
-            assert_eq!(
-                seam_egress(&tracking, &sink, &shifted, EgressMode::Interactive),
-                Egress::TrackingOff {
-                    wheel_lines: 0,
-                    wheel_up: false
-                },
+            assert!(
+                matches!(
+                    seam_egress(
+                        &tracking,
+                        &crate::mode_mirror_of(&tracking),
+                        &sink,
+                        &shifted,
+                        EgressMode::Interactive
+                    ),
+                    Egress::TrackingOff {
+                        wheel_lines: 0,
+                        wheel_up: false,
+                        ..
+                    }
+                ),
                 "shift+{dir:?} bypasses to a viewport that cannot pan"
             );
         }
         // CONTROL: the vertical twin is untouched — it still carries its lines to
         // the viewport, which is the behaviour this change must not disturb.
         let idle = term_with(&[]);
-        assert_eq!(
+        assert!(matches!(
             seam_egress(
                 &idle,
+                &crate::mode_mirror_of(&idle),
                 &sink,
                 &wheel(WheelDir::Up, 2),
                 EgressMode::Interactive
             ),
             Egress::TrackingOff {
                 wheel_lines: 2,
-                wheel_up: true
+                wheel_up: true,
+                ..
             }
-        );
+        ));
     }
 
     /// An app can turn alternate scroll OFF (?1007l): the wheel then falls back to

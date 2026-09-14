@@ -375,10 +375,10 @@ pub fn main_entry(argv: Vec<std::ffi::OsString>) -> ExitCode {
         return cmd_reroute(&args[1..]);
     }
     // The HIDDEN untracked-stage verb (`crate::stage_helper`): what the launchd job the
-    // store's staging lane submits execs, from a clean byte copy of this binary, when the
-    // installer measured itself as provenance-tracked. Same discipline as `__pending`:
-    // unlisted, dispatched before the store lock — its PARENT holds that lock — and it
-    // touches only the staging scratch its spec names.
+    // store's staging lane submits runs — this binary in place, or a clean byte copy of
+    // it when it is tagged — when the installer measured itself as provenance-tracked.
+    // Same discipline as `__pending`: unlisted, dispatched before the store lock — its
+    // PARENT holds that lock — and it touches only the staging scratch its spec names.
     if verb == Some(crate::stage_helper::HIDDEN_VERB) {
         return crate::stage_helper::run_helper(&args[1..]);
     }
@@ -2746,19 +2746,22 @@ fn run_repair(layout: Option<crate::store::Layout>) -> ExitCode {
     }
     if !tracked.is_empty() {
         println!(
-            "repair: {} build(s) were staged in-process by a provenance-tracked installer \
-             under {}=1 and carry com.apple.provenance on every executable (recorded \
-             beside each as <build>.tracked-install): {}",
+            "repair: {} build(s) carry a tracked-install record (<build>.tracked-install), \
+             written under {}=1 when a provenance-tracked installer either staged the bundle \
+             IN-PROCESS — every executable then carries com.apple.provenance — or KEPT an \
+             untracked lane's tree that came back tagged. Each build's own reason follows it. \
+             Repair does not scan the bundle: `aterm pkg doctor` is what says which files \
+             carry the tag today, and it names a stale record when none does: {}",
             tracked.len(),
             crate::lay::ALLOW_TRACKED_ENV,
             tracked.join("; ")
         );
         println!(
             "repair: nothing local removes the tag (`xattr -d` exits 0 and removes nothing) \
-             and the archive is reclaimed after every stage, so each needs a re-seed from \
-             an untracked process — Terminal.app, or `launchctl submit -l aterm-pkg -- <path \
-             to atpkg> install <program>`: `aterm pkg uninstall <program> && aterm pkg \
-             install <program>`"
+             and the archive is reclaimed after every stage, so a build whose files really do \
+             carry it needs a re-seed from an untracked process — Terminal.app, or `launchctl \
+             submit -l aterm-pkg -- <path to atpkg> install <program>`: `aterm pkg uninstall \
+             <program> && aterm pkg install <program>`"
         );
     }
     if !failed.is_empty() {
@@ -2773,8 +2776,9 @@ fn run_repair(layout: Option<crate::store::Layout>) -> ExitCode {
 
 /// Step 2 of [`run_repair`], split out so it can be tested without the rc wiring step 1
 /// writes: re-lay every installed program's shims. Returns how many programs were re-laid,
-/// the `program@build` of each whose build is gone, of each left tombstoned, of each staged
-/// in-process by a provenance-tracked installer (`<build>.tracked-install`), and of each
+/// the `program@build` of each whose build is gone, of each left tombstoned, of each a
+/// provenance-tracked installer recorded (`<build>.tracked-install` — staged in-process,
+/// or a kept lane tree that came back tagged), and of each
 /// whose shims could not be re-laid — the last is what a REFUSED lay from a tracked process
 /// looks like, and it must reach the exit code (audit 2026-09-12: repair said "done" over it).
 fn relay_shims(
@@ -2809,11 +2813,14 @@ fn relay_shims(
             missing.push(format!("{program}@{build}"));
             continue;
         }
-        // A build a provenance-tracked installer staged in-process under the escape
-        // hatch (`<build>.tracked-install`, `crate::store::record_tracked_install`)
-        // carries com.apple.provenance on every executable, and no local operation
-        // can take the tag off: the archive is reclaimed after every stage, so the only
-        // cure is a re-seed — named below, exit 1, like a build that is gone.
+        // A build a provenance-tracked installer RECORDED (`<build>.tracked-install`,
+        // `crate::store::record_tracked_install`). Two outcomes write it
+        // (`install::decide_tracked_stage`): an in-process stage under the escape hatch,
+        // which tags every executable, and `KeepRecorded` — the untracked lane laid the
+        // tree and only its witness came back tagged. This reads the record and never
+        // scans, so it reports the record, not the tag; `doctor` does the scan and says
+        // "a stale record" when nothing in `bin/` carries it. Exit 1 either way: a
+        // recorded build needs an operator's eye, like a build that is gone.
         if let Some(why) = crate::store::tracked_install_record(&build_dir) {
             tracked.push(format!("{program}@{build} — {why}"));
         }

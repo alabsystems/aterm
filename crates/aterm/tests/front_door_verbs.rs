@@ -186,3 +186,51 @@ fn ship_is_a_front_door_verb_at_a_terminal() {
         "`aterm ship` must reach the release tool at a terminal; output was {out:?}"
     );
 }
+
+/// THE HIDDEN HELPER VERBS ARE ROUTED BY NAME, NOT BY ARGV0.
+///
+/// The untracked lane submits a launchd job that runs this binary on
+/// `__stage-payload` / `__lay-files`. Since the provenance fix an UNTAGGED helper
+/// runs IN PLACE, keeping the name it has on disk — for the shipped app,
+/// `…/Contents/MacOS/aterm` — and the argv0 alias that routes `atpkg` to the package
+/// CLI never fires for that name. Measured on the SHIPPED v0.84.0 bundle binary
+/// (2026-09-13): `aterm __lay-files <spec>` printed
+/// `aterm-gui: unknown option '__lay-files'` and laid nothing, so `aterm pkg install`
+/// from the installed app refused with a fresh message. Only a byte COPY worked,
+/// because the copy is named `atpkg`.
+///
+/// This drives the REAL binary under its real name and proves it reaches the helper
+/// BODY: the body is the only thing that writes `<spec-dir>/result`, and the mode fork
+/// cannot write it at all. Both verbs, because they are two dispatch arms.
+#[test]
+fn the_front_door_serves_the_hidden_helper_verbs_under_its_own_name() {
+    for verb in ["__lay-files", "__stage-payload"] {
+        let dir =
+            std::env::temp_dir().join(format!("aterm-hidden-verb-{verb}-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).expect("scratch dir");
+        let spec = dir.join("spec");
+        // A spec the helper must REFUSE (no header): a refusal still proves arrival,
+        // and laying real files from a test is not this pin's business.
+        std::fs::write(&spec, "not-a-spec\n").expect("write spec");
+
+        let out = Command::new(env!("CARGO_BIN_EXE_aterm"))
+            .arg(verb)
+            .arg(&spec)
+            .env("ATERM_NO_AUTO_UPDATE", "1")
+            .output()
+            .expect("run the front door");
+        let stderr = String::from_utf8_lossy(&out.stderr).into_owned();
+        assert!(
+            !stderr.contains("unknown option"),
+            "{verb} fell through to the mode fork: {stderr}"
+        );
+        let result = std::fs::read_to_string(dir.join("result"))
+            .unwrap_or_else(|e| panic!("{verb} wrote no result file ({e}); stderr was: {stderr}"));
+        assert!(
+            result.starts_with("err\n"),
+            "{verb} reached the body but answered {result:?}"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+}

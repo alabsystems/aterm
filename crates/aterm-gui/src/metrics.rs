@@ -1511,6 +1511,11 @@ static H_FRAME_RENDER: Histogram = Histogram::new();
 static H_KEY_WRITE: Histogram = Histogram::new();
 static H_PRE_PRESENT: Histogram = Histogram::new();
 static H_ACQUIRE_WAIT: Histogram = Histogram::new();
+/// UI-thread TERMINAL-MUTEX wait, per acquiring site — see [`TermWaitSite`].
+static H_TERM_WAIT: [Histogram; TermWaitSite::COUNT] =
+    [const { Histogram::new() }; TermWaitSite::COUNT];
+static MAX_TERM_WAIT_NS: [AtomicU64; TermWaitSite::COUNT] =
+    [const { AtomicU64::new(0) }; TermWaitSite::COUNT];
 static H_RESIZE_PRESENT: Histogram = Histogram::new();
 static H_RESIZE_REFLOW: Histogram = Histogram::new();
 
@@ -1641,6 +1646,63 @@ pub fn note_capture_episode(active: bool) {
 #[must_use]
 pub fn acquire_wait_distribution() -> &'static Histogram {
     &H_ACQUIRE_WAIT
+}
+
+/// The UI-thread sites that BLOCK on a session's terminal mutex on the hot
+/// paths — the redraw's LOCK A and LOCK B fallback and the key press's
+/// consolidated scope. The seam's own acquisition is gone (it reads the
+/// lock-free `ModeMirror`), so these three are the whole set.
+///
+/// Each acquisition books its wait here so the reader's slice-boundary handoff
+/// (`yield_to_ui_waiter`) is MEASURABLE: the `term_wait_*` percentiles under
+/// `metrics percentiles` must sit at or under one reader slice while output
+/// floods, where the unfair-mutex behaviour they were added to expose put them
+/// at hundreds of microseconds.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum TermWaitSite {
+    /// `redraw_window`'s first, unconditional acquisition.
+    RedrawA = 0,
+    /// `redraw_window`'s second acquisition, on its blocking fallback arm.
+    RedrawB = 1,
+    /// The key press's one consolidated scope in `input_to_session`.
+    Press = 2,
+}
+
+impl TermWaitSite {
+    /// Number of sites — the histogram array length.
+    pub const COUNT: usize = 3;
+    /// Every site, in report order.
+    pub const ALL: [Self; Self::COUNT] = [Self::RedrawA, Self::RedrawB, Self::Press];
+
+    /// The `metrics` field stem for this site.
+    #[must_use]
+    pub const fn label(self) -> &'static str {
+        match self {
+            Self::RedrawA => "redraw_a",
+            Self::RedrawB => "redraw_b",
+            Self::Press => "press",
+        }
+    }
+}
+
+/// Record one UI-thread terminal-mutex wait at `site` (cheap: one bucket
+/// increment + a `fetch_max`). Uncontended acquisitions book `0` so `n_*`
+/// counts every acquisition and the percentiles are over the true population.
+pub fn note_term_wait(site: TermWaitSite, ns: u64) {
+    H_TERM_WAIT[site as usize].record(ns);
+    MAX_TERM_WAIT_NS[site as usize].fetch_max(ns, Ordering::Relaxed);
+}
+
+/// The terminal-mutex wait distribution for one UI-thread site.
+#[must_use]
+pub fn term_wait_distribution(site: TermWaitSite) -> &'static Histogram {
+    &H_TERM_WAIT[site as usize]
+}
+
+/// The worst terminal-mutex wait booked at `site` since the last reset, ns.
+#[must_use]
+pub fn term_wait_max_ns(site: TermWaitSite) -> u64 {
+    MAX_TERM_WAIT_NS[site as usize].load(Ordering::Relaxed)
 }
 
 /// The acquire-wait `(last, max)` pair in nanoseconds — the scalars the
@@ -1868,9 +1930,12 @@ pub fn note_grid_committed() {
     }
 }
 
-/// Arm the THRU-2 interactivity window: a human just pressed a key, so the PTY
-/// reader must keep its term-lock holds FINE until `TYPING_HOT_TAIL_NS` after the
-/// LAST key.
+/// Arm the THRU-2 INTERACTIVE-INPUT-PENDING window: a human is waiting on the UI
+/// thread — a key press, a wheel/trackpad gesture, a mouse button press — so
+/// the PTY reader must keep its term-lock holds FINE (and the gather its short
+/// batch budget) until `TYPING_HOT_TAIL_NS` after the LAST such input. Hover
+/// motion is deliberately NOT an arming event: it is not a wait, and it would
+/// keep the reader on twice the lock round-trips through any mouse movement.
 ///
 /// Called at the TRUE hardware arrival (the `WindowEvent::KeyboardInput` arm),
 /// BEFORE any press-path `term_lock` — that ordering is the whole point. The
@@ -1901,6 +1966,14 @@ pub fn note_typing_hot() {
 pub fn input_pending() -> bool {
     let until = TYPING_HOT_UNTIL_NS.load(Ordering::Relaxed);
     until != 0 && now_ns() < until
+}
+
+/// TEST SEAM: the raw interactive-input-pending deadline (ns), so a handler test
+/// can pin "this event ARMED the hint" as a monotone advance of the stamp —
+/// robust to other tests arming it concurrently, unlike a bare `input_pending()`.
+#[cfg(test)]
+pub(crate) fn interactive_input_deadline_ns() -> u64 {
+    TYPING_HOT_UNTIL_NS.load(Ordering::Relaxed)
 }
 
 // ---- ATERM_LATENCY_TRACE: isolate the UI-thread key->write component ---------
@@ -2626,6 +2699,10 @@ pub fn reset() {
     LAST_ACQUIRE_WAIT_NS.store(0, Ordering::Relaxed);
     MAX_ACQUIRE_WAIT_NS.store(0, Ordering::Relaxed);
     H_ACQUIRE_WAIT.reset();
+    for site in TermWaitSite::ALL {
+        H_TERM_WAIT[site as usize].reset();
+        MAX_TERM_WAIT_NS[site as usize].store(0, Ordering::Relaxed);
+    }
     LAST_INPUT_PRESENT_NS.store(0, Ordering::Relaxed);
     LAST_RESIZE_PRESENT_NS.store(0, Ordering::Relaxed);
     LAST_RESIZE_REFLOW_NS.store(0, Ordering::Relaxed);

@@ -1776,6 +1776,7 @@ mod tests {
             pack: None,
             wake_persist_s: 2.4,
             ribbon_tall: true,
+            ribbon_flat: false,
         };
         // The caret's config exactly as the host builds it (app_render.rs,
         // the live `rainbow_cfg`): an unpinned Default-theme cursor, the seam's
@@ -4200,6 +4201,7 @@ mod tests {
             pack: None,
             wake_persist_s: 2.4,
             ribbon_tall: true,
+            ribbon_flat: false,
         };
         let body_cfg = cfg();
         let t0 = Instant::now();

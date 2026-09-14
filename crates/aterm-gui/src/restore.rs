@@ -84,11 +84,13 @@ pub(crate) struct TerminalLeafRestore {
     /// USER session metadata (session-metadata stage 1; additive, absent
     /// tolerated by older manifests): the operator's `meta set` title/
     /// description/icon/role/attention, captured at quit (and at a seamless
-    /// update's park) and RE-SEEDED onto whichever session fills the leaf on
-    /// the way back — a respawned one, a re-adopted one, or the window's
-    /// already-running bootstrap when this leaf names it
-    /// (`App::graft_restored_user_meta`, which also leaves alone any field a
-    /// driver wrote on that live session first) — so restore keeps the
+    /// update's park) and RE-SEEDED on the way back onto the shell this leaf
+    /// stands for — after a quit or a closed tab's reopen, the session that
+    /// fills the leaf; after a seamless update, the handed-off shell
+    /// `local_id` names, wherever it runs, and never a fresh shell standing in
+    /// for it
+    /// (`App::carry_restored_identity`, which also leaves alone any field a
+    /// driver wrote on a live session first) — so restore keeps the
     /// operator-chosen identity (the `title` above is the engine/OSC one — a
     /// different datum).
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -442,6 +444,10 @@ impl RestoredSplitTree {
         }
     }
 
+    /// The first directory a TERMINAL leaf of this tree recorded, in the same
+    /// walk as [`Self::first_terminal_leaf`]: that leaf's own cwd when it has
+    /// one, else the next terminal pane's that does — see
+    /// [`WindowLayout::bootstrap_cwd`].
     fn first_terminal_cwd(&self) -> Option<&str> {
         match self {
             Self::Leaf {
@@ -687,16 +693,47 @@ impl WindowLayout {
     /// way it rebuilds it (tabs in order, each tree first branch before
     /// second), so the shell adopted as that session must be the one that
     /// leaf names — `main_entry` picks window 0's by this, and `apply_restore_manifest`
-    /// every further window's. The legacy `tabs` mirror is only a fallback for
-    /// a layout with no canonical terminal leaf: it lists all-terminal tabs
-    /// only, so it names a different shell whenever a tab split between a
+    /// every further window's. The legacy `tabs` mirror speaks only for a
+    /// layout with no canonical terminal leaf at all: it lists all-terminal
+    /// tabs only, so it names a different shell whenever a tab split between a
     /// native view and a terminal comes first.
     pub(crate) fn bootstrap_local_id(&self) -> Option<u64> {
+        match self.bootstrap_terminal_leaf() {
+            Some(leaf) => leaf.local_id,
+            None => self.tabs.first()?.leaves().first()?.local_id(),
+        }
+    }
+
+    /// The working directory of the pane this window's BOOTSTRAP session
+    /// fills — the leaf [`Self::bootstrap_local_id`] names, by the same pick —
+    /// so the session spawned for it starts where that pane's shell was.
+    ///
+    /// That leaf's own cwd when it recorded one. When it recorded none — its
+    /// program sent no OSC 7, or the quit-time capture found its terminal
+    /// locked and left the directory out (`App::restore_session_meta`) — the
+    /// first directory another terminal pane of the SAME tab recorded, in
+    /// rebuild order, since panes split off one another usually share a
+    /// directory. Never another tab's: when no pane of this tab recorded a
+    /// directory, the bootstrap starts in the default one.
+    pub(crate) fn bootstrap_cwd(&self) -> Option<&str> {
+        match self.bootstrap_tab() {
+            Some(tab) => tab.root.first_terminal_cwd(),
+            None => self.tabs.first()?.leaves().first()?.cwd(),
+        }
+    }
+
+    /// The canonical tree's first terminal leaf, in rebuild order: the leaf
+    /// the deferred restore grafts this window's bootstrap session onto.
+    fn bootstrap_terminal_leaf(&self) -> Option<&TerminalLeafRestore> {
+        self.bootstrap_tab()?.root.first_terminal_leaf()
+    }
+
+    /// The first canonical tab with a terminal leaf: the tab holding
+    /// [`Self::bootstrap_terminal_leaf`].
+    fn bootstrap_tab(&self) -> Option<&RestoredTab> {
         self.restored_tabs
             .iter()
-            .find_map(|tab| tab.root.first_terminal_leaf())
-            .and_then(|leaf| leaf.local_id)
-            .or_else(|| self.tabs.first()?.leaves().first()?.local_id())
+            .find(|tab| tab.root.first_terminal_leaf().is_some())
     }
 
     /// Validated canonical order. Legacy terminal-only manifests synthesize the identity
@@ -944,6 +981,33 @@ impl RestoreManifest {
         Some(ids)
     }
 
+    /// Every canonical terminal leaf that names a handed-off shell (`local_id`),
+    /// cloned, in rebuild order. The orphan net (`App::adopt_orphan_shells_as_tabs`)
+    /// runs after the rebuild has consumed the manifest, and puts on each shell
+    /// the rebuild left over the USER identity of the leaf that names it.
+    pub(crate) fn handed_off_leaves(&self) -> Vec<TerminalLeafRestore> {
+        fn collect(node: &RestoredSplitTree, leaves: &mut Vec<TerminalLeafRestore>) {
+            match node {
+                RestoredSplitTree::Leaf {
+                    view: RestoredView::Terminal(terminal),
+                } if terminal.local_id.is_some() => leaves.push(terminal.clone()),
+                RestoredSplitTree::Leaf { .. } => {}
+                RestoredSplitTree::Split { first, second, .. } => {
+                    collect(first, leaves);
+                    collect(second, leaves);
+                }
+            }
+        }
+
+        let mut leaves = Vec::new();
+        for window in &self.windows {
+            for tab in &window.restored_tabs {
+                collect(&tab.root, &mut leaves);
+            }
+        }
+        leaves
+    }
+
     /// True only when this layout names every authenticated inherited terminal
     /// exactly once and names no additional terminal. Native leaves are allowed:
     /// they have no PTY and are independently restored from bounded descriptors.
@@ -954,17 +1018,12 @@ impl RestoreManifest {
             && self.seamless_terminal_ids().as_deref() == Some(expected.as_slice())
     }
 
-    /// The cwd of the FIRST window's FIRST tab's first (tree-order) leaf — the pane
-    /// the bootstrap session 0 becomes, so its spawn can start in the right directory
-    /// (every other leaf is spawned later by `apply_pending_restore` with its own cwd).
+    /// The cwd of the pane the bootstrap session 0 becomes — the FIRST window's
+    /// [`WindowLayout::bootstrap_cwd`] — so its spawn can start in the right
+    /// directory (every other leaf is spawned later by `apply_pending_restore`
+    /// with its own cwd).
     pub(crate) fn first_leaf_cwd(&self) -> Option<&str> {
-        let first = self.windows.first()?;
-        if let Some(tab) = first.restored_tabs.first()
-            && let Some(cwd) = tab.root.first_terminal_cwd()
-        {
-            return Some(cwd);
-        }
-        first.tabs.first()?.leaves().first()?.cwd()
+        self.windows.first()?.bootstrap_cwd()
     }
 
     pub(crate) fn to_toml(&self) -> Result<String, String> {
@@ -1406,6 +1465,24 @@ fn load_cell_metrics_from(
     let (cell_w, cell_h) = (entry.cell_w as usize, entry.cell_h as usize);
     ((1..=MAX_CELL_EDGE_PX).contains(&cell_w) && (1..=MAX_CELL_EDGE_PX).contains(&cell_h))
         .then_some((cell_w, cell_h))
+}
+
+/// The ONE display scale this machine has measured cells at — the cache's sole
+/// entry — for `predicted_first_window_scale` on a host with no pre-window
+/// display query. Two or more entries (a laptop that also drives an external
+/// display) are `None`: choosing between them would be a guess dressed as a
+/// record, and the caller's 1× fallback is the honest unknown. A missing or
+/// malformed cache is `None` the same way `load_cell_metrics` reads it.
+pub(crate) fn recorded_cell_metrics_scale() -> Option<f64> {
+    recorded_cell_metrics_scale_from(&cell_metrics_path()?)
+}
+
+fn recorded_cell_metrics_scale_from(path: &Path) -> Option<f64> {
+    let cache = read_cell_metrics(path)?;
+    match cache.entries.as_slice() {
+        [only] => Some(f64::from(only.scale_milli) / 1000.0),
+        _ => None,
+    }
 }
 
 /// Persist one scale's measured cell metrics. Fire-and-forget on a spawned
@@ -2014,6 +2091,30 @@ metadata = "opaque=copy-me"
         assert_eq!(absent["returned"], 1);
         assert!(model.check_invariant("AtMostOneConsumer", &absent));
         assert!(model.check_invariant("ReturnOnlyAfterDurableClaim", &absent));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// The recorded scale is the cache's SOLE entry: none when the file is
+    /// absent, the one scale after one store, and — the case a guess would
+    /// get wrong half the time — none again once a second scale is recorded.
+    #[test]
+    fn the_recorded_scale_is_the_sole_cached_scale_or_nothing() {
+        let dir = std::env::temp_dir().join(format!(
+            "aterm-cell-metrics-recorded-scale-{}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("cell-metrics.toml");
+        assert_eq!(recorded_cell_metrics_scale_from(&path), None, "no cache");
+        store_cell_metrics_to(&path, "JetBrains Mono|lh=1", 2.0, 24.0, 14, 30).unwrap();
+        assert_eq!(recorded_cell_metrics_scale_from(&path), Some(2.0));
+        store_cell_metrics_to(&path, "JetBrains Mono|lh=1", 1.0, 12.0, 7, 15).unwrap();
+        assert_eq!(
+            recorded_cell_metrics_scale_from(&path),
+            None,
+            "two recorded scales are not a prediction"
+        );
         let _ = std::fs::remove_dir_all(&dir);
     }
 

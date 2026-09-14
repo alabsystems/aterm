@@ -291,7 +291,14 @@ fn no_source_file_rolls_its_own_gutter() {
 fn hand_authored_structure_fits_an_eighty_column_window() {
     let csr = Path::new("/Users//example/Downloads/devid-m22.certSigningRequest");
     let mut over = Vec::new();
-    for line in apple::errand_lines(csr, true) {
+    // Both shapes of the errand: the named-folder one, and the one with nothing named
+    // (which carries the ⌘⇧G / --cert-dir hint instead).
+    let named = apple::Watch::new(Some(Path::new("/Users//example/Downloads")));
+    let own = apple::Watch::new(None);
+    let lines = apple::errand_lines(csr, true, &named)
+        .into_iter()
+        .chain(apple::errand_lines(csr, true, &own));
+    for line in lines {
         for row in publish::grid_block_at(80, "apple id", &line).lines() {
             // A row that is a single unbreakable token (a path, a URL) is allowed to
             // overrun — see `wrapped`, rule 3.

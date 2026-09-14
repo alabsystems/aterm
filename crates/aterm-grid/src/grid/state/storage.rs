@@ -295,6 +295,13 @@ impl GridStorage {
         self.content_gen += 1;
     }
 
+    /// Mark both cells of a wide glyph as content-damaged and bump `content_gen`.
+    #[inline]
+    pub(crate) fn mark_content_wide_cell(&mut self, row: u16, col: u16) {
+        self.damage.mark_wide_cell(row, col);
+        self.content_gen += 1;
+    }
+
     /// Mark a single row as content-damaged and bump `content_gen`.
     #[inline]
     pub(crate) fn mark_content_row(&mut self, row: u16) {

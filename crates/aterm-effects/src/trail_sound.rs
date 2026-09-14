@@ -3872,6 +3872,19 @@ impl TrailSynth {
                 // A Glide is deliberately NOT here — it stays gap-thinned like a
                 // keystroke, so a held arrow can't machine-gun.
                 | SoundGesture::Trail(SoundKind::Sweep { .. })
+                // THE V2 ENGINE'S TWINS OF Sweep AND Jump (2026-09-13). The
+                // rainbow-kitty ENGINE is engaged by the LOOK, the SYNTH by
+                // the VOICE, so a named instrument under the rainbow kitty
+                // style sends `Navigation`/`Meteor` — which only that engine
+                // mints — down THIS path. Absent from the list, a word hop
+                // arriving within MIN_GAP of the key that preceded it was
+                // thinned to silence: measured, a typed key then a nav tick
+                // 30 ms later spawned 0 voices under `voice = marimba` and 1
+                // under the default. They are already rate-limited upstream
+                // by the glow's one-cue-per-observed-move law, exactly like
+                // the Sweep above.
+                | SoundGesture::Trail(SoundKind::Navigation)
+                | SoundGesture::Trail(SoundKind::Meteor { .. })
               // A LANDING is punctuation you can SEE: the starburst is on
               // glass whether or not the gap would have thinned the note,
               // so thinning it would silence a VISIBLE celebration.
@@ -3934,6 +3947,11 @@ impl TrailSynth {
             ev.kind,
             SoundGesture::Trail(SoundKind::Shift)
                 | SoundGesture::Trail(SoundKind::Poof)
+                // THE NAV TICK does not claim the beat either (2026-09-13),
+                // on the grace note's own rule: a word hop is a −24 dB aside,
+                // and letting it own the shared slot would thin the letter
+                // typed straight after it.
+                | SoundGesture::Trail(SoundKind::Navigation)
                 // THE OUTPUT PIP is the purest case of the same rule: it is
                 // not authored at all. A pip that claimed the shared beat
                 // would let the MACHINE thin the human's very next keystroke

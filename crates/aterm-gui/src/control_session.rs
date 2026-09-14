@@ -1651,6 +1651,11 @@ pub(crate) fn cmd_turn_guarded(
     let now0 = Instant::now();
     let started_ms = crate::turn_ledger::now_ms();
     let deadline = now0 + Duration::from_millis(timeout_ms);
+    // The alt-screen archive's mark as the turn STARTS — before the yield, before
+    // a byte is typed — so `offscreen since=<arch>` reads everything a fullscreen
+    // app scrolled off its top from here on, the echo of this turn's own text
+    // included. Recorded in the ledger below and printed by `history`.
+    let arch = crate::turn_ledger::ArchMark::of(&term_lock(term));
 
     // Exit detection, identical to `await` (including the deregistration race:
     // "was registered, now gone" is exited).
@@ -1950,6 +1955,7 @@ pub(crate) fn cmd_turn_guarded(
             text: crate::turn_ledger::clamp_text(ledger_text_override.unwrap_or(text)),
             screen_hash,
             seq,
+            arch,
         });
     }
     // Wake any `events` subscriber NOW so it scans the fresh record immediately
@@ -1990,8 +1996,13 @@ pub(crate) fn cmd_turn_guarded(
 /// last n (default: all retained); `since=<id>` keeps records with id strictly
 /// greater than `<id>` (poll the ledger forward). Each record: `turn <id>
 /// submitted=<0|1> status=<..> started_ms=<..> dur_ms=<..> seq=<..> hash=<hex16>
-/// text=<pct-encoded>` — the durable memory of what a driver typed and what
-/// settled, keyed by the same id the `turn` reply and events digest use.
+/// arch=<origin>:<last> text=<pct-encoded>` — the durable memory of what a driver
+/// typed and what settled, keyed by the same id the `turn` reply and events digest
+/// use. `arch=` is the alt-screen archive's mark when the turn started
+/// ([`crate::turn_ledger::ArchMark`]): hand it to `offscreen since=` to read what a
+/// fullscreen app scrolled away since. It sits BEFORE `text=` because `text=` is
+/// the free-text tail every reader cuts a row at (aterm-link's hook splits on
+/// `" text="`), so a field after it would be read as part of the message.
 pub(crate) fn cmd_history(ctx: &SessionCtx, rest: &str) -> String {
     let mut n = 0usize;
     let mut since: Option<u64> = None;
@@ -2015,7 +2026,7 @@ pub(crate) fn cmd_history(ctx: &SessionCtx, rest: &str) -> String {
     let mut out = format!("OK {}\n", recs.len());
     for r in recs {
         out.push_str(&format!(
-            "turn {} submitted={} status={} started_ms={} dur_ms={} seq={} hash={:016x} text={}\n",
+            "turn {} submitted={} status={} started_ms={} dur_ms={} seq={} hash={:016x} arch={} text={}\n",
             r.id,
             u8::from(r.submitted),
             r.status,
@@ -2023,6 +2034,7 @@ pub(crate) fn cmd_history(ctx: &SessionCtx, rest: &str) -> String {
             r.dur_ms,
             r.seq,
             r.screen_hash,
+            r.arch,
             super::pct_encode(&r.text),
         ));
     }
@@ -3007,6 +3019,8 @@ mod tests {
         let ctx = Arc::new(crate::SessionCtx {
             sink: Arc::new(aterm_session::sink::SinkWriter::new(-1)),
             output_echo: Arc::new(crate::app_input::OutputEchoTracker::default()),
+            modes: crate::mode_mirror_of(term),
+            ui_waiting: Arc::default(),
             edges: std::sync::Mutex::new(EdgeTable::new()),
             turn_lease: std::sync::Mutex::new(None),
             self_id: sid.clone(),
@@ -3214,6 +3228,8 @@ mod tests {
         crate::SessionCtx {
             sink: Arc::new(aterm_session::sink::SinkWriter::new(-1)),
             output_echo: Arc::new(crate::app_input::OutputEchoTracker::default()),
+            modes: Arc::default(),
+            ui_waiting: Arc::default(),
             edges: std::sync::Mutex::new(EdgeTable::new()),
             turn_lease: std::sync::Mutex::new(None),
             self_id: SessionId::generate(),

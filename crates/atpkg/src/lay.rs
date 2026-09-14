@@ -17,14 +17,15 @@
 //! through them dies after the claim exactly as v0.83.0 did. The staging lane made the
 //! bundle clean; this lane makes the way IN clean. Nothing a tracked process writes
 //! itself escapes (`fork`, `posix_spawn`, `exec` into a clean image were all measured
-//! tagged), so the shims are handed, like the bundle, to a job launchd spawns from a
-//! clean byte copy of this binary — the one mechanism that measured clean.
+//! tagged), so the shims are handed, like the bundle, to a job launchd spawns from this
+//! binary — run in place when it is untagged, from a clean byte copy when it is tagged
+//! ([`crate::stage_helper::plan_helper`]) — the one mechanism that measured clean.
 //!
 //! # The mechanism
 //!
 //! The tracked parent renders every file it wants laid — path and body — into a SPEC,
-//! submits the shared one-shot job ([`crate::stage_helper::Job`]: `cat` this binary to a
-//! clean copy, exec the copy on [`HIDDEN_VERB`]), and the copy writes each file the way
+//! submits the shared one-shot job ([`crate::stage_helper::Job`]: run this binary — or a
+//! clean `cat` copy of it — on [`HIDDEN_VERB`]), and the helper writes each file the way
 //! the parent would have: a dotted sibling temp, mode `0755`, fsync, `rename(2)` — all
 //! of it in the untracked process, because a tracked parent tags a clean file by merely
 //! renaming or `chmod`ing it. The parent then MEASURES the first file back. Batched on
@@ -46,8 +47,8 @@
 //! the doctor's `bin/` scan sees them directly.
 //!
 //! A binary that is not `atpkg`/`aterm` — a test harness, some other embedding of this
-//! crate — has NO lane by construction ([`Lane::Unavailable`]: a copy of it would not
-//! serve the verb) and writes in-process as it always did; that is a fact about the
+//! crate — has NO lane by construction ([`Lane::Unavailable`]: it would not serve the
+//! verb) and writes in-process as it always did; that is a fact about the
 //! binary, not a failure of the lane, and the product's one binary is always `aterm`.
 //!
 //! Sourced shell hooks (`~/.aterm/shell.d`) are deliberately NOT routed here: a sourced
@@ -151,12 +152,14 @@ fn allowed_note(what: &str, why: &str) {
 // Which binary would serve the lane.
 // ---------------------------------------------------------------------------------------
 
-/// Whether this binary has an untracked lane at all: a copy of it must serve the hidden
-/// verbs, which only the two production spellings do
+/// Whether this binary has an untracked lane at all: it must serve the hidden verbs,
+/// which only the two production spellings do
 /// ([`crate::stage_helper::exe_serves_hidden_verb`]).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Lane {
-    /// The helper to copy: this binary, canonicalized.
+    /// The helper the job runs: this binary, canonicalized (the real path is what the
+    /// job execs, and the symlink a `~/.local/bin/aterm` is can carry a tag its target
+    /// does not).
     Helper(PathBuf),
     /// No lane for this binary — a test harness, a foreign embedding. Says why.
     Unavailable(String),
@@ -168,7 +171,7 @@ pub fn lane_for_this_binary() -> Lane {
     match std::env::current_exe().and_then(std::fs::canonicalize) {
         Ok(exe) if crate::stage_helper::exe_serves_hidden_verb(&exe) => Lane::Helper(exe),
         Ok(exe) => Lane::Unavailable(format!(
-            "{} is not an atpkg/aterm binary, so a copy of it would not serve {HIDDEN_VERB}",
+            "{} is not an atpkg/aterm binary, so it would not serve {HIDDEN_VERB}",
             exe.display()
         )),
         Err(e) => Lane::Unavailable(format!("cannot resolve this binary's own path: {e}")),
@@ -363,10 +366,11 @@ pub fn run_helper(args: &[String]) -> ExitCode {
 // The parent side.
 // ---------------------------------------------------------------------------------------
 
-/// Lay `files` through an untracked launchd job running a clean byte copy of
-/// `helper_exe`, then MEASURE: the first file is read back for the tag, and a tagged one
-/// is a lane that ran without achieving its purpose — `Err`, like a lane that did not
-/// run. `scratch` holds the job's spec, logs and the copy. `Err(reason)` is "the lane
+/// Lay `files` through an untracked launchd job running `helper_exe` (in place, or from
+/// a clean byte copy when the binary is tagged — [`crate::stage_helper::plan_helper`]),
+/// then MEASURE: the first file is read back for the tag, and a tagged one is a lane
+/// that ran without achieving its purpose — `Err`, like a lane that did not run.
+/// `scratch` holds the job's spec, logs and any copy. `Err(reason)` is "the lane
 /// could not do it"; the files it did write (all of them, on the measured-tagged path)
 /// are complete files, and the caller's policy decides what happens next.
 #[cfg(target_os = "macos")]
@@ -380,11 +384,11 @@ pub fn lay_untracked(
     }
     if !crate::stage_helper::exe_serves_hidden_verb(helper_exe) {
         return Err(format!(
-            "{} is not an atpkg/aterm binary, so a copy of it would not serve {HIDDEN_VERB}",
+            "{} is not an atpkg/aterm binary, so it would not serve {HIDDEN_VERB}",
             helper_exe.display()
         ));
     }
-    let job = crate::stage_helper::Job::prepare(scratch, "lay-helper")?;
+    let mut job = crate::stage_helper::Job::prepare(scratch, "lay-helper")?;
     std::fs::write(&job.spec, encode_spec(files)).map_err(|e| format!("write spec: {e}"))?;
     job.submit(helper_exe, HIDDEN_VERB)?;
     job.wait_for_result()?;

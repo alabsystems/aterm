@@ -198,6 +198,8 @@ pub(crate) struct TypedKittySummon {
     chars: Vec<char>,
     matches: Vec<Match>,
     scratch: ScanScratch,
+    /// Reused `(byte offset, char)` walk for [`Self::trailing_scan_start`].
+    tail: Vec<(usize, char)>,
     /// Lifetime count of printed keystrokes fed to this window's detector —
     /// the [`DOG_SUMMON_KEYS`] gate's odometer. Deliberately NOT reset by
     /// session switches, breaks, or backspaces (see the gate's doc), and not
@@ -245,6 +247,24 @@ impl TypedKittySummon {
         self.keys_typed = self.keys_typed.saturating_add(1);
         self.buf.push(ch);
         self.trim();
+        // INCREMENTAL. A completion is a match that ENDS at the window's end,
+        // and the scanner ends a token only on a token character (an interior
+        // joiner is consumed only when a token character follows) and a
+        // no-space run only on a no-space character — so a key that is
+        // neither can complete nothing, and the scan is skipped outright.
+        if !(aterm_lexicon::is_token_char(ch) || aterm_lexicon::is_no_space_script(ch)) {
+            return TypedHit::default();
+        }
+        // Otherwise scan ONLY the trailing token / no-space run plus the two
+        // characters of left context the scanner's code-adjacency guard reads,
+        // segmented with the lexicon's own exported predicates (the same rule
+        // as its `token_end`, walked backwards), instead of re-tokenising and
+        // re-folding every token in the 48-char window per keystroke. Exact
+        // for any surface length: the trailing token is scanned whole, its
+        // left guard sees the same two characters, and its right guard is at
+        // the window end either way; earlier tokens could only yield matches
+        // that do not end at the window end, which were discarded anyway.
+        let start = Self::trailing_scan_start(&self.buf, ch, &mut self.tail);
         let Self {
             buf,
             chars,
@@ -252,7 +272,7 @@ impl TypedKittySummon {
             scratch,
             ..
         } = self;
-        lexicon.scan_into_with_scratch(buf, opts, chars, matches, scratch);
+        lexicon.scan_into_with_scratch(&buf[start..], opts, chars, matches, scratch);
         let end = self.chars.len();
         // A word COMPLETED on this keystroke iff a match ends at the window's
         // end. Anything earlier was already consumed or is mid-word context.
@@ -306,6 +326,48 @@ impl TypedKittySummon {
         }
     }
 
+    /// Byte offset into `buf` where the incremental scan starts: the trailing
+    /// token (when `last` is a token char) or trailing no-space run (when it is
+    /// a no-space-script char), extended by two preceding chars of left
+    /// context. `tail` is reused scratch for the backward walk.
+    ///
+    /// Token segmentation mirrors the scanner's `token_end` exactly, backwards:
+    /// a maximal run of token chars where an interior joiner (`'`, `’`, `-`)
+    /// counts only with token chars on BOTH sides.
+    fn trailing_scan_start(buf: &str, last: char, tail: &mut Vec<(usize, char)>) -> usize {
+        tail.clear();
+        tail.extend(buf.char_indices());
+        let n = tail.len();
+        if n == 0 {
+            return 0;
+        }
+        // Index (into `tail`) of the first char of the trailing token/run.
+        let mut i = n - 1;
+        if aterm_lexicon::is_no_space_script(last) {
+            while i > 0 && aterm_lexicon::is_no_space_script(tail[i - 1].1) {
+                i -= 1;
+            }
+        } else {
+            loop {
+                if i > 0 && aterm_lexicon::is_token_char(tail[i - 1].1) {
+                    i -= 1;
+                } else if i > 1
+                    && aterm_lexicon::is_interior_joiner(tail[i - 1].1)
+                    && aterm_lexicon::is_token_char(tail[i - 2].1)
+                {
+                    // `tail[i]` is a token char (we only arrive here from one),
+                    // so the joiner is interior: consume it and keep walking.
+                    i -= 2;
+                } else {
+                    break;
+                }
+            }
+        }
+        // Two chars of left context for `left_suppresses` (`c == '.'` looks one
+        // further back than the adjacent char).
+        tail[i.saturating_sub(2)].0
+    }
+
     /// A plain Backspace pops the most recent char (typo tolerance, bounded
     /// by [`BUF_CAP`] of history). Popping never fires — deletion cannot
     /// complete a word here, only [`Self::note_char`] checks for completion.
@@ -327,6 +389,124 @@ mod tests {
 
     fn lex() -> Lexicon {
         Lexicon::builtin().clone()
+    }
+
+    /// P06 — the incremental detector (token-gated, trailing-token scan) is
+    /// keystroke-for-keystroke IDENTICAL to a reference that rescans the whole
+    /// window: same completions, same classes, same window clears. The corpus
+    /// walks the cases the segmentation must get right: joiners and
+    /// possessives (`cat's`, `cat-like`), code-adjacent context (`./cat`,
+    /// `--cat`, `x.cat`), `scat`/`concatenate` (no bare `cat` inside a token),
+    /// tokens longer than any surface, CJK runs against Latin, punctuation and
+    /// spaces, and a long prose run that trims the window.
+    #[test]
+    fn incremental_scan_matches_a_whole_window_rescan_keystroke_for_keystroke() {
+        let lexicon = lex();
+        let opts = ScanOptions {
+            allow_bare_cat: true,
+            ..ScanOptions::default()
+        };
+        let corpus: &[&str] = &[
+            "the cat sat on the mat and the kitten purred loudly",
+            "a scat concatenate cats' kitty's cat-like meow-cat kitty",
+            "./cat --cat x.cat a.cat. cat.b (cat) [kitty] {kitten} cat!",
+            "xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxcat kitty",
+            "猫 kitty 子猫 ねこ cat ねこねこ kitty猫 cat",
+            "kot koty kotek chat chaton gato gatito katze kätzchen",
+            "damn that cat, what the hell kitty?!  puppy dog doggo",
+            "cat's cat-like cat-cat cat'-cat cat''s ca't c-a-t catcat",
+        ];
+        // Reference: the pre-incremental detector — whole-window scan, same
+        // hit/clear law — kept minimal and local to this test.
+        struct Reference {
+            buf: String,
+            chars: Vec<char>,
+            matches: Vec<Match>,
+            scratch: ScanScratch,
+        }
+        impl Reference {
+            fn note_char(
+                &mut self,
+                ch: char,
+                lexicon: &Lexicon,
+                opts: &ScanOptions,
+            ) -> Option<Class> {
+                self.buf.push(ch);
+                while self.buf.chars().count() > BUF_CAP {
+                    let mut it = self.buf.chars();
+                    it.next();
+                    self.buf = it.as_str().to_string();
+                }
+                lexicon.scan_into_with_scratch(
+                    &self.buf,
+                    opts,
+                    &mut self.chars,
+                    &mut self.matches,
+                    &mut self.scratch,
+                );
+                let end = self.chars.len();
+                let hit = self.matches.iter().filter(|m| m.end == end).fold(
+                    None::<Class>,
+                    |acc, m| match (acc, m.class) {
+                        (Some(Class::Profanity), _) | (_, Class::Profanity) => {
+                            Some(Class::Profanity)
+                        }
+                        (_, class) => Some(class),
+                    },
+                );
+                if hit.is_some() {
+                    self.buf.clear();
+                }
+                hit
+            }
+        }
+        let now = Instant::now();
+        for (line_no, line) in corpus.iter().enumerate() {
+            let mut det = TypedKittySummon::default();
+            let mut reference = Reference {
+                buf: String::new(),
+                chars: Vec::new(),
+                matches: Vec::new(),
+                scratch: ScanScratch::default(),
+            };
+            let mut fired = 0;
+            for (k, ch) in line.chars().enumerate() {
+                let expect = reference.note_char(ch, &lexicon, &opts);
+                let got = det.note_char(now, 7, ch, &lexicon, &opts);
+                // `TypedHit` surfaces three classes; other completions (orca,
+                // emphasis) are a hit for the reference and `default()` for the
+                // detector, and the canine REACTION is further gated on
+                // `keys_typed` — so compare the completion via the one fact
+                // both sides expose identically: a completion clears the window.
+                let got_completed = det.buf.is_empty() && !reference.buf.is_empty() || {
+                    // both cleared, or neither
+                    det.buf.is_empty() == reference.buf.is_empty() && expect.is_some()
+                };
+                assert_eq!(
+                    det.buf, reference.buf,
+                    "line {line_no} key {k} ({ch:?}): window state diverged (a missed or spurious completion)"
+                );
+                let got_class = if got.profanity {
+                    Some(Class::Profanity)
+                } else if got.feline {
+                    Some(Class::Feline)
+                } else {
+                    None
+                };
+                let expect_class = match expect {
+                    Some(Class::Profanity) => Some(Class::Profanity),
+                    Some(Class::Feline) => Some(Class::Feline),
+                    _ => None,
+                };
+                assert_eq!(
+                    got_class, expect_class,
+                    "line {line_no} key {k} ({ch:?}): reaction diverged from the whole-window reference"
+                );
+                let _ = got_completed;
+                fired += usize::from(expect.is_some());
+            }
+            assert!(fired > 0, "line {line_no} exercised no completion");
+        }
     }
 
     /// Feed a string one char at a time; count the LEDGER-RECORDED summons.

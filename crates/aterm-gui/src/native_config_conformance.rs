@@ -793,6 +793,59 @@ impl Drop for KittyFixtures {
     }
 }
 
+/// Render one deterministic classic companion through the effects state that
+/// the live/capture config installer populated. Returning the addressed atlas
+/// texel as well as the destination proves parity of both placement and source
+/// pixels; comparing only the retained `Arc` would let a stale atlas key pass.
+fn installed_custom_kitty_projection(
+    app: &mut crate::App,
+    wid: crate::WindowId,
+) -> (aterm_core::render::FreeSprite, [u8; 4]) {
+    let (cell_w, cell_h) = app
+        .spawn_cell_px(wid)
+        .expect("headless renderer has admitted cell metrics");
+    let ws = app.windows.get_mut(&wid).expect("headless window");
+    let geom = aterm_effects::word_decorations::EffectGeom {
+        cell_w,
+        cell_h,
+        rows: ws.rows,
+        cols: ws.cols,
+    };
+    // A presented frame admits exactly ONE companion body (the effects
+    // engine's one-body law), and the headless host has already spent this
+    // frame's claim and bake budget on its own render. Open a fresh host
+    // frame, as `app_render` does once per presented frame, so this probe
+    // is that frame's single emission rather than a refused second body.
+    ws.word_decos.begin_host_frame();
+    let cursor = (3, 5);
+    let mut free = Vec::new();
+    let fp = ws
+        .word_decos
+        .kitty_cursor(
+            aterm_effects::word_decorations::KittyCursorFrame {
+                geom,
+                cursor,
+                look: aterm_effects::kitty_registry::KittyLook::default(),
+                colors: aterm_effects::cat_baker::CatColorKey::default(),
+                bob: 0.0,
+                alpha: 255,
+                pose: aterm_effects::kitty_cursor::CatPose::STILL,
+                sing: 0.0,
+                notes: [None; aterm_effects::kitty_sing::MAX_NOTES],
+            },
+            &mut free,
+        )
+        .expect("installed custom kitty emits");
+    assert_ne!(fp, 0, "custom kitty contributes a repaint identity");
+    assert_eq!(free.len(), 1, "custom source emits one body");
+    let sprite = free[0];
+    let atlas = ws.word_decos.free_atlas().expect("custom kitty atlas");
+    let offset = (usize::from(sprite.ay) * atlas.width as usize + usize::from(sprite.ax)) * 4;
+    let pixel =
+        <[u8; 4]>::try_from(&atlas.rgba[offset..offset + 4]).expect("addressed custom atlas texel");
+    (sprite, pixel)
+}
+
 fn snapshot_catalog_is_generation_consistent(snapshot: &ConfigSnapshot) -> bool {
     let Ok(config) = aterm_toml::from_str::<crate::app_config::Config>(&snapshot.text) else {
         return false;
@@ -1182,6 +1235,12 @@ fn config_snapshot_catalog_is_atomic_across_patch_external_and_cross_view_delive
             .expect("installed RGBA"),
         rgba
     ));
+    let live_render = installed_custom_kitty_projection(&mut app, wid);
+    assert_eq!(
+        live_render.1,
+        <[u8; 4]>::try_from(&rgba[..4]).expect("Ready sprite first texel"),
+        "the live-installed engine addresses the admitted source pixels"
+    );
     let after_live = config_catalog_projection(
         &model,
         &external,
@@ -1231,6 +1290,12 @@ fn config_snapshot_catalog_is_atomic_across_patch_external_and_cross_view_delive
             .expect("capture RGBA"),
         rgba
     ));
+    let capture_render = installed_custom_kitty_projection(&mut app, wid);
+    assert_eq!(
+        capture_render, live_render,
+        "live installation and the actual capture reinstall produce identical \
+         destination and addressed atlas texel"
+    );
     let after_capture = config_catalog_projection(
         &model,
         &external,

@@ -827,7 +827,7 @@ pub(crate) fn cmd_metrics(term: Option<&Arc<Mutex<Terminal>>>, rest: &str) -> St
              n_resize={} resize_p50_ms={:.2} resize_p95_ms={:.2} resize_p99_ms={:.2} \
              n_reflow={} reflow_p50_ms={:.2} reflow_p95_ms={:.2} reflow_p99_ms={:.2} \
              n_present_tainted={} present_tainted_p50_ms={:.2} \
-             present_tainted_p95_ms={:.2} present_tainted_p99_ms={:.2}{}\n",
+             present_tainted_p95_ms={:.2} present_tainted_p99_ms={:.2}{}{}\n",
             input.count(),
             p(input, 0.50),
             p(input, 0.95),
@@ -866,6 +866,10 @@ pub(crate) fn cmd_metrics(term: Option<&Arc<Mutex<Terminal>>>, rest: &str) -> St
             p(tainted, 0.50),
             p(tainted, 0.95),
             p(tainted, 0.99),
+            // UI-THREAD TERMINAL-MUTEX WAIT, per acquiring site (redraw LOCK A,
+            // LOCK B fallback, key press): the span the typing audit listed as
+            // unmeasured. Formatted by one helper so text and JSON stay twins.
+            text_term_wait_fields(),
             // ECHO ROUND TRIP (audit item 5): the one slice on this line that is
             // NOT aterm's own cost — bytes out to the PTY, first bytes back from
             // the child. Formatted by `echo_rtt` itself so its percentiles can
@@ -1244,6 +1248,57 @@ fn cell_pipeline_object(cell_ns: &[u64; aterm_gpu::startup_probe::CELL_PIPELINE_
     format!("{{{body}}}")
 }
 
+/// The per-site UI-thread terminal-mutex wait fields (text form): for each of
+/// `redraw_a` / `redraw_b` / `press`, ` n_term_wait_<site>=N
+/// term_wait_<site>_p50_ms=… _p95_ms=… _p99_ms=… max_term_wait_<site>_ms=…`.
+/// Leading space; empty never (the sites are static).
+fn text_term_wait_fields() -> String {
+    use std::fmt::Write as _;
+    let ms = |ns: u64| ns as f64 / 1e6;
+    let mut out = String::new();
+    for site in crate::metrics::TermWaitSite::ALL {
+        let h = crate::metrics::term_wait_distribution(site);
+        let p = |q: f64| ms(h.percentile(q).unwrap_or(0));
+        let label = site.label();
+        let _ = write!(
+            out,
+            " n_term_wait_{label}={} term_wait_{label}_p50_ms={:.2} \
+             term_wait_{label}_p95_ms={:.2} term_wait_{label}_p99_ms={:.2} \
+             max_term_wait_{label}_ms={:.2}",
+            h.count(),
+            p(0.50),
+            p(0.95),
+            p(0.99),
+            ms(crate::metrics::term_wait_max_ns(site)),
+        );
+    }
+    out
+}
+
+/// JSON twin of [`text_term_wait_fields`]: a leading-comma fragment.
+fn json_term_wait_fields() -> String {
+    use std::fmt::Write as _;
+    let ms = |ns: u64| ns as f64 / 1e6;
+    let mut out = String::new();
+    for site in crate::metrics::TermWaitSite::ALL {
+        let h = crate::metrics::term_wait_distribution(site);
+        let p = |q: f64| ms(h.percentile(q).unwrap_or(0));
+        let label = site.label();
+        let _ = write!(
+            out,
+            ",\"n_term_wait_{label}\":{},\"term_wait_{label}_p50_ms\":{:.2},\
+             \"term_wait_{label}_p95_ms\":{:.2},\"term_wait_{label}_p99_ms\":{:.2},\
+             \"max_term_wait_{label}_ms\":{:.2}",
+            h.count(),
+            p(0.50),
+            p(0.95),
+            p(0.99),
+            ms(crate::metrics::term_wait_max_ns(site)),
+        );
+    }
+    out
+}
+
 /// Structured twin of [`cmd_metrics`]. All scheduler/redraw counters and typed
 /// owner/reason labels are present so automation never has to scrape the text
 /// line. `reset` and `percentiles` retain the text verb's semantics, with one
@@ -1280,7 +1335,7 @@ pub(crate) fn cmd_metrics_json(term: Option<&Arc<Mutex<Terminal>>>, command: &st
              \"resize_p50_ms\":{:.2},\"resize_p95_ms\":{:.2},\
              \"resize_p99_ms\":{:.2},\"n_present_tainted\":{},\
              \"present_tainted_p50_ms\":{:.2},\"present_tainted_p95_ms\":{:.2},\
-             \"present_tainted_p99_ms\":{:.2}{}}}",
+             \"present_tainted_p99_ms\":{:.2}{}{}}}",
             input.count(),
             p(input, 0.50),
             p(input, 0.95),
@@ -1315,6 +1370,8 @@ pub(crate) fn cmd_metrics_json(term: Option<&Arc<Mutex<Terminal>>>, command: &st
             p(tainted, 0.50),
             p(tainted, 0.95),
             p(tainted, 0.99),
+            // Field-for-field twin of the text form's term-wait fragment.
+            json_term_wait_fields(),
             // Field-for-field twin of the text form's echo fragment.
             crate::echo_rtt::percentile_fields_json(),
         ));
@@ -1540,6 +1597,253 @@ pub(crate) fn cmd_metrics_json(term: Option<&Arc<Mutex<Terminal>>>, command: &st
 pub(crate) fn cmd_lines(term: &Arc<Mutex<Terminal>>) -> String {
     let t = term_lock(term);
     format!("OK {}\n", t.grid().scrollback_lines())
+}
+
+/// The `offscreen` grammar, as the wire states it on a usage error. ONE constant:
+/// every refusal of [`offscreen_args`] answers these bytes, and the catalog row
+/// spells the same synopsis, so the two cannot drift apart (the `text` lesson,
+/// [`TEXT_USAGE`]).
+pub(crate) const OFFSCREEN_USAGE: &str =
+    "ERR usage: offscreen [since=<i>] [tail=<n>] [max=<n>] [screen=1]\n";
+
+/// `offscreen since=<i>` naming a row NEWER than the archive's newest: the caller
+/// holds an index this archive never issued (subscribe's wording for the same
+/// mistake). A `since=<origin>:<i>` minted under ANOTHER origin is not this
+/// error — it reads from the start of this archive and `origin=` shows the reset.
+pub(crate) const OFFSCREEN_BAD_SINCE: &str = "ERR bad since\n";
+
+/// How many archived rows one `offscreen` reply carries when `max=` does not say:
+/// `more=1` marks a page with rows left over, and `since=<last>` reads the next
+/// (`last=` is the index of the page's own last row, not the archive's newest).
+/// A bare poll therefore ships at most this many rows of an archive that can hold
+/// 65,536 (in 4 MiB); a caller that wants a bigger page says so with `max=`.
+pub(crate) const OFFSCREEN_DEFAULT_MAX: usize = 2000;
+
+/// Where an `offscreen` read starts: `since=<i>` (this archive's index) or
+/// `since=<origin>:<i>` (an index minted under `origin`, e.g. a `history` row's
+/// `arch=` mark). Exclusive, like `history since=`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct OffscreenSince {
+    /// The origin the index was minted under; `None` = this archive's own.
+    pub(crate) origin: Option<u64>,
+    /// The last index the caller already has (0 = from the beginning).
+    pub(crate) index: u64,
+}
+
+/// What an `offscreen` read asks for, parsed from its argument tail by
+/// [`offscreen_args`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub(crate) struct OffscreenArgs {
+    /// `since=`: rows strictly after this index (`None` = from the beginning).
+    pub(crate) since: Option<OffscreenSince>,
+    /// `tail=<n>`: the NEWEST n rows after `since` instead of the oldest.
+    pub(crate) tail: Option<usize>,
+    /// `max=<n>`: the page size (default [`OFFSCREEN_DEFAULT_MAX`]).
+    pub(crate) max: Option<usize>,
+    /// `screen=1`: append the current screen rows, read under the same lock.
+    pub(crate) screen: bool,
+}
+
+/// A decimal number and nothing else: ASCII digits only, so `+5`, ` 5`, `5x` and
+/// the empty string are all refused (`str::parse` would take the `+`).
+fn offscreen_number(s: &str) -> Option<u64> {
+    if s.is_empty() || !s.bytes().all(|b| b.is_ascii_digit()) {
+        return None;
+    }
+    s.parse().ok()
+}
+
+/// The `offscreen` argument tail: `since=<i>` or `since=<origin>:<i>`, `tail=<n>`,
+/// `max=<n>` and `screen=1`, each at most once, in any order; empty for the first
+/// page from the beginning. ANYTHING else — an unknown or repeated token, `tail=0`,
+/// `max=0`, a non-number, a `screen=` other than 1 — is [`OFFSCREEN_USAGE`], so a
+/// guessed modifier is never silently dropped. `tail=` and `max=` combine: the
+/// newest `min(tail, max)` rows.
+pub(crate) fn offscreen_args(rest: &str) -> Result<OffscreenArgs, String> {
+    let usage = || Err(OFFSCREEN_USAGE.to_string());
+    let count = |v: &str| -> Option<usize> {
+        offscreen_number(v)
+            .and_then(|n| usize::try_from(n).ok())
+            .filter(|&n| n > 0)
+    };
+    let mut args = OffscreenArgs::default();
+    for tok in rest.split_whitespace() {
+        let Some((key, value)) = tok.split_once('=') else {
+            return usage();
+        };
+        match key {
+            "since" if args.since.is_none() => {
+                let since = match value.split_once(':') {
+                    Some((origin, index)) => {
+                        match (offscreen_number(origin), offscreen_number(index)) {
+                            (Some(origin), Some(index)) => OffscreenSince {
+                                origin: Some(origin),
+                                index,
+                            },
+                            _ => return usage(),
+                        }
+                    }
+                    None => match offscreen_number(value) {
+                        Some(index) => OffscreenSince {
+                            origin: None,
+                            index,
+                        },
+                        None => return usage(),
+                    },
+                };
+                args.since = Some(since);
+            }
+            "tail" if args.tail.is_none() => match count(value) {
+                Some(n) => args.tail = Some(n),
+                None => return usage(),
+            },
+            "max" if args.max.is_none() => match count(value) {
+                Some(n) => args.max = Some(n),
+                None => return usage(),
+            },
+            "screen" if !args.screen && value == "1" => args.screen = true,
+            _ => return usage(),
+        }
+    }
+    Ok(args)
+}
+
+/// `offscreen [since=<i>|since=<origin>:<i>] [tail=<n>] [max=<n>] [screen=1]` ->
+/// the rows an ALTERNATE-screen app scrolled off its top, from the session's
+/// alt-screen archive (`aterm_core::terminal::AltArchive`), line-framed:
+///
+/// `OK <n> first=<i> last=<j> lost=<k> breaks=<b> back=<d>[ back_at=<i> pin=<p>]
+/// epoch=<e> origin=<o> alt=<0|1> seq=<s>[ enabled=0][ more=1][ screen_rows=<m>]`
+/// then `<n>` lines.
+///
+/// * The archived rows come first, oldest first: reply line `m` is archived index
+///   `first + m`. `last` is the index of the reply's LAST archived row — the
+///   archive's newest when nothing was left out, and with no row the index the
+///   read stopped at (0 = nothing yet) — so the next page or poll is always
+///   `since=<last>`.
+/// * `since=` is EXCLUSIVE. An index minted under another origin (`<origin>:<i>`
+///   from a restarted or handed-off process) reads from the start of this archive
+///   — `origin=` shows the reset; an index past `last` is [`OFFSCREEN_BAD_SINCE`].
+/// * At most `max=` rows (default [`OFFSCREEN_DEFAULT_MAX`]): the oldest ones after
+///   `since`, or with `tail=<n>` the newest `n`; `more=1` when rows were left out.
+/// * `lost=` counts rows after `since` evicted before this read, `breaks=` the
+///   discontinuities at or after `since` (a redraw with no overlap, a resize, the
+///   app leaving the alt screen, a reset, a restore), `back=` how many archived rows
+///   the screen still shows at the top of its scrolling region — when nonzero,
+///   screen rows `pin .. pin+back` are archived rows `back_at ..` (`pin=` rows of
+///   a header sit above them) — `epoch=` the baseline generation, `alt=` whether
+///   the alternate screen is active now, and `seq=` the engine's content seq — all
+///   read under the SAME lock as the rows. `enabled=0` says the archive is OFF
+///   (`ATERM_ALT_ARCHIVE=0`, a budget of 0): nothing that scrolled off was kept,
+///   so an empty reply is not "nothing scrolled off".
+/// * `screen=1` appends the current screen rows `[0, R)` (the `text` rows), taken
+///   under that same lock, and closes the header with `screen_rows=<m>`. `<n>`
+///   counts EVERY line that follows — the framing every line-framed client reads —
+///   so the archived rows are the first `n - m` and the screen the last `m`.
+///
+/// The archive's rows are cloned out as `Arc<str>` under the terminal lock (one
+/// refcount bump each) and the reply is formatted AFTER the lock is released: a
+/// full archive is 4 MiB, which must never be copied while the PTY reader and the
+/// renderer wait on the lock.
+pub(crate) fn cmd_offscreen(term: &Arc<Mutex<Terminal>>, rest: &str) -> String {
+    let args = match offscreen_args(rest) {
+        Ok(args) => args,
+        Err(err) => return err,
+    };
+    let (read, alt, seq, screen) = {
+        let t = term_lock(term);
+        let archive = t.alt_archive();
+        let since = match args.since {
+            None => 0,
+            // Minted under another origin: those indices mean nothing here. Read
+            // from the beginning; the reply's `origin=` tells the caller why.
+            Some(OffscreenSince {
+                origin: Some(origin),
+                ..
+            }) if origin != archive.origin() => 0,
+            Some(OffscreenSince { index, .. }) if index > archive.last() => {
+                return OFFSCREEN_BAD_SINCE.to_string();
+            }
+            Some(OffscreenSince { index, .. }) => index,
+        };
+        let page = args.max.unwrap_or(OFFSCREEN_DEFAULT_MAX);
+        let query = match args.tail {
+            Some(n) => aterm_core::terminal::AltArchiveQuery::newest(since, n.min(page)),
+            None => aterm_core::terminal::AltArchiveQuery::oldest(since, page),
+        };
+        let read = archive.read(query);
+        let screen: Option<Vec<String>> = args.screen.then(|| {
+            (0..usize::from(t.rows()))
+                .map(|r| visible_row(&t, r))
+                .collect()
+        });
+        (read, t.is_alternate_screen(), t.content_seq(), screen)
+    };
+    format_offscreen_reply(&read, alt, seq, screen.as_deref())
+}
+
+/// Frame an `offscreen` read (see [`cmd_offscreen`]); runs with no lock held.
+fn format_offscreen_reply(
+    read: &aterm_core::terminal::AltArchiveRead,
+    alt: bool,
+    seq: u64,
+    screen: Option<&[String]>,
+) -> String {
+    use std::fmt::Write as _;
+    let screen_rows = screen.map_or(0, <[String]>::len);
+    let body_bytes: usize = read.rows.iter().map(|r| r.len() + 1).sum::<usize>()
+        + screen.map_or(0, |s| s.iter().map(|r| r.len() + 1).sum());
+    let mut out = String::with_capacity(body_bytes + 192);
+    // The page's own last row: `since=<last>` must read the NEXT page, never
+    // skip to the archive's newest (which `more=1` says lies further on).
+    let page_last = read.page_last();
+    let _ = write!(
+        out,
+        "OK {} first={} last={} lost={} breaks={} back={}",
+        read.rows.len() + screen_rows,
+        read.first,
+        page_last,
+        read.lost,
+        read.gaps.len(),
+        read.back,
+    );
+    if read.back > 0 {
+        let _ = write!(out, " back_at={} pin={}", read.back_at, read.pin);
+    }
+    let _ = write!(
+        out,
+        " epoch={} origin={} alt={} seq={}",
+        read.epoch,
+        read.origin,
+        u8::from(alt),
+        seq,
+    );
+    if !read.enabled {
+        out.push_str(" enabled=0");
+    }
+    if read.more {
+        out.push_str(" more=1");
+    }
+    if let Some(screen) = screen {
+        let _ = write!(out, " screen_rows={}", screen.len());
+    }
+    out.push('\n');
+    for row in &read.rows {
+        // The archive stores rows already collapsed the way `text` collapses them;
+        // map again anyway, because a control char left in a row (a newline above
+        // all) would break the n-line framing for every client.
+        if row.chars().any(|c| visible_char(c) != c) {
+            out.extend(row.chars().map(visible_char));
+        } else {
+            out.push_str(row);
+        }
+        out.push('\n');
+    }
+    for row in screen.unwrap_or_default() {
+        out.push_str(row);
+        out.push('\n');
+    }
+    out
 }
 
 /// `line <n>` -> `OK <text>\n` for the line at MONOTONIC ABSOLUTE row `n`, or
@@ -6561,5 +6865,609 @@ mod trim_tests {
             "a countless header passes through"
         );
         assert_eq!(trim_lines_reply("OK 0\n"), "OK 0 trimmed=0\n");
+    }
+}
+
+/// `offscreen`: the grammar, the slicing and paging, the since= rules, the counts
+/// the header reports, and `screen=1` — against a real engine fed a synthetic
+/// alt-screen app that repaints in place inside DEC 2026 frames (never a real
+/// capture: those carry private content).
+#[cfg(test)]
+mod offscreen_tests {
+    use std::collections::HashMap;
+    use std::fmt::Write as _;
+    use std::sync::{Arc, Mutex};
+
+    use aterm_core::terminal::Terminal;
+
+    use super::{
+        OFFSCREEN_BAD_SINCE, OFFSCREEN_DEFAULT_MAX, OFFSCREEN_USAGE, OffscreenArgs, OffscreenSince,
+        cmd_offscreen, cmd_text, offscreen_args,
+    };
+
+    const ROWS: u16 = 8;
+    const TRANSCRIPT: usize = 6;
+    const ORIGIN: u64 = 0xA11_0000_0042;
+
+    fn row(i: usize) -> String {
+        format!("row {i:05} of the transcript")
+    }
+
+    /// The screen with transcript row `start` at the top: six transcript rows, then
+    /// a composer and a footer that never move (the chrome the differ excludes).
+    fn frame(start: usize) -> Vec<String> {
+        let mut v: Vec<String> = (start..start + TRANSCRIPT).map(row).collect();
+        v.push("> type a message".to_string());
+        v.push("footer: ready".to_string());
+        v
+    }
+
+    /// Paint one frame the way Claude Code does: CUP + text + EL per row inside a
+    /// DEC 2026 synchronized update, and no scroll sequence at all.
+    fn paint(t: &mut Terminal, start: usize) {
+        let mut b = String::from("\x1b[?2026h");
+        for (r, text) in frame(start).iter().enumerate() {
+            let _ = write!(b, "\x1b[{};1H{text}\x1b[K", r + 1);
+        }
+        b.push_str("\x1b[?2026l");
+        t.process(b.as_bytes());
+    }
+
+    /// An engine on the alternate screen whose app painted frames `0..frames`, one
+    /// row further down the transcript each time: `frames - 1` rows scrolled off
+    /// its top, archived as indices `1..frames`, where index `i` holds `row(i - 1)`.
+    fn scrolled_engine(frames: usize) -> Terminal {
+        let mut t = Terminal::new(ROWS, 40);
+        t.set_alt_archive_enabled(true); // whatever ATERM_ALT_ARCHIVE says here
+        t.set_alt_archive_origin(ORIGIN);
+        t.process(b"\x1b[?1049h");
+        for s in 0..frames {
+            paint(&mut t, s);
+        }
+        t
+    }
+
+    fn scrolled(frames: usize) -> Arc<Mutex<Terminal>> {
+        Arc::new(Mutex::new(scrolled_engine(frames)))
+    }
+
+    /// A reply split into its header count, its `key=value` fields and its lines;
+    /// asserts the count IS the number of lines that follow (the framing).
+    fn parse(reply: &str) -> (usize, HashMap<String, String>, Vec<String>) {
+        let (header, body) = reply.split_once('\n').expect("a header line");
+        let mut toks = header.split_whitespace();
+        assert_eq!(toks.next(), Some("OK"), "{reply}");
+        let n: usize = toks.next().unwrap().parse().expect("a count");
+        let fields = toks
+            .map(|t| {
+                let (k, v) = t.split_once('=').expect("key=value");
+                (k.to_string(), v.to_string())
+            })
+            .collect();
+        let lines: Vec<String> = body.lines().map(str::to_string).collect();
+        assert_eq!(
+            lines.len(),
+            n,
+            "OK <n> counts every line that follows: {reply}"
+        );
+        assert!(body.is_empty() || body.ends_with('\n'), "{reply:?}");
+        (n, fields, lines)
+    }
+
+    fn field(fields: &HashMap<String, String>, key: &str) -> u64 {
+        fields
+            .get(key)
+            .unwrap_or_else(|| panic!("no {key}= in {fields:?}"))
+            .parse()
+            .unwrap()
+    }
+
+    fn rows(from: usize, to: usize) -> Vec<String> {
+        (from..to).map(row).collect()
+    }
+
+    #[test]
+    fn offscreen_args_accept_each_option_once_in_any_order() {
+        assert_eq!(offscreen_args(""), Ok(OffscreenArgs::default()));
+        assert_eq!(offscreen_args("   "), Ok(OffscreenArgs::default()));
+        assert_eq!(
+            offscreen_args("screen=1 max=5 tail=2 since=9"),
+            Ok(OffscreenArgs {
+                since: Some(OffscreenSince {
+                    origin: None,
+                    index: 9
+                }),
+                tail: Some(2),
+                max: Some(5),
+                screen: true,
+            })
+        );
+        assert_eq!(
+            offscreen_args("since=77:0").map(|a| a.since),
+            Ok(Some(OffscreenSince {
+                origin: Some(77),
+                index: 0
+            }))
+        );
+        assert_eq!(
+            offscreen_args("since=0").map(|a| a.since.unwrap().index),
+            Ok(0)
+        );
+    }
+
+    /// Nothing is silently ignored: an unknown or repeated token, `tail=0`, `max=0`,
+    /// a non-number (a sign included), a malformed origin mark, and any `screen=`
+    /// but 1 all answer the ONE usage line.
+    #[test]
+    fn offscreen_args_refuse_junk_repeats_zeros_and_non_numbers() {
+        for bad in [
+            "junk",
+            "5",
+            "--json",
+            "since",
+            "since=",
+            "since=x",
+            "since=-1",
+            "since=+3",
+            "since=1:",
+            "since=:1",
+            "since=1:2:3",
+            "since=a:2",
+            "since=1 since=2",
+            "tail=0",
+            "tail=",
+            "tail=-2",
+            "tail=+2",
+            "tail=2 tail=3",
+            "max=0",
+            "max=x",
+            "max=3 max=3",
+            "screen",
+            "screen=0",
+            "screen=2",
+            "screen=1 screen=1",
+            "tail=2 junk",
+            "since=99999999999999999999999",
+        ] {
+            assert_eq!(
+                offscreen_args(bad),
+                Err(OFFSCREEN_USAGE.to_string()),
+                "{bad:?}"
+            );
+            assert_eq!(
+                cmd_offscreen(&scrolled(3), bad),
+                OFFSCREEN_USAGE,
+                "the verb answers the parser's line for {bad:?}"
+            );
+        }
+    }
+
+    /// The bare read: every archived row, oldest first, `first=1`, `last` the newest
+    /// index, and the state the header promises read under the same lock.
+    #[test]
+    fn offscreen_returns_the_rows_the_app_scrolled_off_oldest_first() {
+        let term = scrolled(10);
+        let reply = cmd_offscreen(&term, "");
+        let (n, f, lines) = parse(&reply);
+        assert_eq!(n, 9, "{reply}");
+        assert_eq!(lines, rows(0, 9));
+        assert_eq!(field(&f, "first"), 1);
+        assert_eq!(field(&f, "last"), 9);
+        assert_eq!(field(&f, "lost"), 0);
+        assert_eq!(field(&f, "breaks"), 0);
+        assert_eq!(field(&f, "back"), 0);
+        assert_eq!(field(&f, "origin"), ORIGIN);
+        assert_eq!(field(&f, "alt"), 1);
+        let t = term.lock().unwrap();
+        assert_eq!(field(&f, "seq"), t.content_seq());
+        assert_eq!(field(&f, "epoch"), u64::from(t.alt_archive().epoch()));
+        assert!(!f.contains_key("more") && !f.contains_key("screen_rows"));
+        // The screen still shows the rows that did NOT scroll off; `lines` stays 0.
+        assert_eq!(t.grid().scrollback_lines(), 0);
+    }
+
+    /// `since=` is exclusive; `since=<last>` is the empty "nothing new" poll; one
+    /// past `last` is `ERR bad since`. The origin-qualified form reads the same as
+    /// the bare one under this archive's origin, and from the START under any
+    /// other (a mark from a previous process), even one past `last`.
+    #[test]
+    fn offscreen_since_is_exclusive_and_origin_checked() {
+        let term = scrolled(10);
+        let (_, f, lines) = parse(&cmd_offscreen(&term, "since=4"));
+        assert_eq!(lines, rows(4, 9));
+        assert_eq!(field(&f, "first"), 5);
+        let (n, f, _) = parse(&cmd_offscreen(&term, "since=9"));
+        assert_eq!((n, field(&f, "first"), field(&f, "last")), (0, 10, 9));
+        assert_eq!(cmd_offscreen(&term, "since=10"), OFFSCREEN_BAD_SINCE);
+        assert_eq!(
+            cmd_offscreen(&term, &format!("since={ORIGIN}:4")),
+            cmd_offscreen(&term, "since=4")
+        );
+        assert_eq!(
+            cmd_offscreen(&term, &format!("since={ORIGIN}:10")),
+            OFFSCREEN_BAD_SINCE
+        );
+        for other in ["7:4", "7:10", "7:999999"] {
+            let (_, f, lines) = parse(&cmd_offscreen(&term, &format!("since={other}")));
+            assert_eq!(lines, rows(0, 9), "{other} reads from the start");
+            assert_eq!(
+                field(&f, "origin"),
+                ORIGIN,
+                "and says whose archive it read"
+            );
+        }
+        // An archive that has archived nothing: since=0 is fine, since=1 is not.
+        let empty = scrolled(1);
+        let (n, f, _) = parse(&cmd_offscreen(&empty, "since=0"));
+        assert_eq!((n, field(&f, "last"), field(&f, "first")), (0, 0, 1));
+        assert_eq!(cmd_offscreen(&empty, "since=1"), OFFSCREEN_BAD_SINCE);
+    }
+
+    /// `max=` pages oldest-first with `more=1` until the last page; paging with
+    /// `since=<last>` reassembles the whole archive with no gap and no repeat.
+    /// `tail=` takes the newest rows instead, and combines with `max=`.
+    #[test]
+    fn offscreen_pages_with_max_and_tails_with_tail() {
+        let term = scrolled(10);
+        let (_, f, lines) = parse(&cmd_offscreen(&term, "max=4"));
+        assert_eq!(lines, rows(0, 4));
+        assert_eq!(f.get("more").map(String::as_str), Some("1"));
+        let mut since = 0;
+        let mut all = Vec::new();
+        loop {
+            let (n, f, lines) = parse(&cmd_offscreen(&term, &format!("since={since} max=4")));
+            all.extend(lines);
+            // The page's newest index: the next page's exclusive `since`.
+            since = field(&f, "first") + n as u64 - 1;
+            if !f.contains_key("more") {
+                break;
+            }
+        }
+        assert_eq!(all, rows(0, 9), "pages tile the archive exactly");
+
+        let (_, f, lines) = parse(&cmd_offscreen(&term, "tail=3"));
+        assert_eq!(lines, rows(6, 9));
+        assert_eq!(field(&f, "first"), 7);
+        assert_eq!(f.get("more").map(String::as_str), Some("1"));
+        let (_, f, lines) = parse(&cmd_offscreen(&term, "tail=3 since=7"));
+        assert_eq!(lines, rows(7, 9), "tail never reaches back past since");
+        assert!(!f.contains_key("more"));
+        let (_, _, lines) = parse(&cmd_offscreen(&term, "max=2 tail=3"));
+        assert_eq!(lines, rows(7, 9), "the newest min(tail, max)");
+        let (_, f, lines) = parse(&cmd_offscreen(&term, "tail=50"));
+        assert_eq!(lines, rows(0, 9));
+        assert!(!f.contains_key("more"));
+    }
+
+    /// With no `max=`, one reply carries at most [`OFFSCREEN_DEFAULT_MAX`] rows and
+    /// says `more=1`; `since=<last>` of that page reads the rest.
+    #[test]
+    fn offscreen_caps_a_reply_at_the_default_page() {
+        let extra = 5;
+        let term = scrolled(OFFSCREEN_DEFAULT_MAX + extra + 1);
+        let (n, f, lines) = parse(&cmd_offscreen(&term, ""));
+        assert_eq!(n, OFFSCREEN_DEFAULT_MAX);
+        assert_eq!(f.get("more").map(String::as_str), Some("1"));
+        assert_eq!(lines.first(), Some(&row(0)));
+        let page_last = field(&f, "first") + n as u64 - 1;
+        let (n, f, lines) = parse(&cmd_offscreen(&term, &format!("since={page_last}")));
+        assert_eq!(n, extra);
+        assert!(!f.contains_key("more"));
+        assert_eq!(
+            lines,
+            rows(OFFSCREEN_DEFAULT_MAX, OFFSCREEN_DEFAULT_MAX + extra)
+        );
+    }
+
+    /// Rows evicted at the byte budget are counted as `lost=` for a reader whose
+    /// `since` predates them, and not for one that is past them.
+    #[test]
+    fn offscreen_counts_evicted_rows_as_lost() {
+        let mut t = scrolled_engine(1);
+        // Each row costs its bytes plus a fixed overhead: ten rows fit.
+        t.set_alt_archive_budget(
+            10 * (row(0).len() + aterm_core::terminal::ALT_ARCHIVE_ROW_OVERHEAD),
+        );
+        for s in 1..31 {
+            paint(&mut t, s);
+        }
+        let term = Arc::new(Mutex::new(t));
+        let (n, f, lines) = parse(&cmd_offscreen(&term, "since=0"));
+        let first = field(&f, "first");
+        assert_eq!(field(&f, "last"), 30);
+        assert!(first > 1 && n < 30, "some rows were evicted: {f:?}");
+        assert_eq!(
+            field(&f, "lost"),
+            first - 1,
+            "every row before first is lost"
+        );
+        assert_eq!(lines.first(), Some(&row(first as usize - 1)));
+        let (_, f, _) = parse(&cmd_offscreen(&term, &format!("since={}", first - 1)));
+        assert_eq!(field(&f, "lost"), 0, "nothing after since was evicted");
+        let (_, f, _) = parse(&cmd_offscreen(&term, "since=3"));
+        assert_eq!(field(&f, "lost"), first - 4);
+    }
+
+    /// `breaks=` counts the discontinuities at or after `since`; leaving the alt
+    /// screen is one, and `alt=` follows the screen. `back=` is how many archived
+    /// rows the screen shows again at its top after the app scrolled back.
+    #[test]
+    fn offscreen_reports_breaks_alt_and_back() {
+        let mut t = scrolled_engine(10);
+        paint(&mut t, 8); // the app scrolled BACK one row: row 8 is on screen again
+        let term = Arc::new(Mutex::new(t));
+        let (_, f, _) = parse(&cmd_offscreen(&term, ""));
+        assert_eq!(field(&f, "back"), 1, "{f:?}");
+        assert_eq!(field(&f, "last"), 9, "scrolling back archives nothing");
+        term.lock().unwrap().process(b"\x1b[?1049l");
+        let (_, f, _) = parse(&cmd_offscreen(&term, ""));
+        assert_eq!(field(&f, "alt"), 0);
+        assert_eq!(field(&f, "breaks"), 1, "leaving the alt screen is a break");
+        let last = field(&f, "last");
+        let (_, f, _) = parse(&cmd_offscreen(&term, &format!("since={last}")));
+        assert_eq!(
+            field(&f, "breaks"),
+            1,
+            "a break after last: the screen does not continue"
+        );
+    }
+
+    /// `screen=1` appends the current screen, the same rows `text` shows, and the
+    /// header's count covers them: the archived rows are the first `n - m` lines,
+    /// the screen the last `screen_rows=<m>`.
+    #[test]
+    fn offscreen_screen_appends_the_live_screen_under_the_same_count() {
+        let term = scrolled(10);
+        let (n, f, lines) = parse(&cmd_offscreen(&term, "since=6 screen=1"));
+        let m = field(&f, "screen_rows") as usize;
+        assert_eq!(m, usize::from(ROWS));
+        assert_eq!(n, 3 + m);
+        assert_eq!(lines[..3], rows(6, 9)[..]);
+        let text = cmd_text(&term);
+        let screen: Vec<&str> = text.lines().skip(1).collect();
+        assert_eq!(
+            lines[3..].iter().map(String::as_str).collect::<Vec<_>>(),
+            screen
+        );
+        assert_eq!(lines[3], row(9), "the screen continues the archive");
+        // With nothing new archived, screen=1 is the screen alone.
+        let (n, f, _) = parse(&cmd_offscreen(&term, "since=9 screen=1"));
+        assert_eq!((n, field(&f, "screen_rows")), (m, m as u64));
+    }
+
+    /// The verb's catalog row selects LINES framing — `aterm ctl` prints the rows
+    /// only because the client reads that off this row — and it is a Read-class
+    /// Session verb like `text` and `cast`.
+    #[test]
+    fn offscreen_is_a_line_framed_session_read() {
+        use aterm_types::control_verbs::{Framing, OpClass, Target, framing_of, spec};
+        let s = spec("offscreen").expect("`offscreen` is a catalog verb");
+        assert_eq!(s.op, OpClass::Read);
+        assert_eq!(s.target, Target::Session);
+        for request in [
+            "offscreen",
+            "offscreen since=3 screen=1",
+            "@s-a offscreen tail=2",
+        ] {
+            assert_eq!(
+                framing_of("offscreen", request),
+                Framing::Lines,
+                "{request}"
+            );
+        }
+    }
+
+    /// The wire's usage line and the catalog state ONE grammar: the summary opens
+    /// with it and the detail quotes the usage line verbatim.
+    #[test]
+    fn the_offscreen_usage_line_and_the_catalog_state_the_same_grammar() {
+        let s = aterm_types::control_verbs::spec("offscreen").expect("catalog verb");
+        let grammar = OFFSCREEN_USAGE
+            .trim_end()
+            .strip_prefix("ERR usage: ")
+            .expect("the wire line keeps its ERR prefix");
+        assert!(
+            s.summary.starts_with(grammar),
+            "summary {:?} must open with {grammar:?}",
+            s.summary
+        );
+        assert!(
+            s.detail.contains(OFFSCREEN_USAGE.trim_end()),
+            "{}",
+            s.detail
+        );
+    }
+}
+
+/// `offscreen`'s wire contract as a client uses it: paging with `since=<last>`,
+/// an archive that is off, the re-shown rows under a pinned header, and the
+/// row text itself (review of round 7).
+#[cfg(test)]
+mod offscreen_wire_tests {
+    use std::collections::HashMap;
+    use std::fmt::Write as _;
+    use std::sync::{Arc, Mutex};
+
+    use aterm_core::terminal::Terminal;
+
+    use super::{cmd_offscreen, visible_row};
+
+    const ROWS: u16 = 8;
+    const ORIGIN: u64 = 0xA11_0000_0042;
+
+    fn row(i: usize) -> String {
+        format!("row {i:05} of the transcript")
+    }
+
+    fn paint_rows(t: &mut Terminal, rows: &[String]) {
+        let mut b = String::from("\x1b[?2026h");
+        for (r, text) in rows.iter().enumerate() {
+            let _ = write!(b, "\x1b[{};1H{text}\x1b[K", r + 1);
+        }
+        b.push_str("\x1b[?2026l");
+        t.process(b.as_bytes());
+    }
+
+    fn plain(start: usize) -> Vec<String> {
+        let mut v: Vec<String> = (start..start + 6).map(row).collect();
+        v.push("> type a message".to_string());
+        v.push("footer: ready".to_string());
+        v
+    }
+
+    fn engine() -> Terminal {
+        let mut t = Terminal::new(ROWS, 40);
+        t.set_alt_archive_enabled(true);
+        t.set_alt_archive_origin(ORIGIN);
+        t.process(b"\x1b[?1049h");
+        t
+    }
+
+    fn parse(reply: &str) -> (usize, HashMap<String, String>, Vec<String>) {
+        let (header, body) = reply.split_once('\n').expect("a header line");
+        let mut toks = header.split_whitespace();
+        assert_eq!(toks.next(), Some("OK"), "{reply}");
+        let n: usize = toks.next().unwrap().parse().expect("a count");
+        let fields = toks
+            .map(|t| {
+                let (k, v) = t.split_once('=').expect("key=value");
+                (k.to_string(), v.to_string())
+            })
+            .collect();
+        let lines: Vec<String> = body.lines().map(str::to_string).collect();
+        assert_eq!(lines.len(), n, "{reply}");
+        (n, fields, lines)
+    }
+
+    fn field(f: &HashMap<String, String>, key: &str) -> u64 {
+        f.get(key)
+            .unwrap_or_else(|| panic!("no {key}= in {f:?}"))
+            .parse()
+            .unwrap()
+    }
+
+    /// The documented paging loop. `OFFSCREEN_DEFAULT_MAX`'s doc says "`more=1`
+    /// marks a page with rows left over, and `since=<last>` reads the next"; the
+    /// catalog says "poll with since=<last>"; spec C says "page with
+    /// since=<last> until more=0". A client that does exactly that gets every
+    /// archived row once (`last=` was the archive's newest, so page 2 was empty).
+    #[test]
+    fn paging_with_since_last_as_documented_reads_every_row() {
+        let mut t = engine();
+        for s in 0..10 {
+            paint_rows(&mut t, &plain(s));
+        }
+        let term = Arc::new(Mutex::new(t));
+        let mut all = Vec::new();
+        let mut since = 0u64;
+        let mut pages = 0;
+        loop {
+            let reply = cmd_offscreen(&term, &format!("since={since} max=4"));
+            let (_, f, lines) = parse(&reply);
+            all.extend(lines);
+            since = field(&f, "last");
+            pages += 1;
+            if !f.contains_key("more") || pages > 10 {
+                break;
+            }
+        }
+        let want: Vec<String> = (0..9).map(row).collect();
+        assert_eq!(
+            all, want,
+            "paging with since=<last> must neither skip nor repeat"
+        );
+    }
+
+    /// An archive that is OFF (ATERM_ALT_ARCHIVE=0, or budget 0) does not read as
+    /// an archive that simply has nothing: nine rows scrolled off here and none
+    /// were kept, so the header says `enabled=0` (and an archive that is on never
+    /// carries the field).
+    #[test]
+    fn a_disabled_archive_is_not_reported_as_an_empty_one() {
+        let mut t = engine();
+        t.set_alt_archive_enabled(false);
+        for s in 0..10 {
+            paint_rows(&mut t, &plain(s));
+        }
+        let term = Arc::new(Mutex::new(t));
+        let (n, f, _) = parse(&cmd_offscreen(&term, ""));
+        assert_eq!(n, 0);
+        assert_eq!(f.get("enabled").map(String::as_str), Some("0"), "{f:?}");
+        term.lock().unwrap().set_alt_archive_enabled(true);
+        let (_, f, _) = parse(&cmd_offscreen(&term, ""));
+        assert!(!f.contains_key("enabled"), "{f:?}");
+    }
+
+    /// `back=` under a PINNED header: the re-shown rows sit at screen rows
+    /// `[pin, pin+back)` and are archived rows `back_at..` — the wire says both,
+    /// so the rows a joiner skips are exactly rows it already has (with `back=`
+    /// alone a joiner skipped the header and kept a duplicate).
+    #[test]
+    fn back_under_a_pinned_header_names_rows_the_archive_holds() {
+        fn framed(start: usize) -> Vec<String> {
+            let mut v = vec!["HEADER pinned title bar".to_string()];
+            v.extend((start..start + 5).map(row));
+            v.push("> type a message".to_string());
+            v.push("footer: ready".to_string());
+            v
+        }
+        let mut t = engine();
+        for s in 0..10 {
+            paint_rows(&mut t, &framed(s));
+        }
+        paint_rows(&mut t, &framed(8)); // the app scrolled back one row
+        let term = Arc::new(Mutex::new(t));
+        let reply = cmd_offscreen(&term, "screen=1");
+        let (n, f, lines) = parse(&reply);
+        let m = field(&f, "screen_rows") as usize;
+        let back = field(&f, "back") as usize;
+        let (pin, back_at) = (field(&f, "pin") as usize, field(&f, "back_at"));
+        let first = field(&f, "first");
+        let (archived, screen) = lines.split_at(n - m);
+        assert_eq!((back, pin), (1, 1), "{f:?}");
+        for k in 0..back {
+            let at = usize::try_from(back_at - first).unwrap() + k;
+            assert_eq!(
+                screen[pin + k],
+                archived[at],
+                "screen row pin+{k} is archived row back_at+{k}: {f:?}"
+            );
+        }
+        assert_eq!(
+            screen[0], "HEADER pinned title bar",
+            "the header is not re-shown"
+        );
+        // No re-shown rows, no pin=/back_at=.
+        term.lock()
+            .unwrap()
+            .process(b"\x1b[?2026h\x1b[2;1Hnew row\x1b[K\x1b[?2026l");
+        let (_, f, _) = parse(&cmd_offscreen(&term, ""));
+        if field(&f, "back") == 0 {
+            assert!(
+                !f.contains_key("pin") && !f.contains_key("back_at"),
+                "{f:?}"
+            );
+        }
+    }
+
+    /// Rows are exactly what `text` showed: wide CJK, a combining mark, an emoji,
+    /// a NUL-filled gap (CUF over unwritten cells).
+    #[test]
+    fn archived_rows_are_byte_identical_to_the_text_rows_they_were() {
+        fn special(i: usize) -> String {
+            format!("r{i:03} \u{65e5}\u{672c} cafe\u{301} \u{1F44D}\x1b[3Cgap")
+        }
+        let mut t = engine();
+        let mut shown = Vec::new();
+        for s in 0..8 {
+            let mut v: Vec<String> = (s..s + 6).map(special).collect();
+            v.push("> type a message".to_string());
+            v.push("footer: ready".to_string());
+            paint_rows(&mut t, &v);
+            shown.push(visible_row(&t, 0));
+        }
+        let term = Arc::new(Mutex::new(t));
+        let (_, _, lines) = parse(&cmd_offscreen(&term, ""));
+        assert_eq!(lines, shown[..7].to_vec());
     }
 }

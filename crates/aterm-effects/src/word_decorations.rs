@@ -22536,6 +22536,233 @@ mod tests {
         assert_ne!(body.w, 72, "homage has its own dimensions");
     }
 
+    /// The custom image follows the same exact prospective-footprint contract
+    /// as built-in art. At the two hard viewport edges it stays present: the
+    /// right edge clamps horizontally, while row zero deliberately presents
+    /// the visible lower portion of a body centred above the first baseline.
+    #[test]
+    fn custom_kitty_footprint_matches_emission_at_interior_right_and_top_edges() {
+        let g = geom20();
+        let grid_w = i32::from(g.cols) * i32::from(g.cell_w);
+        let mut wd = WordDecorations::default();
+        wd.set_kitty_sprite_source(KittySpriteSource::Custom {
+            source_fp: 0x101,
+            w: 4,
+            h: 2,
+            rgba: Arc::from(vec![0xff; 4 * 2 * 4]),
+        });
+        let emit = |wd: &mut WordDecorations, cursor: (u16, u16)| {
+            let expected = wd
+                .kitty_cursor_footprint(KittyCursorLayout {
+                    geom: g,
+                    cursor,
+                    look: KittyLook::default(),
+                    bob: 0.0,
+                })
+                .expect("custom sprite remains placeable");
+            let mut free = Vec::new();
+            wd.kitty_cursor(
+                KittyCursorFrame {
+                    geom: g,
+                    cursor,
+                    look: KittyLook::default(),
+                    colors: CatColorKey::default(),
+                    bob: 0.0,
+                    alpha: 255,
+                    pose: crate::kitty_cursor::CatPose::STILL,
+                    sing: 0.0,
+                    notes: [None; crate::kitty_sing::MAX_NOTES],
+                },
+                &mut free,
+            )
+            .expect("custom sprite emits");
+            assert_eq!(free.len(), 1, "custom art is exactly one body");
+            let body = free[0];
+            assert_eq!(
+                expected,
+                CatFootprint {
+                    x: body.x,
+                    y: body.y,
+                    w: body.w,
+                    h: body.h,
+                },
+                "palette/custody geometry is the body actually sent to the renderer"
+            );
+            body
+        };
+
+        let interior = emit(&mut wd, (3, 5));
+        assert_eq!((interior.w, interior.h), (72, 36));
+        assert!(interior.x >= 0 && interior.x + i32::from(interior.w) <= grid_w);
+
+        let right = emit(&mut wd, (3, g.cols - 1));
+        assert_eq!(
+            right.x + i32::from(right.w),
+            grid_w,
+            "the configured body clamps exactly at the right edge"
+        );
+        assert!(right.x >= 0);
+
+        let top_right = emit(&mut wd, (0, g.cols - 1));
+        assert_eq!(top_right.x + i32::from(top_right.w), grid_w);
+        assert!(
+            top_right.y < 0 && top_right.y + i32::from(top_right.h) > 0,
+            "row-zero custom art is partially clipped, never wholly misplaced or dropped: \
+             {top_right:?}"
+        );
+    }
+
+    /// A same-dimension asset replacement is still a new paint generation: it
+    /// rebases an in-flight line fold, addresses freshly baked pixels, and an
+    /// invalid replacement then fails closed without retaining either body or
+    /// source identity from the last valid generation.
+    #[test]
+    fn custom_kitty_hot_reload_rebases_repaints_and_invalid_replacement_is_dark() {
+        use crate::kitty_cursor::{CatFoldDirection, CatFoldFrame, CursorCatPlacementFrame};
+
+        let g = geom20();
+        let t0 = Instant::now();
+        let red: Arc<[u8]> = Arc::from([0xff, 0x10, 0x20, 0xff].repeat(8));
+        let green: Arc<[u8]> = Arc::from([0x20, 0xee, 0x60, 0xff].repeat(8));
+        let mut wd = WordDecorations::default();
+        wd.set_kitty_sprite_source(KittySpriteSource::Custom {
+            source_fp: 0x201,
+            w: 4,
+            h: 2,
+            rgba: Arc::clone(&red),
+        });
+
+        let layout = |cursor| KittyCursorLayout {
+            geom: g,
+            cursor,
+            look: KittyLook::default(),
+            bob: 0.0,
+        };
+        let emit =
+            |wd: &mut WordDecorations, cursor: (u16, u16), motion: CursorCatPlacementFrame| {
+                let placement = wd
+                    .resolve_kitty_cursor_placement(layout(cursor), motion)
+                    .expect("custom kitty placement");
+                let mut free = Vec::new();
+                let fp = wd
+                    .kitty_cursor_at_placement(
+                        KittyCursorFrame {
+                            geom: g,
+                            cursor,
+                            look: KittyLook::default(),
+                            colors: CatColorKey::default(),
+                            bob: 0.0,
+                            alpha: 255,
+                            pose: crate::kitty_cursor::CatPose::STILL,
+                            sing: 0.0,
+                            notes: [None; crate::kitty_sing::MAX_NOTES],
+                        },
+                        placement,
+                        &mut free,
+                    )
+                    .expect("custom kitty emission");
+                (placement, free[0], fp)
+            };
+        let atlas_pixel = |atlas: &aterm_render::SceneAtlas, sprite: FreeSprite| {
+            let offset =
+                (usize::from(sprite.ay) * atlas.width as usize + usize::from(sprite.ax)) * 4;
+            <[u8; 4]>::try_from(&atlas.rgba[offset..offset + 4]).expect("atlas texel")
+        };
+
+        let old_cursor = (3, g.cols - 1);
+        let (_, red_body, red_fp) = emit(
+            &mut wd,
+            old_cursor,
+            CursorCatPlacementFrame {
+                sampled_at: t0,
+                fold: None,
+                facing_left: false,
+            },
+        );
+        let red_atlas = wd.free_atlas().expect("red atlas");
+        assert_eq!(atlas_pixel(&red_atlas, red_body), [0xff, 0x10, 0x20, 0xff]);
+
+        let started = t0 + Duration::from_millis(16);
+        let folding = |progress| CursorCatPlacementFrame {
+            sampled_at: started + Duration::from_secs_f32(progress * 0.28),
+            fold: Some(CatFoldFrame {
+                started,
+                direction: CatFoldDirection::Forward,
+                progress,
+            }),
+            facing_left: false,
+        };
+        let (moving, _, _) = emit(&mut wd, (4, 0), folding(0.2));
+        assert!(moving.in_motion(), "negative control: old art is mid-fold");
+
+        wd.set_kitty_sprite_source(KittySpriteSource::Custom {
+            source_fp: 0x202,
+            w: 4,
+            h: 2,
+            rgba: Arc::clone(&green),
+        });
+        assert_eq!(wd.kitty_sprite_source_fingerprint(), Some(0x202));
+        assert!(Arc::ptr_eq(
+            wd.kitty_sprite_rgba().expect("replacement source"),
+            &green
+        ));
+        let (replaced, green_body, green_fp) = emit(&mut wd, (4, 0), folding(0.3));
+        assert!(
+            !replaced.in_motion(),
+            "the replacement cannot inherit the old asset's off-glass fold"
+        );
+        assert_eq!(
+            (green_body.x, green_body.y, green_body.w, green_body.h),
+            (
+                replaced.sample.x,
+                replaced.sample.y,
+                replaced.sample.w,
+                replaced.sample.h
+            )
+        );
+        let green_atlas = wd.free_atlas().expect("replacement atlas");
+        assert_eq!(
+            atlas_pixel(&green_atlas, green_body),
+            [0x20, 0xee, 0x60, 0xff],
+            "same-size hot reload addresses replacement texels"
+        );
+        assert!(green_atlas.version > red_atlas.version);
+        assert_ne!(green_fp, red_fp, "the repaint key moves with the new art");
+
+        wd.set_kitty_sprite_source(KittySpriteSource::Custom {
+            source_fp: 0x203,
+            w: 4,
+            h: 2,
+            rgba: Arc::from(vec![0u8; 4 * 2 * 4 - 1]),
+        });
+        assert_eq!(wd.kitty_sprite_source_fingerprint(), None);
+        assert!(!wd.has_custom_kitty_sprite());
+        assert!(wd.kitty_sprite_rgba().is_none());
+        assert!(wd.kitty_cursor_footprint(layout((4, 0))).is_none());
+        let mut stale = Vec::new();
+        assert!(
+            wd.kitty_cursor(
+                KittyCursorFrame {
+                    geom: g,
+                    cursor: (4, 0),
+                    look: KittyLook::default(),
+                    colors: CatColorKey::default(),
+                    bob: 0.0,
+                    alpha: 255,
+                    pose: crate::kitty_cursor::CatPose::STILL,
+                    sing: 0.0,
+                    notes: [None; crate::kitty_sing::MAX_NOTES],
+                },
+                &mut stale,
+            )
+            .is_none()
+        );
+        assert!(
+            stale.is_empty(),
+            "invalid reload cannot retain the old body"
+        );
+    }
+
     /// The later/right-shifted anchor remains a preference, not permission to
     /// leave the grid: body stretch and forward pose lead clamp together at the
     /// right margin.

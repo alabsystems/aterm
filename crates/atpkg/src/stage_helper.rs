@@ -16,32 +16,56 @@
 //! tagged. The one thing that does escape is a job LAUNCHD spawns from an UNTAGGED
 //! executable: launchd is the job's parent, not us.
 //!
-//! # The mechanism (every step measured, `scratchpad/provenance/probe2.sh` m6/m8/m17/m18)
+//! # The mechanism (measured: `scratchpad/provenance/probe2.sh` m6/m8/m17/m18 on
+//! 2026-09-12, re-measured on 2026-09-13 — the commit that introduced [`plan_helper`])
 //!
 //! 1. The tracked parent writes a small SPEC (archive, destination, the fields
 //!    [`crate::install::stage_payload_spec`] reads) into the per-program staging scratch.
-//! 2. It submits a one-shot launchd job — `/bin/sh -c 'cat "$1" > "$2" && chmod 755 "$2"
-//!    && exec "$2" __stage-payload "$3"'` — that BYTE-COPIES this very binary (`cat`, by
-//!    the untracked job: the copy is clean; `cp`/`ditto` would carry the tag across),
-//!    and execs the copy on the hidden verb. The copy is named `atpkg` so the `aterm`
-//!    multi-tool's argv0 alias routes it to this CLI.
-//! 3. The copy runs the ordinary extractor — the same vetting, caps, mode sanitizing and
+//! 2. It MEASURES this very binary (`xattr`, [`crate::provenance::xattr_names`]) and plans
+//!    the job from that ([`plan_helper`]):
+//!    * an UNTAGGED binary — the installed app's own executable, a build made from an
+//!      untracked shell — is run IN PLACE, by its real path: launchd is the job's parent
+//!      and the tag follows the executable, so the job is untracked and writes clean
+//!      files (a launchd job exec'ing a clean script writes clean files; one exec'ing a
+//!      tagged script writes tagged files — both measured 2026-09-13);
+//!    * a TAGGED binary that stands alone — a `target/debug/aterm` built from a tracked
+//!      shell — is first BYTE-COPIED by the job itself (`cat`, by the untracked job: the
+//!      copy is clean and runs clean, measured; `cp`/`ditto` would carry the tag across)
+//!      and the copy is run;
+//!    * a TAGGED binary that is a bundle's own executable (`….app/Contents/MacOS/…`)
+//!      is REFUSED up front: run in place it would be tracked, and a copy of it will not
+//!      run — its code signature covers the bundle's `Info.plist`, so the kernel kills
+//!      the copy at exec (measured 2026-09-13 on the Developer ID `aterm.app`: `codesign
+//!      -v` on the copy says "invalid Info.plist (plist or signature have been
+//!      modified)", the exec dies with SIGKILL, and the old lane — which copied EVERY
+//!      binary — reported that as "exited without a result" with an empty stderr).
+//! 3. It submits a one-shot launchd job — `/bin/sh -c '<wrapper>'` — that runs the helper
+//!    on the hidden verb with the spec file as its one argument, RECORDS the helper's exit
+//!    status in `<job>/status` (a signal as `128 + n`, `/bin/sh`'s convention), removes its
+//!    own label, and exits 0. Always 0: `launchctl submit` keeps a job alive on failure and
+//!    re-spawns it, which is how a failed helper became a label launchd re-ran for a day.
+//!    The copy, when there is one, is named `atpkg` so the `aterm` multi-tool's argv0
+//!    alias routes it to this CLI.
+//! 4. The helper runs the ordinary extractor — the same vetting, caps, mode sanitizing and
 //!    fused `tree_root` fold as the in-process lane, because it IS the in-process lane in
 //!    another process — into the `incoming` scratch the parent created, and writes the
 //!    folded root to a result file (temp + rename).
-//! 4. The parent waits for the result, removes the job, and carries on exactly as before:
-//!    the tree_root re-verify, the swap (a tracked parent renaming a clean DIRECTORY tags
-//!    the directory and leaves the files inside clean — measured), the marker.
+//! 5. The parent waits for the result, and carries on exactly as before: the tree_root
+//!    re-verify, the swap (a tracked parent renaming a clean DIRECTORY tags the directory
+//!    and leaves the files inside clean — measured), the marker. A helper that did NOT
+//!    answer is reported by its real fate — the status the wrapper recorded (exit code,
+//!    or the signal that killed it: SIGKILL means the binary could not run) and its
+//!    stderr — never as a bare "exited without a result" when that fate is known.
 //!
 //! # What it is not
 //!
-//! Not a trust boundary: the copy is our own bytes in our own `0700` staging dir under
-//! the store lock, and the root it reports is re-verified against the SIGNED root by the
-//! parent as always (`ATPKG_STAGE_DISK_REVERIFY` re-arms the on-disk walk). Not
-//! optional once it is needed: a tracked installer whose lane cannot run — no launchd, a
-//! job that never starts, a helper that does not answer — REFUSES the install
-//! ([`crate::install::StageError::TrackedInstaller`]) rather than lay a bundle that would
-//! carry the tag on every executable; the one escape hatch,
+//! Not a trust boundary: the helper is our own bytes (in place, or a copy in our own
+//! `0700` staging dir under the store lock), and the root it reports is re-verified
+//! against the SIGNED root by the parent as always (`ATPKG_STAGE_DISK_REVERIFY` re-arms
+//! the on-disk walk). Not optional once it is needed: a tracked installer whose lane
+//! cannot run — no launchd, a job that never starts, a helper that does not answer —
+//! REFUSES the install ([`crate::install::StageError::TrackedInstaller`]) rather than lay
+//! a bundle that would carry the tag on every executable; the one escape hatch,
 //! `ATPKG_ALLOW_TRACKED_INSTALL=1`, accepts the in-process stage and RECORDS it beside the
 //! build (`<build>.tracked-install`), which `aterm pkg doctor` reports as the cause and
 //! `aterm pkg repair` names as needing a re-seed ([`crate::install::stage_for_store_with`]
@@ -49,6 +73,16 @@
 //! script, and a tagged shim tracks the tool it execs (law m21) — so the shims, the
 //! `agents/` twins, the pending and reroute stubs and the tombstones go through the same
 //! job under a second hidden verb ([`crate::lay`]), sharing the [`Job`] below.
+//!
+//! # Leaks, and why there are none now
+//!
+//! A parent killed between `submit` and its `Drop` (a test under a timeout, a `kill -9`)
+//! used to leave the label registered: two such labels from one dead test pid sat in
+//! launchd for a day, re-spawned and re-`cat`ing `/usr/bin/true` (2026-09-12/13). Now
+//! the JOB removes its own label as its last act, so a dead parent leaves nothing behind
+//! once the job has run; and [`Job::prepare`] sweeps any `systems.alab.atpkg.*` label
+//! whose owning pid is gone (a job wedged when its parent died), so the next install
+//! tidies after the last one.
 //!
 //! macOS only; on every other platform [`stage_untracked`] is unavailable by construction.
 
@@ -67,8 +101,9 @@ pub const HIDDEN_VERB: &str = "__stage-payload";
 /// misreads a newer spec.
 const SPEC_HEADER: &str = "atpkg-stage-spec v1";
 
-/// How long the parent tolerates "no result AND no running job" before calling the lane
-/// dead — covers launchd's start latency and the 50 MB `cat` of the helper copy.
+/// How long the parent tolerates "no result, no status AND no running job" before calling
+/// the lane dead — covers launchd's start latency (the wrapper's `status` file, written
+/// the moment the helper exits, is what normally ends the wait on a failure).
 const EXIT_GRACE: Duration = Duration::from_secs(3);
 
 /// The absolute ceiling on one staged extraction (the shipped `trust` member is 3.4 GB;
@@ -264,9 +299,9 @@ pub fn run_helper(args: &[String]) -> ExitCode {
 /// Whether `exe` is a binary that serves [`HIDDEN_VERB`] under the argv0 name `atpkg`:
 /// the standalone `atpkg` (dev builds) or the `aterm` multi-tool, whose argv0 alias
 /// routes `atpkg` to this CLI. Anything else — a test harness, a foreign binary — would
-/// be copied, exec'd, and answer nothing, costing the exit grace for no result. This is a
-/// guard on OUR OWN spelling, not a measurement of the subject; the result file is the
-/// only proof the lane accepts.
+/// be run, and answer nothing, costing a round trip for no result. This is a guard on
+/// OUR OWN spelling, not a measurement of the subject; the result file is the only proof
+/// the lane accepts.
 #[must_use]
 pub fn exe_serves_hidden_verb(exe: &Path) -> bool {
     matches!(
@@ -278,7 +313,8 @@ pub fn exe_serves_hidden_verb(exe: &Path) -> bool {
 /// What the untracked lane laid: the folded `tree_root`, and whether the first regular
 /// file it laid nevertheless came back carrying the tag — MEASURED, not assumed. A tagged
 /// witness means the lane ran but did not achieve its purpose (never observed: launchd is
-/// the job's parent and the copy is clean bytes, so every measurement came back clean);
+/// the job's parent and the helper it runs is untagged — in place or as a clean copy —
+/// so every measurement came back clean);
 /// the tree is still the verified tree, and the caller decides under its policy
 /// ([`crate::install::stage_for_store_with`]) whether to keep it and record the fact or
 /// to refuse.
@@ -290,11 +326,12 @@ pub struct StagedUntracked {
     pub witness_tagged: bool,
 }
 
-/// Stage `archive` at `dest` through an untracked launchd job running a clean byte copy
-/// of `helper_exe` (see the module docs), returning the folded `tree_root` and the
+/// Stage `archive` at `dest` through an untracked launchd job running `helper_exe` — in
+/// place when it is untagged, as a clean byte copy when it is tagged and free-standing
+/// ([`plan_helper`]; see the module docs) — returning the folded `tree_root` and the
 /// measured outcome ([`StagedUntracked`]).
 ///
-/// `scratch` holds the job's spec, logs and the copy — the per-program staging dir, a
+/// `scratch` holds the job's spec, logs and any copy — the per-program staging dir, a
 /// `0700` scratch the store lock already guards. `dest` must exist and be empty, as for
 /// the in-process lane; on ANY error it is left as the caller made it (emptied), so the
 /// caller can extract into it in-process if its policy allows.
@@ -313,13 +350,13 @@ pub fn stage_untracked(
 ) -> Result<StagedUntracked, String> {
     if !exe_serves_hidden_verb(helper_exe) {
         return Err(format!(
-            "{} is not an atpkg/aterm binary, so a copy of it would not serve {HIDDEN_VERB}",
+            "{} is not an atpkg/aterm binary, so it would not serve {HIDDEN_VERB}",
             helper_exe.display()
         ));
     }
     // `Job` removes its label and scratch on drop, so every early `?` below leaves
     // neither a registered launchd job nor a spec file behind.
-    let job = Job::prepare(scratch, "stage-helper")?;
+    let mut job = Job::prepare(scratch, "stage-helper")?;
     let spec_text = encode_spec(spec, archive, dest);
     std::fs::write(&job.spec, spec_text).map_err(|e| format!("write spec: {e}"))?;
     job.submit(helper_exe, HIDDEN_VERB)?;
@@ -403,25 +440,132 @@ pub(crate) fn first_regular_file(dir: &Path) -> Option<PathBuf> {
     None
 }
 
+/// How the launchd job runs the helper — decided by [`plan_helper`] from a MEASUREMENT
+/// of the binary (its tag) and its shape (a bundle's own executable or free-standing),
+/// never from where it was built.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum HelperPlan {
+    /// The binary is untagged: the job runs it in place, by its real path. launchd is
+    /// the parent and the tag follows the executable, so the job is untracked.
+    ExecOriginal,
+    /// The binary is tagged and free-standing: the job `cat`s it to a clean copy first
+    /// (a byte copy made by an untracked process is clean — measured) and runs the copy.
+    CopyThenExec,
+}
+
+/// The bundle `exe` is the executable of — `<bundle>.app` for
+/// `<bundle>.app/Contents/MacOS/<exe>` with a `Contents/Info.plist` beside it — or
+/// `None` for a free-standing binary. A bundle-resident executable is never copied: its
+/// code signature covers the bundle's `Info.plist`, so a copy outside the bundle fails
+/// its own signature check and the kernel kills it at exec (measured 2026-09-13).
+#[must_use]
+pub fn bundle_of(exe: &Path) -> Option<PathBuf> {
+    let macos = exe.parent()?;
+    if macos.file_name()? != std::ffi::OsStr::new("MacOS") {
+        return None;
+    }
+    let contents = macos.parent()?;
+    if contents.file_name()? != std::ffi::OsStr::new("Contents") {
+        return None;
+    }
+    if !contents.join("Info.plist").is_file() {
+        return None;
+    }
+    contents.parent().map(Path::to_path_buf)
+}
+
+/// Decide how the job runs `exe` from the two facts about it: `tagged` (measured —
+/// [`crate::provenance::carries_provenance`]) and the bundle it belongs to, if any
+/// ([`bundle_of`]). An untagged binary runs in place whatever its shape; a tagged
+/// free-standing one is copied clean by the job; a tagged bundle executable is refused
+/// with the reason, because neither way would work — in place it is tracked, copied it
+/// cannot run.
+pub fn plan_helper(exe: &Path, tagged: bool, bundle: Option<&Path>) -> Result<HelperPlan, String> {
+    match (tagged, bundle) {
+        (false, _) => Ok(HelperPlan::ExecOriginal),
+        (true, None) => Ok(HelperPlan::CopyThenExec),
+        (true, Some(bundle)) => Err(format!(
+            "{} carries com.apple.provenance and is the executable of the bundle {}: a \
+             launchd job running it in place would be tracked (the tag follows the \
+             executable), and a byte copy of it will not run — its code signature covers \
+             the bundle's Info.plist, so the kernel kills the copy at exec (SIGKILL; \
+             measured 2026-09-13). re-seed that bundle from an untracked process, or run \
+             this verb from one",
+            exe.display(),
+            bundle.display()
+        )),
+    }
+}
+
+/// [`plan_helper`] for a real binary: the tag measured with `xattr`, the bundle read off
+/// the path. A binary that cannot be inspected is an error, not "untagged" — a plan built
+/// on a failure to look would run a possibly tagged helper and call its files clean.
+pub fn plan_for_exe(exe: &Path) -> Result<HelperPlan, String> {
+    let names = crate::provenance::xattr_names(exe).map_err(|e| {
+        format!(
+            "cannot inspect {} for com.apple.provenance: {e}",
+            exe.display()
+        )
+    })?;
+    let tagged = names
+        .iter()
+        .any(|n| n == crate::provenance::PROVENANCE_XATTR);
+    plan_helper(exe, tagged, bundle_of(exe).as_deref())
+}
+
+/// The wrapper `/bin/sh -c` runs, positional: `$1` helper, `$2` spec, `$3` verb,
+/// `$4` status file, `$5` this job's label, `$6` the copy path (empty to run in place).
+///
+/// It runs the helper, records the helper's exit status — `128 + n` for a signal, the
+/// shell's convention — in `$4` (temp + rename), removes its own label and exits 0. The
+/// unconditional 0 is deliberate: `launchctl submit` keeps a job alive on failure, and a
+/// helper that could not run became a label launchd re-spawned every ten seconds; the
+/// status file, not launchd's opinion of the wrapper, is the record of what happened.
+/// The self-removal is what makes a parent killed before its `Drop` leak nothing.
+#[cfg(target_os = "macos")]
+const WRAPPER: &str = r#"exe="$1"
+if [ -n "$6" ]; then
+  if cat "$1" > "$6" && chmod 755 "$6"; then exe="$6"; else exe=""; fi
+fi
+if [ -n "$exe" ]; then "$exe" "$3" "$2"; s=$?; else echo "atpkg-untracked: could not copy $1 to $6" >&2; s=125; fi
+printf '%s\n' "$s" > "$4.tmp" && mv -f "$4.tmp" "$4"
+/bin/launchctl remove "$5"
+exit 0
+"#;
+
+/// The wrapper's status when the helper could not be copied (before any exec).
+#[cfg(target_os = "macos")]
+const STATUS_COPY_FAILED: i32 = 125;
+
 /// One submitted job: its scratch dir, label and files. Shared by the two hidden verbs —
 /// the staging lane here and the executable-laying lane ([`crate::lay`]) — so there is
-/// ONE launchd choreography (byte copy, exec, result file, grace, ceiling, cleanup).
+/// ONE launchd choreography (plan, wrapper, result and status files, grace, ceiling,
+/// self-removal, sweep, cleanup).
 #[cfg(target_os = "macos")]
 pub(crate) struct Job {
     dir: PathBuf,
     label: String,
     pub(crate) spec: PathBuf,
     result: PathBuf,
+    status: PathBuf,
     copy: PathBuf,
     out_log: PathBuf,
     err_log: PathBuf,
+    /// The helper the job was submitted with, for the fate report.
+    helper: PathBuf,
 }
+
+/// The label prefix every job of this crate carries; the sweep looks for it.
+#[cfg(target_os = "macos")]
+const LABEL_PREFIX: &str = "systems.alab.atpkg.";
 
 #[cfg(target_os = "macos")]
 impl Job {
     /// Create the job's `0700` scratch under `scratch`, named `<stem>-<pid>-<seq>-<nonce>`
-    /// (the label is `systems.alab.atpkg.` + that name).
+    /// (the label is `systems.alab.atpkg.` + that name). First sweeps the labels earlier
+    /// parents left behind ([`Self::sweep_orphans`]).
     pub(crate) fn prepare(scratch: &Path, stem: &str) -> Result<Self, String> {
+        Self::sweep_orphans();
         static SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
         let seq = SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         let nonce = std::time::SystemTime::now()
@@ -434,22 +578,60 @@ impl Job {
         crate::platform::set_mode(&dir, 0o700)
             .map_err(|e| format!("chmod {}: {e}", dir.display()))?;
         Ok(Self {
-            label: format!("systems.alab.atpkg.{stem}"),
+            label: format!("{LABEL_PREFIX}{stem}"),
             spec: dir.join("spec"),
             result: dir.join("result"),
+            status: dir.join("status"),
             // Named `atpkg` so the `aterm` multi-tool routes the copy here by argv0.
             copy: dir.join("atpkg"),
             out_log: dir.join("out.log"),
             err_log: dir.join("err.log"),
+            helper: PathBuf::new(),
             dir,
         })
     }
 
-    /// `launchctl submit` the one-shot job: byte-copy `helper_exe` (by the untracked
-    /// job, so the copy is clean), exec the copy on `verb` with the spec file as its one
-    /// argument. launchd — not this process — is its parent.
-    pub(crate) fn submit(&self, helper_exe: &Path, verb: &str) -> Result<(), String> {
-        let script = "cat \"$1\" > \"$2\" && chmod 755 \"$2\" && exec \"$2\" \"$4\" \"$3\"";
+    /// Remove every `systems.alab.atpkg.<stem>-<pid>-<seq>-<nonce>` label whose `<pid>`
+    /// no longer exists: a parent that died before its `Drop` (a test killed under a
+    /// timeout) left its job registered, and until 2026-09-13 launchd kept such labels —
+    /// and re-spawned them — indefinitely. A label whose pid is alive is left alone
+    /// (another install in flight, or a pid reused by something else: not ours to judge).
+    /// Best effort: a `launchctl` that cannot list is simply no sweep.
+    fn sweep_orphans() {
+        let Ok(out) = std::process::Command::new("/bin/launchctl")
+            .arg("list")
+            .output()
+        else {
+            return;
+        };
+        let me = std::process::id();
+        for line in String::from_utf8_lossy(&out.stdout).lines() {
+            let Some(label) = line.split('\t').nth(2) else {
+                continue;
+            };
+            let Some(pid) = owner_pid_of_label(label) else {
+                continue;
+            };
+            if pid == me || pid_exists(pid) {
+                continue;
+            }
+            let _ = std::process::Command::new("/bin/launchctl")
+                .args(["remove", label])
+                .output();
+        }
+    }
+
+    /// `launchctl submit` the one-shot job: the wrapper runs `helper_exe` on `verb` with
+    /// the spec file as its one argument, in place or from a clean copy as
+    /// [`plan_for_exe`] decides; launchd — not this process — is its parent. A helper
+    /// that can be run neither way is refused here, before anything is submitted.
+    pub(crate) fn submit(&mut self, helper_exe: &Path, verb: &str) -> Result<(), String> {
+        let plan = plan_for_exe(helper_exe)?;
+        self.helper = helper_exe.to_path_buf();
+        let copy: &Path = match plan {
+            HelperPlan::ExecOriginal => Path::new(""),
+            HelperPlan::CopyThenExec => &self.copy,
+        };
         let out = std::process::Command::new("/bin/launchctl")
             .arg("submit")
             .args(["-l", &self.label])
@@ -460,12 +642,14 @@ impl Job {
             .arg("--")
             .arg("/bin/sh")
             .arg("-c")
-            .arg(script)
+            .arg(WRAPPER)
             .arg("atpkg-untracked")
             .arg(helper_exe)
-            .arg(&self.copy)
             .arg(&self.spec)
             .arg(verb)
+            .arg(&self.status)
+            .arg(&self.label)
+            .arg(copy)
             .output()
             .map_err(|e| format!("spawn /bin/launchctl: {e}"))?;
         if !out.status.success() {
@@ -478,18 +662,42 @@ impl Job {
         Ok(())
     }
 
-    /// Whether launchd still reports a live pid for the label.
-    fn running(&self) -> bool {
-        std::process::Command::new("/bin/launchctl")
+    /// What launchd says about the label right now.
+    fn liveness(&self) -> Liveness {
+        let Ok(o) = std::process::Command::new("/bin/launchctl")
             .args(["list", &self.label])
             .output()
-            .is_ok_and(|o| {
-                o.status.success() && String::from_utf8_lossy(&o.stdout).contains("\"PID\"")
-            })
+        else {
+            return Liveness::Unknown;
+        };
+        if !o.status.success() {
+            return Liveness::Unknown;
+        }
+        let text = String::from_utf8_lossy(&o.stdout);
+        if text.contains("\"PID\"") {
+            Liveness::Running
+        } else {
+            Liveness::Registered {
+                last_exit: last_exit_status(&text),
+            }
+        }
     }
 
-    /// Block until the result file exists. `Err` when the job is gone without one (after
-    /// [`EXIT_GRACE`]), or [`CEILING`] passes with it still running.
+    /// The status the wrapper recorded, once the helper has exited.
+    fn read_status(&self) -> Option<i32> {
+        std::fs::read_to_string(&self.status)
+            .ok()?
+            .lines()
+            .next()?
+            .trim()
+            .parse()
+            .ok()
+    }
+
+    /// Block until the result file exists. `Err` names the helper's real fate when it
+    /// exited without one (the status the wrapper recorded: exit code, or the signal that
+    /// killed it), the job's disappearance when launchd has neither a job nor a status
+    /// after [`EXIT_GRACE`], or the [`CEILING`] passing with it still running.
     pub(crate) fn wait_for_result(&self) -> Result<(), String> {
         let started = Instant::now();
         let mut last_liveness = Instant::now();
@@ -497,6 +705,15 @@ impl Job {
         loop {
             if self.result.exists() {
                 return Ok(());
+            }
+            // The helper writes its answer (temp + rename) BEFORE it exits and the
+            // wrapper writes the status AFTER: a status with no result is a helper that
+            // never answered.
+            if let Some(status) = self.read_status() {
+                if self.result.exists() {
+                    return Ok(());
+                }
+                return Err(self.fate(status));
             }
             if started.elapsed() > CEILING {
                 return Err(format!(
@@ -507,21 +724,64 @@ impl Job {
             }
             if last_liveness.elapsed() >= Duration::from_millis(500) {
                 last_liveness = Instant::now();
-                if self.running() {
-                    gone_since = None;
-                } else {
-                    let since = *gone_since.get_or_insert_with(Instant::now);
-                    if since.elapsed() >= EXIT_GRACE {
-                        return Err(format!(
-                            "the untracked helper job {} exited without a result{}",
-                            self.label,
-                            self.log_tail()
-                        ));
+                match self.liveness() {
+                    Liveness::Running => gone_since = None,
+                    not_running => {
+                        let since = *gone_since.get_or_insert_with(Instant::now);
+                        if since.elapsed() >= EXIT_GRACE {
+                            // One more look: the status may have landed after the poll.
+                            if self.result.exists() {
+                                return Ok(());
+                            }
+                            if let Some(status) = self.read_status() {
+                                return Err(self.fate(status));
+                            }
+                            return Err(self.vanished(not_running));
+                        }
                     }
                 }
             }
             std::thread::sleep(Duration::from_millis(50));
         }
+    }
+
+    /// The helper exited (status recorded by the wrapper) without writing a result: say
+    /// what happened to it ([`fate_body`]), with its stderr.
+    fn fate(&self, status: i32) -> String {
+        format!(
+            "the untracked helper job {} {}{}",
+            self.label,
+            fate_body(&self.helper, status),
+            self.log_tail()
+        )
+    }
+
+    /// launchd has no running job and the wrapper recorded no status: the job never
+    /// started, or the wrapper itself was killed. Say which, with launchd's last exit
+    /// status for the wrapper when the label is still registered.
+    fn vanished(&self, liveness: Liveness) -> String {
+        let seen = match liveness {
+            Liveness::Registered {
+                last_exit: Some(wait),
+            } => format!(
+                "; launchd still lists the label and its last exit status for the wrapper \
+                 was {}",
+                describe_wait_status(wait)
+            ),
+            Liveness::Registered { last_exit: None } => {
+                "; launchd still lists the label with no run recorded — the job never \
+                 started inside the grace"
+                    .to_string()
+            }
+            Liveness::Unknown | Liveness::Running => {
+                "; launchd no longer lists the label".to_string()
+            }
+        };
+        format!(
+            "the untracked helper job {} is gone without a result or an exit status{seen}{}",
+            self.label,
+            self.log_tail()
+        )
     }
 
     /// The job's stderr, for a refusal message — bounded, one line.
@@ -558,12 +818,150 @@ impl Job {
     }
 }
 
+/// What a recorded status says happened to the helper. SIGKILL is named for what it
+/// means here — the kernel would not run the binary — because that is the shape a copied
+/// bundle executable dies in (exit 137 from the wrapper, empty stderr; 2026-09-13).
+#[cfg(target_os = "macos")]
+fn fate_body(helper: &Path, status: i32) -> String {
+    match status {
+        STATUS_COPY_FAILED => format!(
+            "never ran: the wrapper could not byte-copy {} into the job's scratch",
+            helper.display()
+        ),
+        126 => format!(
+            "exited without a result: {} could not be executed (exit status 126)",
+            helper.display()
+        ),
+        127 => format!(
+            "exited without a result: {} was not found (exit status 127)",
+            helper.display()
+        ),
+        129..=192 => {
+            let signal = status - 128;
+            // SIGKILL is not self-describing: the wrapper records only `128+n`, so the
+            // CAUSE is not measured here. The one cause this lane has actually produced
+            // is the code-signature kill of a byte copy of a bundle-signed executable,
+            // and it is named as the first thing to check — not as the finding. Memory
+            // pressure during a multi-GB extract, `launchctl kill -9` and an operator
+            // all read identically at this seam.
+            let meaning = if signal == 9 {
+                "the kernel killed the helper before it answered; this lane's known cause \
+                 is a code-signature kill of a byte copy of a bundle-signed executable \
+                 (it fails its own Info.plist check), but jetsam under memory pressure and \
+                 an explicit kill land here too — the wrapper records the signal, not the \
+                 reason"
+            } else {
+                "the helper crashed"
+            };
+            format!(
+                "was killed by signal {signal} ({}) before it answered — {meaning}; helper {}",
+                signal_name(signal),
+                helper.display()
+            )
+        }
+        code => format!("exited without a result (exit status {code})"),
+    }
+}
+
+/// What `launchctl list <label>` says about a job.
+#[cfg(target_os = "macos")]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Liveness {
+    /// A live pid.
+    Running,
+    /// Registered, no pid: not started yet, or exited (with launchd's raw wait status
+    /// for the wrapper when one has been recorded).
+    Registered { last_exit: Option<i32> },
+    /// launchd does not list the label (the job removed itself, or was never submitted).
+    Unknown,
+}
+
+/// `"LastExitStatus" = N;` from `launchctl list <label>`'s plist text — the raw wait
+/// status (`exit 3` reads 768, a SIGKILL reads 9; measured 2026-09-13).
+#[cfg(target_os = "macos")]
+fn last_exit_status(list_text: &str) -> Option<i32> {
+    let idx = list_text.find("\"LastExitStatus\"")?;
+    let rest = &list_text[idx..];
+    let eq = rest.find('=')?;
+    let value: String = rest[eq + 1..]
+        .trim_start()
+        .chars()
+        .take_while(|c| c.is_ascii_digit() || *c == '-')
+        .collect();
+    value.parse().ok()
+}
+
+/// A raw wait status, spoken: `exit status 3`, or `signal 9 (SIGKILL)`.
+#[cfg(target_os = "macos")]
+fn describe_wait_status(wait: i32) -> String {
+    let signal = wait & 0x7f;
+    if signal == 0 {
+        format!("exit status {}", (wait >> 8) & 0xff)
+    } else {
+        format!("signal {signal} ({})", signal_name(signal))
+    }
+}
+
+/// The names `/bin/sh` and launchd's numbers stand for, for the ones a helper dies of.
+#[cfg(target_os = "macos")]
+fn signal_name(signal: i32) -> &'static str {
+    match signal {
+        1 => "SIGHUP",
+        2 => "SIGINT",
+        3 => "SIGQUIT",
+        4 => "SIGILL",
+        5 => "SIGTRAP",
+        6 => "SIGABRT",
+        7 => "SIGEMT",
+        8 => "SIGFPE",
+        9 => "SIGKILL",
+        10 => "SIGBUS",
+        11 => "SIGSEGV",
+        12 => "SIGSYS",
+        13 => "SIGPIPE",
+        14 => "SIGALRM",
+        15 => "SIGTERM",
+        _ => "signal",
+    }
+}
+
+/// The `<pid>` in a label of ours — `systems.alab.atpkg.<stem>-<pid>-<seq>-<nonce>`,
+/// where `<stem>` may itself carry dashes (`stage-helper`, `lay-helper`), so the fields
+/// are read from the right. `None` for any other label, including the integration tests'
+/// `systems.alab.atpkg.test.<name>.<pid>`, which clean up after themselves.
+#[cfg(target_os = "macos")]
+fn owner_pid_of_label(label: &str) -> Option<u32> {
+    let rest = label.strip_prefix(LABEL_PREFIX)?;
+    if rest.starts_with("test.") {
+        return None;
+    }
+    let mut fields = rest.rsplitn(4, '-');
+    let _nonce = fields.next()?;
+    let _seq = fields.next()?;
+    let pid = fields.next()?;
+    let _stem = fields.next()?;
+    pid.parse().ok()
+}
+
+/// Whether a process with `pid` exists (`kill(pid, 0)`: `ESRCH` is the only "no").
+#[cfg(target_os = "macos")]
+fn pid_exists(pid: u32) -> bool {
+    let Ok(pid) = libc::pid_t::try_from(pid) else {
+        return true;
+    };
+    // SAFETY: `kill` with signal 0 delivers nothing; it only asks the kernel whether the
+    // pid is addressable.
+    let rc = unsafe { libc::kill(pid, 0) };
+    rc == 0 || std::io::Error::last_os_error().raw_os_error() != Some(libc::ESRCH)
+}
+
 #[cfg(target_os = "macos")]
 impl Drop for Job {
-    /// Forget the label and the scratch; a one-shot job that already exited is simply
-    /// unregistered, a wedged one is stopped. On drop, so no exit path of the lane —
-    /// a spec that would not write, a submit that failed, a result that would not parse
-    /// — leaves a registered job or a scratch dir behind.
+    /// Forget the label and the scratch; a one-shot job that already exited (and, since
+    /// 2026-09-13, removed its own label) is a no-op here, a wedged one is stopped. On
+    /// drop, so no exit path of the lane — a spec that would not write, a submit that
+    /// failed, a result that would not parse — leaves a registered job or a scratch dir
+    /// behind.
     fn drop(&mut self) {
         let _ = std::process::Command::new("/bin/launchctl")
             .args(["remove", &self.label])
@@ -642,7 +1040,7 @@ mod tests {
         assert_eq!(decode_spec(&no_dest).unwrap_err(), "spec names no dest");
     }
 
-    /// Only the two production spellings are copied and exec'd; a test harness is not.
+    /// Only the two production spellings are run as helpers; a test harness is not.
     #[test]
     fn only_atpkg_and_aterm_binaries_are_taken_as_helpers() {
         assert!(exe_serves_hidden_verb(Path::new("/x/target/debug/atpkg")));
@@ -674,5 +1072,169 @@ mod tests {
             "temp answer must be renamed away"
         );
         let _ = std::fs::remove_dir_all(&d);
+    }
+
+    /// The plan never copies a bundle's own executable: untagged, it runs in place; tagged,
+    /// it is refused with the reason (a copy is killed at exec, in place it is tracked).
+    /// A free-standing binary runs in place untagged and is copied tagged.
+    #[test]
+    fn a_bundle_resident_executable_is_never_copied() {
+        let d =
+            std::env::temp_dir().join(format!("atpkg-stage-helper-bundle-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&d);
+        let contents = d.join("aterm.app").join("Contents");
+        std::fs::create_dir_all(contents.join("MacOS")).unwrap();
+        let exe = contents.join("MacOS").join("aterm");
+        std::fs::write(&exe, b"").unwrap();
+        // No Info.plist yet: not a bundle, whatever the path looks like.
+        assert_eq!(bundle_of(&exe), None);
+        std::fs::write(contents.join("Info.plist"), b"<plist/>").unwrap();
+        let bundle = bundle_of(&exe).expect("Contents/MacOS/<exe> beside Info.plist");
+        assert_eq!(bundle, d.join("aterm.app"));
+        assert_eq!(
+            plan_helper(&exe, false, Some(&bundle)),
+            Ok(HelperPlan::ExecOriginal)
+        );
+        let refused = plan_helper(&exe, true, Some(&bundle)).unwrap_err();
+        assert!(refused.contains("Info.plist"), "{refused}");
+        assert!(refused.contains("SIGKILL"), "{refused}");
+        assert!(refused.contains("aterm.app"), "{refused}");
+        // Free-standing.
+        let free = Path::new("/x/target/debug/aterm");
+        assert_eq!(bundle_of(free), None);
+        assert_eq!(plan_helper(free, false, None), Ok(HelperPlan::ExecOriginal));
+        assert_eq!(plan_helper(free, true, None), Ok(HelperPlan::CopyThenExec));
+        let _ = std::fs::remove_dir_all(&d);
+    }
+
+    /// The wrapper, run by `/bin/sh` directly (no launchd): in place it makes no copy and
+    /// records the helper's exit status; a helper killed by SIGKILL is recorded as 137
+    /// (`128 + 9`, the shell's convention); with a copy path it `cat`s the helper there,
+    /// mode 0755, and runs the copy; and it exits 0 every time.
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn the_wrapper_records_the_helpers_fate_and_copies_only_when_told_to() {
+        use std::os::unix::fs::PermissionsExt as _;
+        let d =
+            std::env::temp_dir().join(format!("atpkg-stage-helper-wrapper-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&d);
+        std::fs::create_dir_all(&d).unwrap();
+        let run = |helper: &Path, copy: &Path, tag: &str| -> (i32, String) {
+            let status = d.join(format!("status-{tag}"));
+            let out = std::process::Command::new("/bin/sh")
+                .arg("-c")
+                .arg(WRAPPER)
+                .arg("atpkg-untracked")
+                .arg(helper)
+                .arg(d.join("spec"))
+                .arg(HIDDEN_VERB)
+                .arg(&status)
+                .arg("systems.alab.atpkg.test.no-such-label")
+                .arg(copy)
+                .output()
+                .unwrap();
+            let recorded = std::fs::read_to_string(&status).unwrap_or_default();
+            (out.status.code().unwrap_or(-1), recorded)
+        };
+        // In place: /usr/bin/true exits 0; no copy appears.
+        let copy = d.join("atpkg");
+        let (wrapper_exit, recorded) = run(Path::new("/usr/bin/true"), Path::new(""), "inplace");
+        assert_eq!(wrapper_exit, 0);
+        assert_eq!(recorded.trim(), "0");
+        assert!(!copy.exists(), "no copy was asked for");
+        // Copied: the copy exists at 0755 and ran.
+        let (wrapper_exit, recorded) = run(Path::new("/usr/bin/true"), &copy, "copied");
+        assert_eq!(wrapper_exit, 0);
+        assert_eq!(recorded.trim(), "0");
+        assert!(copy.exists());
+        assert_eq!(
+            std::fs::metadata(&copy).unwrap().permissions().mode() & 0o777,
+            0o755
+        );
+        // Killed: a helper that SIGKILLs itself is recorded as 137, and the wrapper still exits 0.
+        let killer = d.join("killer.sh");
+        std::fs::write(&killer, "#!/bin/sh\nkill -9 $$\n").unwrap();
+        std::fs::set_permissions(&killer, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let (wrapper_exit, recorded) = run(&killer, Path::new(""), "killed");
+        assert_eq!(wrapper_exit, 0);
+        assert_eq!(recorded.trim(), "137");
+        // A copy that cannot be made (destination dir missing) is 125 and runs nothing.
+        let (wrapper_exit, recorded) = run(&killer, &d.join("no-such-dir").join("atpkg"), "nocopy");
+        assert_eq!(wrapper_exit, 0);
+        assert_eq!(recorded.trim(), STATUS_COPY_FAILED.to_string());
+        let _ = std::fs::remove_dir_all(&d);
+    }
+
+    /// The fate report names the real thing: a signal by number and name, an exit status
+    /// by number, the copy failure as "never ran" — and the bare "exited without a result"
+    /// only when that is all there is. For SIGKILL it names this lane's KNOWN cause (the
+    /// code-signature kill of a copied bundle binary) while saying the signal is all the
+    /// wrapper recorded: jetsam and an explicit kill reach the same seam, so the report
+    /// must not hand back a cause it never measured.
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn the_fate_report_names_the_signal_or_the_exit_status() {
+        let helper = Path::new("/x/atpkg");
+        let killed = fate_body(helper, 137);
+        assert!(killed.contains("signal 9 (SIGKILL)"), "{killed}");
+        assert!(killed.contains("code-signature kill"), "{killed}");
+        // It must NOT hand back that cause as the finding: the other causes are named
+        // and the source of the reading is stated.
+        assert!(killed.contains("jetsam"), "{killed}");
+        assert!(
+            killed.contains("records the signal, not the reason"),
+            "{killed}"
+        );
+        assert!(!killed.contains("exited without a result"), "{killed}");
+        let crashed = fate_body(helper, 139);
+        assert!(crashed.contains("signal 11 (SIGSEGV)"), "{crashed}");
+        assert!(crashed.contains("crashed"), "{crashed}");
+        assert_eq!(
+            fate_body(helper, 0),
+            "exited without a result (exit status 0)"
+        );
+        assert_eq!(
+            fate_body(helper, 3),
+            "exited without a result (exit status 3)"
+        );
+        assert!(fate_body(helper, 126).contains("could not be executed (exit status 126)"));
+        assert!(fate_body(helper, 127).contains("was not found (exit status 127)"));
+        assert!(fate_body(helper, STATUS_COPY_FAILED).starts_with("never ran"));
+    }
+
+    /// launchd's `LastExitStatus` is a raw wait status (measured: `exit 3` → 768, SIGKILL
+    /// → 9); it is parsed off the plist text and spoken as an exit status or a signal.
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn launchds_last_exit_status_is_a_wait_status_and_is_spoken_as_one() {
+        let text = "{\n\t\"LimitLoadToSessionType\" = \"Aqua\";\n\t\"Label\" = \"x\";\n\t\"LastExitStatus\" = 768;\n};";
+        assert_eq!(last_exit_status(text), Some(768));
+        assert_eq!(describe_wait_status(768), "exit status 3");
+        assert_eq!(describe_wait_status(9), "signal 9 (SIGKILL)");
+        assert_eq!(describe_wait_status(0), "exit status 0");
+        assert_eq!(last_exit_status("{\n\t\"PID\" = 12;\n};"), None);
+    }
+
+    /// The sweep reads the owning pid off our labels only: the two shapes the lanes mint
+    /// (a dashed stem), never the integration tests' `test.` labels or a foreign label.
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn the_sweep_reads_the_owning_pid_off_our_labels_only() {
+        assert_eq!(
+            owner_pid_of_label("systems.alab.atpkg.stage-helper-4281-0-18d4bf618a493520"),
+            Some(4281)
+        );
+        assert_eq!(
+            owner_pid_of_label("systems.alab.atpkg.lay-helper-4281-1-18d4bf61975232a8"),
+            Some(4281)
+        );
+        assert_eq!(
+            owner_pid_of_label("systems.alab.atpkg.test.clean.123"),
+            None
+        );
+        assert_eq!(owner_pid_of_label("com.apple.Finder"), None);
+        assert_eq!(owner_pid_of_label("systems.alab.atpkg.odd"), None);
+        assert!(pid_exists(std::process::id()), "this process exists");
+        assert!(pid_exists(1), "launchd exists (EPERM is not ESRCH)");
     }
 }

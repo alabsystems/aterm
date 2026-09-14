@@ -16,8 +16,8 @@ supported paths:
 
 1. **The CLI** — `aterm ctl`, `aterm drive`, `aterm fleet` (also the argv0 aliases
    `aterm-ctl`, `aterm-drive`, `aterm-fleet`; one binary serves all of them).
-2. **The library API** — `aterm-ctl`'s `CtlClient`/`RelayClient`, `aterm-agent`'s
-   `Turn`/`SelfGovernor`, for embedding rather than shelling out.
+2. **The library API** — `aterm-agent`'s `CtlClient`/`RelayClient`/`Turn`/`SelfGovernor`
+   (all four live in that one crate), for embedding rather than shelling out.
 
 **The verb table is generated at build time — run `aterm ctl --help` for the authoritative
 verb list and never guess a verb.** This file carries only the idioms `--help` does not.
@@ -81,7 +81,7 @@ Stamp yourself on arrival so peers can tell the same about you:
 | `ATERM_COLUMNS` / `ATERM_LINES` | server | Initial grid (clamped 20..=500 / 5..=300). |
 | `ATERM_EXEC` | server | Run this in the PTY then exec `$SHELL` — deterministic paint instead of a host-specific prompt. |
 | `ATERM_CTL` | `drive`, `fleet` | Path to the `aterm-ctl` client they shell out to (`fleet` uses it for the `events` streamers and `exec`; its fleet **discovery** is in-process). |
-| `ATERM_CONTROL_TOKEN` | **only `aterm drive --dial`** | Not read by `aterm ctl` — that reads the sibling token *file*. |
+| `ATERM_CONTROL_TOKEN` | `aterm drive` (whenever a socket is configured — `--dial` *and* the local `prompt` fast path), `aterm link hook` | Not read by `aterm ctl` — that reads the sibling token *file*, and `drive` falls back to the same file. |
 
 Auth is automatic: a per-launch 32-byte token file sits beside the socket —
 `aterm-<pid>.token` for a default socket, and for an explicit
@@ -132,7 +132,7 @@ the server's. *(`--sock`/`--pid` used to be silently ignored here, so a scoped `
 the user's real terminals. Fixed 2026-07-26; a stale build still has the old behavior.)*
 
 Line shapes:
-- `ls` → `<pid> <local> <sid> <parent|-> <state> <title-pct-encoded> meta=<0|1> window=<id|none|-> active=<0|1|-> wfocus=<0|1|-> detail=<cmd|->[ *]`
+- `ls` → `<pid> <local> <sid> <parent|-> <state> <title-pct-encoded> meta=<0|1> nonce=<hex32> window=<id|none|-> active=<0|1|-> wfocus=<0|1|-> detail=<cmd|->[ *]`
 - `sessions` → the same without the leading pid
 - `windows` → `<pid> window=<id> focused=<0|1> sessions=<n> active=<sid>[,<sid>…]`, then
   `<pid> window=none sessions=<n>` for sessions no window holds and `<pid> window=- sessions=<n>`
@@ -202,8 +202,10 @@ Targeting classes matter. **Session** verbs (`text screen cursor image turn awai
 wait send close status meta blocks` …) act on the resolved session. **App** verbs (`window
 chrome panes controls open invoke settings metrics video inspect`) route the selector to the
 *instance* and act on its **front window** — except `spawn` and `tab`, where `@<sid>` AIMS at
-the window hosting `<sid>` (see below). **Meta** verbs (`sessions exits who whoami version
-help grant dial*`) reject a selector outright.
+the window hosting `<sid>` (see below). **Meta** verbs split on a selector: `sessions exits
+who whoami grant dial*` are owner-only and answer `ERR denied` to any non-self one, while
+`version help verbs update` are answered before targeting and simply IGNORE it. `privacy` is
+the exception that *rejects* one, because it aggregates per session and would read wrong.
 
 Asymmetry: `spawn` is instance/window-targeted (`aterm ctl spawn` → `OK <sid>`), `close` is
 Session-targeted (`aterm ctl "@<sid>" close` → `OK closed <sid>`).
@@ -246,7 +248,9 @@ aterm ctl "@$SID" blocks        # shell-integration command blocks; the executin
   read the prompt box only at decision points — never on a poll.
 - `search` replies `OK <n>` (or `OK <n> incomplete` when scrollback was evicted mid-scan),
   then one `<row> <col> <len>` per match where **row is the ABSOLUTE scrollback row**.
-- `--json` goes *after* the verb, honored only by `text screen cursor dims blocks edges grants`.
+- `--json` goes *after* the verb. The verbs that honor it are named in the protocol header of
+  `aterm ctl help --full`, which is GENERATED from the server's own allowlist — read it rather
+  than a copy. (A copy here listed seven and was already wrong about `metrics` and `privacy`.)
 - Free-text fields anywhere (titles, `history` `text=`, `status` `subject=`/`detail=`, meta
   values) are percent-encoded.
 - `status` carries no `window=` on purpose (it is polled; the window lives on the main
@@ -574,8 +578,10 @@ aterm drive --dial <name> prompt 'run the tests'
 
 - **`dial <name>` with no verb is rejected** — a bare dial would deadlock a one-shot client.
 - Dialing out is owner-only. Use `image --bytes` remotely (a path names the server's disk).
-- `aterm drive --dial` needs `$ATERM_CONTROL_TOKEN` set explicitly — its fallback derives
-  `<sock without .sock>.token`, which does **not** match `aterm ctl`'s convention.
+- `aterm drive --dial` authenticates the way `aterm ctl` does: `$ATERM_CONTROL_TOKEN` if set,
+  else the sibling token file by the SHARED convention. *(It used to derive `<sock without
+  .sock>.token`, a name the server never writes, so `--dial` silently failed to authenticate
+  where `aterm ctl` worked. Fixed — a stale build still has the old behavior.)*
 
 ## Fleet
 
@@ -623,6 +629,7 @@ aterm drive phase "@$SID"                                     # busy | prompt | 
 aterm drive await-turn "@$SID" --timeout 600000               # block until not busy, print the phase; exit 124 = still busy
 aterm drive supervise "@$SID" --auto-reads --max-s 1800 --notes notes.txt   # the manager loop; see the supervise-agent skill
 aterm drive watch "@$SID" --auto-reads --notes notes.txt      # the same loop under a background monitor: one line per decision
+aterm drive report "@$SID"                                    # what the worker said since your turn, what scrolled off included
 ```
 
 `prompt` is `send` → `key enter` → `await idle <ms> timeout <ms>` → best-effort
@@ -635,12 +642,54 @@ program *is* Claude. Point it at your own REPL's prompt otherwise, or pass `''` 
 idle-only. Also settable via `$ATERM_DRIVE_READY` (the flag wins). A non-matching pattern
 costs a bounded extra wait, never a failed turn.
 
-The last five are the `supervise-agent` skill's loop (`aterm drive --help`, *SUPERVISING A
+The last six are the `supervise-agent` skill's loop (`aterm drive --help`, *SUPERVISING A
 WORKER*): `classify` is the read-only judgment, `phase` one read → one word, `await-turn`
 the wait that never sleeps, `supervise` the loop that approves only a read-only Bash prompt
 (guarded: `key if=Do.you.want.to.proceed 1`) and stops at everything else, `watch` that loop
-printing one `EVENT` line per review point and keeping on. `--timeout` is milliseconds;
-`--max-s` is seconds.
+printing one `EVENT` line per review point and keeping on, `report` what the worker said
+since your turn. `--timeout` is milliseconds; `--max-s` is seconds.
+
+**Never rate a session for the human.** While Claude Code's session survey (`● How is
+Claude doing this session?` over `1: Bad    2: Fine   3: Good   0: Dismiss`) is open
+above the composer, a turn whose first character is 1, 2 or 3 is taken as the human's
+rating. `aterm drive phase` (and `await-turn`) ends with `survey 0` while it is open:
+dismiss it with `aterm ctl "@$SID" key 'if=^●.How.is.Claude.doing' 0` — `0`, guarded on
+the survey's own row (a copy quoted in the transcript or in a tool's output matches
+nothing), quoted for zsh — before you type. `watch` prints `EVENT survey seq=<n> dismiss
+with: …` once when it appears, and `watch --dismiss-surveys` presses the `0` itself and
+prints `DISMISSED survey seq=<n>` once the survey has gone (still open, it prints the
+`EVENT survey` line for you instead); a monitor that filters `watch`'s lines keeps it:
+`grep --line-buffered -E '^(EVENT|APPROVED|DISMISSED|TIMEOUT|EXIT)'`.
+
+**A worker running out of context is a decision point too.** Claude Code parks `1% until
+auto-compact` (or `Context left until auto-compact: 7%`) right-aligned above its composer
+as the context runs low, and then compacts: its history becomes a summary, and standing
+rules you gave it (run nothing heavy while a flag file exists) can silently drop out.
+`aterm drive phase` (and `await-turn`) ends with `context <n>%` while the indicator is up.
+`watch` prints `EVENT context seq=<n> <v>% until auto-compact` once a descent, when it
+first reads at or below `--context-warn` (default 10; `0` turns both lines off) — ask the
+worker to bring its handoff and notes up to date before it compacts — and `EVENT compacted
+seq=<n>` once the indicator has gone from above the composer (or jumped back up 30 points
+or more): re-send your standing rules in one turn. `supervise` says both on stderr, for
+what happens during its run only: a compaction between two runs prints nothing, so after
+an `EVENT context` check `phase` before the next run — no `context <n>%` line (and no box
+up) means it compacted. Only the indicator is read: alone on its row, ending against the
+right edge above the composer; a copy quoted in the transcript does not count unless it,
+too, ends at that edge. Never type `/compact` or `/clear` into the worker for it without
+the human.
+
+**Read what the worker said since your turn with `aterm drive report`; the screen alone
+loses what scrolled off a fullscreen app.** Claude Code runs on the alternate screen and
+repaints in place, so a row that leaves its top is gone from `text` (`lines` stays 0) —
+measured, 7 of the 35 message blocks one worker turn displayed were still on the screen.
+The host keeps those rows (`aterm ctl "@$SID" offscreen`), and every `turn` records where
+they stood when it began (`history`'s `arch=`); `report` joins them with the screen in one
+read, from your turn's `❯` row down to the live zone, every row verbatim. Its header
+`report complete=<0|1> [reason=…] marker=… turn=<id|-> rows=<n> archived=<a> screen=<s>
+last=<o:i|->` says whether anything may be missing and why (`archive-gap`, `archive-reset`,
+`max-rows`, `marker-not-found`, `no-archive` for the screen alone, `main-screen` when the
+worker is off the alternate screen); then `--` and the rows. `watch --report` adds
+`complete=<0|1> rows=<n>` to each idle, question and limited `EVENT`.
 
 `drive` **shells out** to `aterm-ctl`, so through a bare symlink with no sibling client it
 fails with `could not run aterm-ctl`. Set `$ATERM_CTL`, or just use `aterm ctl` — that path

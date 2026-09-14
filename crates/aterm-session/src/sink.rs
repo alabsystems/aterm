@@ -66,12 +66,39 @@ pub struct AcceptedOrder(u64);
 pub struct WriteReceipt {
     accepted: usize,
     order: Option<AcceptedOrder>,
+    /// The WHOLE frame reached the kernel on the direct lane in this call —
+    /// nothing of it sits in the spill. A receipt-aware caller that wants to
+    /// know "is my input drained to the kernel?" can then skip the spill-mutex
+    /// probe (`try_egress_drained_to_kernel`) entirely: the answer is `true`
+    /// by construction. `false` for spilled, split, short or empty frames.
+    direct: bool,
 }
 
 impl WriteReceipt {
     fn new(accepted: usize, order: Option<AcceptedOrder>) -> Self {
         debug_assert_eq!(accepted == 0, order.is_none());
-        Self { accepted, order }
+        Self {
+            accepted,
+            order,
+            direct: false,
+        }
+    }
+
+    /// A direct-lane write that ended with `accepted` of `intended` bytes in
+    /// the kernel: `direct` iff the frame completed (a peer-closed short write
+    /// keeps the conservative `false`).
+    fn completed(accepted: usize, intended: usize, order: AcceptedOrder) -> Self {
+        Self {
+            accepted,
+            order: (accepted > 0).then_some(order),
+            direct: accepted > 0 && accepted == intended,
+        }
+    }
+
+    /// Whether the whole frame reached the kernel directly (see the field).
+    #[must_use]
+    pub const fn is_direct(self) -> bool {
+        self.direct
     }
 
     /// Number of bytes accepted by this call.
@@ -274,6 +301,18 @@ struct Shared {
     // Live only on the unix spill/drain path; the Windows twin writes blocking.
     #[cfg_attr(not(unix), allow(dead_code))]
     drained: Condvar,
+    /// OFF-THREAD DRAINER ARRANGEMENT. When installed, a NON-PARKING writer that
+    /// must spill with no drainer live does not `dup(2)` + `pthread_create` on
+    /// its own (UI) thread: it commits the bytes under a `drainer pending` mark
+    /// and calls this hook, which must be non-blocking (a `try_send` to an
+    /// existing worker that then calls [`SinkWriter::arrange_pending_drainer`]).
+    /// Absent (tests, embedders without a worker), the historical inline
+    /// arrangement runs. Blocking writers always arrange inline — they are on
+    /// expendable threads and the arrange-before-commit guarantee costs them
+    /// nothing.
+    // Live only on the unix spill/drain path; the Windows twin writes blocking.
+    #[cfg_attr(not(unix), allow(dead_code))]
+    arranger: std::sync::OnceLock<Box<dyn Fn() + Send + Sync>>,
 }
 
 /// See [`Shared::spill`].
@@ -292,6 +331,17 @@ struct Spill {
     // Live only on the unix spill/drain path; the Windows twin writes blocking.
     #[cfg_attr(not(unix), allow(dead_code))]
     draining: bool,
+    /// `draining` was set by a non-parking writer that DEFERRED the spawn to the
+    /// installed arranger (see `Shared::arranger`); cleared by
+    /// [`SinkWriter::arrange_pending_drainer`] when the thread exists (or the
+    /// spawn failed and `draining` was rolled back so the next writer retries).
+    // Live only on the unix spill/drain path; the Windows twin writes blocking.
+    #[cfg_attr(not(unix), allow(dead_code))]
+    arrange_pending: bool,
+    /// Sticky for this sink's lifetime: the drainer discarded buffered bytes
+    /// after a closed peer or hard error. A completion fence must not mistake
+    /// the resulting empty buffer for a successful drain.
+    failed: bool,
 }
 
 impl Spill {
@@ -526,9 +576,47 @@ impl SinkWriter {
     /// PTY master) would die with the process, so Commit must wait until every
     /// live sink reports drained. Kernel-queued bytes, by contrast, are the
     /// child's to replay and need no such wait.
+    ///
+    /// This answers "does this process still hold bytes", NOT "did the bytes
+    /// land": after the drainer discards a spill over a dead peer the buffer is
+    /// empty and this reads `true` — there is nothing left for `_exit` to
+    /// destroy, and the handoff's 3 s fail-closed deadline must not stall on a
+    /// loss that has already happened and cannot be recovered. A reply-bearing
+    /// writer that must tell its caller whether bytes REACHED the kernel uses
+    /// [`Self::wait_egress_drained_to_kernel`], which keeps the sticky failure.
     #[must_use]
     pub fn egress_drained_to_kernel(&self) -> bool {
         self.shared.spill_is_empty()
+    }
+
+    /// Block an EXPENDABLE producer until every process-local spill byte has
+    /// either reached the kernel or the spill drainer has observed a dead
+    /// peer. Returns `true` only for the first case.
+    ///
+    /// This is deliberately not the ordinary write API: UI-thread input must
+    /// remain non-parking. Completion-correlated callers (the control thread's
+    /// background `paste` / `paste-bin` reply) use it after a nominally full
+    /// `write_frame` result because that result can mean "accepted into the
+    /// spill", not yet "accepted by the kernel". A dead drainer clears buffered
+    /// bytes to unblock ownership teardown, so the sticky `failed` bit
+    /// distinguishes that loss from a successful drain — and, unlike the
+    /// polling fences above, this one reports it: an `OK` built on this fence
+    /// means every byte reached the kernel.
+    #[must_use]
+    pub fn wait_egress_drained_to_kernel(&self) -> bool {
+        let mut spill = self
+            .shared
+            .spill
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner());
+        while spill.draining && !spill.buf.is_empty() {
+            spill = self
+                .shared
+                .drained
+                .wait(spill)
+                .unwrap_or_else(|poison| poison.into_inner());
+        }
+        spill.buf.is_empty() && !spill.failed
     }
 
     /// Non-parking observation of [`Self::egress_drained_to_kernel`].
@@ -548,6 +636,36 @@ impl SinkWriter {
             Err(std::sync::TryLockError::WouldBlock) => None,
         }
     }
+
+    /// Install the OFF-THREAD drainer arranger (see `Shared::arranger`): a
+    /// non-blocking hook a non-parking writer calls INSTEAD of spawning the
+    /// spill drainer on its own thread. The hook's owner must then call
+    /// [`Self::arrange_pending_drainer`] from a worker thread. First install
+    /// wins; later calls are ignored.
+    pub fn install_spill_arranger(&self, arranger: impl Fn() + Send + Sync + 'static) {
+        let _ = self.shared.arranger.set(Box::new(arranger));
+    }
+
+    /// Worker-side half of [`Self::install_spill_arranger`]: spawn the drainer a
+    /// non-parking writer marked pending. Idempotent; a spawn failure rolls the
+    /// `draining` mark back so the next writer arranges again (inline for a
+    /// blocking writer, via the hook for a non-parking one) — the spilled bytes
+    /// are never stranded behind a drainer that does not exist.
+    #[cfg(unix)]
+    pub fn arrange_pending_drainer(&self) {
+        let mut s = self.shared.spill.lock().unwrap_or_else(|p| p.into_inner());
+        if !s.arrange_pending {
+            return;
+        }
+        s.arrange_pending = false;
+        if !self.shared.arrange_drainer(self.master, &mut s) {
+            s.draining = false;
+        }
+    }
+
+    /// Windows twin: no spill drainer exists, nothing is ever pending.
+    #[cfg(not(unix))]
+    pub fn arrange_pending_drainer(&self) {}
 
     /// Current attempted-input epoch for this sink.
     ///
@@ -922,7 +1040,7 @@ impl SinkWriter {
             }
         }
         drop(guard);
-        Ok(WriteReceipt::new(off, (off > 0).then_some(order)))
+        Ok(WriteReceipt::completed(off, bytes.len(), order))
     }
 
     /// Windows twin of [`Self::write_frame_body_locked`]: a ConPTY handle is not a
@@ -952,7 +1070,7 @@ impl SinkWriter {
             }
         }
         drop(guard);
-        Ok(WriteReceipt::new(off, (off > 0).then_some(order)))
+        Ok(WriteReceipt::completed(off, bytes.len(), order))
     }
 
     /// The legacy blocking write, taking the fd lock itself (the degraded path
@@ -1072,11 +1190,14 @@ impl SinkWriter {
         // frame then parks the loop. Keeping the loop responsive there is a caller-side
         // fix: route automated/cross-session input egress through `write_frame` on the
         // expendable control thread so this guard never fires on the UI thread.
-        if self.shared.spill_len() >= Shared::SPILL_CAP {
+        // ONE spill-mutex read answers both questions below (the cap and the
+        // FIFO predicate); they used to be two acquisitions per keystroke.
+        let spilled = self.shared.spill_len();
+        if spilled >= Shared::SPILL_CAP {
             return self.write_frame_after_reserve(bytes);
         }
         // Undelivered spill exists → queue behind it (order), never touch the fd.
-        if !self.shared.spill_is_empty()
+        if spilled != 0
             && let Some(order) = self.shared.spill_append(self.master, bytes, false)?
         {
             return Ok(WriteReceipt::new(bytes.len(), Some(order)));
@@ -1206,7 +1327,7 @@ impl SinkWriter {
             }
         }
         drop(guard);
-        Ok(WriteReceipt::new(off, (off > 0).then_some(order)))
+        Ok(WriteReceipt::completed(off, bytes.len(), order))
     }
 
     /// Windows: the unix spill/`poll(2)` machinery does not apply to a ConPTY handle
@@ -1310,8 +1431,11 @@ impl Shared {
                 accepted_order: 0,
                 buf: VecDeque::new(),
                 draining: false,
+                arrange_pending: false,
+                failed: false,
             }),
             drained: Condvar::new(),
+            arranger: std::sync::OnceLock::new(),
         }
     }
 
@@ -1390,11 +1514,26 @@ impl Shared {
                 s = self.drained.wait(s).unwrap_or_else(|p| p.into_inner());
             }
         }
-        if !s.draining && !self.arrange_drainer(master, &mut s) {
-            return Ok(None);
+        // Who spawns the drainer. A NON-PARKING writer is the UI thread; with an
+        // arranger installed it never runs `dup`/`pthread_create` itself — it
+        // marks the drainer pending, commits, and pokes the worker (below, after
+        // the mutex drops). Everyone else arranges inline, before committing.
+        let defer = !wait_for_room && self.arranger.get().is_some();
+        if !s.draining {
+            if defer {
+                s.draining = true;
+                s.arrange_pending = true;
+            } else if !self.arrange_drainer(master, &mut s) {
+                return Ok(None);
+            }
         }
+        let poke = defer && s.arrange_pending;
         let order = s.next_accepted_order()?;
         s.buf.extend(bytes.iter().copied());
+        drop(s);
+        if poke && let Some(arranger) = self.arranger.get() {
+            arranger();
+        }
         Ok(Some(order))
     }
 
@@ -1456,6 +1595,12 @@ impl Shared {
     /// pre-prepend chunk that would deliver a foreign frame inside the split one.
     #[cfg(unix)]
     fn drain_loop(self: Arc<Self>, fd: OwnedFd) {
+        // This thread holds `Shared.lock` — the mutex the UI thread's keystroke
+        // write contends — for every chunk it writes. A lock holder must not run
+        // below the thread it can stall (the QoS floor rule): at the inherited
+        // DEFAULT class it is an E-core candidate whose descheduling parks every
+        // keystroke behind it.
+        aterm_pty::declare_interactive_thread();
         loop {
             let guard = self.lock.lock().unwrap_or_else(|p| p.into_inner());
             // Peek without removing, so writers keep seeing "undelivered bytes
@@ -1510,6 +1655,7 @@ impl Shared {
                 if dead {
                     s.buf.clear();
                     s.draining = false;
+                    s.failed = true;
                     drop(s);
                     self.drained.notify_all();
                     return;
@@ -2049,6 +2195,23 @@ mod tests {
             "small writes below a fresh spill cap must not wait for the wedge to clear"
         );
 
+        // Completion-correlated expendable writers must park while these
+        // accepted bytes still live only in the process spill.
+        let (completion_tx, completion_rx) = std::sync::mpsc::channel();
+        let completion_sink = sink.clone();
+        let completion_thread = std::thread::spawn(move || {
+            completion_tx
+                .send(completion_sink.wait_egress_drained_to_kernel())
+                .expect("completion receiver alive");
+        });
+        assert!(
+            matches!(
+                completion_rx.recv_timeout(std::time::Duration::from_millis(50)),
+                Err(std::sync::mpsc::RecvTimeoutError::Timeout)
+            ),
+            "the completion fence returned before the spill reached the kernel"
+        );
+
         // Unwedge: drain everything; the spill drainer must deliver A,B,C after
         // the fill bytes, contiguous and in submission order.
         let mut got = Vec::new();
@@ -2060,12 +2223,64 @@ mod tests {
             got.extend_from_slice(&chunk[..n]);
         }
         assert_eq!(&got[wedged..], b"AAAABBBBCCCC", "spill delivered in order");
+        assert!(
+            completion_rx
+                .recv_timeout(std::time::Duration::from_secs(2))
+                .expect("completion fence settles after drain")
+        );
+        completion_thread.join().expect("completion thread");
 
         // The drainer settled: a fresh direct write goes straight through.
         assert_eq!(sink.write_frame_nonparking(b"D").expect("direct"), 1);
         let mut one = [0u8; 8];
         let n = reader.read(&mut one).expect("read D");
         assert_eq!(&one[..n], b"D");
+    }
+
+    /// A drainer that empties the buffer only because its peer died is not a
+    /// successful completion. The blocking completion fence must keep that
+    /// distinction after the discarded queue becomes physically empty — and
+    /// keep it STICKY, so a later completion-correlated reply over the same
+    /// sink cannot be told the loss never happened. The polling fences answer
+    /// a different question ("does this process still hold bytes") and read
+    /// settled: the update handoff's 3 s fail-closed deadline must not stall
+    /// on a loss `_exit` can neither cause nor recover.
+    #[test]
+    fn egress_completion_fails_closed_when_the_spill_peer_dies() {
+        let (reader, writer) = std::os::unix::net::UnixStream::pair().expect("socketpair");
+        let sink = Arc::new(SinkWriter::new(writer.as_raw_fd()));
+
+        writer.set_nonblocking(true).expect("nonblocking for fill");
+        let mut wedged = 0usize;
+        loop {
+            match aterm_pty::write_some(writer.as_raw_fd(), &[b'.'; 4096]) {
+                Ok(n) if n > 0 => wedged += n,
+                _ => break,
+            }
+        }
+        writer.set_nonblocking(false).expect("back to blocking");
+        assert!(wedged > 0, "buffer filled");
+        assert_eq!(sink.write_frame_nonparking(b"lost").expect("spill"), 4);
+        assert!(!sink.egress_drained_to_kernel());
+
+        drop(reader);
+        assert!(
+            !sink.wait_egress_drained_to_kernel(),
+            "peer-death discard cannot satisfy the blocking completion fence"
+        );
+        assert!(
+            !sink.wait_egress_drained_to_kernel(),
+            "the failure is sticky: a second completion fence over the same sink still fails"
+        );
+        assert!(
+            sink.egress_drained_to_kernel(),
+            "nothing process-local remains after the discard: the polling handoff fence is settled"
+        );
+        assert_eq!(
+            sink.try_egress_drained_to_kernel(),
+            Some(true),
+            "the non-parking twin agrees with the polling fence"
+        );
     }
 
     /// `egress_drained_to_kernel` tracks the PROCESS-LOCAL spill: true on the
@@ -2238,5 +2453,135 @@ mod tests {
         let mut buf = [0u8; 8];
         let n = reader.read(&mut buf).expect("read");
         assert_eq!(&buf[..n], b"hello");
+    }
+}
+
+#[cfg(all(test, unix))]
+mod p04_direct_receipt_and_deferred_drainer_tests {
+    //! P04 — the non-parking keystroke write's receipt says whether the frame
+    //! went straight to the kernel, and a concession with an arranger installed
+    //! spawns NO thread on the conceding (UI) thread.
+    use super::*;
+    use std::io::Read as _;
+    use std::os::unix::net::UnixStream;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    /// A sink over one end of a socketpair; the other end reads what it wrote.
+    fn sink_and_reader() -> (Arc<SinkWriter>, UnixStream) {
+        let (reader, writer) = UnixStream::pair().expect("socketpair");
+        reader
+            .set_read_timeout(Some(std::time::Duration::from_secs(5)))
+            .expect("timeout");
+        let owned: OwnedFd = writer.into();
+        (Arc::new(SinkWriter::new_owned(owned)), reader)
+    }
+
+    fn read_exactly(reader: &mut UnixStream, want: usize) -> Vec<u8> {
+        let mut out = vec![0u8; want];
+        reader.read_exact(&mut out).expect("bytes reach the peer");
+        out
+    }
+
+    #[test]
+    fn a_whole_frame_on_the_direct_lane_is_direct_and_a_spilled_one_is_not() {
+        let (sink, mut reader) = sink_and_reader();
+        let direct = sink
+            .write_frame_nonparking_with_receipt(b"a")
+            .expect("write");
+        assert!(
+            direct.is_direct(),
+            "an uncontended keystroke goes straight to the kernel"
+        );
+        assert_eq!(direct.accepted(), 1);
+        // Hold the fd lock from this thread: the next non-parking frame must
+        // concede to the spill and report NOT direct.
+        let held = sink.shared.lock.lock().unwrap();
+        let spilled = sink
+            .write_frame_nonparking_with_receipt(b"b")
+            .expect("spill");
+        assert!(!spilled.is_direct(), "a conceded frame sits in the spill");
+        assert_eq!(
+            spilled.accepted(),
+            1,
+            "…but it IS accepted (ordered delivery)"
+        );
+        drop(held);
+        assert_eq!(read_exactly(&mut reader, 2), b"ab");
+    }
+
+    #[test]
+    fn a_concession_with_an_arranger_defers_the_spawn_to_the_worker() {
+        static POKES: AtomicUsize = AtomicUsize::new(0);
+        let (sink, mut reader) = sink_and_reader();
+        sink.install_spill_arranger(|| {
+            POKES.fetch_add(1, Ordering::SeqCst);
+        });
+        let held = sink.shared.lock.lock().unwrap();
+        let receipt = sink
+            .write_frame_nonparking_with_receipt(b"xyz")
+            .expect("concede to the spill");
+        assert_eq!(receipt.accepted(), 3);
+        assert!(!receipt.is_direct());
+        assert_eq!(
+            POKES.load(Ordering::SeqCst),
+            1,
+            "the arranger was poked exactly once"
+        );
+        {
+            let s = sink.shared.spill.lock().unwrap();
+            assert!(
+                s.draining && s.arrange_pending,
+                "committed under a PENDING mark, no thread yet"
+            );
+            assert_eq!(s.buf.len(), 3);
+        }
+        // A second concession while still pending appends behind AND re-pokes:
+        // a poke the worker's queue dropped must not strand the spill, so every
+        // conceding write while the mark is pending renews it (idempotent on
+        // the worker side).
+        let receipt2 = sink
+            .write_frame_nonparking_with_receipt(b"!")
+            .expect("append");
+        assert_eq!(receipt2.accepted(), 1);
+        assert_eq!(
+            POKES.load(Ordering::SeqCst),
+            2,
+            "pending ⇒ the poke is renewed"
+        );
+        drop(held);
+        // Nothing drains until the WORKER arranges the drainer…
+        std::thread::sleep(std::time::Duration::from_millis(20));
+        assert_eq!(sink.try_egress_drained_to_kernel(), Some(false));
+        // …which is the worker-side half.
+        sink.arrange_pending_drainer();
+        assert_eq!(read_exactly(&mut reader, 4), b"xyz!");
+        let t0 = std::time::Instant::now();
+        while sink.try_egress_drained_to_kernel() != Some(true) {
+            assert!(
+                t0.elapsed() < std::time::Duration::from_secs(5),
+                "drainer never emptied"
+            );
+            std::thread::yield_now();
+        }
+        assert!(!sink.shared.spill.lock().unwrap().arrange_pending);
+    }
+
+    #[test]
+    fn without_an_arranger_the_concession_arranges_inline_as_before() {
+        let (sink, mut reader) = sink_and_reader();
+        let held = sink.shared.lock.lock().unwrap();
+        let receipt = sink
+            .write_frame_nonparking_with_receipt(b"q")
+            .expect("concede");
+        assert_eq!(receipt.accepted(), 1);
+        {
+            let s = sink.shared.spill.lock().unwrap();
+            assert!(
+                s.draining && !s.arrange_pending,
+                "inline arrangement: the thread exists"
+            );
+        }
+        drop(held);
+        assert_eq!(read_exactly(&mut reader, 1), b"q");
     }
 }

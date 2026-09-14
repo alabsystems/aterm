@@ -6217,6 +6217,7 @@ fn run_feed_bin<W: Write>(
         };
         crate::app_input::tracked_egress(
             &term,
+            &ctx.modes,
             &ctx.sink,
             &ctx.output_echo,
             &event,
@@ -6560,14 +6561,25 @@ where
         } else {
             InputEvent::KeySequence(payload)
         };
-        crate::app_input::tracked_egress(
+        let receipt = crate::app_input::tracked_egress(
             &term,
+            &ctx.modes,
             &ctx.sink,
             &ctx.output_echo,
             &event,
             EgressMode::Backpressured,
         );
-        format!("OK {n} bytes\n")
+        // The hidden arm answers from the SAME receipt the front arm's App seam
+        // maps through `dispatch_front_input`: a short or failed PTY write is
+        // `ERR write failed`, never a false `OK` for bytes that did not land —
+        // and under `id=` a false `OK` would make the retry a `dup=1` for a
+        // frame the peer never saw. A paste additionally waits for its bytes
+        // to leave the process-local spill, so a peer that dies while they are
+        // queued is reported as the loss it is (see `background_reply_outcome`).
+        match background_reply_outcome(&ctx.sink, receipt, paste) {
+            InputOutcome::Ok => format!("OK {n} bytes\n"),
+            outcome => control_input::input_reply_to_str(Ok(outcome)),
+        }
     });
     if writer.write_all(response.as_bytes()).is_err() {
         return false;
@@ -7227,6 +7239,12 @@ fn front_drive_denial(surface: FrontControlSurface) -> String {
 /// what the active-tab seam would emit for the SAME event, preserving the Tier-1
 /// indistinguishability invariant (no `Source` is involved). `None` (a malformed
 /// verb line) maps to `err`. Always `Egress::Reported` for these arms.
+///
+/// The reply is the write's RECEIPT, exactly as the front-session arms and
+/// [`cross_mouse_apply`] answer: a short or failed PTY write (dead peer) is
+/// `ERR write failed`, never a false `OK` — the reply-fidelity contract that
+/// `OK` means delivered. A paste's `OK` says more: every byte left the
+/// process-local spill for the kernel (see [`background_reply_outcome`]).
 fn cross_input(
     term: &Arc<Mutex<Terminal>>,
     ctx: &SessionCtx,
@@ -7247,14 +7265,18 @@ fn cross_input(
             // announcing a gap for a verb the ledger never records would be its
             // own kind of dishonesty.
             crate::note_unseamed_control_input(&ev);
-            crate::app_input::tracked_egress(
+            let paste = matches!(&ev, InputEvent::Paste(..));
+            let receipt = crate::app_input::tracked_egress(
                 term,
+                &ctx.modes,
                 &ctx.sink,
                 &ctx.output_echo,
                 &ev,
                 EgressMode::Backpressured,
             );
-            "OK\n".to_string()
+            control_input::input_reply_to_str(Ok(background_reply_outcome(
+                &ctx.sink, receipt, paste,
+            )))
         }
         None => err.to_string(),
     }
@@ -7262,18 +7284,48 @@ fn cross_input(
 
 /// Raw `send`/`feed` bytes are still terminal input: retain their historical
 /// unlogged-input/latency accounting while routing the frame through the same
-/// per-session echo receipt as vocabulary input.
-fn cross_raw_input(term: &Arc<Mutex<Terminal>>, ctx: &SessionCtx, bytes: Vec<u8>) {
+/// per-session echo receipt as vocabulary input. Returns the write's verdict so
+/// the verb's reply can say `ERR write failed` instead of an unconditional `OK`.
+fn cross_raw_input(term: &Arc<Mutex<Terminal>>, ctx: &SessionCtx, bytes: Vec<u8>) -> InputOutcome {
     crate::metrics::note_input();
     crate::note_unseamed_control_bytes(&bytes);
     let event = InputEvent::KeySequence(bytes);
-    crate::app_input::tracked_egress(
+    let receipt = crate::app_input::tracked_egress(
         term,
+        &ctx.modes,
         &ctx.sink,
         &ctx.output_echo,
         &event,
         EgressMode::Backpressured,
     );
+    crate::app_input::egress_to_outcome(receipt.egress)
+}
+
+/// The reply-bearing verdict for one background (control-thread) write: the
+/// seam's receipt mapped through [`crate::app_input::egress_to_outcome`], so a
+/// short or failed PTY write is `WriteFailed` — and, when `kernel_receipt` is
+/// set (a `paste` / `paste-bin`, whose `OK` is a delivered-turn receipt rather
+/// than an accepted keystroke), the process-local spill must also drain to the
+/// kernel first. A frame the sink SPILLED behind a wedged foreground reports
+/// `Delivery::Full` — accepted for ordered delivery, not yet accepted by the
+/// kernel — and if the peer dies before the drainer hands it over, the drainer
+/// discards it. The sink's completion fence keeps that discard as a sticky
+/// failure, so the paste is answered `ERR write failed`, never a false `OK`.
+///
+/// The wait parks only this expendable control thread (the same thread the
+/// `Backpressured` write already parks under `SPILL_CAP`), never the UI loop.
+/// Keystroke-shaped input keeps the seam's accepted-for-delivery contract, as
+/// the front-session arms do.
+fn background_reply_outcome(
+    sink: &aterm_session::sink::SinkWriter,
+    receipt: crate::input::EgressReceipt,
+    kernel_receipt: bool,
+) -> InputOutcome {
+    let outcome = crate::app_input::egress_to_outcome(receipt.egress);
+    if kernel_receipt && outcome == InputOutcome::Ok && !sink.wait_egress_drained_to_kernel() {
+        return InputOutcome::WriteFailed;
+    }
+    outcome
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -7334,6 +7386,7 @@ fn operator_input(
     };
     match crate::app_input::tracked_egress(
         term,
+        &ctx.modes,
         &ctx.sink,
         &ctx.output_echo,
         &ev,
@@ -7656,6 +7709,7 @@ fn cross_mouse_apply(
     let ev = parse_mouse(rest)?;
     match crate::app_input::tracked_egress(
         term,
+        &ctx.modes,
         &ctx.sink,
         &ctx.output_echo,
         &ev,
@@ -7673,6 +7727,7 @@ fn cross_mouse_apply(
         Egress::TrackingOff {
             wheel_lines,
             wheel_up,
+            ..
         } if wheel_lines > 0 => {
             let delta = if wheel_up { wheel_lines } else { -wheel_lines };
             term_lock(term).scroll_display(delta);
@@ -8550,10 +8605,11 @@ fn handle(
             Some(InputEvent::KeySequence(control_input::send_bytes(rest))),
             "ERR\n",
         ),
-        "send" => {
-            cross_raw_input(term, ctx, control_input::send_bytes(rest));
-            "OK\n".to_string()
-        }
+        "send" => control_input::input_reply_to_str(Ok(cross_raw_input(
+            term,
+            ctx,
+            control_input::send_bytes(rest),
+        ))),
         // Phase 0.5: the SELF (active-tab) path funnels `key`/`ctrl`/`mouse`/`paste`/
         // `focus`/`resize`/`scroll` through the source-blind `App::input` seam on the
         // EVENT LOOP (posts `Wake::Input` / a reply-bearing resize), so the bytes are
@@ -8617,8 +8673,10 @@ fn handle(
         "feed" => match control_input::feed_bytes(rest) {
             Ok(bytes) => {
                 let n = bytes.len();
-                cross_raw_input(term, ctx, bytes);
-                format!("OK {n} bytes\n")
+                match cross_raw_input(term, ctx, bytes) {
+                    InputOutcome::Ok => format!("OK {n} bytes\n"),
+                    outcome => control_input::input_reply_to_str(Ok(outcome)),
+                }
             }
             Err(error) => error.to_string(),
         },
@@ -8870,6 +8928,10 @@ fn handle(
         // rather than scraping the $ATERM_TRACE_LATENCY stderr log. Read-side.
         "metrics" => control_query::cmd_metrics(Some(term), rest),
         "lines" => control_query::cmd_lines(term),
+        // `offscreen`: the rows an ALT-screen app scrolled off its top (Claude Code
+        // repaints in place, so `lines` stays 0 and they are otherwise gone). Reads
+        // the TARGET term's own archive, so it is correct cross-session like `lines`.
+        "offscreen" => control_query::cmd_offscreen(term, rest),
         "line" => control_query::cmd_line(term, rest),
         "modes" => control_query::cmd_modes(term),
         // `custody` -> WHO last took the reading position or the highlight, by name.
@@ -9026,6 +9088,7 @@ fn json_unsupported(verb: &str) -> Option<String> {
             | "cell"
             | "line"
             | "lines"
+            | "offscreen"
             | "title"
             | "cwd"
             | "history"
@@ -13053,6 +13116,8 @@ mod tests {
         let ctx = Arc::new(crate::SessionCtx {
             sink: Arc::new(SinkWriter::new(11)),
             output_echo: Arc::new(crate::app_input::OutputEchoTracker::default()),
+            modes: crate::mode_mirror_of(&term_a),
+            ui_waiting: Arc::default(),
             edges: std::sync::Mutex::new(EdgeTable::new()),
             turn_lease: std::sync::Mutex::new(None),
             self_id: SessionId::generate(),
@@ -13504,9 +13569,12 @@ mod tests {
         let rx = unsafe { std::fs::File::from_raw_fd(rd) };
         let sid = SessionId::generate();
         let nonce = LaunchNonce::generate();
+        let term = Arc::new(Mutex::new(Terminal::new(24, 80)));
         let ctx = Arc::new(crate::SessionCtx {
             sink: Arc::new(SinkWriter::new(wr)),
             output_echo: Arc::new(crate::app_input::OutputEchoTracker::default()),
+            modes: crate::mode_mirror_of(&term),
+            ui_waiting: Arc::default(),
             edges: std::sync::Mutex::new(EdgeTable::new()),
             turn_lease: std::sync::Mutex::new(None),
             self_id: sid.clone(),
@@ -13535,7 +13603,7 @@ mod tests {
             parent: None,
             state: SessionState::Alive,
             title: String::new(),
-            term: Arc::new(Mutex::new(Terminal::new(24, 80))),
+            term,
             master: wr, // the write end doubles as the "master" for this headless test
             ctx,
         };
@@ -13558,6 +13626,137 @@ mod tests {
         } else {
             Vec::new()
         }
+    }
+
+    /// One DEC 2026 frame of a synthetic alt-screen app (never a real capture):
+    /// transcript rows `start..` above a composer and a footer that never move,
+    /// painted with CUP + text + EL and no scroll sequence — the Claude Code shape
+    /// whose scrolled-off rows only the `offscreen` archive keeps.
+    #[cfg(unix)]
+    fn paint_alt_frame(t: &mut Terminal, start: usize) {
+        use std::fmt::Write as _;
+        let rows = usize::from(t.rows());
+        let mut b = String::from("\x1b[?2026h");
+        for r in 0..rows {
+            let text = match rows - r {
+                1 => "footer: ready".to_string(),
+                2 => "> type a message".to_string(),
+                _ => format!("transcript row {:05}", start + r),
+            };
+            let _ = write!(b, "\x1b[{};1H{text}\x1b[K", r + 1);
+        }
+        b.push_str("\x1b[?2026l");
+        t.process(b.as_bytes());
+    }
+
+    /// `history` prints each turn's alt-screen archive MARK as
+    /// `arch=<origin>:<last>`, taken when the turn STARTED — so the rows the app
+    /// scrolls off while the turn's text lands are AFTER it, and `offscreen
+    /// since=<mark>` reads exactly them — and prints it BEFORE `text=`, the
+    /// free-text tail every reader cuts a row at.
+    #[test]
+    #[cfg(unix)]
+    fn history_prints_the_turn_start_arch_mark_before_text() {
+        const ORIGIN: u64 = 0xBEEF;
+        let store = crate::session_store::new_store();
+        let subscribers = subscribe::new_registry();
+        let (target, _rx) = pipe_session(73);
+        store.write().unwrap().register(target.clone());
+        {
+            let mut t = target.term.lock().unwrap();
+            t.set_alt_archive_enabled(true);
+            t.set_alt_archive_origin(ORIGIN);
+            t.process(b"\x1b[?1049h");
+            for start in 0..5 {
+                paint_alt_frame(&mut t, start);
+            }
+            assert_eq!(
+                t.alt_archive().last(),
+                4,
+                "four rows scrolled off before the turn"
+            );
+        }
+        // The app scrolls three more rows off while the turn's text is delivered.
+        let paste = |text: &str| {
+            assert_eq!(text, "look here");
+            let mut t = target.term.lock().unwrap();
+            for start in 5..8 {
+                paint_alt_frame(&mut t, start);
+            }
+            true
+        };
+        let press = |_: &str| panic!("submit=none must not press");
+        let reply = control_session::cmd_turn(
+            &target.term,
+            &store,
+            target.local_id,
+            "idle=1 timeout=2000 submit=none -- look here",
+            &subscribers,
+            &target.ctx,
+            &control_session::TurnIo {
+                paste: &paste,
+                press: &press,
+                ..control_session::TurnIo::paste_only()
+            },
+        );
+        assert!(reply.starts_with("OK "), "{reply}");
+        assert_eq!(target.term.lock().unwrap().alt_archive().last(), 7);
+
+        let history = control_session::cmd_history(&target.ctx, "");
+        let row = history.lines().nth(1).expect("one ledger row");
+        let (meta, text) = row.split_once(" text=").expect("a text= tail");
+        assert!(
+            meta.ends_with(&format!(" arch={ORIGIN}:4")),
+            "the mark is the START of the turn, just before text=: {row}"
+        );
+        assert_eq!(text, "look%20here", "text= stays the whole tail");
+        assert_eq!(
+            target
+                .ctx
+                .turns
+                .lock()
+                .unwrap()
+                .since(None)
+                .last()
+                .map(|r| r.arch),
+            Some(crate::turn_ledger::ArchMark {
+                origin: ORIGIN,
+                last: 4
+            })
+        );
+
+        // The mark is the token `offscreen since=` takes: it reads exactly the rows
+        // that scrolled off during the turn.
+        let off = control_query::cmd_offscreen(&target.term, &format!("since={ORIGIN}:4"));
+        let rows: Vec<&str> = off.lines().skip(1).collect();
+        assert_eq!(
+            rows,
+            [
+                "transcript row 00004",
+                "transcript row 00005",
+                "transcript row 00006"
+            ],
+            "{off}"
+        );
+    }
+
+    /// `offscreen` has no structured form: an explicit `--json` is the honest
+    /// refusal, never the text reply with the flag silently dropped.
+    #[test]
+    fn offscreen_refuses_json_honestly() {
+        assert_eq!(
+            json_unsupported("offscreen"),
+            Some("ERR json: not supported for offscreen\n".to_string())
+        );
+        assert_eq!(
+            take_json_flag("since=4 --json screen=1"),
+            (true, "since=4 screen=1".to_string()),
+            "the dispatch sees the flag on an offscreen tail"
+        );
+        assert!(
+            !aterm_types::control_verbs::JSON_CAPABLE_VERBS.contains(&"offscreen"),
+            "no json emitter answers first"
+        );
     }
 
     /// A wedged target must not make the operator's foreground `turn` exceed its
@@ -13731,7 +13930,10 @@ mod tests {
         // Raw feed/send retain their direct background route but now publish an
         // accepted-input receipt on that same resolved SessionCtx.
         let unlogged_before_feed = crate::unseamed_control_inputs();
-        cross_raw_input(&term, ctx, feed_bytes("03").unwrap());
+        assert_eq!(
+            cross_raw_input(&term, ctx, feed_bytes("03").unwrap()),
+            InputOutcome::Ok
+        );
         assert_eq!(
             drain_pipe(&target_rx),
             b"\x03",
@@ -13746,7 +13948,10 @@ mod tests {
         // `send` (the other always-cross writer) still writes to the resolved sink.
         // `send` is RAW (no implicit CR unless a literal trailing `\n` is given).
         let unlogged_before_send = crate::unseamed_control_inputs();
-        cross_raw_input(&term, ctx, send_bytes("ls"));
+        assert_eq!(
+            cross_raw_input(&term, ctx, send_bytes("ls")),
+            InputOutcome::Ok
+        );
         assert_eq!(
             drain_pipe(&target_rx),
             b"ls",
@@ -13823,9 +14028,12 @@ mod tests {
         );
         let sid = SessionId::generate();
         let nonce = LaunchNonce::generate();
+        let term = Arc::new(Mutex::new(Terminal::new(24, 80)));
         let ctx = Arc::new(crate::SessionCtx {
             sink: Arc::new(SinkWriter::new(master)),
             output_echo: Arc::new(crate::app_input::OutputEchoTracker::default()),
+            modes: crate::mode_mirror_of(&term),
+            ui_waiting: Arc::default(),
             edges: std::sync::Mutex::new(EdgeTable::new()),
             turn_lease: std::sync::Mutex::new(None),
             self_id: sid,
@@ -13847,7 +14055,6 @@ mod tests {
             )),
             fabric: crate::fabric::SessionFabric::default(),
         });
-        let term = Arc::new(Mutex::new(Terminal::new(24, 80)));
         let before = ctx.cast.lock().unwrap().event_count();
 
         assert_eq!(cross_resize(&term, master, &ctx, 0, None, "10 40"), "OK\n");
@@ -14051,6 +14258,8 @@ mod tests {
         Arc::new(crate::SessionCtx {
             sink: Arc::new(SinkWriter::new(-1)),
             output_echo: Arc::new(crate::app_input::OutputEchoTracker::default()),
+            modes: Arc::default(),
+            ui_waiting: Arc::default(),
             edges: std::sync::Mutex::new(EdgeTable::new()),
             turn_lease: std::sync::Mutex::new(None),
             self_id: SessionId::generate(),
@@ -14424,6 +14633,10 @@ mod tests {
                 "screen",
                 "line",
                 "lines",
+                // `offscreen` reads rows the same screen already SHOWED (the
+                // archive keeps only what `text` displayed), so it is a screen
+                // read like `text`/`cast`, and grants nothing a read edge lacks.
+                "offscreen",
                 "cell",
                 "cursor",
                 "dims",
@@ -16100,6 +16313,8 @@ mod tests {
         let ctx = Arc::new(crate::SessionCtx {
             sink: Arc::new(SinkWriter::new(master)),
             output_echo: Arc::new(crate::app_input::OutputEchoTracker::default()),
+            modes: crate::mode_mirror_of(&term),
+            ui_waiting: Arc::default(),
             edges: std::sync::Mutex::new(EdgeTable::new()),
             turn_lease: std::sync::Mutex::new(None),
             self_id: sid.clone(),
@@ -16315,7 +16530,10 @@ mod tests {
             cross_session_authorized(Scope::Owner, "send", &peer_h.ctx),
             "owner write ok"
         );
-        cross_raw_input(&target.0, &target.3, send_bytes("echo-into-peer"));
+        assert_eq!(
+            cross_raw_input(&target.0, &target.3, send_bytes("echo-into-peer")),
+            InputOutcome::Ok
+        );
 
         // A read-only Edge is denied the SAME write BEFORE any byte is sent (op-gate).
         let read_scope = Scope::Edge(EdgeToken::generate());
@@ -18780,6 +18998,157 @@ mod tests {
         );
     }
 
+    /// A hidden `paste-bin` / `feed-bin` into a session whose peer is gone
+    /// answers `ERR write failed`, not `OK <n> bytes`: the hidden arm holds the
+    /// same receipt the front arm maps through the App seam, and a frame that
+    /// was parsed is not a frame that landed. The stream stays framed past the
+    /// consumed payload, nothing enters App input, and the front session is
+    /// untouched. Ported from `codex/cursor-effects-integration` (77a9e4b6f),
+    /// which rerouted the hidden arm through the App route; on main the direct
+    /// hatch stays (a headless driver has no front window) and reports its own
+    /// receipt instead.
+    #[test]
+    #[cfg(unix)]
+    fn background_binary_frame_reports_a_dead_peer_as_write_failed() {
+        let store = session_store::new_store();
+        let (front, front_rx) = pipe_session(1);
+        let (background, background_rx) = pipe_session(2);
+        store.write().unwrap().register(front.clone());
+        store.write().unwrap().register(background.clone());
+        let active = active_for_handle(&front);
+        // The background peer is gone: its pipe's read end is closed, so the
+        // sink's direct write fails (EPIPE) instead of landing.
+        drop(background_rx);
+
+        for (verb, frame) in [
+            ("paste-bin", &b"@2 paste-bin 3\nabcafter\n"[..]),
+            ("feed-bin", &b"@2 feed-bin 3\nxyzafter\n"[..]),
+        ] {
+            let mut reader = BufReader::new(std::io::Cursor::new(frame));
+            let line = read_request_line(&mut reader).expect("request line");
+            let mut reply = Vec::new();
+            let mut dispatch = |_event, _session| -> Result<InputOutcome, String> {
+                panic!("background {verb} unexpectedly entered App input")
+            };
+            let mut clear_license = |_session| "OK\n".to_string();
+            assert!(run_feed_bin_routed(
+                &line,
+                verb,
+                &mut reader,
+                FeedBinRoute {
+                    active: &active,
+                    store: &store,
+                    scope: Scope::Owner,
+                },
+                &mut dispatch,
+                &mut clear_license,
+                &mut reply,
+            ));
+            assert_eq!(
+                String::from_utf8_lossy(&reply),
+                "ERR write failed\n",
+                "{verb} into a dead peer must not answer a false OK"
+            );
+            assert!(
+                drain_pipe(&front_rx).is_empty(),
+                "{verb} must not touch the front session"
+            );
+            assert_eq!(
+                read_request_line(&mut reader).as_deref(),
+                Some("after"),
+                "{verb}: the following request remains framed"
+            );
+        }
+    }
+
+    /// Cross-session `send`/`feed` (the raw helper) and `key`/`ctrl` (the
+    /// vocabulary helper) into a session whose peer is gone report the failed
+    /// write instead of the unconditional `OK` they used to answer — the same
+    /// receipt `cross_mouse_apply` has always honoured.
+    #[test]
+    #[cfg(unix)]
+    fn cross_session_input_reports_a_dead_peer_as_write_failed() {
+        let (h, rx) = pipe_session(74);
+        drop(rx);
+        assert_eq!(
+            cross_raw_input(&h.term, &h.ctx, send_bytes("ls")),
+            InputOutcome::WriteFailed,
+            "raw send into a dead peer is a failed write"
+        );
+        assert_eq!(
+            cross_input(&h.term, &h.ctx, parse_key("enter"), "ERR\n"),
+            "ERR write failed\n",
+            "a key into a dead peer is a failed write, not OK"
+        );
+        // A malformed line is still the usage error, decided before any write.
+        assert_eq!(
+            cross_input(
+                &h.term,
+                &h.ctx,
+                parse_key("notakey"),
+                control_input::KEY_USAGE
+            ),
+            control_input::KEY_USAGE
+        );
+    }
+
+    /// A cross-session paste reply is a kernel-delivery receipt, not merely
+    /// acceptance into the process-local spill. Build a real wedged pipe, put
+    /// an older interactive frame in its spill, then close the peer while the
+    /// paste waits behind it. `cross_input` must preserve the sink's sticky
+    /// failure verdict and return an error after the queued bytes are
+    /// discarded. Ported from `codex/cursor-effects-integration` (03a066831).
+    #[test]
+    #[cfg(unix)]
+    fn cross_session_paste_reports_a_dead_spill_peer_as_write_failed() {
+        let (handle, reader) = pipe_session(73);
+        aterm_pty::set_nonblocking(handle.master, true).expect("nonblocking test master");
+        handle.ctx.sink.note_master_nonblocking(true);
+
+        let mut filled = 0_usize;
+        loop {
+            match aterm_pty::write_some(handle.master, &[b'.'; 4096]) {
+                Ok(n) if n > 0 => filled += n,
+                Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => break,
+                other => panic!("unexpected pipe fill result: {other:?}"),
+            }
+        }
+        assert!(filled > 0, "pipe reached real backpressure");
+        assert_eq!(
+            handle
+                .ctx
+                .sink
+                .write_frame_nonparking(b"older")
+                .expect("older frame enters spill"),
+            5,
+        );
+        assert!(
+            !handle.ctx.sink.egress_drained_to_kernel(),
+            "negative control: bytes really remain process-local before paste",
+        );
+
+        let closer = std::thread::spawn(move || {
+            std::thread::sleep(std::time::Duration::from_millis(25));
+            drop(reader);
+        });
+        let reply = cross_input(
+            &handle.term,
+            &handle.ctx,
+            Some(InputEvent::Paste("newer".into(), PasteFraming::AtDrain)),
+            "ERR malformed\n",
+        );
+        closer.join().expect("peer closer");
+        assert_eq!(reply, "ERR write failed\n");
+        assert!(
+            !handle.ctx.sink.wait_egress_drained_to_kernel(),
+            "empty-after-peer-death remains a sticky completion failure",
+        );
+        assert!(
+            handle.ctx.sink.egress_drained_to_kernel(),
+            "nothing process-local remains: the handoff's polling fence is settled",
+        );
+    }
+
     /// The shipping binary-frame parser and native input dispatcher compose all
     /// the way through to the focused Editor minibuffer. This covers the
     /// `aterm-ctl paste --stdin` route, including exact payload framing, rather
@@ -19235,9 +19604,20 @@ mod tests {
     }
 
     /// A headless window wearing the rainbow kitty, ticked once so its engine
-    /// is live — the fixture the even-hand laws drive their turns into.
-    fn rainbow_kitty_window() -> (crate::App, crate::WindowId) {
-        let mut app = crate::App::headless_for_test();
+    /// is live — the fixture the even-hand laws drive their turns into. Its
+    /// session writes into a REAL pipe (the read end is returned and must be
+    /// held): a key whose write fails is revoked at the seam — stamp AND
+    /// press credit, since the one-press echo (2026-09-12) — so a ribbon can
+    /// only be laid by keys that actually reached the wire.
+    fn rainbow_kitty_window() -> (crate::App, crate::WindowId, std::fs::File) {
+        use std::os::unix::io::FromRawFd;
+        let mut fds = [0i32; 2];
+        assert_eq!(unsafe { libc::pipe(fds.as_mut_ptr()) }, 0, "pipe(2)");
+        let (rd, wr) = (fds[0], fds[1]);
+        let rx = unsafe { std::fs::File::from_raw_fd(rd) };
+        let mut app = crate::App::headless_for_test_with_sink(Arc::new(
+            aterm_session::sink::SinkWriter::new(wr),
+        ));
         app.config.motion = Some("full".into());
         app.config.cursor_trail = Some(true);
         app.config.cursor_trail_style = Some("rainbow kitty".into());
@@ -19250,7 +19630,7 @@ mod tests {
             crate::app_render::CursorFxInputs::sample_for_test(std::time::Instant::now()),
         )
         .expect("the fixture window ticks");
-        (app, wid)
+        (app, wid, rx)
     }
 
     /// **AN AGENT'S TYPED TURN LAYS RIBBON AND A PASTED TURN DOES NOT** (the
@@ -19271,7 +19651,7 @@ mod tests {
         use crate::input::{InputEvent, Source};
 
         let drive = |line: &str| -> (String, usize) {
-            let (app, wid) = rainbow_kitty_window();
+            let (app, wid, _rx) = rainbow_kitty_window();
             let app = RefCell::new(app);
             let col = Cell::new(0u16);
             // The seam, then the echo: the caret one cell on per glyph, and the
@@ -22430,6 +22810,7 @@ mod tests {
             sparks: 4,
             momentum: 0.5,
             momentum_display: 0.44,
+            momentum_glow: 0.0,
             glow_active: true,
             pet_active: true,
             pet_action: "purr",
@@ -22467,6 +22848,8 @@ mod tests {
                 forgotten: 2,
                 credits: 3,
                 swallowed_no_echo: 4,
+                park_returns: 5,
+                park_flushed: 6,
             },
         }
         .line();

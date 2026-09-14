@@ -1595,11 +1595,21 @@ pub fn cursor_cat_motion_pulse_routing_model() -> Model {
 ///   stamp never refunds cells to fund a second stray sweep (`credit_refunded`).
 /// * A press is IN FLIGHT until its row echoes or an observed edge forgets it
 ///   (2026-09-12, the stall): with no stamp fresh, two or more unpaid presses
-///   license the row's late echo as one batch (`InFlightBatchEchoMintsLight`);
-///   a keyless move the echo shape refuses forgets them
-///   (`UnexplainedHopForgetsCredits`), so a swallowed press never licenses a
-///   later batch (`phantom_admitted`) and the pool a forget leaves is empty
-///   until the next press. The mutant is the patience that does not forget.
+///   license the row's late echo as one batch (`InFlightBatchEchoMintsLight`),
+///   and ONE unpaid press licenses exactly its own one-cell echo
+///   (`InFlightPressEchoMintsLight`, the stalled last key) — spent on
+///   admission, so one press funds one cell once; a keyless move the echo
+///   shape refuses forgets them (`UnexplainedHopForgetsCredits`), so a
+///   swallowed press never licenses a later batch (`phantom_admitted`) and
+///   the pool a forget leaves is empty until the next press. The decline
+///   guards read a pool of AT MOST ONE press: with two or more in flight a
+///   keyless move is a batch's echo or an unexplained hop, never merely cold
+///   or stale; with exactly one the model carries no hop width, so it
+///   admits BOTH the press's own +1 (`InFlightPressEchoMintsLight`) and the
+///   engine's real refusal of a hop wider than one cell — refused and KEPT
+///   (`StaleStampMoveDeclines` / `ColdMoveDeclines`, which forfeit nothing).
+///   The mutant is the patience that does not forget, and the one-press
+///   echo that does not spend.
 ///   The model is clockless: the patience's BOUND (`PatienceElapses`) is a
 ///   forget like any other here, and its number is pinned by the engine's
 ///   own tests, not by `ty`.
@@ -1802,7 +1812,10 @@ pub fn cursor_hint_license_model() -> Model {
             // The licensed typed echo: one hint, one echo. `Buggy=1` leaves the
             // stamp live after consuming it, so one press funds every echo that
             // follows — caught twice over, by the disposition conservation and
-            // by `admissions <= arms`.
+            // by `admissions <= arms`. The echo SPENDS the credit its cell
+            // lays (the 2026-09-10 law, `lays_typed_cells`: every same-row
+            // forward typed echo spends), so the pool after an on-time echo
+            // is what the real ring holds — empty.
             action LicensedTypedMoveMintsLight when (
                 hint == 1 && spawns <= MoveCap - 1
             ) {
@@ -1810,6 +1823,7 @@ pub fn cursor_hint_license_model() -> Model {
                 hint = if Buggy == 1 { 1 } else { 0 };
                 consumed = consumed + 1;
                 admissions = admissions + 1;
+                spent = if credit_arms - spent - forfeited > 0 { spent + 1 } else { spent };
                 births = births + 1;
                 resident = 1;
                 licensed_tally = licensed_tally + 1;
@@ -1884,6 +1898,24 @@ pub fn cursor_hint_license_model() -> Model {
                 licensed_tally = licensed_tally + 1;
                 phantom_admitted = if just_forgot == 1 { 1 } else { phantom_admitted };
             }
+            // THE ONE-PRESS ECHO (2026-09-12, the stalled last key): no stamp
+            // is fresh and exactly ONE press is unpaid — its own +1 echo is
+            // licensed and the press is SPENT: one press, one cell, once.
+            // `Buggy=1` does not spend, so the same press funds a second +1
+            // and `PairedAdmissionsNeverExceedArms` catches it within two
+            // moves (press, expire, +1, +1: two admissions on one arm).
+            action InFlightPressEchoMintsLight when (
+                (hint == 0 || hint == 2) && spawns <= MoveCap - 1
+                    && credit_arms - spent - forfeited == 1
+            ) {
+                spawns = spawns + 1;
+                spent = if Buggy == 1 { spent } else { spent + 1 };
+                admissions = admissions + 1;
+                births = births + 1;
+                resident = 1;
+                licensed_tally = licensed_tally + 1;
+                phantom_admitted = if just_forgot == 1 { 1 } else { phantom_admitted };
+            }
             // AN UNEXPLAINED HOP FORGETS THE CREDITS (2026-09-12): a keyless
             // move the echo shape refuses — backward, cross-row, a row change
             // no key licensed, a forward hop the share rule refused. The
@@ -1910,11 +1942,16 @@ pub fn cursor_hint_license_model() -> Model {
                 forfeited = credit_arms - spent;
             }
             // THE COLD MOVE: program output nobody's fingers asked for. No
-            // stamp at all. `Buggy=1` is the pre-licence seam — v0.43.0's tick,
-            // which spawned on every presented cursor delta. With two or more
-            // presses in flight a keyless move is never merely cold: it is
-            // the batch's echo or an unexplained hop, and those two actions
-            // own it.
+            // stamp at all, and at most ONE press in flight: with two or more
+            // a keyless move is never merely cold — it is the batch's echo or
+            // an unexplained hop, and those actions own it. With exactly one
+            // the model has no hop width: a +1 is the press's own echo
+            // (`InFlightPressEchoMintsLight`), a wider hop is refused and the
+            // press KEPT — the engine's real transition
+            // (`a_single_stalled_press_wider_than_one_cell_is_still_refused_and_kept`)
+            // — so both are enabled here and neither forfeits. `Buggy=1` is
+            // the pre-licence seam — v0.43.0's tick, which spawned on every
+            // presented cursor delta.
             action ColdMoveDeclines when (
                 hint == 0 && spawns <= MoveCap - 1
                     && credit_arms - spent - forfeited <= CoalesceCells - 1
@@ -1975,11 +2012,15 @@ pub fn cursor_hint_license_model() -> Model {
                     declined_tally + 1
                 };
             }
-            // A move whose stamp is SET but stale. The window, not the field.
-            // One press whose echo never came is indistinguishable from a
-            // stamp that went stale (`AStaleStampIsNotALicence`); two or
-            // more in flight are a batch, and `InFlightBatchEchoMintsLight`
-            // owns that shape.
+            // A move whose stamp is SET but stale, with at most ONE press in
+            // flight. The stamp was never the licence, the press in flight is
+            // (`AStaleStampIsNotALicence`): over an empty pool — spent by its
+            // own echo, forgotten by an edge, past the patience — a stale
+            // stamp licenses nothing; over ONE press the model has no hop
+            // width, so a +1 is `InFlightPressEchoMintsLight`'s and a wider
+            // hop (vim's `w` on a stale stamp) is this refusal, the press
+            // KEPT for the next key's bridge. Two or more in flight are
+            // `InFlightBatchEchoMintsLight`'s.
             action StaleStampMoveDeclines when (
                 hint == 2 && spawns <= MoveCap - 1
                     && credit_arms - spent - forfeited <= CoalesceCells - 1

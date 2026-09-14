@@ -251,6 +251,12 @@ pub enum PetInputKind {
     Navigate,
     Submit,
     Paste,
+    /// A kill chord that moves the caret (`^U`, `^W`): the line's content
+    /// going. Reaches the cursor engines as a kill (2026-09-13); the pet reads
+    /// it as an edit like a delete.
+    Kill,
+    /// A kill chord that leaves the caret where it is (`^K`).
+    KillForward,
 }
 
 impl PetInputKind {
@@ -262,6 +268,8 @@ impl PetInputKind {
             "navigate" => Some(Self::Navigate),
             "submit" => Some(Self::Submit),
             "paste" => Some(Self::Paste),
+            "kill" => Some(Self::Kill),
+            "kill-forward" => Some(Self::KillForward),
             _ => None,
         }
     }
@@ -394,7 +402,11 @@ impl PetBrain {
     /// may complete an explicit witness, but never creates another input.
     pub fn note_console_input(&mut self, now: Instant, kind: PetInputKind) {
         let repair_live = self.console.repair_until.is_some_and(|end| now < end);
-        if kind == PetInputKind::Delete || (kind == PetInputKind::Text && repair_live) {
+        let erases = matches!(
+            kind,
+            PetInputKind::Delete | PetInputKind::Kill | PetInputKind::KillForward
+        );
+        if erases || (kind == PetInputKind::Text && repair_live) {
             if !repair_live {
                 self.console.repair_target =
                     self.last_caret.map(|(r, c)| (f32::from(r), f32::from(c)));
@@ -476,6 +488,24 @@ impl PetBrain {
         pane: PetPane,
         exclusions: &[PetRect],
     ) {
+        // The hidden-cursor resident holds its last drawn body. Keep that
+        // body's cells inside the bounded observation window too; centering
+        // a large pane instead made an unchanged, blank home look unknown.
+        // A new surface/history/geometry cannot inherit the old body's hint.
+        let held_center = self
+            .console
+            .cursor_home
+            .and(self.console.last_body)
+            .filter(|_| {
+                !input.cursor_visible
+                    && self.console.presentable
+                    && self.alpha > 0.0
+                    && self
+                        .console
+                        .tick_stamp
+                        .is_some_and(|prior| facts.stamp.preserves_cursor_home(prior))
+            })
+            .map(|body| (body.row + body.rows * 0.5, body.col + body.cols * 0.5));
         let world = self
             .console
             .world
@@ -484,7 +514,7 @@ impl PetBrain {
         let prior_selection = world.selection_target();
         let prior_progress = world.progress();
         let old_ink = self.console.last_body.and_then(|r| local_ink(world, r));
-        world.observe_with_exclusions(input, facts, pane, exclusions);
+        world.observe_with_exclusions_near(input, facts, pane, exclusions, held_center);
         if world.stamp().is_some()
             && (prior_stamp != world.stamp()
                 || prior_selection != world.selection_target()
@@ -524,6 +554,49 @@ impl PetBrain {
             self.console.completion = None;
             self.console.failure_quiet_until = None;
         }
+    }
+
+    /// Exact occupancy where the console map covers the whole footprint.
+    /// `None` retains the span fallback; it never licenses an unobserved gap.
+    pub(super) fn observed_ink_overlaps(&self, col: f32, row: f32, width: f32) -> Option<bool> {
+        let (a, b) = (col + INK_PAD, col + width - INK_PAD);
+        // A first/last glyph span is a hull, not solid ink. Coding consoles
+        // animate sparse particles around a stationary composer: treating the
+        // spaces between them as glyphs sent the pet across the pane whenever
+        // a distant particle moved. The console already sampled exact glyph
+        // occupancy; use it for a completely observed footprint. No rescan,
+        // allocation, or guessed blanks outside that bounded map.
+        if self.console.presentable
+            && let Some(world) = self.console.world.as_ref()
+            && row.is_finite()
+            && row >= 0.0
+            && a.is_finite()
+            && a >= 0.0
+            && b.is_finite()
+            && b > a
+        {
+            let first = a.floor() as usize;
+            let end = b.ceil() as usize;
+            if end > first && end - first <= crate::pet_world::MAX_WORLD_COLS {
+                return (first..end).try_fold(false, |occupied, c| {
+                    world
+                        .ink_at(row.round() as usize, c)
+                        .map(|ink| occupied || ink)
+                });
+            }
+        }
+        None
+    }
+
+    /// An observed but incoherent surface cannot license new locomotion from
+    /// the older ink spans. An unfed legacy host has no such observation.
+    pub(super) fn console_observation_incoherent(&self) -> bool {
+        self.console.presentable
+            && self
+                .console
+                .world
+                .as_ref()
+                .is_some_and(|world| world.stamp().is_none())
     }
 
     /// Ownership/custody is independent of whether a live caret exists.

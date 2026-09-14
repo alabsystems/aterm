@@ -437,12 +437,12 @@ const STARTER_CONFIG: &str = "\
 # motion = \"auto\"                 # auto (live Reduce Motion on macOS; sampled at Windows window attach; no OS query elsewhere) | full | reduced
 # load_adaptive_motion = true      # drop effects under sustained render overload; false = never shed (motion=\"full\" also forces effects on)
 # cursor_trail = true              # the cursor motion trail + light crown, plus the walking cat the default style rides it with. Default ON — except on Windows, where it is opt-IN: uncomment this line for the whole show
-# cursor_trail_style = \"rainbow kitty pet\"  # rainbow kitty pet (DEFAULT; the tall full-height rainbow body — letters inside the light — with the walking cat; \"rainbow kitty\"/\"kitty\" name the same resident) | rainbow kitty flying (same tall ribbon under the earned flying head; aliases \"flying kitty\"/\"kitty flying\" and historical \"nyan rainbow\"/\"nyan\"/\"rainbow\") | rainbow kitty underline (the explicit highlighter-plus-under-baseline alternate) | rainbow kitty tall (an explicit spelling of the default tall body; aliases \"rainbow tall\"/\"tall rainbow\"/\"nyan tall\") | rainbow dog pet | phaser | comet | lumen | sparkle | fire | laser | water | beam | classic (the v0.28 trail restored: thin comet, soft square bloom, and the jump comet the modern gates no longer draw; aliases \"v0.28\"/\"retro\") | classic mono (the same salvaged trail in ONE hue from the theme cursor colour, following cursor_trail_color/OSC 12, instead of the rolling spectrum) | off
+# cursor_trail_style = \"rainbow kitty pet\"  # rainbow kitty pet (DEFAULT; the tall full-height rainbow body — letters inside the light — with the walking cat; \"rainbow kitty\"/\"kitty\" name the same resident) | rainbow kitty flying (same tall ribbon under the earned flying head; aliases \"flying kitty\"/\"kitty flying\" and historical \"nyan rainbow\"/\"nyan\"/\"rainbow\") | rainbow kitty underline (the explicit highlighter-plus-under-baseline alternate) | rainbow kitty tall (an explicit spelling of the default tall body; aliases \"rainbow tall\"/\"tall rainbow\"/\"nyan tall\") | rainbow kitty flat (the A/B control: the flat body of 2026-09-13, before the comet body and its vivid rail; aliases \"rainbow flat\"/\"flat rainbow\"/\"nyan flat\") | rainbow dog pet | phaser | comet | lumen | sparkle | fire | laser | water | beam | classic (the v0.28 trail restored: thin comet, soft square bloom, and the jump comet the modern gates no longer draw; aliases \"v0.28\"/\"retro\") | classic mono (the same salvaged trail in ONE hue from the theme cursor colour, following cursor_trail_color/OSC 12, instead of the rolling spectrum) | off
 # cursor_trail_color = \"#50FA7B\"      # base colour (default: the theme's cursor colour)
 # cursor_trail_accent = \"#7AA2F7\"     # comet-tail / ring colour (default: brightened base)
 # cursor_trail_ms = 260                # fade duration in ms (30..=2000)
 # cursor_trail_length = 24             # max comet length in cells (1..=512)
-# cursor_trail_intensity = 0.7         # aurora brightness 0.0..=1.0
+# cursor_trail_intensity = 1.0         # aurora brightness 0.0..=1.0
 # cursor_trail_radius = 0.6            # bloom-crown radius in cells (0.0..=2.0)
 # cursor_trail_wake_ms = 300           # PARSED BUT INERT since 2026-09-06 (the retired v1
 #                                      # rainbow-kitty wake dial; kept loading, 0..=1500)
@@ -506,10 +506,12 @@ const STARTER_CONFIG: &str = "\
 # allow_window_ops = false         # XTWINOPS title, text-grid-size, text-area-pixels and cell-size reports (window/screen
 #                                  # position and screen size stay unanswered); Linux also applies window
 #                                  # manipulations (move stays denied)
-# allow_notifications = false
+# allow_notifications = false      # OSC 9/99/777 desktop notifications; macOS delivers through terminal-notifier
+#                                  # if installed, else osascript — a subprocess under aterm's identity
 # allow_palette_reconfigure = false
 # allow_kitty_file_transfer = false
-# allow_osc52_query = false        # programs may READ the clipboard (OSC 52); answered only when on
+# allow_osc52_query = false        # programs may READ the clipboard (OSC 52); answered only when on. On macOS 26 that
+#                                  # read is what raises the system's \"aterm would like to paste from …\" alert
 # secure_keyboard_entry = false    # macOS: block other processes from observing keystrokes (held while aterm is frontmost)
 
 # --- sparkle words (purely visual; NEVER affects copied text, logs, or recordings)

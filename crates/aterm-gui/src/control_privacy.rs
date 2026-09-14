@@ -1363,11 +1363,13 @@ impl App {
         }
     }
 
-    /// THIS instance's own adoption record: `adopted` when it took over a
-    /// running root shell from a predecessor across an in-place apply, `live`
-    /// otherwise. Per-session attribution is reported per session.
+    /// THIS instance's own adoption record: `adopted` when it took over its
+    /// predecessor's running shells across an in-place apply, `live`
+    /// otherwise — `adopted` even when its own session 0 is a fresh bootstrap
+    /// (a window 0 with no terminal pane). Per-session attribution is reported
+    /// per session.
     fn instance_attribution(&self) -> Attribution {
-        if self.bootstrap_session_adopted {
+        if self.handoff_successor {
             Attribution::Adopted
         } else {
             Attribution::Live

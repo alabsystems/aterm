@@ -1142,26 +1142,49 @@ SUPERVISING A WORKER (a coding agent in another tab; its @sid from `aterm ctl ls
                      notice under the `⎿` gutter (or the footer shows one) — the
                      worker's own words about limits never count — and what you
                      send it fails until the limit resets or its model is
-                     switched
+                     switched. With Claude Code's session survey open above the
+                     composer (`● How is Claude doing this session?` over
+                     `1: Bad … 0: Dismiss`; a copy quoted in the transcript
+                     does not count) a last line `survey 0` names the key that
+                     dismisses it (`aterm ctl @sid key
+                     'if=^●.How.is.Claude.doing' 0`): while it is open, a turn
+                     that starts with 1, 2 or 3 is taken as a rating — the
+                     human's to give, never yours. With Claude Code's context
+                     indicator up (`<n>% until auto-compact`, or `Context left
+                     until auto-compact: <n>%`, alone on its row above the
+                     composer's top rule, ending against the right edge; a copy
+                     quoted in the transcript does not count unless it, too,
+                     ends at that edge) a last line `context <n>%`, after any
+                     `survey 0`, says how much of the worker's context is left
+                     before it auto-compacts
   await-turn [@sid] [--timeout MS] [--reconnect-s S]
                      block until the phase is no longer busy (the live status
                      row and the busy footer both quiet; a screen without the
                      composer, once its output pauses), then print it like
-                     `phase`; exit 124 on the timeout (also when it runs out
-                     while a lost connection is ridden out: the last screen
-                     read, if any)
+                     `phase`, its `survey 0` and `context <n>%` lines included;
+                     exit 124 on the timeout (also when it runs out while a
+                     lost connection is ridden out: the last screen read, if
+                     any)
   supervise [@sid] [--auto-reads] [--max-s S] [--allow-python GLOB]... [--notes FILE]
-            [--reconnect-s S]
+            [--reconnect-s S] [--dismiss-surveys] [--context-warn PCT]
                      the loop: await-turn; with --auto-reads a Bash prompt whose
                      command is read-only is approved (option 1, guarded: a
                      skipped guard is not an approval, and the box must leave
-                     before the next look) and noted; anything else — a write, a
+                     before the next look; on a host without the guard,
+                     nothing is pressed when the confirming read shows the
+                     session survey open — a `1` there could be a rating — and
+                     the box is yours) and noted; anything else — a write, a
                      workflow, a question, a limit notice, an idle composer — is
                      printed and the tool exits 0 for YOUR review; TIMEOUT / exit
                      124, with the last read, once --max-s is spent (nothing is
-                     pressed after it; spent in an outage, it is the TIMEOUT too)
+                     pressed after it; spent in an outage, it is the TIMEOUT too).
+                     The session survey is never answered: watch's `EVENT
+                     survey` line goes to stderr, or --dismiss-surveys
+                     dismisses it; watch's `EVENT context` and `EVENT
+                     compacted` lines go there too, for what happens during the
+                     run (see --context-warn)
   watch [@sid] [--auto-reads] [--allow-python GLOB]... [--notes FILE] [--max-s S]
-        [--reconnect-s S]
+        [--reconnect-s S] [--report] [--dismiss-surveys] [--context-warn PCT]
                      supervise's loop that never exits at a review point: it
                      prints ONE line — `EVENT <phase> seq=<n> <summary>` — and
                      keeps watching, looking again once the screen has moved past
@@ -1179,6 +1202,40 @@ SUPERVISING A WORKER (a coding agent in another tab; its @sid from `aterm ctl ls
                      loop. Run it under your harness's
                      background monitor:
                        aterm drive watch @s-… --auto-reads --notes notes.txt
+                     With --report, an idle, question or limited line carries
+                     `complete=<0|1> rows=<n>` of `report` before its summary.
+                     When the session survey appears it prints, once, `EVENT
+                     survey seq=<n> dismiss with: aterm ctl @sid key
+                     'if=^●.How.is.Claude.doing' 0` — not while a box is up or
+                     text is typed in the composer, not again while it stays
+                     open, and again when it comes back after any read saw it
+                     gone; with --dismiss-surveys it presses that `0` and,
+                     once the survey has gone, prints `DISMISSED survey
+                     seq=<n>` instead. As the worker's context runs low it
+                     prints `EVENT context seq=<n> <v>% until auto-compact`
+                     once a descent, at the read that sees it (mid-turn too),
+                     and `EVENT compacted seq=<n>` once the worker has
+                     compacted (see --context-warn); with no indicator on the
+                     screen, every line is as before
+  report [@sid] [--since ORIGIN:I] [--max-rows N]
+                     what the worker said since your turn, in full — the screen
+                     alone loses what a fullscreen app (Claude Code) scrolled off
+                     its top. One read of the host's archive of those rows and of
+                     the screen (`offscreen … screen=1`), joined: from your newest
+                     landed `turn`'s `❯` row (found by its text, or for a paste
+                     the last `[Pasted text …]` row if it fits; without a turn
+                     in the ledger the last `❯` row; with --since, right after
+                     that archived row) down to the live zone, every row
+                     verbatim. Prints `report complete=<0|1> [reason=…]
+                     marker=<ledger|user-row|since> turn=<id|-> rows=<n>
+                     archived=<a> screen=<s> last=<origin:i|->`, `--`, then the
+                     rows. complete=0 names why: marker-not-found, archive-gap
+                     (rows evicted, or a redraw with no overlap after the start),
+                     archive-reset (the host restarted or handed the session
+                     over), max-rows (more rows than --max-rows, default 8000:
+                     raise it), main-screen (the worker is not on the alternate
+                     screen: its main screen's scrollback is not read) or
+                     no-archive (the screen alone)
   --reconnect-s S    await-turn, supervise and watch ride through an aterm
                      self-update: the session keeps its @sid on the new
                      instance, and a request that got no answer (`server closed
@@ -1208,6 +1265,38 @@ SUPERVISING A WORKER (a coding agent in another tab; its @sid from `aterm ctl ls
                      instance, so a ride-out through it lapses: leave both
                      unset (the instance hosting this terminal, else the
                      newest) or name the `aterm.sock` alias
+  --dismiss-surveys  supervise and watch dismiss Claude Code's session survey
+                     instead of reporting it: when it appears, a GUARDED `0`
+                     (`key if=^●.How.is.Claude.doing 0` — only `0`, never a
+                     rating; `OK skipped` means no row matched, nothing
+                     written); once a fresh read shows it gone, `DISMISSED
+                     survey seq=<n>` (watch: stdout; supervise: stderr) and a
+                     --notes line, none of it for a skipped `0`. Still open
+                     there, it is handed to you (the `EVENT survey` line) and
+                     not pressed again; a `0` that landed in the composer is
+                     backspaced. Nothing is pressed while a box is up or text
+                     is typed in the composer, and a host without `key if=`
+                     gets no `0`: the survey is reported instead
+  --context-warn PCT supervise and watch follow Claude Code's context indicator
+                     (see phase) on every read of a turn, a busy one included:
+                     the first reading at or below PCT (default 10; 0 to 100; 0 =
+                     off, neither line) prints `EVENT context seq=<n> <v>% until
+                     auto-compact`, once a descent; after it, a read with the
+                     composer frame, no approval box and no indicator — or one 30
+                     points or more over the last reading — prints `EVENT
+                     compacted seq=<n>` once and arms the warning again (watch:
+                     stdout; supervise: stderr). supervise's watch lasts one run
+                     — each run starts armed — so a compaction between two runs
+                     prints nothing: after an `EVENT context`, a `phase` before
+                     the next run with no `context <n>%` line (and no box up) is
+                     the compaction; watch keeps one watch while it runs. Only
+                     the indicator is read. A compaction replaces the worker's
+                     history with a summary, and the standing rules you gave it
+                     can silently drop out: on `EVENT context`, have the worker
+                     bring its handoff and notes up to date before it compacts;
+                     on `EVENT compacted`, re-send your standing rules in one
+                     turn. Never type /compact or /clear into the worker for it
+                     without the human
 
   aterm drive --help       every flag
   aterm help introspection the control protocol underneath
@@ -1856,7 +1945,7 @@ pub fn in_session() -> Option<String> {
 ///
 /// This page exists because the delivery layer above it is not universal and
 /// cannot be made so from inside this repo. Claude Code has a hooks contract, so
-/// `aterm-link hook install claude` can wake it; Codex is sandboxed away from the
+/// `aterm link hook install claude` can wake it; Codex is sandboxed away from the
 /// socket entirely, so its path is the file mirror; Gemini CLI and OpenCode have
 /// neither a hook contract aterm can write nor a sandbox exception to work
 /// around. What every one of them DOES have is a shell and one command. So the
@@ -1878,7 +1967,8 @@ WHAT IT IS
 
   The transport is astream, a separate message bus. One `aterm-link serve` bridge per
   aterm instance carries records between the bus and the endpoint. With no bridge
-  attached the verbs still answer — the inbox is simply always empty and `post` refuses.
+  attached the verbs still answer — the inbox is simply always empty, and `post` still
+  queues and answers `OK <id>`; only a kind that waits (`ask`, `task`) is refused.
 
 THE FIVE VERBS YOU NEED
   aterm ctl @self inbox                     what is addressed to me
@@ -1890,6 +1980,19 @@ THE FIVE VERBS YOU NEED
   Kinds: ask answer task report note ack control. `ask` and `task` wait for the broker to
   confirm the record landed and answer `OK <id> off=<n>`; that offset is the correlation
   id an answer carries back as `re=<n>`. `--peek` reads without moving the watermark.
+
+  A WAIT THAT DOES NOT LAND HAS FOUR ANSWERS, AND THREE OF THEM MEAN QUEUED:
+    queued=1        a bridge exists and will publish it
+    no-bridge=1     this instance has no bridge RIGHT NOW. Not a verdict on the message:
+                    `aterm ctl fabric attach <command...>` drains the same outbox
+    ERR timeout id= the wait expired with no landing reported
+  Those three still hold the row, and `post` has no idempotency key — so re-posting on
+  any of them is how a peer gets the same task twice. Report "queued", never "not sent".
+    ERR <reason> id=  THE FOURTH, AND THE ONE THAT IS NOT QUEUED: the bridge RETIRED the
+                    post — `unroutable` (the address resolves to nothing), `ambiguous`
+                    (two nodes claim the sid) or `undeliverable`. The row is dead, no
+                    bridge drains it again, and re-posting is the right move once the
+                    address is right. Report it as that reason, never as queued.
 
 READ YOUR MAIL AT THESE TWO MOMENTS
   At the START of a turn, and again BEFORE you stop. An `ask` or a `task` addressed to
@@ -1912,16 +2015,20 @@ THE HALT
   which is also the scope every in-session client holds — by `aterm ctl hold <sid> on|off
   [reason=<r>]`; it is the owner's stop signal to the drivers, not a containment wall: any
   Owner client can lift it, the halted session's own agent included, and an Owner act
-  never touches a fleet hold. Every PTY-reaching verb answers `ERR halted <reason>` from
-  any scope. Reads, `post`, `inbox seen` and `meta set` keep working, and the physical
-  keyboard is untouched. It is a stop, not a failure — report it, do not retry around it,
-  and do not lift a local hold on yourself.
+  never touches a fleet hold. Every PTY-reaching verb answers `ERR halted reason=<r>
+  origin=<local|fleet>` from any scope. Reads, `post`, `inbox seen` and `meta set` keep
+  working, and the physical keyboard is untouched. It is a stop, not a failure — report
+  it, do not retry around it, and do not lift a local hold on yourself.
 
 IS IT ON HERE?
   aterm ctl @self status        ... fabric=<connected|disconnected|absent>
-  absent        no bridge was ever launched; `post` refuses with `no-bridge=1`
-  connected     a bridge is serving; mail flows
-  disconnected  the bridge this instance had is gone, and its sessions are held
+  absent        no bridge was ever launched; a post that waits is refused `no-bridge=1`
+  connected     a bridge PROCESS is attached to this instance. NOT a statement about the
+                bus: a bridge pointed at a broker socket that does not exist reports
+                `connected` too, and a post there answers `ERR timeout` after its wait.
+                Measured 2026-09-12. Read the broker's own liveness separately.
+  disconnected  the bridge this instance had is gone, and its sessions are held. Killing
+                the BROKER does not produce this — only losing the bridge does.
 
 TURNING IT ON (the operator does this once)
   Every piece is in the one aterm binary, under `aterm link` (the `aterm-link` argv0 alias
@@ -1973,7 +2080,7 @@ TURNING IT ON (the operator does this once)
   Off by default, deliberately: no bridge, no bus, no cross-host anything.
 
 BEING WOKEN — WHAT EXISTS, PER AGENT, HONESTLY
-  Claude Code   `aterm-link hook install claude` writes four hooks into
+  Claude Code   `aterm link hook install claude` writes four hooks into
                 .claude/settings.json. SessionStart and UserPromptSubmit put the inbox
                 METADATA (never a body) in front of the model; PreToolUse blocks tool
                 calls while held; Stop keeps the turn alive when unread mail arrives.
@@ -1984,7 +2091,7 @@ BEING WOKEN — WHAT EXISTS, PER AGENT, HONESTLY
   anything else these too, because it is only files.
 
 THE FILE MIRROR — THE PATH THAT NEEDS NO VENDOR SUPPORT AT ALL
-  aterm-link mirror <root> --sock <path>
+  aterm link mirror <root> --sock <path>
 
   <root>/.aterm/<sid>/inbox.ndjson    read  — one JSON object per delivered message
   <root>/.aterm/<sid>/outbox.ndjson   write — append one object to send it
@@ -2941,7 +3048,10 @@ mod tests {
             "fabric=<connected|disconnected|absent>",
             "no-bridge=1",
             "ERR halted",
-            "aterm-link mirror",
+            // `aterm link mirror`, not `aterm-link mirror`: the argv0 symlink
+            // ships from the NEXT release, and this page is read on installs
+            // that predate it. The verb form resolves on every lane.
+            "aterm link mirror",
             "outbox.ndjson",
             "[fabric]",
             // TURNING IT ON names the verbs the one shipped binary carries. Until
@@ -2970,9 +3080,45 @@ mod tests {
             !page.contains("applies next launch"),
             "the page must not prescribe a relaunch the verb makes unnecessary"
         );
+        // ALL THREE not-landed answers, and that each means QUEUED. An audit on
+        // 2026-09-12 found `ERR timeout id=<n>` named by no agent-facing surface
+        // at all, and `no-bridge=1` documented as "nothing will ever publish it"
+        // when a later `fabric attach` drains the same outbox — measured. An
+        // agent that believes either re-posts, and `post` has no idempotency
+        // key, so the peer gets the task twice.
+        for needle in [
+            "queued=1",
+            "no-bridge=1",
+            "ERR timeout id=",
+            "fabric attach",
+            // THE FOURTH ANSWER, and the only one that is not queued: a post the
+            // bridge RETIRED. `cmd_post`'s wait loop returns `ERR {reason} id={id}`
+            // for a row it finds `dead`, and `cmd_outbox` filters `!p.dead`, so
+            // nothing drains it again. The page said there were three and that all
+            // of them meant queued; an agent obeying that reported a task nobody
+            // will ever publish as queued.
+            "ERR <reason> id=",
+            "unroutable",
+        ] {
+            assert!(
+                page.contains(needle),
+                "the four not-landed answers: `{needle}`"
+            );
+        }
+        assert!(
+            page.contains("THREE OF THEM MEAN QUEUED"),
+            "the page must say what the queued answers have in common, not only list them"
+        );
+        // `connected` is weaker than it sounds and the page must say so: a bridge
+        // pointed at a broker socket that does not exist reports `connected`, and
+        // killing the broker never moves it off `connected`.
+        assert!(
+            page.contains("NOT a statement about the"),
+            "the page must not let `connected` read as `the bus works`"
+        );
         // The honesty rows: one agent has a wake path, the others are told so.
         assert!(
-            page.contains("aterm-link hook install claude"),
+            page.contains("aterm link hook install claude"),
             "the one built wake path must be named"
         );
         for agent in ["Codex", "Gemini CLI", "OpenCode"] {

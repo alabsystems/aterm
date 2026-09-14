@@ -2676,15 +2676,43 @@ fn cli_parses_the_whole_spec_5_surface() {
         parse(&["provision", "--id", "m2"]).unwrap(),
         cli::Cmd::Provision {
             id: "m2".into(),
-            check: false
+            check: false,
+            cert_dir: None,
         }
     );
     assert_eq!(
         parse(&["provision", "--id", "m2", "--check"]).unwrap(),
         cli::Cmd::Provision {
             id: "m2".into(),
-            check: true
+            check: true,
+            cert_dir: None,
         }
+    );
+    // The one folder the browser errand may use is NAMED, never assumed: without the
+    // flag provision reads only ~/.aterm/apple (the 2026-09-12 TCC audit's Downloads
+    // poll), and the flag takes exactly one folder.
+    assert_eq!(
+        parse(&[
+            "provision",
+            "--id",
+            "m2",
+            "--cert-dir",
+            "/Users//x/Downloads"
+        ])
+        .unwrap(),
+        cli::Cmd::Provision {
+            id: "m2".into(),
+            check: false,
+            cert_dir: Some("/Users//x/Downloads".into()),
+        }
+    );
+    assert!(
+        cli::USAGE.contains("--cert-dir <folder>"),
+        "help must document the one folder the errand may use"
+    );
+    assert!(
+        cli::USAGE.contains("~/Downloads or another folder macOS guards on its own"),
+        "help must say the default reads nothing outside ~/.aterm/apple"
     );
     assert!(
         cli::USAGE.contains("provision --id"),
@@ -2820,6 +2848,26 @@ fn cli_rejects_malformed_and_conflicting_invocations() {
         (vec!["cut", "--frobnicate"], "unknown cut flag"),
         (vec!["provision"], "--id"),
         (vec!["provision", "--id"], "needs a machine id"),
+        (
+            vec!["provision", "--id", "m2", "--cert-dir"],
+            "needs a folder",
+        ),
+        (
+            vec!["provision", "--id", "m2", "--cert-dir", ""],
+            "not an empty string",
+        ),
+        (
+            vec![
+                "provision",
+                "--id",
+                "m2",
+                "--cert-dir",
+                "a",
+                "--cert-dir",
+                "b",
+            ],
+            "given twice",
+        ),
         (
             vec!["provision", "--frobnicate", "m2"],
             "unknown provision flag",

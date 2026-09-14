@@ -109,6 +109,7 @@ fn main() {
     let cfg = GlowConfig {
         classic_mono: false,
         ribbon_tall: false,
+        ribbon_flat: false,
         enabled: true,
         style: GlowStyle::Phaser,
         color: 0x0050_FA7B,

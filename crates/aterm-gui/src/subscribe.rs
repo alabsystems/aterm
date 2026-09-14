@@ -2455,6 +2455,7 @@ pub(crate) mod bench_seam {
             text: "run the suite".to_string(),
             screen_hash: id.wrapping_mul(0x9E37_79B9_7F4A_7C15),
             seq: id,
+            arch: crate::turn_ledger::ArchMark::default(),
         }
     }
 }
@@ -4056,6 +4057,7 @@ mod tests {
                 text: format!("m{id}"),
                 screen_hash: id,
                 seq: id,
+                arch: crate::turn_ledger::ArchMark::default(),
             });
         };
 

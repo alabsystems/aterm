@@ -24,16 +24,22 @@ use aterm_types::charset::{GlMapping, SingleShift};
 use super::{TerminalHandler, Vt52CursorState};
 
 impl TerminalHandler<'_> {
-    /// Stamp the ECHO ANCHOR: where this print action left the cursor, plus a
-    /// monotonic action count (see `TransientState::print_anchor`). Called at
-    /// the tail of every `ActionSink` print path — two stores and a cursor
+    /// Stamp the ECHO ANCHOR: where this print action's run ENDED — one past
+    /// the last glyph, so a glyph printed at the last column with the wrap
+    /// deferred (the DEC caret parked ON that column, `pending_wrap` set)
+    /// reports the column past it (2026-09-12) — plus a monotonic action
+    /// count (see `TransientState::print_anchor`). Called at the tail of
+    /// every `ActionSink` print path — two stores, a cursor read and a flag
     /// read per print ACTION (bulk runs amortize it over the whole run), so
     /// the hot blast path pays nothing measurable. Observability only: no
     /// parser or grid decision ever reads it back.
     #[inline]
     fn stamp_print_anchor(&mut self) {
         let cursor = self.grid.cursor();
-        self.transient.print_anchor = Some((cursor.row, cursor.col));
+        let col = cursor
+            .col
+            .saturating_add(u16::from(self.grid.pending_wrap()));
+        self.transient.print_anchor = Some((cursor.row, col));
         self.transient.print_anchor_seq = self.transient.print_anchor_seq.wrapping_add(1);
     }
 }

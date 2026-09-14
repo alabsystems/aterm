@@ -3027,6 +3027,14 @@ pub fn drain_more(master: i32, buf: &mut [u8], mut filled: usize) -> usize {
 /// tax — and IMPROVES p99 (679 vs 1385 µs: fewer, fuller deliveries).
 const IDLE_POLL_DEFAULT_US: u32 = 50;
 
+/// [`drain_more_nonblocking`]'s per-batch budget WHILE A KEYSTROKE IS PENDING
+/// (`interactive_pending() == true`): a third of the 3 ms flood budget, so the
+/// gather can no longer hold a human's echo byte for a streaming program's
+/// batch cadence. Still long enough — with the 16 immediate probes and the
+/// µs idle bridge — to coalesce a TUI's per-keystroke repaint burst into one
+/// batch rather than fragmenting it into ≤1 KiB slices.
+const HOT_BATCH_BUDGET: std::time::Duration = std::time::Duration::from_millis(1);
+
 /// Idle-cutoff hysteresis (`ATERM_PTY_IDLE_POLL_US=<µs>`): how long a dry,
 /// parser-idle gap may wait for a refill before delivering. An immediate
 /// cutoff (0) protects the fps/request-response class (the ghostty bb0ac4c
@@ -3164,12 +3172,23 @@ fn idle_refill_wait(master: i32, wake_rd: i32, wait_us: u32) -> BridgeWait {
 /// gap waits up to that many µs for a refill before delivering — the
 /// immediate cutoff's small-batch churn costs ~33-43 MB/s of flood
 /// throughput; `0` restores immediate delivery.
+///
+/// `interactive_pending` is the host's "a human is waiting on the UI thread"
+/// hint (armed at hardware key arrival, decaying a few hundred ms after the
+/// last key; the same signal the parse stage slices its lock holds on). It is
+/// consulted at each DRY GAP only: while it is true the batch budget is capped
+/// at [`HOT_BATCH_BUDGET`] and the gap is bridged with the µs-scale idle wait
+/// instead of the 1 ms bridge poll — so a keystroke's echo typed into a
+/// continuously streaming program is delivered on the human's schedule, not
+/// the batch's, while a TUI repaint burst (µs refill gaps) still coalesces.
+/// A plain `fn` pointer so this crate stays independent of the host's metrics.
 pub fn drain_more_nonblocking(
     master: i32,
     buf: &mut [u8],
     filled: usize,
     wake_rd: i32,
     parse_in_flight: Option<&std::sync::atomic::AtomicUsize>,
+    interactive_pending: fn() -> bool,
 ) -> usize {
     drain_more_nonblocking_with_idle_wait(
         master,
@@ -3177,6 +3196,7 @@ pub fn drain_more_nonblocking(
         filled,
         wake_rd,
         parse_in_flight,
+        interactive_pending,
         idle_poll_us(),
     )
 }
@@ -3190,6 +3210,7 @@ fn drain_more_nonblocking_with_idle_wait(
     filled: usize,
     wake_rd: i32,
     parse_in_flight: Option<&std::sync::atomic::AtomicUsize>,
+    interactive_pending: fn() -> bool,
     idle_wait_us: u32,
 ) -> usize {
     drain_more_nonblocking_with_idle_wait_after_gap(
@@ -3198,6 +3219,7 @@ fn drain_more_nonblocking_with_idle_wait(
         filled,
         wake_rd,
         parse_in_flight,
+        interactive_pending,
         idle_wait_us,
         || {},
     )
@@ -3211,12 +3233,18 @@ fn drain_more_nonblocking_with_idle_wait(
 /// taken. That is what lets a test inject a refill that PROVABLY lands inside
 /// the park, instead of racing a sleep against it. The shipping wrapper supplies
 /// an inlined no-op.
+#[allow(
+    clippy::too_many_arguments,
+    reason = "the gather's knobs are threaded explicitly so tests can drive each one \
+              (idle wait, interactive hint, park seam) without a builder on the hot path"
+)]
 fn drain_more_nonblocking_with_idle_wait_after_gap(
     master: i32,
     buf: &mut [u8],
     mut filled: usize,
     wake_rd: i32,
     parse_in_flight: Option<&std::sync::atomic::AtomicUsize>,
+    interactive_pending: fn() -> bool,
     idle_wait_us: u32,
     mut before_gap_park: impl FnMut(),
 ) -> usize {
@@ -3245,24 +3273,38 @@ fn drain_more_nonblocking_with_idle_wait_after_gap(
         match io::Error::last_os_error().kind() {
             io::ErrorKind::Interrupted => continue,
             io::ErrorKind::WouldBlock => {
+                // A human waiting on the UI thread? Sampled per dry gap (one
+                // atomic + one clock read), never per byte.
+                let hot = interactive_pending();
                 // Quiet. Interactive (< one outq) delivers NOW; over-budget
-                // batches deliver regardless of bridge luck.
-                if filled < SATURATED || start.elapsed() >= BATCH_BUDGET {
+                // batches deliver regardless of bridge luck — and "over budget"
+                // is the SHORT budget while a keystroke is pending: a byte that
+                // is this human's echo must not ride the streaming program's
+                // 3 ms batch schedule.
+                let budget = if hot { HOT_BATCH_BUDGET } else { BATCH_BUDGET };
+                if filled < SATURATED || start.elapsed() >= budget {
                     break;
                 }
                 if spins < NB_SPIN_MAX {
                     spins += 1;
                     continue;
                 }
-                if parse_in_flight
-                    .is_some_and(|c| c.load(std::sync::atomic::Ordering::Relaxed) == 0)
+                // The µs-scale bridge: the parser-idle hysteresis, and — while a
+                // key is pending — the ONLY park, whatever the parser is doing.
+                // The 16 immediate probes plus this wait still coalesce a TUI
+                // repaint's µs refill gaps into one batch (the bb0ac4c regression
+                // class stays closed); what changes is that a continuous stream
+                // no longer holds the echo for a 1 ms poll per gap.
+                if hot
+                    || parse_in_flight
+                        .is_some_and(|c| c.load(std::sync::atomic::Ordering::Relaxed) == 0)
                 {
                     if idle_wait_us == 0 {
-                        break; // parser idle: bridging would add pure output latency
+                        break; // knob off: bridging would add pure output latency
                     }
                     // Hysteresis: a µs-bounded wait for the refill instead of
-                    // delivering a churn-sized batch (BATCH_BUDGET still caps
-                    // the whole gather — it is re-checked per dry gap).
+                    // delivering a churn-sized batch (the budget still caps the
+                    // whole gather — it is re-checked per dry gap).
                     before_gap_park();
                     match idle_refill_wait(master, wake_rd, idle_wait_us) {
                         BridgeWait::Refill => {
@@ -3292,6 +3334,20 @@ pub fn wake(wake_wr: i32) {
     // SAFETY: `wake_wr` is the pipe write end; a 1-byte write is atomic (never partial).
     unsafe {
         libc::write(wake_wr, b.as_ptr() as *const libc::c_void, 1);
+    }
+}
+
+/// Declare the CALLING thread `QOS_CLASS_USER_INTERACTIVE` (macOS; a no-op on
+/// other unixes). For a worker that holds a lock the UI thread contends — the
+/// sink's spill drainer — so it never runs below the thread it can stall (the
+/// host's QoS floor rule). Safe wrapper so a `forbid(unsafe_code)` crate can
+/// declare it; setting one's own class cannot fail in a way worth reporting.
+pub fn declare_interactive_thread() {
+    #[cfg(target_os = "macos")]
+    // SAFETY: sets this thread's own QoS class; takes no pointers and mutates no
+    // shared state, so there is nothing for another thread to observe.
+    unsafe {
+        libc::pthread_set_qos_class_self_np(libc::qos_class_t::QOS_CLASS_USER_INTERACTIVE, 0);
     }
 }
 
@@ -3494,7 +3550,7 @@ mod tests {
         let n = read(rd, &mut buf[..1]); // stand-in for the read_or_wake first chunk
         assert_eq!(n, 1);
         let t0 = std::time::Instant::now();
-        let filled = drain_more_nonblocking(rd, &mut buf, 1, -1, None);
+        let filled = drain_more_nonblocking(rd, &mut buf, 1, -1, None, never_hot);
         assert_eq!(filled, 4, "must gather the whole burst");
         assert_eq!(&buf[..4], b"echo");
         assert!(
@@ -3508,6 +3564,195 @@ mod tests {
         );
         close_fd(rd);
         close_fd(wr);
+    }
+
+    /// The host hint "a human is waiting on the UI thread", pinned OFF: the
+    /// flood-shaped gather every test below assumes unless it says otherwise.
+    fn never_hot() -> bool {
+        false
+    }
+
+    /// …and pinned ON: a keystroke is pending for the whole gather.
+    fn always_hot() -> bool {
+        true
+    }
+
+    /// P05 — with a keystroke pending the gather bridges a dry gap with the µs
+    /// idle wait EVEN WHILE THE PARSER IS BUSY (never the 1 ms bridge poll),
+    /// and a refill that lands inside that wait still joins the same batch —
+    /// a TUI's per-keystroke repaint burst keeps coalescing.
+    #[test]
+    fn drain_more_nonblocking_hot_bridges_a_busy_parser_gap_with_the_idle_wait() {
+        use std::sync::atomic::AtomicUsize;
+        const CHUNK: usize = 2048;
+        /// One gather over a fresh pipe: (bytes gathered, parks taken, wall held).
+        fn gather() -> (usize, u32, std::time::Duration) {
+            let mut m = [0i32; 2];
+            // SAFETY: valid 2-int out-array for pipe(2).
+            assert_eq!(unsafe { libc::pipe(m.as_mut_ptr()) }, 0, "pipe");
+            let (rd, wr) = (m[0], m[1]);
+            set_nonblocking(rd, true).expect("nonblock read end");
+            let chunk = [0xC3u8; CHUNK];
+            // SAFETY: bounded write to this test's live pipe end.
+            assert_eq!(
+                unsafe { libc::write(wr, chunk.as_ptr().cast(), chunk.len()) },
+                chunk.len() as isize
+            );
+            let busy = AtomicUsize::new(1);
+            let mut buf = [0u8; 65_536];
+            let n = read(rd, &mut buf[..1024]);
+            assert!(n > 0);
+            let mut parks = 0u32;
+            let t0 = std::time::Instant::now();
+            let filled = drain_more_nonblocking_with_idle_wait_after_gap(
+                rd,
+                &mut buf,
+                n as usize,
+                -1,
+                Some(&busy),
+                always_hot,
+                // The knob at 0 would DELIVER on the idle branch before the seam; a
+                // hot gather that fired the seam therefore provably took the
+                // µs-wait branch and not the busy-parser bridge poll.
+                IDLE_POLL_DEFAULT_US,
+                || {
+                    parks += 1;
+                    if parks == 1 {
+                        // SAFETY: bounded write to this test's live pipe end.
+                        assert_eq!(
+                            unsafe { libc::write(wr, chunk.as_ptr().cast(), chunk.len()) },
+                            chunk.len() as isize
+                        );
+                    }
+                },
+            );
+            let held = t0.elapsed();
+            close_fd(wr);
+            close_fd(rd);
+            (filled, parks, held)
+        }
+        // The byte and park counts are exact on every run. The HOLD is a
+        // wall-clock reading of a 50 µs wait, and a parallel suite can stretch
+        // it past the 1 ms bound (held 1.43 ms once beside the continuous-stream
+        // test's writer thread); the BEST of nine gathers is the property — the
+        // old code parked a busy-parser gap on the 1 ms bridge poll, and its
+        // gather cannot beat that however many times it runs. Nine, not three:
+        // under the workspace gate's load (loadavg 8-18) the best of three once
+        // read 943 µs against the 1 ms bound — every one of three ~80 µs gathers
+        // had been stretched tenfold by scheduling — and a gather costs ~100 µs,
+        // so nine samples buy the margin for nothing.
+        let mut best_held = std::time::Duration::MAX;
+        for _ in 0..9 {
+            let (filled, parks, held) = gather();
+            assert_eq!(
+                filled,
+                2 * CHUNK,
+                "a refill inside the hot idle wait must join the same batch"
+            );
+            assert!(
+                parks >= 2,
+                "one park to bridge the refill, one to end the burst"
+            );
+            best_held = best_held.min(held);
+        }
+        eprintln!("P05 busy-parser hot gather: best of nine held {best_held:?}");
+        // The second (dry) park was the µs idle wait, not a 1 ms bridge poll:
+        // the whole gather stays well inside HOT_BATCH_BUDGET.
+        assert!(
+            best_held < HOT_BATCH_BUDGET,
+            "hot gather held {best_held:?} at best; a 1 ms bridge poll would have been taken"
+        );
+    }
+
+    /// P05 — the hold a CONTINUOUS stream (refills every ~100 µs for longer
+    /// than any budget) imposes on an echo byte: ≤ the 1 ms hot budget with a
+    /// keystroke pending, the 3 ms flood budget otherwise. Red before the fix:
+    /// both arms held ≥ 3 ms. Margins are 2-3x each way so a loaded machine
+    /// cannot invert them.
+    #[test]
+    fn drain_more_nonblocking_hot_caps_a_continuous_stream_at_the_hot_budget() {
+        use std::sync::atomic::AtomicUsize;
+        fn hold(interactive_pending: fn() -> bool) -> std::time::Duration {
+            let mut m = [0i32; 2];
+            // SAFETY: valid 2-int out-array for pipe(2).
+            assert_eq!(unsafe { libc::pipe(m.as_mut_ptr()) }, 0, "pipe");
+            let (rd, wr) = (m[0], m[1]);
+            set_nonblocking(rd, true).expect("nonblock read end");
+            let chunk = [0xC3u8; 2048];
+            // SAFETY: bounded write to this test's live pipe end.
+            assert_eq!(
+                unsafe { libc::write(wr, chunk.as_ptr().cast(), chunk.len()) },
+                chunk.len() as isize
+            );
+            let stop = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+            let writer = {
+                let stop = stop.clone();
+                std::thread::spawn(move || {
+                    // ONE byte per iteration: the gather loop ends the moment its
+                    // 64 KiB buffer is full, and 64-byte writes at yield cadence
+                    // filled it in ~0.7 ms on an idle machine — the COLD control
+                    // then ended on "buffer full" well inside the hot budget and
+                    // proved nothing. A byte per yield cannot reach 64 KiB inside
+                    // the 3 ms `BATCH_BUDGET` on any machine, so the cold arm ends
+                    // on its budget, which is the property.
+                    let small = [b'x'; 1];
+                    while !stop.load(std::sync::atomic::Ordering::Relaxed) {
+                        // SAFETY: bounded write to this test's live pipe end.
+                        unsafe {
+                            libc::write(wr, small.as_ptr().cast(), small.len());
+                        }
+                        // Tightest cadence a non-realtime thread can hold: a
+                        // sleep(100 µs) stretched past the 1 ms bridge poll under
+                        // a parallel test load and ended the COLD gather early.
+                        std::thread::yield_now();
+                    }
+                    close_fd(wr);
+                })
+            };
+            let busy = AtomicUsize::new(1); // a parser mid-batch: the flood shape
+            let mut buf = [0u8; 65_536];
+            let n = read(rd, &mut buf[..1024]);
+            assert!(n > 0);
+            let t0 = std::time::Instant::now();
+            let _ = drain_more_nonblocking_with_idle_wait(
+                rd,
+                &mut buf,
+                n as usize,
+                -1,
+                Some(&busy),
+                interactive_pending,
+                IDLE_POLL_DEFAULT_US,
+            );
+            let held = t0.elapsed();
+            stop.store(true, std::sync::atomic::Ordering::Relaxed);
+            writer.join().expect("writer");
+            close_fd(rd);
+            held
+        }
+        // Scheduling noise under a parallel suite can stretch or cut either arm,
+        // so each is judged from the direction that falsifies it: the hot arm by
+        // its SHORTEST of three holds (the old code's hot arm cannot beat ~3 ms
+        // however many times it is run), the cold control by its LONGEST (a
+        // writer descheduled past the bridge poll cuts one run short; it cannot
+        // make a run hold past the budget).
+        let shortest = |f: fn() -> bool| (0..5).map(|_| hold(f)).min().expect("five runs");
+        let longest = |f: fn() -> bool| (0..3).map(|_| hold(f)).max().expect("three runs");
+        let hot = shortest(always_hot);
+        let cold = longest(never_hot);
+        eprintln!("P05 continuous-stream gather hold: hot={hot:?} cold={cold:?}");
+        assert!(
+            hot < std::time::Duration::from_micros(2200),
+            "hot gather must close near HOT_BATCH_BUDGET, held {hot:?}"
+        );
+        // The CONTROL: the flood-shaped gather still holds a continuous stream
+        // well past the hot budget (its bridge poll continues the batch on every
+        // refill) and ends on the 3 ms `BATCH_BUDGET`; the floor is set at the
+        // discriminating value, not the nominal one, so a late budget check
+        // under load cannot fail it.
+        assert!(
+            cold >= std::time::Duration::from_micros(1500),
+            "cold gather keeps holding past the hot budget, held {cold:?}"
+        );
     }
 
     /// Direct-read drain: a saturated burst (>= one outq) is gathered fully into
@@ -3530,7 +3775,7 @@ mod tests {
         let mut buf = [0u8; 65_536];
         let n = read(rd, &mut buf[..1024]);
         assert!(n > 0);
-        let filled = drain_more_nonblocking(rd, &mut buf, n as usize, -1, None);
+        let filled = drain_more_nonblocking(rd, &mut buf, n as usize, -1, None, never_hot);
         assert_eq!(
             filled,
             payload.len(),
@@ -3564,7 +3809,7 @@ mod tests {
         let mut buf = [0u8; 65_536];
         let n = read(rd, &mut buf[..1024]);
         assert!(n > 0);
-        let filled = drain_more_nonblocking(rd, &mut buf, n as usize, wake_rd, None);
+        let filled = drain_more_nonblocking(rd, &mut buf, n as usize, wake_rd, None, never_hot);
         assert_eq!(filled, payload.len(), "keeps the drained burst");
         let mut b = [0u8; 4];
         // SAFETY: bounded read from this test's live wake pipe end.
@@ -3616,6 +3861,7 @@ mod tests {
             n as usize,
             -1,
             Some(&busy),
+            never_hot,
             // 0 = the idle path's immediate-deliver cutoff, which returns BEFORE
             // the seam. That is what keeps the idle-cutoff SIGN pinned: invert
             // `== 0` and this busy parser takes the idle branch, breaks at the
@@ -3709,10 +3955,11 @@ mod tests {
                         n as usize,
                         -1,
                         Some(&idle),
+                        never_hot,
                         0,
                     )
                 } else {
-                    drain_more_nonblocking(rd, &mut buf, n as usize, -1, Some(&idle))
+                    drain_more_nonblocking(rd, &mut buf, n as usize, -1, Some(&idle), never_hot)
                 };
                 let el = t0.elapsed();
                 close_fd(rd);
@@ -3786,6 +4033,7 @@ mod tests {
             n as usize,
             -1,
             Some(&idle),
+            never_hot,
             IDLE_POLL_DEFAULT_US,
             || {
                 assert!(!injected, "the refill must be injected exactly once");
@@ -3848,6 +4096,7 @@ mod tests {
                 n as usize,
                 -1,
                 Some(&idle),
+                never_hot,
                 100_000,
             );
             writer.join().unwrap();
@@ -3896,6 +4145,7 @@ mod tests {
             n as usize,
             wake_rd,
             Some(&idle),
+            never_hot,
             100_000,
         );
         assert_eq!(filled, payload.len(), "keeps the drained burst");
@@ -3948,7 +4198,7 @@ mod tests {
         let n = read(rd, &mut buf[..1024]);
         assert!(n > 0);
         let t0 = std::time::Instant::now();
-        let filled = drain_more_nonblocking(rd, &mut buf, n as usize, -1, Some(&busy));
+        let filled = drain_more_nonblocking(rd, &mut buf, n as usize, -1, Some(&busy), never_hot);
         // Sample BEFORE the join: the join waits on a thread that sleeps 300us, so
         // reading `elapsed` after it folded another thread's scheduling into the
         // number this assertion is about.
@@ -6032,26 +6282,7 @@ mod tests {
         // Run `sleep` (touches no termios, unlike a shell) and tcgetattr the
         // master — on both BSD and Linux ptys the master reflects the slave's
         // termios, so the two deltas must be visible.
-        // SAFETY: single-threaded test, trusted-launcher contract trivially holds.
-        let authority = unsafe { aterm_cap::Authority::root_authority() };
-        let spawn_cap = authority.grant::<aterm_cap::effects::Spawn>(aterm_cap::Tier::Trusted);
-        let sandbox_cap = authority.grant::<aterm_sandbox::Sandbox>(aterm_cap::Tier::Trusted);
-        let exec: Vec<String> = vec!["/bin/sleep".into(), "5".into()];
-        let master = spawn_shell(
-            24,
-            80,
-            &spawn_cap,
-            &sandbox_cap,
-            &[],
-            None, // shell_override
-            None, // shell_args
-            None, // argv_override
-            Some(&exec),
-            None,
-            None,
-        )
-        .expect("sleep must spawn");
-        assert!(master >= 0);
+        let master = spawn_on_pty(&["/bin/sleep", "5"]);
         // SAFETY: tcgetattr on a valid master fd fills the zeroed out-param.
         let t = unsafe {
             let mut t: libc::termios = std::mem::zeroed();
@@ -6067,9 +6298,10 @@ mod tests {
         }
     }
 
-    /// Spawn `argv` on a fresh PTY (the real spawn seam, so the child's own
-    /// `tcsetattr` on the SLAVE is what the master read sees) and return
-    /// the master. Test-only helper for the `tty_echo_*` tests.
+    /// Spawn `argv` on a fresh PTY through the real spawn seam (so the
+    /// child's own `tcsetattr` on the SLAVE is what a master read sees) and
+    /// return the master. Test-only helper for the spawn-seam tests: the
+    /// `tty_echo_*` reads, the termios delta check and the close-on-exec dup.
     fn spawn_on_pty(argv: &[&str]) -> i32 {
         // SAFETY: single-threaded test, trusted-launcher contract trivially holds.
         let authority = unsafe { aterm_cap::Authority::root_authority() };
@@ -6227,25 +6459,7 @@ mod tests {
     /// makes `F_DUPFD_CLOEXEC` load-bearing rather than decorative.
     #[test]
     fn a_duplicated_master_stays_close_on_exec() {
-        // SAFETY: single-threaded test, trusted-launcher contract trivially holds.
-        let authority = unsafe { aterm_cap::Authority::root_authority() };
-        let spawn_cap = authority.grant::<aterm_cap::effects::Spawn>(aterm_cap::Tier::Trusted);
-        let sandbox_cap = authority.grant::<aterm_sandbox::Sandbox>(aterm_cap::Tier::Trusted);
-        let exec: Vec<String> = vec!["/bin/sleep".into(), "5".into()];
-        let master = spawn_shell(
-            24,
-            80,
-            &spawn_cap,
-            &sandbox_cap,
-            &[],
-            None,
-            None,
-            None,
-            Some(&exec),
-            None,
-            None,
-        )
-        .expect("sleep must spawn");
+        let master = spawn_on_pty(&["/bin/sleep", "5"]);
 
         // SAFETY: F_GETFD only reads the descriptor flags of a valid fd.
         let flags_of = |fd: i32| unsafe { libc::fcntl(fd, libc::F_GETFD) };

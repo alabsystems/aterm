@@ -193,7 +193,15 @@ pub(crate) enum Outcome {
 
 /// The driver. Idempotent by construction: it reads the world, and only one branch
 /// creates anything.
-pub(crate) fn acquire(id: &str, may_change: bool) -> Outcome {
+/// `cert_dir` is the ONE folder the operator named for the browser errand (`--cert-dir`):
+/// the request is copied there and the issued certificate is looked for there. `None`
+/// means nothing outside `~/.aterm/apple` is read or written — in particular NOT
+/// `~/Downloads`. Until 2026-09-13 the wait polled `read_dir(~/Downloads)` every three
+/// seconds unasked; run from an aterm shell that makes aterm the app responsible for a
+/// "would like to access files in your Downloads folder" dialog (TCC audit of
+/// 2026-09-12, `atpkg::protected`). A folder macOS guards is read only when the operator
+/// names it, because naming it is the consent.
+pub(crate) fn acquire(id: &str, may_change: bool, cert_dir: Option<&Path>) -> Outcome {
     if !cfg!(target_os = "macos") {
         return Outcome::Skipped("cuts run on macOS (Tier APPLE); no keychain on this host".into());
     }
@@ -281,7 +289,7 @@ pub(crate) fn acquire(id: &str, may_change: bool) -> Outcome {
 
     // K && C, no identity — install if Apple has answered, otherwise wait for it.
     if let (Some(key), Some(csr)) = (&seen.key, &seen.csr) {
-        return await_then_install(key, csr, id, &dir, seen.invalid_present);
+        return await_then_install(key, csr, id, &dir, seen.invalid_present, cert_dir);
     }
 
     // A CSR with no key is unusable: a certificate issued against it could never be
@@ -332,7 +340,7 @@ pub(crate) fn acquire(id: &str, may_change: bool) -> Outcome {
                      — no new key, no new slot"
                     ),
                 );
-                await_then_install(key, &csr, id, &dir, seen.invalid_present)
+                await_then_install(key, &csr, id, &dir, seen.invalid_present, cert_dir)
             }
             Err(e) => Outcome::Blocked {
                 what: format!("could not rebuild the certificate request: {e}"),
@@ -344,9 +352,14 @@ pub(crate) fn acquire(id: &str, may_change: bool) -> Outcome {
     // !I && !K && !C — run 1. This is the only branch that spends a slot.
     match confirm_slot(id, seen.invalid_present) {
         Ok(true) => match generate(&dir, id) {
-            Ok(csr) => {
-                await_then_install(&key_path(&dir, id), &csr, id, &dir, seen.invalid_present)
-            }
+            Ok(csr) => await_then_install(
+                &key_path(&dir, id),
+                &csr,
+                id,
+                &dir,
+                seen.invalid_present,
+                cert_dir,
+            ),
             Err(outcome) => outcome,
         },
         Ok(false) => Outcome::Waiting {
@@ -371,13 +384,22 @@ const WAIT_FOR_CERT: std::time::Duration = std::time::Duration::from_secs(30 * 6
 /// The certificate can only be created by the Account Holder in a browser, so instead of
 /// ending the run and making the operator remember to type the same thing again, the
 /// command prints the errand and WAITS for the certificate to appear — matching it by
-/// public key, so it starts the moment the right file lands in ~/Downloads.
+/// public key, so it starts the moment the right file lands in a watched folder —
+/// `~/.aterm/apple`, and the one folder the operator named with `--cert-dir`.
 ///
 /// Interrupting is safe and loses nothing: every fact this verb acts on is derived from
 /// disk and the keychain, never from a progress marker, so a re-run resumes exactly here.
 /// Without a terminal (CI, a pipe) it does not wait at all — it reports the errand and
 /// returns, because there is nobody to do it.
-fn await_then_install(key: &Path, csr: &Path, id: &str, dir: &Path, invalid: usize) -> Outcome {
+fn await_then_install(
+    key: &Path,
+    csr: &Path,
+    id: &str,
+    dir: &Path,
+    invalid: usize,
+    cert_dir: Option<&Path>,
+) -> Outcome {
+    let watch = Watch::new(cert_dir);
     // Two causes, two remedies, and they are NOT interchangeable. `find_matching_cert`
     // fails either because a directory it must read is unreadable, or because this
     // machine's OWN request key could not be read — and the second is not a certificate
@@ -412,7 +434,7 @@ fn await_then_install(key: &Path, csr: &Path, id: &str, dir: &Path, invalid: usi
             }
         }
     };
-    let rejected = match find_matching_cert(key) {
+    let rejected = match find_matching_cert(key, &watch) {
         Ok((Some(cer), _)) => return install(&cer, key, id),
         Err(why) => return blocked(why),
         Ok((None, rejected)) => rejected,
@@ -422,7 +444,7 @@ fn await_then_install(key: &Path, csr: &Path, id: &str, dir: &Path, invalid: usi
     // nothing is the one thing worse than saying it twice.
     if !has_terminal() {
         return Outcome::Waiting {
-            what: waiting_text(id, invalid, &rejected, None),
+            what: waiting_text(id, invalid, &rejected, None, &watch),
             // The SAME errand, from the SAME function, minus the paragraph about a wait
             // that does not happen here. There used to be a second, hand-maintained
             // paragraph for this path, and the two had already drifted: the paragraph
@@ -430,7 +452,7 @@ fn await_then_install(key: &Path, csr: &Path, id: &str, dir: &Path, invalid: usi
             // download is matched by public key; the numbered form had truncated the
             // first into an ambiguity and dropped the second entirely. Two spellings of
             // one fact is how a tool tells an operator two different things.
-            next: errand_lines(csr, false).join("\n"),
+            next: errand_lines(csr, false, &watch).join("\n"),
         };
     }
     // Said BEFORE the errand and before the wait, because it is the difference between
@@ -440,20 +462,26 @@ fn await_then_install(key: &Path, csr: &Path, id: &str, dir: &Path, invalid: usi
     //
     // The errand opens with `upload {csr}`, so it IS the "request ready" line: printing
     // that path on a line of its own first said the same thing one line earlier.
-    // Surface the request in ~/Downloads and reveal it in Finder before the errand
-    // names it: the operator's next act is an upload dialog, and a path under hidden
-    // ~/.aterm is invisible to one. The errand then names the copy the dialog can see.
-    // Done BEFORE the refusal note too, so that note can name the visible copy as the
-    // thing to upload — a note that points at hidden ~/.aterm cannot be acted on.
-    let visible = surface_csr(csr, id);
+    // Surface the request in the folder the operator NAMED and reveal it in Finder
+    // before the errand names it: the operator's next act is an upload dialog, and a
+    // path under hidden ~/.aterm is invisible to one. The errand then names the copy the
+    // dialog can see. Done BEFORE the refusal note too, so that note can name the
+    // visible copy as the thing to upload. With no folder named, nothing is copied
+    // anywhere: the errand names the hidden path and says how a file dialog reaches it
+    // (⌘⇧G), and how to name a visible folder next time — `~/Downloads` is never
+    // touched on the operator's behalf (the TCC dialog that costs).
+    let visible = watch
+        .named
+        .as_deref()
+        .and_then(|named| surface_csr(csr, id, named));
     let upload = visible.as_deref().unwrap_or(csr);
     // Built HERE, not at the top of the function, and that is the whole fix: it captures
-    // `upload` — the copy in ~/Downloads that an upload dialog can actually see — rather
-    // than `csr` under hidden ~/.aterm, which this module's own comment above says
-    // "cannot be acted on". The timeout verdict is the last line on the screen when the
-    // command exits, so it is the one place a path has to be one the operator can use.
+    // `upload` — the copy in the named folder that an upload dialog can actually see —
+    // rather than `csr` under hidden ~/.aterm. The timeout verdict is the last line on
+    // the screen when the command exits, so it is the one place a path has to be one the
+    // operator can use.
     let waiting = |rejected: &[PathBuf]| Outcome::Waiting {
-        what: waiting_text(id, invalid, rejected, Some(upload)),
+        what: waiting_text(id, invalid, rejected, Some(upload), &watch),
         next: format!(
             "upload {} at https://developer.apple.com/account/resources/certificates and \
              download the certificate THAT produces.\n\
@@ -466,7 +494,11 @@ fn await_then_install(key: &Path, csr: &Path, id: &str, dir: &Path, invalid: usi
         ),
     };
     let mut label = APPLE_LABEL;
-    if let Some(note) = rejected_note(&rejected, Some(upload)) {
+    if let Some(note) = watch.consent_note() {
+        step(label, &note);
+        label = "";
+    }
+    if let Some(note) = rejected_note(&rejected, Some(upload), &watch) {
         step(label, &note);
         label = "";
     }
@@ -475,7 +507,7 @@ fn await_then_install(key: &Path, csr: &Path, id: &str, dir: &Path, invalid: usi
     // certificate to appear…", which is exactly the sentence that reads as permission to
     // go to the portal and take whatever is already in the list. The wait's own facts now
     // live INSIDE the errand, above the trap, where they belong.
-    for line in errand_lines(upload, true) {
+    for line in errand_lines(upload, true, &watch) {
         step(label, &line);
         label = "";
     }
@@ -484,7 +516,7 @@ fn await_then_install(key: &Path, csr: &Path, id: &str, dir: &Path, invalid: usi
     let mut rejected = rejected;
     while started.elapsed() < WAIT_FOR_CERT {
         std::thread::sleep(std::time::Duration::from_secs(3));
-        match find_matching_cert(key) {
+        match find_matching_cert(key, &watch) {
             Ok((Some(cer), _)) => {
                 step(
                     APPLE_LABEL,
@@ -512,9 +544,9 @@ fn await_then_install(key: &Path, csr: &Path, id: &str, dir: &Path, invalid: usi
                     .filter(|p| !rejected.contains(p))
                     .cloned()
                     .collect();
-                if let Some(note) = rejected_note(&fresh, Some(upload)) {
+                if let Some(note) = rejected_note(&fresh, Some(upload), &watch) {
                     // A header, because this arrives in the middle of a wait whose last
-                    // line said "watching ~/Downloads". Without an opening that names the
+                    // line said "watching …". Without an opening that names the
                     // verdict, a note beginning "examined, not this request's" reads as
                     // progress — the tool looking at files — rather than as a refusal of
                     // the file the operator downloaded four seconds ago.
@@ -831,16 +863,22 @@ fn plural(n: usize) -> &'static str {
 /// `csr` is `Some` wherever a request has been SURFACED to a path the operator can act
 /// on, and it selects the strong half of [`rejected_note`]: "this is not a download
 /// problem: upload <path>". Passing `None` there — which the timeout used to do — chose
-/// the weak half, "if the browser saved the .cer elsewhere, move it into ~/Downloads",
+/// the weak half, "if the browser saved the .cer elsewhere, move it into a watched folder",
 /// which tells the operator their file is fine and merely misplaced. That reading is
 /// precisely what sends them back to the portal to create a second certificate. The
 /// non-interactive path keeps `None` on purpose: nothing has been surfaced there, so the
 /// search-location fact is the true one.
-fn waiting_text(id: &str, invalid: usize, rejected: &[PathBuf], csr: Option<&Path>) -> String {
+fn waiting_text(
+    id: &str,
+    invalid: usize,
+    rejected: &[PathBuf],
+    csr: Option<&Path>,
+    watch: &Watch,
+) -> String {
     let mut s = format!(
         "a certificate request for '{id}' is out for signature and no matching certificate has arrived yet"
     );
-    if let Some(note) = rejected_note(rejected, csr) {
+    if let Some(note) = rejected_note(rejected, csr, watch) {
         s.push_str("; ");
         s.push_str(&note);
     }
@@ -1197,7 +1235,7 @@ fn write_csr(key: &Path, csr: &Path) -> Result<PathBuf, String> {
 ///
 /// `waiting` is the one thing that legitimately differs between the two callers: only the
 /// interactive path then sits in a loop, so only it may promise one.
-pub(crate) fn errand_lines(csr: &Path, waiting: bool) -> Vec<String> {
+pub(crate) fn errand_lines(csr: &Path, waiting: bool, watch: &Watch) -> Vec<String> {
     let mut out = vec![
         // The FILE first, on its own line, because "which file" is what the paragraph
         // form lost. It is named again at the step that uploads it, so the reader who
@@ -1218,10 +1256,22 @@ pub(crate) fn errand_lines(csr: &Path, waiting: bool) -> Vec<String> {
         "2. Profile Type 'G2 Sub-CA'".to_string(),
         "     NOT 'Previous Sub-CA' — its intermediate expires 2027-02-01".to_string(),
         "3. upload the request named above".to_string(),
-        "4. Download the result into ~/Downloads".to_string(),
+        format!("4. Download the result into {}", watch.spoken()),
         "     the filename does not matter — it is matched against this request by public key"
             .to_string(),
     ];
+    if watch.named.is_none() {
+        // No visible folder was named, so the request stayed under hidden ~/.aterm and
+        // the download has to come back there. Say how a file dialog reaches a hidden
+        // path, and how to have a visible folder next time — instead of copying into
+        // ~/Downloads unasked, which is the folder macOS puts a consent dialog on.
+        out.push(
+            "     (hidden folders: press ⌘⇧G in the file dialog and paste the path; or \
+             re-run with --cert-dir <folder> to have the request copied to, and the \
+             certificate looked for in, a folder you name)"
+                .to_string(),
+        );
+    }
     if waiting {
         // The wait's facts belong HERE, above the trap, not after it. Printed after, the
         // last line on the screen was "waiting for the certificate to appear" — which
@@ -1229,9 +1279,10 @@ pub(crate) fn errand_lines(csr: &Path, waiting: bool) -> Vec<String> {
         // precisely the act the trap exists to prevent.
         out.push(String::new());
         out.push(format!(
-            "watching ~/Downloads and ~/.aterm/apple: this step finishes the instant the \
-             matching .cer lands, and gives up after {} min. Ctrl-C is safe — nothing is \
-             lost and this step resumes exactly here.",
+            "watching {}: this step finishes the instant the matching .cer lands, and \
+             gives up after {} min. Ctrl-C is safe — nothing is lost and this step \
+             resumes exactly here.",
+            watch.spoken(),
             WAIT_FOR_CERT.as_secs() / 60
         ));
     }
@@ -1267,7 +1318,7 @@ pub(crate) fn errand_lines(csr: &Path, waiting: bool) -> Vec<String> {
             .to_string(),
     );
     // The FIELD CASE, which is the one that actually happens: a wrong .cer is already in
-    // ~/Downloads. It needs an act, or the prohibition above is advice with no exit.
+    // the watched folder. It needs an act, or the prohibition above is advice with no exit.
     //
     // The act is NOT "delete it and start over". An earlier draft said that, and it was
     // the harmful answer: deleting is pointless (a non-matching .cer is ignored, not in
@@ -1287,18 +1338,94 @@ pub(crate) fn errand_lines(csr: &Path, waiting: bool) -> Vec<String> {
     out
 }
 
-/// Copy the request somewhere a file picker can actually see. The canonical copy lives
-/// under hidden `~/.aterm/apple/`, which an upload dialog cannot show — and the dialog
-/// opens in ~/Downloads, which is also where the certificate comes back, so the errand
-/// starts and ends in one visible folder. The CSR is PUBLIC material (the subject and
-/// public key; the private half never leaves `~/.aterm/apple`), so the copy leaks
-/// nothing. Best-effort by design: on any failure the hidden canonical path still
-/// works, and the Finder reveal merely pre-selects the file for the operator.
+/// WHERE the certificate is looked for, and where the request is surfaced: the folders
+/// `provision` is allowed to read on the operator's behalf.
+///
+/// `~/.aterm/apple` always — it is aterm's own. `named` is the ONE extra folder the
+/// operator gave with `--cert-dir`, and naming it is the consent: it may be `~/Downloads`
+/// or any other folder macOS guards, and the note printed before the errand says so.
+/// Nothing else is ever read. Until 2026-09-13 `~/Downloads` was polled unasked every
+/// three seconds for the whole wait — from an aterm shell, aterm is the app responsible
+/// for that folder's consent dialog (the 2026-09-12 TCC audit; `atpkg::protected`).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct Watch {
+    /// `~/.aterm/apple`, or `None` without a `$HOME` (then only `named` is read).
+    own: Option<PathBuf>,
+    /// The folder the operator named, as given (a relative path is theirs to resolve).
+    named: Option<PathBuf>,
+}
+
+impl Watch {
+    pub(crate) fn new(named: Option<&Path>) -> Self {
+        Self {
+            own: apple_dir(),
+            named: named.map(Path::to_path_buf),
+        }
+    }
+
+    /// The folders `find_matching_cert` reads: the named one first (it is where the
+    /// download lands), then aterm's own.
+    fn dirs(&self) -> Vec<PathBuf> {
+        self.named.iter().chain(self.own.iter()).cloned().collect()
+    }
+
+    /// The folders, spoken for the errand: `~/Downloads or ~/.aterm/apple`, with `$HOME`
+    /// folded to `~` so the line fits the eye and the eighty-column window.
+    pub(crate) fn spoken(&self) -> String {
+        let home = std::env::var_os("HOME").map(PathBuf::from);
+        let tilde = |p: &Path| -> String {
+            match &home {
+                Some(h) if p.starts_with(h) => match p.strip_prefix(h) {
+                    Ok(rest) if rest.as_os_str().is_empty() => "~".to_string(),
+                    Ok(rest) => format!("~/{}", rest.display()),
+                    Err(_) => p.display().to_string(),
+                },
+                _ => p.display().to_string(),
+            }
+        };
+        let mut parts: Vec<String> = self.dirs().iter().map(|p| tilde(p)).collect();
+        if parts.is_empty() {
+            parts.push("~/.aterm/apple".to_string());
+        }
+        parts.join(" or ")
+    }
+
+    /// One line saying that the named folder is one macOS guards, printed before the
+    /// errand — so the consent dialog, if this machine raises one, is explained by the
+    /// line above it rather than arriving as a surprise about a folder nobody mentioned.
+    /// `None` when nothing named is guarded. Decided on the canonical path, which is what
+    /// would be opened (`canonicalize` is not itself gated — design §1.5); a spelling
+    /// that cannot be resolved is judged as given.
+    fn consent_note(&self) -> Option<String> {
+        let named = self.named.as_deref()?;
+        let home = std::env::var_os("HOME").map(PathBuf::from)?;
+        let resolved = std::fs::canonicalize(named).unwrap_or_else(|_| named.to_path_buf());
+        let home_resolved = std::fs::canonicalize(&home).unwrap_or(home);
+        atpkg::protected::under_protected_root(&home_resolved, &resolved).then(|| {
+            format!(
+                "{} is a folder macOS guards: reading it can raise a one-time \
+                 \"would like to access files\" dialog for this terminal — you named the \
+                 folder, so that dialog is yours to answer",
+                named.display()
+            )
+        })
+    }
+}
+
+/// Copy the request into the folder the operator NAMED, where a file picker can see it.
+/// The canonical copy lives under hidden `~/.aterm/apple/`, which an upload dialog cannot
+/// show; the named folder is also where the certificate comes back, so the errand starts
+/// and ends in one visible folder. The CSR is PUBLIC material (the subject and public
+/// key; the private half never leaves `~/.aterm/apple`), so the copy leaks nothing.
+/// Best-effort by design: on any failure the hidden canonical path still works, and the
+/// Finder reveal merely pre-selects the file for the operator.
+///
+/// Never called with a folder the operator did not name. It used to write into
+/// `~/Downloads` unconditionally — a write into a folder macOS guards, by a process whose
+/// responsible app is the terminal it runs in, is that terminal's consent dialog.
 #[cfg(unix)]
-fn surface_csr(csr: &Path, id: &str) -> Option<PathBuf> {
-    let visible = std::env::var_os("HOME")
-        .map(|h| PathBuf::from(h).join("Downloads"))?
-        .join(format!("devid-{id}.certSigningRequest"));
+fn surface_csr(csr: &Path, id: &str, named: &Path) -> Option<PathBuf> {
+    let visible = named.join(format!("devid-{id}.certSigningRequest"));
     std::fs::copy(csr, &visible).ok()?;
     let _ = Command::new("/usr/bin/open")
         .arg("-R")
@@ -1310,32 +1437,37 @@ fn surface_csr(csr: &Path, id: &str) -> Option<PathBuf> {
 /// Find a downloaded certificate that belongs to THIS key, by comparing public keys. This
 /// is why there is no `--cer` flag and no fixed drop path: the machine already holds the
 /// only thing that can identify the right file, so it proves the match instead of trusting
-/// a filename — or a teammate's certificate that happens to be in ~/Downloads.
+/// a filename — or a teammate's certificate that happens to be in the same folder.
+///
+/// Looks ONLY in [`Watch::dirs`]: `~/.aterm/apple`, plus the one folder the operator
+/// named. `~/Downloads` is not on the list unless they named it — this runs every three
+/// seconds for up to thirty minutes, and a `read_dir` of a guarded folder by a process
+/// under an aterm shell is aterm's "would like to access files in your Downloads folder"
+/// dialog, raised with nobody having asked for Downloads.
 ///
 /// `Err` is reserved for "could not look properly"; `Ok((None, …))` means "looked, not
-/// there". Collapsing the two would tell an operator whose ~/Downloads is unreadable that
+/// there". Collapsing the two would tell an operator whose named folder is unreadable that
 /// Apple had not answered yet.
 ///
 /// The second half of the pair is every `.cer` that WAS examined and is not this
 /// machine's. Discarding it made "Apple has not issued the certificate" and "the wrong
-/// certificate is sitting in ~/Downloads" print the identical heartbeat for thirty
+/// certificate is sitting in the watched folder" print the identical heartbeat for thirty
 /// minutes — and the natural reading of that is the first, so the operator goes back to
 /// developer.apple.com and creates another certificate: one more of five permanent slots,
 /// spent to fix a download. Paths only, no `openssl` reads: this runs every three seconds
 /// for the whole wait, and the reasons are only ever needed once, in [`rejected_note`].
-fn find_matching_cert(key: &Path) -> Result<(Option<MatchedCert>, Vec<PathBuf>), String> {
+fn find_matching_cert(
+    key: &Path,
+    watch: &Watch,
+) -> Result<(Option<MatchedCert>, Vec<PathBuf>), String> {
     let want = key_spki_sha256(key)
         .ok_or_else(|| format!("could not read the public half of {}", key.display()))?;
-    let home = std::env::var_os("HOME").ok_or("HOME is not set")?;
     let mut unreadable = Vec::new();
     let mut rejected = Vec::new();
-    for dir in [
-        PathBuf::from(&home).join("Downloads"),
-        PathBuf::from(&home).join(".aterm").join("apple"),
-    ] {
+    for dir in watch.dirs() {
         let entries = match std::fs::read_dir(&dir) {
             Ok(e) => e,
-            // A missing ~/Downloads is normal; one that exists but cannot be read is not.
+            // A missing folder is normal; one that exists but cannot be read is not.
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => continue,
             Err(e) => {
                 unreadable.push(format!("{}: {e}", dir.display()));
@@ -1370,8 +1502,8 @@ fn find_matching_cert(key: &Path) -> Result<(Option<MatchedCert>, Vec<PathBuf>),
 /// file, why it was refused, and where the right one has to land. Named files, because
 /// "no matching certificate" about a directory the operator can see a certificate in is
 /// the sentence that sends them to spend another slot.
-fn rejected_note(rejected: &[PathBuf], csr: Option<&Path>) -> Option<String> {
-    // Three is enough to recognise the one you just downloaded; a full ~/Downloads dump
+fn rejected_note(rejected: &[PathBuf], csr: Option<&Path>, watch: &Watch) -> Option<String> {
+    // Three is enough to recognise the one you just downloaded; a full folder dump
     // would be a paragraph nobody reads.
     const SHOWN: usize = 3;
     if rejected.is_empty() {
@@ -1403,7 +1535,10 @@ fn rejected_note(rejected: &[PathBuf], csr: Option<&Path>) -> Option<String> {
              certificate THAT produces",
             csr.display()
         ),
-        None => " — if the browser saved the .cer elsewhere, move it into ~/Downloads".to_string(),
+        None => format!(
+            " — if the browser saved the .cer elsewhere, move it into {}",
+            watch.spoken()
+        ),
     };
     Some(format!(
         "examined, not this request's: {}{more}{fix}",
@@ -2231,22 +2366,93 @@ mod tests {
     /// the non-interactive one is the one nobody re-reads, so it is the one that rots.
     #[test]
     fn the_errand_names_the_request_the_role_and_the_sub_ca() {
-        let text = errand_lines(Path::new("/tmp/devid-m9.certSigningRequest"), false).join("\n");
+        let watch = Watch::new(None);
+        let text =
+            errand_lines(Path::new("/tmp/devid-m9.certSigningRequest"), false, &watch).join("\n");
         assert!(text.contains("/tmp/devid-m9.certSigningRequest"));
         assert!(text.contains("nobody else create"), "{text}");
         assert!(text.contains("G2 Sub-CA"));
         assert!(
-            text.contains("~/Downloads"),
+            text.contains(".aterm/apple"),
             "the download has to land somewhere: {text}"
         );
-        assert!(!text.contains("re-run"), "{text}");
-        // The path that does NOT wait may not promise one.
-        assert!(!text.contains("watching ~/Downloads"), "{text}");
+        // Nothing named, so the one folder macOS guards is never suggested — the errand
+        // says how to reach the hidden folder and how to name a visible one instead.
+        assert!(!text.contains("Downloads"), "{text}");
+        assert!(text.contains("--cert-dir"), "{text}");
+        assert!(text.contains("⌘⇧G"), "{text}");
+        // "re-run" as an instruction is forbidden on the waiting path (see the doc); the
+        // named-folder hint says "re-run with --cert-dir", which is the one exception,
+        // so the guard excludes that phrase and keeps the rest of the ban.
         assert!(
-            errand_lines(Path::new("/tmp/x.csr"), true)
-                .iter()
-                .any(|l| l.contains("watching ~/Downloads"))
+            !text
+                .replace("re-run with --cert-dir", "")
+                .contains("re-run"),
+            "{text}"
         );
+        // The path that does NOT wait may not promise one.
+        assert!(!text.contains("watching"), "{text}");
+        assert!(
+            errand_lines(Path::new("/tmp/x.csr"), true, &watch)
+                .iter()
+                .any(|l| l.contains("watching") && l.contains(".aterm/apple"))
+        );
+    }
+
+    /// `provision` reads `~/.aterm/apple` and the ONE folder the operator named — never
+    /// `~/Downloads` on its own initiative. The 2026-09-12 TCC audit found the wait
+    /// polling `read_dir(~/Downloads)` every three seconds for thirty minutes: from an
+    /// aterm shell, aterm is the app responsible for the "would like to access files in
+    /// your Downloads folder" dialog that costs. Naming the folder is the consent.
+    #[test]
+    fn nothing_outside_aterms_own_folder_is_read_unless_the_operator_named_it() {
+        let own = Watch::new(None);
+        let dirs = own.dirs();
+        assert_eq!(dirs.len(), 1, "{dirs:?}");
+        assert!(dirs[0].ends_with(".aterm/apple"), "{dirs:?}");
+        assert!(
+            !dirs
+                .iter()
+                .any(|d| d.to_string_lossy().contains("Downloads")),
+            "{dirs:?}"
+        );
+        let named = Watch::new(Some(Path::new("/Users//x/Downloads")));
+        let dirs = named.dirs();
+        assert_eq!(dirs.len(), 2, "{dirs:?}");
+        assert_eq!(
+            dirs[0],
+            Path::new("/Users//x/Downloads"),
+            "the named folder is looked in first"
+        );
+        assert!(dirs[1].ends_with(".aterm/apple"), "{dirs:?}");
+        // Spoken for the errand: the named folder, then aterm's own.
+        let spoken = named.spoken();
+        assert!(spoken.starts_with("/Users//x/Downloads or "), "{spoken}");
+        assert!(spoken.ends_with(".aterm/apple"), "{spoken}");
+        // With a folder named, the errand names it and drops the how-to-name-one hint.
+        let text = errand_lines(Path::new("/tmp/x.csr"), true, &named).join("\n");
+        assert!(text.contains("/Users//x/Downloads"), "{text}");
+        assert!(!text.contains("--cert-dir"), "{text}");
+    }
+
+    /// The consent note is printed only for a NAMED folder macOS guards, judged on the
+    /// canonical path — so `~/Downloads` earns it and `~/.aterm/apple-scratch` does not,
+    /// and nothing is said when nothing was named.
+    #[test]
+    fn the_consent_note_names_only_a_guarded_folder_the_operator_named() {
+        let home = PathBuf::from(std::env::var_os("HOME").expect("HOME in tests"));
+        assert!(Watch::new(None).consent_note().is_none());
+        let guarded = Watch::new(Some(&home.join("Downloads")));
+        let note = guarded
+            .consent_note()
+            .expect("Downloads is a guarded folder");
+        assert!(note.contains("macOS guards"), "{note}");
+        assert!(note.contains("yours to answer"), "{note}");
+        let plain = Watch::new(Some(&home.join(".aterm").join("apple-scratch")));
+        assert!(plain.consent_note().is_none());
+        // Per component, never a string prefix: `Downloadsx` is not `Downloads`.
+        let lookalike = Watch::new(Some(&home.join("Downloadsx")));
+        assert!(lookalike.consent_note().is_none());
     }
 
     /// The interactive errand must be SCANNABLE, and the trap must be the last thing
@@ -2254,9 +2460,11 @@ mod tests {
     /// wasted certificate slot; these assertions pin the shape that replaced it.
     #[test]
     fn the_errand_lines_put_the_upload_target_and_the_trap_where_they_are_seen() {
+        let watch = Watch::new(Some(Path::new("/Users//x/Downloads")));
         let lines = errand_lines(
             Path::new("/Users//x/Downloads/devid-m9.certSigningRequest"),
             true,
+            &watch,
         );
         // The file to upload gets a line to ITSELF — not buried mid-sentence.
         assert!(
@@ -2294,7 +2502,7 @@ mod tests {
              argue with: {joined}"
         );
         assert!(joined.contains("G2 Sub-CA"));
-        assert!(joined.contains("~/Downloads"));
+        assert!(joined.contains("/Users//x/Downloads"));
         assert!(!joined.contains("re-run"), "{joined}");
         // The trap is stated, and stated LAST — including after the wait paragraph.
         // Nothing may be printed below it: the line the eye lands on is the line that
@@ -2349,7 +2557,9 @@ mod tests {
             "/Users//x/Downloads/developerID_application.cer",
         )];
         let csr = PathBuf::from("/Users//x/Downloads/devid-m9.certSigningRequest");
-        let note = rejected_note(&rejected, Some(&csr)).expect("a refusal must be explained");
+        let watch = Watch::new(None);
+        let note =
+            rejected_note(&rejected, Some(&csr), &watch).expect("a refusal must be explained");
         assert!(note.contains("developerID_application.cer"), "{note}");
         assert!(note.contains("devid-m9.certSigningRequest"), "{note}");
         assert!(
@@ -2358,11 +2568,15 @@ mod tests {
         );
         // Without a request to point at (the non-interactive path prints the errand
         // separately), it falls back to the location hint rather than inventing one.
-        let generic = rejected_note(&rejected, None).expect("still explained");
-        assert!(generic.contains("~/Downloads"), "{generic}");
+        let generic = rejected_note(&rejected, None, &watch).expect("still explained");
+        // The hint names the folder provision actually watches — aterm's own, since
+        // nothing was named — never a folder it does not read (the fixture's rejected
+        // file sits in Downloads; the HINT must not send the operator there).
+        assert!(generic.contains("move it into ~/.aterm/apple"), "{generic}");
+        assert!(!generic.contains("move it into ~/Downloads"), "{generic}");
         assert!(!generic.contains("not a download problem"), "{generic}");
         // Nothing refused, nothing to say.
-        assert!(rejected_note(&[], Some(&csr)).is_none());
+        assert!(rejected_note(&[], Some(&csr), &watch).is_none());
     }
 
     /// Two overlapping Developer ID certificates is what a RENEWAL looks like, and the

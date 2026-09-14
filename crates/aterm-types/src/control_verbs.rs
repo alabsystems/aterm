@@ -447,6 +447,35 @@ pub const VERBS: &[VerbSpec] = &[
         "OK <scrollback-line-count>",
         "",
     ),
+    // LINES framing, not `lines`'s Status: the reply is `OK <n> …` + n rows, and the
+    // client picks its framing from this row (`framing_of`), so a Status row would
+    // make `aterm ctl offscreen` print the header and drop every row.
+    v(
+        "offscreen",
+        Read,
+        Lines,
+        Session,
+        "offscreen [since=<i>] [tail=<n>] [max=<n>] [screen=1]: rows a TUI scrolled off",
+        "— Claude Code and other fullscreen apps repaint the ALTERNATE screen in place, so \
+         `lines` stays 0 and a row that leaves the top is gone from the grid; aterm keeps those \
+         rows per session, in memory only (4 MiB, on unless ATERM_ALT_ARCHIVE=0), by comparing \
+         each committed frame (a DEC 2026 close; at most one per 16 ms for an app that sends \
+         none) with the one before. Reply `OK <n> first=<i> last=<j> lost=<k> breaks=<b> back=<d> \
+         [back_at=<i> pin=<p>] epoch=<e> origin=<o> alt=<0|1> seq=<s> [enabled=0] [more=1] \
+         [screen_rows=<m>]` then n lines, oldest first: line m is archived row first+m, and last= \
+         is the reply's own last row. since= is exclusive, so page and poll with since=<last>; \
+         since=<origin>:<i> (a `history` arch= mark) from another origin reads from the start and \
+         origin= shows it; an index past the newest is `ERR bad since`. At most 2000 rows per \
+         reply, or max=<n>; tail=<n> takes the newest n instead; more=1 says rows were left out. \
+         lost= counts rows after since that were evicted or wiped, breaks= the discontinuities at \
+         or after since (a redraw with no overlap, a resize, leaving the alt screen, a reset), \
+         back= how many archived rows the screen shows again: screen rows pin..pin+back are \
+         archived rows back_at.. (pin= header rows above them). enabled=0: the archive is off, so \
+         nothing that scrolled away was kept. screen=1 appends the current screen rows, read \
+         under the same lock: n counts them too, and they are the last screen_rows=<m> lines. \
+         Anything else is `ERR usage: offscreen [since=<i>] [tail=<n>] [max=<n>] [screen=1]`; \
+         there is no --json form",
+    ),
     v(
         "cell",
         Read,
@@ -712,7 +741,8 @@ pub const VERBS: &[VerbSpec] = &[
         Lines,
         Session,
         "history [<n>] [since=<id>]: the turn LEDGER",
-        "- id/submitted/status/dur_ms/seq/hash/text per completed turn",
+        "- id/submitted/status/dur_ms/seq/hash/arch/text per completed turn; arch=<origin>:<last> \
+         is the alt-screen archive's mark when the turn started, for `offscreen since=`",
     ),
     // `meta` reads/writes the USER-settable session metadata. Base op-class Read
     // (the bare form is a pure metadata readout); the `meta set`/`meta unset`
@@ -1221,7 +1251,7 @@ pub const VERBS: &[VerbSpec] = &[
          reason= age_ms= origin= target= alt= licence=` row per judged cursor move, from the \
          engine's fixed-size DIAGNOSTIC ring. `licence=` names the class that admitted a \
          licensed row: `key` (a press hint — typed, Backspace, nav, Return, a composer \
-         newline, Tab or ⌃V as a gesture, the unpaid press), `inflight` (no hint was fresh and the \
+         newline, Tab or ⌃V as a gesture), `inflight` (no hint was fresh and the unpaid \
          presses still waiting on the row licensed the batch — a stalled prompt catching \
          up), `insert` (a DELIVERED insert, \
          Rainbow Kitty only — a file drop, ⌘V, and into the tab on screen the `paste` verb, \
@@ -1231,24 +1261,28 @@ pub const VERBS: &[VerbSpec] = &[
          contract), `rewrite` (the program pulled the caret back inside that insert's span \
          and the ribbon retracted to it), or `none` on a decline. A move paints only if a \
          keypress or a delivered insert LICENSED it, so a \
-         decline carries one of four reasons: `no-fresh-hint` (no key hint was fresh — the \
+         decline carries one of five reasons: `no-fresh-hint` (no key hint was fresh — the \
          move was program output nobody's fingers asked for), `no-credits` (a multi-cell \
          coalesce outran the press CREDIT budget), `off-shape` (licensed and classified, but \
          the style's shape gates laid nothing), `program-row` (the anchored-echo lane refused \
          a row that has advanced keylessly, or one contesting a fresher row's echo — a \
-         spinner/status row must never spend a typed stamp). Every observed move is counted \
+         spinner/status row must never spend a typed stamp), `hidden-relocation` (a key was \
+         pressed, but the caret reappeared from behind a repaint's hidden bracket too far or \
+         too late for the bounded hide-bridge to name a source cell — the one refusal that \
+         happens before the licence gate, so it is reported here rather than counted twice). \
+         Every observed move is counted \
          exactly once: \
          licensed + declined is the number of cursor deltas the seam has judged. \
          `trail status`: one standing-state row instead — `trail style= resolved= \
          config_enabled= effective= focused= motion= motion_stage= shed= intensity= \
          licensed= declined= last_decline_reason= spawns= ribbon_active= ribbon_look= \
          ribbon_segments= ribbon_hue_bands= field= sparks= momentum= \
-         momentum_display= flow= combo= combo_best= glow_active= pet_active= cat_active= \
+         momentum_display= momentum_glow= flow= combo= combo_best= glow_active= pet_active= cat_active= \
          block_fill= block_fill_rgb= block_fill_base= block_fill_base_from= \
          pet_action= pet_content= pet_pending= pet_body= pet_focus= pet_reason= \
          pet_anchor= pet_event_seq= pet_pose= inserts_delivered= inserts_lit= \
          inserts_retracted= last_insert_cells= inflight_licensed= inflight_forgotten= \
-         credits= swallowed_no_echo=` (every gate \
+         credits= swallowed_no_echo= park_returns= park_flushed=` (every gate \
          from the config knob to the glass, in the order the frame path walks them, plus \
          the cumulative tally the ring has forgotten — `licensed=0 declined>0` blames the \
          licence and names why, `licensed>0` over a dark screen blames everything \
@@ -1271,7 +1305,14 @@ pub const VERBS: &[VerbSpec] = &[
          — iTerm2's password-mode rule, read off the master's termios): the tty will never \
          echo them, so they are neither a licence nor a credit, and a dark password prompt \
          with this count rising is the rule working. A raw-mode program (Claude Code, vim, \
-         a shell prompt under readline) echoes for itself and is never counted here. The \
+         a shell prompt under readline) echoes for itself and is never counted here. \
+         `park_returns=` / `park_flushed=` are the HELD PARKS (Rainbow Kitty only): a \
+         same-row backward move a key stands behind — Ink parking the caret at the start \
+         of the input before it rewrites the row — is held for one stamp window rather \
+         than judged at once; `park_returns=` counts the rewrites that came back past the \
+         park's origin and were judged as one echo from it, `park_flushed=` the parks \
+         judged as the plain retreat they were (no return: silence, a Backspace, a scroll, \
+         the next unrelated move). The \
          `block_fill*` four are the BLOCK CURSOR's body, which no \
          other field covers: a style can take the caret away from the terminal entirely, \
          and `glow_active=false pet_active=false` over a tinted block is what that looks \
@@ -1283,6 +1324,10 @@ pub const VERBS: &[VerbSpec] = &[
          or `white` — a CursorColor-based owner handed no pinned cursor colour builds from \
          the theme-polar white, and the shipped-default rainbow style takes that path) — \
          so a caret that ignored OSC 12 is separable from one that honoured it. \
+         `momentum_glow=` is the TYPING-MOMENTUM GLOW's own decayed value (0.00-1.00, the \
+         `cursor_momentum_glow` halo that warms the caret and pins its blink) — not \
+         `momentum=`, which is the rainbow engine's cat momentum — so a warm caret reads \
+         beside a nonzero number instead of `momentum=0.00`. \
          `flow=`/`combo=`/`combo_best=` are the row's one reading about the PERSON: \
          `combo=` counts keys typed at speed (the eased spine at 0.8 or above) with no \
          delete, and zeroes on a delete, a kill, or a hand that dropped below speed; \
@@ -1290,6 +1335,15 @@ pub const VERBS: &[VerbSpec] = &[
          `combo_best=` is the window's high-water mark, which an exit never resets. A \
          driver that reads `flow=1.00` is looking at a human mid-flow and can hold its \
          turn. The three are 0 on every style but rainbow kitty, whose spine prices them. \
+         While rainbow kitty owns the frame the row ends with `v2_quads= v2_halos= v2_stars= \
+         v2_meteors= v2_bridged= ribbon_retired=` — the frame's quads, halos, live stars and \
+         meteors; `v2_bridged=`, the cells the engine's echo ledger relit for a late echo the \
+         ring scored `declined`; and `ribbon_retired=`, the window's cumulative count of ribbon \
+         cells retired by CONTENT: the host saw the glyph under a cell change or go (an input \
+         box re-laid a row up, a row cleared and not put back), or the caret was observed on \
+         another row through a move the licence gate declined — the number that says a band \
+         went out because its text moved, as against expiring (a redraw that puts the same \
+         text back counts nothing). \
          In a `--headless` instance the engine ticks only while a capture drives its clock (`image` \
          after each key, or a `video`), and a caret on ROW 0 has no sky band there (no chrome \
          head band above the grid), so `v2_stars=0` on row 0 is the geometry, not a dark trail \
@@ -1557,10 +1611,22 @@ pub const VERBS: &[VerbSpec] = &[
          IN THE OUTBOX and a bridge will publish it (a bridge exit is the ordinary relaunch \
          path, and `outbox` is a peek that removes nothing), so it must not be read as `not \
          sent` and re-posted — `post` carries no idempotency key that would collapse the \
-         duplicate. `no-bridge=1` says the opposite about the same queued message: this instance \
-         has no `[fabric] command`, so no bridge exists to drain the outbox and none is coming. \
-         Nothing will publish it, no answer can arrive, and further posts only fill the queue \
-         until `ERR outbox full`. The body is inline text up to 4 KiB, or `len=<n>` followed \
+         duplicate. `no-bridge=1` says something NARROWER about the same queued \
+         message, and the difference is the whole report an agent makes: this instance has no \
+         `[fabric] command`, so no bridge exists to drain the outbox RIGHT NOW and none is \
+         coming ON ITS OWN. It is not a verdict on the message. `fabric attach <command...>` \
+         arms a supervisor and that same outbox drains — measured 2026-09-12, a post refused \
+         `no-bridge=1` landed in the addressee's inbox the moment a bridge attached — so the \
+         honest sentence is \"queued, and unpublishable until this instance has a bridge\", never \
+         \"not sent\". Reporting it as lost is how a delivered task gets done twice. Further \
+         posts only fill the queue until `ERR outbox full`. THE THIRD OUTCOME, which this row \
+         used to omit: `ERR timeout id=<n>`, the `--wait` expiring with no landing reported. It \
+         is queued exactly like the other two, and must not be re-posted either. THE FOURTH IS \
+         THE ONE THAT IS NOT QUEUED: `ERR <reason> id=<n>` — `unroutable`, `ambiguous` or \
+         `undeliverable` — is the bridge RETIRING the post, and the wait is released with that \
+         verdict rather than a timeout. `outbox` then omits the row (it lists only rows that are \
+         not dead), so no bridge drains it again: this one is reported as its reason, and \
+         re-posting is right once the address is. The body is inline text up to 4 KiB, or `len=<n>` followed \
          by that many raw bytes up to 256 KiB. There is no `to=fleet`: a node holds no fleet \
          write grant, and an agent may only ASK a human to halt. REFUSED to an edge-token \
          connection — a write-input edge over one session would otherwise speak AS that session, \
@@ -2906,7 +2972,17 @@ mod tests {
             "a `--wait` refused for want of a link must not read as `not sent`"
         );
         assert!(
-            help("post").contains("no-bridge=1") && help("post").contains("none is coming"),
+            help("post").contains("no-bridge=1")
+                && help("post").contains("none is coming ON ITS OWN")
+                // The THIRD outcome. It was missing entirely, and it means QUEUED:
+                // an agent that reads a timeout as a failure re-posts, and `post`
+                // has no idempotency key, so the peer gets the task twice.
+                && help("post").contains("ERR timeout id=<n>")
+                // The retired verdict is the one outcome that is NOT queued, and the
+                // row claimed there were three. An agent that believed it reported a
+                // post nothing will ever publish as queued.
+                && help("post").contains("ERR <reason> id=<n>")
+                && help("post").contains("unroutable"),
             "…and the state where nothing WILL publish it must not read as \
              `queued=1` either: on an instance with no `[fabric] command` the \
              row's own advice (do not re-post, a replacement bridge will publish \

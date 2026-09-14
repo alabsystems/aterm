@@ -22,7 +22,9 @@ use std::process::Command;
 
 use atpkg::install::{StageSpec, stage_payload_spec};
 use atpkg::provenance::{carries_provenance, measure_tracked};
-use atpkg::stage_helper::{HIDDEN_VERB, decode_spec, encode_spec, stage_untracked};
+use atpkg::stage_helper::{
+    HIDDEN_VERB, HelperPlan, decode_spec, encode_spec, plan_for_exe, stage_untracked,
+};
 
 fn scratch(label: &str) -> PathBuf {
     let d = std::env::temp_dir().join(format!(
@@ -171,6 +173,26 @@ fn the_launchd_lane_lays_an_identical_tree_and_a_clean_one_when_the_caller_is_tr
     let staged = stage_untracked(&helper_exe(), &spec(), &archive, &dest, &d)
         .unwrap_or_else(|why| panic!("the lane must run on this macOS: {why}"));
     assert_eq!(staged.root, expected);
+    // The job removed its own label (2026-09-13): soon nothing of this pid's is
+    // registered. "Soon", not "now": the other tests in this binary run their own jobs
+    // on other threads at the same time, and a job of theirs still RUNNING is not a
+    // leak — a leak is a label that stays once every job has answered.
+    let mine = format!("systems.alab.atpkg.stage-helper-{}-", std::process::id());
+    let registered = || -> Vec<String> {
+        let listed = Command::new("/bin/launchctl").arg("list").output().unwrap();
+        String::from_utf8_lossy(&listed.stdout)
+            .lines()
+            .filter(|l| l.contains(&mine))
+            .map(str::to_string)
+            .collect()
+    };
+    let waited = std::time::Instant::now();
+    let mut leaked = registered();
+    while !leaked.is_empty() && waited.elapsed() < std::time::Duration::from_secs(20) {
+        std::thread::sleep(std::time::Duration::from_millis(200));
+        leaked = registered();
+    }
+    assert!(leaked.is_empty(), "labels still registered: {leaked:?}");
     assert!(
         !staged.witness_tagged,
         "the lane measures its own outcome, and it must be clean"
@@ -241,6 +263,7 @@ fn a_helper_that_cannot_answer_is_detected_and_the_destination_is_left_empty() {
     let started = std::time::Instant::now();
     let why = stage_untracked(&fake, &spec(), &archive, &dest, &d).unwrap_err();
     assert!(why.contains("exited without a result"), "{why}");
+    assert!(why.contains("exit status 0"), "the fate is named: {why}");
     assert!(
         started.elapsed() < std::time::Duration::from_secs(20),
         "detection took {:?}",
@@ -251,5 +274,180 @@ fn a_helper_that_cannot_answer_is_detected_and_the_destination_is_left_empty() {
         0,
         "dest emptied for the caller's policy"
     );
+    let _ = std::fs::remove_dir_all(&d);
+}
+
+/// `cat "$1" > "$2"` from a job LAUNCHD spawns — an untracked process whatever this test
+/// process is — so the copy is clean (measured law; `crate::provenance`). Waits for a
+/// `done` file, removes the label on every path.
+fn launchd_cat(src: &Path, dst: &Path, dir: &Path) {
+    let done = dir.join("cat.done");
+    let label = format!("systems.alab.atpkg.test.cat.{}", std::process::id());
+    let out = Command::new("/bin/launchctl")
+        .args(["submit", "-l", &label, "--", "/bin/sh", "-c"])
+        .arg("cat \"$1\" > \"$2\" && chmod 755 \"$2\"; : > \"$3\"")
+        .arg("x")
+        .arg(src)
+        .arg(dst)
+        .arg(&done)
+        .output()
+        .expect("launchctl runs");
+    assert!(
+        out.status.success(),
+        "launchctl submit: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let started = std::time::Instant::now();
+    while !done.exists() {
+        assert!(
+            started.elapsed() < std::time::Duration::from_secs(60),
+            "the launchd cat did not finish"
+        );
+        std::thread::sleep(std::time::Duration::from_millis(50));
+    }
+    let _ = Command::new("/bin/launchctl")
+        .args(["remove", &label])
+        .output();
+}
+
+/// HOW the job runs the helper is a measurement of the binary, and both ways lay clean
+/// files. The test binary built from a tracked shell carries the tag and is COPIED; a
+/// clean byte copy of it (made by a launchd job) is run IN PLACE — and that in-place run
+/// lays the same tree, clean. Under an untracked shell the binary is already clean, both
+/// plans read `ExecOriginal`, and the tagged half is vacuous: the tag cannot be minted by
+/// hand, so this test says which case it exercised.
+#[test]
+fn the_helper_runs_in_place_when_clean_and_is_copied_when_tagged() {
+    let d = scratch("plan");
+    let exe = helper_exe();
+    let tagged = carries_provenance(&exe);
+    let plan = plan_for_exe(&exe).expect("the test binary can be inspected");
+    assert_eq!(
+        plan,
+        if tagged {
+            HelperPlan::CopyThenExec
+        } else {
+            HelperPlan::ExecOriginal
+        },
+        "the plan follows the measured tag ({})",
+        exe.display()
+    );
+
+    let clean_dir = d.join("clean");
+    std::fs::create_dir_all(&clean_dir).unwrap();
+    let clean = clean_dir.join("atpkg");
+    launchd_cat(&exe, &clean, &d);
+    assert!(
+        !carries_provenance(&clean),
+        "a byte copy made by a launchd job is clean"
+    );
+    assert_eq!(plan_for_exe(&clean).unwrap(), HelperPlan::ExecOriginal);
+
+    let archive = bundle_archive(&d);
+    let reference = d.join("reference");
+    std::fs::create_dir_all(&reference).unwrap();
+    let expected = stage_payload_spec(&spec(), &archive, &reference).unwrap();
+    let dest = d.join("incoming");
+    std::fs::create_dir_all(&dest).unwrap();
+    let staged = stage_untracked(&clean, &spec(), &archive, &dest, &d)
+        .unwrap_or_else(|why| panic!("the in-place lane must run on this macOS: {why}"));
+    assert_eq!(staged.root, expected);
+    assert!(!staged.witness_tagged);
+    assert_eq!(tree(&dest), tree(&reference));
+    assert!(
+        !carries_provenance(&dest.join("bin/tool")),
+        "a clean helper run in place by launchd writes clean files"
+    );
+    eprintln!(
+        "test binary tagged={tagged} → plan {plan:?}; clean copy → ExecOriginal, laid clean \
+         (in-process reference tagged={})",
+        carries_provenance(&reference.join("bin/tool"))
+    );
+    let _ = std::fs::remove_dir_all(&d);
+}
+
+/// A helper the kernel will not run is reported by its SIGNAL, not as "exited without a
+/// result": a fake `atpkg` that SIGKILLs itself stands in for the copied bundle binary
+/// the old lane died on (`aterm.app`'s own executable, killed at exec, empty stderr —
+/// 2026-09-13). The destination is left empty for the caller's policy.
+#[test]
+fn a_helper_killed_at_exec_is_reported_by_its_signal() {
+    use std::os::unix::fs::PermissionsExt as _;
+    let d = scratch("killed");
+    let archive = bundle_archive(&d);
+    let dest = d.join("incoming");
+    std::fs::create_dir_all(&dest).unwrap();
+    let fake_dir = d.join("fake");
+    std::fs::create_dir_all(&fake_dir).unwrap();
+    let fake = fake_dir.join("atpkg");
+    std::fs::write(&fake, "#!/bin/sh\nkill -9 $$\n").unwrap();
+    std::fs::set_permissions(&fake, std::fs::Permissions::from_mode(0o755)).unwrap();
+    let started = std::time::Instant::now();
+    let why = stage_untracked(&fake, &spec(), &archive, &dest, &d).unwrap_err();
+    assert!(why.contains("signal 9 (SIGKILL)"), "{why}");
+    // The cause the lane KNOWS is named, and named as a candidate: this fixture kills
+    // itself with `kill -9`, which is exactly one of the other causes the report must
+    // leave open, so a report that called it a code-signature kill would be wrong here.
+    assert!(why.contains("code-signature kill"), "{why}");
+    assert!(why.contains("records the signal, not the reason"), "{why}");
+    assert!(!why.contains("exited without a result"), "{why}");
+    assert!(
+        started.elapsed() < std::time::Duration::from_secs(20),
+        "detection took {:?}",
+        started.elapsed()
+    );
+    assert_eq!(std::fs::read_dir(&dest).unwrap().count(), 0);
+    let _ = std::fs::remove_dir_all(&d);
+}
+
+/// A label left by a parent that died before its `Drop` — the shape two labels from one
+/// dead test pid had on 2026-09-12/13 — is swept by the next job any process prepares.
+/// The orphan is minted here with a pid that does not exist; the lane's next `prepare`
+/// removes it.
+#[test]
+fn a_label_whose_owning_pid_is_dead_is_swept_by_the_next_job() {
+    let d = scratch("sweep");
+    // A pid nothing runs under: macOS pids stay below 99999.
+    let dead_pid = 99_998u32;
+    let alive = Command::new("/bin/ps")
+        .args(["-p", &dead_pid.to_string()])
+        .output()
+        .unwrap()
+        .status
+        .success();
+    assert!(!alive, "pid {dead_pid} is unexpectedly alive; pick another");
+    let orphan = format!("systems.alab.atpkg.stage-helper-{dead_pid}-0-deadbeef");
+    let out = Command::new("/bin/launchctl")
+        .args(["submit", "-l", &orphan, "--", "/usr/bin/true"])
+        .output()
+        .unwrap();
+    assert!(
+        out.status.success(),
+        "launchctl submit: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let listed = || -> bool {
+        let out = Command::new("/bin/launchctl").arg("list").output().unwrap();
+        String::from_utf8_lossy(&out.stdout).contains(&orphan)
+    };
+    assert!(listed(), "the orphan is registered before the sweep");
+
+    // Any lane call prepares a job, and preparing sweeps. A silent helper keeps it short.
+    let archive = bundle_archive(&d);
+    let dest = d.join("incoming");
+    std::fs::create_dir_all(&dest).unwrap();
+    let fake_dir = d.join("fake");
+    std::fs::create_dir_all(&fake_dir).unwrap();
+    let fake = fake_dir.join("atpkg");
+    std::fs::copy("/usr/bin/true", &fake).unwrap();
+    let _ = stage_untracked(&fake, &spec(), &archive, &dest, &d);
+    assert!(
+        !listed(),
+        "the orphan label was swept by the next job's prepare"
+    );
+    // Belt and braces for a failed assertion above: never leave it behind.
+    let _ = Command::new("/bin/launchctl")
+        .args(["remove", &orphan])
+        .output();
     let _ = std::fs::remove_dir_all(&d);
 }

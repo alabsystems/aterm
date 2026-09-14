@@ -3697,7 +3697,7 @@ impl App {
                 engine.note_output_cells(
                     &ws.input_scratch.cells,
                     (ws.input_scratch.cursor_row, ws.input_scratch.cursor_col),
-                    rows,
+                    (rows, cols),
                     exact_focus.content_seq,
                     now,
                     output_echo.input_hot,
@@ -4602,6 +4602,19 @@ impl App {
                 }
                 if (cpos.row as usize) + 1 < rows {
                     term.row_cols_into(cpos.row as usize + 1, &mut ws.poof_row_below_buf);
+                }
+                // THE CONTENT WITNESS's rows — the windowed LOCK A capture's
+                // twin, so this helper retires an abandoned band exactly as
+                // a windowed present would.
+                ws.cursor_glow
+                    .observe_ribbon_row(cpos.row, &ws.poof_row_buf);
+                let mut ribbon_rows = [0u16; aterm_effects::rainbow_kitty::witness::WITNESS_ROWS];
+                let n = ws.cursor_glow.ribbon_rows(&mut ribbon_rows);
+                for &r in &ribbon_rows[..n] {
+                    if usize::from(r) < rows && r != cpos.row {
+                        term.row_cols_into(usize::from(r), &mut ws.witness_row_buf);
+                        ws.cursor_glow.observe_ribbon_row(r, &ws.witness_row_buf);
+                    }
                 }
                 Some((cpos.row, cpos.col, probe_trust))
             } else {

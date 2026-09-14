@@ -585,9 +585,10 @@ USAGE
     aterm-drive classify [--allow-python GLOB]... <cmd...> | phase [@sid]
               | await-turn [@sid] [--timeout MS] [--reconnect-s S]
               | supervise [@sid] [--auto-reads] [--max-s S] [--allow-python GLOB]... [--notes FILE]
-                          [--reconnect-s S]
+                          [--reconnect-s S] [--dismiss-surveys] [--context-warn PCT]
               | watch [@sid] [--auto-reads] [--allow-python GLOB]... [--notes FILE] [--max-s S]
-                      [--reconnect-s S]
+                      [--reconnect-s S] [--report] [--dismiss-surveys] [--context-warn PCT]
+              | report [@sid] [--since ORIGIN:I] [--max-rows N]
 
 COMMANDS
     prompt <text...>   Type <text>, press Enter, then BLOCK until the agent's turn
@@ -678,20 +679,46 @@ SUPERVISING A WORKER (a Claude Code session in another tab; `@sid` from `aterm c
                        text that says `Approaching` a limit. The worker sits at an
                        idle composer, and what you send it fails until the limit
                        resets or its model is switched.
+                       A last line `survey 0` follows when Claude Code's session
+                       survey is OPEN above the composer — `● How is Claude doing
+                       this session?` in column 0 over `1: Bad … 0: Dismiss`,
+                       only blank rows, a right-aligned hint or a tip between it
+                       and the top rule (a copy quoted in the transcript is not
+                       open). `0` is the key that dismisses it: `aterm ctl @sid
+                       key 'if=^●.How.is.Claude.doing' 0` — the guard matches
+                       only a row that starts with `●`, so a copy quoted in the
+                       transcript (indented, or under `⎿`) lets no `0` through
+                       to the composer (quoted: `^` is a glob in zsh with
+                       extended_glob). While it is open, a turn whose first
+                       character is 1, 2 or 3 is taken as a rating — the human's
+                       to give, never yours. Dismiss it first.
+                       A last line `context <n>%` follows (after any `survey 0`)
+                       while Claude Code's context indicator is up: `<n>% until
+                       auto-compact` (or `Context left until auto-compact: <n>%`)
+                       under the status row (with none, under the last transcript
+                       row) and above the top rule, alone on its row, ending
+                       against the right edge where the rules end (in a narrow
+                       pane too). A copy quoted in the transcript or in a tool's
+                       output does not count unless it, too, ends at that edge.
+                       That much of the worker's context is left before Claude
+                       Code auto-compacts it, replacing its history with a summary
+                       in which the rules you gave it may not survive (see
+                       --context-warn).
     await-turn [@sid] [--timeout MS] [--reconnect-s S]
-                       Block until the phase is no longer busy, then print it like
-                       `phase`. The loop is `await idle 2000` → read → `await seq`
-                       (never a sleep); where the host knows `await gone`, the busy
-                       footer LEAVING is the first wait. A screen without the
-                       composer rules (a build, a script, a REPL) whose output
-                       never held still for the 2 s is busy too: its turn ends
-                       when the output pauses. Exit 124 on --timeout (default: the
-                       global --timeout) with the worker still busy — or with the
-                       connection lost (see --reconnect-s): then the phase of the
-                       last screen read, or `busy` with `reason no screen: no
+                       Block until the phase is no longer busy, then print it
+                       exactly like `phase` (its `survey 0` and `context <n>%`
+                       lines included). The loop is `await idle 2000` → read →
+                       `await seq` (never a sleep); where the host knows `await
+                       gone`, the busy footer LEAVING is the first wait. A screen
+                       without the composer rules (a build, a script, a REPL) whose
+                       output never held still for the 2 s is busy too: its turn
+                       ends when the output pauses. Exit 124 on --timeout (default:
+                       the global --timeout) with the worker still busy — or with
+                       the connection lost (see --reconnect-s): then the phase of
+                       the last screen read, or `busy` with `reason no screen: no
                        read answered before the timeout` when none was.
     supervise [@sid] [--auto-reads] [--max-s S] [--allow-python GLOB]... [--notes FILE]
-              [--reconnect-s S]
+              [--reconnect-s S] [--dismiss-surveys] [--context-warn PCT]
                        The loop: await-turn; with --auto-reads, a Bash prompt whose
                        command classifies read-only is approved (option 1, pressed
                        GUARDED: `key if=Do.you.want.to.proceed 1` on a host that has
@@ -701,8 +728,11 @@ SUPERVISING A WORKER (a Claude Code session in another tab; `@sid` from `aterm c
                        guard matched no row (that box is handed to you); a host
                        without the guard answers a usage line or a bare `ERR` and
                        the press falls back to read → confirm → press → re-read,
-                       backspacing a digit that landed in the composer; `ERR busy
-                       sink` is retried, any other `ERR` stops the loop), one line
+                       backspacing a digit that landed in the composer — and
+                       with the session survey open on the confirming read it
+                       presses nothing and hands the box to you (a `1` that
+                       reaches the survey is a rating); `ERR busy sink` is
+                       retried, any other `ERR` stops the loop), one line
                        appended to --notes, then `await seq` until the box has LEFT
                        before the next look (an unchanged screen is never pressed
                        twice; one that does not move after the press is handed to
@@ -715,9 +745,18 @@ SUPERVISING A WORKER (a Claude Code session in another tab; `@sid` from `aterm c
                        1800) is spent it prints TIMEOUT, then the last read's
                        compact result, and exits 124 — a turn read at or after
                        the deadline is not pressed, and a budget spent while a
-                       lost connection is ridden out is the TIMEOUT too.
+                       lost connection is ridden out is the TIMEOUT too. The
+                       session survey is never answered: when it appears (see
+                       phase) supervise says watch's `EVENT survey` line on
+                       stderr, or with --dismiss-surveys presses its `0` and
+                       says `DISMISSED survey seq=<n>` there once it has gone
+                       (see --dismiss-surveys). The worker's context running low,
+                       and the compaction after it, are said there too, as they
+                       happen during the run: watch's `EVENT context` and `EVENT
+                       compacted` lines (see --context-warn; a compaction between
+                       two runs is not seen).
     watch [@sid] [--auto-reads] [--allow-python GLOB]... [--notes FILE] [--max-s S]
-          [--reconnect-s S]
+          [--reconnect-s S] [--report] [--dismiss-surveys] [--context-warn PCT]
                        supervise's loop for a harness that wakes its agent once per
                        stdout line (a background monitor, a supervisor process).
                        Approvals are supervise's, and each prints `APPROVED
@@ -754,7 +793,88 @@ SUPERVISING A WORKER (a Claude Code session in another tab; `@sid` from `aterm c
                        window (`EXIT reconnect window lapsed: …`, see
                        --reconnect-s), a request or the notes file failed, or,
                        before the loop ran, one of its flags or the host (also
-                       on stderr).
+                       on stderr). With --report, an idle, question or limited
+                       point's line carries `complete=<0|1> rows=<n>` of
+                       `report` (read at that point) between the seq and the
+                       summary: `EVENT idle seq=<n> complete=1 rows=57 <summary>`;
+                       run `report` to read the rows. Without it the line is as
+                       above. When the session survey APPEARS (open at this look,
+                       and seen gone since it was last said — by any read, a
+                       busy one included; see phase) one line comes ahead of
+                       that look's point, and none again while it stays open:
+                         EVENT survey seq=<n> dismiss with: <command>
+                       the command being `aterm ctl @sid key
+                       'if=^●.How.is.Claude.doing' 0` (`aterm ctl key …` with no
+                       @sid given). While a prompt box is up, or text is typed
+                       in the composer (on any of its rows), the survey waits:
+                       the box is reported or approved first, and the survey
+                       line comes at the next look without them. With
+                       --dismiss-surveys the loop presses that `0` itself and
+                       prints `DISMISSED survey seq=<n>` instead once a fresh
+                       read shows the survey gone (see --dismiss-surveys). As
+                       the worker's context runs low it prints, at the first
+                       read at or below --context-warn (mid-turn too, ahead of
+                       any point) and once a descent:
+                         EVENT context seq=<n> <v>% until auto-compact
+                       and once the indicator has gone again (or jumped 30
+                       points or more), the worker having compacted:
+                         EVENT compacted seq=<n>
+                       (see --context-warn). With no indicator on the screen,
+                       every line is as above.
+    report [@sid] [--since ORIGIN:I] [--max-rows N]
+                       What the worker said since your turn, in full. Read it
+                       instead of the screen: Claude Code runs on the ALTERNATE
+                       screen and repaints in place, so what scrolled off its top
+                       is gone from the screen — the host keeps those rows (`aterm
+                       ctl @sid offscreen`), and this joins them with the screen's.
+                       Prints one header line, `--`, then the rows:
+                         report complete=<0|1> [reason=<r>[,<r>...]] marker=<m>
+                         turn=<id|-> rows=<n> archived=<a> screen=<s> last=<o:i|->
+                       The start (marker=ledger): your newest `turn` whose submit
+                       landed (the newest at all when none did; `history`); its
+                       `arch=` mark says where the archive stood when it began,
+                       and the report opens at the last `❯` row in column 0 whose
+                       text begins with the turn's first 60 characters
+                       (whitespace ignored, so a wrap never matters) — or, when
+                       the turn's text is a paste (a line break, or 200+
+                       characters) Claude Code shows as `[Pasted text #N +L
+                       lines]`, the last such row if its L fits the text. With no
+                       turn in the ledger (you typed with `prompt` or by hand):
+                       the last `❯` row (marker=user-row). --since ORIGIN:I (a
+                       `last=` from an earlier report) starts right after that
+                       archived row (marker=since). The rows come from ONE
+                       `offscreen … max=<--max-rows> screen=1` read (`since=<mark>`,
+                       or `tail=` with no mark): the archived rows, then the
+                       screen's, less the rows it shows again from the archive
+                       that the read got and everything from the live zone down
+                       (a spinner or `Waiting for …` status row and what hangs
+                       under it — under a done row, only what hangs under it — or,
+                       above an idle composer, the blank rows, right-aligned
+                       hints, tips and survey parked there — the composer, its
+                       footer), found by position; every other row is kept
+                       verbatim (done rows, tables, todo items, code), blank rows
+                       at either end aside. archived=/screen= count where the
+                       rows came from. complete=1 only when the host kept an
+                       archive, the start was found, the archive is the one the
+                       mark named, the worker is on the alternate screen, no row
+                       after the start was evicted and no gap lies after it, and
+                       --max-rows (default 8000) held every row; otherwise
+                       reason= lists why: no-archive (a host without `offscreen`
+                       or with its archive off, or an `aterm ctl` too old to
+                       relay the rows: the screen alone), main-screen (the worker
+                       is not on the alternate screen — not a fullscreen app, or
+                       it left one: its main screen's scrollback is not read),
+                       archive-reset (the host restarted or handed the session
+                       over since the mark), archive-gap (rows evicted, or a
+                       redraw with no overlap, a resize or a reset after the
+                       start: something may be missing), max-rows (more rows
+                       than --max-rows: some were not read; raise it),
+                       marker-not-found (everything read, from the top). With a
+                       start found in the archive, a gap the read counts after
+                       the mark is placed against it with a one-row `offscreen`
+                       read: one just before your turn (a resize) is not a gap in
+                       it. Exit 0 whatever complete= says; 1 when a request fails
+                       (the session gone, the host unreachable).
     --reconnect-s S    (await-turn, supervise, watch) An aterm self-update hands
                        every session to the new instance under the same @sid, and
                        a request in flight may get no answer (`server closed the
@@ -801,6 +921,51 @@ SUPERVISING A WORKER (a Claude Code session in another tab; `@sid` from `aterm c
                        `aterm ctl instances` prints) goes with its instance, so
                        every ride-out through one lapses: leave both unset, or
                        name the `aterm.sock` alias.
+    --dismiss-surveys  (supervise, watch) Dismiss Claude Code's session survey
+                       rather than report it. When it appears, press `0` — only
+                       `0`, never a rating — GUARDED: `key
+                       if=^●.How.is.Claude.doing 0`, the check and the press
+                       under one lock (`OK skipped` means no row matched and
+                       nothing was written), then look again from a fresh read.
+                       The survey gone there, print `DISMISSED survey seq=<n>`
+                       (the press's seq; watch: stdout, supervise: stderr) and
+                       append one --notes line — nothing for a skipped press.
+                       Still open there (the `0` did not take, or the guard
+                       matched no row of it), it is handed to you: the `EVENT
+                       survey` line and a --notes line, and it is not pressed
+                       again while it stays open. A `0` that landed in the
+                       composer instead (the survey had left first, or did not
+                       take it) is backspaced and noted, and nothing is
+                       dismissed. Nothing is pressed while a prompt box is up or
+                       text is typed in the composer (the survey waits), and a
+                       host without `key if=` gets no `0` at all: the survey is
+                       reported as without the flag.
+    --context-warn PCT (supervise, watch) Watch Claude Code's context indicator
+                       (`<n>% until auto-compact` above the composer; see phase) on
+                       every read of a turn, a busy one included. The first reading
+                       at or below PCT (default 10; 0 to 100; 0 = off: neither
+                       line) prints `EVENT context seq=<n> <v>% until
+                       auto-compact`, once a descent. After it, a read that shows
+                       the composer frame, no approval box and no indicator — or
+                       one that reads 30 points or more over the last — prints
+                       `EVENT compacted seq=<n>` once, and the warning is armed
+                       again for the next descent. watch: stdout; supervise:
+                       stderr. supervise's watch lasts one run: each run starts
+                       armed (one that starts low warns again), so a compaction
+                       between two runs, while you act on a result, leaves it
+                       nothing to see and prints no `EVENT compacted`. After an
+                       `EVENT context`, check `phase` before the next run: no
+                       `context <n>%` line (and no box up) is the compaction.
+                       watch keeps one watch for as long as it runs. Only the
+                       indicator is read: nothing Claude Code says about
+                       compacting. A compaction replaces the worker's history
+                       with a summary, and standing rules you gave it (run
+                       nothing heavy while a flag file exists, say) can silently
+                       drop out. On `EVENT context`, have the worker bring its
+                       handoff and notes up to date before it compacts; on
+                       `EVENT compacted`, re-send your standing rules in one
+                       turn. Never type /compact or /clear into the worker for it
+                       without the human.
 
 OPTIONS
     --socket PATH   The target aterm's control socket. Defaults to
@@ -856,7 +1021,9 @@ EXAMPLES
     aterm-drive supervise @s-1e918c46 --auto-reads --max-s 1800 --notes notes.txt
     # the same loop, never exiting at a review point: one stdout line per
     # decision — run it under your harness's background monitor:
-    aterm-drive watch @s-1e918c46 --auto-reads --notes notes.txt
+    aterm-drive watch @s-1e918c46 --auto-reads --notes notes.txt --report
+    # everything the worker said since your turn, what scrolled off included:
+    aterm-drive report @s-1e918c46
 
 GOTCHA
     Submit with a real Enter keypress (this tool uses `key enter`), never a raw

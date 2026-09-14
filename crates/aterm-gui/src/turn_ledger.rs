@@ -52,6 +52,41 @@ pub struct TurnRecord {
     pub screen_hash: u64,
     /// The engine `content_seq` at settle (matches the `turn` reply's `seq=`).
     pub seq: u64,
+    /// Where the session's alt-screen archive stood when the turn STARTED (before
+    /// a byte was typed): `offscreen since=<origin>:<last>` then reads exactly the
+    /// rows a fullscreen app scrolled off the top during and after this turn.
+    /// `history` prints it as `arch=<origin>:<last>`.
+    pub arch: ArchMark,
+}
+
+/// A position in a session's alt-screen archive (`aterm_core`'s `AltArchive`):
+/// the archive's host-assigned `origin` and its newest index `last` (0 = nothing
+/// archived yet). Printed `<origin>:<last>` — the exact token `offscreen
+/// since=` accepts, so a mark from another process (a handoff, a restart) reads
+/// from the start of the new archive instead of from an unrelated index.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct ArchMark {
+    /// The archive's origin (unique per aterm process; 0 when the host never set one).
+    pub origin: u64,
+    /// The newest archived index at the mark.
+    pub last: u64,
+}
+
+impl ArchMark {
+    /// The mark of `term`'s archive as it stands now. Caller holds the term lock.
+    pub(crate) fn of(term: &aterm_core::terminal::Terminal) -> Self {
+        let archive = term.alt_archive();
+        Self {
+            origin: archive.origin(),
+            last: archive.last(),
+        }
+    }
+}
+
+impl std::fmt::Display for ArchMark {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{}:{}", self.origin, self.last)
+    }
 }
 
 /// A session's bounded turn history, newest-last, drop-oldest at [`LEDGER_CAP`].
@@ -165,6 +200,7 @@ mod tests {
             text: format!("msg{id}"),
             screen_hash: id,
             seq: id,
+            arch: ArchMark::default(),
         }
     }
 

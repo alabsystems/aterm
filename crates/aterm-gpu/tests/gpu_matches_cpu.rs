@@ -1013,12 +1013,15 @@ fn linear_mode_matches_cpu_and_keeps_procedural_exact() {
     let input = term.cell_frame(rows, cols);
 
     // Default (corrected) CPU frame, kept for the non-vacuity control below.
-    let corrected_frame = cpu.render_input(&input);
+    // SETTLED: this test renders the CPU twice and the GPU once, and the fallback
+    // chain lands from a background parse on whichever render polls it, so an
+    // unsettled comparison reads that arrival as a divergence (see `settled_cpu`).
+    let corrected_frame = common::settled_cpu(&mut cpu, &input);
 
     cpu.set_text_blending(aterm_render::TextBlending::Linear);
     gpu.set_text_blending(aterm_render::TextBlending::Linear);
-    let cpu_frame = cpu.render_input(&input);
-    let gpu_frame = gpu.render_input(&mut win, &input, None);
+    let cpu_frame = common::settled_cpu(&mut cpu, &input);
+    let gpu_frame = common::settled_gpu(&mut gpu, &mut win, &input);
 
     let delta = max_channel_delta(&cpu_frame, &gpu_frame);
     eprintln!("linear-mode GPU vs CPU max per-channel delta = {delta}");

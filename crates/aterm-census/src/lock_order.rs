@@ -275,6 +275,14 @@ const GUARD_HELPERS: &[GuardHelper] = &[
         def_file: "crates/aterm-gui/src/lib.rs",
     },
     GuardHelper {
+        // P63's REGISTERING acquire (the UI thread's `term_lock` that books its
+        // wait): its body blocks on `term_lock(term)`, so it is the same lock and
+        // the same graph node — its callers' holds must be as visible as `term_lock`'s.
+        symbol: "term_lock_ui",
+        identity: "term",
+        def_file: "crates/aterm-gui/src/lib.rs",
+    },
+    GuardHelper {
         symbol: "lock_fonts",
         identity: "chrome_fonts",
         def_file: "crates/aterm-gui/src/tray_raster.rs",
@@ -3245,8 +3253,12 @@ mod tests {
             // term_lock's registered def_file (moved main.rs -> lib.rs in the
             // ONE-binary refactor); must match GUARD_HELPERS above.
             "crates/aterm-gui/src/lib.rs".to_string(),
+            // `term_lock_ui` shares the file and the `term` identity: its interior
+            // acquires through `term_lock(term)`, exactly as the shipping helper does.
             "pub(crate) fn term_lock(term: &Mutex<Terminal>) -> TermGuard<'_> {\n    \
-             term.lock().unwrap()\n}\n"
+             term.lock().unwrap()\n}\n\
+             pub(crate) fn term_lock_ui(term: &Mutex<Terminal>, w: &AtomicU32) -> TermGuard<'_> {\n    \
+             term_lock(term)\n}\n"
                 .to_string(),
         ));
         files.push((

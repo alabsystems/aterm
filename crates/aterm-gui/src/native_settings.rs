@@ -5108,7 +5108,7 @@ fn renderer_preview_spec_for_key_with_font(
         accent: field_color(state, prefs::EDIT_CURSOR_TRAIL_ACCENT),
         duration_ms: field_number(state, prefs::EDIT_CURSOR_TRAIL_MS, 260_u64),
         length: field_number(state, prefs::EDIT_CURSOR_TRAIL_LENGTH, 24_usize),
-        intensity: field_number(state, prefs::EDIT_CURSOR_TRAIL_INTENSITY, 0.7_f32),
+        intensity: field_number(state, prefs::EDIT_CURSOR_TRAIL_INTENSITY, 1.0_f32),
         radius: field_number(state, prefs::EDIT_CURSOR_TRAIL_RADIUS, 0.6_f32),
         ring: field_bool(state, prefs::EDIT_CURSOR_TRAIL_RING, true),
         // The typing-wake dial is authored in MILLISECONDS of recent travel (the

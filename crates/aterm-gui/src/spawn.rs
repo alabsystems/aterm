@@ -938,10 +938,24 @@ pub(crate) fn spawn_session(
     ));
     // Per-session live byte fan-out (Item 2): the reader thread tees every burst.
     let byte_fanout = Arc::new(crate::cast::ByteFanout::new());
+    // Build the live engine (config applied, DEC 1007 alternate-scroll defaulted ON)
+    // BEFORE the reader thread starts, byte-identical to the single-session startup.
+    let term = Arc::new(Mutex::new(new_live_terminal(
+        rows,
+        cols,
+        factory.terminal_config.as_ref(),
+        factory.appearance,
+        cell_px,
+    )));
+    // …and hand its lock-free input-mode mirror to the session context: the seam
+    // reads it per key press instead of taking the terminal mutex.
+
     // Per-session fabric identity (day-one single local session: a fresh id+nonce).
     let ctx = Arc::new(SessionCtx {
         sink: sink.clone(),
         output_echo: Arc::new(crate::app_input::OutputEchoTracker::default()),
+        modes: crate::mode_mirror_of(&term),
+        ui_waiting: Arc::default(),
         edges: std::sync::Mutex::new(EdgeTable::new()),
         turn_lease: std::sync::Mutex::new(None),
         self_id,
@@ -964,16 +978,6 @@ pub(crate) fn spawn_session(
     if id == 0 {
         register_injected_parent_edges(&ctx);
     }
-
-    // Build the live engine (config applied, DEC 1007 alternate-scroll defaulted ON)
-    // BEFORE the reader thread starts, byte-identical to the single-session startup.
-    let term = Arc::new(Mutex::new(new_live_terminal(
-        rows,
-        cols,
-        factory.terminal_config.as_ref(),
-        factory.appearance,
-        cell_px,
-    )));
 
     // SEAMLESS SCREEN CARRY: hydrate the adopted engine with the outgoing
     // process's checkpoint BEFORE the reader starts (no engine race) and before
@@ -1509,7 +1513,9 @@ fn attach_reader_inner(
     };
     // Dedicated reply-writer thread: the reader hands query replies here instead
     // of writing them inline, so it never parks on the input-pipe write.
-    let reply_tx = spawn_reply_writer(session.ctx.sink.clone())?;
+    // The join handle is dropped (detached): the thread ends on its own when its
+    // reader drops the sender or the sink drops (see `spawn_reply_writer`).
+    let (reply_tx, _reply_writer_join) = spawn_reply_writer(session.ctx.sink.clone())?;
 
     // THRU-5: dedicated tier-compression worker. Only when it actually spawns do
     // we activate the offload on the engine — so a spawn failure cleanly falls
@@ -1517,7 +1523,7 @@ fn attach_reader_inner(
     // threshold) rather than deferring to a worker that does not exist. Set
     // explicitly BOTH ways: a re-attach whose worker fails must deactivate the
     // offload a previous attach turned on.
-    let compress_tx = spawn_compress_worker(session.term.clone());
+    let compress_tx = spawn_compress_worker(session.term.clone(), session.ctx.ui_waiting.clone());
     crate::term_lock(&session.term).set_compress_offload_active(compress_tx.is_some());
 
     // MEM-L2 wake resources are created only after every helper thread exists. A
@@ -1546,6 +1552,7 @@ fn attach_reader_inner(
         last_output_ns: session.last_output_ns.clone(),
         latest_output_activity_ns: session.latest_output_activity_ns.clone(),
         output_wake_pending: session.output_wake_pending.clone(),
+        ui_waiting: session.ctx.ui_waiting.clone(),
         wake_rd,
         stop: session.reader_stop.clone(),
         start_gate,
@@ -1787,7 +1794,34 @@ pub(crate) fn new_live_terminal(
     // apply_config never touches alternate_scroll, so ordering is irrelevant; set it
     // last to make the default-on unmistakable.
     t.modes_mut().alternate_scroll = true;
+    // The alt-screen archive's ORIGIN: its indices mean something only inside this
+    // process, so a mark a driver holds from a previous process (a self-update
+    // handoff, a restart) must never be read as an index into this one.
+    t.set_alt_archive_origin(alt_archive_origin());
     t
+}
+
+/// This process's alt-screen archive ORIGIN, stamped on every live session's
+/// archive ([`new_live_terminal`]) and printed by `offscreen origin=` and the turn
+/// ledger's `arch=<origin>:<last>` marks: `pid << 32 ^ launch nanos`, fixed at the
+/// first call and never 0.
+///
+/// WHY a process identity and not a per-session counter: archive indices restart
+/// at 1 in every process, so after a self-update handoff a driver's `since=1203`
+/// would silently read a NEW archive's unrelated row 1204. `offscreen
+/// since=<origin>:<i>` names the origin the index was minted under, and one that
+/// is not this process's reads from the start instead, with `origin=` saying why.
+/// The pid alone repeats across reboots and the clock alone repeats across two
+/// processes launched in one tick; together they do not in practice.
+pub(crate) fn alt_archive_origin() -> u64 {
+    static ORIGIN: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
+    *ORIGIN.get_or_init(|| {
+        let nanos = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map_or(0, |d| u64::try_from(d.as_nanos()).unwrap_or(u64::MAX));
+        let origin = (u64::from(std::process::id()) << 32) ^ nanos;
+        origin.max(1)
+    })
 }
 
 /// The fast in-memory grid ring for a live session, in lines — held at the pre-SCROLL-1
@@ -2427,7 +2461,8 @@ fn spawn_temporal_writer(
 /// the write keeps the reader returning to `read()` so output always drains; FIFO
 /// preserves reply order and the sink's whole-frame lock still serializes it
 /// against every other writer. An idle terminal parks on `recv()`; the thread
-/// ends when the reader drops the sender at EOF (releasing its `Arc<SinkWriter>`).
+/// ends when every sender is gone — the reader's at EOF, and the spill
+/// arranger's when the sink's last strong clone drops (it holds the sink weakly).
 /// MEM-L3: the reply queue is BOUNDED. The writer drains it with a BLOCKING
 /// `write_frame`, so if a local child floods DA/DSR/CPR queries yet never reads its
 /// own stdin the write parks and the always-draining reader would otherwise pile
@@ -2438,20 +2473,250 @@ fn spawn_temporal_writer(
 /// capability-probe burst ever drops.
 const REPLY_QUEUE_CAP: usize = 1024;
 
+/// What the reply-writer thread is asked to do. Terminal replies are its job;
+/// arranging the sink's spill drainer is the second, so a keystroke that
+/// concedes the fd lock never `dup`s and `pthread_create`s on the UI thread.
+pub(crate) enum ReplyJob {
+    /// A DA/DSR/CPR/kitty-query reply from the parser, written in order.
+    Bytes(std::sync::Arc<[u8]>),
+    /// A non-parking writer spilled with no drainer live: spawn it from here.
+    ArrangeSpillDrainer,
+}
+
 fn spawn_reply_writer(
     sink: Arc<SinkWriter>,
-) -> Result<std::sync::mpsc::SyncSender<std::sync::Arc<[u8]>>, String> {
-    let (reply_tx, reply_rx) =
-        std::sync::mpsc::sync_channel::<std::sync::Arc<[u8]>>(REPLY_QUEUE_CAP);
+) -> Result<
+    (
+        std::sync::mpsc::SyncSender<ReplyJob>,
+        std::thread::JoinHandle<()>,
+    ),
+    String,
+> {
+    let (reply_tx, reply_rx) = std::sync::mpsc::sync_channel::<ReplyJob>(REPLY_QUEUE_CAP);
+    // LIFETIME. The spill-arranger `poke` installed below is a sender of THIS
+    // thread's channel and lives inside the sink's `Shared`, so the thread may
+    // hold the sink only WEAKLY: a strong clone would close the cycle thread →
+    // sink → arranger → sender → channel, in which `recv()` never disconnects
+    // and every closed session leaks its writer thread, its spill state and the
+    // PTY master — `Session::drop` closes the master precisely by letting the
+    // LAST `Arc<SinkWriter>` drop. Weak, the last external clone (ctx, window
+    // mirrors, the reader at EOF) frees `Shared`, the `poke` goes with it, and
+    // `recv()` returns `Err`. Pinned by `reply_writer_lifetime_tests`.
+    let weak = Arc::downgrade(&sink);
+    let join = spawn_reply_writer_thread(move || {
+        // Holds `Shared.lock` — the mutex the keystroke write spins on — for
+        // every reply it writes, so it must not run below the UI thread (the
+        // qos.rs floor rule); at the inherited DEFAULT class a descheduled
+        // hold turned into a keystroke's lost spin and a spill concession.
+        crate::qos::set_self(crate::qos::Role::Interactive);
+        while let Ok(job) = reply_rx.recv() {
+            // Every sender is held by a holder of a strong clone, so a failed
+            // upgrade means that holder was the last and dropped it after
+            // sending: the master is already closed, nothing is left to write.
+            let Some(sink) = weak.upgrade() else { break };
+            match job {
+                // The same whole-frame NON-PARKING write the keystroke path
+                // uses: on the O_NONBLOCK master its hold is ONE write(2)
+                // (no poll under the lock); a full tty spills the tail to the
+                // ordered drainer instead of parking here with the lock held.
+                // Oversized replies fall back to the blocking path inside.
+                ReplyJob::Bytes(resp) => {
+                    let _ = sink.write_frame_nonparking(&resp);
+                }
+                ReplyJob::ArrangeSpillDrainer => sink.arrange_pending_drainer(),
+            }
+        }
+    })
+    .map_err(|error| format!("spawn reply writer: {error}"))?;
+    // The UI thread's keystroke write concedes the fd lock to whoever holds it;
+    // this thread is one such holder. Hand it the drainer-arrangement duty so a
+    // concession is a VecDeque push plus a `try_send` here, never a thread
+    // creation on the event loop. A full queue drops the poke, and the next
+    // conceding write re-pokes (the mark stays pending) — never stranded. The
+    // slot is first-install-wins: a re-attach's writer installs nothing (its
+    // clone is dropped), so the FIRST attach's writer carries the duty for the
+    // sink's whole life and later writers hold only their reader's sender.
+    // ORDER: installed only now that the thread EXISTS. Installed before the
+    // spawn, a spawn failure (EAGAIN — `attach_reader_inner` returns Err and
+    // `attach_deferred_readers` retries the session) would leave a poke into a
+    // receiver-less channel holding the slot for the sink's whole life: the
+    // retry's writer could not install, every later concession would take the
+    // sink's `defer` arm with its poke swallowed, and accepted keystrokes would
+    // never be delivered. After a failed spawn the slot stays EMPTY (inline
+    // arrangement stays live) and the retried attach's writer becomes the
+    // arranger worker — `a_failed_spawn_leaves_the_arranger_slot_to_the_
+    // retried_attach`. The fn's own `sink` handle drops at return; the thread
+    // never held a strong one.
+    {
+        let poke = reply_tx.clone();
+        sink.install_spill_arranger(move || {
+            let _ = poke.try_send(ReplyJob::ArrangeSpillDrainer);
+        });
+    }
+    Ok((reply_tx, join))
+}
+
+/// The reply writer's ONE thread creation, behind a seam
+/// `reply_writer_lifetime_tests` can fail on demand: thread exhaustion
+/// (EAGAIN) is the failure `spawn_reply_writer` must leave no trace of, and it
+/// cannot be provoked reliably in a test.
+fn spawn_reply_writer_thread(
+    body: impl FnOnce() + Send + 'static,
+) -> std::io::Result<std::thread::JoinHandle<()>> {
+    if take_injected_reply_writer_spawn_fault() {
+        return Err(std::io::Error::other("injected reply-writer spawn failure"));
+    }
     std::thread::Builder::new()
         .name("aterm-reply-writer".into())
-        .spawn(move || {
-            while let Ok(resp) = reply_rx.recv() {
-                let _ = sink.write_frame(&resp);
-            }
-        })
-        .map_err(|error| format!("spawn reply writer: {error}"))?;
-    Ok(reply_tx)
+        .spawn(body)
+}
+
+#[cfg(test)]
+thread_local! {
+    /// Armed by a test on ITS thread: the next `spawn_reply_writer_thread` on
+    /// that thread fails instead of spawning (one-shot, consumed by the check).
+    static REPLY_WRITER_SPAWN_FAULT: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+#[cfg(test)]
+fn take_injected_reply_writer_spawn_fault() -> bool {
+    REPLY_WRITER_SPAWN_FAULT.with(|f| f.replace(false))
+}
+
+/// Shipping builds have no fault seam: the spawn is always attempted.
+#[cfg(not(test))]
+fn take_injected_reply_writer_spawn_fault() -> bool {
+    false
+}
+
+#[cfg(all(test, unix))]
+mod reply_writer_lifetime_tests {
+    //! P04 repair — the reply writer's spill-arranger duty must not pin the
+    //! session. The arranger's sender lives inside the sink, so a writer thread
+    //! holding the sink STRONGLY kept its own channel open forever and, with it,
+    //! the closed session's spill state and PTY master (`Session::drop` closes
+    //! the master by dropping the LAST `Arc<SinkWriter>`). Both tests fail red
+    //! on that tree: the writer never exits and the peer never sees EOF.
+    use super::{ReplyJob, spawn_reply_writer};
+    use aterm_session::sink::SinkWriter;
+    use std::io::Read as _;
+    use std::os::unix::net::UnixStream;
+    use std::sync::Arc;
+    use std::time::{Duration, Instant};
+
+    /// A master-owning sink over one end of a socketpair; the peer sees what it
+    /// writes and EOF when the sink's `OwnedFd` closes.
+    fn sink_and_peer() -> (Arc<SinkWriter>, UnixStream) {
+        let (peer, writer) = UnixStream::pair().expect("socketpair");
+        peer.set_read_timeout(Some(Duration::from_secs(5)))
+            .expect("read timeout");
+        let owned: std::os::fd::OwnedFd = writer.into();
+        (Arc::new(SinkWriter::new_owned(owned)), peer)
+    }
+
+    fn wait_finished(join: &std::thread::JoinHandle<()>, what: &str) {
+        let t0 = Instant::now();
+        while !join.is_finished() {
+            assert!(t0.elapsed() < Duration::from_secs(5), "{what} never exited");
+            std::thread::sleep(Duration::from_millis(1));
+        }
+    }
+
+    #[test]
+    fn the_last_external_sink_clone_closes_the_master_and_ends_the_writer() {
+        let (sink, mut peer) = sink_and_peer();
+        let weak = Arc::downgrade(&sink);
+        let (reply_tx, join) = spawn_reply_writer(sink.clone()).expect("spawn");
+        reply_tx
+            .send(ReplyJob::Bytes(Arc::from(&b"ok"[..])))
+            .expect("queued");
+        let mut buf = [0u8; 2];
+        peer.read_exact(&mut buf).expect("the reply is written");
+        assert_eq!(&buf, b"ok");
+        // The reader exiting at EOF (its sender) and the session tearing down
+        // (the ctx / mirror clones) — the MEM-L2 close path.
+        drop(reply_tx);
+        drop(sink);
+        wait_finished(&join, "the reply writer");
+        assert_eq!(
+            weak.strong_count(),
+            0,
+            "no strong clone may survive the session"
+        );
+        let n = peer
+            .read(&mut buf)
+            .expect("EOF, not a read timeout: the master fd must have closed");
+        assert_eq!(n, 0, "EOF");
+    }
+
+    #[test]
+    fn a_reattached_writer_ends_with_its_reader_and_the_first_with_the_sink() {
+        let (sink, mut peer) = sink_and_peer();
+        let (first_tx, first_join) = spawn_reply_writer(sink.clone()).expect("spawn");
+        let (second_tx, second_join) = spawn_reply_writer(sink.clone()).expect("re-attach");
+        drop(first_tx);
+        drop(second_tx);
+        // The re-attach's writer holds nothing but its reader's sender: gone now.
+        wait_finished(&second_join, "the re-attached reply writer");
+        // The first carries the arranger duty for as long as the sink lives…
+        std::thread::sleep(Duration::from_millis(20));
+        assert!(
+            !first_join.is_finished(),
+            "the arranger-bearing writer must serve the live sink"
+        );
+        // …and no longer, so the master still closes with the session.
+        drop(sink);
+        wait_finished(&first_join, "the first reply writer");
+        let n = peer
+            .read(&mut [0u8; 1])
+            .expect("EOF, not a read timeout: the master fd must have closed");
+        assert_eq!(n, 0, "EOF");
+    }
+
+    /// The arranger slot is first-install-wins for the sink's whole life, so
+    /// it may only ever hold a sender whose writer thread EXISTS. Installed
+    /// before the spawn, a failed spawn (`attach_reader_inner` returns Err,
+    /// `attach_deferred_readers` retries the same session) leaves a poke into a
+    /// receiver-less channel in the slot: the retry's writer cannot install,
+    /// every later UI-thread concession takes the `defer` arm with its poke
+    /// swallowed, no drainer is ever arranged, and accepted keystrokes are
+    /// never delivered. Observable here: the retried attach's writer must be
+    /// the arranger worker — it outlives its reader's sender while the sink
+    /// lives — which is only true when the failed attempt installed nothing.
+    #[test]
+    fn a_failed_spawn_leaves_the_arranger_slot_to_the_retried_attach() {
+        let (sink, mut peer) = sink_and_peer();
+        super::REPLY_WRITER_SPAWN_FAULT.with(|f| f.set(true));
+        let err =
+            spawn_reply_writer(sink.clone()).expect_err("the injected spawn failure surfaces");
+        assert!(err.contains("spawn reply writer"), "{err}");
+        assert!(
+            !super::take_injected_reply_writer_spawn_fault(),
+            "the fault is one-shot: consumed by the failed attempt"
+        );
+        // The retry — a fresh writer into the same sink.
+        let (retry_tx, retry_join) = spawn_reply_writer(sink.clone()).expect("the retry spawns");
+        retry_tx
+            .send(ReplyJob::Bytes(Arc::from(&b"ok"[..])))
+            .expect("queued");
+        let mut buf = [0u8; 2];
+        peer.read_exact(&mut buf)
+            .expect("the retry's writer writes");
+        assert_eq!(&buf, b"ok");
+        drop(retry_tx);
+        std::thread::sleep(Duration::from_millis(50));
+        assert!(
+            !retry_join.is_finished(),
+            "the retried attach's writer must carry the arranger duty: a failed spawn \
+             may not leave its dead sender in the slot"
+        );
+        drop(sink);
+        wait_finished(&retry_join, "the retried reply writer");
+        let n = peer
+            .read(&mut buf)
+            .expect("EOF, not a read timeout: the master fd must have closed");
+        assert_eq!(n, 0, "EOF");
+    }
 }
 
 // THRU-5: off-thread tier-compression worker tuning.
@@ -2490,7 +2755,10 @@ const COMPRESS_TRICKLE_INTERVAL: std::time::Duration = std::time::Duration::from
 /// leaves the offload INACTIVE, so the reader keeps draining inline at the 1000-
 /// line threshold (the pre-THRU-5 behavior). Ends when the reader drops the
 /// returned sender (session drop / EOF), exactly like the reply/cast writers.
-fn spawn_compress_worker(term: Arc<Mutex<Terminal>>) -> Option<std::sync::mpsc::SyncSender<()>> {
+fn spawn_compress_worker(
+    term: Arc<Mutex<Terminal>>,
+    ui_waiting: Arc<std::sync::atomic::AtomicU32>,
+) -> Option<std::sync::mpsc::SyncSender<()>> {
     let (tx, rx) = std::sync::mpsc::sync_channel::<()>(COMPRESS_SIGNAL_CAP);
     std::thread::Builder::new()
         .name("aterm-scrollback-compress".into())
@@ -2525,6 +2793,8 @@ fn spawn_compress_worker(term: Arc<Mutex<Terminal>>) -> Option<std::sync::mpsc::
                     if last_trickle.elapsed() >= COMPRESS_TRICKLE_INTERVAL {
                         term_lock(&term).drain_lazy_bounded(COMPRESS_BUDGET);
                         last_trickle = std::time::Instant::now();
+                        // Same slice-boundary handoff as the reader (P63).
+                        crate::yield_to_ui_waiter(&ui_waiting);
                     }
                 }
                 // Timeout = quiet; Disconnected = session teardown. Either way
@@ -2548,6 +2818,9 @@ fn spawn_compress_worker(term: Arc<Mutex<Terminal>>) -> Option<std::sync::mpsc::
                         break;
                     }
                     prev = remaining;
+                    // Hand the boundary to a parked UI acquisition first (P63),
+                    // then the historical scheduler yield.
+                    crate::yield_to_ui_waiter(&ui_waiting);
                     std::thread::yield_now();
                 }
             }
@@ -2683,6 +2956,9 @@ fn spawn_pty_gather(
                                 n,
                                 wake_rd,
                                 Some(parse_in_flight.as_ref()),
+                                // The same interactive-input-pending hint the
+                                // parse stage slices its lock holds on (P05).
+                                crate::metrics::input_pending,
                             )
                         } else {
                             aterm_pty::drain_more(master, &mut buf, n)
@@ -2729,7 +3005,7 @@ struct PtyReaderWiring {
     /// Query-reply sink: the reader hands DA/DSR/CPR replies to the dedicated
     /// reply-writer thread over this FIFO instead of writing them inline (the
     /// inline write could block on the input pipe and deadlock the session).
-    reply_tx: std::sync::mpsc::SyncSender<std::sync::Arc<[u8]>>,
+    reply_tx: std::sync::mpsc::SyncSender<ReplyJob>,
     /// THRU-5 compression-worker signal (`None` when the worker could not spawn ⇒
     /// offload inactive, reader drains inline). The reader `try_send`s a token
     /// after a burst once its lazy backlog crosses `COMPRESS_SIGNAL_AT`; the
@@ -2758,6 +3034,10 @@ struct PtyReaderWiring {
     /// bounding wake traffic during an output flood without ever losing the final
     /// burst. Self-expiring — see [`gated_output_wake`].
     output_wake_pending: Arc<AtomicU64>,
+    /// UI-waiter register shared with the owning `Session` (`SessionCtx::ui_waiting`):
+    /// non-zero while a UI-thread acquisition is parked on this terminal's mutex.
+    /// Read between slices so the boundary becomes a handoff (P63).
+    ui_waiting: Arc<std::sync::atomic::AtomicU32>,
     /// Read end of this session's wake pipe (MEM-L2): `Session::drop` writes the paired
     /// write end to break this reader out of a `read` that an orphaned child keeps from
     /// EOF'ing. `-1` when no pipe could be made ⇒ the wake-pipe-less fallback poll. Owned
@@ -2798,6 +3078,7 @@ fn spawn_pty_reader(w: PtyReaderWiring) -> Result<std::thread::JoinHandle<()>, S
         last_output_ns,
         latest_output_activity_ns,
         output_wake_pending,
+        ui_waiting,
         wake_rd,
         stop,
         start_gate,
@@ -3029,6 +3310,17 @@ fn spawn_pty_reader(w: PtyReaderWiring) -> Result<std::thread::JoinHandle<()>, S
                             }
                         }
                         off = end;
+                        // THE HANDOFF (P63). The guard above just dropped; on macOS's
+                        // unfair pthread mutex a UI thread parked on it would need
+                        // 10-30 µs to wake while this loop re-takes the lock in ~100 ns,
+                        // so without this the press/redraw waiter lost every slice
+                        // boundary and waited out the whole batch. Spin — bounded —
+                        // only while a UI acquisition is actually registered, and only
+                        // when another slice follows (at the batch end the reader goes
+                        // to `recv`, which is release enough).
+                        if off < bytes.len() {
+                            crate::yield_to_ui_waiter(&ui_waiting);
+                        }
                     }
                     acc
                 };
@@ -3061,7 +3353,7 @@ fn spawn_pty_reader(w: PtyReaderWiring) -> Result<std::thread::JoinHandle<()>, S
                     // `try_send` (never `send`): on the full BOUNDED queue (MEM-L3) this
                     // DROPS the reply rather than blocking the reader — only reachable when a
                     // child floods queries without draining stdin, which is self-inflicted.
-                    let _ = reply_tx.try_send(resp);
+                    let _ = reply_tx.try_send(ReplyJob::Bytes(resp));
                 }
                 // Coalesce wakes: post `Wake::Output` only on the latch's clear->armed
                 // edge (see [`gated_output_wake`] for the protocol's guarantees).
@@ -4508,6 +4800,27 @@ mod kitty_transfer_tests {
         assert!(
             !t2.modes().alternate_scroll,
             "an app can still turn alternate scroll off"
+        );
+    }
+
+    /// Every live session's alt-screen archive carries THIS process's origin: set
+    /// (a bare `Terminal::new` leaves it 0), the same for two sessions of one
+    /// process (the id is the process, not the session), and stable across calls.
+    #[test]
+    fn live_session_archive_carries_the_process_origin() {
+        let a = new_live_terminal(10, 40, None, aterm_types::Appearance::Dark, None);
+        let b = new_live_terminal(12, 50, None, aterm_types::Appearance::Dark, None);
+        let origin = alt_archive_origin();
+        assert_ne!(origin, 0, "an origin of 0 is the unset value");
+        assert_eq!(origin, alt_archive_origin(), "fixed for the process");
+        assert_eq!(a.alt_archive().origin(), origin);
+        assert_eq!(b.alt_archive().origin(), origin);
+        assert_eq!(
+            aterm_core::terminal::Terminal::new(2, 2)
+                .alt_archive()
+                .origin(),
+            0,
+            "a bare engine has no host to name its origin"
         );
     }
 

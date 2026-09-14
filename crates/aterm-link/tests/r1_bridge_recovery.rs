@@ -23,7 +23,7 @@ mod harness;
 
 use std::time::Duration;
 
-use harness::{until, World, FLEET};
+use harness::{until, until_within, World, FLEET};
 
 /// The `msg` row ids and texts a session's ring holds, `--peek` so nothing is
 /// listed or marked by looking.
@@ -558,11 +558,25 @@ fn a_post_that_becomes_unroutable_leaves_no_reservation_and_no_pin() {
     });
     std::fs::remove_file(&marker).expect("let the publish through");
 
-    let verdict = until("the post to be retired at the door", || {
-        w.ev()
-            .into_iter()
-            .find(|e| e.starts_with("undeliverable ") && e.contains(&format!("to=@{b}")))
-    });
+    // PERIOD-DRIVEN, so it waits on the harness's slower clock (see
+    // `until_within`): nothing PUSHES this retirement. The door re-resolves the
+    // address on a drain, and the drain that finally answers `unroutable` is the
+    // one that runs after the bridge's own periodic re-read has moved the roster
+    // under it — `FEED_RETRY` (250 ms) gated by `ROSTER_REFRESH` (2 s). On a
+    // quiet machine it lands in milliseconds; under the workspace gate (dozens of
+    // test binaries, this bridge one starved process among them) it did not land
+    // inside the 60 s event-driven budget on 2026-09-13, and the crate is
+    // untouched by that train. This is still a hang detector: a door that never
+    // retires the post fails, just later.
+    let verdict = until_within(
+        harness::PERIODIC_DEADLINE,
+        "the post to be retired at the door (a drain after the periodic roster re-read)",
+        || {
+            w.ev()
+                .into_iter()
+                .find(|e| e.starts_with("undeliverable ") && e.contains(&format!("to=@{b}")))
+        },
+    );
     assert!(
         verdict.contains("reason=unroutable"),
         "a session whose only roster row says `state=exited` is not a route: {verdict}"

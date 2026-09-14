@@ -49,6 +49,66 @@ pub(crate) enum LeafIds {
     Retired,
 }
 
+/// The session filling a restored terminal leaf's pane, as
+/// [`App::carry_restored_identity`] is handed it — which decides how an
+/// identity can reach it.
+#[derive(Clone, Copy)]
+enum FillingShell<'a> {
+    /// The window's bootstrap, grafted onto the leaf: already registered and
+    /// served under its sid, so an identity arrives through the live door
+    /// ([`App::graft_restored_user_meta`]).
+    Registered(u64),
+    /// A session the leaf just spawned or re-adopted, which nobody can address
+    /// until it is registered: seeded directly
+    /// ([`App::seed_restored_user_meta`]).
+    Unregistered(&'a Session),
+}
+
+/// Remove and return the handed-off shell the outgoing process knew as
+/// `local_id`, when it is still waiting to be placed. Every adopt site matches
+/// through this — `main_entry` for session 0, `apply_restore_manifest` for each
+/// further window's bootstrap, the leaf builders for every other pane — and
+/// each match removes the shell, so none is adopted twice. A window or pane
+/// whose shell is already taken gets `None` here and spawns a fresh shell in
+/// its place.
+pub(crate) fn take_handed_off_shell(
+    handed_off: &mut Vec<crate::spawn::Adopted>,
+    local_id: Option<u64>,
+) -> Option<crate::spawn::Adopted> {
+    let local_id = local_id?;
+    let index = handed_off
+        .iter()
+        .position(|shell| shell.local_id == local_id)?;
+    Some(handed_off.remove(index))
+}
+
+/// The handed-off shell `main_entry` adopts as SESSION 0, removed from
+/// `handed_off`, or `None` for a fresh session 0. Session 0 is window 0's
+/// bootstrap, and the deferred restore grafts it onto the leaf
+/// [`restore::WindowLayout::bootstrap_local_id`] names, so it adopts the shell
+/// that leaf names.
+///
+/// A window 0 with NO terminal leaf (every tab a native view) names no shell,
+/// and none belongs in it: the handoff layout names every handed-off shell
+/// exactly once (`covers_exact_seamless_ids`), so each one's pane lies in a
+/// later window, which adopts it there. Session 0 is then a FRESH bootstrap,
+/// which window 0's native-only rebuild retires exactly as a cold restore
+/// retires it. Adopting a shell for it instead — the first one listed, as this
+/// pick once did — kept that shell in window 0 as an extra tab and put a fresh
+/// stand-in in its own pane.
+///
+/// With no layout to place by (a headless boot keeps none), the first shell;
+/// the orphan net places the rest.
+pub(crate) fn take_session0_shell(
+    handed_off: &mut Vec<crate::spawn::Adopted>,
+    layout: Option<&restore::RestoreManifest>,
+) -> Option<crate::spawn::Adopted> {
+    match layout.and_then(|layout| layout.windows.first()) {
+        Some(window0) => take_handed_off_shell(handed_off, window0.bootstrap_local_id()),
+        None => (!handed_off.is_empty()).then(|| handed_off.remove(0)),
+    }
+}
+
 /// Mint recovery authority only from the already-validated typed descriptor.
 /// Its copyable metadata is deliberately never parsed to recover a path/route.
 fn recovery_capability(
@@ -548,7 +608,14 @@ impl App {
         // manifest (its layout write failed) still falls through to the orphan net below,
         // so its handed-off shells are placed as tabs rather than stranded — the layout is
         // recoverable, a lost shell is not.
+        let mut handed_off_leaves = Vec::new();
         if let Some(manifest) = self.pending_restore.take() {
+            // The leaves naming handed-off shells outlive the manifest the rebuild
+            // consumes, so a shell the rebuild leaves over still gets its identity.
+            // A cold restore hands nothing off and keeps none.
+            if !self.seamless_adopt.is_empty() {
+                handed_off_leaves = manifest.handed_off_leaves();
+            }
             self.apply_restore_manifest(el, manifest);
         }
         // SEAMLESS orphan safety net: any handed-off live shell the layout did NOT place
@@ -556,7 +623,7 @@ impl App {
         // adopted anyway as a fresh tab in the front window. A live shell is NEVER dropped
         // just because its exact pane could not be reconstructed. A no-op on a cold
         // restore (`seamless_adopt` is empty).
-        self.adopt_orphan_shells_as_tabs();
+        self.adopt_orphan_shells_as_tabs(&handed_off_leaves);
     }
 
     /// SEAMLESS CONNECTION RE-MINT (design §1.4#6): re-establish the manifest's
@@ -705,19 +772,18 @@ impl App {
                 self.sync_active_session();
                 continue;
             }
-            let first_leaf = wl.tabs.first().and_then(|t| t.leaves().first().copied());
-            let cwd0: Option<String> = recursive_terminal
-                .and_then(|leaf| leaf.cwd.clone())
-                .or_else(|| first_leaf.and_then(|leaf| leaf.cwd()).map(String::from));
+            // The bootstrap starts in the directory of the pane it will fill — the
+            // leaf `bootstrap_local_id` names, by the same pick.
+            let cwd0: Option<String> = wl.bootstrap_cwd().map(String::from);
             // SEAMLESS: adopt this window's first-leaf shell as its bootstrap session
             // (matched by id), so the reopened window comes up with its LIVE shell rather
             // than a fresh one. Consumed (removed) so it is never adopted twice; a cold
             // restore's `seamless_adopt` is empty, so this is always `None` there. The
-            // same pick `main_entry` makes for window 0, so the graft's leaf names this shell.
-            let adopt = wl
-                .bootstrap_local_id()
-                .and_then(|id| self.seamless_adopt.iter().position(|a| a.local_id == id))
-                .map(|pos| self.seamless_adopt.remove(pos));
+            // same pick `main_entry` makes for window 0 (`take_session0_shell`), so the
+            // graft's leaf names this shell. An accepted handoff layout names each shell
+            // once, so it is still waiting here; were it taken, the window's bootstrap
+            // would be a fresh stand-in, which `carry_restored_identity` gives no identity.
+            let adopt = take_handed_off_shell(&mut self.seamless_adopt, wl.bootstrap_local_id());
             let outer = (wl.outer_x, wl.outer_y);
             let maximized = wl.maximized;
             let Some(wid) = self.create_window_internal(el, cwd0.as_deref(), adopt) else {
@@ -812,17 +878,23 @@ impl App {
     /// live shell handed across a seamless update is ever lost. Empty ⇒ no-op (every cold
     /// restore, and the normal seamless case where the layout placed them all).
     ///
-    /// An orphan comes back WITHOUT its USER metadata (`meta set` fields): the leaf
-    /// that carried them either did not rebuild or was filled by another shell (the
-    /// bootstrap a failed tab handed on, which `graft_restored_user_meta` refuses to
-    /// give that leaf's identity), and the manifest has been consumed by the time this
-    /// net runs. Every shell the layout placed in its own pane keeps it.
-    fn adopt_orphan_shells_as_tabs(&mut self) {
+    /// Each orphan comes back wearing the USER identity (`meta set` fields) of the
+    /// leaf in `handed_off_leaves` that names it — kept from the manifest the
+    /// rebuild consumed ([`restore::RestoreManifest::handed_off_leaves`]) and put on
+    /// through [`Self::carry_restored_identity`], before the orphan is registered. A
+    /// shell is left over because the leaf naming it never rebuilt (its tab failed
+    /// to build, or its window could not be created) or was filled by another shell
+    /// (the bootstrap a failed tab handed on, which gets none of that leaf's
+    /// identity); either way the identity reached nobody before this net. An orphan
+    /// no leaf names — there was no layout — comes back bare.
+    fn adopt_orphan_shells_as_tabs(&mut self, handed_off_leaves: &[restore::TerminalLeafRestore]) {
         if self.seamless_adopt.is_empty() {
             return;
         }
         let orphans = std::mem::take(&mut self.seamless_adopt);
-        let (Some(wid), Some(proxy)) = (self.frontmost_window, self.proxy.clone()) else {
+        // The headless test harness has no proxy; `spawn_orphan_shell` stubs the spawn.
+        let can_spawn = self.proxy.is_some() || (cfg!(test) && self.headless);
+        let Some(wid) = self.frontmost_window.filter(|_| can_spawn) else {
             // No window/proxy to place them in (should not happen post-restore): drop the
             // Adopted holders — their raw fds close with the process, ending the shells.
             crate::logging::stderr_line!(
@@ -834,23 +906,21 @@ impl App {
         let Some((rows, cols)) = self.windows.get(&wid).map(|ws| (ws.rows, ws.cols)) else {
             return;
         };
-        // CELL-PX-1: the host window's real cell box for every newborn engine.
-        let cell_px = self.spawn_cell_px(wid);
         for adopted in orphans {
             let id = self.next_session_id;
-            match spawn_session(
-                id,
-                wid,
-                rows,
-                cols,
-                cell_px,
-                &self.session_factory,
-                &proxy,
-                None,
-                None, // not a connected controller spawn
-                Some(adopted),
-            ) {
+            let local_id = adopted.local_id;
+            match self.spawn_orphan_shell(id, wid, rows, cols, adopted) {
                 Ok(s) => {
+                    if let Some(leaf) = handed_off_leaves
+                        .iter()
+                        .find(|leaf| leaf.local_id == Some(local_id))
+                    {
+                        self.carry_restored_identity(
+                            leaf,
+                            FillingShell::Unregistered(&s),
+                            LeafIds::Retired,
+                        );
+                    }
                     self.next_session_id += 1;
                     Self::register_session(&self.store, &s, None);
                     let tree = pane::PaneTree::new(id);
@@ -884,6 +954,43 @@ impl App {
         } else {
             self.sync_window(wid);
         }
+    }
+
+    /// Re-adopt one orphaned handed-off shell as session `id` of window `wid`
+    /// — [`Self::adopt_orphan_shells_as_tabs`]'s spawn.
+    fn spawn_orphan_shell(
+        &self,
+        id: u64,
+        wid: WindowId,
+        rows: u16,
+        cols: u16,
+        adopted: crate::spawn::Adopted,
+    ) -> std::io::Result<Session> {
+        #[cfg(test)]
+        if self.proxy.is_none() && self.headless {
+            // The adoption `spawn_session` performs below, as far as a stub can:
+            // the id it records from the `Adopted` handle.
+            let mut session = crate::stub_session(id);
+            session.handoff_local_id = Some(adopted.local_id);
+            return Ok(session);
+        }
+        let proxy = self
+            .proxy
+            .clone()
+            .ok_or_else(|| std::io::Error::other("terminal spawning is unavailable"))?;
+        spawn_session(
+            id,
+            wid,
+            rows,
+            cols,
+            // CELL-PX-1: the host window's real cell box for the newborn engine.
+            self.spawn_cell_px(wid),
+            &self.session_factory,
+            &proxy,
+            None,
+            None, // not a connected controller spawn
+            Some(adopted),
+        )
     }
 
     /// Fill window `wid` from a validated mixed-tab restore record. Terminal trees keep
@@ -987,12 +1094,14 @@ impl App {
         }
 
         // A cold native-only first window starts with the application's unavoidable
-        // process bootstrap shell. Once at least one real native descriptor has reopened,
-        // retire that terminal completely; later native-only windows take the zero-session
-        // creation path above and never need this conversion.
+        // process bootstrap shell, and so does a handoff successor's whose window 0 has
+        // no terminal leaf (`take_session0_shell`). Once at least one real native
+        // descriptor has reopened, retire that terminal completely; later native-only
+        // windows take the zero-session creation path above and never need this
+        // conversion. A bootstrap that IS a handed-off shell is never retired.
         if terminal_layouts.is_empty()
             && had_bootstrap_terminal
-            && !self.bootstrap_session_adopted
+            && !self.window_holds_handed_off_shell(wid)
             && native_ids.iter().any(Option::is_some)
         {
             self.remove_restore_bootstrap_terminals(wid);
@@ -1084,8 +1193,7 @@ impl App {
         let has_terminal = restored_tabs
             .iter()
             .any(|tab| tab.root.first_terminal_leaf().is_some());
-        let preserve_adopted_bootstrap =
-            !has_terminal && self.bootstrap_session_adopted && self.window_has_terminal_tab(wid);
+        let preserve_adopted_bootstrap = !has_terminal && self.window_holds_handed_off_shell(wid);
         let mut reusable_terminal = if preserve_adopted_bootstrap {
             None
         } else {
@@ -1210,14 +1318,23 @@ impl App {
         })
     }
 
-    fn window_has_terminal_tab(&self, wid: WindowId) -> bool {
+    /// Whether a terminal view of window `wid` shows a shell handed across a
+    /// seamless update (`Session::handoff_local_id`): a live pre-update shell
+    /// that must stay reachable even where the layout has no terminal slot for
+    /// it. A window's bootstrap is one only when it was adopted. A successor
+    /// whose window 0 has no terminal leaf spawns session 0 fresh
+    /// (`take_session0_shell`), and that bootstrap is as throwaway as a cold
+    /// one.
+    fn window_holds_handed_off_shell(&self, wid: WindowId) -> bool {
         self.windows.get(&wid).is_some_and(|window| {
             window.tab_set.tabs().iter().any(|tab| {
                 tab.root.leaves().into_iter().any(|view| {
-                    matches!(
-                        self.view_store.get(view),
-                        Some(crate::tab_model::View::Terminal(_))
-                    )
+                    self.view_store
+                        .get(view)
+                        .copied()
+                        .and_then(crate::tab_model::View::terminal_session)
+                        .and_then(|session| self.pool.get(session))
+                        .is_some_and(|session| session.handoff_local_id.is_some())
                 })
             })
         })
@@ -1479,10 +1596,11 @@ impl App {
         // 2026-09-12) came back with `user_title=- description=- icon=- role=-
         // attention=-` on BOTH of its sessions: two windows, one terminal each,
         // so every session was a graft, and only a leaf that spawned or
-        // re-adopted a session below was ever re-seeded. What the graft may and
-        // may not overwrite is `graft_restored_user_meta`'s business.
+        // re-adopted a session below was ever re-seeded. Which shell the leaf's
+        // identity lands on is `carry_restored_identity`'s business, and what it
+        // may overwrite there is `graft_restored_user_meta`'s.
         if let Some((view, session)) = reusable_terminal.take() {
-            self.graft_restored_user_meta(session, terminal);
+            self.carry_restored_identity(terminal, FillingShell::Registered(session), ids);
             return Ok(view);
         }
         // RE-ATTACH ONLY TO AN ID THIS PROCESS MINTED. A closed-tab record names a
@@ -1519,8 +1637,13 @@ impl App {
         let id = self.next_session_id;
         #[cfg(test)]
         if self.proxy.is_none() && self.headless {
-            let session = crate::stub_session(id);
-            Self::seed_restored_user_meta(&session, terminal);
+            let mut session = crate::stub_session(id);
+            // The adoption `spawn_session` performs below, as far as a stub can:
+            // the same match, and the id it records from the `Adopted` handle.
+            session.handoff_local_id =
+                take_handed_off_shell(&mut self.seamless_adopt, terminal.local_id)
+                    .map(|shell| shell.local_id);
+            self.carry_restored_identity(terminal, FillingShell::Unregistered(&session), ids);
             let view = self
                 .view_store
                 .insert_terminal(id)
@@ -1539,14 +1662,7 @@ impl App {
             .get(&wid)
             .map(|window| (window.rows, window.cols))
             .ok_or_else(|| "restore window disappeared".to_string())?;
-        let adopt = terminal
-            .local_id
-            .and_then(|local| {
-                self.seamless_adopt
-                    .iter()
-                    .position(|item| item.local_id == local)
-            })
-            .map(|index| self.seamless_adopt.remove(index));
+        let adopt = take_handed_off_shell(&mut self.seamless_adopt, terminal.local_id);
         let session = spawn_session(
             id,
             wid,
@@ -1561,7 +1677,7 @@ impl App {
             adopt,
         )
         .map_err(|error| error.to_string())?;
-        Self::seed_restored_user_meta(&session, terminal);
+        self.carry_restored_identity(terminal, FillingShell::Unregistered(&session), ids);
         self.next_session_id = self.next_session_id.saturating_add(1);
         let view = self
             .view_store
@@ -1594,31 +1710,113 @@ impl App {
         let _ = meta.set("attention", leaf.attention.clone());
     }
 
-    /// Put the leaf's USER identity back on the GRAFTED session — the window's
-    /// bootstrap, which the reuse branch in [`Self::restore_terminal_leaf`]
-    /// hands this leaf. Unlike [`Self::seed_restored_user_meta`]'s session,
-    /// this one is LIVE before the deferred pass reaches it: registered and
-    /// served under its sid. On a handoff the child owns that sid from its
-    /// control-socket bind in `main_entry`, which repoints `aterm.sock` and the
-    /// sid's graph entry at itself before `first_present_done` lets this pass
-    /// run. So a reader may have seen it without its identity, and a driver may
-    /// have written it. Three rules follow.
+    /// Put `leaf`'s USER identity (its five `meta set` fields) on the shell
+    /// the leaf NAMES — on a handoff, not necessarily the session `filling` its
+    /// pane. A peer reads a session's identity before typing into it: the
+    /// `role=` it checks, the `attention=` it answers, and `role=operator`,
+    /// which moves the status item's operator election and its Stop
+    /// confirm-suppression. So the identity must describe the process that
+    /// runs under the sid it is read from.
     ///
-    /// * THE LEAF MUST NAME THIS SHELL. An adopted bootstrap keeps the id the
-    ///   parent knew it by (`Session::handoff_local_id`); a leaf naming any
-    ///   other id describes a different shell, whose title, role and attention
-    ///   must never land on this one — a misplaced `role=operator` moves the
-    ///   status item's operator election and its Stop confirm-suppression to
-    ///   the wrong process. A bootstrap a handoff child spawned instead of
-    ///   adopting stands in for the handed-over shell the leaf names; it is not
-    ///   that shell either. Only a cold restore's bootstrap, which exists to
-    ///   become the shell of the pane it fills, takes the leaf's identity with
-    ///   no name to match. `main_entry` and `apply_restore_manifest` pick every
-    ///   window's bootstrap by [`restore::WindowLayout::bootstrap_local_id`] —
-    ///   this very leaf — so on a handoff the two part only when a tab failed
-    ///   to build and handed the bootstrap on to the next terminal leaf; the
-    ///   pane keeps its position, and the shell keeps no identity rather than
-    ///   the wrong one.
+    /// * A COLD restore's leaf, or one from this process's own closed-tab
+    ///   ledger ([`LeafIds::Live`]), names no running shell to look for. The
+    ///   session filling the pane becomes that leaf's shell — a cold bootstrap
+    ///   exists to become the shell of the pane it fills, and a respawn stands
+    ///   for the tab that was closed — so it takes the identity.
+    /// * A HANDOFF layout's leaf names a handed-over shell by the id the
+    ///   outgoing process knew it by, and the live session adopted under that
+    ///   id (`Session::handoff_local_id`) takes the identity, wherever it runs.
+    ///   Whenever the layout is honored that is the session filling the pane:
+    ///   each shell is adopted by the leaf that names it, or, for a window's
+    ///   bootstrap leaf, as that window's bootstrap ([`take_session0_shell`]
+    ///   for window 0, `apply_restore_manifest` for the rest). It is not when
+    ///   a tab failed to build and handed its window's bootstrap on to the
+    ///   next terminal leaf, whose pane another adopted shell then fills — nor
+    ///   were a shell ever taken before its own leaf, when a fresh STAND-IN
+    ///   would fill it, with its own sid and none of the named shell's
+    ///   history. Neither takes the leaf's identity. The named shell does: at
+    ///   once, through the live door, if it already runs here; otherwise it is
+    ///   still waiting in `seamless_adopt`, and the orphan net puts the
+    ///   identity on it when it places it
+    ///   ([`Self::adopt_orphan_shells_as_tabs`]). One stderr line reports the
+    ///   mismatch, and names where the identity went only when it moved or is
+    ///   still to move.
+    fn carry_restored_identity(
+        &mut self,
+        leaf: &restore::TerminalLeafRestore,
+        filling: FillingShell<'_>,
+        ids: LeafIds,
+    ) {
+        let filling_adopted_as = match filling {
+            FillingShell::Registered(session) => self
+                .pool
+                .get(session)
+                .and_then(|live| live.handoff_local_id),
+            FillingShell::Unregistered(session) => session.handoff_local_id,
+        };
+        let from_handoff = ids == LeafIds::Retired && self.handoff_successor;
+        if !from_handoff
+            || leaf
+                .local_id
+                .is_some_and(|named| filling_adopted_as == Some(named))
+        {
+            match filling {
+                // Its window's own rebuild repaints the chrome that shows it.
+                FillingShell::Registered(session) => {
+                    self.graft_restored_user_meta(session, leaf);
+                }
+                FillingShell::Unregistered(session) => {
+                    Self::seed_restored_user_meta(session, leaf);
+                }
+            }
+            return;
+        }
+        let identity = match leaf.local_id.and_then(|named| self.adopted_session(named)) {
+            Some(named) => {
+                if self.graft_restored_user_meta(named, leaf) {
+                    // That shell's window may be rebuilt and showing it already,
+                    // so fan the change out the way a driver's `meta set` does
+                    // (`Wake::MetaChanged`): its tab chrome and the operator item.
+                    self.refresh_meta_dependent_chrome(named);
+                    self.refresh_operator_status_item();
+                    "; that pane's identity went to the shell it names, which runs in another pane"
+                } else {
+                    // Nothing moved: the leaf carries no identity, the shell
+                    // already wears it, or a driver wrote every field it differs in.
+                    ""
+                }
+            }
+            None if leaf.carried_user_meta() != crate::session_timeline::SessionMeta::default() => {
+                "; the shell it names is not running here yet, and the orphan net puts that \
+                 pane's identity on it if it places it"
+            }
+            None => "",
+        };
+        crate::logging::stderr_line!(
+            "aterm-gui: session restore: a pane was filled by a shell its layout did not \
+             name{identity}"
+        );
+    }
+
+    /// The live session adopted as the shell the outgoing process knew as
+    /// `local_id`, if one is running here.
+    fn adopted_session(&self, local_id: u64) -> Option<u64> {
+        self.pool.sessions.iter().find_map(|(&session, pooled)| {
+            (pooled.session.handoff_local_id == Some(local_id)).then_some(session)
+        })
+    }
+
+    /// Put `leaf`'s USER identity on LIVE session `session`, the shell
+    /// [`Self::carry_restored_identity`] found the leaf names. Unlike
+    /// [`Self::seed_restored_user_meta`]'s session, this one is registered and
+    /// served under its sid before the deferred pass reaches the leaf: a
+    /// window's bootstrap, or a named shell running in another pane. On a
+    /// handoff the child serves session 0's sid from its control-socket bind in
+    /// `main_entry`, which repoints `aterm.sock` and the sid's graph entry at
+    /// itself before `first_present_done` lets this pass run. So a reader may
+    /// have seen the session without its identity, and a driver may have
+    /// written it. Two rules follow.
+    ///
     /// * A DRIVER'S WRITE WINS. A field `meta set`, `meta unset` or the GUI
     ///   rename wrote on this process keeps that value
     ///   ([`crate::session_timeline::restore_carried_meta`]). It was answered
@@ -1631,30 +1829,21 @@ impl App {
     ///   timeline (which also moves `composed_session_chrome`'s `high_id` key,
     ///   so the tooltip the first present cached is recomposed) and pushed to
     ///   the session's `events` watchers.
-    fn graft_restored_user_meta(&mut self, session: u64, leaf: &restore::TerminalLeafRestore) {
+    ///
+    /// Returns whether any field moved.
+    fn graft_restored_user_meta(&self, session: u64, leaf: &restore::TerminalLeafRestore) -> bool {
         let Some(live) = self.pool.get(session) else {
-            return;
+            return false;
         };
-        let names_this_shell = match live.handoff_local_id {
-            Some(adopted_as) => leaf.local_id == Some(adopted_as),
-            None => !self.bootstrap_session_adopted,
-        };
-        if !names_this_shell {
-            crate::logging::stderr_line!(
-                "aterm-gui: session restore: a pane was filled by a shell its layout \
-                 did not name; that pane's identity was not carried onto it"
-            );
-            return;
-        }
         let ctx = live.ctx.clone();
-        if crate::session_timeline::restore_carried_meta(&ctx, &leaf.carried_user_meta())
-            && self.subscribers.any()
-        {
+        let moved = crate::session_timeline::restore_carried_meta(&ctx, &leaf.carried_user_meta());
+        if moved && self.subscribers.any() {
             self.subscribers
                 .lock()
                 .unwrap_or_else(|p| p.into_inner())
                 .notify(session);
         }
+        moved
     }
 
     fn restore_native_leaf(
@@ -2195,10 +2384,7 @@ impl App {
             // forking a fresh one — the shell keeps going across the update. A cold
             // restore's `seamless_adopt` is empty, so this is always `None` there (fresh
             // fork, unchanged). Consumed (removed) so a shell is never adopted twice.
-            let adopt = leaf
-                .local_id()
-                .and_then(|lid| self.seamless_adopt.iter().position(|a| a.local_id == lid))
-                .map(|pos| self.seamless_adopt.remove(pos));
+            let adopt = take_handed_off_shell(&mut self.seamless_adopt, leaf.local_id());
             match spawn_session(
                 id,
                 wid,
@@ -3023,7 +3209,8 @@ mod tests {
     fn native_only_restore_never_discards_a_seamlessly_adopted_bootstrap() {
         let mut app = App::headless_for_test();
         let wid = WindowId(0);
-        app.bootstrap_session_adopted = true;
+        app.handoff_successor = true;
+        adopt_as(&mut app, 0, 0);
         let original_terminal = app.windows[&wid].tab_set.active_id().unwrap();
         let layout = restore::WindowLayout {
             rows: 24,
@@ -3060,6 +3247,46 @@ mod tests {
             "adopted session is never torn down"
         );
         assert!(app.structural_invariants_ok());
+    }
+
+    /// A handoff successor whose window 0 has no terminal leaf spawns session 0
+    /// FRESH (`take_session0_shell`): no handed-off shell belongs in window 0.
+    /// That bootstrap is as throwaway as a cold one, so a native-only rebuild
+    /// retires it — on the canonical path a handoff layout takes and on the
+    /// legacy one — instead of keeping it as an extra tab the layout never had.
+    #[test]
+    fn a_successors_fresh_bootstrap_is_retired_by_a_native_only_window_0() {
+        let legacy = restore::WindowLayout {
+            rows: 24,
+            cols: 80,
+            active_tab: 0,
+            outer_x: None,
+            outer_y: None,
+            maximized: None,
+            tabs: Vec::new(),
+            native_tabs: vec![restore::NativeTabRestore::Settings {
+                route: "/updates".to_string(),
+            }],
+            tab_order: vec![restore::TabOrderEntry::Native { index: 0 }],
+            active_item: Some(0),
+            restored_tabs: Vec::new(),
+        };
+        for (path, layout) in [
+            ("canonical", window_of(vec![settings_leaf()])),
+            ("legacy", legacy),
+        ] {
+            let mut app = App::headless_for_test();
+            app.handoff_successor = true;
+            app.restore_into_window(WindowId(0), layout);
+            let window = &app.windows[&WindowId(0)];
+            assert_eq!(window.tab_set.len(), 1, "{path}: only the Settings tab");
+            assert!(window.layouts.is_empty(), "{path}");
+            assert!(
+                app.pool.get(0).is_none(),
+                "{path}: the fresh bootstrap retired"
+            );
+            assert!(app.structural_invariants_ok(), "{path}");
+        }
     }
 
     #[test]
@@ -3828,7 +4055,7 @@ mod tests {
         // `bootstrap_local_id`, and each keeping the id the parent knew it by.
         // Adoption mints a fresh ctx, so both start with no USER metadata.
         let mut new = App::headless_for_test();
-        new.bootstrap_session_adopted = true;
+        new.handoff_successor = true;
         let picked: Vec<Option<u64>> = carried
             .windows
             .iter()
@@ -4008,7 +4235,7 @@ mod tests {
         for adopted in [true, false] {
             let mut app = App::headless_for_test();
             if adopted {
-                app.bootstrap_session_adopted = true;
+                app.handoff_successor = true;
                 adopt_as(&mut app, 0, 0);
             }
             driver_meta(&app, 0, MetaField::Role, MetaEdit::Set("worker:new"));
@@ -4142,37 +4369,672 @@ mod tests {
         };
 
         // `main_entry` picks by `bootstrap_local_id`: session 0 IS shell 0, fills tab
-        // A's terminal pane, and takes shell 0's identity.
+        // A's terminal pane, and takes shell 0's identity; tab B adopts shell 1.
         let mut new = App::headless_for_test();
-        new.bootstrap_session_adopted = true;
+        new.handoff_successor = true;
         adopt_as(&mut new, 0, 0);
+        new.seamless_adopt = vec![handed_off_shell(1)];
         new.restore_into_window(WindowId(0), window.clone());
         let placed = tab_sessions(&new);
         assert_eq!(placed[0], vec![0], "tab A's terminal pane is session 0");
         assert_eq!(registry_meta(&new, 0), operator);
+        assert_eq!(
+            new.pool.get(placed[1][0]).and_then(|s| s.handoff_local_id),
+            Some(1),
+            "tab B's pane adopted shell 1"
+        );
         assert_eq!(registry_meta(&new, placed[1][0]), worker);
 
         // The mirror's pick: session 0 is shell 1. The graft still fills tab
         // A's pane with it, but tab A's leaf names shell 0, so none of that
-        // leaf's identity may land on this one.
+        // leaf's identity may land on this one. Tab B's leaf names shell 1,
+        // which is taken, so a fresh stand-in fills that pane: shell 1's
+        // identity goes to session 0, the shell it describes, and the
+        // stand-in wears none.
         let mut new = App::headless_for_test();
-        new.bootstrap_session_adopted = true;
+        new.handoff_successor = true;
         adopt_as(&mut new, 0, 1);
+        new.seamless_adopt = vec![handed_off_shell(0)];
         new.restore_into_window(WindowId(0), window.clone());
-        assert_eq!(tab_sessions(&new)[0], vec![0]);
+        let placed = tab_sessions(&new);
+        assert_eq!(placed[0], vec![0]);
         assert_eq!(
             registry_meta(&new, 0),
+            worker,
+            "a leaf naming shell 0 stamped its identity on shell 1, or shell 1 lost its own"
+        );
+        assert_eq!(
+            new.pool.get(placed[1][0]).and_then(|s| s.handoff_local_id),
+            None,
+            "PRECONDITION: tab B's pane is a stand-in"
+        );
+        assert_eq!(
+            registry_meta(&new, placed[1][0]),
             SessionMeta::default(),
-            "a leaf naming shell 0 stamped its identity on shell 1"
+            "a stand-in wore the identity of the shell it stands in for"
         );
 
         // A handoff child's bootstrap it did NOT adopt stands in for a shell
         // running elsewhere; it is not the one the leaf names either.
         let mut new = App::headless_for_test();
-        new.bootstrap_session_adopted = true;
+        new.handoff_successor = true;
+        new.seamless_adopt = vec![handed_off_shell(1)];
         new.restore_into_window(WindowId(0), window);
-        assert_eq!(tab_sessions(&new)[0], vec![0]);
+        let placed = tab_sessions(&new);
+        assert_eq!(placed[0], vec![0]);
         assert_eq!(registry_meta(&new, 0), SessionMeta::default());
+        assert_eq!(registry_meta(&new, placed[1][0]), worker);
+    }
+
+    /// A shell the outgoing process handed across as `local_id`, the way
+    /// `seamless::take_incoming` gives it to `main_entry`. A headless restore
+    /// reads only the id: the stub spawn never touches the fd or the pid.
+    fn handed_off_shell(local_id: u64) -> crate::spawn::Adopted {
+        crate::spawn::Adopted {
+            local_id,
+            master: -1,
+            pid: -1,
+            sid: aterm_session::SessionId::generate(),
+            nonce: aterm_session::LaunchNonce::generate(),
+            checkpoint: None,
+        }
+    }
+
+    /// The five USER fields handed-off shell `shell` wore in the predecessor.
+    /// Every value names its shell, so a value on the wrong session says whose
+    /// it was.
+    fn identity_of(shell: u64) -> crate::session_timeline::SessionMeta {
+        crate::session_timeline::SessionMeta {
+            user_title: Some(format!("shell {shell}")),
+            description: Some(format!("the work shell {shell} was doing")),
+            icon: Some(format!("🐚{shell}")),
+            role: Some(format!("worker:shell-{shell}")),
+            attention: Some(format!("shell {shell} waits on a review")),
+            ..crate::session_timeline::SessionMeta::default()
+        }
+    }
+
+    /// The terminal leaf a capture writes for handed-off shell `shell`,
+    /// carrying the identity [`identity_of`] gives that shell.
+    fn leaf_naming(shell: u64) -> restore::RestoredSplitTree {
+        let identity = identity_of(shell);
+        restore::RestoredSplitTree::leaf(restore::RestoredView::Terminal(
+            restore::TerminalLeafRestore {
+                cwd: Some(format!("/tmp/shell-{shell}")),
+                title: format!("zsh {shell}"),
+                profile: None,
+                local_id: Some(shell),
+                user_title: identity.user_title,
+                description: identity.description,
+                icon: identity.icon,
+                role: identity.role,
+                attention: identity.attention,
+            },
+        ))
+    }
+
+    fn settings_leaf() -> restore::RestoredSplitTree {
+        restore::RestoredSplitTree::leaf(restore::RestoredView::Native(
+            restore::NativeLeafRestore::settings("/about".to_string()),
+        ))
+    }
+
+    fn split_of(
+        first: restore::RestoredSplitTree,
+        second: restore::RestoredSplitTree,
+    ) -> restore::RestoredSplitTree {
+        restore::RestoredSplitTree::Split {
+            axis: restore::SplitKind::Horizontal,
+            ratio: 0.5,
+            first: Box::new(first),
+            second: Box::new(second),
+        }
+    }
+
+    /// A window of one tab per root, each focused on its first pane (a
+    /// focus path must name a leaf, or the parse refuses the tab).
+    fn window_of(roots: Vec<restore::RestoredSplitTree>) -> restore::WindowLayout {
+        let mut layout = single_leaf_window(bare_leaf());
+        layout.restored_tabs = roots
+            .into_iter()
+            .map(|root| {
+                let mut focused_path = Vec::new();
+                let mut node = &root;
+                while let restore::RestoredSplitTree::Split { first, .. } = node {
+                    focused_path.push(restore::RestoreBranch::First);
+                    node = first;
+                }
+                restore::RestoredTab {
+                    root,
+                    focused_path,
+                    zoomed: false,
+                }
+            })
+            .collect();
+        layout
+    }
+
+    /// `main_entry`'s pick for session 0 before `take_session0_shell`: the shell
+    /// window 0's bootstrap leaf names or, with no such leaf, the first shell the
+    /// handoff lists (`SessionHandoff::from_store` lists them in local-id order).
+    fn first_listed_session0_shell(
+        handed_off: &mut Vec<crate::spawn::Adopted>,
+        layout: &restore::RestoreManifest,
+    ) -> Option<crate::spawn::Adopted> {
+        super::take_handed_off_shell(handed_off, layout.windows[0].bootstrap_local_id())
+            .or_else(|| Some(handed_off.remove(0)))
+    }
+
+    /// A handoff SUCCESSOR rebuilt from `windows` the way the child runs. The
+    /// layout crosses the wire (`to_toml`, then `from_toml` plus
+    /// `covers_exact_seamless_ids`, as `take_incoming` accepts it) with shells
+    /// `0..shells` handed off; session 0 adopts by `session0`'s pick; window 0
+    /// is rebuilt around it, and every further window is created around the
+    /// shell its bootstrap leaf names — `apply_restore_manifest`'s pick — or a
+    /// fresh one when that shell is taken. The restore itself runs unchanged,
+    /// and must place every shell: this harness leaves the orphan net nothing.
+    fn successor_of(
+        windows: Vec<restore::WindowLayout>,
+        shells: u64,
+        session0: fn(
+            &mut Vec<crate::spawn::Adopted>,
+            &restore::RestoreManifest,
+        ) -> Option<crate::spawn::Adopted>,
+    ) -> App {
+        let ids = (0..shells).collect::<Vec<_>>();
+        let wire = restore::RestoreManifest::new(windows)
+            .to_toml()
+            .expect("the parent serializes its layout");
+        let carried = restore::RestoreManifest::from_toml(&wire)
+            .filter(|layout| layout.covers_exact_seamless_ids(&ids))
+            .expect("the child accepts the sidecar");
+        let mut new = App::headless_for_test();
+        new.handoff_successor = true;
+        let mut handed_off = ids.iter().copied().map(handed_off_shell).collect();
+        if let Some(shell) = session0(&mut handed_off, &carried) {
+            adopt_as(&mut new, 0, shell.local_id);
+        }
+        new.seamless_adopt = handed_off;
+        let mut windows = carried.windows.into_iter();
+        new.restore_into_window(WindowId(0), windows.next().expect("window 0"));
+        for layout in windows {
+            let mut bootstrap = crate::stub_session(new.next_session_id);
+            bootstrap.handoff_local_id =
+                super::take_handed_off_shell(&mut new.seamless_adopt, layout.bootstrap_local_id())
+                    .map(|shell| shell.local_id);
+            App::register_session(&new.store, &bootstrap, None);
+            let wid = new.insert_logical_window(bootstrap, 24, 80);
+            new.restore_into_window(wid, layout);
+        }
+        assert!(
+            new.seamless_adopt.is_empty(),
+            "PRECONDITION: the layout placed every handed-off shell"
+        );
+        new
+    }
+
+    /// What every leaf of every window shows, tab by tab: the handed-off
+    /// shell a terminal pane runs (`Some(None)` for a shell nobody handed
+    /// off), `None` for a native view.
+    fn shown_shells(app: &App) -> Vec<Vec<Vec<Option<Option<u64>>>>> {
+        app.windows
+            .values()
+            .map(|window| {
+                window
+                    .tab_set
+                    .tabs()
+                    .iter()
+                    .map(|tab| {
+                        tab.root
+                            .leaves()
+                            .into_iter()
+                            .map(|view| {
+                                let session = app
+                                    .view_store
+                                    .get(view)
+                                    .copied()
+                                    .and_then(crate::tab_model::View::terminal_session)?;
+                                Some(app.pool.get(session)?.handoff_local_id)
+                            })
+                            .collect()
+                    })
+                    .collect()
+            })
+            .collect()
+    }
+
+    /// Every tab focused on a handed-off shell shows that shell's icon
+    /// ([`identity_of`]) at the head of its tooltip.
+    fn assert_tooltips_name_their_shells(app: &App, shape: &str) {
+        for window in app.windows.values() {
+            for tab in window.tab_set.tabs() {
+                let Some(shell) = app
+                    .view_store
+                    .get(tab.focus)
+                    .copied()
+                    .and_then(crate::tab_model::View::terminal_session)
+                    .and_then(|session| app.pool.get(session))
+                    .and_then(|session| session.handoff_local_id)
+                else {
+                    continue;
+                };
+                assert!(
+                    tab.presentation
+                        .tooltip
+                        .as_deref()
+                        .is_some_and(|tip| tip.starts_with(&format!("🐚{shell}"))),
+                    "{shape}: shell {shell}'s tab tooltip {:?}",
+                    tab.presentation.tooltip
+                );
+            }
+        }
+    }
+
+    /// EVERY SHELL COMES BACK IN THE PANE ITS LEAF NAMES, WEARING THAT LEAF'S
+    /// IDENTITY, AND NO STAND-IN IS SPAWNED. When window 0 has no terminal leaf,
+    /// `main_entry` once adopted the first shell the handoff listed as session 0
+    /// anyway. That shell's own leaf lies in a later window, whose rebuild found
+    /// it taken and spawned a FRESH shell in its pane — a stand-in, with a new
+    /// sid and no history — while the shell itself stayed in window 0 as an
+    /// extra tab. The stand-in was also seeded with the leaf's identity
+    /// (`role=` included, which peers read before typing) while the shell that
+    /// identity describes came back bare; when the leaf was its window's first
+    /// pane, the graft refused the stand-in and the identity reached nobody.
+    /// `take_session0_shell` now adopts nothing for such a window 0: session 0
+    /// is a fresh bootstrap its native-only rebuild retires, and each shell is
+    /// adopted by its own leaf. The third shape — a native first tab with the
+    /// terminal leaf later in the same window — was always right; it is the
+    /// control.
+    ///
+    /// HOW IT FAILS WITHOUT THE FIXES, as measured. With the old pick
+    /// ([`first_listed_session0_shell`]) in place of `take_session0_shell`, the
+    /// first two shapes fail the placement check: shell 0 is an extra tab of
+    /// window 0 and a stand-in fills its pane
+    /// (`a_handoff_keeps_each_identity_on_its_shell_when_a_leaf_names_a_shell_running_elsewhere`
+    /// keeps those shapes, to hold the identity rule there). Further back —
+    /// against the code before the identity fix, whose headless stub never
+    /// adopted from `seamless_adopt` — this test's first form fails at its
+    /// PRECONDITION that the layout placed every handed-off shell, not at an
+    /// identity check, since every stub stands in for its shell (as the review
+    /// of that fix measured). The identity failures described above were
+    /// measured with the stub adopting and the old identity rule.
+    #[test]
+    fn a_handoff_carries_each_identity_onto_the_shell_its_leaf_names_and_never_a_stand_in() {
+        let shapes = [
+            (
+                "window 0 is one native tab; shell 0's leaf is a later pane of window 1",
+                vec![
+                    window_of(vec![settings_leaf()]),
+                    window_of(vec![
+                        split_of(leaf_naming(2), leaf_naming(0)),
+                        leaf_naming(1),
+                    ]),
+                ],
+            ),
+            (
+                "window 0 is one native tab; shell 0's leaf is window 1's first pane",
+                vec![
+                    window_of(vec![settings_leaf()]),
+                    window_of(vec![
+                        leaf_naming(0),
+                        split_of(leaf_naming(1), leaf_naming(2)),
+                    ]),
+                ],
+            ),
+            (
+                "window 0 opens on a native tab and has its terminal leaf later",
+                vec![
+                    window_of(vec![
+                        settings_leaf(),
+                        split_of(leaf_naming(1), leaf_naming(2)),
+                    ]),
+                    window_of(vec![leaf_naming(0)]),
+                ],
+            ),
+        ];
+        for (shape, windows) in shapes {
+            // Where the layout puts each shell: the pane its leaf names.
+            let named = windows
+                .iter()
+                .map(|window| {
+                    window
+                        .restored_tabs
+                        .iter()
+                        .map(|tab| {
+                            let mut leaves = Vec::new();
+                            let mut stack = vec![&tab.root];
+                            while let Some(node) = stack.pop() {
+                                match node {
+                                    restore::RestoredSplitTree::Leaf {
+                                        view: restore::RestoredView::Terminal(leaf),
+                                    } => leaves.push(Some(leaf.local_id)),
+                                    restore::RestoredSplitTree::Leaf { .. } => leaves.push(None),
+                                    restore::RestoredSplitTree::Split { first, second, .. } => {
+                                        stack.push(second);
+                                        stack.push(first);
+                                    }
+                                }
+                            }
+                            leaves
+                        })
+                        .collect::<Vec<_>>()
+                })
+                .collect::<Vec<_>>();
+            let new = successor_of(windows, 3, |handed_off, layout| {
+                super::take_session0_shell(handed_off, Some(layout))
+            });
+
+            assert_eq!(
+                shown_shells(&new),
+                named,
+                "{shape}: every shell is in the pane its leaf names, and no window holds a \
+                 pane or tab the layout did not"
+            );
+            let mut adopted = Vec::new();
+            for (&session, pooled) in &new.pool.sessions {
+                let shell = pooled.session.handoff_local_id.unwrap_or_else(|| {
+                    panic!("{shape}: session {session} is no handed-off shell — a stand-in")
+                });
+                adopted.push(shell);
+                assert_eq!(
+                    registry_meta(&new, session),
+                    identity_of(shell),
+                    "{shape}: shell {shell} (session {session}) wears exactly the identity of \
+                     the leaf that names it"
+                );
+            }
+            adopted.sort_unstable();
+            assert_eq!(adopted, vec![0, 1, 2], "{shape}: every shell is live");
+            assert_tooltips_name_their_shells(&new, shape);
+            assert!(new.structural_invariants_ok(), "{shape}");
+        }
+
+        // With no layout to place by, session 0 still takes a shell.
+        let mut handed_off = (0..3).map(handed_off_shell).collect::<Vec<_>>();
+        assert_eq!(
+            super::take_session0_shell(&mut handed_off, None).map(|shell| shell.local_id),
+            Some(0)
+        );
+        assert_eq!(handed_off.len(), 2);
+    }
+
+    /// A LEAF NAMING A SHELL THAT RUNS ELSEWHERE GIVES ITS IDENTITY TO THAT
+    /// SHELL, NOT TO THE STAND-IN FILLING ITS PANE. An honored handoff layout
+    /// never reaches this: each shell is adopted by its own leaf or as its own
+    /// window's bootstrap. The old session-0 pick reached it
+    /// ([`first_listed_session0_shell`]), and a tab that fails to build hands its
+    /// window's bootstrap on to another shell's pane; `carry_restored_identity`
+    /// must stay right there. Session 0 is shell 0, kept as an extra tab in
+    /// native-only window 0 because it IS a handed-off shell; its own pane is
+    /// filled by a stand-in, whose identity it takes through the live door, and
+    /// window 0's tab chrome repaints to show it.
+    #[test]
+    fn a_handoff_keeps_each_identity_on_its_shell_when_a_leaf_names_a_shell_running_elsewhere() {
+        use crate::session_timeline::SessionMeta;
+
+        for (shape, windows) in [
+            (
+                "shell 0's leaf is a later pane of window 1",
+                vec![
+                    window_of(vec![settings_leaf()]),
+                    window_of(vec![
+                        split_of(leaf_naming(2), leaf_naming(0)),
+                        leaf_naming(1),
+                    ]),
+                ],
+            ),
+            (
+                "shell 0's leaf is window 1's first pane",
+                vec![
+                    window_of(vec![settings_leaf()]),
+                    window_of(vec![
+                        leaf_naming(0),
+                        split_of(leaf_naming(1), leaf_naming(2)),
+                    ]),
+                ],
+            ),
+        ] {
+            let new = successor_of(windows, 3, first_listed_session0_shell);
+            assert_eq!(
+                new.pool.get(0).and_then(|session| session.handoff_local_id),
+                Some(0),
+                "PRECONDITION {shape}: session 0 is shell 0"
+            );
+            let mut stand_ins = Vec::new();
+            for (&session, pooled) in &new.pool.sessions {
+                match pooled.session.handoff_local_id {
+                    Some(shell) => assert_eq!(
+                        registry_meta(&new, session),
+                        identity_of(shell),
+                        "{shape}: shell {shell} (session {session}) wears exactly the identity \
+                         of the leaf that names it"
+                    ),
+                    None => {
+                        stand_ins.push(session);
+                        assert_eq!(
+                            registry_meta(&new, session),
+                            SessionMeta::default(),
+                            "{shape}: stand-in session {session} is no handed-off shell, so \
+                             it wears no identity"
+                        );
+                    }
+                }
+            }
+            assert_eq!(stand_ins.len(), 1, "{shape}: stand-ins {stand_ins:?}");
+            // Window 0 was rebuilt before shell 0's identity arrived; its tab
+            // shows it all the same.
+            assert_tooltips_name_their_shells(&new, shape);
+            assert!(new.structural_invariants_ok(), "{shape}");
+        }
+    }
+
+    /// A SHELL THE REBUILD LEAVES OVER STILL COMES BACK WEARING ITS IDENTITY.
+    /// The orphan net re-homes every handed-off shell no leaf took as a tab of
+    /// the front window, so none is lost. Such a shell is left over because the
+    /// leaf naming it never rebuilt — its tab failed to build, or, as here, its
+    /// window could not be created and `apply_restore_manifest` stopped — or
+    /// was filled by another shell. Its identity reached nobody during the
+    /// rebuild, and the net used to place it bare: the manifest was consumed by
+    /// then. The leaves naming handed-off shells now outlive it
+    /// (`handed_off_leaves`), and the net puts each one's identity on its
+    /// shell before registering it.
+    #[test]
+    fn an_orphaned_shell_comes_back_wearing_the_identity_of_the_leaf_that_names_it() {
+        let wire = restore::RestoreManifest::new(vec![
+            window_of(vec![leaf_naming(0)]),
+            window_of(vec![
+                leaf_naming(1),
+                split_of(leaf_naming(2), leaf_naming(3)),
+            ]),
+        ])
+        .to_toml()
+        .expect("the parent serializes its layout");
+        let carried = restore::RestoreManifest::from_toml(&wire)
+            .filter(|layout| layout.covers_exact_seamless_ids(&[0, 1, 2, 3]))
+            .expect("the child accepts the sidecar");
+        let mut new = App::headless_for_test();
+        new.handoff_successor = true;
+        let mut handed_off = (0..4).map(handed_off_shell).collect();
+        let shell0 = super::take_session0_shell(&mut handed_off, Some(&carried))
+            .expect("window 0's bootstrap leaf names shell 0");
+        adopt_as(&mut new, 0, shell0.local_id);
+        new.seamless_adopt = handed_off;
+        let leaves = carried.handed_off_leaves();
+        // Window 0 rebuilds; window 1 is never created.
+        new.restore_into_window(WindowId(0), carried.windows[0].clone());
+        assert_eq!(
+            new.seamless_adopt.len(),
+            3,
+            "PRECONDITION: window 1's shells are left over"
+        );
+
+        new.adopt_orphan_shells_as_tabs(&leaves);
+        assert!(new.seamless_adopt.is_empty(), "the net placed every orphan");
+        let mut adopted = Vec::new();
+        for (&session, pooled) in &new.pool.sessions {
+            let shell = pooled
+                .session
+                .handoff_local_id
+                .expect("every session is a handed-off shell");
+            adopted.push(shell);
+            assert_eq!(
+                registry_meta(&new, session),
+                identity_of(shell),
+                "shell {shell} (session {session}) wears the identity of the leaf that names it"
+            );
+        }
+        adopted.sort_unstable();
+        assert_eq!(adopted, vec![0, 1, 2, 3], "every shell is live");
+        assert_eq!(
+            shown_shells(&new),
+            vec![vec![
+                vec![Some(Some(0))],
+                vec![Some(Some(1))],
+                vec![Some(Some(2))],
+                vec![Some(Some(3))],
+            ]],
+            "each orphan is a tab of its own in the front window"
+        );
+        assert_tooltips_name_their_shells(&new, "orphans");
+        assert!(new.structural_invariants_ok());
+    }
+
+    /// THE BOOTSTRAP STARTS IN THE DIRECTORY OF THE PANE IT FILLS. A cold
+    /// restore spawns session 0 in `first_leaf_cwd` before the deferred pass
+    /// grafts it onto the canonical tree's first terminal leaf — the leaf
+    /// `bootstrap_local_id` names. `first_leaf_cwd` read the first TAB, and on a
+    /// native-only first tab fell back to the legacy `tabs` mirror, which lists
+    /// all-terminal tabs only: behind a tab splitting a native view with a
+    /// terminal, it named another tab's pane. A pane that recorded no directory
+    /// starts where another pane of its OWN tab was — what that first-tab read
+    /// did for a first tab — but never where another tab's was.
+    #[test]
+    fn the_bootstrap_cwd_is_the_directory_of_the_leaf_the_bootstrap_fills() {
+        // PREDECESSOR: a Settings tab, a tab splitting a recovery placeholder
+        // with session 0, then session 1's all-terminal tab.
+        let mut old = App::headless_for_test();
+        old.restore_into_window(
+            WindowId(0),
+            window_of(vec![
+                settings_leaf(),
+                split_of(
+                    restore::RestoredSplitTree::leaf(restore::RestoredView::Placeholder(
+                        restore::PlaceholderLeafRestore {
+                            restore_tag: "markdown".to_string(),
+                            reason: "Document could not be reopened".to_string(),
+                            metadata: String::new(),
+                        },
+                    )),
+                    restore::RestoredSplitTree::leaf(restore::RestoredView::Terminal(bare_leaf())),
+                ),
+                restore::RestoredSplitTree::leaf(restore::RestoredView::Terminal(bare_leaf())),
+            ]),
+        );
+        let feed = |session: u64, bytes: &[u8]| {
+            crate::term_lock(&old.pool.get(session).expect("live session").term).process(bytes);
+        };
+        feed(1, b"\x1b]7;file://localhost/aterm-proof/other-tab\x07");
+        let carried = |app: &App| {
+            restore::RestoreManifest::from_toml(
+                &app.capture_restore_manifest()
+                    .to_toml()
+                    .expect("the layout serializes"),
+            )
+            .expect("the layout parses")
+        };
+
+        let manifest = carried(&old);
+        let window = &manifest.windows[0];
+        let mirror_first = window
+            .tabs
+            .first()
+            .and_then(|tab| tab.leaves().first().copied())
+            .map(|leaf| (leaf.local_id(), leaf.cwd().map(str::to_owned)));
+        assert_eq!(
+            (mirror_first, window.bootstrap_local_id()),
+            (
+                Some((Some(1), Some("/aterm-proof/other-tab".to_string()))),
+                Some(0)
+            ),
+            "PRECONDITION: the mirror's first leaf is session 1's tab; the bootstrap fills \
+             session 0's pane"
+        );
+        assert_eq!(
+            manifest.first_leaf_cwd(),
+            None,
+            "no pane of session 0's tab recorded a directory, so the bootstrap starts in \
+             the default one, not in session 1's tab's"
+        );
+
+        feed(0, b"\x1b]7;file://localhost/aterm-proof/split-pane\x07");
+        let manifest = carried(&old);
+        assert_eq!(
+            manifest.first_leaf_cwd(),
+            Some("/aterm-proof/split-pane"),
+            "the bootstrap starts in the directory of the pane it fills"
+        );
+        assert_eq!(
+            manifest.windows[0].bootstrap_cwd(),
+            manifest.first_leaf_cwd(),
+            "every window's bootstrap takes its cwd by the one pick"
+        );
+
+        // A pane that recorded no directory — its program sent no OSC 7, or
+        // the capture found its terminal locked — takes the first directory
+        // another terminal pane of its own tab recorded, in rebuild order.
+        let pane_in = |cwd: Option<&str>| {
+            restore::RestoredSplitTree::leaf(restore::RestoredView::Terminal(
+                restore::TerminalLeafRestore {
+                    cwd: cwd.map(str::to_owned),
+                    ..bare_leaf()
+                },
+            ))
+        };
+        for (shape, window, expected) in [
+            (
+                "the bootstrap's pane recorded one",
+                window_of(vec![split_of(pane_in(Some("/x")), pane_in(Some("/y")))]),
+                Some("/x"),
+            ),
+            (
+                "split first tab, its first pane recorded none",
+                window_of(vec![split_of(pane_in(None), pane_in(Some("/y")))]),
+                Some("/y"),
+            ),
+            (
+                "nested split first tab, its first pane recorded none",
+                window_of(vec![split_of(
+                    split_of(pane_in(None), pane_in(Some("/y"))),
+                    pane_in(Some("/z")),
+                )]),
+                Some("/y"),
+            ),
+            (
+                "a native view first in the bootstrap's tab",
+                window_of(vec![split_of(settings_leaf(), pane_in(Some("/y")))]),
+                Some("/y"),
+            ),
+            (
+                "no pane of the bootstrap's tab recorded one",
+                window_of(vec![
+                    split_of(pane_in(None), pane_in(None)),
+                    pane_in(Some("/other-tab")),
+                ]),
+                None,
+            ),
+            (
+                "behind a native-only first tab, still only the bootstrap's own tab",
+                window_of(vec![
+                    settings_leaf(),
+                    split_of(settings_leaf(), pane_in(None)),
+                    pane_in(Some("/other-tab")),
+                ]),
+                None,
+            ),
+        ] {
+            let manifest = restore::RestoreManifest::new(vec![window]);
+            assert_eq!(manifest.first_leaf_cwd(), expected, "{shape}");
+        }
     }
 
     /// THE GRAFT IS A CHANGE A WATCHER CAN SEE. The grafted session is already

@@ -70,6 +70,7 @@ impl Terminal {
             transient: TransientState::new(),
             watchers: super::observe::WatcherSet::default(),
             row_text_scratch: Vec::new(),
+            alt_archive: super::alt_archive::AltArchiveState::new(),
             current_working_directory: None,
             color: ColorState::new(),
             font: FontDescriptor::default(),
@@ -81,6 +82,7 @@ impl Terminal {
             taskbar_progress: None,
             kitty_keyboard: KittyKeyboardState::new(),
             xterm_keyboard: XtermKeyboardState::new(),
+            mode_mirror: std::sync::Arc::default(),
             #[cfg(feature = "sixel")]
             sixel: SixelState::new(),
             window_callback: None,
@@ -130,6 +132,10 @@ impl Terminal {
         if terminal.modes.allow_osc52_query {
             terminal.clipboard_auth.authorize_query();
         }
+        // The fresh fold is not an empty word (negative flags default ON), so
+        // the mirror must be published from the real state, never left at
+        // `Default`.
+        terminal.refresh_mode_mirror();
 
         terminal
     }

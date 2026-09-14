@@ -331,6 +331,7 @@ fn cfg_for(style: GlowStyle) -> GlowConfig {
         // Mirrors the shipping resolver: tall is the default; only an explicit
         // underline style opts into the quieter shoulder.
         ribbon_tall: true,
+        ribbon_flat: false,
         enabled: true,
         style,
         color: 0x00d0_d0d0,

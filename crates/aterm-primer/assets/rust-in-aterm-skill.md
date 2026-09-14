@@ -22,13 +22,17 @@ exception: if you run it, say in your reply that you did and why.
 | `rustdoc` | `trustdoc` | the doc tool |
 | — | `ty`, `ay`, `clean` | model checker · SMT solver · theorem prover |
 
-They live in `$ATPKG_BIN` and are on PATH in every shell. Resolve `targo`
-through rustup's `trust` channel rather than by path — a channel points at a
-sealed artifact, a path can point at a build tree that is being emptied:
+They live in `$ATPKG_BIN` and are on PATH in every shell. That is the copy
+`aterm pkg update` keeps current, and it is the one to use: it keeps working
+even when rustup's `trust` link is stale. Do **not** resolve `targo` through
+`rustup which` — that entry is not guaranteed to be the managed store (`aterm
+pkg doctor` warns in so many words when it is not), it has been found pointing
+into a live build tree that was being emptied, and when it is missing the
+command yields no path at all. Ask the tool, then ask the directory:
 
 ```sh
-TARGO="$(dirname "$(rustup which cargo --toolchain trust)")/targo"
-"$TARGO" --unverified --version     # a real targo answers; a cargo-in-disguise rejects the flag
+targo --unverified --version     # a real targo answers; a cargo-in-disguise rejects the flag
+aterm help rust                  # which toolchain THIS directory gets, and why
 ```
 
 ## Name the lane — a bare `targo build` is refused ON PURPOSE
@@ -45,8 +49,11 @@ The refusal you get from a bare `targo build` is that rule, not a broken tool.
 Do not fall back to stock `cargo` because of it — add the lane.
 
 Inside an aterm session, typing a bare `cargo …` prints the `targo` spelling of
-your exact command in both lanes and then runs upstream. That printout is the
-answer; `ATERM_REROUTE_QUIET=1` silences it if you have decided.
+your exact command in both lanes and then runs upstream. Two verbs are the
+exception: `cargo clippy` and `cargo fmt` print **one** branded spelling
+(`targo tippy`, `targo fmt`) and no lane question, because linting and
+formatting neither prove nor build. That printout is the answer;
+`ATERM_REROUTE_QUIET=1` silences it if you have decided.
 
 ## Before the first build in a project: measure, do not guess
 
@@ -56,10 +63,10 @@ aterm help rust      # which toolchain this directory gets, and why — measured
 
 It prints which toolchain won and which candidates were refused, what `rustc`
 on this PATH answers to `--print sysroot`, whether `rust-toolchain.toml` pins a
-channel, whether `.cargo/config.toml` switches verification off, and which
-lane the project's own instructions ask for. If a project's `CLAUDE.md` or
-`AGENTS.md` names a different toolchain, the project wins — say so when you
-use it.
+channel, and whether `.cargo/config.toml` switches verification off. It reads
+no instruction file: if a project's `CLAUDE.md` or `AGENTS.md` names a
+different toolchain or lane, that one is yours to open, and the project wins —
+say so when you use it.
 
 ## Errors that are not what they look like
 

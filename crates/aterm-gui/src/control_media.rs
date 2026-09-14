@@ -781,8 +781,10 @@ pub(crate) fn cmd_window(
             let ((w, h), retention) = retained.into_parts();
             crate::control::ControlReply::with_handoff(format!("OK {w} {h} {path}\n"), retention)
         }
-        // The main thread's clear, actionable message (missing permission / headless /
-        // window not open / off-macOS / capture failure) is surfaced as a single `ERR`.
+        // The main thread's clear, actionable message (headless / no on-screen window
+        // number / not on screen / geometry moved mid-capture / cancelled / off-platform)
+        // is surfaced as a single `ERR`. Never a missing permission: aterm photographs
+        // its OWN window, which needs no Screen Recording grant (`capture_window_pixels`).
         Err(msg) => format!("ERR {msg}\n").into(),
     }
 }
@@ -1597,9 +1599,11 @@ pub(crate) fn cmd_video(
 /// analogue of `chrome`, so a driver can read native tabs and transient surfaces without
 /// a screenshot.
 ///
-/// Unlike the pixel `window` capture, this works HEADLESS and needs no Screen Recording
-/// grant: the main thread compiles the native Settings model or calls a transient
-/// surface's concrete serializer (`App::read_aux_controls`), never walking AppKit views.
+/// Unlike the pixel `window` capture, this works HEADLESS: the main thread compiles the
+/// native Settings model or calls a transient surface's concrete serializer
+/// (`App::read_aux_controls`), never walking AppKit views, so no window need be on
+/// screen. NEITHER verb needs a Screen Recording grant — `window` photographs aterm's OWN
+/// window, which needs none (`cmd_window`, `capture_window_pixels`).
 /// A closed Settings tab truthfully reports zero visible controls. Framed `OK <n>\n` +
 /// `<n>` rows, the SAME multi-line shape as `chrome`/`text`.
 pub(crate) fn cmd_controls(proxy: &EventLoopProxy<Wake>, rest: &str) -> String {
@@ -2107,6 +2111,8 @@ pub(crate) fn parse_trail_form(rest: &str) -> Result<TrailForm, String> {
 ///   budget), `off-shape` (licensed and classified, but the style's shape
 ///   gates laid nothing) or `program-row`; `licence=` (2026-09-10) names the
 ///   class a licensed row was admitted under — `key` (a press hint),
+///   `inflight` (no hint was fresh and the unpaid presses still waiting on
+///   the row licensed the batch — a stalled prompt catching up; 2026-09-12),
 ///   `insert` (a DELIVERED insert, Rainbow Kitty only: a file drop, ⌘V, and
 ///   — into the tab on screen — the `paste` verb, `paste-bin`, `turn`'s
 ///   paste phase, an unguarded `key tab` or `key ctrl+v`; its bytes provably
@@ -2128,10 +2134,12 @@ pub(crate) fn parse_trail_form(rest: &str) -> Result<TrailForm, String> {
 ///   how many placeholder rewrites it retracted, and the last one's width in
 ///   cells (priced from its text, else the 32-cell bound), and the PRESSES IN
 ///   FLIGHT (`inflight_licensed=`/`inflight_forgotten=`/`credits=`/
-///   `swallowed_no_echo=`): batches the waiting presses alone licensed after a
-///   stalled prompt caught up, edges that forgot a pool, the pool right now, and
-///   presses a canonical no-echo tty (a password prompt) will never echo. What is
-///   TRUE.
+///   `swallowed_no_echo=`/`park_returns=`/`park_flushed=`): batches the waiting
+///   presses alone licensed after a stalled prompt caught up, edges that forgot
+///   a pool, the pool right now, presses a canonical no-echo tty (a password
+///   prompt) will never echo, held parks whose RETURN came within the window and
+///   was judged as one `origin -> target` echo, and held parks flushed through
+///   the ordinary body at their own clock. What is TRUE.
 ///
 /// THE BLOCK-FILL FIELDS ARE NOT DECORATION. A cursor-body effect replaces the
 /// caret's colour outright (`RenderInput::cursor_fill_override` is applied

@@ -73,6 +73,7 @@ fn cfg(style: GlowStyle) -> GlowConfig {
         // This parity script follows the shipping default; explicit underline
         // geometry has its own resolver, geometry, and live-paint pins.
         ribbon_tall: true,
+        ribbon_flat: false,
         enabled: true,
         dark_theme: true,
         theme_fg: 0x00C8_D3F5,
@@ -149,8 +150,14 @@ struct TypedScriptOutcome {
 }
 
 fn typed_script(style: GlowStyle, licensed: bool) -> TypedScriptOutcome {
+    typed_script_with(&cfg(style), licensed)
+}
+
+/// [`typed_script`] on an explicit config — the flat-spelling control below
+/// runs the same script with `ribbon_flat` set.
+fn typed_script_with(c: &GlowConfig, licensed: bool) -> TypedScriptOutcome {
     let g = geom();
-    let c = cfg(style);
+    let c = *c;
     let tc = trail_cfg();
     let mut glow = CursorGlow::default();
     let mut trail = CursorTrail::default();
@@ -768,7 +775,31 @@ fn a_licensed_typed_move_is_byte_identical_across_the_license_commit() {
         // blunt end (design section 7's falsifier 3, judged on captured
         // frames at 5x). Entry 2 alone moves again; the other EIGHT came back
         // byte-identical.
-        88_705_757_032_532_170,
+        // RE-CAPTURED 2026-09-13 — THE OWNER'S GAPS (`RAINBOW-KITTY-V2.md`
+        // §29): a cell boundary takes the brighter cell's coverage, the
+        // one-finger hold is per row, abutting typed cohorts are healed
+        // into one before the plan, an erase holds its row and a late
+        // retreat still retracts. This script's typing and fold cross every
+        // one of those, so entry 2 alone moves; the other EIGHT came back
+        // byte-identical — the laws are v2's own and no other style's
+        // frame can reach them, which is this re-capture's control.
+        // RE-CAPTURED 2026-09-13 — THE COMET, THE VIVID RAIL AND THE
+        // FROM-THE-HAND ATTACK (`RAINBOW-KITTY-V2.md` §30; the owner: "a
+        // wider rainbow that seems to be painted from the cursor … I don't
+        // see much yellow?"). The body is fattest at the hand and thins
+        // behind it, a second polyline below the row bottom carries the
+        // full-value spectrum inside the caret's light band, and a new
+        // cell's light enters as a 40 ms wipe from the caret side. Entry 2
+        // alone moves (`7_634_783_364_044_148_639` →
+        // `13_840_333_753_928_455_602`); the other EIGHT came back
+        // byte-identical. The previous number is now the `rainbow kitty
+        // flat` spelling's pin (`the_flat_spelling_keeps_the_pre_comet_
+        // typed_fold`), which is this re-capture's second control: the
+        // gate restores the old fold byte for byte.
+        // RE-CAPTURED 2026-09-13 (the comet's review round): the rail's reach
+        // capped at RAIL_REACH_MAX_CH, the wipe on typed cells only, the last
+        // row flat. Entry 2 alone; the other EIGHT came back byte-identical.
+        7_629_358_332_570_765_847,
         12_359_376_227_302_100_357,
         17_288_162_128_308_037_669,
         13_741_658_660_564_044_123,
@@ -794,6 +825,34 @@ fn a_licensed_typed_move_is_byte_identical_across_the_license_commit() {
     assert_eq!(
         actual, GOLDEN,
         "a licensed typed move stopped being byte-identical to the pre-license tree"
+    );
+}
+
+/// THE FLAT SPELLING IS THE PRE-COMET FOLD (2026-09-13,
+/// `RAINBOW-KITTY-V2.md` §30). With `GlowConfig::ribbon_flat` set — the
+/// `rainbow kitty flat` spelling, the owner's A/B control — the same script
+/// folds to the number entry 2 of `GOLDEN` held BEFORE the comet body, the
+/// vivid rail and the from-the-hand attack landed (captured on 8582a67f9,
+/// the gap fixes). Every comet branch in `ribbon.rs` collapses to the old
+/// expression under the flag, and this is the measurement of that claim.
+#[test]
+fn the_flat_spelling_keeps_the_pre_comet_typed_fold() {
+    const PRE_COMET: u64 = 7_634_783_364_044_148_639;
+    let mut flat = cfg(GlowStyle::RainbowKitty);
+    flat.ribbon_flat = true;
+    let a = typed_script_with(&flat, true);
+    let b = typed_script_with(&flat, true);
+    assert_eq!(a, b, "the flat typed script is nondeterministic");
+    assert_eq!(
+        a.fingerprint, PRE_COMET,
+        "the flat spelling stopped being byte-identical to the pre-comet ribbon"
+    );
+    // …and the control: the default body is the comet, so the same script
+    // WITHOUT the flag folds to something else (entry 2 of `GOLDEN`).
+    assert_ne!(
+        typed_script(GlowStyle::RainbowKitty, true).fingerprint,
+        PRE_COMET,
+        "the comet body must move the fold, or the flat pin is vacuous"
     );
 }
 

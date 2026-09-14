@@ -240,7 +240,7 @@ impl Default for CursorPreviewSpec {
             accent: None,
             duration_ms: 260,
             length: 24,
-            intensity: 0.7,
+            intensity: 1.0,
             radius: 0.6,
             ring: true,
             wake_persist_s: aterm_effects::cursor_glow::RAINBOW_WAKE_PERSIST,

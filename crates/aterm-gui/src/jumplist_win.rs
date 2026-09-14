@@ -56,7 +56,7 @@
 //!
 //! **Timing & failure posture**: registration runs once per process on a
 //! throwaway background thread spawned *after the first present* (see the
-//! `JUMP_LIST` Once next to the font-warm hook in `app_render.rs`) — the shell
+//! `JUMP_LIST` Once in the first-present finalizer in `app_render.rs`) — the shell
 //! round-trips registry + profile-disk IO, none of which belongs on
 //! time-to-glass. Every failure is silent-best-effort: one `aterm_log` warn
 //! line, never a startup error — a terminal that cannot register a jump list

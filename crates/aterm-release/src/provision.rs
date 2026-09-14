@@ -71,6 +71,7 @@ pub fn run_provision(
     _repo: &std::path::Path,
     _id: &str,
     _check_only: bool,
+    _cert_dir: Option<&std::path::Path>,
 ) -> crate::ledger::Result<()> {
     Err(crate::ledger::Error::new(
         "provision is POSIX-only: the provisioning engine reads the master phrase from /dev/tty",
@@ -78,7 +79,12 @@ pub fn run_provision(
 }
 
 #[cfg(unix)]
-pub fn run_provision(repo: &Path, id: &str, check_only: bool) -> Result<()> {
+pub fn run_provision(
+    repo: &Path,
+    id: &str,
+    check_only: bool,
+    cert_dir: Option<&Path>,
+) -> Result<()> {
     // The same id rules the roster enforces, checked before anything network-shaped.
     atpkg_keys::provision::vet_machine_id(id).map_err(Error::new)?;
 
@@ -348,7 +354,7 @@ pub fn run_provision(repo: &Path, id: &str, check_only: bool) -> Result<()> {
     // formatted into an English sentence and then scraped back out with a 40-hex regex over
     // the printed line — and on a machine with two certificates that regex pinned whichever
     // appeared first in the prose, while the sentence claimed the profile disambiguated.
-    let (apple_check, apple_sha1) = apple_identity_check(id, !check_only);
+    let (apple_check, apple_sha1) = apple_identity_check(id, !check_only, cert_dir);
     record(crate::apple::APPLE_LABEL, apple_check, &mut checks);
 
     phase(
@@ -1812,8 +1818,12 @@ fn apple_clt_check() -> Check {
 /// which meant the pin was decided by "whichever SHA-1 appeared first in some prose" — and
 /// the prose it was scraped out of also contains a filesystem path.
 #[cfg(unix)]
-fn apple_identity_check(id: &str, may_change: bool) -> (Check, Option<String>) {
-    match crate::apple::acquire(id, may_change) {
+fn apple_identity_check(
+    id: &str,
+    may_change: bool,
+    cert_dir: Option<&Path>,
+) -> (Check, Option<String>) {
+    match crate::apple::acquire(id, may_change, cert_dir) {
         crate::apple::Outcome::Ready { ids, note } => {
             // `ids` holds only SHA-1s, so this count is a count of certificates. `verdict`
             // proves ids[0] can actually sign, so ids[0] is the one to pin: a profile

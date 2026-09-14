@@ -353,7 +353,8 @@ The pet answers to `rainbow kitty pet`, `rainbow kitty`, and bare `kitty` — al
 three are the same animal; the original flying head has its own name now,
 `rainbow kitty flying` (the historical `nyan` aliases still select it). The rest
 of the shelf: `rainbow dog pet`, the ribbon geometries `rainbow kitty underline`
-and `rainbow kitty tall`, then `phaser`, `comet`, `lumen`, `sparkle`, `fire`,
+and `rainbow kitty tall`, the A/B control `rainbow kitty flat` (the body before
+the comet and its vivid rail), then `phaser`, `comet`, `lumen`, `sparkle`, `fire`,
 `laser`, `water`, `beam`, `classic`, `classic mono`, and `off` — or load a Trail Pack, a TOML cursor trail
 composed from the built-in beam, crown, particle, and ramp primitives, no restart
 needed. `classic` is the v0.28 trail restored: a thin four-layer comet under a

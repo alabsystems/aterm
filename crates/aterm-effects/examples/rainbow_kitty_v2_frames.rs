@@ -395,6 +395,7 @@ impl Sim {
                 intensity: 1.0,
                 duration: Duration::from_millis(900),
                 ribbon_tall: true,
+                ribbon_flat: false,
                 theme_fg: INK,
                 theme_bg: GROUND,
                 reduced_motion: false,

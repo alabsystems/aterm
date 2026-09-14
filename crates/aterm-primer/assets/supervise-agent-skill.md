@@ -63,16 +63,28 @@ Two ways in:
 **Sandbox anything you run UNATTENDED.** Use a *disposable checkout* — a separate
 clone or a `git worktree` in a throwaway path — never the user's live tree. A
 branch is **not** a sandbox: it protects committed history, not the filesystem, so
-a stray write or `rm` still hits your real files. For stronger isolation, spawn
-the worker with `aterm-gui --headless --sandbox` (containment mode: no network,
-writes confined to `/tmp`) when the task fits inside it. Your budget and breaker
-are a discipline, not a sandbox.
+a stray write or `rm` still hits your real files — and `aterm-gui --headless
+--sandbox` does **not** close that hole either. What containment mode actually
+buys, on macOS: the kernel Seatbelt profile denies ALL network, and denies
+read+write of the credential set (`.ssh`, `.aws`, `.gnupg`, `.config/gh`,
+`.netrc`, …) and the private-user-data set (Documents, Downloads, media, the
+Mail/Messages/keychain/cookies/browser stores). The rest of the filesystem is
+`(allow default)`: **writes are not confined, and your live tree stays
+writable.** Off macOS nothing is enforced at all. So use `--sandbox` for the
+network and secret denial, and the disposable checkout for the filesystem —
+neither substitutes for the other. Your budget and breaker are a discipline,
+not a sandbox.
 
 Keep a durable **notes file** with what a fresh copy of you needs to resume:
 objective, worker sid + socket, the ground-truth command, budget remaining, and
 one line per action taken. That file — not your context window — is your memory
 across restarts. Point `aterm drive supervise --notes` (or `watch --notes`) at the
-same file: it appends one UTC-stamped line per approval or hand-off.
+same file — but it writes far less than the whole story: with `--auto-reads` ON it
+appends one UTC-stamped line per BASH-prompt decision (approved, not read-only,
+two-approvals, press skipped, press unanswered) and NOTHING else. A question, an
+idle composer, a limit notice, an Edit/Write/workflow box: no line. Without
+`--auto-reads` the file stays empty for the whole run. Everything else in the
+notes is yours to write.
 
 ## The loop
 
@@ -118,7 +130,7 @@ mechanical steps (`aterm drive --help`, *SUPERVISING A WORKER*); an older `aterm
    |---|---|
    | `busy` — a live spinner or `Waiting for N …` row just above the composer, `esc to interrupt`, or a shell or monitor still running | WAIT — not a review point yet. A monitor alone is soft busy: a question or a limit notice under it reads `question` / `limited`, because a monitor can run for hours |
    | the busy indicator that *was* there is now gone | the turn finished → go REVIEW |
-   | `prompt` — an approval box (`Do you want…`, `1. Yes / 2. No`, trust-folder prompt) | read WHAT it asks. Matches the task and is safe → approve GUARDED on a row the box shows: `aterm ctl "@$SID" key if=Do.you.want.to.proceed 1` (the option's number, or `enter`); `OK skipped seq=<n>` = the box was already gone and nothing was pressed — re-CLASSIFY. Surprising, destructive, or off-task → deny (`key escape`) and redirect, or ESCALATE |
+   | `prompt` — an approval box (`Do you want…`, `1. Yes / 2. No`, trust-folder prompt) | read WHAT it asks. Matches the task and is safe → approve GUARDED on a row the box shows: `aterm ctl "@$SID" key if=Do.you.want.to.proceed 1` (the option's number, or `enter`); `OK skipped seq=<n>` = NO VISIBLE ROW matched your regex and nothing was pressed — which is equally true when the box is GONE and when a *different* box is up (an Edit box asks `Do you want to make this edit to …?`, a workflow box `Run a dynamic workflow?`). Re-read the screen and classify what is actually there; re-pressing the same guard just skips again. Surprising, destructive, or off-task → deny (`key escape`) and redirect, or ESCALATE |
    | Claude Code's permission prompt: the command line, then `Do you want to proceed?` with numbered options — `1.` Yes (this once), `2.` Yes and don't ask again for a SCOPE (`git log *`, `allow reading from <dir>`), one option `switch to auto mode`, the last `No`; footer `Esc to cancel · Tab to amend` | classify the COMMAND LINE, not the box — the `classify` line `phase` printed, or `aterm drive classify '<command>'`. Read-only and the scope on option 2 is a read-only grant → option 2 (it removes a whole class of future prompts; see *Auto-approving reads*). A write or delete → judge that one command; option 1 at most, never the scope grant. **Never pick `switch to auto mode` unless the human said so.** Off-task or unsafe → `key escape` and redirect, or ESCALATE |
    | `limited` — its last turn ended on a usage or rate limit notice (`You've hit your session limit · resets 7:30pm`) | the worker cannot act until the limit resets or its model is switched; anything you send it fails. Decide per the human's policy — wait for `reset`, switch with `/model`, or ESCALATE — and never keep driving into the wall |
    | `question` — a prose question, composer idle | answer it with a `turn`, from your notes |
@@ -142,6 +154,15 @@ mechanical steps (`aterm drive --help`, *SUPERVISING A WORKER*); an older `aterm
    - **answer** — it asked something → drive the answer.
    - **done** — ground truth PROVES completion for THIS objective (tests pass, exit 0, the expected artifact exists — whatever the objective's check actually is) → STOP.
    - **escalate** — unsafe, surprising, or you cannot tell → STOP for a human.
+
+   **Read what the worker said since your turn with `aterm drive report "@$SID"`, not
+   the screen:** Claude Code runs on the alternate screen, so what scrolled off its top
+   is gone from `text` — measured, 7 of the 35 message blocks of one worker turn were
+   still on the screen; a lost one reported a broken build. `report` joins the rows the
+   host kept (`offscreen`) with the screen's, from your turn's `❯` row down, verbatim.
+   `report complete=1 …` = nothing was lost; `complete=0 reason=…` = rows may be missing
+   (the reason says why) — say so, and lean harder on the ground truth. Either way it is
+   the worker's account of its work, not proof of it.
 
    Drive with ONE verified human turn, settled on the busy footer LEAVING the screen:
    ```sh
@@ -216,8 +237,10 @@ to the manager (<why>): <command>` in the notes). It prints the `phase` lines, a
 then the prompt box verbatim or the last 28 non-blank rows. `TIMEOUT` / exit 124, then the
 last read's lines, once `--max-s` (seconds, default 1800) is spent — nothing is pressed
 after it. `--allow-python GLOB`
-(repeatable) widens the python rule; the default globs are `scripts/*standing*.py`,
-`scripts/*report*.py`, `scripts/*score*.py`. Without `--auto-reads` every prompt is yours.
+(repeatable) REPLACES the python globs — it does not widen them: the defaults are
+`scripts/*standing*.py`, `scripts/*report*.py`, `scripts/*score*.py`, and passing the
+flag once drops all three, so repeat them if you still want them.
+Without `--auto-reads` every prompt is yours.
 It presses option 1 only — never the scope grant, never auto mode — and never types text:
 REVIEW, drive the next `turn`, call it again. Its `--max-s` bounds ONE call's wall clock;
 the drive budget below is still yours to count.
@@ -225,7 +248,7 @@ the drive budget below is still yours to count.
 ### Let the harness wake you: `aterm drive watch`
 
 ```sh
-aterm drive watch "@$SID" --auto-reads --notes "$NOTES"   # under your harness's background monitor
+aterm drive watch "@$SID" --auto-reads --notes "$NOTES" --report   # under your harness's background monitor
 ```
 
 When your harness can run a long-lived command in the background and wake you once per
@@ -247,6 +270,37 @@ except that a review point prints one line and the loop keeps going.
   however quick the worker was. An identical screen that the worker somehow reached
   again is the one case it stays quiet about: if a line you expected does not come,
   `aterm drive phase` it.
+- **`EVENT survey seq=<n> dismiss with: aterm ctl @<sid> key 'if=^●.How.is.Claude.doing'
+  0` is Claude Code's session survey, and it is never yours to answer.** It is printed
+  once when `● How is Claude doing this session?` over `1: Bad    2: Fine   3: Good   0:
+  Dismiss` appears above the composer (`aterm drive phase` and `await-turn` end with
+  `survey 0` while it is open), and again if it comes back after going. While it is open,
+  a turn whose first character is 1, 2 or 3 is taken as the HUMAN's rating of the
+  session: never rate it for them. Run the command it names — `0`, guarded on the
+  survey's own row, quoted for zsh — before your next `turn`. With `--dismiss-surveys`
+  the loop presses that `0` itself (never while a box is up) and prints `DISMISSED survey
+  seq=<n>` once the survey has gone; if it is still there, you get the `EVENT survey`
+  line instead. A monitor that filters the lines keeps that one too: `aterm drive watch
+  … | grep --line-buffered -E '^(EVENT|APPROVED|DISMISSED|TIMEOUT|EXIT)'`.
+- **`EVENT context seq=<n> <v>% until auto-compact` means the worker is about to compact;
+  `EVENT compacted seq=<n>` means it has.** Claude Code parks `1% until auto-compact`
+  right-aligned above its composer as the context runs low (`aterm drive phase` and
+  `await-turn` end with `context <n>%` while it is up); a compaction replaces the worker's
+  history with a summary, and your standing rules (run nothing heavy while a flag file
+  exists, say) can silently drop out of it. `watch` says the first reading at or below
+  `--context-warn` (default 10; `0` turns both lines off) once a descent, even mid-turn:
+  have the worker bring its handoff notes up to date before it compacts. It says `EVENT
+  compacted` once the indicator has gone from above the composer (or jumped back up 30
+  points or more): re-send your standing rules in ONE turn. `supervise` says both on
+  stderr, but only for what happens during its run — each run starts afresh, so a
+  compaction between two runs (while you act on a result) prints nothing: after an `EVENT
+  context`, run `aterm drive phase` before the next `supervise`; no `context <n>%` line
+  (and no box up) means it compacted. Never type `/compact` or `/clear` into the worker
+  for it without the human.
+- **`--report` counts what was said:** each idle, question and limited EVENT carries
+  `complete=<0|1> rows=<n>` before its summary (`EVENT idle seq=812 complete=1 rows=57 …`)
+  — the `report` of everything the worker said since your turn, which the one-line
+  summary is not. Read it with `aterm drive report "@$SID"` before you REVIEW.
 - **`APPROVED seq=<n> <command>` lines are the audit trail** of what it waved through —
   the same reads `supervise --auto-reads` approves, noted in `--notes` too.
 - **`RECONNECT <reason>` and `RECONNECTED after <ms> ms` are informational:** `watch`

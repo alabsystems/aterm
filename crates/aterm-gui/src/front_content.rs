@@ -56,6 +56,9 @@ pub(crate) struct TerminalMirror {
     pub(crate) term: Arc<Mutex<Terminal>>,
     pub(crate) master: i32,
     pub(crate) sink: Arc<SinkWriter>,
+    /// The session's UI-waiter register (`SessionCtx::ui_waiting`), so the
+    /// redraw's blocking acquisitions can announce themselves to the reader.
+    pub(crate) ui_waiting: Arc<std::sync::atomic::AtomicU32>,
 }
 
 impl std::fmt::Debug for TerminalMirror {

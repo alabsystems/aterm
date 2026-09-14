@@ -59,6 +59,7 @@ fn inject_operator_launch_line(
     let event = crate::input::InputEvent::KeySequence(bytes);
     crate::app_input::tracked_egress(
         term,
+        &ctx.modes,
         &ctx.sink,
         &ctx.output_echo,
         &event,
@@ -1889,6 +1890,7 @@ impl App {
                         term: session.term.clone(),
                         master: session.master,
                         sink: session.ctx.sink.clone(),
+                        ui_waiting: session.ctx.ui_waiting.clone(),
                     }),
                 )
             }
@@ -2163,6 +2165,7 @@ impl App {
             term,
             master,
             sink,
+            sess.ctx.ui_waiting.clone(),
             s,
             rows,
             cols,

@@ -490,6 +490,9 @@ impl Terminal {
             let (_parser, mut handler) = terminal.split_for_process();
             handler.sgr_style().apply_style_change();
         }
+        // `modes`/kitty/xterm were assigned by value above, after `with_grid`
+        // published the fresh fold — republish for the hydrated state.
+        terminal.refresh_mode_mirror();
 
         terminal
     }
@@ -548,6 +551,7 @@ impl Terminal {
         // the parked one would come back on the next alt exit as a highlight with no
         // history behind it.
         // Only the PARKED slot, which this design introduced and therefore owns.
+        // (Mode mirror: republished at the end of this fn — see below.)
         // Hydration arguably invalidates the LIVE selection too — its anchors name a
         // lineage this terminal never saw — but that is a pre-existing gap, and
         // clearing it here is user-visible on the seamless-update ADOPT path
@@ -555,6 +559,13 @@ impl Terminal {
         // in-place update. Left alone deliberately rather than changed as a side
         // effect of screen-scoping.
         self.parked_text_selection.clear();
+        // In-place hydration replaced `modes`, the kitty stack and the xterm
+        // keyboard state outside `process()`: republish the lock-free fold so
+        // the input seam encodes against the adopted session's modes.
+        self.refresh_mode_mirror();
+        // The alt-screen archive was following the replaced grids: flush, record a
+        // `restore` gap, and rebaseline on what was just installed.
+        self.alt_archive_after_restore();
     }
 }
 

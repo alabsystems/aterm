@@ -17,6 +17,19 @@ pub struct Screen {
     pub cursor_col: usize,
     /// The content sequence the read was taken at (`await seq <n>` waits past it).
     pub seq: u64,
+    /// The grid row the first of `rows` is: a shaped read's `first` (`tail=`
+    /// sends it when it does not start at row 0), 0 for a full read.
+    pub first: usize,
+}
+
+impl Screen {
+    /// The cursor's index into `rows` — its grid row less [`Self::first`];
+    /// `None` when that row is not among the rows read.
+    pub fn cursor_index(&self) -> Option<usize> {
+        self.cursor_row
+            .checked_sub(self.first)
+            .filter(|&i| i < self.rows.len())
+    }
 }
 
 /// Parse the JSON body of a `text --json` reply (with or without the `OK 1`
@@ -46,6 +59,7 @@ pub fn parse_text_json(body: &str) -> Result<Screen, String> {
         cursor_row: usize::try_from(num(cursor, "row").unwrap_or(0)).unwrap_or(usize::MAX),
         cursor_col: usize::try_from(num(cursor, "col").unwrap_or(0)).unwrap_or(usize::MAX),
         seq: num(Some(&v), "seq").unwrap_or(0),
+        first: usize::try_from(num(Some(&v), "first").unwrap_or(0)).unwrap_or(usize::MAX),
     })
 }
 
@@ -273,6 +287,27 @@ mod tests {
         let s = parse_text_json(trimmed).expect("parses");
         assert!(s.rows.is_empty());
         assert_eq!(s.seq, 5);
+    }
+
+    /// A `tail=` read that does not start at row 0 says where it starts
+    /// (`first`), and the cursor's grid row maps onto the rows read through
+    /// it; a full read starts at 0, and a cursor above a tail is on none.
+    #[test]
+    fn a_tail_reads_first_row_places_the_cursor() {
+        let tail = r#"{"rows":["a","❯ hi","b"],"cursor":{"row":61,"col":4},"dims":{"rows":63,"cols":80},"seq":9,"first":60}"#;
+        let s = parse_text_json(tail).expect("parses");
+        assert_eq!((s.first, s.cursor_row), (60, 61));
+        assert_eq!(s.cursor_index(), Some(1));
+        let full = r#"{"rows":["a","❯ hi"],"cursor":{"row":1,"col":4},"dims":{"rows":2,"cols":80},"seq":9}"#;
+        let s = parse_text_json(full).expect("parses");
+        assert_eq!((s.first, s.cursor_index()), (0, Some(1)));
+        let above = Screen {
+            rows: vec!["a".to_string()],
+            cursor_row: 3,
+            first: 10,
+            ..Screen::default()
+        };
+        assert_eq!(above.cursor_index(), None);
     }
 
     #[test]

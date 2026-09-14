@@ -96,14 +96,51 @@ pub const HIDE_BRIDGE_MAX_DIST: u16 = 2;
 /// bridge law): an app repositioning its cursor mid-repaint still spawns
 /// nothing.
 pub const HIDE_BRIDGE_TYPED_MAX_DIST: u16 = 8;
+/// The bridge's reach while a NAVIGATION hint is fresh (2026-09-13, the silent
+/// word hop): UNBOUNDED. The typed reach is 8 because a typed echo is bounded
+/// by how many keys can batch inside one hide window; a navigation key carries
+/// no such bound — Option+Left crosses a word, `Home` crosses a line — so a
+/// distance cap on a nav-witnessed landing is a cap on the gesture itself.
+///
+/// This is not a widening of the anti-stray law. [`CursorTrail::spawn`] and
+/// `CursorGlow::spawn` still own the licence and still consume the hint
+/// exactly once; a STALE nav hint bridges nothing, so an app repositioning
+/// its cursor mid-repaint with no key behind it spawns exactly what it
+/// spawned before. What changes is only which SOURCE CELL a licensed move is
+/// measured from — and the source's AGE is still bounded, by
+/// [`nav_bridge_source_ok`]: it must have been visible within one
+/// [`HIDE_BRIDGE_MS`] window OF THE KEY, so a caret the engine last saw
+/// minutes ago (a viewport parked in history) can never become the origin of
+/// a screen-crossing gesture on one word key.
+pub const HIDE_BRIDGE_NAV_MAX_DIST: u16 = u16::MAX;
 
-/// The bridge reach for one reappear: widened while a typed/backspace echo
-/// hint is fresh, classic otherwise. The single decision both the trail and
-/// glow engines share (they must agree, or the opaque bed and the additive
-/// light desynchronize on the same move).
+/// May a NAV-witnessed hidden→visible landing use `seen` as its source cell?
+///
+/// The honest predicate is not "how old is the sample NOW" — the tick that
+/// observes an echo may be a frame or two behind it — but **"was the caret
+/// still visible around the time the key was pressed"**: the press is what
+/// moved it, so a sample taken within one hide window before the press is the
+/// cell it moved FROM. A sample older than that belongs to some earlier state
+/// (the caret parked off-viewport, a different screen) and bridges nothing.
+///
+/// With the nav hint itself capped at `NAV_HINT_FRESH`, the source can be at
+/// most `NAV_HINT_FRESH + HIDE_BRIDGE_MS` old — bounded, and shared by both
+/// engines so the bed and the light cannot disagree on one move.
 #[must_use]
-pub fn hide_bridge_reach(typed_hint_fresh: bool) -> u16 {
-    if typed_hint_fresh {
+pub fn nav_bridge_source_ok(key: Instant, seen: Instant) -> bool {
+    key.saturating_duration_since(seen).as_millis() as u64 <= HIDE_BRIDGE_MS
+}
+
+/// The bridge reach for one reappear: UNBOUNDED while a navigation hint is
+/// fresh, widened while a typed/backspace echo hint is fresh, classic
+/// otherwise. The single decision both the trail and glow engines share (they
+/// must agree, or the opaque bed and the additive light desynchronize on the
+/// same move).
+#[must_use]
+pub fn hide_bridge_reach(typed_hint_fresh: bool, nav_hint_fresh: bool) -> u16 {
+    if nav_hint_fresh {
+        HIDE_BRIDGE_NAV_MAX_DIST
+    } else if typed_hint_fresh {
         HIDE_BRIDGE_TYPED_MAX_DIST
     } else {
         HIDE_BRIDGE_MAX_DIST
@@ -268,7 +305,11 @@ pub struct CursorTrail {
     /// `spawn` lays NO comet across them.
     /// BANKED per press, one stamp per echo sweep (the glow engine's
     /// [`TypedStamps`] contract, kept in lockstep so the two engines license
-    /// exactly the same flood-typing moves).
+    /// exactly the same flood-typing moves). Revoked in lockstep too, by the
+    /// dispatch instant (`revoke_input_hints_at`): the glow engine's
+    /// press-credit ring goes with the stamp only on a FAILED write
+    /// (`CursorGlow::revoke_failed_input_at`) — a queued key keeps its credit
+    /// and has its stamp re-banked at delivery.
     type_hint: TypedStamps,
     /// Fresh-navigation veto twin of `CursorGlow::nav_hint` (armed from the
     /// same host site): a deliberate Ctrl-A/E leap must never re-anchor even
@@ -603,9 +644,22 @@ impl CursorTrail {
             // batched echoes hop farther than 2 cells inside one hide window;
             // unhinted moves keep the classic source law.
             let typed_fresh = self.type_hint.any_fresh(now, Self::TYPE_HINT_FRESH);
-            let reach = hide_bridge_reach(typed_fresh);
+            // A fresh NAVIGATION hint outranks the hide window entirely
+            // (2026-09-13, the silent word hop; lockstep with
+            // `CursorGlow::tick`): the key was pressed, and this landing is
+            // its echo however long the caret was unobservable (a TUI that
+            // repaints inside DECTCEM-hide) and however far it hopped.
+            // `spawn` still owns the license, still consumes the hint once,
+            // and still refuses a stale one — so an unhinted program
+            // relocation keeps the pinned 2-cell law — and the SOURCE's age is
+            // still bounded, by `nav_bridge_source_ok`.
+            let nav_bridge = self
+                .nav_hint
+                .filter(|t| now.saturating_duration_since(*t).as_secs_f32() <= Self::NAV_HINT_FRESH)
+                .is_some_and(|key| nav_bridge_source_ok(key, seen));
+            let reach = hide_bridge_reach(typed_fresh, nav_bridge);
             let plausible = cur.is_some_and(|(cr, cc)| cr.abs_diff(r).max(cc.abs_diff(c)) <= reach);
-            (fresh && plausible).then_some((r, c))
+            ((fresh || nav_bridge) && plausible).then_some((r, c))
         });
         let declined_hidden_relocation = spawn_from.is_none()
             && self.last.is_none()
@@ -633,7 +687,18 @@ impl CursorTrail {
             // still the completion boundary for one-shot input state.
             // No move reached `spawn`, so consume the hints dark; otherwise the
             // next unrelated PTY/CUP delta could borrow them.
+            //
+            // THE NAV HINT IS THE EXCEPTION (2026-09-13, lockstep with
+            // `CursorGlow::retire_hidden_movement_provenance`): a same-cell
+            // completion under a FRESH nav hint is a key whose echo has not
+            // landed yet — the frame that snapped a scrolled viewport back, or
+            // the hidden half of an Ink repaint — and wiping it here declined
+            // that echo `no-fresh-hint` one frame later. A stale hint retires.
+            let fresh_nav = self.nav_hint.filter(|t| {
+                now.saturating_duration_since(*t).as_secs_f32() <= Self::NAV_HINT_FRESH
+            });
             self.clear_typed();
+            self.nav_hint = fresh_nav;
         } else if unseeded_visible {
             // A fresh/reset engine has no honest source cell from which to
             // render this landing. Seed the visible anchor, but spend every
@@ -1828,6 +1893,9 @@ mod tests {
         echoed.insert("hint", 0);
         echoed.insert("consumed", 1);
         echoed.insert("admissions", 1);
+        // The echo spends the press's credit (the 2026-09-10 spend law the
+        // model carries since 2026-09-12).
+        echoed.insert("spent", 1);
         echoed.insert("spawns", 1);
         echoed.insert("births", 1);
         echoed.insert("licensed_tally", 1);

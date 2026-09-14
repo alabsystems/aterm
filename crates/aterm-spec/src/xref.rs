@@ -1133,6 +1133,7 @@ pub fn model_registry() -> Vec<Model> {
         // metadata-only single-head lifecycle; the updater scan binding lives in
         // aterm-update::github.
         release_durable_post_intent_model(),
+        roster_pair_redo_model(),
         release_channel_floor_model(),
         release_journal_prefix_model(),
         release_publisher_fence_model(),

@@ -19,6 +19,7 @@ fn config(style: GlowStyle) -> GlowConfig {
         // Shipping default: the tall body; explicit underline is exercised by
         // the workload matrix benchmark.
         ribbon_tall: true,
+        ribbon_flat: false,
         enabled: true,
         dark_theme: true,
         // The documented default dark palette — a COHERENT pair, never 0/0

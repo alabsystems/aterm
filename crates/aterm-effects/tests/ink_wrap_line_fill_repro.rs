@@ -81,6 +81,7 @@ fn cfg(style: GlowStyle) -> GlowConfig {
         // Mirrors the shipping resolver for the rainbow family. The field is
         // irrelevant to every other style in this cross-style regression.
         ribbon_tall: true,
+        ribbon_flat: false,
         enabled: true,
         dark_theme: true,
         // The documented default dark palette — a COHERENT pair, never 0/0

@@ -413,6 +413,21 @@ impl PetWorld {
         pane: PetPane,
         exclusions: &[PetRect],
     ) -> bool {
+        self.observe_with_exclusions_near(input, facts, pane, exclusions, None)
+    }
+
+    /// Observe fresh cells around an already admitted resident when a console
+    /// hides its cursor. The hint selects coverage only: it is neither a caret
+    /// nor permission to occupy any cell. Selection and a visible caret keep
+    /// their normal precedence, and every coherence check still applies.
+    pub(crate) fn observe_with_exclusions_near(
+        &mut self,
+        input: &RenderInput,
+        facts: &PetWorldFacts,
+        pane: PetPane,
+        exclusions: &[PetRect],
+        held_center: Option<(f32, f32)>,
+    ) -> bool {
         self.retire();
         let s = facts.stamp.surface;
         if s.terminal_id == 0
@@ -444,8 +459,18 @@ impl PetWorld {
         self.stamp = Some(facts.stamp);
         self.progress = facts.progress;
         self.selection_target = selection_target(input, pane);
+        let held_center = held_center.filter(|&(row, col)| {
+            input.display_offset == 0
+                && row.is_finite()
+                && col.is_finite()
+                && row >= 0.0
+                && col >= 0.0
+                && row < pane.rows as f32
+                && col < pane.cols as f32
+        });
         let center = if input.display_offset != 0 || !input.cursor_visible {
             self.selection_target
+                .or(held_center)
                 .unwrap_or((pane.rows as f32 * 0.5, pane.cols as f32 * 0.5))
         } else {
             (

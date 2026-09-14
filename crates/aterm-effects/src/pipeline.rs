@@ -61,7 +61,27 @@ use crate::matrix_rain::{
     RainVisibility,
 };
 use crate::output_streak::{MAX_COMETS, OutputStreak, StreakConfig, TAIL_MAX, TAIL_MIN};
+use crate::rainbow_kitty::TypedClass;
 use crate::word_decorations::{DecoConfig, EffectGeom, Resolved, SelView, WordDecorations};
+
+/// The symbols a US layout types with Shift held — what the web host can
+/// know of a key's shiftedness once the browser has resolved it to a
+/// character (the native seam reads the modifier itself).
+const WEB_SHIFTED_SYMBOLS: &str = "~!@#$%^&*()_+{}|:\"<>?";
+
+/// The glyph class a committed web character carries to the rainbow engine —
+/// the same table the native seam prices with (`aterm-gui`'s
+/// `typed_class_for`): the spacebar's rest, the `!` hero, a capital, and
+/// every other printable.
+#[must_use]
+pub fn web_typed_class(ch: char) -> TypedClass {
+    match ch {
+        ' ' => TypedClass::Space,
+        '!' => TypedClass::Bang,
+        c if c.is_uppercase() => TypedClass::Capital,
+        _ => TypedClass::Glyph,
+    }
+}
 
 /// The COHERENT cold-start ground pair for `dark_theme: true` — the
 /// documented default palette. What `new()` seeds the glow fold with, and what
@@ -345,6 +365,7 @@ impl EffectsPipeline {
                 // so the presentation flag is exactly `false` here rather than
                 // a guess: `apply` overwrites it from the real spelling.
                 ribbon_tall: false,
+                ribbon_flat: false,
                 // …and the same for the classic wake's colour face: Lumen is
                 // not the classic style, so this is `false` by fact rather
                 // than by guess, and `apply` re-derives it from the spelling.
@@ -727,7 +748,14 @@ impl EffectsPipeline {
         if let Some(rain) = self.rain.as_deref_mut() {
             rain.note_keystroke();
         }
-        self.glow.note_typed_cells(now, width as u16);
+        // THE GLYPH IS SPELLED TO THE ENGINE (2026-09-13): the web host used
+        // to price every key as a plain `Glyph`, so a Space never rested the
+        // synth and a capital or a `!` never earned its hero star; the native
+        // seam has always asked the glyph (`aterm-gui`'s `typed_class_for`).
+        let class = web_typed_class(ch);
+        let shifted = ch.is_uppercase() || WEB_SHIFTED_SYMBOLS.contains(ch);
+        self.glow
+            .note_typed_glyph(now, width as u16, shifted, class);
         self.trail.note_typed(now);
         true
     }
@@ -736,8 +764,48 @@ impl EffectsPipeline {
     /// paste. Call once after transport admission, never from output parsing
     /// or composition preview. Admission does not establish an actual edit.
     /// [`Self::note_committed_char`] already reports a scalar's Text event.
+    ///
+    /// **THE KEY'S KIND REACHES THE GLOW** (2026-09-13). On the web every
+    /// non-text key — Backspace, Enter, the arrows, `^A`/`^K`/`^U` — used to
+    /// reach the cursor engines only as a text-blind
+    /// [`Self::note_keystroke`], which the engine replays as a TYPED glyph:
+    /// a Backspace ADVANCED the ribbon's momentum, banked a press credit and
+    /// re-laid the very cell it had just erased, and nothing ever retracted
+    /// it (the owner's WASM crop: seven cells of ribbon under blank cells
+    /// right of the text). A page that reports its keys here gets the native
+    /// laws: `delete` is the erase (the ribbon retracts, the sky throws its
+    /// stars), `navigate` licenses the hop without a typed credit, `submit`
+    /// is the Enter key (inert until its flight is observed), `paste` the
+    /// gesture. A page that only calls `note_keystroke` keeps its old
+    /// behaviour, byte for byte.
     pub fn note_console_input(&mut self, kind: PetInputKind) {
-        self.companion.note_console_input(self.now(), kind);
+        let now = self.now();
+        self.companion.note_console_input(now, kind);
+        let editing = |me: &mut Self| {
+            me.typing_cadence.on_keystroke(now);
+            me.rain_material_editing = true;
+            if let Some(rain) = me.rain.as_deref_mut() {
+                rain.note_keystroke();
+            }
+        };
+        match kind {
+            PetInputKind::Delete => {
+                editing(self);
+                self.glow.note_backspace(now);
+            }
+            PetInputKind::Kill => {
+                editing(self);
+                self.glow.note_kill(now, true);
+            }
+            PetInputKind::KillForward => {
+                editing(self);
+                self.glow.note_kill(now, false);
+            }
+            PetInputKind::Navigate => self.glow.note_navigation(now),
+            PetInputKind::Submit => self.glow.note_return(now),
+            PetInputKind::Paste => self.glow.note_user_gesture(now),
+            PetInputKind::Text => {}
+        }
     }
 
     /// Visual bell → the rain engine's 2 s constant-luminance amber ALERT
@@ -856,6 +924,10 @@ impl EffectsPipeline {
             // highlighter-plus-under-baseline alternate. Keep this embedder
             // twin aligned with the native resolver.
             ribbon_tall: !crate::cursor_glow::GlowStyle::style_names_underline_ribbon(style),
+            // The comet body and its vivid rail are the DEFAULT; only the
+            // explicit `... flat` spelling restores the 2026-09-13 flat body
+            // (`RAINBOW-KITTY-V2.md` §30). A spelling, like the two above.
+            ribbon_flat: crate::cursor_glow::GlowStyle::style_names_flat_ribbon(style),
             // The classic wake's colour face is a spelling too, and re-derives
             // here for the same reason — keep aligned with the native resolver.
             classic_mono: crate::cursor_glow::GlowStyle::style_names_classic_mono(style),
@@ -2297,7 +2369,7 @@ impl EffectsPipeline {
             streak.note_output_cells(
                 &input.cells,
                 (input.cursor_row, input.cursor_col),
-                rows,
+                (rows, cols),
                 streak_token,
                 now,
                 false,
@@ -2320,6 +2392,10 @@ impl EffectsPipeline {
             ^ streak_fp.rotate_left(33)
     }
 }
+
+#[cfg(test)]
+#[path = "pipeline_input_tests.rs"]
+mod input_contract_tests;
 
 #[cfg(test)]
 mod tests {

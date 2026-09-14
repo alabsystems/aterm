@@ -144,11 +144,39 @@ pub struct Lane {
     pub note: &'static str,
 }
 
+/// A DIRECT row whose branded tool is VERB-FIRST: the upstream name takes a
+/// source file as its first argument, the branded tool takes a subcommand.
+///
+/// `lean file.lean` is the case this exists for. Every other DIRECT row is
+/// argument-compatible with its branded tool (`clippy`→`tippy`,
+/// `rustfmt`→`trustfmt`, `rustdoc`→`trustdoc`), so plain passthrough is right
+/// for them; `clean` is verb-first, so passthrough produced
+/// `clean file.lean` → "unrecognized subcommand 'file.lean'" and the Lean name
+/// was unusable inside a session.
+///
+/// Keyed on the source EXTENSION, never on "the argument is not a flag": the
+/// branded tool has its own subcommands (`repl`, `eval`, `lake`), and a
+/// not-a-flag rule would rewrite `lean repl` into `clean check repl`. Matching
+/// `.lean` cannot collide with a subcommand and leaves `lean --version`,
+/// `lean repl` and an explicit `lean check f.lean` exactly as the caller wrote
+/// them.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct SourceVerb {
+    /// The branded subcommand a bare source file routes through.
+    pub verb: &'static str,
+    /// The source extension that selects it, leading dot included.
+    pub ext: &'static str,
+}
+
 /// The per-row policy — philosophy §4's table, one variant per column.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Policy {
     /// Run `branded` with the caller's arguments; announce one line.
-    Direct { branded: &'static str },
+    /// `source_verb` is `Some` only when the branded tool is VERB-FIRST.
+    Direct {
+        branded: &'static str,
+        source_verb: Option<SourceVerb>,
+    },
     /// Refuse; name `branded` and every `lane` with the caller's arguments.
     /// An empty `lanes` means "one spelling, equivalence unproven" (`tlc`).
     Signpost {
@@ -208,13 +236,17 @@ pub const TABLE: &[Row] = &[
     Row {
         upstream: "clippy",
         family: "Rust",
-        policy: Policy::Direct { branded: "tippy" },
+        policy: Policy::Direct {
+            branded: "tippy",
+            source_verb: None,
+        },
     },
     Row {
         upstream: "rustfmt",
         family: "Rust",
         policy: Policy::Direct {
             branded: "trustfmt",
+            source_verb: None,
         },
     },
     Row {
@@ -222,12 +254,19 @@ pub const TABLE: &[Row] = &[
         family: "Rust",
         policy: Policy::Direct {
             branded: "trustdoc",
+            source_verb: None,
         },
     },
     Row {
         upstream: "lean",
         family: "Lean",
-        policy: Policy::Direct { branded: "clean" },
+        policy: Policy::Direct {
+            branded: "clean",
+            source_verb: Some(SourceVerb {
+                verb: "check",
+                ext: ".lean",
+            }),
+        },
     },
     Row {
         upstream: "tlc",
@@ -274,7 +313,7 @@ pub fn row_for(name: &str) -> Option<&'static Row> {
 #[must_use]
 pub fn branded_of(row: &Row) -> &'static str {
     match row.policy {
-        Policy::Direct { branded }
+        Policy::Direct { branded, .. }
         | Policy::Signpost { branded, .. }
         | Policy::Oracle { branded, .. } => branded,
     }
@@ -508,9 +547,15 @@ pub fn policy_summary(row: &Row) -> String {
     let upstream = row.upstream;
     let escape = escape_clause(upstream);
     match row.policy {
-        Policy::Direct { branded } => {
-            format!("runs '{branded} <args>' with one stderr line {escape}")
-        }
+        Policy::Direct {
+            branded,
+            source_verb,
+        } => match source_verb {
+            Some(SourceVerb { verb, ext }) => format!(
+                "runs '{branded} <args>' with one stderr line ('{branded} {verb} <file>' for a bare `{ext}` file) {escape}"
+            ),
+            None => format!("runs '{branded} <args>' with one stderr line {escape}"),
+        },
         Policy::Signpost { branded, lanes: [] } => format!(
             "announced, naming '{branded} <args>' (drop-in equivalence is not yet proven), then run upstream {escape}"
         ),
@@ -767,9 +812,12 @@ pub fn run(layout: &Layout, upstream: &str, args: &[String]) -> ExitCode {
         return exec_upstream(layout, upstream, args);
     }
     match row.policy {
-        Policy::Direct { branded } => {
+        Policy::Direct {
+            branded,
+            source_verb,
+        } => {
             eprintln!("{}", direct_announcement(upstream, row.family, branded));
-            exec_branded(layout, upstream, branded, args)
+            exec_branded(layout, upstream, branded, &direct_args(source_verb, args))
         }
         Policy::Signpost { branded, lanes } => {
             if let Some(toolchain) =
@@ -874,6 +922,29 @@ fn exec_upstream(layout: &Layout, upstream: &str, args: &[String]) -> ExitCode {
 
 /// A DIRECT row: the managed copy of `branded`, through the store (never PATH),
 /// with the managed `bin/` appended for its children — `atpkg run`'s discipline.
+/// The arguments a DIRECT row hands its branded tool.
+///
+/// Identity for every row without a [`SourceVerb`]. For a verb-first row it
+/// inserts the verb ONLY when the caller's first argument is a source file of
+/// the declared extension, so `lean f.lean` reaches `clean check f.lean` while
+/// `lean --version`, `lean repl` and an explicit `lean check f.lean` are passed
+/// through untouched. Pure, so the table's behaviour is testable without
+/// spawning anything.
+#[must_use]
+fn direct_args(source_verb: Option<SourceVerb>, args: &[String]) -> Vec<String> {
+    match source_verb {
+        Some(SourceVerb { verb, ext })
+            if args.first().is_some_and(|first| first.ends_with(ext)) =>
+        {
+            let mut out = Vec::with_capacity(args.len() + 1);
+            out.push(verb.to_string());
+            out.extend_from_slice(args);
+            out
+        }
+        _ => args.to_vec(),
+    }
+}
+
 fn exec_branded(layout: &Layout, upstream: &str, branded: &str, args: &[String]) -> ExitCode {
     let Some(target) = crate::which(layout, branded) else {
         eprintln!(
@@ -907,6 +978,56 @@ mod tests {
 
     fn args(list: &[&str]) -> Vec<String> {
         list.iter().map(|s| s.to_string()).collect()
+    }
+
+    /// `lean f.lean` must reach `clean check f.lean` — the branded tool is
+    /// verb-first, so plain passthrough spelled `clean f.lean` and died on
+    /// "unrecognized subcommand". Every other shape stays byte-identical: a
+    /// flag, one of `clean`'s OWN subcommands (the reason this is keyed on the
+    /// extension and not on "not a flag"), an already-explicit verb, and every
+    /// DIRECT row that declares no `SourceVerb`.
+    #[test]
+    fn a_verb_first_direct_row_routes_a_bare_source_file_through_its_verb() {
+        let lean = row_for("lean").expect("lean is a rerouted name");
+        let Policy::Direct { source_verb, .. } = lean.policy else {
+            panic!("lean is a DIRECT row");
+        };
+        let sv = source_verb.expect("lean declares a source verb");
+
+        assert_eq!(
+            direct_args(source_verb, &args(&["f.lean"])),
+            args(&["check", "f.lean"])
+        );
+        assert_eq!(
+            direct_args(source_verb, &args(&["a/b/Main.lean", "--json"])),
+            args(&["check", "a/b/Main.lean", "--json"])
+        );
+        // Untouched: a flag, one of clean's own subcommands, an explicit verb.
+        for passthrough in [
+            vec!["--version"],
+            vec!["repl"],
+            vec!["check", "f.lean"],
+            vec![],
+        ] {
+            assert_eq!(
+                direct_args(source_verb, &args(&passthrough)),
+                args(&passthrough),
+                "{passthrough:?} must pass through unchanged"
+            );
+        }
+        assert_eq!(sv.verb, "check");
+        assert_eq!(sv.ext, ".lean");
+
+        // A row with no source verb is pure identity.
+        let clippy = row_for("clippy").expect("clippy is a rerouted name");
+        let Policy::Direct {
+            source_verb: none, ..
+        } = clippy.policy
+        else {
+            panic!("clippy is a DIRECT row");
+        };
+        assert!(none.is_none());
+        assert_eq!(direct_args(none, &args(&["x.rs"])), args(&["x.rs"]));
     }
 
     /// The table is the policy: no name twice, every branded target a name the

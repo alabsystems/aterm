@@ -41,6 +41,53 @@
 //! the front window is unfocused. At one window the set is `{active}` (focused) or
 //! `{}` (unfocused) — byte-identical to the old two-atomic behavior. This matches
 //! the iTerm2 / Terminal.app default and keeps background-tab activity visible.
+//!
+//! **Identity and consent (macOS).** Both delivery paths are SUBPROCESSES, and a
+//! subprocess of aterm runs with aterm as its TCC "responsible" app — whatever it
+//! asks the system for is asked in aterm's name, at a program's request (OSC 9 /
+//! 99 / 777 are program output; over SSH they are the remote's). That is why the
+//! whole module sits behind the fail-closed `allow_notifications` opt-in
+//! (`handler_osc_notify.rs`: no callback fires while it is off), the same consent
+//! surface as the other program-triggered escapes (`allow_window_ops`,
+//! `allow_osc52_query`, `allow_palette_reconfigure`, `allow_kitty_file_transfer`).
+//! What an `osascript` launched in aterm's name asks the system for was MEASURED
+//! on macOS 26 (2026-09-13, `/usr/bin/log show --predicate 'subsystem ==
+//! "com.apple.TCC"'` over 2026-09-11 00:00 to 2026-09-13 12:00): that PREDICATE
+//! surfaced TWO `osascript` launches, and only one of them is aterm's. (The window
+//! holds more — an unfiltered query over the same span finds four, pids 19482, 44554,
+//! 35342 and 27784 — but the other two raised no TCC record at all, which is the
+//! question this paragraph is about.)
+//! pid 27784 (2026-09-12 22:18:34) ran under `responsible=targo-…` with
+//! `binary_path=…/target.noindex/release/aterm-release` — the DMG builder's
+//! Finder-layout script (`crates/aterm-release/src/dmg.rs`, `osascript (DMG
+//! window layout)`) running under `targo`, nothing to do with this module.
+//! pid 35342 (2026-09-12 15:54:46) ran under `responsible=com.aterm.aterm`
+//! (`responsible_path` the installed `aterm.app` binary); TCC does not log the
+//! script, so which osascript aterm ran is UNIDENTIFIED. The DECIDING fact is the
+//! live config: `~/.config/aterm/aterm.toml` sets neither `allow_notifications` nor
+//! `allow_osc52_query`, so this fallback was OFF on 2026-09-12 and no launch that day
+//! can be its. The binary also holds three osascript sites, not one — this fallback,
+//! `atpkg`'s `Elevation::Osascript` administrator dialog
+//! (`crates/atpkg/src/elevate.rs`), and the macOS-gated `display alert` a failed
+//! launch raises off the main thread (`crates/aterm-gui/src/lib.rs`) — so the name
+//! alone never identifies the caller. An earlier reading of the same log counted three launches
+//! under `com.aterm.aterm` and credited them all to this fallback; the attribution
+//! was wrong, and the count came from a wider query than the TCC predicate used here. What both launches DID read in TCC is the same: one
+//! `kTCCServiceListenEvent` PREFLIGHT each (`AUTHREQ_CTX … preflight=yes,
+//! query=1`, then WindowServer's own `AUTHREQ_ATTRIBUTION` for the same pid),
+//! answered from the database with no `AUTHREQ_PROMPTING` — WindowServer's
+//! standard check on any process that connects to it, not a notification
+//! permission, and a preflight never raises a dialog. `usernoted` and
+//! `com.apple.usernotifications` logged nothing naming osascript, Script Editor
+//! or a display in the two minutes around either launch. So: on the measured
+//! platform an osascript under aterm's identity asks for nothing that prompts,
+//! but no launch in the log is attributable to THIS fallback, so its own
+//! behaviour is unmeasured; it stays behind the fail-closed `allow_notifications`
+//! opt-in regardless, because the attribution is aterm's. There is no in-process
+//! `UNUserNotificationCenter` path in aterm today (nothing under `crates/` links
+//! UserNotifications); adding one would move the identity from a subprocess to
+//! the bundle itself and needs the bundle's own notification consent — a design
+//! step, not a fallback swap.
 
 // Real delivery exists on macOS and Windows; elsewhere (Linux) this module is a
 // channel-draining stub (`spawn_delivery`), so the real-notification
@@ -140,6 +187,10 @@ pub fn spawn_delivery(
 /// activate, app sender) when installed; otherwise falls back to `osascript`'s
 /// `display notification`. Runs ONLY on the delivery thread (blocking is fine
 /// there). Best-effort: a missing notifier or a non-zero exit is swallowed.
+///
+/// Reached only through the `allow_notifications` gate (the module doc's
+/// *Identity and consent* paragraph says what each subprocess asks the system for
+/// under aterm's name, and that the measured answer is: nothing that prompts).
 #[cfg(target_os = "macos")]
 pub fn deliver(title: Option<&str>, body: &str, _silent: bool) {
     use std::process::{Command, Stdio};

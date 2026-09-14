@@ -484,11 +484,17 @@ fn ident_ending_at(s: &str, end: usize) -> Option<&str> {
     }
 }
 
-/// Term-lock guard variables bound in `body` via `let [mut] <ident> = term_lock(`.
+/// Term-lock guard variables bound in `body` via `let [mut] <ident> = term_lock(`
+/// — or via the UI thread's REGISTERING spelling, `= [crate::]term_lock_ui(`
+/// (P63): it returns the same guard, so a binding through it is the same hold.
 fn guard_vars(body: &[String]) -> std::collections::BTreeSet<String> {
     let mut guards = std::collections::BTreeSet::new();
     for line in body {
-        let Some(eq) = line.find("= term_lock(") else {
+        let Some(eq) = line
+            .find("= term_lock(")
+            .or_else(|| line.find("= crate::term_lock_ui("))
+            .or_else(|| line.find("= term_lock_ui("))
+        else {
             continue;
         };
         let lhs = line[..eq].trim_end();
@@ -535,8 +541,9 @@ fn term_hop_calls(body: &[String]) -> (Vec<TermHopHazard>, usize) {
         }
     };
     for line in body {
-        // Idiom (1): a call chained directly on the lock guard, `term_lock(..).m(`.
-        if line.contains("term_lock(") {
+        // Idiom (1): a call chained directly on the lock guard, `term_lock(..).m(`
+        // (or `term_lock_ui(..).m(` — the `_ui` infix breaks the plain needle).
+        if line.contains("term_lock(") || line.contains("term_lock_ui(") {
             let mut search = line.as_str();
             while let Some(rel) = search.find(").") {
                 let after = &search[rel + 2..];
@@ -1166,6 +1173,39 @@ mod tests {
     fn guard_vars_captures_the_term_lock_binding() {
         let g = guard_vars(&body("        let mut term = term_lock(&s.term);"));
         assert!(g.contains("term"));
+    }
+
+    /// P63's registering acquire binds the SAME guard: redraw LOCK A is
+    /// `let mut term = crate::term_lock_ui(&t.term, ui_waiting, site);`, and a
+    /// `term.resize(` under it must stay a hazard (it went blind when the needle
+    /// only knew `= term_lock(`). Both the path-qualified and bare spellings, and
+    /// the chained idiom, are covered.
+    #[test]
+    fn guard_vars_captures_the_term_lock_ui_binding() {
+        let g = guard_vars(&body(
+            "            let mut term = crate::term_lock_ui(&front_terminal.term, ui_waiting, site);",
+        ));
+        assert!(
+            g.contains("term"),
+            "crate::term_lock_ui( binding yields `term`"
+        );
+        let g = guard_vars(&body(
+            "        let mut t = term_lock_ui(&term, &ui_waiting, site);",
+        ));
+        assert!(g.contains("t"), "bare term_lock_ui( binding yields `t`");
+        let (hz, _) = term_hop_calls(&body(
+            "    let mut term = crate::term_lock_ui(&s.term, w, site);\n    term.resize(r, c);",
+        ));
+        assert_eq!(
+            hz.len(),
+            1,
+            "resize on a term_lock_ui-bound guard must flag"
+        );
+        assert_eq!(hz[0].method, "resize");
+        let (hz, _) = term_hop_calls(&body(
+            "    crate::term_lock_ui(&s.term, w, site).resize(r, c);",
+        ));
+        assert_eq!(hz.len(), 1, "chained term_lock_ui(..).resize( must flag");
     }
 
     // ------------------------------------------------------------------

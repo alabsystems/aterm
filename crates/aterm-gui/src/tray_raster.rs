@@ -1305,8 +1305,10 @@ struct UiFontAssets {
 #[derive(Clone)]
 #[cfg_attr(not(windows), allow(dead_code))]
 pub(crate) struct UiVariableSemibold {
-    /// The whole font file (ttf-parser borrows it per raster).
-    pub(crate) bytes: Arc<[u8]>,
+    /// The whole font file (ttf-parser borrows it per raster) — the SAME
+    /// admission the regular face was parsed from, a file mapping when the
+    /// file lives on the system font volume (`font_file::admit_font_file`).
+    pub(crate) bytes: aterm_render::font::FaceBytes,
     /// Collection index the regular was parsed at.
     pub(crate) index: u32,
     /// The `(tag, value)` instance coords — `wght` pulled to the Fluent
@@ -1330,7 +1332,7 @@ const UI_SEMIBOLD_WGHT: f32 = 600.0;
 /// would hand `UiBold` a look-alike — the exact contrast loss the "never pair
 /// SegUIVar with itself" rule guards against, in another coat).
 fn variable_semibold_of(
-    bytes: Arc<[u8]>,
+    bytes: aterm_render::font::FaceBytes,
     index: u32,
     regular: &Arc<ChromeFont>,
 ) -> Option<UiVariableSemibold> {
@@ -1486,20 +1488,57 @@ fn ui_font_candidates() -> Vec<UiFontCandidate> {
     Vec::new()
 }
 
+/// The UI face FILES one `resolve_ui_font_assets` admitted, each DISTINCT
+/// path once, plus how many admissions that took.
+///
+/// The macOS candidate names `/System/Library/Fonts/HelveticaNeue.ttc` for
+/// BOTH its faces (regular = index 0, semibold = index 10), and the resolver
+/// used to `std::fs::read` the 4.47 MB collection once per face — unbounded,
+/// and two independent heap copies retained for the process's life by the two
+/// parsed faces. One admission per path, and through
+/// `font_file::admit_font_file`: the same bounded admission the terminal
+/// faces get, which MAPS a file on the system font volume, so the
+/// collection is file-backed pages shared with every other process, not
+/// 8.9 MB of anonymous heap per window. `reads` lives on the value rather than
+/// in a process-global counter so the proof of "once" is this resolve's alone.
+#[derive(Default)]
+struct UiFontFiles {
+    admitted: std::collections::HashMap<std::path::PathBuf, Option<aterm_render::font::FaceBytes>>,
+    reads: usize,
+}
+
+impl UiFontFiles {
+    fn admit(&mut self, path: &std::path::Path) -> Option<aterm_render::font::FaceBytes> {
+        if let Some(hit) = self.admitted.get(path) {
+            return hit.clone();
+        }
+        self.reads += 1;
+        let admitted = aterm_render::font_file::admit_font_file(path).ok();
+        self.admitted.insert(path.to_path_buf(), admitted.clone());
+        admitted
+    }
+}
+
 /// Parse one UI face; the file bytes ride back beside it so the resolver can
 /// keep them for a variable face ([`variable_semibold_of`]), which re-parses
 /// them through `ttf-parser` to instance a `wght` axis the face type itself
 /// does not expose.
 ///
-/// ONE copy of the file, shared three ways — the handle returned here, the
-/// parsed face (which reads outlines on demand and so holds the file), and the
-/// [`UiVariableSemibold`] the resolver may build from it. It read into a `Vec`
-/// and then made two more copies before `fontdue` was retired, which was
-/// invisible while the parsed face kept no bytes at all.
-fn parse_ui_font(path: &std::path::Path, index: u32) -> Option<(Arc<ChromeFont>, Arc<[u8]>)> {
-    let bytes: Arc<[u8]> = std::fs::read(path).ok()?.into();
-    let font = ChromeFont::from_shared_slice(
-        Arc::clone(&bytes),
+/// ONE admission of the file, shared every way — the handle returned here, the
+/// parsed face (which reads outlines on demand and so holds the file), the
+/// [`UiVariableSemibold`] the resolver may build from it, AND the sibling face
+/// parsed from the same file ([`UiFontFiles`]). It read into a `Vec` and then
+/// made two more copies before `fontdue` was retired, which was invisible
+/// while the parsed face kept no bytes at all; and it read the file once per
+/// FACE until the admission cache.
+fn parse_ui_font(
+    files: &mut UiFontFiles,
+    path: &std::path::Path,
+    index: u32,
+) -> Option<(Arc<ChromeFont>, aterm_render::font::FaceBytes)> {
+    let bytes = files.admit(path)?;
+    let font = ChromeFont::from_shared(
+        bytes.clone(),
         aterm_render::font::FontSettings {
             collection_index: index,
         },
@@ -1518,10 +1557,17 @@ static UI_FONT_RESOLVE_ATTEMPTS: std::sync::atomic::AtomicU64 =
 fn resolve_ui_font_assets() -> UiFontAssets {
     #[cfg(test)]
     UI_FONT_RESOLVE_ATTEMPTS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-    let mut first_regular: Option<(Arc<ChromeFont>, Arc<[u8]>, u32)> = None;
+    let mut files = UiFontFiles::default();
+    resolve_ui_font_assets_with(&mut files)
+}
+
+/// [`resolve_ui_font_assets`] over a caller-owned admission cache, so a test
+/// can see exactly which files one resolve admitted and how many times.
+fn resolve_ui_font_assets_with(files: &mut UiFontFiles) -> UiFontAssets {
+    let mut first_regular: Option<(Arc<ChromeFont>, aterm_render::font::FaceBytes, u32)> = None;
     for candidate in ui_font_candidates() {
-        let regular = parse_ui_font(&candidate.regular_path, candidate.regular_index);
-        let semibold = parse_ui_font(&candidate.semibold_path, candidate.semibold_index);
+        let regular = parse_ui_font(files, &candidate.regular_path, candidate.regular_index);
+        let semibold = parse_ui_font(files, &candidate.semibold_path, candidate.semibold_index);
         match (regular, semibold) {
             (Some((regular, bytes)), Some((semibold, _))) => {
                 let variable_semibold =
@@ -3378,6 +3424,50 @@ mod tests {
                 file(&first_complete.regular_path).contains("noto"),
                 "the first complete pair is Noto, never the DejaVu fallback: {:?}",
                 first_complete.regular_path
+            );
+        }
+    }
+
+    /// One admission per distinct UI face FILE, whatever the candidate ladder
+    /// pairs: the macOS candidate names HelveticaNeue.ttc for both its faces
+    /// and used to read the 4.47 MB collection twice (two heap copies, kept).
+    /// And the admission is the bounded terminal-face one, which MAPS a file
+    /// on the system font volume (`font_file::maps_in_place`, the one
+    /// definition of the rule) rather than copying it.
+    #[test]
+    fn ui_font_assets_admit_each_distinct_file_once() {
+        let mut files = UiFontFiles::default();
+        let assets = resolve_ui_font_assets_with(&mut files);
+        assert_eq!(
+            files.reads,
+            files.admitted.len(),
+            "every distinct path was admitted exactly once"
+        );
+        let Some(pair) = ui_font_candidates()
+            .into_iter()
+            .find(|c| c.regular_path.is_file() && c.semibold_path.is_file())
+        else {
+            eprintln!("SKIP: no complete UI face pair on this host");
+            return;
+        };
+        assert!(assets.regular.is_some() && assets.semibold.is_some());
+        if pair.regular_path == pair.semibold_path {
+            assert_eq!(
+                files.reads,
+                1,
+                "regular and semibold live in ONE file ({}); it must be admitted once, \
+                 not once per face",
+                pair.regular_path.display()
+            );
+        }
+        for (path, admitted) in &files.admitted {
+            let Some(bytes) = admitted else { continue };
+            assert_eq!(
+                bytes.is_mapped(),
+                cfg!(unix) && aterm_render::font_file::maps_in_place(path),
+                "{}: a UI face is a file MAPPING exactly when it lives on the system font \
+                 volume, and a copy otherwise",
+                path.display()
             );
         }
     }

@@ -108,11 +108,181 @@ pub(crate) struct StripDrag {
     pub(crate) origin_col: u16,
 }
 
+/// Outcome of one hover resolution ([`App::resolve_hover_cursor`]).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum HoverProbe {
+    /// The cursor was written; this is the cell whose link the band discloses
+    /// (`None` from every arm where the grid is not under the pointer).
+    Resolved(Option<crate::link_target::LinkHover>),
+    /// The grid probe found the terminal mutex busy and touched nothing; the
+    /// caller keeps the previous cursor and caption.
+    Deferred,
+}
+
+/// The grid arm of one hover resolution, memoised on EVERYTHING it depends on,
+/// so the terminal mutex is touched once per QUESTION rather than once per pixel
+/// of motion (a trackpad asks the same `(row, col, modifier)` question ~7 times
+/// per cell it crosses, a 1 kHz mouse far more).
+///
+/// The key is the session, the WINDOW cell (pane-local cells are clamped into
+/// the focused pane, so two window cells over a sibling share one), the link
+/// modifier, the pointer/pane/chrome gate, and the ENGINE FILL the answer
+/// stands on ([`HoverFrame`]). That last term is what makes the memo a function
+/// of the LAST PRESENTED FRAME — the semantics the resolver already documents
+/// ("the pointer stands on the row the frame DREW"): a row rewritten or
+/// scrolled under a still pointer arrives as a new engine fill, and
+/// [`App::refresh_hover_for_frame_locked`] re-probes it, under the fill's own
+/// hold, before the caption is spliced.
+///
+/// The VALUE keeps the OSC 8 destination itself (`Some` ⇔ the cell is linked)
+/// as the `Arc<str>` the engine already holds, so the caption splice reads it
+/// with no lock and no `String` copy per frame. [`crate::link_target::LinkHover`]
+/// stays `Copy + PartialEq` (it is compared by value at the event boundary);
+/// this sibling record carries the string.
+#[derive(Clone, Debug)]
+pub(crate) struct HoverMemo {
+    session: u64,
+    window_cell: (u16, u16),
+    /// The pane-local cell the probe read — the one a `LinkHover` names.
+    cell: (u16, u16),
+    mod_held: bool,
+    /// `pointer_is_inside_focused_pane && !chrome_owns_terminal_row` at
+    /// resolution time: part of the key, because a gate that flips (a panel
+    /// opening under the pointer) changes the answer without moving anything.
+    under_pointer: bool,
+    /// The engine fill this answer stands on — see [`HoverFrame`].
+    frame: HoverFrame,
+    /// The hyperlink under the cell, when it carries one.
+    link: Option<std::sync::Arc<str>>,
+    /// A plain-text URL run under the cell (probed only with the modifier held).
+    plain_url: bool,
+}
+
+/// The ENGINE FILL a window's frame stands on — the hover memo's epoch.
+///
+/// Read from the scratch the ENGINE filled, never from a host-bumped counter:
+/// `terminal_id` (which engine), `engine_fill_seq` (that engine's damage epoch
+/// as of the fill — it moves on output AND on a viewport scroll, because
+/// `Grid::scroll_display` applies display-offset damage) and `display_offset`.
+/// Every host mutator on the presented path — the strip prepend, the find
+/// panel, the tab menu, this caption itself — bumps `snapshot_seq` and touches
+/// none of these, so a caption that paints every frame cannot make the next
+/// frame look new, and a frame the engine did not refill (the effect-only
+/// reuse) keys identically to the one before it.
+///
+/// TWO triples, because two scratches can be the engine-filled one: the
+/// single-pane routes fill `input_scratch` directly, while the composed split
+/// route fills the FOCUSED pane into `pane_scratch` and keeps an engine-exact
+/// copy in `composed_focus_scratch` (the composite itself is blitted, never
+/// engine-filled). Whichever route the frame took, the other scratch is left
+/// untouched and so contributes a constant; a route switch changes exactly
+/// one of them, which is one re-probe — the right answer for a grid that just
+/// changed hands. (The focused pane is the only one the hover can stand on:
+/// the resolver's gate requires the pointer inside it.)
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct HoverFrame {
+    single: (u64, u64, i32),
+    composed: (u64, u64, i32),
+}
+
+impl HoverMemo {
+    /// The engine-fill epoch of `ws`'s frame — see [`HoverFrame`].
+    pub(crate) fn frame_of(ws: &crate::WindowState) -> HoverFrame {
+        let of = |s: &aterm_core::render::RenderInput| {
+            (s.terminal_id, s.engine_fill_seq, s.display_offset)
+        };
+        HoverFrame {
+            single: of(&ws.input_scratch),
+            composed: of(&ws.composed_focus_scratch),
+        }
+    }
+
+    /// Whether this memo answers for `(session, window cell, modifier, gate)`
+    /// against the frame stamped `frame`.
+    fn answers(
+        &self,
+        session: u64,
+        window_cell: (u16, u16),
+        mod_held: bool,
+        under_pointer: bool,
+        frame: HoverFrame,
+    ) -> bool {
+        self.session == session
+            && self.window_cell == window_cell
+            && self.mod_held == mod_held
+            && self.under_pointer == under_pointer
+            && self.frame == frame
+    }
+
+    /// The cached destination for `hover`, if this memo is the resolution that
+    /// produced it (same session, same cell) — the caption splice's lock-free
+    /// read.
+    pub(crate) fn url_for(
+        &self,
+        hover: &crate::link_target::LinkHover,
+    ) -> Option<&std::sync::Arc<str>> {
+        (self.session == hover.session && self.cell == hover.cell)
+            .then_some(self.link.as_ref())
+            .flatten()
+    }
+
+    /// Whether this memo is the answer for the pointer AS THE FRAME FINDS IT:
+    /// the front `session`, the window cell the pointer last rested on, the
+    /// modifier it holds, and the engine fill the frame just landed. The
+    /// frame-time refresh's gate ([`crate::App::refresh_hover_for_frame_locked`]).
+    /// Every term is a field read; the pointer/pane/chrome gate is deliberately
+    /// not among them (it costs a layout walk in a split, and a flip of it
+    /// alone is the motion path's to notice). A memo naming a DIFFERENT cell
+    /// is what the motion path leaves behind when its non-blocking probe found
+    /// the mutex busy — so the next frame, under its own hold, answers it.
+    pub(crate) fn stands_for(&self, ws: &crate::WindowState, session: u64) -> bool {
+        self.session == session
+            && self.window_cell == ws.last_mouse_window_cell
+            && self.mod_held == link_modifier_held(ws.mods)
+            && self.frame == Self::frame_of(ws)
+    }
+}
+
+/// The grid arm's two probes for one hovered cell, against a terminal the
+/// caller already holds — the frame's own guard or the motion path's
+/// successful `try_lock`. Returns `(link, plain_url)`.
+///
+/// The destination itself, as the `Arc<str>` the grid already holds: kept in
+/// the memo so the caption splice reads it with no lock and no copy per frame,
+/// and re-read only when the frame under the pointer changes. VIEWPORT-keyed,
+/// like the plain-text probe beside it: the pointer stands on the row the frame
+/// DREW, and a screen-keyed probe answers about a different line the moment the
+/// viewport is scrolled back.
+///
+/// The plain-text probe needs only the row's CHARACTERS (one char per column,
+/// viewport-keyed), never the whole colour/decoration resolution `render_row`
+/// performs; it runs only for the gesture that needs it, and only once per cell
+/// entered. It earns no caption: a detected URL IS its own visible text.
+fn probe_hover_cell(
+    t: &Terminal,
+    row: u16,
+    col: u16,
+    cell_is_under_pointer: bool,
+    mod_held: bool,
+) -> (Option<std::sync::Arc<str>>, bool) {
+    let link = if cell_is_under_pointer {
+        t.hyperlink_at_visible(row, col)
+    } else {
+        None
+    };
+    let plain_url = mod_held && cell_is_under_pointer && link.is_none() && {
+        let mut chars = Vec::new();
+        t.row_cols_into(usize::from(row), &mut chars);
+        crate::find_url_span(&chars, usize::from(col)).is_some()
+    };
+    (link, plain_url)
+}
+
 /// Whether the "open link" modifier is held: Cmd (Super) on macOS — its native
 /// convention — and Ctrl on every other platform, because Linux/X11 desktops grab
 /// the Super (Windows) key, so a Super-click would never reach aterm. Mirrors the
 /// keybinding accelerator choice (Ctrl/Ctrl+Shift on Linux).
-fn link_modifier_held(mods: winit::keyboard::ModifiersState) -> bool {
+pub(crate) fn link_modifier_held(mods: winit::keyboard::ModifiersState) -> bool {
     #[cfg(target_os = "macos")]
     {
         mods.super_key()
@@ -254,13 +424,46 @@ thread_local! {
 /// once and threads this `Copy` snapshot through the `*_with` seams. The
 /// zero-argument wrappers stay for the ~80 cold call sites, and each of them now
 /// derives exactly once as well.
-#[derive(Clone, Copy)]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 struct PointerGeometry {
     /// `(cell_w, cell_h)` in device px.
     cell: (usize, usize),
     pad: usize,
     pad_top: usize,
     head: usize,
+}
+
+/// Every input of the pixel → pane-local cell mapping that is NOT the pixel,
+/// plus the identity of the session the cell is reported to. The same-pixel
+/// early return in [`App::route_cursor_moved`] (G14) may stand on the last
+/// routing decision only while the mapping that produced `last_mouse_cell`
+/// is the mapping the next report would be built under: a keyboard focus
+/// move between splits, a keyboard tab switch, a split/close/zoom that moves
+/// the focused rect, a font zoom, a strip splice or a window resize all
+/// change one of these WITHOUT a pointer event, and each leaves the parked
+/// pane-local cell pointing into a rect that is no longer the focused
+/// pane's. Stamped beside `hover_grid_owned` at the grid arm from the very
+/// values the mapping just used, and re-derived (lock-free, plan included)
+/// by the predicate, so the premise "the identical pixel cannot answer
+/// differently" is checked against the whole function, not just its
+/// argument.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub(crate) struct HoverMapping {
+    /// The front content the seam would report to (a tab switch or a focus
+    /// move between splits changes this and nothing the pointer can see).
+    front: Option<crate::front_content::FrontContent>,
+    /// The window's physical size: the frame origin's leading bands come from
+    /// it ([`App::frame_origin_with`]).
+    win_px: Option<(u32, u32)>,
+    /// The window grid `(rows, cols)` the window cell is clamped into.
+    dims: (u16, u16),
+    /// Strip + status rows above the terminal band.
+    chrome_rows: u16,
+    /// Cell size and the three insets.
+    geom: PointerGeometry,
+    /// The focused pane's `(row_off, col_off, rows, cols)` the pane-local cell
+    /// is translated into and clamped by.
+    pane_rect: (u16, u16, u16, u16),
 }
 
 /// Pane-local result of one pointer-to-cell mapping. The pane rectangle is
@@ -1031,6 +1234,33 @@ impl App {
         }
     }
 
+    /// The [`HoverMapping`] window `wid`'s pointer→cell mapping runs under
+    /// RIGHT NOW: the geometry and the focused pane rect derived afresh (the
+    /// rect plans the split — no lock, same cost the full route pays in
+    /// `refresh_mouse_cell`; a lone pane is four reads).
+    fn hover_mapping(&self, wid: WindowId) -> HoverMapping {
+        self.hover_mapping_with(wid, self.pointer_geometry(wid), self.focused_pane_rect(wid))
+    }
+
+    /// [`Self::hover_mapping`] against a geometry and focused rect the caller
+    /// already derived — the grid arm stamps from the mapping it just ran.
+    fn hover_mapping_with(
+        &self,
+        wid: WindowId,
+        geom: PointerGeometry,
+        pane_rect: (u16, u16, u16, u16),
+    ) -> HoverMapping {
+        let ws = self.windows.get(&wid);
+        HoverMapping {
+            front: ws.and_then(|ws| ws.front_content),
+            win_px: ws.and_then(|ws| ws.win_px.map(|px| (px.width, px.height))),
+            dims: ws.map_or((0, 0), |ws| (ws.rows, ws.cols)),
+            chrome_rows: self.chrome_rows(),
+            geom,
+            pane_rect,
+        }
+    }
+
     /// The window pixel at the CENTRE of terminal cell `(row, col)` — the exact
     /// inverse of [`pixel_to_term_cell`] plus the frame origin
     /// [`Self::window_to_frame_with`] removes, so feeding the result back through
@@ -1595,6 +1825,7 @@ impl App {
         // BEFORE the strip-hover early return, or a window with no chip under the
         // pointer would keep vouching for a position the pointer has left.
         ws.pointer_position_known = false;
+        ws.hover_grid_owned = false;
         if ws.strip_hover.is_none() && !ws.strip_hover_new_tab {
             return;
         }
@@ -2145,8 +2376,71 @@ impl App {
         // pointer on chrome (the strip arm below) retires a standing caption
         // AND repaints it away.
         let parked = self.park_link_target(wid);
-        self.update_hover_cursor_with(wid, self.pointer_geometry(wid));
+        self.update_hover_cursor_with(wid, self.pointer_geometry(wid), parked, None);
         self.settle_link_target(wid, parked);
+    }
+
+    /// Re-resolve the hover when the FRAME under a still pointer has changed —
+    /// the frame-time half of the memoised hover ([`HoverMemo`]), run UNDER THE
+    /// FRAME'S OWN HOLD. Called from every engine-fill site the moment the fill
+    /// lands and while the guard that produced it is still held (`t`): the
+    /// single-pane LOCK B and its rescan LOCK A, the composed route's focused
+    /// pane, and the headless capture's twins of both. When the pointer is
+    /// known, the last resolution reached the grid, and the frame's ENGINE FILL
+    /// has moved since that resolution ([`HoverFrame`]: output rewrote the row,
+    /// a wheel scrolled the viewport, a tab switch put another grid under the
+    /// pointer), the grid arm re-probes against `t` — once per changed fill —
+    /// and republishes the cursor and the caption's cell. A frame the engine
+    /// did not refill — and every frame that only carries host bands, the
+    /// caption included — costs one epoch compare, whatever the effect lane's
+    /// cadence.
+    ///
+    /// THE PROBE RIDES THE FRAME'S ACQUISITION, so it can never be deferred:
+    /// the reader cannot be mid-slice while this thread holds the mutex the
+    /// slice needs. That is what retires the retry-frame question outright —
+    /// no `try_lock` at frame time, no parked answer standing for "one frame",
+    /// no deadline owed to the scheduler for a re-probe that a busy mutex put
+    /// off, and no way for the RepaintKey early-out to swallow the frame that
+    /// was to carry the retry (the frame that presents this fill IS the frame
+    /// the answer is published on). What the motion path's non-blocking probe
+    /// deferred is caught here too: a missing memo, or one naming a different
+    /// cell than the pointer now rests on, counts as stale
+    /// ([`HoverMemo::stands_for`]), so the next frame resolves it under its
+    /// own hold.
+    ///
+    /// A CONTINUATION of the last routing decision, never an independent
+    /// resolver: it runs only while `hover_grid_owned` says the last
+    /// `route_cursor_moved` reached the grid arm. A pointer a modal, the tab
+    /// context menu, a native view, chrome or a connector/divider drag owns
+    /// returned before that arm, and the frame must not resolve the grid cell
+    /// under a menu card, or swap a drag's grab cursor for an I-beam, on that
+    /// owner's behalf. (The resolver's own guards cover the pointer-eventless
+    /// modifier path, which has no routing decision to continue.)
+    ///
+    /// No settle: the caller IS the frame, and what this publishes reaches the
+    /// glass through the frame's own RepaintKey (`link_caption`), so there is
+    /// nothing to ask a further redraw for. The gate register it reads
+    /// (`chrome_rows`) is the previous frame's at this point, exactly as it is
+    /// for a pointer event arriving between frames.
+    pub(crate) fn refresh_hover_for_frame_locked(&mut self, wid: WindowId, t: &Terminal) {
+        let Some(ws) = self.windows.get(&wid) else {
+            return;
+        };
+        if !ws.pointer_position_known || !ws.hover_grid_owned {
+            return;
+        }
+        let Some(session) = self.front_terminal(wid).map(|front| front.session) else {
+            return;
+        };
+        if ws
+            .hover_memo
+            .as_ref()
+            .is_some_and(|memo| memo.stands_for(ws, session))
+        {
+            return;
+        }
+        let parked = self.park_link_target(wid);
+        self.update_hover_cursor_with(wid, self.pointer_geometry(wid), parked, Some(t));
     }
 
     /// TAKE the standing link hover without repainting, so the resolution about
@@ -2192,8 +2486,30 @@ impl App {
     /// probe on purpose — a cursor that promises a click and a caption that
     /// names its destination must never be able to disagree about which link is
     /// under the pointer.
-    fn update_hover_cursor_with(&mut self, wid: WindowId, geom: PointerGeometry) {
-        let resolved = self.resolve_hover_cursor(wid, geom);
+    ///
+    /// `parked` is the hover the caller's park/settle bracket took at the event
+    /// boundary: when the grid probe finds the terminal mutex BUSY (the PTY
+    /// reader mid-slice) the resolution is deferred and the previous answer —
+    /// cursor and caption both — stands until the next pointer event or the
+    /// next engine fill, whose frame re-probes under its own hold
+    /// ([`Self::refresh_hover_for_frame_locked`]). A hover icon is never worth
+    /// parking the UI thread behind the reader.
+    ///
+    /// `probe` is that hold when the caller IS the frame: the guard the fill
+    /// was taken under, against which the grid arm reads directly — no
+    /// acquisition of its own, and no deferral possible. `None` on the motion
+    /// and modifier paths, which own no lock and try for one.
+    fn update_hover_cursor_with(
+        &mut self,
+        wid: WindowId,
+        geom: PointerGeometry,
+        parked: Option<crate::link_target::LinkHover>,
+        probe: Option<&Terminal>,
+    ) {
+        let resolved = match self.resolve_hover_cursor(wid, geom, probe) {
+            HoverProbe::Resolved(hover) => hover,
+            HoverProbe::Deferred => parked,
+        };
         if let Some(ws) = self.windows.get_mut(&wid) {
             // A plain write: the park/settle bracket at the event boundary owns
             // the repaint decision, because only it can see what the value was
@@ -2204,12 +2520,15 @@ impl App {
 
     /// Resolve the hover state, writing the cursor and RETURNING the cell whose
     /// hyperlink is to be disclosed (`None` from every arm where the grid is not
-    /// the thing under the pointer).
+    /// the thing under the pointer). `probe` is the frame's own terminal hold
+    /// when there is one (see [`Self::update_hover_cursor_with`]).
     fn resolve_hover_cursor(
         &mut self,
         wid: WindowId,
         geom: PointerGeometry,
-    ) -> Option<crate::link_target::LinkHover> {
+        probe: Option<&Terminal>,
+    ) -> HoverProbe {
+        use HoverProbe::Resolved;
         // While a modal overlay is open the pointer is ITS (the About dialog runs
         // its own link/I-beam cursor, the palette its row hand): a Cmd press must
         // not resolve a terminal link hidden UNDER the card and flip the cursor
@@ -2219,14 +2538,33 @@ impl App {
             .get(&wid)
             .is_some_and(|ws| ws.overlay.is_some())
         {
-            return None;
+            return Resolved(None);
+        }
+        // The tab context menu is a separate window-state surface, not an
+        // `Overlay` variant, and it owns the pointer the same way while it is
+        // up (the motion ladder returns at its arm): a link hidden under the
+        // card earns no hand and no caption, and the cell beneath it is not
+        // what a press there would hit.
+        if self
+            .windows
+            .get(&wid)
+            .is_some_and(|ws| ws.tab_menu.is_some())
+        {
+            return Resolved(None);
+        }
+        // A connector drag owns the pointer for the gesture's lifetime
+        // (`conn_drag_motion` set the grab cursor once at its start and the
+        // motion ladder returns at its arm): re-resolving mid-drag would swap
+        // the grab for an I-beam and caption a link the drop cannot reach.
+        if self.conn_drag.is_some() {
+            return Resolved(None);
         }
         // A native view owns its cursor through the motion path's native branch
         // (I-beam over text bodies, hand over controls): a modifier tap must not
         // stomp what that branch resolved — the old blind swap did exactly that,
         // clearing `native_text_cursor` on a Ctrl tap over an editor body.
         if self.active_native_view(wid).is_some() {
-            return None;
+            return Resolved(None);
         }
         // A held divider drag owns the resize cursor until release
         // (`begin_divider_drag` set it, `finish_divider_drag` restores): mid-drag
@@ -2237,9 +2575,11 @@ impl App {
             .get(&wid)
             .is_some_and(|ws| ws.divider_drag.is_some())
         {
-            return None;
+            return Resolved(None);
         }
-        let (px, py) = self.windows.get(&wid).map(|ws| ws.last_cursor_px)?;
+        let Some((px, py)) = self.windows.get(&wid).map(|ws| ws.last_cursor_px) else {
+            return Resolved(None);
+        };
         // Chrome: over the tab strip the pointer is a button pointer, never an
         // I-beam (the strip is not selectable text) — the same answer the motion
         // path's own strip branch gives, repeated here for the pointer-eventless
@@ -2247,7 +2587,7 @@ impl App {
         // `CursorMoved`, `last_cursor_px` is the window origin.
         if self.strip_col_at_with(wid, geom, px, py).is_some() {
             self.set_hover_cursor(wid, CursorIcon::Default, false, false);
-            return None;
+            return Resolved(None);
         }
         // Split dividers (hover half): the 1-cell seam is drawn, but until this
         // probe nothing SAID it was draggable — the resize cursor appeared only
@@ -2255,11 +2595,14 @@ impl App {
         // dragging to learn you could drag.
         if let Some(icon) = self.divider_cursor_under_pointer(wid) {
             self.set_hover_cursor(wid, icon, true, true);
-            return None;
+            return Resolved(None);
         }
-        // The grid. ONE terminal lock answers everything this arm asks: the
-        // hyperlink on the hovered cell, the plain-text URL run under it, and
-        // the mouse mode.
+        // The grid. The mouse mode is read LOCK-FREE from the session's mode
+        // mirror; the two grid probes (the hyperlink on the hovered cell, the
+        // plain-text URL run under it) are MEMOISED on the question they answer
+        // and re-asked — under one NON-BLOCKING acquisition — only when the
+        // question changes: a new cell, a modifier edge, a flipped gate, or a
+        // new frame under a still pointer (`HoverMemo`).
         let mod_held = self
             .windows
             .get(&wid)
@@ -2268,10 +2611,11 @@ impl App {
             .windows
             .get(&wid)
             .map_or((0, 0), |ws| ws.last_mouse_cell);
-        let window_row = self
+        let window_cell = self
             .windows
             .get(&wid)
-            .map_or(0, |ws| ws.last_mouse_window_cell.0);
+            .map_or((0, 0), |ws| ws.last_mouse_window_cell);
+        let window_row = window_cell.0;
         // WHOSE CELL THIS IS — whether the cell about to be probed is the cell
         // the pointer is actually over. Two ways it is not, and a link read
         // through either would be a hand promising a click that opens nothing
@@ -2295,31 +2639,56 @@ impl App {
             .map(|terminal| (terminal.term.clone(), terminal.session))
         else {
             self.set_hover_cursor(wid, CursorIcon::Text, false, true);
-            return None;
+            return Resolved(None);
         };
-        let (linked, plain_url, tracking) = {
-            let t = term_lock(&term);
-            // Only WHETHER there is a link: the destination itself is re-read
-            // from the grid at paint (`link_target`'s header), so copying the
-            // string per motion event would buy a value that has to be
-            // discarded anyway.
-            //
-            // VIEWPORT-keyed, like the plain-text probe beside it
-            // (`render_row` resolves through `display_offset`): the pointer
-            // stands on the row the frame DREW, and a screen-keyed probe
-            // answers about a different line the moment the viewport is
-            // scrolled back.
-            let linked = cell_is_under_pointer && t.hyperlink_at_visible(row, col).is_some();
-            // The plain-text probe renders a whole row, so it runs only for the
-            // gesture that needs it. It also earns no caption: a detected URL
-            // IS its own visible text, so there is nothing about its
-            // destination that the screen is not already saying.
-            let plain_url = mod_held
-                && cell_is_under_pointer
-                && !linked
-                && plain_url_at(&t.render_row(row as usize), col as usize).is_some();
-            (linked, plain_url, t.mouse_tracking_enabled())
+        // The mouse mode, from the terminal's published mirror: `process()`
+        // republishes it before every hold ends, so this is the mode the last
+        // completed batch left — with no queue position behind the reader.
+        let tracking = self
+            .pool
+            .get(session)
+            .is_some_and(|owner| owner.ctx.modes.mouse_tracking_enabled());
+        let Some(ws) = self.windows.get_mut(&wid) else {
+            return Resolved(None);
         };
+        let frame = HoverMemo::frame_of(ws);
+        let answered = ws.hover_memo.as_ref().is_some_and(|memo| {
+            memo.answers(session, window_cell, mod_held, cell_is_under_pointer, frame)
+        });
+        if !answered {
+            let (link, plain_url) = match probe {
+                // THE FRAME'S OWN HOLD: the fill that made this question new
+                // was taken under it, and it is still held — read straight
+                // through it. Nothing to acquire, nothing to defer.
+                Some(t) => probe_hover_cell(t, row, col, cell_is_under_pointer, mod_held),
+                None => {
+                    // NON-BLOCKING: a busy mutex means the PTY reader is
+                    // mid-slice, and a hover icon must never queue the UI
+                    // thread behind it. Defer — the caller keeps the previous
+                    // cursor and caption — and the next pointer event re-asks
+                    // against a free lock, or the next engine fill answers
+                    // under the frame's own hold.
+                    let Some(t) = crate::term_try_lock(&term) else {
+                        return HoverProbe::Deferred;
+                    };
+                    probe_hover_cell(&t, row, col, cell_is_under_pointer, mod_held)
+                }
+            };
+            ws.hover_memo = Some(HoverMemo {
+                session,
+                window_cell,
+                cell: (row, col),
+                mod_held,
+                under_pointer: cell_is_under_pointer,
+                frame,
+                link,
+                plain_url,
+            });
+        }
+        let (linked, plain_url) = ws
+            .hover_memo
+            .as_ref()
+            .map_or((false, false), |memo| (memo.link.is_some(), memo.plain_url));
         if mod_held && (linked || plain_url) {
             self.set_hover_cursor(wid, CursorIcon::Pointer, true, false);
         } else if tracking {
@@ -2332,11 +2701,11 @@ impl App {
         // unrelated, and the moment a person needs to know that is while they
         // are deciding whether the underlined word is worth a click — which is
         // before their hand reaches the modifier, not after.
-        linked.then_some(crate::link_target::LinkHover {
+        Resolved(linked.then_some(crate::link_target::LinkHover {
             cell: (row, col),
             window_row,
             session,
-        })
+        }))
     }
 
     /// Write one resolved hover-cursor state, touching the OS cursor only on a
@@ -2481,18 +2850,80 @@ impl App {
         // exactly what the parked-and-not-republished caption means — so the two
         // cannot drift as branches are added.
         let parked = self.park_link_target(wid);
-        self.route_cursor_moved(wid, x, y);
+        self.route_cursor_moved(wid, x, y, parked);
         self.settle_link_target(wid, parked);
     }
 
     /// The pointer-motion routing itself: chrome, modals, native views, drags,
     /// then the grid. See [`Self::on_cursor_moved`] for the caption bracket that
     /// wraps it.
-    fn route_cursor_moved(&mut self, wid: WindowId, x: f64, y: f64) {
+    fn route_cursor_moved(
+        &mut self,
+        wid: WindowId,
+        x: f64,
+        y: f64,
+        parked: Option<crate::link_target::LinkHover>,
+    ) {
         // Pointer motion is not typing. It stays dark, and as a newer user
         // boundary it closes an older swallowed key's licence even when
         // chrome/modal handling returns locally.
         self.clear_move_license(wid);
+        // THE SAME PIXEL AGAIN (G14). macOS synthesises a `CursorMoved` at the
+        // pointer's current position before EVERY wheel event (winit's
+        // `scrollWheel:` calls `mouse_motion` first, with no compare against
+        // the previous location), so a trackpad glide arrives as a stream of
+        // stationary pointer events at device rate. Nothing below can answer
+        // differently than it did for the identical pixel: the geometry, the
+        // strip/modal/native hit tests, the cell, the hover — the memo would
+        // answer it lock-free with tracking OFF, but with tracking ON (tmux,
+        // vim, less) the seam still took its blocking lock to report a motion
+        // that did not happen. So an unmoved pointer with no gesture in flight
+        // stops here: the last routing decision stands, the frame-time refresh
+        // owns re-resolution under a still pointer, and the caller's
+        // park/settle bracket is handed the parked caption back unchanged.
+        // The premise is that the OWNER has not changed, so it holds only when
+        // the last decision reached the grid (`hover_grid_owned`) and nothing
+        // that outranks the grid has taken the pointer since: a modal or the
+        // tab context menu can open under a still pointer by keyboard, and a
+        // keyboard tab switch can put a native view under it — each of those
+        // answers the identical pixel differently, and the first same-pixel
+        // event after an owner CLOSES is how the revealed content takes the
+        // pointer back. Every gesture that CAN change under a still pointer
+        // is excluded too: a held button (a drag, an autoscroll at the edge),
+        // a live selection, a divider or connector drag. The first event
+        // after the pointer left (`pointer_position_known` cleared) routes
+        // fully. And the premise covers the MAPPING, not just the pixel: the
+        // pane-local cell a wheel or press report is built from was derived
+        // under a front session, a focused pane rect and a cell geometry, and
+        // the keyboard changes all three without a pointer event — a focus
+        // move between splits, a tab switch onto another layout, a
+        // split/close/zoom, a font zoom, a window resize. `hover_mapping` is
+        // what the grid arm derived the parked cell under; when the live
+        // mapping differs, this event routes fully (re-deriving the cell for
+        // the NEW owner), and the one after it is skipped again. Cheap terms
+        // first; the mapping (a split plan) is derived only once they hold.
+        if self.conn_drag.is_none()
+            && self.active_native_view(wid).is_none()
+            && self.windows.get(&wid).is_some_and(|ws| {
+                ws.pointer_position_known
+                    && ws.hover_grid_owned
+                    && (x, y) == ws.last_cursor_px
+                    && ws.overlay.is_none()
+                    && ws.tab_menu.is_none()
+                    && ws.held_mouse_button.is_none()
+                    && !ws.selecting
+                    && ws.divider_drag.is_none()
+            })
+            && self
+                .windows
+                .get(&wid)
+                .is_some_and(|ws| ws.hover_mapping == self.hover_mapping(wid))
+        {
+            if let Some(ws) = self.windows.get_mut(&wid) {
+                ws.link_hover = parked;
+            }
+            return;
+        }
         // Remember the raw pixel position so a follow-up button press can tell
         // whether it landed in the tab strip (intercepted before cell mapping).
         if let Some(ws) = self.windows.get_mut(&wid) {
@@ -2500,22 +2931,11 @@ impl App {
             // Written HERE, beside the coordinate it qualifies, so the flag and the
             // position it vouches for cannot be set by two different events.
             ws.pointer_position_known = true;
-            // POINTER PURSUIT (wave 3): the brain is its own motion sensor,
-            // but it only senses on a TICK — and with the frame lane
-            // released, mouse motion alone never produced one, so the pet
-            // could not see a toy waved at it until an unrelated repaint.
-            // One requested frame per motion event (coalesced by the
-            // windowing system) lets the brain sample the pointer; if the
-            // motion is real its own heat re-arms `needs_frames` and the
-            // effects cadence takes over from there. Gated on the pet
-            // actually being on glass — `pet_hit_rect` is Some exactly when
-            // a visible pet was drawn last frame — so a petless window pays
-            // nothing.
-            if ws.pet_hit_rect.is_some()
-                && let Some(w) = ws.os_window.as_ref()
-            {
-                w.request_redraw();
-            }
+            // And the grid's claim on the pointer is WITHDRAWN until the ladder
+            // below actually reaches the grid arm: every return before it
+            // hands the pointer to another owner, and the frame-time refresh
+            // must not resolve on that owner's behalf (`hover_grid_owned`).
+            ws.hover_grid_owned = false;
         }
         // DRAG-TO-CONNECT (design §3.1–§3.3): while the connector gesture is
         // armed or dragging from THIS window, motion belongs to it — the §3.1
@@ -2741,7 +3161,47 @@ impl App {
             self.drag_divider(wid);
             return;
         }
-        self.update_hover_cursor_with(wid, geom);
+        // POINTER PURSUIT (wave 3): the brain is its own motion sensor, but it
+        // only senses on a TICK — and with the frame lane released, mouse
+        // motion alone never produced one, so the pet could not see a toy
+        // waved at it until an unrelated repaint. This asks for that frame on
+        // the EDGE the design needs and nowhere else (`pet_wake_wanted`): a
+        // visible pet (`pet_hit_rect` is Some exactly when one was drawn last
+        // frame), whose brain is NOT already running its own cadence, and a
+        // pointer at least one cell away from the position the brain last
+        // consumed. A request per event was a full attempt (LOCK A + the effect
+        // tick + LOCK B) at device rate — 90-125/s on a trackpad — all
+        // duplicates once the brain's heat had armed the 60 Hz lane, which
+        // samples `last_cursor_px` on its own ticks; and the brain needs
+        // ≥ 6.7 cells/s of travel to notice anything, so sub-cell motion never
+        // told it a thing. Below the chrome/modal returns on purpose: a pointer
+        // over the strip or a card cannot be a toy (`pet_pointer_cell` is None
+        // off the grid).
+        if let Some(ws) = self.windows.get_mut(&wid)
+            && pet_wake_wanted(
+                ws.pet_hit_rect.is_some(),
+                ws.cursor_pet.needs_frames(),
+                ws.pet_pointer_sampled_px,
+                (x, y),
+                geom.cell,
+            )
+            && let Some(w) = ws.os_window.as_ref()
+        {
+            w.request_redraw();
+        }
+        // THE GRID ARM. From here the pointer is the grid's: the frame-time
+        // refresh may continue this resolution when the frame under the still
+        // pointer changes. Set immediately before the resolution so the two
+        // cannot disagree about which routing decision the frame continues.
+        // The mapping stamp is taken from the SAME geometry and pane rect the
+        // cell walk above just used, so the same-pixel premise and the cell it
+        // vouches for cannot be derived under two different layouts.
+        let mapping = self.hover_mapping_with(wid, geom, mapped_cell.pane_rect);
+        if let Some(ws) = self.windows.get_mut(&wid) {
+            ws.hover_grid_owned = true;
+            ws.hover_mapping = mapping;
+        }
+        self.update_hover_cursor_with(wid, geom, parked, None);
         // Which half of the cell the pointer is in: the right half includes
         // the hovered cell, the left half stops before it. Remembered so a
         // shift-click press (which has no pixel position of its own) can
@@ -2806,6 +3266,25 @@ impl App {
         // pointer is inside the grid. `row`/`col` are already clamped to the grid by
         // `pixel_to_cell`, so the edge row is 0 (top) or rows-1 (bottom).
         self.selection_autoscroll_with(wid, geom, y, mapped_cell.pane_rect);
+        // A PLAIN HOVER WITH TRACKING OFF — the shell-prompt default — produces
+        // nothing downstream: the seam's MouseMove arm would take a SECOND
+        // terminal-mutex acquisition (behind the PTY reader's slice) solely to
+        // re-read the mouse mode and answer `TrackingOff`. Read the mode from the
+        // session's lock-free mirror instead and stop here, keeping the arm's one
+        // remaining effect (`last_mouse_side`); `clear_move_license` at the top
+        // already performed its `clear_typed` pair. The seam still runs for
+        // every motion that has work: a tracking app's report, or a live
+        // selection drag (`drag_selection`).
+        let tracking = self
+            .front_terminal(wid)
+            .and_then(|front| self.pool.get(front.session))
+            .is_some_and(|owner| owner.ctx.modes.mouse_tracking_enabled());
+        if !tracking && !self.windows.get(&wid).is_some_and(|ws| ws.selecting) {
+            if let Some(ws) = self.windows.get_mut(&wid) {
+                ws.last_mouse_side = side;
+            }
+            return;
+        }
         self.input(
             wid,
             InputEvent::MouseMove {
@@ -3504,6 +3983,14 @@ impl App {
         // FSM that yields the authoritative `click_count`. These stay in the
         // handler; the seam consumes `click_count`/`side` as DATA.
         let pressed = state == ElementState::Pressed;
+        // INTERACTIVE INPUT PENDING (G17): a button press is a wait on the UI
+        // thread (a click, a selection start, a link open) — arm the reader's
+        // hint before the acquisitions below. Releases and hover motion are
+        // deliberately NOT arming: motion is not a wait, and arming it would
+        // keep the reader on 2x the lock round-trips during any mouse movement.
+        if pressed {
+            crate::metrics::note_typing_hot();
+        }
         // THE END OF A TAB DRAG. Lifting the button ends drag-to-reorder wherever
         // the pointer is, so this sits ABOVE every gate below — a release the
         // palette or the tab menu swallows must still disarm the chip, or the next
@@ -4547,6 +5034,12 @@ impl App {
     /// the cell under the pointer; otherwise scroll the scrollback viewport (the
     /// everyday "scroll up to see history" gesture).
     pub(crate) fn on_mouse_wheel(&mut self, wid: WindowId, delta: MouseScrollDelta) {
+        // INTERACTIVE INPUT PENDING (G17): a wheel/trackpad gesture is a human
+        // waiting on the UI thread exactly as a key press is, and this handler
+        // is about to queue several terminal-mutex acquisitions per event. Arm
+        // the reader's hint FIRST so its next lock holds are the fine slices,
+        // not the 16 KiB idle ones a flood runs against.
+        crate::metrics::note_typing_hot();
         self.clear_move_license(wid);
         // The modal claim is decided before normalization. Sub-line gestures still
         // return below without ever reaching native/terminal scroll consumers, and
@@ -4635,6 +5128,17 @@ impl App {
         // instead would split the decision across two lock windows and hand the
         // control `mouse` verb a different answer than a human hand — exactly the
         // source-blindness the seam exists to guarantee.
+        //
+        // The delta's KIND rides beside the call, not inside the event: it
+        // changes how a chained delta joins an in-flight glide (a display
+        // policy — `scroll_wheel_animated_with`), never the bytes the seam
+        // produces, so the Human/Controller byte-equality invariant is untouched
+        // and the `mouse` verb's grammar gains no field. Cleared before return
+        // so nothing else ever reads a stale kind.
+        let precise = matches!(delta, MouseScrollDelta::PixelDelta(_));
+        if let Some(ws) = self.windows.get_mut(&wid) {
+            ws.wheel_precise = precise;
+        }
         self.input(
             wid,
             InputEvent::Wheel {
@@ -4647,6 +5151,9 @@ impl App {
             },
             Source::Human,
         );
+        if let Some(ws) = self.windows.get_mut(&wid) {
+            ws.wheel_precise = false;
+        }
     }
 
     /// Snap the viewport back to the live bottom (called on keyboard input, the
@@ -4856,6 +5363,37 @@ fn bank_scroll_lines(residual: &mut f64, delta: f64) -> Option<(bool, i32)> {
     *residual -= whole;
     let n = whole.abs() as i32;
     (n > 0).then_some((whole > 0.0, n))
+}
+
+/// Whether ONE pointer-motion event should ask for a frame so the pet brain can
+/// sample the pointer — the wake's EDGE, in one pure function.
+///
+/// * `pet_visible` — a pet body was drawn last frame (`pet_hit_rect.is_some()`);
+///   a petless window never pays.
+/// * `brain_running` — `PetBrain::needs_frames()`: the brain already owns a
+///   frame cadence (heat, pursuit, pounce, a fade…), and that lane samples the
+///   pointer itself, so a request here would only duplicate a frame it has
+///   already scheduled. A chase cannot stall on this gate: pursuit/pounce keep
+///   `needs_frames()` true for their whole duration.
+/// * `sampled_px` — where the brain last saw the pointer (`None` = never): the
+///   request fires only once the pointer is at least one cell (either axis)
+///   away from it, because sub-cell motion cannot change the brain's answer
+///   (its sensor is in cells and its gaze needs ≥ 6.7 cells/s).
+fn pet_wake_wanted(
+    pet_visible: bool,
+    brain_running: bool,
+    sampled_px: Option<(f64, f64)>,
+    pointer_px: (f64, f64),
+    cell: (usize, usize),
+) -> bool {
+    if !pet_visible || brain_running {
+        return false;
+    }
+    let Some((sx, sy)) = sampled_px else {
+        return true;
+    };
+    let (cw, ch) = (cell.0.max(1) as f64, cell.1.max(1) as f64);
+    (pointer_px.0 - sx).abs() >= cw || (pointer_px.1 - sy).abs() >= ch
 }
 
 #[cfg(test)]
@@ -6863,6 +7401,68 @@ mod tests {
         assert_eq!(super::winit_mouse_button(WinitMouseButton::Other(9)), None);
     }
 
+    /// G02 — the pet's pointer wake is an EDGE, not a per-event request: no pet
+    /// on glass or a brain already running its own cadence ⇒ never; a brain that
+    /// has never sampled ⇒ once; thereafter only when the pointer is a full cell
+    /// (either axis) away from the position the brain last consumed — so a
+    /// trackpad's ~7 events per cell (or a 1 kHz mouse's dozens) cost ONE
+    /// attempt per cell of travel instead of one full LOCK A + effect tick +
+    /// LOCK B attempt each, and none at all once heat has armed the 60 Hz lane.
+    #[test]
+    fn pet_wake_is_edge_gated_on_cell_displacement_and_the_brains_own_cadence() {
+        use super::pet_wake_wanted;
+        let cell = (10, 20);
+        let seen = Some((100.0, 200.0));
+        assert!(
+            !pet_wake_wanted(false, false, None, (0.0, 0.0), cell),
+            "no pet drawn: never"
+        );
+        assert!(
+            !pet_wake_wanted(true, true, None, (0.0, 0.0), cell),
+            "the brain's own lane is armed: never (it samples on its ticks)"
+        );
+        assert!(
+            pet_wake_wanted(true, false, None, (0.0, 0.0), cell),
+            "never sampled: the first event asks"
+        );
+        for (dx, dy) in [(0.0, 0.0), (9.9, 0.0), (0.0, 19.9), (-9.9, -19.9)] {
+            assert!(
+                !pet_wake_wanted(true, false, seen, (100.0 + dx, 200.0 + dy), cell),
+                "sub-cell motion ({dx}, {dy}) asks for nothing"
+            );
+        }
+        for (dx, dy) in [(10.0, 0.0), (0.0, 20.0), (-10.0, 0.0), (0.0, -20.0)] {
+            assert!(
+                pet_wake_wanted(true, false, seen, (100.0 + dx, 200.0 + dy), cell),
+                "a cell of travel ({dx}, {dy}) on either axis asks once"
+            );
+        }
+        // Degenerate metrics never divide and never spin.
+        assert!(pet_wake_wanted(true, false, seen, (101.0, 200.0), (0, 0)));
+
+        // The call site: the ONE pet request in the motion routing sits behind
+        // this gate and BELOW the cell walk (after the chrome/modal returns),
+        // never at the top of the ladder. Pinned on the source.
+        let src = include_str!("app_mouse.rs");
+        let route = src
+            .split("fn route_cursor_moved(")
+            .nth(1)
+            .and_then(|rest| rest.split("\n    }\n").next())
+            .expect("route_cursor_moved body");
+        let gate = route
+            .find("pet_wake_wanted(")
+            .expect("the pet wake is gated");
+        let walk = route
+            .find("self.refresh_mouse_cell(wid, geom, x, y);\n        let (lr, lc)")
+            .expect("the grid cell walk");
+        assert!(walk < gate, "the gated wake sits below the cell walk");
+        assert_eq!(
+            route.matches("ws.pet_hit_rect.is_some()").count(),
+            1,
+            "exactly one pet-visibility read in the routing: the gated one"
+        );
+    }
+
     /// PETTING (wave 1): the hit test is pure and pads by the slop on every
     /// side, with the body's own edges staying right/bottom-exclusive.
     #[test]
@@ -7661,14 +8261,311 @@ mod tests {
             );
             if let Some(ws) = app.windows.get_mut(&wid) {
                 ws.last_cursor_px = strip_pt;
+                // The fixture teleports the pointer without a `CursorMoved`;
+                // vouch for it the way motion would, or the modifier path
+                // (correctly) declines to resolve a pointer it cannot place.
+                ws.pointer_position_known = true;
             }
-            app.on_modifiers_changed(wid, winit::keyboard::ModifiersState::CONTROL);
+            // The LINK modifier (Cmd on macOS, Ctrl elsewhere): the one edge the
+            // modifier path resolves on — see the P03 pins below.
+            app.on_modifiers_changed(wid, link_modifier());
             assert_eq!(
                 state(&app),
                 (false, false),
-                "a Ctrl tap over the strip paints chrome's arrow, not an I-beam"
+                "a link-modifier tap over the strip paints chrome's arrow, not an I-beam"
             );
             app.on_modifiers_changed(wid, winit::keyboard::ModifiersState::empty());
+        }
+        app.tab_strip_rows = 0;
+
+        // P03 (c) — ONLY a link-modifier edge re-resolves. Move the pointer memo
+        // back onto the grid (no motion event) and tap Shift: the answer cannot
+        // depend on Shift, so the modifier path must not run the resolver — the
+        // (stale) strip arrow stands. A link-modifier tap then resolves the grid.
+        if let Some(ws) = app.windows.get_mut(&wid) {
+            ws.last_cursor_px = grid;
+            ws.last_mouse_window_cell = (5, 10);
+        }
+        app.on_modifiers_changed(wid, winit::keyboard::ModifiersState::SHIFT);
+        assert_eq!(
+            state(&app),
+            (false, false),
+            "a Shift edge must not re-resolve the hover (no lock, no probe)"
+        );
+        app.on_modifiers_changed(wid, winit::keyboard::ModifiersState::empty());
+        app.on_modifiers_changed(wid, link_modifier());
+        assert_eq!(
+            state(&app),
+            (false, true),
+            "a link-modifier edge resolves the grid"
+        );
+        app.on_modifiers_changed(wid, winit::keyboard::ModifiersState::empty());
+
+        // P03 (c) / G00 — the grid probe never PARKS behind the reader. The
+        // split above moved focus to a NEW pane session: probe THAT terminal.
+        let term = app.front_terminal(wid).expect("terminal").term.clone();
+        let acq = crate::term_lock_acquisitions_on_this_thread;
+        {
+            let mut held = crate::term_lock(&term);
+            // The MODE half needs no lock at all: `process()` published it to
+            // the session's mirror before this hold ends, the memo still answers
+            // the grid half, and the arrow lands while the reader holds the
+            // mutex — zero acquisitions on this thread.
+            held.process(b"\x1b[?1000h");
+            let before = acq();
+            app.update_hover_cursor(wid);
+            assert_eq!(
+                acq() - before,
+                0,
+                "the mode is read from the mirror, lock-free"
+            );
+            assert_eq!(
+                state(&app),
+                (false, false),
+                "tracking resolves to the arrow while the mutex is busy"
+            );
+            // A NEW QUESTION (another cell) while the mutex is busy is DEFERRED:
+            // tracking is back off, so the answer would be the I-beam, but the
+            // grid probe must not queue behind the reader — the arrow stands.
+            held.process(b"\x1b[?1000l");
+            if let Some(ws) = app.windows.get_mut(&wid) {
+                ws.last_cursor_px = (grid.0 + cw as f64 * 2.0, grid.1);
+                ws.last_mouse_window_cell = (5, 12);
+            }
+            let before = acq();
+            app.update_hover_cursor(wid);
+            assert_eq!(acq() - before, 0, "a busy mutex is never waited on");
+            assert_eq!(
+                state(&app),
+                (false, false),
+                "…the probe is deferred: the previous cursor stands, nothing blocked"
+            );
+        }
+        app.update_hover_cursor(wid);
+        assert_eq!(
+            state(&app),
+            (false, true),
+            "lock free again: the I-beam resolves"
+        );
+    }
+
+    /// G17 — a wheel gesture and a button PRESS arm the reader's
+    /// interactive-input-pending hint (the stamp advances across the call);
+    /// a button RELEASE and hover motion do not (structurally: the routing
+    /// contains no arming call — see the source pin below).
+    #[test]
+    fn wheel_and_button_press_arm_the_interactive_input_hint() {
+        let mut app = crate::App::headless_for_test();
+        let wid = crate::WindowId(0);
+        // A brief settle so a stamp another test armed a moment ago cannot be
+        // mistaken for ours: we require a strict ADVANCE across each call, and
+        // the stamp is `now + tail`, so any arming inside the call advances it.
+        std::thread::sleep(std::time::Duration::from_millis(2));
+        let before = crate::metrics::interactive_input_deadline_ns();
+        app.on_mouse_wheel(wid, winit::event::MouseScrollDelta::LineDelta(0.0, -1.0));
+        let after_wheel = crate::metrics::interactive_input_deadline_ns();
+        assert!(after_wheel > before, "a wheel gesture must arm the hint");
+        std::thread::sleep(std::time::Duration::from_millis(2));
+        app.on_mouse_input(
+            wid,
+            winit::event::ElementState::Pressed,
+            winit::event::MouseButton::Left,
+        );
+        let after_press = crate::metrics::interactive_input_deadline_ns();
+        assert!(
+            after_press > after_wheel,
+            "a button press must arm the hint"
+        );
+        app.on_mouse_input(
+            wid,
+            winit::event::ElementState::Released,
+            winit::event::MouseButton::Left,
+        );
+        assert!(
+            crate::metrics::input_pending(),
+            "…and the window is live afterwards"
+        );
+    }
+
+    /// G17 — the arming sites are EXACTLY the wheel handler and the press arm
+    /// of the button handler; the hover routing (`route_cursor_moved` and its
+    /// callees in this file) never arms it. Pinned on the source because the
+    /// negative cannot be observed at runtime without racing every other test
+    /// that legitimately arms the process-wide hint.
+    #[test]
+    fn hover_motion_never_arms_the_interactive_input_hint() {
+        let src = include_str!("app_mouse.rs");
+        // Two production CALL sites (statement lines; the doc/comment mentions
+        // and this test's own text are not calls).
+        let calls = src
+            .lines()
+            .filter(|l| l.trim() == "crate::metrics::note_typing_hot();")
+            .count();
+        assert_eq!(
+            calls, 2,
+            "arming sites must be the wheel handler and the press arm only"
+        );
+        let route = src
+            .split("fn route_cursor_moved(")
+            .nth(1)
+            .and_then(|rest| rest.split("\n    }\n").next())
+            .expect("route_cursor_moved body");
+        assert!(
+            !route.contains("note_typing_hot"),
+            "hover routing must not arm the interactive-input hint"
+        );
+    }
+
+    /// G00/G01 — pointer motion touches the terminal mutex once per QUESTION,
+    /// never once per pixel. Counted through the real `on_cursor_moved` path at
+    /// a shell prompt (tracking off) with the per-thread acquisition census:
+    /// entering a cell asks the grid once (one NON-BLOCKING probe); every
+    /// further event inside that cell asks nothing — neither the hover probe
+    /// nor the seam's second lock, which used to re-read the mouse mode for a
+    /// `TrackingOff` it produced on every event; a modifier edge and a new cell
+    /// each ask exactly once; output that has not yet reached a frame changes
+    /// nothing (the answer is a function of the last presented frame); and a
+    /// new frame under the still pointer is re-asked ONCE, by the frame itself,
+    /// after which the caption splice is free again.
+    ///
+    /// Before the memo the same sweep cost two blocking acquisitions per event
+    /// plus, with the link modifier held, a whole-row `render_row` per event.
+    #[test]
+    fn hover_resolution_is_memoised_per_cell_and_frame() {
+        let mut app = crate::App::headless_for_test();
+        let wid = crate::WindowId(0);
+        let (cw, ch) = app.win_cell_size(wid);
+        let strip_px = f64::from(app.tab_strip_rows) * ch as f64;
+        let at = |app: &crate::App, row: f64, col: f64| {
+            (
+                app.win_pad(wid) as f64 + cw as f64 * col,
+                (app.win_pad_top(wid) + app.win_head(wid)) as f64 + strip_px + ch as f64 * row,
+            )
+        };
+        let acq = crate::term_lock_acquisitions_on_this_thread;
+
+        // Entering a cell: ONE probe (non-blocking), nothing else.
+        let (x, y) = at(&app, 5.5, 10.2);
+        let before = acq();
+        app.on_cursor_moved(wid, x, y);
+        assert_eq!(acq() - before, 1, "entering a cell asks the grid once");
+        assert_eq!(app.windows[&wid].last_mouse_cell, (5, 10));
+        assert!(
+            app.windows[&wid].native_text_cursor,
+            "grid, tracking off: the I-beam"
+        );
+
+        // Seven more events inside the SAME cell (a trackpad's ~7 per cell): zero.
+        let before = acq();
+        for i in 1..8 {
+            let (x, y) = at(&app, 5.5, 10.2 + f64::from(i) * 0.1);
+            app.on_cursor_moved(wid, x, y);
+        }
+        assert_eq!(
+            acq() - before,
+            0,
+            "motion inside one cell takes no terminal lock at all"
+        );
+
+        // The next cell: one again.
+        let (x, y) = at(&app, 5.5, 11.5);
+        let before = acq();
+        app.on_cursor_moved(wid, x, y);
+        assert_eq!(acq() - before, 1, "a new cell is a new question");
+        assert_eq!(app.windows[&wid].last_mouse_cell, (5, 11));
+
+        // A link-modifier edge is a new question (the plain-text URL probe runs,
+        // over the row's CHARACTERS — no `render_row`); motion inside the cell
+        // with it held is not.
+        let before = acq();
+        app.on_modifiers_changed(wid, link_modifier());
+        assert_eq!(acq() - before, 1, "the modifier edge re-asks once");
+        let before = acq();
+        let (x, y) = at(&app, 5.5, 11.7);
+        app.on_cursor_moved(wid, x, y);
+        assert_eq!(
+            acq() - before,
+            0,
+            "…and the held modifier costs nothing per pixel"
+        );
+        app.on_modifiers_changed(wid, winit::keyboard::ModifiersState::empty());
+
+        // Output that has not reached a frame yet: the memo stands (it answers
+        // for the frame the pointer stands on, which is unchanged).
+        let term = app.front_terminal(wid).expect("terminal").term.clone();
+        crate::term_lock(&term).process(b"\x1b[6;1Hhttps://example.test/path more text");
+        let before = acq();
+        let (x, y) = at(&app, 5.5, 11.3);
+        app.on_cursor_moved(wid, x, y);
+        assert_eq!(
+            acq() - before,
+            0,
+            "unpresented output does not re-ask: the answer is per presented frame"
+        );
+
+        // A NEW FRAME under the still pointer: the frame re-asks exactly once,
+        // UNDER ITS OWN HOLD (`refresh_hover_for_frame_locked` at the fill) —
+        // so the frame that carries the change costs exactly what an unchanged
+        // frame costs, the memo lands on the new fill, and the caption splice
+        // acquires nothing on either.
+        let frame = |app: &mut crate::App| {
+            let before = acq();
+            assert!(
+                app.prepare_terminal_capture_grid_with_cursor_fx(
+                    wid,
+                    crate::app_render::ComposedCursorFxClock::Advance(std::time::Instant::now()),
+                )
+                .is_some()
+            );
+            let fill = acq() - before;
+            let before = acq();
+            app.splice_link_target(wid);
+            (fill, acq() - before)
+        };
+        let fresh = |app: &crate::App| {
+            let ws = &app.windows[&wid];
+            ws.hover_memo.as_ref().is_some_and(|m| {
+                m.stands_for(ws, app.front_terminal(wid).expect("terminal").session)
+            })
+        };
+        let (changed_fill, changed_splice) = frame(&mut app);
+        assert!(
+            fresh(&app),
+            "the frame that carried the change re-probed under its hold"
+        );
+        assert_eq!(changed_splice, 0, "the caption splice never acquires");
+        // …and the next frame, unchanged, costs the same: the re-probe rode the
+        // fill's acquisition, it did not add one.
+        let (unchanged_fill, unchanged_splice) = frame(&mut app);
+        assert_eq!(
+            (changed_fill, changed_splice),
+            (unchanged_fill, unchanged_splice),
+            "a changed frame re-probes the hovered cell under the frame's own hold"
+        );
+
+        // The resolver's grid arm renders no row on the pointer path — pinned on
+        // the source, because the cost is invisible to a runtime assertion.
+        let src = include_str!("app_mouse.rs");
+        let resolver = src
+            .split("fn resolve_hover_cursor(")
+            .nth(1)
+            .and_then(|rest| rest.split("\n    }\n").next())
+            .expect("resolve_hover_cursor body");
+        assert!(
+            !resolver.contains("render_row("),
+            "the hover path must never render a row"
+        );
+    }
+
+    /// The platform's "open link" modifier, as `link_modifier_held` reads it.
+    fn link_modifier() -> winit::keyboard::ModifiersState {
+        #[cfg(target_os = "macos")]
+        {
+            winit::keyboard::ModifiersState::SUPER
+        }
+        #[cfg(not(target_os = "macos"))]
+        {
+            winit::keyboard::ModifiersState::CONTROL
         }
     }
 

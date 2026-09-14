@@ -36,6 +36,11 @@
 //! whose turn ended `· 1 monitor still running` (measured) is waiting on the
 //! monitor's next event — and could be asking a question, or be at its usage
 //! limit, all the same. A question or a limit notice outranks it.
+//!
+//! The live zone also carries how much of the worker's context is left before
+//! Claude Code auto-compacts it ([`context_left`]): `1% until auto-compact`,
+//! right-aligned on the row above the top rule (measured 2026-09-13, three
+//! hours into a turn, before the compaction that took the row away).
 
 use std::fmt;
 
@@ -482,6 +487,99 @@ fn is_survey(row: &str) -> bool {
         || (t.starts_with("1: Bad") && t.contains("0: Dismiss"))
 }
 
+/// Whether Claude Code's session survey is OPEN — parked above the composer,
+/// where the next digit typed into it is taken as a RATING (`1` bad, `2`
+/// fine, `3` good) or, `0`, dismisses it. Open is the question row, `●` in
+/// column 0 (`● How is Claude doing this session? (optional)`), right over
+/// its options row (`1: Bad    2: Fine   3: Good   0: Dismiss`), with nothing
+/// between the options and the composer's top rule but what Claude Code
+/// parks there itself: blank rows, a hint or banner against the right edge
+/// (`✔ Update installed · Restart to update`, measured), a `⎿  Tip:` row.
+/// A survey quoted in the transcript is not open — the worker's message
+/// about it, a tool's output under the `⎿` gutter, the worker's words or a
+/// done row between it and the rule — and neither is a question row without
+/// its options. It is parked during a turn too, so a live spinner above it
+/// changes nothing; nor does a box on the screen (the box is what the worker
+/// waits on, and a supervisor answers it first). Without the composer frame,
+/// never.
+pub fn survey_open(rows: &[String]) -> bool {
+    let Some(frame) = composer_frame(rows) else {
+        return false;
+    };
+    let width = rows[frame.bottom].trim_end().chars().count();
+    for i in (1..frame.top).rev() {
+        let row = &rows[i];
+        if is_survey_options(row) {
+            return is_survey_question(&rows[i - 1]);
+        }
+        if is_survey(row) || !is_parked_above_composer(row, width) {
+            return false;
+        }
+    }
+    false
+}
+
+/// The survey's question row as Claude Code draws it: `●` in column 0.
+fn is_survey_question(row: &str) -> bool {
+    row.starts_with('●') && row.contains("How is Claude doing this session")
+}
+
+/// The survey's options row: `1: Bad    2: Fine   3: Good   0: Dismiss`.
+fn is_survey_options(row: &str) -> bool {
+    let t = row.trim_start();
+    t.starts_with("1: Bad") && t.contains("0: Dismiss")
+}
+
+/// How much of the worker's context is left before Claude Code auto-compacts
+/// it, in percent (0 to 100), from its indicator in the live zone: `1% until
+/// auto-compact` (Claude Code 2.1.267/2.1.268, measured 2026-09-13), or
+/// `Context left until auto-compact: 7%` as other versions spell it. The
+/// indicator counts only where Claude Code parks it: under the status row
+/// (under the last transcript row when there is none) and above the
+/// composer's top rule, against the right edge — ending within three columns
+/// of the composer's rules and starting past the transcript's columns, at
+/// column 6 or later (in a 55-column pane the long spelling starts at 18) —
+/// and the whole row, trimmed, the indicator and nothing else. With no status
+/// row the zone begins under the last transcript row, so the rest of that
+/// row's block (the worker's message, a tool's output) is in it; the edge is
+/// what tells the indicator from a copy there. So a worker that quotes it —
+/// in its `⏺` message, on a row of that message, in a tool's output under
+/// the `⎿` gutter (a peer's indicator in `aterm ctl text` output ends where
+/// the peer's edge is, plus the gutter, short of this screen's) — does not
+/// count, and neither does a copy above the status row (history) or one flush
+/// left. The one copy it cannot tell from the indicator is a row of the last
+/// block that ends against this very edge, alone on its row, with no status
+/// row under the block. It sits beside whatever else is parked there (a
+/// spinner and its `⎿  Tip:`, the session survey, a hint). Without the
+/// composer frame, `None`. On a framed screen `None` says only that no
+/// indicator is shown: a worker with room left, or one that has just
+/// compacted (measured: the row was gone after the compaction).
+pub fn context_left(rows: &[String]) -> Option<u8> {
+    let frame = composer_frame(rows)?;
+    let width = rows[frame.bottom].trim_end().chars().count();
+    let from = status_block(rows, frame.top).from;
+    rows[from..frame.top]
+        .iter()
+        .rev()
+        .filter(|row| is_against_right_edge(row, width))
+        .find_map(|row| context_reading(row.trim()))
+}
+
+/// The percentage an indicator reads, `t` its row trimmed: `<n>% until
+/// auto-compact` or `Context left until auto-compact: <n>%`, `<n>` digits
+/// only, 0 to 100 — anything before, after or between them and it is not the
+/// indicator.
+fn context_reading(t: &str) -> Option<u8> {
+    let digits = t.strip_suffix("% until auto-compact").or_else(|| {
+        t.strip_prefix("Context left until auto-compact: ")
+            .and_then(|rest| rest.strip_suffix('%'))
+    })?;
+    if digits.is_empty() || !digits.bytes().all(|b| b.is_ascii_digit()) {
+        return None;
+    }
+    digits.parse::<u8>().ok().filter(|&n| n <= 100)
+}
+
 /// The status row: walking up from the composer's top rule, the first row
 /// that starts with a spinner glyph in column 0, before any transcript row
 /// (`None` when a transcript row comes first, and without a composer frame).
@@ -493,11 +591,14 @@ pub fn status_row(rows: &[String]) -> Option<&str> {
 }
 
 /// The composer row: the last row whose first glyph is `❯` and that is not an
-/// option row (`❯ 1. Yes`).
+/// option row (`❯ 1. Yes`) — unless it is the caret in column 0 right under a
+/// composer rule: a draft that starts with a number (`❯ 1. Keep the harness`,
+/// an answer to a numbered question typed but not sent) is still the composer.
 pub fn composer_index(rows: &[String]) -> Option<usize> {
-    rows.iter().rposition(|r| {
-        let t = r.trim_start();
-        t.starts_with('❯') && !is_option_like(t)
+    (0..rows.len()).rev().find(|&i| {
+        let t = rows[i].trim_start();
+        t.starts_with('❯')
+            && (!is_option_like(t) || (rows[i].starts_with('❯') && i > 0 && is_rule(&rows[i - 1])))
     })
 }
 
@@ -517,6 +618,20 @@ pub fn composer_text(rows: &[String]) -> Option<String> {
             .trim()
             .to_string(),
     )
+}
+
+/// The composer's rows: the caret row's index, then the text of each row
+/// from it down to the bottom rule — the caret row's without the caret — as
+/// a draft that wraps or breaks onto more than one row fills them (the caret
+/// row alone with no rule under it). `None` without a caret row.
+pub fn composer_draft(rows: &[String]) -> Option<(usize, Vec<String>)> {
+    let caret = composer_index(rows)?;
+    let end = (caret + 1..rows.len())
+        .find(|&i| is_rule(&rows[i]))
+        .unwrap_or(caret + 1);
+    let mut lines = vec![composer_text(rows)?];
+    lines.extend(rows[caret + 1..end].iter().map(|r| r.trim().to_string()));
+    Some((caret, lines))
 }
 
 /// Whether the composer's text is Claude Code's DIM placeholder suggestion
@@ -588,6 +703,73 @@ pub fn last_said_index(rows: &[String]) -> Option<usize> {
         None => (composer_index(rows).unwrap_or(rows.len()), None),
     };
     (0..end).rev().find(|&i| is_said(&rows[i], width))
+}
+
+/// Where the transcript ends on the screen, by POSITION: the index of the
+/// first row of the live zone. With Claude Code's composer frame that is the
+/// status row ([`status_row`]) when there is one — it and everything under it
+/// down to the composer (a tip, a todo list, a hint, the survey, a queued
+/// `❯` message) are the live zone; a DONE status row (`✻ Worked for 3m 21s ·
+/// done 8:50 PM`) ends the turn and stays, only what hangs under it goes —
+/// else the top rule, less the blank rows, hints against the right edge,
+/// `⎿  Tip:` rows and the session survey parked right above it. Without the
+/// frame, one past the last non-blank row. No row above it is judged by what
+/// it says: a done row, a table, a todo item the worker wrote, indented code
+/// are all transcript — the report of what the worker said keeps them, where
+/// [`last_said_index`]'s filter would not.
+pub fn transcript_end(rows: &[String]) -> usize {
+    let Some(frame) = composer_frame(rows) else {
+        return rows
+            .iter()
+            .rposition(|r| !r.trim().is_empty())
+            .map_or(0, |i| i + 1);
+    };
+    if let Some(status) = status_block(rows, frame.top).status {
+        // A done row (`✻ Worked for 3m 21s · done 8:50 PM · 1 monitor still
+        // running`) ends the turn in the transcript: it is kept, and only what
+        // hangs under it is the live zone. A spinner or a `Waiting for …` row
+        // is the live zone itself.
+        return if is_done_row(&rows[status]) {
+            status + 1
+        } else {
+            status
+        };
+    }
+    let width = rows[frame.bottom].trim_end().chars().count();
+    let mut end = frame.top;
+    while end > 0 && is_parked_above_composer(&rows[end - 1], width) {
+        end -= 1;
+    }
+    end
+}
+
+/// A status row that reports a finished turn rather than work in flight: not
+/// a spinner's `…` activity, not `Waiting for …`.
+fn is_done_row(row: &str) -> bool {
+    !is_activity_row(row) && !row.contains("Waiting for ")
+}
+
+/// What Claude Code parks between the transcript and an idle composer: a
+/// blank row, a hint or banner against the RIGHT edge (within three columns
+/// of the composer rule's `width` — a transcript row merely indented 20
+/// columns, indented code, is not one), a `⎿  Tip:` row, the survey.
+fn is_parked_above_composer(row: &str, width: usize) -> bool {
+    let t = row.trim_start();
+    t.is_empty()
+        || is_survey(row)
+        || is_against_right_edge(row, width)
+        || t.strip_prefix('⎿')
+            .is_some_and(|g| g.trim_start().starts_with("Tip:"))
+}
+
+/// A row against the RIGHT edge, where Claude Code parks its hints, banners
+/// and context indicator: a hint ([`is_hint`]) that ends within three columns
+/// of the composer rule's `width` (measured: two short). A row that ends
+/// short of the edge is not one, however far in it starts — a transcript row
+/// indented 20 columns (indented code), a right-aligned row quoted in a
+/// tool's output.
+fn is_against_right_edge(row: &str, width: usize) -> bool {
+    is_hint(row, Some(width)) && row.trim_end().chars().count() + 3 >= width
 }
 
 fn is_said(row: &str, width: Option<usize>) -> bool {
@@ -1468,6 +1650,328 @@ mod tests {
         no_done_row.retain(|row| !row.starts_with("✻ "));
         assert_eq!(status_row(&no_done_row), None);
         assert_eq!(worker_phase(&no_done_row), Phase::Question);
+    }
+
+    // ---- the session survey: open above the composer, or only quoted ------
+
+    /// `survey-open.txt`: the bottom 12 rows of a real worker's screen
+    /// (measured 2026-09-13), idle under the survey, with a blank row and the
+    /// update banner between its options row and the top rule. The words in
+    /// the composer and the rule's label were replaced, as in the other
+    /// fixtures.
+    const SURVEY_OPEN: &str = include_str!("fixtures/survey-open.txt");
+
+    /// The survey's two rows as Claude Code parks them.
+    const SURVEY: [&str; 2] = [
+        "● How is Claude doing this session? (optional)",
+        "  1: Bad    2: Fine   3: Good   0: Dismiss",
+    ];
+
+    /// The real screen: the survey is open, the worker idle — the survey is
+    /// neither its status row nor what it said. Without the options row it
+    /// is not open; nor is it without the composer frame.
+    #[test]
+    fn the_survey_parked_above_the_composer_is_open() {
+        let r = saved_screen(SURVEY_OPEN);
+        assert_eq!(r.len(), 12);
+        assert!(survey_open(&r));
+        assert_eq!(worker_phase(&r), Phase::Idle);
+        assert_eq!(status_row(&r), Some("✻ Cooked for 52m 54s · done 12:31 PM"));
+        assert_eq!(last_said_row(&r), Some("  Free disk is 31 GiB."));
+
+        let mut no_options = r.clone();
+        no_options.retain(|row| !row.trim_start().starts_with("1: Bad"));
+        assert_eq!(no_options.len(), 11);
+        assert!(!survey_open(&no_options));
+
+        // wait_bg7: the done row over the survey, the survey on the rule.
+        let bg7 = waiter_capture(include_str!("fixtures/wait_bg7.out"));
+        assert!(survey_open(&bg7));
+        assert!(!survey_open(&rows(&[SURVEY[0], SURVEY[1], "$ "])));
+    }
+
+    /// A survey in the transcript is not open: quoted in the worker's `⏺`
+    /// message, as the message itself, in a tool's output under the `⎿`
+    /// gutter, with the worker's words after it, or above a done row.
+    #[test]
+    fn a_survey_in_the_transcript_is_not_open() {
+        for body in [
+            vec![
+                "⏺ Claude Code parks this above the composer:",
+                "  ● How is Claude doing this session? (optional)",
+                "    1: Bad    2: Fine   3: Good   0: Dismiss",
+                "",
+            ],
+            vec![
+                "⏺ How is Claude doing this session? (optional)",
+                "  1: Bad    2: Fine   3: Good   0: Dismiss",
+            ],
+            vec![
+                "⏺ Bash(cat survey-open.txt)",
+                "  ⎿  ● How is Claude doing this session? (optional)",
+                "       1: Bad    2: Fine   3: Good   0: Dismiss",
+            ],
+            vec![SURVEY[0], SURVEY[1], "  I left it for you to answer."],
+            vec![
+                SURVEY[0],
+                SURVEY[1],
+                "",
+                "✻ Cogitated for 4s · done 2:41 PM",
+                "",
+            ],
+        ] {
+            let r = screen(&body, "  ? for shortcuts");
+            assert!(!survey_open(&r), "{body:?}");
+            assert_eq!(worker_phase(&r), Phase::Idle, "{body:?}");
+        }
+    }
+
+    /// The survey is parked during turns too: under a live spinner it is
+    /// open (wait_bg6; a spinner with the survey put above its frame), and
+    /// on a screen with an approval box it is open as well — the box is
+    /// what the worker waits on, so the phase is still prompt.
+    #[test]
+    fn a_survey_under_a_spinner_or_beside_a_box_is_open() {
+        let bg6 = waiter_capture(include_str!("fixtures/wait_bg6.out"));
+        assert!(survey_open(&bg6));
+        assert_eq!(worker_phase(&bg6), Phase::Busy);
+
+        let spinning = screen(
+            &["⏺ Running the tests.", "", "✻ Synthesizing… (18s)"],
+            "  esc to interrupt",
+        );
+        let spinning = above_frame(spinning, &SURVEY);
+        assert!(survey_open(&spinning));
+        assert_eq!(worker_phase(&spinning), Phase::Busy);
+
+        let boxed = above_frame(bash_one_row(), &SURVEY);
+        assert!(survey_open(&boxed));
+        assert_eq!(worker_phase(&boxed), Phase::Prompt);
+        assert!(!survey_open(&bash_one_row()));
+    }
+
+    // ---- the context indicator: how much is left before auto-compact -----
+
+    /// `context-low.txt`: the bottom 7 rows of a real worker's screen (Claude
+    /// Code 2.1.267/2.1.268, measured 2026-09-13), three hours into a turn:
+    /// the spinner, a `⎿  Tip:` under it, and `1% until auto-compact`
+    /// right-aligned on the row above the composer's top rule. The worker
+    /// auto-compacted later in the task, and afterwards the row was gone.
+    /// The rows Claude Code drew are as recorded; the two rules were not, and
+    /// are drawn 138 columns wide — two past the indicator's end, where a
+    /// hint ends — without the label the top rule may have carried.
+    const CONTEXT_LOW: &str = include_str!("fixtures/context-low.txt");
+
+    /// `text` as Claude Code parks it above a 120-column composer:
+    /// right-aligned, ending two columns short of the rule.
+    fn indicator(text: &str) -> String {
+        format!("{}{text}", " ".repeat(118 - text.chars().count()))
+    }
+
+    /// The real screen reads `Some(1)`, and the worker is busy under it. The
+    /// other spelling (`Context left until auto-compact: 7%`) reads too; a
+    /// reading over 100, or the indicator with anything else on its row, is
+    /// not the indicator; a framed screen without it reads `None`.
+    #[test]
+    fn the_context_indicator_above_the_composer_is_read() {
+        let r = saved_screen(CONTEXT_LOW);
+        assert_eq!(r.len(), 7);
+        assert_eq!(context_left(&r), Some(1));
+        assert_eq!(worker_phase(&r), Phase::Busy);
+        assert_eq!(
+            status_row(&r),
+            Some("✢ Booping… (3h 3m 27s · ↓ 143.3k tokens)")
+        );
+        assert!(!survey_open(&r));
+
+        let idle = screen(
+            &["⏺ Done.", "", "✻ Cogitated for 4s · done 2:41 PM", ""],
+            "  ? for shortcuts",
+        );
+        assert_eq!(context_left(&idle), None);
+        for (text, left) in [
+            ("Context left until auto-compact: 7%", Some(7)),
+            ("0% until auto-compact", Some(0)),
+            ("100% until auto-compact", Some(100)),
+            ("101% until auto-compact", None),
+            ("Context left until auto-compact: 300%", None),
+            ("~1% until auto-compact", None),
+            ("% until auto-compact", None),
+            ("1% until auto-compact · run /compact now", None),
+        ] {
+            let r = above_frame(idle.clone(), &[indicator(text).as_str()]);
+            assert_eq!(context_left(&r), left, "{text}");
+            assert_eq!(worker_phase(&r), Phase::Idle, "{text}");
+            assert_eq!(last_said_row(&r), Some("⏺ Done."), "{text}");
+        }
+    }
+
+    /// The indicator quoted in the transcript is not read: as the worker's
+    /// `⏺` message, on a row of its message, in a tool's output under the `⎿`
+    /// gutter (the first row or one under it), or flush left above the rule;
+    /// nor a right-aligned copy above the status row (history); nor any of it
+    /// without the composer frame.
+    #[test]
+    fn the_context_indicator_in_the_transcript_is_not_read() {
+        for body in [
+            vec!["⏺ 1% until auto-compact", ""],
+            vec![
+                "⏺ Claude Code shows this above the composer:",
+                "  1% until auto-compact",
+                "",
+            ],
+            vec![
+                "⏺ Bash(tail -1 status.txt)",
+                "  ⎿  1% until auto-compact",
+                "",
+            ],
+            vec![
+                "⏺ Bash(tail -2 status.txt)",
+                "  ⎿  the indicator:",
+                "     Context left until auto-compact: 7%",
+                "",
+            ],
+            vec!["⏺ Done.", "", "1% until auto-compact"],
+        ] {
+            let r = screen(&body, "  ? for shortcuts");
+            assert_eq!(context_left(&r), None, "{body:?}");
+        }
+        let old = indicator("4% until auto-compact");
+        let history = screen(
+            &[
+                old.as_str(),
+                "⏺ Done.",
+                "",
+                "✻ Cogitated for 4s · done 2:41 PM",
+                "",
+            ],
+            "  ? for shortcuts",
+        );
+        assert_eq!(context_left(&history), None);
+
+        let one = indicator("1% until auto-compact");
+        let bare = rows(&["⏺ Done.", one.as_str(), "$ "]);
+        assert_eq!(context_left(&bare), None);
+        let mut unframed = saved_screen(CONTEXT_LOW);
+        unframed.retain(|row| !row.starts_with('─'));
+        assert_eq!(unframed.len(), 5);
+        assert_eq!(context_left(&unframed), None);
+    }
+
+    /// The indicator shares the live zone with whatever else Claude Code
+    /// parks there — a spinner and its `⎿  Tip:`, the session survey above it
+    /// or under it — and is read beside them, the survey still open and the
+    /// worker still busy.
+    #[test]
+    fn the_context_indicator_beside_a_survey_a_tip_and_a_spinner_is_read() {
+        let busy = screen(
+            &[
+                "⏺ Running the tests.",
+                "",
+                "✻ Synthesizing… (18s)",
+                "  ⎿  Tip: Use /clear to start fresh when switching topics and free up context",
+            ],
+            "  esc to interrupt",
+        );
+        let left = indicator("9% until auto-compact");
+        for extra in [
+            vec![SURVEY[0], SURVEY[1], "", left.as_str()],
+            vec![left.as_str(), SURVEY[0], SURVEY[1]],
+        ] {
+            let r = above_frame(busy.clone(), &extra);
+            assert_eq!(context_left(&r), Some(9), "{extra:?}");
+            assert!(survey_open(&r), "{extra:?}");
+            assert_eq!(worker_phase(&r), Phase::Busy, "{extra:?}");
+            assert_eq!(status_row(&r), Some("✻ Synthesizing… (18s)"), "{extra:?}");
+        }
+        // The real screen, the survey parked between its indicator and the rule.
+        let real = above_frame(saved_screen(CONTEXT_LOW), &SURVEY);
+        assert_eq!(context_left(&real), Some(1));
+        assert!(survey_open(&real));
+    }
+
+    /// `text` as Claude Code parks it above a composer whose rules are
+    /// `width` columns: against the right edge, ending two columns short.
+    fn parked(width: usize, text: &str) -> String {
+        format!("{}{text}", " ".repeat(width - 2 - text.chars().count()))
+    }
+
+    /// A peer's indicator quoted in the LAST transcript block, with no status
+    /// row under the block to end it: `aterm ctl @s-2 text` run on a
+    /// 100-column peer shows the peer's indicator row under the `⎿` gutter,
+    /// 82 columns in — right-aligned by the peer, so it ends at column 103 of
+    /// this screen, well short of its right edge. It is the block's own row,
+    /// not the indicator: not read over a box (in the tool's output, or in
+    /// the worker's message), nor at idle under a `!` command's output, nor
+    /// under a slash command's `⎿` row (`❯ /model`, the real screen) — and an
+    /// indicator Claude Code parks against the right edge under the same
+    /// block is still read.
+    #[test]
+    fn a_quoted_indicator_in_the_last_block_is_not_read() {
+        let quote = format!("     {}1% until auto-compact", " ".repeat(77));
+        let boxed = |head: &[&str]| {
+            let mut r = rows(head);
+            r.extend(bash_one_row().into_iter().skip(1));
+            r
+        };
+        let mut model = saved_screen(IDLE_AFTER_LIMIT);
+        let set = model
+            .iter()
+            .position(|r| r.trim_start().starts_with("⎿  Set model to"))
+            .expect("the /model output");
+        model.insert(set + 1, quote.clone());
+        for (what, r) in [
+            (
+                "a tool's output over a box",
+                boxed(&["⏺ Bash(aterm ctl @s-2 text)", "  ⎿  ✢ Booping…", &quote]),
+            ),
+            (
+                "a message over a box",
+                boxed(&["⏺ The peer's screen ends:", &quote]),
+            ),
+            (
+                "a `!` command's output at idle",
+                screen(
+                    &["❯ !aterm ctl @s-2 text", "  ⎿  ✢ Booping…", &quote, ""],
+                    "  ? for shortcuts",
+                ),
+            ),
+            ("under `/model`'s output", model),
+        ] {
+            assert_eq!(context_left(&r), None, "{what}");
+            let width = composer_frame(&r).map(|f| r[f.bottom].chars().count());
+            let width = width.expect("framed");
+            let parked = above_frame(r, &[parked(width, "4% until auto-compact").as_str()]);
+            assert_eq!(context_left(&parked), Some(4), "{what}");
+        }
+    }
+
+    /// In a narrow pane the indicator starts left of column 20 — `Context left
+    /// until auto-compact: 8%` ending two columns short of a 55-column rule
+    /// starts at column 18, `1% until auto-compact` in 40 columns at 17 — and
+    /// is read all the same: it is against the right edge, where Claude Code
+    /// parks it. What starts at a transcript column (5, the `⎿` gutter's
+    /// text) is not, even against the edge.
+    #[test]
+    fn the_context_indicator_in_a_narrow_pane_is_read() {
+        let narrow = |width: usize, text: &str| {
+            let mut r = rows(&["⏺ Working.", "", "✻ Synthesizing… (18s)", ""]);
+            r.push(parked(width, text));
+            r.extend(["─".repeat(width), "❯".to_string(), "─".repeat(width)]);
+            r.push("  esc to interrupt".to_string());
+            r
+        };
+        let long = narrow(55, "Context left until auto-compact: 8%");
+        assert_eq!(leading_spaces(&long[4]), 18);
+        assert_eq!(context_left(&long), Some(8));
+        assert_eq!(worker_phase(&long), Phase::Busy);
+        let short = narrow(40, "1% until auto-compact");
+        assert_eq!(leading_spaces(&short[4]), 17);
+        assert_eq!(context_left(&short), Some(1));
+        let gutter = narrow(28, "1% until auto-compact");
+        assert_eq!(leading_spaces(&gutter[4]), 5);
+        assert_eq!(context_left(&gutter), None);
+        assert_eq!(context_left(&narrow(29, "1% until auto-compact")), Some(1));
     }
 
     /// A long hint in an 80-column window starts at column 8, not past column

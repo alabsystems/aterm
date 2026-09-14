@@ -1396,6 +1396,8 @@ pub(crate) fn term_lock(term: &Mutex<Terminal>) -> TermGuard<'_> {
         warn_terminal_mutex_poisoned();
         poisoned.into_inner()
     });
+    #[cfg(test)]
+    note_term_lock_acquired();
     TermGuard {
         guard,
         #[cfg(debug_assertions)]
@@ -1428,6 +1430,8 @@ pub(crate) fn term_try_lock(term: &Mutex<Terminal>) -> Option<TermGuard<'_>> {
         }
         Err(std::sync::TryLockError::WouldBlock) => return None,
     };
+    #[cfg(test)]
+    note_term_lock_acquired();
     Some(TermGuard {
         guard,
         #[cfg(debug_assertions)]
@@ -1435,6 +1439,30 @@ pub(crate) fn term_try_lock(term: &Mutex<Terminal>) -> Option<TermGuard<'_>> {
         #[cfg(debug_assertions)]
         location: std::panic::Location::caller(),
     })
+}
+
+// TEST-ONLY census of terminal-mutex acquisitions made ON THIS THREAD — every
+// successful `term_lock` / `term_try_lock` (and so `term_lock_ui`) on the
+// calling thread since it started. Thread-local on purpose: the lib test
+// binary runs tests in parallel, and a process-wide counter would attribute a
+// sibling test's PTY-reader acquisitions to the pointer path under test. The
+// lock-count proofs (`hover_resolution_is_memoised_per_cell_and_frame`,
+// `a_line_wheel_event_takes_exactly_one_terminal_lock`) read it before and
+// after driving ONE event through the real handlers.
+#[cfg(test)]
+thread_local! {
+    static TERM_LOCK_ACQUISITIONS: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
+}
+
+/// The census read: acquisitions this thread has made so far.
+#[cfg(test)]
+pub(crate) fn term_lock_acquisitions_on_this_thread() -> u64 {
+    TERM_LOCK_ACQUISITIONS.with(std::cell::Cell::get)
+}
+
+#[cfg(test)]
+fn note_term_lock_acquired() {
+    TERM_LOCK_ACQUISITIONS.with(|c| c.set(c.get().wrapping_add(1)));
 }
 
 /// Warn ONCE per process that the terminal mutex was poisoned and recovered.
@@ -1446,6 +1474,227 @@ fn warn_terminal_mutex_poisoned() {
     static WARNED: AtomicBool = AtomicBool::new(false);
     if !WARNED.swap(true, Ordering::Relaxed) {
         aterm_log::warn!("Terminal mutex poisoned by a panicked thread; recovering");
+    }
+}
+
+/// The ONE way to obtain a terminal's lock-free [`ModeMirror`](aterm_core::terminal::ModeMirror)
+/// handle for a session: one blocking acquisition at SESSION CONSTRUCTION, never on
+/// the key path. Every `SessionCtx::modes` is derived through here so the mirror
+/// the input seam encodes against is provably this terminal's — the seam's debug
+/// pairing check (`input::seam_egress_inner`) fails on any other provenance.
+pub(crate) fn mode_mirror_of(term: &Mutex<Terminal>) -> Arc<aterm_core::terminal::ModeMirror> {
+    term_lock(term).mode_mirror().clone()
+}
+
+/// How long a lock-releasing worker (the PTY reader between `process()` slices,
+/// the compress worker between drain batches) spins for a REGISTERED UI-thread
+/// waiter before re-taking the mutex regardless. Long enough for a parked
+/// waiter to be woken and scheduled on another core (macOS `__psynch_mutexwait`
+/// wakeups are ~10-30 µs), short enough that a UI thread re-acquiring in a
+/// tight LOCK A → LOCK B sequence cannot strand the reader.
+pub(crate) const UI_HANDOFF_SPIN: Duration = Duration::from_micros(200);
+
+/// The UI thread's blocking terminal acquisition: [`term_lock`] that REGISTERS
+/// itself as a waiter while it blocks and books its wait under `site`.
+///
+/// Why: the reader's slice loop drops and re-takes the mutex ~100 ns apart. On
+/// macOS `std::sync::Mutex` is a default-policy (first-fit, unfair) pthread
+/// mutex, so a UI thread parked on it needs 10-30 µs to be woken and finds the
+/// lock re-taken — it loses EVERY intra-batch handoff and waits out the batch
+/// remainder, not the one slice the slicing promised. `ui_waiting` lets the
+/// releaser see the waiter and hold off (`yield_to_ui_waiter`) until it has
+/// taken the lock. Fast path: a free mutex is taken with no registration and a
+/// zero-wait sample. Never called from the reader/compress threads (they are the
+/// releasers), and it adds no lock: one atomic each side of the wait.
+#[track_caller]
+pub(crate) fn term_lock_ui<'a>(
+    term: &'a Mutex<Terminal>,
+    ui_waiting: &std::sync::atomic::AtomicU32,
+    site: metrics::TermWaitSite,
+) -> TermGuard<'a> {
+    if let Some(guard) = term_try_lock(term) {
+        metrics::note_term_wait(site, 0);
+        return guard;
+    }
+    ui_waiting.fetch_add(1, Ordering::Release);
+    let t0 = Instant::now();
+    let guard = term_lock(term);
+    ui_waiting.fetch_sub(1, Ordering::Release);
+    metrics::note_term_wait(site, aterm_types::duration_to_nanos(t0.elapsed()));
+    guard
+}
+
+/// The releaser's half of the handoff (see [`term_lock_ui`]): called by the PTY
+/// reader after each `process()` slice's guard drops (when more of the batch
+/// remains) and by the compress worker after each drain batch. Returns at once
+/// when no UI acquisition is pending — the flood fast path pays one `Acquire`
+/// load. Otherwise spins until the waiter has cleared its registration (it took
+/// the lock) or [`UI_HANDOFF_SPIN`] elapses, whichever is first; the bound is
+/// what keeps a UI thread that re-acquires in a tight sequence from stranding
+/// the reader and collapsing flood throughput.
+pub(crate) fn yield_to_ui_waiter(ui_waiting: &std::sync::atomic::AtomicU32) {
+    if ui_waiting.load(Ordering::Acquire) == 0 {
+        return;
+    }
+    let t0 = Instant::now();
+    while ui_waiting.load(Ordering::Acquire) != 0 && t0.elapsed() < UI_HANDOFF_SPIN {
+        std::hint::spin_loop();
+    }
+}
+
+#[cfg(test)]
+mod ui_handoff_tests {
+    //! P63 — the slice boundary is a HANDOFF, not a bare release.
+    use super::*;
+    use std::sync::atomic::AtomicU32;
+
+    /// No registered waiter ⇒ the releaser does not pause at all (the flood
+    /// fast path: one atomic load).
+    #[test]
+    fn no_waiter_means_no_pause() {
+        let waiting = AtomicU32::new(0);
+        let t0 = Instant::now();
+        for _ in 0..1000 {
+            yield_to_ui_waiter(&waiting);
+        }
+        assert!(
+            t0.elapsed() < Duration::from_millis(20),
+            "1000 no-waiter yields took {:?}",
+            t0.elapsed()
+        );
+    }
+
+    /// A registered waiter that clears itself is waited for — the releaser does
+    /// not re-take the lock underneath it.
+    #[test]
+    fn a_registered_waiter_is_waited_for_until_it_takes_the_lock() {
+        let waiting = Arc::new(AtomicU32::new(1));
+        let cleared_at = Arc::new(std::sync::Mutex::new(None::<Instant>));
+        let (w, c) = (waiting.clone(), cleared_at.clone());
+        let clearer = std::thread::spawn(move || {
+            std::thread::sleep(Duration::from_micros(50));
+            *c.lock().unwrap() = Some(Instant::now());
+            w.store(0, Ordering::Release);
+        });
+        yield_to_ui_waiter(&waiting);
+        let returned_at = Instant::now();
+        clearer.join().unwrap();
+        let cleared = cleared_at.lock().unwrap().expect("clearer ran");
+        assert!(
+            returned_at >= cleared,
+            "the releaser returned before the waiter had cleared its registration"
+        );
+    }
+
+    /// The spin is BOUNDED: a waiter that never clears (or re-registers in a
+    /// tight loop) cannot strand the releaser — it re-takes after the bound.
+    #[test]
+    fn a_stuck_waiter_cannot_strand_the_releaser() {
+        let waiting = AtomicU32::new(1);
+        let t0 = Instant::now();
+        yield_to_ui_waiter(&waiting);
+        let spent = t0.elapsed();
+        assert!(spent >= UI_HANDOFF_SPIN, "returned early: {spent:?}");
+        assert!(
+            spent < UI_HANDOFF_SPIN * 20,
+            "bound not honoured: {spent:?} (loaded machine slack is 20x)"
+        );
+    }
+
+    /// `term_lock_ui` registers ONLY while it actually blocks, books the wait,
+    /// and leaves the counter at zero afterwards — on both paths.
+    #[test]
+    fn term_lock_ui_registers_only_while_blocked_and_books_the_wait() {
+        let term = Arc::new(Mutex::new(Terminal::new(24, 80)));
+        let waiting = Arc::new(AtomicU32::new(0));
+        let site = metrics::TermWaitSite::Press;
+        let before = metrics::term_wait_distribution(site).count();
+        // Free mutex: fast path, no registration.
+        {
+            let _g = term_lock_ui(&term, &waiting, site);
+            assert_eq!(waiting.load(Ordering::Acquire), 0);
+        }
+        // Held mutex: the acquirer registers while parked and clears on entry.
+        let held = term_lock(&term);
+        let (t2, w2) = (term.clone(), waiting.clone());
+        let acquirer = std::thread::spawn(move || {
+            let g = term_lock_ui(&t2, &w2, site);
+            let while_held = w2.load(Ordering::Acquire);
+            drop(g);
+            while_held
+        });
+        // Wait until the acquirer has registered, then release to it.
+        let t0 = Instant::now();
+        while waiting.load(Ordering::Acquire) == 0 {
+            assert!(
+                t0.elapsed() < Duration::from_secs(5),
+                "acquirer never registered"
+            );
+            std::thread::yield_now();
+        }
+        drop(held);
+        assert_eq!(
+            acquirer.join().unwrap(),
+            0,
+            "registration must clear on entry"
+        );
+        assert_eq!(waiting.load(Ordering::Acquire), 0);
+        assert!(
+            metrics::term_wait_distribution(site).count() >= before + 2,
+            "both acquisitions must book a sample (n counts every acquisition)"
+        );
+    }
+
+    /// MEASUREMENT (ignored; run with `--ignored --nocapture`): a reader-shaped
+    /// relock loop (hold ~20 µs, release, re-take at once) against a UI-shaped
+    /// acquirer, with and without the boundary handoff. Prints the acquirer's
+    /// wait p50/p99/max for each; the handoff variant must not be worse and is
+    /// expected to bound the wait near one hold where the bare release lets the
+    /// unfair mutex feed the reader many holds in a row.
+    #[test]
+    #[ignore = "timing measurement, not a gate"]
+    fn measure_handoff_vs_bare_release() {
+        fn run(with_handoff: bool) -> (u128, u128, u128) {
+            let term = Arc::new(Mutex::new(Terminal::new(24, 80)));
+            let waiting = Arc::new(AtomicU32::new(0));
+            let stop = Arc::new(std::sync::atomic::AtomicBool::new(false));
+            let reader = {
+                let (t, w, s) = (term.clone(), waiting.clone(), stop.clone());
+                std::thread::spawn(move || {
+                    while !s.load(Ordering::Relaxed) {
+                        {
+                            let _g = term_lock(&t);
+                            let t0 = Instant::now();
+                            while t0.elapsed() < Duration::from_micros(20) {
+                                std::hint::spin_loop();
+                            }
+                        }
+                        if with_handoff {
+                            yield_to_ui_waiter(&w);
+                        }
+                    }
+                })
+            };
+            std::thread::sleep(Duration::from_millis(5));
+            let mut waits = Vec::with_capacity(400);
+            for _ in 0..400 {
+                let t0 = Instant::now();
+                let g = term_lock_ui(&term, &waiting, metrics::TermWaitSite::Press);
+                waits.push(t0.elapsed().as_micros());
+                drop(g);
+                std::thread::sleep(Duration::from_micros(300));
+            }
+            stop.store(true, Ordering::Relaxed);
+            reader.join().unwrap();
+            waits.sort_unstable();
+            (waits[200], waits[396], waits[399])
+        }
+        let bare = run(false);
+        let handoff = run(true);
+        println!(
+            "term_wait µs (p50/p99/max): bare release {:?}  |  handoff {:?}",
+            bare, handoff
+        );
     }
 }
 
@@ -2455,6 +2704,18 @@ struct RepaintKey {
     /// the early-out would keep compositing the stale card until the next
     /// interaction. Idle invariant holds: the bit only changes on a real flip.
     system_dark: bool,
+    /// The hovered link the caption band discloses (`WindowState::link_hover`):
+    /// which cell, in which session, on which window row. The caption is host
+    /// chrome painted over the composite AFTER this key is compared, and the
+    /// cell it names moves with no grid damage at all — the pointer settles on
+    /// a link (the motion path's settle asks for the frame), or the frame-time
+    /// re-probe under the fill's own hold finds the row rewritten under a still
+    /// pointer — so without this term the early-out kept the previous present
+    /// and the band appeared only when something else moved. The destination
+    /// TEXT needs no term of its own: it changes only with the engine fill,
+    /// which `damage_epoch` already carries. `None` — no link under the
+    /// pointer, every ordinary frame — is byte-identical to the pre-band key.
+    link_caption: Option<link_target::LinkHover>,
 }
 
 /// Fingerprint of an IME composition for [`RepaintKey`]: FNV-1a over the text,
@@ -3245,9 +3506,17 @@ enum Wake {
     /// the blocking `ConvertSelection` round-trip that would otherwise freeze the loop
     /// for up to ~1 s on a slow/hung owner. The variant exists on every target so
     /// `Wake` stays platform-independent (never constructed off Linux).
+    ///
+    /// `session` is the terminal that fronted `wid` when the gesture happened: the
+    /// read takes up to a second, and a tab/pane switch in that second must not
+    /// re-target the paste at whichever session became front — delivery goes to
+    /// the owner (hidden-session seam if it is no longer in front), and dies with
+    /// it if it has closed. `None` (no terminal fronted the window) keeps the
+    /// ordinary front-content routing.
     #[cfg_attr(not(target_os = "linux"), allow(dead_code))]
     PasteReady {
         wid: WindowId,
+        session: Option<u64>,
         text: String,
         source: Source,
     },
@@ -3278,10 +3547,14 @@ enum Wake {
     /// which case the text is dropped exactly as the blocking dialog dropped it. `id`
     /// names the sheet being answered so `user_event` retires exactly that sheet's
     /// outstanding-confirmation entry (and its key interceptor) and never a newer one's.
+    /// `session` is the terminal the sheet's question was asked ABOUT (the one that
+    /// fronted `wid` at the gesture); the answer is delivered to it, not to whichever
+    /// tab an `aterm ctl tab` put in front while the sheet stood.
     #[cfg_attr(not(target_os = "macos"), allow(dead_code))]
     PasteConfirmed {
         id: u64,
         wid: WindowId,
+        session: Option<u64>,
         text: String,
         source: Source,
         /// The bracketed-paste reading the SHEET's question was asked under, so
@@ -4542,6 +4815,64 @@ impl Backend {
         }
     }
 
+    /// Pre-rasterize regular + bold printable ASCII into the sealed
+    /// generation's glyph cache. Worker-only, and only AFTER
+    /// [`Self::seal_admitted_font_sources`]: the seal drops every raster.
+    fn prewarm_ascii(&mut self) {
+        match self {
+            Backend::Cpu(renderer) => renderer.prewarm_ascii(),
+            Backend::Gpu(renderer) => renderer.prewarm_ascii(),
+        }
+    }
+
+    /// The post-seal warm at the size the FIRST WINDOW will draw at.
+    ///
+    /// `prewarm_px` is the px `attach_os_window` is predicted to activate
+    /// (`first_window_prewarm_px`); `active_px` is the size this renderer was
+    /// built at and must be handed back at. A `GlyphKey` bakes `px_q`, so a
+    /// warm at the 12 px base is invisible to a first frame drawn at the
+    /// 2× target of 24 px: every prompt key missed and was rasterized on the
+    /// UI thread in the first atlas build, while the worker's rasters sat
+    /// unused. [`Self::activate_px`] is the light switch — every size's
+    /// glyphs stay resident — so warming at the predicted size and switching
+    /// back leaves the renderer exactly as it was, plus the prompt's regular
+    /// and bold bitmaps at the size the first frame will ask for. Both
+    /// switches are no-ops when the prediction IS the base (1× displays, an
+    /// explicit size). `first_window_prewarm_tests` pins the miss and the hit.
+    fn prewarm_ascii_for_first_window(&mut self, prewarm_px: f32, active_px: f32) {
+        self.activate_px(prewarm_px);
+        self.prewarm_ascii();
+        self.activate_px(active_px);
+    }
+
+    /// Pin the glyph-affecting render knobs — THE setter list, run by the
+    /// backend worker before its post-seal warm and by
+    /// `pin_backend_render_config_core` at the join and on every rebuild.
+    /// Each setter drops the glyph cache only when its value changes, so a
+    /// warm that follows a pin of value V survives a later re-pin of the same
+    /// V; a warm that PRECEDES the first pin of a non-default V is discarded
+    /// (`first_window_prewarm_tests` pins both). Same order as the join's
+    /// list always had: `line_height` derives the cell box before
+    /// `adjust_baseline` re-derives it.
+    fn pin_glyph_raster_knobs(&mut self, knobs: &app_config::GlyphRasterKnobs) {
+        self.set_text_shaping(knobs.text_shaping.clone());
+        self.set_font_thicken(knobs.font_thicken);
+        self.set_stem_gamma(knobs.stem_gamma);
+        self.set_font_hinting(&knobs.font_hinting);
+        self.set_line_height(knobs.line_height);
+        self.set_adjust_baseline(knobs.adjust_baseline);
+    }
+
+    /// DIAGNOSTIC: rasterized glyphs resident in the face's cache, for the
+    /// first-present observable (`App::present_input_scratch`) and the warm
+    /// proofs. Not part of the rendering contract.
+    fn glyph_cache_len(&self) -> usize {
+        match self {
+            Backend::Cpu(renderer) => renderer.glyph_cache_len(),
+            Backend::Gpu(renderer) => renderer.glyph_cache_len(),
+        }
+    }
+
     fn rebuild_font_from_admitted(&mut self, px: f32, theme: Theme) -> Result<(), String> {
         match self {
             Backend::Cpu(renderer) => {
@@ -5099,6 +5430,17 @@ struct StartupFontGeneration {
     config: app_config::FontConfig,
     variations: Vec<(u32, f32)>,
     dark_nudge: f32,
+    /// The glyph-affecting render knobs, resolved once on the main thread and
+    /// pinned on the worker BETWEEN the seal and the warm, so the join's
+    /// re-pin of the same values (`pin_backend_render_config_core`) is a
+    /// no-op and the warm reaches the first frame under any typography config.
+    raster_knobs: app_config::GlyphRasterKnobs,
+    /// The px the first window is predicted to activate — the size the warm
+    /// targets (`first_window_prewarm_px`). Predicted on the main thread
+    /// AFTER the worker spawn (the prediction's CoreGraphics call opens the
+    /// WindowServer connection, ~15 ms cold) and carried here so it overlaps
+    /// the worker's GPU build instead of delaying the worker's start.
+    prewarm_px: f32,
 }
 
 fn apply_font_config_to_backend(
@@ -5565,7 +5907,7 @@ enum BackendSlot {
     /// Backend still building on its spawn thread. The handle is `Some` until
     /// [`App::finalize_backend`] takes it (an invariant, not a state: `None`
     /// inside `Pending` is unreachable outside that method).
-    Pending(Option<std::thread::JoinHandle<(Backend, bool)>>),
+    Pending(Option<std::thread::JoinHandle<(Backend, bool, bool)>>),
     Ready(Backend),
 }
 
@@ -5638,6 +5980,16 @@ impl BackendSlot {
 
     fn activate_px(&mut self, px: f32) {
         self.ready_mut().activate_px(px);
+    }
+
+    /// See [`Backend::pin_glyph_raster_knobs`].
+    fn pin_glyph_raster_knobs(&mut self, knobs: &app_config::GlyphRasterKnobs) {
+        self.ready_mut().pin_glyph_raster_knobs(knobs);
+    }
+
+    /// See [`Backend::glyph_cache_len`].
+    fn glyph_cache_len(&self) -> usize {
+        self.ready().glyph_cache_len()
     }
 
     fn cell_geometry(&self, px: f32) -> (usize, usize, i32) {
@@ -5859,6 +6211,18 @@ pub struct SessionCtx {
     /// Accepted-input evidence shared by every input capability for this PTY,
     /// including direct cross-session control writes and every visible view.
     pub(crate) output_echo: Arc<crate::app_input::OutputEchoTracker>,
+    /// This session terminal's LOCK-FREE input-mode mirror (keyboard encoding
+    /// mode + mouse mode), the seam's per-key read that replaced a second
+    /// blocking `term_lock` behind the PTY reader's `process()` slice. Always
+    /// derived from the session's own terminal via [`crate::mode_mirror_of`].
+    pub(crate) modes: Arc<aterm_core::terminal::ModeMirror>,
+    /// Number of UI-thread acquisitions currently BLOCKED on this session's
+    /// terminal mutex (see [`term_lock_ui`]). The PTY reader and the compress
+    /// worker read it between their lock holds and spin briefly while it is
+    /// non-zero (`yield_to_ui_waiter`), turning a slice boundary — a bare
+    /// release the unfair pthread mutex lets the releaser immediately re-take —
+    /// into an actual handoff to the waiting UI thread.
+    pub(crate) ui_waiting: Arc<std::sync::atomic::AtomicU32>,
     pub edges: std::sync::Mutex<EdgeTable>,
     pub self_id: SessionId,
     pub nonce: LaunchNonce,
@@ -5974,8 +6338,11 @@ struct Session {
     child_reaped: std::sync::atomic::AtomicBool,
     /// Original outgoing pool id when this session owns a PTY adopted through
     /// the current seamless-update handshake. Together with `master` + `pid`,
-    /// this lets readiness prove the exact set that reached the live child pool.
-    /// Fresh sessions and test stubs carry `None`.
+    /// this lets readiness prove the exact set that reached the live child pool,
+    /// and it is the one name a handoff layout's leaf can match: the restore
+    /// carries a leaf's USER identity only onto the session adopted under the
+    /// id the leaf names (`App::carry_restored_identity`). Fresh sessions carry
+    /// `None`, and so does a test stub unless its test adopts it.
     handoff_local_id: Option<u64>,
     ctx: Arc<SessionCtx>,
     /// The proxy-table key for the child this session spawned (Item 5b), retained
@@ -7942,6 +8309,24 @@ struct WindowState {
     /// this flag is what says whether they mean anything — which is the difference
     /// between reporting where the pointer is and inventing a cell it is not on.
     pointer_position_known: bool,
+    /// Whether the LAST pointer routing decision reached the GRID's hover arm
+    /// (`App::route_cursor_moved` ran `update_hover_cursor_with`), as opposed
+    /// to returning to a layer that owns the pointer instead — a modal, the tab
+    /// context menu, a native view, chrome, a divider or connector drag. The
+    /// frame-time refresh (`App::refresh_hover_for_frame_locked`) is a CONTINUATION of
+    /// that decision, never an independent resolver: while this is `false` a
+    /// changed frame under a still pointer re-resolves nothing, because the
+    /// pointer is not the grid's to resolve. Written beside
+    /// [`Self::pointer_position_known`] at the top of every routing (false) and
+    /// at the grid arm (true); cleared with it by `App::on_cursor_left`.
+    hover_grid_owned: bool,
+    /// The mapping [`Self::last_mouse_cell`] was derived under when
+    /// [`Self::hover_grid_owned`] was last set — front session, window size and
+    /// grid, chrome rows, cell geometry, focused pane rect. The same-pixel early
+    /// return in `App::route_cursor_moved` compares it against the live mapping
+    /// so a keyboard-driven focus/layout/geometry change under a still pointer
+    /// re-derives the cell before the next wheel/press report is built from it.
+    hover_mapping: app_mouse::HoverMapping,
     /// Sub-cell pixel offset of the last pointer move inside its grid cell, so a
     /// button press / wheel notch (winit delivers no pixel position on those) can
     /// still report a genuine sub-cell PIXEL coordinate under DEC 1016 (SGR-pixel
@@ -7962,6 +8347,15 @@ struct WindowState {
     /// which is exactly the axis bleed the dominance guard exists to prevent.
     /// Only ever drained toward a `WheelDir::Left`/`Right` report.
     scroll_residual_x: f64,
+    /// Set by `on_mouse_wheel` for exactly the duration of the seam call it
+    /// makes: whether the wheel event being routed was a PRECISE (`PixelDelta`,
+    /// trackpad / Magic Mouse) delta rather than a notch. Read by the glide
+    /// arm to choose how a chained delta joins an in-flight ease — a notch
+    /// RETARGETS (the M1 180 ms brief, written for notch wheels), a precise
+    /// delta EXTENDS without pushing the deadline out (`Glide::extend_target`).
+    /// Cleared again before the handler returns, so a controller wheel (which
+    /// never passes through the handler) always reads a notch.
+    wheel_precise: bool,
     /// Whether the OS cursor is currently the link "pointer" (Cmd-hovering a link),
     /// so `set_cursor` is only called on a state change, not every mouse move.
     hover_pointer: bool,
@@ -7979,6 +8373,15 @@ struct WindowState {
     /// link under the pointer is byte-identical to one from before the band
     /// existed.
     link_hover: Option<link_target::LinkHover>,
+    /// The grid arm's last hover resolution, memoised on everything it depends
+    /// on ([`app_mouse::HoverMemo`]): the session, the WINDOW cell, the link
+    /// modifier, the pointer/pane/chrome gate, and the ENGINE FILL the frame
+    /// stands on ([`app_mouse::HoverFrame`]). Pointer motion inside one cell
+    /// re-publishes the memo with no terminal lock; a new cell, a modifier edge
+    /// or a new engine fill under a still pointer re-probes — non-blocking —
+    /// and rewrites it. Also the home of the hovered link's destination
+    /// (`Arc<str>`), read by the caption splice with no lock and no allocation.
+    hover_memo: Option<app_mouse::HoverMemo>,
     /// TERMINAL rows of this window's grid that CHROME has covered while
     /// composing the current frame: the find panel, the notice and paste bands,
     /// the link caption itself.
@@ -8137,6 +8540,19 @@ struct WindowState {
     /// LUMEN cursor-aurora animation state (additive light comet/bloom/ring/sparks).
     /// Empty/idle when no recent move, so it costs nothing on a steady screen.
     cursor_glow: crate::cursor_glow::CursorGlow,
+    /// The cell widths of the LAST typed dispatch's graphemes, in order — a
+    /// plain key is one width, a committed IME run one per grapheme — so a
+    /// Backspace can price the glyph it erases for the glow engine's press
+    /// ring ([`crate::cursor_glow::CursorGlow::note_backspace_erasing`]):
+    /// the engine banks an IME commit as ONE press at its summed width, and
+    /// a Backspace erases one glyph of it, not the run. Each Backspace pops
+    /// the newest width (a zero-width cluster inside a run is a priced 0,
+    /// which retires nothing); any other press replaces the memory with its
+    /// own (or empties it), so a pop on an empty memory prices nothing
+    /// (`None`) and the engine retires the whole newest press, as it always
+    /// did for a plain key. Capacity is reused across commits: the steady
+    /// typing path allocates nothing.
+    typed_glyph_widths: Vec<u16>,
     /// Typing-reactive RAINBOW-CURSOR state (the `rainbow kitty` block-cursor glow): a hue that
     /// spins + saturates with typing momentum and cools to a dim ember. Settles to
     /// inactive so a still cursor rides the blink cadence at no extra idle cost — and
@@ -8385,6 +8801,15 @@ struct WindowState {
     /// hovered. The petting hit-box — `on_mouse_input` consumes a left press
     /// inside it (padded by `PET_HIT_SLOP_PX`) before the terminal seam.
     pet_hit_rect: Option<(i32, i32, i32, i32)>,
+    /// The raw window pixel the pet brain LAST SAMPLED the pointer at (stamped
+    /// beside `pet_pointer_cell` on both render paths), or `None` before its
+    /// first sample. The motion path's pet wake is EDGE-gated on it: a
+    /// `CursorMoved` asks for a frame only when the pointer has moved at least
+    /// one cell from the position the brain has already consumed AND the
+    /// brain's own cadence is not running (`needs_frames()`); once the brain has
+    /// heat, the armed 60 Hz effect lane owns pointer sampling and every
+    /// per-event request would be a duplicate of a frame it already scheduled.
+    pet_pointer_sampled_px: Option<(f64, f64)>,
     /// THE TENURE GATE for this window's program cat
     /// ([`crate::app_kitty::KittyTenure`]): turns the focused pane's raw,
     /// instantly-flapping program claim into the slow, deliberate one the
@@ -8466,6 +8891,14 @@ struct WindowState {
     poof_row_above_buf: Vec<char>,
     /// The row BELOW the probed cursor row (see `poof_row_above_buf`).
     poof_row_below_buf: Vec<char>,
+    /// CONTENT-WITNESS row scratch (reused every frame — zero steady-state
+    /// alloc): one grid row at a time, captured under the SAME term lock as
+    /// `poof_row_buf` for each row Rainbow Kitty's resident ribbon occupies
+    /// (`CursorGlow::ribbon_rows`) and handed to
+    /// `CursorGlow::observe_ribbon_row`, which copies it into its own slot.
+    /// The witness retires a ribbon cell whose glyph has changed or gone —
+    /// the abandoned band an input-box relocation leaves behind.
+    witness_row_buf: Vec<char>,
     /// Last focused terminal/screen coordinate space consumed by the cursor
     /// effect family: `(Terminal::render_identity(), alternate_screen)`.
     /// Main and alternate grids reuse one session but carry unrelated cursor
@@ -10463,6 +10896,7 @@ impl WindowState {
         term: Arc<Mutex<Terminal>>,
         master: i32,
         sink: Arc<SinkWriter>,
+        ui_waiting: Arc<std::sync::atomic::AtomicU32>,
         session: u64,
         rows: u16,
         cols: u16,
@@ -10484,6 +10918,7 @@ impl WindowState {
             term,
             master,
             sink,
+            ui_waiting,
         });
         Self::new_with_front(
             front_content,
@@ -10569,12 +11004,16 @@ impl WindowState {
             last_mouse_window_cell: (0, 0),
             last_cursor_px: (0.0, 0.0),
             pointer_position_known: false,
+            hover_grid_owned: false,
+            hover_mapping: app_mouse::HoverMapping::default(),
             last_mouse_px_off: crate::input::PixelOffset::CELL_ORIGIN,
             scroll_residual: 0.0,
             scroll_residual_x: 0.0,
+            wheel_precise: false,
             hover_pointer: false,
             native_text_cursor: false,
             link_hover: None,
+            hover_memo: None,
             chrome_rows: Vec::new(),
             selecting: false,
             divider_drag: None,
@@ -10602,6 +11041,7 @@ impl WindowState {
             close_warning_until: None,
             bell_flash: BellFlash::new(),
             cursor_glow: crate::cursor_glow::CursorGlow::default(),
+            typed_glyph_widths: Vec::new(),
             cursor_rainbow: crate::cursor_rainbow::CursorRainbow::default(),
             cursor_droplet: crate::cursor_droplet::CursorDroplet::default(),
             momentum_glow: aterm_effects::cursor_momentum::MomentumGlow::default(),
@@ -10633,6 +11073,7 @@ impl WindowState {
             verdict_spent: None,
             verdict_hush: false,
             pet_hit_rect: None,
+            pet_pointer_sampled_px: None,
             kitty_tenure: crate::app_kitty::KittyTenure::default(),
             kitty_rung: crate::launch_kitty::CompanionRung::Launch,
             pet_content_seq: None,
@@ -10645,6 +11086,7 @@ impl WindowState {
             poof_row_buf: Vec::new(),
             poof_row_above_buf: Vec::new(),
             poof_row_below_buf: Vec::new(),
+            witness_row_buf: Vec::new(),
             cursor_effect_coordinate_space: None,
             cursor_scroll_state: None,
             blink_epoch_seen: 0,
@@ -12480,7 +12922,8 @@ struct App {
     /// `None` when restore is off, nothing was persisted, or it has been applied.
     pending_restore: Option<restore::RestoreManifest>,
     /// SEAMLESS multi-session adopt: the live shells handed across an update re-exec that
-    /// still need placing (session 0 was already spawned from the first leaf). Drained by
+    /// still need placing (session 0 already took the one window 0's bootstrap leaf
+    /// names, when window 0 has a terminal leaf). Drained by
     /// [`Self::apply_pending_restore`], which re-adopts each leaf whose `local_id` matches
     /// one of these (matched shell → adopt in place; leftover → appended so it is never
     /// lost). Empty on a normal launch (no handoff) and after restore runs.
@@ -12539,11 +12982,15 @@ struct App {
     /// the parent rolls back, and every session survives — but it would retire
     /// the automatic lane, which is why it is derived and never configured.
     handoff_device_proof_term: bool,
-    /// Whether session 0 was re-adopted from a seamless-update handoff. A cold
-    /// native-only restore may retire its throwaway bootstrap shell, but an adopted
-    /// bootstrap owns a live pre-update shell and must remain reachable even when an
-    /// older/native-only manifest has no terminal slot for it.
-    bootstrap_session_adopted: bool,
+    /// Whether this process is the SUCCESSOR of a seamless-update handoff: it
+    /// re-adopted the shells its predecessor handed across. Its restore layout is
+    /// then a handoff layout, whose leaves name those shells
+    /// (`App::carry_restored_identity`). Session 0 is one of them unless window 0's
+    /// layout has no terminal leaf, and then it is a fresh bootstrap
+    /// (`app_restore::take_session0_shell`) — so whether a window's bootstrap is a
+    /// live pre-update shell that must stay reachable is read off the session
+    /// itself (`Session::handoff_local_id`), never off this flag.
+    handoff_successor: bool,
     /// RESTORE-1: the layout captured at the moment a window close DECIDED to exit
     /// the app (`close_window_logical` drains `windows` before `el.exit()`, so the
     /// post-loop writer would otherwise see an empty map on that path). The Cmd-Q
@@ -13134,8 +13581,9 @@ impl Drop for App {
 /// every fallible step has succeeded, so a failure there can hand the paste back
 /// to the caller instead of dropping it inside a block that will never be called.
 #[cfg(target_os = "macos")]
-type PasteConfirmPayload =
-    std::rc::Rc<std::cell::RefCell<Option<(WindowId, String, Source, input::PasteFraming)>>>;
+type PasteConfirmPayload = std::rc::Rc<
+    std::cell::RefCell<Option<(WindowId, Option<u64>, String, Source, input::PasteFraming)>>,
+>;
 
 impl App {
     /// Read-only effective serious-mode status for menu/palette/control wiring.
@@ -15049,6 +15497,7 @@ impl App {
                         term: s.term.clone(),
                         master: s.master,
                         sink: s.ctx.sink.clone(),
+                        ui_waiting: s.ctx.ui_waiting.clone(),
                     });
                 } else {
                     ws.front_content = None;
@@ -15590,6 +16039,7 @@ impl App {
             term.clone(),
             master,
             app_sink,
+            session0.ctx.ui_waiting.clone(),
             0,
             24,
             80,
@@ -15753,7 +16203,7 @@ impl App {
             incoming_handoff_pending: false,
             handoff_degraded: false,
             handoff_device_proof_term: false,
-            bootstrap_session_adopted: false,
+            handoff_successor: false,
             quit_capture: None,
             winit_to_window: HashMap::new(),
             headless: true,
@@ -16634,10 +17084,22 @@ impl App {
         // by (say) Shift alone would leave its stamp fresh for an unrelated
         // child cursor move to borrow.
         self.clear_move_license(wid);
-        if let Some(ws) = self.windows.get_mut(&wid) {
-            ws.mods = mods;
+        let Some(ws) = self.windows.get_mut(&wid) else {
+            return;
+        };
+        let previous = std::mem::replace(&mut ws.mods, mods);
+        // The hover answer depends on exactly ONE modifier — the platform's
+        // "open link" key (`link_modifier_held`) — and only while the pointer is
+        // actually inside this window. Every other edge (Shift down/up around a
+        // capital, Ctrl/Alt chords, a Cmd-Tab away) re-derived an answer that
+        // could not have changed, through a blocking terminal-mutex acquisition
+        // per edge behind the PTY reader. Resolve only on a link-modifier edge.
+        let pointer_inside = ws.pointer_position_known;
+        if pointer_inside
+            && app_mouse::link_modifier_held(previous) != app_mouse::link_modifier_held(mods)
+        {
+            self.update_hover_cursor(wid);
         }
-        self.update_hover_cursor(wid);
     }
 
     /// Toggle the drag-and-drop hover highlight for `wid` and repaint. Driven by
@@ -16855,13 +17317,19 @@ impl App {
     /// last said — the two are the same window in practice on Windows (a click
     /// activates first), but the gesture should not depend on that ordering.
     fn paste_clipboard_into(&mut self, wid: WindowId) {
+        // THE OWNER IS NAMED AT THE GESTURE. Everything below may deliver later —
+        // the X11 worker read, the confirmation sheet/banner — and by then a tab
+        // or pane switch may have put another session in front of `wid`. The
+        // paste belongs to the session the person was looking at when they
+        // pressed paste, so that identity rides with the text from here on.
+        let session = self.focused_session_id(wid);
         // Read the system clipboard via the platform backend: macOS in-process
         // NSPasteboard (direct UTF-8, no subprocess and no locale transcoding),
         // Windows in-process. Both are instant, so deliver on the UI thread.
         #[cfg(not(target_os = "linux"))]
         {
             if let Some(text) = control::pbpaste() {
-                self.deliver_paste(wid, text, Source::Human);
+                self.deliver_paste(wid, session, text, Source::Human);
                 // Load-bearing on Windows only: it skips the CF_HDROP arm
                 // below once text pasted. On macOS nothing follows this block,
                 // so a bare `return` is the needless_return lint on one
@@ -16888,7 +17356,7 @@ impl App {
             if let Some(paths) = crate::clipboard_win::get_paths() {
                 let text = input::paths_paste_insertion(&paths);
                 if !text.is_empty() {
-                    self.deliver_paste(wid, text, Source::Human);
+                    self.deliver_paste(wid, session, text, Source::Human);
                 }
             }
         }
@@ -16900,7 +17368,7 @@ impl App {
         #[cfg(target_os = "linux")]
         {
             if let Some(text) = control::pbpaste_owned() {
-                self.deliver_paste(wid, text, Source::Human);
+                self.deliver_paste(wid, session, text, Source::Human);
                 return;
             }
             // A real run always has a proxy; guard rather than panic (test-only None).
@@ -16915,6 +17383,7 @@ impl App {
                     if let Some(text) = control::pbpaste() {
                         let _ = proxy.send_event(Wake::PasteReady {
                             wid,
+                            session,
                             text,
                             source: Source::Human,
                         });
@@ -16936,17 +17405,34 @@ impl App {
     /// queued could put them in either disagreement — a body confirmed as
     /// unbracketed landing bracketed, or a body judged inert because 2004 was on
     /// landing unbracketed at a bare prompt, every line submitted, never asked.
-    fn deliver_paste(&mut self, wid: WindowId, text: String, source: Source) {
-        // The one read. No terminal to read (headless, or before the window has
-        // content) means nothing was observed and nothing is owed: the writer
-        // frames by the live mode as it always has.
-        let framing = self
-            .front_terminal(wid)
-            .map_or(input::PasteFraming::AtDrain, |terminal| {
-                input::PasteFraming::Gesture {
-                    bracketed: term_lock(&terminal.term).modes().bracketed_paste,
-                }
-            });
+    ///
+    /// `session` is the terminal that OWNED the gesture — the one that fronted
+    /// `wid` when paste was pressed, named by the caller at that moment. It is
+    /// the terminal whose DEC 2004 is read here, the terminal the confirmation
+    /// asks about, and the only terminal the bytes may reach: a deferred delivery
+    /// (the X11 worker read, the sheet or banner answer) lands on it through
+    /// [`App::input_to_session`]'s pinned path even if another tab has since
+    /// come to the front, and lands nowhere if it has closed. `None` means the
+    /// window fronted no terminal at the gesture (native content), and delivery
+    /// keeps the ordinary front-content routing.
+    fn deliver_paste(&mut self, wid: WindowId, session: Option<u64>, text: String, source: Source) {
+        // The one read — of the OWNER's mode, not the window's current front: the
+        // two differ exactly when a switch happened between gesture and delivery,
+        // and the question is about the owner. No terminal to read (the owner
+        // has closed; headless; native content) means nothing was observed and
+        // nothing is owed: the writer frames by the live mode as it always has.
+        let bracketed = match session {
+            Some(owner) => self
+                .pool
+                .get(owner)
+                .map(|owner| term_lock(&owner.term).modes().bracketed_paste),
+            None => self
+                .front_terminal(wid)
+                .map(|terminal| term_lock(&terminal.term).modes().bracketed_paste),
+        };
+        let framing = bracketed.map_or(input::PasteFraming::AtDrain, |bracketed| {
+            input::PasteFraming::Gesture { bracketed }
+        });
         // PASTEJACKING GUARD (HUMAN path only — the control `paste` verb and the file
         // drop are unaffected): when bracketed paste is OFF and the clipboard holds an
         // embedded newline, a hidden line could auto-submit a command at a bare prompt /
@@ -16970,8 +17456,10 @@ impl App {
                 // attach one to (headless, or before `attach_os_window`), so hand
                 // the text back and deliver it: the guard has no UI to ask through,
                 // matching the posture of the no-dialog platform fallback below.
-                if let Some(text) = self.present_multiline_paste_sheet(wid, text, source, framing) {
-                    self.deliver_paste_confirmed(wid, text, source, framing);
+                if let Some(text) =
+                    self.present_multiline_paste_sheet(wid, session, text, source, framing)
+                {
+                    self.deliver_paste_confirmed(wid, session, text, source, framing);
                 }
                 return;
             }
@@ -16986,11 +17474,11 @@ impl App {
             // Enter answers it in `on_key` (fail-closed, like the sheet).
             #[cfg(not(any(target_os = "macos", windows)))]
             {
-                self.present_multiline_paste_banner(wid, text, source, framing);
+                self.present_multiline_paste_banner(wid, session, text, source, framing);
                 return;
             }
         }
-        self.deliver_paste_confirmed(wid, text, source, framing);
+        self.deliver_paste_confirmed(wid, session, text, source, framing);
     }
 
     /// Present the multi-line paste confirmation as a WINDOW SHEET on `wid`, resuming
@@ -17035,6 +17523,7 @@ impl App {
     fn present_multiline_paste_sheet(
         &mut self,
         wid: WindowId,
+        session: Option<u64>,
         text: String,
         source: Source,
         framing: input::PasteFraming,
@@ -17129,13 +17618,15 @@ impl App {
         // is contained and reported, not a `nounwind`-frame abort). The response
         // is `NSModalResponse`, i.e. `NSInteger`.
         let completion = move |response: isize| {
-            let Some((wid, text, source, framing)) = handler_payload.borrow_mut().take() else {
+            let Some((wid, session, text, source, framing)) = handler_payload.borrow_mut().take()
+            else {
                 return;
             };
             let proceed = response == appkit::consts::NS_ALERT_FIRST_BUTTON_RETURN;
             let _ = proxy.send_event(Wake::PasteConfirmed {
                 id,
                 wid,
+                session,
                 text,
                 source,
                 framing,
@@ -17202,7 +17693,7 @@ impl App {
             // ARMED HERE, one statement before the sheet goes up: every fallible
             // step above has succeeded, so the completion can no longer find an
             // empty cell for a sheet that is really on screen.
-            *payload.borrow_mut() = Some((wid, text, source, framing));
+            *payload.borrow_mut() = Some((wid, session, text, source, framing));
             // `-beginSheetModalForWindow:completionHandler:` is `v@:@@?`, so the
             // last parameter is a `BlockPtr`; AppKit copies the block, so
             // `handler`'s own reference may drop at the end of this function.
@@ -17269,17 +17760,33 @@ impl App {
     /// macOS sheet can resume it from `Wake::PasteConfirmed` without re-running the
     /// pastejacking guard (which would ask twice). `framing` is that guard's own
     /// reading of DEC 2004, carried here rather than re-read: it is the answer the
-    /// person was given, and it must be the answer the PTY gets.
+    /// person was given, and it must be the answer the PTY gets. `session` is the
+    /// owner named at the gesture, for the same reason: it is the terminal the
+    /// person was given the answer ABOUT, and it must be the terminal the PTY
+    /// bytes reach.
     fn deliver_paste_confirmed(
         &mut self,
         wid: WindowId,
+        session: Option<u64>,
         text: String,
         source: Source,
         framing: input::PasteFraming,
     ) {
         // Route through the seam so paste-formatting + the snap-to-bottom side
-        // effect converge with the controller `paste` verb.
-        self.input(wid, InputEvent::Paste(text, framing), source);
+        // effect converge with the controller `paste` verb. The owner PINS the
+        // target exactly as a held key's press does and as a control `@sid`
+        // paste does: if it still fronts a window the paste lands there; if a
+        // tab or pane switch hid it meanwhile, the hidden-session seam carries
+        // the bytes to it anyway; if it has closed, nothing is delivered — the
+        // one thing that never happens is the paste landing on whichever
+        // session the switch put in front.
+        self.input_to_session(
+            wid,
+            InputEvent::Paste(text, framing),
+            source,
+            session,
+            crate::app_input::PressPhase::Initial,
+        );
     }
 
     /// Present the multi-line paste confirmation as an IN-WINDOW BANNER over `wid`'s
@@ -17295,6 +17802,7 @@ impl App {
     fn present_multiline_paste_banner(
         &mut self,
         wid: WindowId,
+        session: Option<u64>,
         text: String,
         source: Source,
         framing: input::PasteFraming,
@@ -17307,7 +17815,9 @@ impl App {
             );
             return;
         }
-        self.paste_banner = Some(paste_banner::PendingPaste::new(wid, text, source, framing));
+        self.paste_banner = Some(paste_banner::PendingPaste::new(
+            wid, session, text, source, framing,
+        ));
         if let Some(w) = self.windows.get(&wid).and_then(|ws| ws.os_window.as_ref()) {
             w.request_redraw();
         }
@@ -17318,17 +17828,19 @@ impl App {
     /// re-running the guard, which would ask twice); `!proceed` drops it — the text's
     /// only copy dies here, which is the fail-closed cancel. Reached from the Enter/
     /// Escape gate in `on_key` and from a click on the banner band (`app_mouse`).
-    /// No-op when no banner is up.
+    /// No-op when no banner is up. The parked OWNER rides into delivery: the
+    /// answer goes to the session the banner asked about, even if a tab-bar click
+    /// or `aterm ctl tab` put another session in front while the question stood.
     pub(crate) fn answer_paste_banner(&mut self, proceed: bool) {
         let Some(pending) = self.paste_banner.take() else {
             return;
         };
-        let (wid, text, source, framing) = pending.take();
+        let (wid, session, text, source, framing) = pending.take();
         if let Some(w) = self.windows.get(&wid).and_then(|ws| ws.os_window.as_ref()) {
             w.request_redraw();
         }
         if proceed {
-            self.deliver_paste_confirmed(wid, text, source, framing);
+            self.deliver_paste_confirmed(wid, session, text, source, framing);
         }
     }
 
@@ -17343,8 +17855,11 @@ impl App {
     /// skipped `deliver_paste`'s guard.)
     #[cfg(target_os = "linux")]
     pub(crate) fn paste_primary_into(&mut self, wid: WindowId) {
+        // The owner is named at the gesture, exactly as `paste_clipboard_into`
+        // names it: the worker read below can outlast a tab switch.
+        let session = self.focused_session_id(wid);
         if let Some(text) = control::primary_get_owned() {
-            self.deliver_paste(wid, text, Source::Human);
+            self.deliver_paste(wid, session, text, Source::Human);
             return;
         }
         // A real run always has a proxy; guard rather than panic (test-only None).
@@ -17359,6 +17874,7 @@ impl App {
                 if let Some(text) = control::primary_get() {
                     let _ = proxy.send_event(Wake::PasteReady {
                         wid,
+                        session,
                         text,
                         source: Source::Human,
                     });
@@ -21764,10 +22280,17 @@ impl ApplicationHandler<Wake> for App {
                 }
             }
             // The Linux/X11 paste worker finished a foreign-owner read: deliver it via
-            // the SAME guard + seam the synchronous path uses. A stale `wid` (window
-            // closed while the read was in flight) is tolerated — `input` is a no-op
-            // for an absent window. Never constructed off Linux (see the variant).
-            Wake::PasteReady { wid, text, source } => self.deliver_paste(wid, text, source),
+            // the SAME guard + seam the synchronous path uses, to the SESSION that
+            // owned the gesture (a tab switched during the read does not re-target
+            // it). A stale `wid` (window closed while the read was in flight) is
+            // tolerated — the seam is a no-op for an absent window, and a closed
+            // owner delivers nothing. Never constructed off Linux (see the variant).
+            Wake::PasteReady {
+                wid,
+                session,
+                text,
+                source,
+            } => self.deliver_paste(wid, session, text, source),
             // The same worker's find-field hand-off: insert at the caret instead of
             // delivering to the PTY. A find closed while the read was in flight makes
             // `search_edit_in` a no-op, exactly like a stale `wid`.
@@ -21801,6 +22324,7 @@ impl ApplicationHandler<Wake> for App {
             Wake::PasteConfirmed {
                 id,
                 wid,
+                session,
                 text,
                 source,
                 framing,
@@ -21820,7 +22344,7 @@ impl ApplicationHandler<Wake> for App {
                 #[cfg(not(target_os = "macos"))]
                 let _ = id;
                 if proceed {
-                    self.deliver_paste_confirmed(wid, text, source, framing);
+                    self.deliver_paste_confirmed(wid, session, text, source, framing);
                 }
             }
             // A macOS menu item was clicked (menu.rs posted it). Dispatch into the
@@ -22319,6 +22843,100 @@ impl ApplicationHandler<Wake> for App {
 
 // PTY spawn lives in `aterm-pty` (the single WS-G spawn seam); the frontend
 // passes it the shell-integration injection computed below.
+
+/// The display scale the FIRST window is predicted to open at, decided on the
+/// main thread BEFORE the backend worker spawns, so the worker's post-seal
+/// glyph warm can target the size `attach_os_window` will activate. In
+/// precedence: the explicit render-scale override; the main display's backing
+/// scale (macOS — pure CoreGraphics, no AppKit, no window yet); the one scale
+/// this machine has measured cells at (the cell-metrics cache, when it holds
+/// exactly one entry); else 1×. A prediction, never a decision: the attach
+/// path still activates the window's REAL scale, and a miss only means the
+/// warm landed at the wrong size — exactly the pre-prediction status quo.
+fn predicted_first_window_scale() -> f64 {
+    resolve_force_scale()
+        .or_else(main_display_backing_scale)
+        .or_else(crate::restore::recorded_cell_metrics_scale)
+        .unwrap_or(1.0)
+}
+
+/// The px the backend worker warms the prompt at: the attach path's auto-scale
+/// target for the predicted scale — [`app_window::hidpi_target_font_px`], the
+/// SAME function, so the two cannot disagree about a display — else the size
+/// the renderer was built at (an explicit size, a 1× display). Pure, for the
+/// proof in `first_window_prewarm_tests`.
+fn first_window_prewarm_px(font_px_explicit: bool, font_px: f32, predicted_scale: f64) -> f32 {
+    app_window::hidpi_target_font_px(font_px_explicit, predicted_scale).unwrap_or(font_px)
+}
+
+/// The main display's backing scale — physical pixels per point of its current
+/// mode — through CoreGraphics alone: no `NSScreen`, no AppKit, so it is safe
+/// on the main thread before the application object exists. `None` when there
+/// is no display to ask (no WindowServer session, a mode CG will not report),
+/// which [`predicted_first_window_scale`] treats as unknown.
+#[cfg(target_os = "macos")]
+fn main_display_backing_scale() -> Option<f64> {
+    cg_display::main_display_backing_scale()
+}
+
+/// No pre-window display query on this platform; the prediction falls through
+/// to the recorded scale, then 1×.
+#[cfg(not(target_os = "macos"))]
+fn main_display_backing_scale() -> Option<f64> {
+    None
+}
+
+/// The one CoreGraphics display query the launch path makes before AppKit is
+/// up: the main display's current mode, for its backing scale
+/// ([`predicted_first_window_scale`]). Same shape as [`cg_capture`]: the exact
+/// symbols this needs, opaque pointers, every `Copy`d object released once.
+#[cfg(target_os = "macos")]
+mod cg_display {
+    use std::ffi::c_void;
+
+    /// Opaque `CGDisplayModeRef` — handed back to CG or released, never read.
+    type CGDisplayModeRef = *mut c_void;
+    /// `CGDirectDisplayID` is a `uint32_t`.
+    type CGDirectDisplayID = u32;
+
+    // SAFETY (whole block): the standard CoreGraphics display entry points with
+    // the signatures published in `CGDirectDisplay.h`; the one caller below
+    // releases the copied mode exactly once and dereferences nothing.
+    #[link(name = "CoreGraphics", kind = "framework")]
+    unsafe extern "C" {
+        fn CGMainDisplayID() -> CGDirectDisplayID;
+        /// `Copy` rule: the caller owns the returned mode. NULL when the display
+        /// has no current mode CG will report (no session, no display).
+        fn CGDisplayCopyDisplayMode(display: CGDirectDisplayID) -> CGDisplayModeRef;
+        fn CGDisplayModeGetWidth(mode: CGDisplayModeRef) -> usize;
+        fn CGDisplayModeGetPixelWidth(mode: CGDisplayModeRef) -> usize;
+        fn CGDisplayModeRelease(mode: CGDisplayModeRef);
+    }
+
+    /// Backing pixels per point of the main display's current mode: 2.0 on a
+    /// Retina panel at any "looks like" resolution (the panel renders at 2×
+    /// and scales), 1.0 on a 1× display. This is the ratio AppKit reports as
+    /// `backingScaleFactor` for a window on that display — what winit's
+    /// `scale_factor()`, and therefore `attach_os_window`, hands the first
+    /// window.
+    pub fn main_display_backing_scale() -> Option<f64> {
+        // SAFETY: `CGDisplayCopyDisplayMode` returns either NULL (checked) or a
+        // mode object this function owns and releases exactly once after its
+        // two width reads; nothing is dereferenced in Rust.
+        unsafe {
+            let mode = CGDisplayCopyDisplayMode(CGMainDisplayID());
+            if mode.is_null() {
+                return None;
+            }
+            let points = CGDisplayModeGetWidth(mode);
+            let pixels = CGDisplayModeGetPixelWidth(mode);
+            CGDisplayModeRelease(mode);
+            // Display widths are a few thousand at most: exact in an f64.
+            #[allow(clippy::cast_precision_loss)]
+            (points > 0 && pixels >= points).then(|| pixels as f64 / points as f64)
+        }
+    }
+}
 
 /// Minimal, hand-rolled CoreGraphics / CoreFoundation FFI for the `window`
 /// control-socket verb's full-window capture. The workspace has no `core-graphics`
@@ -22860,6 +23478,18 @@ impl ContentionBackoff {
     }
 }
 
+/// The update loop's park once the holder looks WEDGED, given the loop's interval
+/// in seconds: [`CONTENTION_WEDGE_PARK`], never longer than the interval — and
+/// `None` for a ONCE-PASS (`ATPKG_UPDATE_INTERVAL_SECS=0`), which stands down for
+/// this launch after a wedge instead of parking (the loop's exit rule; the three
+/// doc sites — `prefs.rs`, `pkg_check.rs`, the streaming design §4 — say so). The
+/// once-pass used to be given a 1 s park here, so its log line and its ⏸ row
+/// promised "trying again in 1 s" one statement before the loop broke for good
+/// (2026-09-13). Pure for the test.
+fn wedge_park(interval_secs: u64) -> Option<Duration> {
+    (interval_secs > 0).then(|| CONTENTION_WEDGE_PARK.min(Duration::from_secs(interval_secs)))
+}
+
 /// A wait or a park as a person reads it: "30 s", "2 min", "10 min", "6 h".
 fn human_park(d: Duration) -> String {
     let secs = d.as_secs();
@@ -22950,7 +23580,13 @@ fn foreign_writer_died_mid_pass(snap: &PkgProgressSnapshot, child_pid: u32) -> b
 /// holder's own tick thread keeps fresh whether or not anything is happening (a
 /// pass parked on a sudo prompt heartbeats too), and never `pid`/timestamps. This
 /// is what tells a slow install from a wedged one for the update loop's backoff
-/// ([`ContentionBackoff::park`]). Updates `last_holder`; pure for the test.
+/// ([`ContentionBackoff::park`]). `last_holder` is refreshed on the first
+/// foreign-running read and on an advance ONLY: the compared fields of an
+/// unadvanced read equal what is held, and a `ProgressFile` is twenty-odd
+/// allocations the tailer would otherwise clone ten times a second for the
+/// whole half-hour wait on top of the JSON parse (2026-09-13) — so its pid,
+/// heartbeat and timestamp fields go stale and must never be compared. Pure for
+/// the test.
 fn holder_work_advanced(
     snap: &PkgProgressSnapshot,
     child_pid: u32,
@@ -22964,7 +23600,9 @@ fn holder_work_advanced(
             || prev.programs != snap.file.programs
             || prev.queue != snap.file.queue
     });
-    *last_holder = Some(snap.file.clone());
+    if advanced || last_holder.is_none() {
+        *last_holder = Some(snap.file.clone());
+    }
     advanced
 }
 
@@ -23254,6 +23892,20 @@ mod pkg_progress_tests {
         assert_eq!(human_park(Duration::from_secs(90)), "90 s");
     }
 
+    /// The wedged park is the hour, bounded by the interval — and a ONCE-PASS has
+    /// no park at all: the loop stands down for this launch after a wedge, so
+    /// neither the log nor the ⏸ row may promise a retry it will not make.
+    #[test]
+    fn a_once_pass_has_no_wedged_park_to_promise() {
+        assert_eq!(
+            wedge_park(0),
+            None,
+            "interval 0 is one pass: no retry to name"
+        );
+        assert_eq!(wedge_park(30), Some(Duration::from_secs(30)));
+        assert_eq!(wedge_park(6 * 3600), Some(CONTENTION_WEDGE_PARK));
+    }
+
     /// A SIBLING's file whose writer died mid-pass (dead pid, no `ended_unix`) is
     /// not this window's story while our own child lives: the tailer holds it back
     /// instead of rendering the ⏸ Warn "stopped" row over a pass that is continuing
@@ -23311,15 +23963,26 @@ mod pkg_progress_tests {
             !holder_work_advanced(&running(&file), ours, &mut last),
             "the first read is the baseline, not an advance"
         );
+        let baseline_heartbeat = file.heartbeat_unix;
         file.heartbeat_unix += 5;
         assert!(
             !holder_work_advanced(&running(&file), ours, &mut last),
             "a heartbeat alone is liveness, not progress"
         );
+        assert_eq!(
+            last.as_ref().map(|f| f.heartbeat_unix),
+            Some(baseline_heartbeat),
+            "…and is not copied: the baseline is refreshed only on an advance"
+        );
         file.programs.get_mut("trust").unwrap().bytes_done = 50;
         assert!(
             holder_work_advanced(&running(&file), ours, &mut last),
             "bytes landing is progress"
+        );
+        assert_eq!(
+            last.as_ref().map(|f| f.heartbeat_unix),
+            Some(file.heartbeat_unix),
+            "an advance refreshes the whole baseline"
         );
         assert!(
             !holder_work_advanced(&running(&file), ours, &mut last),
@@ -23477,6 +24140,269 @@ mod pass_verdict_tests {
     }
 }
 
+/// What one `atpkg` launch child said and how it ended — [`run_atpkg_pass`]'s
+/// answer, which the seed lane and the update loop classify ([`Self::verdict`])
+/// and report ([`report_pass_verdict`]) the same way.
+struct PassRun {
+    /// What the child's stdout said about the marker contract: whether it
+    /// announced, whether anything answered — and whether it queued behind a
+    /// sibling at the store lock, which is neither ([`read_seed_markers`]).
+    seen: SeedMarkers,
+    /// The exit code; `None` for a child killed by a signal.
+    code: Option<i32>,
+    /// Exit 0.
+    ok: bool,
+    /// Whether the child-scoped tailer saw a sibling HOLDER's work advance while
+    /// this child was queued behind it ([`PkgProgressTailer::finish`]) — what the
+    /// loop's backoff reads to tell a slow install from a wedged one.
+    holder_advanced: bool,
+    /// The child's whole stderr. atpkg refuses some passes at its own dispatch
+    /// edge — an unwritable or symlinked prefix — BEFORE the verb runs, and those
+    /// refusals print only to stderr and emit no marker; with stderr on /dev/null
+    /// the GUI raised no event, wrote no status and logged nothing, so a launch
+    /// that silently did nothing was indistinguishable from one that had nothing
+    /// to do (2026-08-20 round-8 audit).
+    said: String,
+}
+
+impl PassRun {
+    /// HOW THE PASS ENDED, classified once and purely ([`classify_pass_exit`]).
+    /// This used to be two overlapping `if`s whose refusal branch — "a non-zero
+    /// exit that never reached the marker, which is a real failure every time" —
+    /// read a store-lock contention refusal as a terminal install failure
+    /// (2026-09-10).
+    fn verdict(&self) -> PassVerdict {
+        classify_pass_exit(self.code, self.seen.saw_start, self.seen.saw_terminal)
+    }
+
+    /// What stderr said, trimmed and bounded for a log line.
+    fn why(&self) -> String {
+        self.said.trim().chars().take(2000).collect()
+    }
+}
+
+/// Run one `atpkg <verb>` launch child and wait for it — the seed pass and every
+/// tick of the update loop are this ONE shape, spawned, tailed, drained and joined
+/// the same way. The two lanes used to carry byte-identical copies of all of it,
+/// and that is exactly how `read_seed_markers` came to exist: one copy fixed twice
+/// without the other (2026-09-13).
+///
+/// The child QUEUES BEHIND A SIBLING'S PASS instead of refusing (`--wait-lock`,
+/// 2026-09-10): the macOS Full Disk Access grant quits the app and opens it again
+/// while the first window's pass still holds the store lock (13 s apart, measured:
+/// pids 15359 and 15441), and so does a self-update re-exec or a window opened by
+/// hand. The first window's child is NOT detached on purpose — it dies at its next
+/// line of output once its window is gone (its stdout is a pipe nobody reads; the
+/// store is crash-consistent under that, see `atpkg::lock`) — and this child's
+/// wait is what picks the work up: atpkg polls the lock for up to
+/// [`ATPKG_WAIT_LOCK_SECS`], announces the wait once on stdout (`lock-waiting:`),
+/// and exits 75 if the bound runs out. WHO spawned it is said outright
+/// ([`atpkg::cli::SPAWNER_PID_ENV`]): a waiter whose window quits stands down
+/// when its parent is no longer this pid (the edge's own `getppid` capture races
+/// a parent that dies inside the child's startup; the pid from the spawner does
+/// not). `child_path` is the login shell's PATH, resolved once per thread (R1).
+///
+/// Stdout is STREAMED, not collected with `.output()`: laying down the toolset is
+/// minutes of work and gigabytes of disk, and `.output()` blocks until the child
+/// exits — so every notice arrived only after the thing it described had already
+/// finished. Reading line by line is what lets the `seed-starting:` marker put a
+/// notice on screen WHILE the extraction runs; a user watching gigabytes appear in
+/// Activity Monitor with a silent app is the complaint this avoids. Stderr is
+/// CAPTURED ([`PassRun::said`]) and DRAINED CONCURRENTLY, not after stdout: both
+/// pipes are ours, and reading stdout to EOF before touching stderr meant a child
+/// that wrote more than the pipe holds (64 KiB) blocked in write(2) while this
+/// thread blocked on stdout — a wedge that held the store lock, kept the heartbeat
+/// alive, and refused every `aterm pkg` verb until the app quit (2026-08-26 audit;
+/// latent — atpkg's stderr is per-program refusals — but the shape is the classic
+/// two-pipe deadlock). With a store `layout`, machine progress rides the FILE
+/// (`--progress-file`, the R5 opt-in — the marker lines stay byte-stable, and
+/// terminal lanes, which never pass the flag, are byte-unchanged), read by a
+/// CHILD-SCOPED tailer (§3): this thread blocks on the child's stdout for the
+/// marker contract, so the tail lives in its own small thread, spawned with the
+/// child and joined right after `wait()` — one final read (classified
+/// not-running) and a join; no child, no tailer, no wakes (FL-1 by construction).
+/// THE ADMIN STEP follows every pass (§17.8): the rows it wrote are read back
+/// here, on the worker thread, and a `needs admin` set that "Not now" has not
+/// dismissed raises its one card — on the lean install the update lane is where
+/// those rows first appear; a set already declined raises nothing, and the
+/// six-hourly tick stays silent.
+///
+/// `Err` is a failed SPAWN — a bundle whose co-located atpkg cannot exec — which
+/// each lane gives a voice of its own.
+fn run_atpkg_pass(
+    verb: &str,
+    atpkg: &std::path::Path,
+    child_path: &str,
+    layout: Option<&atpkg::store::Layout>,
+    proxy: &EventLoopProxy<Wake>,
+) -> std::io::Result<PassRun> {
+    let mut cmd = std::process::Command::new(atpkg);
+    cmd.arg(verb)
+        .arg("--wait-lock")
+        .arg(ATPKG_WAIT_LOCK_SECS.to_string())
+        .env(atpkg::cli::SPAWNER_PID_ENV, std::process::id().to_string())
+        .env("PATH", child_path)
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped());
+    if let Some(l) = layout {
+        cmd.arg("--progress-file").arg(l.progress_file());
+    }
+    let mut child = cmd.spawn()?;
+    let tailer = layout.cloned().and_then(|l| {
+        let proxy = proxy.clone();
+        PkgProgressTailer::spawn(l, child.id(), move |snapshot| {
+            let _ = proxy.send_event(Wake::PkgProgress { snapshot });
+        })
+    });
+    let mut refusal = child.stderr.take();
+    let mut seen = SeedMarkers::default();
+    let said = std::thread::scope(|scope| {
+        let drain = refusal.as_mut().map(|pipe| {
+            scope.spawn(move || {
+                use std::io::Read as _;
+                let mut text = String::new();
+                let _ = pipe.read_to_string(&mut text);
+                text
+            })
+        });
+        if let Some(out) = child.stdout.take() {
+            // ONLY A TERMINAL MARKER COUNTS as an answer (2026-08-20 round-9
+            // audit), and the rule lives in ONE place: `read_seed_markers`. The
+            // start opens the held card, and a store-lock wait (`lock-waiting:`,
+            // 2026-09-10) opens only the lane's waiting row — it is neither a
+            // start nor an answer.
+            seen = read_seed_markers(std::io::BufReader::new(out), |event| {
+                let _ = proxy.send_event(event);
+            });
+        }
+        drain.and_then(|h| h.join().ok()).unwrap_or_default()
+    });
+    let status = child.wait().ok();
+    let holder_advanced = tailer.is_some_and(PkgProgressTailer::finish);
+    post_admin_step(layout, proxy);
+    Ok(PassRun {
+        seen,
+        code: status.and_then(|s| s.code()),
+        ok: status.is_some_and(|s| s.success()),
+        holder_advanced,
+        said,
+    })
+}
+
+/// The lane's WAITING ROW across a child's exit. A `lock-waiting:` line opened it,
+/// and the row belongs to the LANE, not to the child that opened it — it is
+/// carried across the seed child and every update child. A waited pass that then
+/// RAN (or died) retires its own row: `toolchain_snapshot(None)` clears only a
+/// non-terminal bar, so a terminal outcome — this child's marker, the sibling's
+/// tailed pass — is left standing. A `Busy` exit leaves the row for the child
+/// that queues next behind the same holder; the lane's own `Busy` arm decides
+/// its fate. Returns whether the row is (still) open.
+fn carry_wait_row(
+    open: bool,
+    run: &PassRun,
+    verdict: PassVerdict,
+    proxy: &EventLoopProxy<Wake>,
+) -> bool {
+    let open = open || run.seen.saw_lock_wait;
+    if open && verdict != PassVerdict::Busy {
+        let _ = proxy.send_event(Wake::PkgProgress { snapshot: None });
+        return false;
+    }
+    open
+}
+
+/// The three verdict arms the seed lane and the update loop SHARE, logged and
+/// answered one way — they were two copies, and the copies had already drifted:
+/// the loop's refusal card carried the log-truncated `why` while the seed's
+/// carried the whole `said` (2026-09-13). `Busy` is each lane's own: the seed
+/// lane's answer is `seed_pending`, the loop's its backoff — a caller passes it
+/// here only by mistake, and it does nothing.
+///
+/// * `AnnouncedThenDied` — the announcement is held for 20 minutes and nothing
+///   else would take it down, so answer it — WITH THE CHILD'S OWN VERDICT, not
+///   with the fact that we failed to read one. This arm used to send
+///   `PkgSeedFailed` however the child ended while its comment said "however the
+///   child ended", and since the contract's markers were ALL failure markers, a
+///   pass that announced itself, did the work, succeeded and exited 0 was reported
+///   as "⚠ ALab toolchain install failed" (owner report, 2026-09-11; the update
+///   lane had the same defect verbatim, and is the more exposed of the two — it
+///   runs every six hours for the life of the process). [`seed_retire`] reads the
+///   exit and the store — the one POSITIVE authority in reach; the marker
+///   stream's silence is not. Both earlier audits are guards inside it.
+/// * `Answered | Quiet` — the markers spoke, or the child ran QUIETLY: `atpkg
+///   seed` exits quietly, markerlessly and ZERO on every ordinary launch of a
+///   provisioned Mac (the seal is reclaimed after the first success), on a
+///   declined toolset, a disabled manager, and `seed_install = false`, and raising
+///   the failure event there put "⚠ ALab toolchain install failed" on screen at
+///   every launch of a healthy machine (2026-08-20 round-10 audit). NOTHING is
+///   raised — the rule is the first line of `seed_retire`, pinned by
+///   `the_quiet_steady_state_raises_nothing`. The log is a different question
+///   from the pill: stderr reaches it whatever the exit, whether or not a marker
+///   was printed — a pass that exits non-zero AFTER a marker, or exits 0 with
+///   per-program failure lines, used to drop its stderr entirely (2026-09-10).
+/// * `Refused` — a markerless non-zero exit that is NOT contention: the CLI-edge
+///   `Io` refusal (an unwritable prefix), a spawn that died, a signal. Always a
+///   WARN line; with `refusal_card`, also said ON SCREEN (`PkgSeedFailed`). That
+///   is the seed's rule, first or retried: its refusal was the ONE failing path
+///   with no card, because the announcement is gated on `saw_start` and a refusal
+///   never gets that far — a machine sat with no toolchain for three weeks in
+///   exactly this state, two WARN lines in a file nobody opens and a normal prompt
+///   on screen (docs/AUDIT-nux-first-open-toolchain-2026-08-31.md). This does NOT
+///   reintroduce the round-10 false positive: a healthy machine exits ZERO, which
+///   is `Quiet`. The six-hourly update's refusal stays a log line.
+fn report_pass_verdict(
+    verb: &str,
+    verdict: PassVerdict,
+    run: &PassRun,
+    why: &str,
+    layout: Option<&atpkg::store::Layout>,
+    proxy: &EventLoopProxy<Wake>,
+    refusal_card: bool,
+) {
+    let unanswered: &str = if why.is_empty() {
+        "atpkg exited without saying why"
+    } else {
+        why
+    };
+    match verdict {
+        PassVerdict::AnnouncedThenDied => {
+            if run.ok {
+                aterm_log::info!(
+                    "atpkg {verb} announced an install and ended without answering it \
+                     (exit 0): {unanswered}"
+                );
+            } else {
+                aterm_log::warn!(
+                    "atpkg {verb} announced an install and ended without answering it: \
+                     {unanswered}"
+                );
+            }
+            let retire = seed_retire(run.seen, run.ok, pkg_store_holds_programs(layout));
+            if let Some(event) = seed_retire_event(retire, &run.said) {
+                let _ = proxy.send_event(event);
+            }
+        }
+        PassVerdict::Answered | PassVerdict::Quiet => {
+            if !why.is_empty() {
+                if run.ok {
+                    aterm_log::info!("atpkg {verb} said: {why}");
+                } else {
+                    aterm_log::warn!("atpkg {verb} said: {why}");
+                }
+            }
+        }
+        PassVerdict::Refused => {
+            aterm_log::warn!("the ALab toolchain {verb} pass did not run: {unanswered}");
+            if refusal_card {
+                let _ = proxy.send_event(Wake::PkgSeedFailed {
+                    detail: pass_said_detail(&run.said),
+                });
+            }
+        }
+        PassVerdict::Busy => {}
+    }
+}
+
 /// Spawn the silent toolchain-update loop: a detached thread that periodically runs the
 /// co-located `atpkg update` so installed managed programs (`trust`/`clean`/…) keep current
 /// (and, with `[packages].auto_install = true`, bootstrap-installs missing default-set
@@ -23554,18 +24480,9 @@ fn spawn_pkg_update_check(config: &Config, proxy: EventLoopProxy<Wake>) -> bool 
             // from its seal through the same verify chain. On an already-provisioned
             // install it prints and does nothing.
             // Store mutation is serialized by atpkg's own store-wide lock. Runs once
-            // BEFORE the loop, off the event loop. Stdout is captured for the stable
-            // seed markers (stderr stays discarded — atpkg records its own
-            // status.toml); a marker match posts the one-shot `Wake::PkgSeed`, a
-            // quiet seed posts nothing.
-            // Stdout is STREAMED, not collected with `.output()`. Laying down the
-            // toolset is minutes of work and gigabytes of disk, and `.output()`
-            // blocks until the child exits — so every notice arrived only after
-            // the thing it described had already finished. Reading line by line
-            // is what lets the `seed-starting:` marker put a notice on screen
-            // WHILE the extraction runs; a user watching gigabytes appear in
-            // Activity Monitor with a silent app is the complaint this avoids.
-            // (stderr stays discarded — atpkg records its own status.toml.)
+            // BEFORE the loop, off the event loop, as one `run_atpkg_pass` — the
+            // child's stdout is scanned for the stable seed markers and a marker
+            // match posts the one-shot `Wake::PkgSeed`; a quiet seed posts nothing.
             //
             // (There was a `seed_installed_something` flag here that suppressed the
             // first update tick. It is gone: the update pass moves bytes only for
@@ -23580,14 +24497,10 @@ fn spawn_pkg_update_check(config: &Config, proxy: EventLoopProxy<Wake>) -> bool 
             // (`aterm_update_core::seal_guard`) — which guards a user-run
             // `atpkg seed` exactly like this spawn, and deleted the five
             // rounds of begin/note/end patches this block used to carry.
-            // What the child's stdout said about the marker contract: whether it
-            // announced, whether anything answered — and whether it queued behind a
-            // sibling at the store lock, which is neither (`read_seed_markers`).
-            let mut seen = SeedMarkers::default();
             // Whether a `lock-waiting:` line has opened the waiting row on the
             // toolchain lane and nothing has retired it yet — carried across the
             // seed child and every update child, since the row belongs to the
-            // LANE, not to the child that opened it.
+            // LANE, not to the child that opened it (`carry_wait_row`).
             let mut wait_row_open = false;
             // Whether the seed pass is still OWED for this launch: it timed out queued
             // behind a sibling (`Busy`), so the update loop runs `seed` again ahead
@@ -23598,255 +24511,70 @@ fn spawn_pkg_update_check(config: &Config, proxy: EventLoopProxy<Wake>) -> bool 
             // next launch (2026-09-10; reachable only behind a holder that outlasts
             // the seed's whole half-hour wait at first open).
             let mut seed_pending = false;
-            // STDERR IS CAPTURED, NOT DISCARDED. atpkg refuses some seeds at its own
-            // dispatch edge — an unwritable or symlinked prefix — BEFORE `cmd_seed`
-            // runs, so those refusals print only to stderr and emit no marker. With
-            // stderr going to /dev/null the GUI raised no event, wrote no status and
-            // logged nothing, so a launch that silently did nothing was
-            // indistinguishable from one that had nothing to do (2026-08-20 round-8
-            // audit). Store-lock CONTENTION is not one of those refusals any more:
-            // the child WAITS on it (`--wait-lock`, below) and a wait that runs out
-            // is a `Busy` verdict, never a failure.
-            let mut seed_cmd = std::process::Command::new(&atpkg);
-            seed_cmd
-                .arg("seed")
-                // QUEUE BEHIND A SIBLING'S PASS instead of refusing (2026-09-10):
-                // the macOS Full Disk Access grant quits the app and opens it
-                // again while the first window's pass still holds the store lock
-                // (13 s apart, measured: pids 15359 and 15441), and so does a
-                // self-update re-exec or a window opened by hand. The first
-                // window's child is NOT detached on purpose — it dies at its next
-                // line of output once its window is gone (its stdout is a pipe
-                // nobody reads; the store is crash-consistent under that, see
-                // `atpkg::lock`) — and this child's wait is what picks the work
-                // up: atpkg polls the lock for up to `ATPKG_WAIT_LOCK_SECS`,
-                // announces the wait once on stdout (`lock-waiting:`), and exits
-                // 75 if the bound runs out.
-                .arg("--wait-lock")
-                .arg(ATPKG_WAIT_LOCK_SECS.to_string())
-                // WHO spawned it, said outright: a waiter whose window quits
-                // stands down when its parent is no longer this pid (the edge's
-                // own `getppid` capture races a parent that dies inside the
-                // child's startup; the pid from the spawner does not).
-                .env(atpkg::cli::SPAWNER_PID_ENV, std::process::id().to_string())
-                .env("PATH", &child_path)
-                .stdout(std::process::Stdio::piped())
-                .stderr(std::process::Stdio::piped());
-            if let Some(l) = &layout {
-                // R5 opt-in: machine progress rides the FILE, not stdout — the
-                // marker lines above stay byte-stable, and terminal lanes (which
-                // never pass this flag) are byte-unchanged.
-                seed_cmd.arg("--progress-file").arg(l.progress_file());
-            }
-            // A failed SPAWN gets a voice too: `if let Ok` alone meant a bundle
-            // whose co-located atpkg cannot exec produced literally nothing —
-            // no log line, no pill, no status — on the one launch whose whole
-            // job was laying the toolchain down.
-            let seed_spawn = seed_cmd.spawn();
-            if let Err(error) = &seed_spawn {
-                aterm_log::warn!("could not launch atpkg seed: {error}");
-            }
-            if let Ok(mut child) = seed_spawn {
-                // CHILD-SCOPED sibling tailer (§3): this thread is about to BLOCK
-                // on the child's stdout for the marker contract, so the file tail
-                // lives in its own small thread, joined right after `wait()`.
-                let tailer = layout.clone().and_then(|l| {
-                    let proxy = proxy.clone();
-                    PkgProgressTailer::spawn(l, child.id(), move |snapshot| {
-                        let _ = proxy.send_event(Wake::PkgProgress { snapshot });
-                    })
-                });
-                let mut refusal = child.stderr.take();
-                // STDERR IS DRAINED CONCURRENTLY, not after stdout. Both pipes are
-                // ours, and reading stdout to EOF before touching stderr meant a
-                // child that wrote more than the pipe holds (64 KiB) blocked in
-                // write(2) while this thread blocked on stdout — a wedge that
-                // held the store lock, kept the heartbeat alive, and refused every
-                // `aterm pkg` verb until the app quit (2026-08-26 audit; latent —
-                // atpkg's stderr is per-program refusals — but the shape is the
-                // classic two-pipe deadlock). A scoped helper reads stderr while
-                // the marker loop reads stdout; both are joined before `wait()`.
-                let said = std::thread::scope(|scope| {
-                    let drain = refusal.as_mut().map(|pipe| {
-                        scope.spawn(move || {
-                            use std::io::Read as _;
-                            let mut text = String::new();
-                            let _ = pipe.read_to_string(&mut text);
-                            text
-                        })
-                    });
-                    if let Some(out) = child.stdout.take() {
-                        // ONLY A TERMINAL MARKER COUNTS as an answer (2026-08-20 round-9
-                        // audit), and the rule lives in ONE place both passes read:
-                        // `read_seed_markers`. The seed and update lanes carried two
-                        // byte-identical copies of this loop and one of them was fixed
-                        // twice without the other. The start opens the held card, and
-                        // a store-lock wait (`lock-waiting:`, 2026-09-10) opens only the
-                        // lane's waiting row — it is neither a start nor an answer.
-                        seen = read_seed_markers(std::io::BufReader::new(out), |event| {
-                            let _ = proxy.send_event(event);
-                        });
-                    }
-                    drain.and_then(|h| h.join().ok()).unwrap_or_default()
-                });
-                let status = child.wait().ok();
-                let code = status.and_then(|s| s.code());
-                let ok = status.is_some_and(|s| s.success());
-                // Child exited: the tailer's lifetime ends here — one final read
-                // (classified not-running) and a join. No child, no tailer, no wakes.
-                if let Some(t) = tailer {
-                    t.finish();
-                }
-                // THE ADMIN STEP, after the seed pass: the rows it wrote are read back
-                // here (worker thread) and a `needs admin` set that "Not now" has not
-                // dismissed raises its one card.
-                post_admin_step(layout.as_ref(), &proxy);
-                // RETIRE ONLY A CARD THAT WAS ACTUALLY RAISED. `atpkg seed` exits
-                // quietly and MARKERLESSLY on every ordinary launch of a provisioned
-                // Mac — the seal is reclaimed after the first success, so the steady
-                // state prints a plain sentence and exits 0 — and firing the failure
-                // event there put "⚠ ALab toolchain install failed" on screen at every
-                // single launch of a perfectly healthy machine. Same for a declined
-                // toolset, a disabled manager, and `seed_install = false`
-                // (2026-08-20 round-10 audit). That rule is now the FIRST line of
-                // `seed_retire`, where the update pass reads it too, and it is pinned
-                // by `the_quiet_steady_state_raises_nothing`.
-                let detail_of = |said: &str| {
-                    if said.trim().is_empty() {
-                        "atpkg ended without saying what happened".to_string()
-                    } else {
-                        said.trim().to_string()
-                    }
-                };
-                if seen.saw_lock_wait {
-                    // The wait line opened the lane's waiting row; the row belongs to
-                    // the LANE (see `wait_row_open`), so it is carried past this child.
-                    wait_row_open = true;
-                }
-                let why: String = said.trim().chars().take(2000).collect();
-                // HOW THE PASS ENDED, classified once and purely
-                // ([`classify_pass_exit`]). This used to be two overlapping `if`s
-                // whose refusal branch — "a non-zero exit that never reached the
-                // marker, which is a real failure every time" — read a store-lock
-                // contention refusal as a terminal install failure (2026-09-10).
-                let verdict = classify_pass_exit(code, seen.saw_start, seen.saw_terminal);
-                // A WAITED PASS THAT THEN RAN (or died) RETIRES ITS OWN WAITING ROW.
-                // `toolchain_snapshot(None)` clears only a non-terminal bar, so a
-                // terminal outcome — this child's marker, the sibling's tailed pass
-                // — is left standing. A `Busy` exit leaves the row for the update
-                // child that queues next behind the same holder (see below).
-                if wait_row_open && verdict != PassVerdict::Busy {
-                    let _ = proxy.send_event(Wake::PkgProgress { snapshot: None });
-                    wait_row_open = false;
-                }
-                match verdict {
-                    // The announcement is held for 20 minutes and nothing else would
-                    // take it down, so answer it — WITH THE CHILD'S OWN VERDICT, not
-                    // with the fact that we failed to read one. This arm used to send
-                    // `PkgSeedFailed` however the child ended while its comment said
-                    // "however the child ended", and since the contract's markers were
-                    // ALL failure markers, a pass that announced itself, did the work,
-                    // succeeded and exited 0 was reported as "⚠ ALab toolchain install
-                    // failed" (owner report, 2026-09-11). `seed_retire` reads the exit
-                    // and the store — the one POSITIVE authority in reach; the marker
-                    // stream's silence is not. Both earlier audits are guards inside it.
-                    PassVerdict::AnnouncedThenDied => {
-                        let unanswered: &str = if why.is_empty() {
-                            "atpkg exited without saying why"
-                        } else {
-                            why.as_str()
-                        };
-                        if ok {
-                            aterm_log::info!(
-                                "atpkg seed announced an install and ended without \
-                                 answering it (exit 0): {unanswered}"
-                            );
-                        } else {
+            // Store-lock CONTENTION is not an edge refusal any more: the child
+            // WAITS on it (`--wait-lock`) and a wait that runs out is a `Busy`
+            // verdict, never a failure.
+            match run_atpkg_pass("seed", &atpkg, &child_path, layout.as_ref(), &proxy) {
+                // A failed SPAWN gets a voice too: `if let Ok` alone meant a bundle
+                // whose co-located atpkg cannot exec produced literally nothing —
+                // no log line, no pill, no status — on the one launch whose whole
+                // job was laying the toolchain down.
+                Err(error) => aterm_log::warn!("could not launch atpkg seed: {error}"),
+                Ok(run) => {
+                    let why = run.why();
+                    let verdict = run.verdict();
+                    wait_row_open = carry_wait_row(wait_row_open, &run, verdict, &proxy);
+                    match verdict {
+                        // QUEUED BEHIND A SIBLING AND THE BOUND RAN OUT (atpkg exit 75).
+                        // Not a failure and no failure bar: with the update loop armed
+                        // the loop runs the SEED again behind the same holder, on its
+                        // own backoff, and the update follows once it has run; without
+                        // the loop, say honestly that nothing in this window will. A
+                        // half-hour wait IS an anomaly, so the log line is a WARN (the
+                        // round-8 rule: a pass that did not run leaves one), but a Warn
+                        // ROW would be the incident's mistake.
+                        PassVerdict::Busy => {
+                            seed_pending = true;
+                            let bound = human_park(Duration::from_secs(ATPKG_WAIT_LOCK_SECS));
                             aterm_log::warn!(
-                                "atpkg seed announced an install and ended without \
-                                 answering it: {unanswered}"
+                                "the ALab toolchain seed pass waited {bound} for another atpkg \
+                                 pass to release the store lock and stood aside{}{}",
+                                stood_aside_said(run.seen),
+                                if run_update_loop {
+                                    " — the update loop tries the seed again behind it"
+                                } else {
+                                    " — automatic updates are off, so this window will not retry"
+                                }
                             );
-                        }
-                        let retire =
-                            seed_retire(seen, ok, pkg_store_holds_programs(layout.as_ref()));
-                        if let Some(event) = seed_retire_event(retire, &said) {
-                            let _ = proxy.send_event(event);
-                        }
-                    }
-                    // The markers spoke, or the child ran QUIETLY — `atpkg seed`
-                    // exits quietly, markerlessly and ZERO on every ordinary launch
-                    // of a provisioned Mac (the seal is reclaimed after the first
-                    // success), on a declined toolset, a disabled manager, and
-                    // `seed_install = false`, and raising the failure event there put
-                    // "⚠ ALab toolchain install failed" on screen at every launch of a
-                    // healthy machine (2026-08-20 round-10 audit). NOTHING is raised.
-                    // The log is a different question from the pill: the pass's
-                    // stderr reaches it whatever the exit (2026-09-10).
-                    PassVerdict::Answered | PassVerdict::Quiet => {
-                        if !why.is_empty() {
-                            if ok {
+                            if !why.is_empty() {
                                 aterm_log::info!("atpkg seed said: {why}");
-                            } else {
-                                aterm_log::warn!("atpkg seed said: {why}");
+                            }
+                            if !run_update_loop {
+                                // THE REMEDY IS THE SEED, not an update: the seed did not
+                                // run, so nothing recorded adoption, and `atpkg update` on
+                                // a store the seed has not adopted is `cmd_update_all`'s
+                                // empty no-op (the very reason the loop path retries
+                                // `seed` — `seed_pending`, above). The row used to name
+                                // `aterm pkg update`, which did nothing (2026-09-13).
+                                let _ = proxy.send_event(Wake::PkgLockTimedOut {
+                                    detail: format!(
+                                        "another install held the store lock for {bound} \
+                                         \u{2014} automatic updates are off; run: aterm pkg seed"
+                                    ),
+                                });
+                                wait_row_open = false;
                             }
                         }
-                    }
-                    // QUEUED BEHIND A SIBLING AND THE BOUND RAN OUT (atpkg exit 75).
-                    // Not a failure and no failure bar: with the update loop armed
-                    // the loop runs the SEED again behind the same holder, on its
-                    // own backoff, and the update follows once it has run; without
-                    // the loop, say honestly that nothing in this window will. A
-                    // half-hour wait IS an anomaly, so the log line is a WARN (the
-                    // round-8 rule: a pass that did not run leaves one), but a Warn
-                    // ROW would be the incident's mistake.
-                    PassVerdict::Busy => {
-                        seed_pending = true;
-                        let bound = human_park(Duration::from_secs(ATPKG_WAIT_LOCK_SECS));
-                        aterm_log::warn!(
-                            "the ALab toolchain seed pass waited {bound} for another atpkg pass \
-                             to release the store lock and stood aside{}{}",
-                            stood_aside_said(seen),
-                            if run_update_loop {
-                                " — the update loop tries the seed again behind it"
-                            } else {
-                                " — automatic updates are off, so this window will not retry"
-                            }
-                        );
-                        if !why.is_empty() {
-                            aterm_log::info!("atpkg seed said: {why}");
-                        }
-                        if !run_update_loop {
-                            let _ = proxy.send_event(Wake::PkgLockTimedOut {
-                                detail: format!(
-                                    "another install held the store lock for {bound} \u{2014} \
-                                     automatic updates are off; run: aterm pkg update"
-                                ),
-                            });
-                            wait_row_open = false;
-                        }
-                    }
-                    // A markerless non-zero exit that is NOT contention: the CLI-edge
-                    // `Io` refusal (an unwritable prefix), a spawn that died, a signal.
-                    // Say it on screen, not only in the log: this was the ONE failing
-                    // path with no card, because the announcement is gated on
-                    // `saw_start` and a refusal never gets that far. A machine sat
-                    // with no toolchain for three weeks in exactly this state: two
-                    // WARN lines in a file nobody opens, and a normal prompt on
-                    // screen (docs/AUDIT-nux-first-open-toolchain-2026-08-31.md).
-                    // This does NOT reintroduce the round-10 false positive: a
-                    // healthy machine exits ZERO, which is `Quiet` above.
-                    PassVerdict::Refused => {
-                        aterm_log::warn!(
-                            "the ALab toolchain install did not run: {}",
-                            if why.is_empty() {
-                                "atpkg exited without saying why"
-                            } else {
-                                &why
-                            }
-                        );
-                        let _ = proxy.send_event(Wake::PkgSeedFailed {
-                            detail: detail_of(&said),
-                        });
+                        // The shared arms; a seed's refusal is said on screen.
+                        other => report_pass_verdict(
+                            "seed",
+                            other,
+                            &run,
+                            &why,
+                            layout.as_ref(),
+                            &proxy,
+                            true,
+                        ),
                     }
                 }
             }
@@ -23883,9 +24611,8 @@ fn spawn_pkg_update_check(config: &Config, proxy: EventLoopProxy<Wake>) -> bool 
             // short backoff, never the interval — see `ContentionBackoff`.
             let mut backoff = ContentionBackoff::default();
             loop {
-                // Whether THIS pass timed out queued behind a sibling (atpkg exit
-                // 75), and the short park that follows when it did.
-                let mut busy = false;
+                // The short park that follows THIS pass timing out queued behind a
+                // sibling (atpkg exit 75) — `Some` is also what says it did.
                 let mut busy_park: Option<Duration> = None;
                 // THE VERB THIS TICK RUNS: `update`, or `seed` again while the seed
                 // is still owed (`seed_pending`, above) — the retried seed rides
@@ -23893,174 +24620,29 @@ fn spawn_pkg_update_check(config: &Config, proxy: EventLoopProxy<Wake>) -> bool 
                 // RUN (any verdict but `Busy`) the update follows at once, as it
                 // does after a first seed that ran.
                 let verb = if seed_pending { "seed" } else { "update" };
-                // STREAM this child too. It was spawned with stdout discarded, which
-                // meant the NETWORK provisioning lane reached the user through no
-                // channel whatsoever: a multi-GB install could run with nothing on
-                // screen, and a failure was equally invisible. That lane is not
-                // exotic — it is the whole delivery path for an Intel Mac the day
-                // x86_64 publishes, for a seedless cut, for a seal past its horizon,
-                // and for any machine that updated the app before provisioning. The
-                // markers atpkg already prints (`net-installed:`, and the
-                // seed-unusable class) were being written to /dev/null.
-                let mut update_cmd = std::process::Command::new(&atpkg);
-                // STDERR IS CAPTURED HERE TOO — the seed pass learned this in
-                // round 8 and this lane never did: atpkg's CLI-edge refusals
-                // (an unwritable prefix) print only to stderr and emit no marker,
-                // so with stderr on /dev/null and the exit status discarded,
-                // six-hourly provisioning could fail forever with zero evidence
-                // anywhere. On the lean install this lane IS how the toolchain
-                // arrives — and on a lean install it is THIS pass that installs
-                // the default set, which is why a contention refusal here (the
-                // incident of 2026-09-10) left an adopted, empty store for six
-                // hours: the child now WAITS on the lock instead (same bound and
-                // reasoning as the seed child above).
-                update_cmd
-                    .arg(verb)
-                    .arg("--wait-lock")
-                    .arg(ATPKG_WAIT_LOCK_SECS.to_string())
-                    .env(atpkg::cli::SPAWNER_PID_ENV, std::process::id().to_string())
-                    .env("PATH", &child_path)
-                    .stdout(std::process::Stdio::piped())
-                    .stderr(std::process::Stdio::piped());
-                if let Some(l) = &layout {
-                    // Same R5 opt-in as the seed child: rich progress rides the
-                    // file + `Wake::PkgProgress`; stdout keeps only the markers.
-                    update_cmd.arg("--progress-file").arg(l.progress_file());
-                }
-                match update_cmd.spawn() {
-                    Ok(mut child) => {
-                        // Child-scoped tailer, exactly as on the seed pass: spawned
-                        // with the child, joined at its exit (FL-1 by construction).
-                        let tailer = layout.clone().and_then(|l| {
-                            let proxy = proxy.clone();
-                            PkgProgressTailer::spawn(l, child.id(), move |snapshot| {
-                                let _ = proxy.send_event(Wake::PkgProgress { snapshot });
-                            })
-                        });
-                        let mut refusal = child.stderr.take();
-                        // The same announcement bookkeeping as the seed pass:
-                        // `net-starting:` OPENS the bar (it rides the
-                        // PkgSeedStarted arm), and a child that dies after
-                        // opening it must still answer it — or the bar sits
-                        // for its full hold with the failure recorded nowhere.
-                        let mut seen = SeedMarkers::default();
-                        // Concurrent stderr drain — the seed lane's rule, for
-                        // the seed lane's reason (the two-pipe wedge).
-                        let said = std::thread::scope(|scope| {
-                            let drain = refusal.as_mut().map(|pipe| {
-                                scope.spawn(move || {
-                                    use std::io::Read as _;
-                                    let mut text = String::new();
-                                    let _ = pipe.read_to_string(&mut text);
-                                    text
-                                })
-                            });
-                            if let Some(out) = child.stdout.take() {
-                                // The one marker loop both lanes read
-                                // (`read_seed_markers`): a start opens the card, a
-                                // store-lock wait opens the lane's row, and only a
-                                // terminal answers.
-                                seen = read_seed_markers(std::io::BufReader::new(out), |event| {
-                                    let _ = proxy.send_event(event);
-                                });
-                            }
-                            drain.and_then(|h| h.join().ok()).unwrap_or_default()
-                        });
-                        let status = child.wait().ok();
-                        let code = status.and_then(|s| s.code());
-                        let ok = status.is_some_and(|s| s.success());
-                        // Joined at the child's exit, as on the seed pass — and it
-                        // says whether the HOLDER our child was queued behind moved
-                        // its work on meanwhile, which the backoff below reads.
-                        let holder_advanced = tailer.is_some_and(PkgProgressTailer::finish);
-                        // The same admin step after a NETWORK pass — on the lean
-                        // install this lane is where the `needs admin` rows first
-                        // appear. Same rule, same marker: a set already declined
-                        // raises nothing, and the six-hourly tick stays silent.
-                        post_admin_step(layout.as_ref(), &proxy);
-                        if seen.saw_lock_wait {
-                            // The wait line opened the lane's waiting row (see
-                            // `wait_row_open`): carried past this child, like the seed's.
-                            wait_row_open = true;
-                        }
-                        let why: String = said.trim().chars().take(2000).collect();
-                        // The seed lane's classifier, for the seed lane's reason.
-                        let verdict = classify_pass_exit(code, seen.saw_start, seen.saw_terminal);
-                        if wait_row_open && verdict != PassVerdict::Busy {
-                            let _ = proxy.send_event(Wake::PkgProgress { snapshot: None });
-                            wait_row_open = false;
-                        }
+                // This child is STREAMED and its stderr CAPTURED exactly as the
+                // seed's is — the one `run_atpkg_pass`. It was spawned with stdout
+                // discarded, which meant the NETWORK provisioning lane reached the
+                // user through no channel whatsoever: a multi-GB install could run
+                // with nothing on screen, and a failure was equally invisible. That
+                // lane is not exotic — it is the whole delivery path for an Intel
+                // Mac the day x86_64 publishes, for a seedless cut, for a seal past
+                // its horizon, and for any machine that updated the app before
+                // provisioning. The markers atpkg already prints (`net-installed:`,
+                // and the seed-unusable class) were being written to /dev/null; and
+                // with stderr on /dev/null and the exit status discarded, its
+                // CLI-edge refusals (an unwritable prefix) could fail six-hourly
+                // provisioning forever with zero evidence anywhere. On the lean
+                // install this lane IS how the toolchain arrives — it is THIS pass
+                // that installs the default set, which is why a contention refusal
+                // here (the incident of 2026-09-10) left an adopted, empty store for
+                // six hours: the child now WAITS on the lock instead.
+                match run_atpkg_pass(verb, &atpkg, &child_path, layout.as_ref(), &proxy) {
+                    Ok(run) => {
+                        let why = run.why();
+                        let verdict = run.verdict();
+                        wait_row_open = carry_wait_row(wait_row_open, &run, verdict, &proxy);
                         match verdict {
-                            // `net-starting:` OPENS the bar (it rides the PkgSeedStarted
-                            // arm), and a child that dies after opening it must still
-                            // answer it — or the bar sits for its full hold with the
-                            // failure recorded nowhere.
-                            PassVerdict::AnnouncedThenDied => {
-                                // A pass that announced RAN (it held the lock): the
-                                // contention tally starts over like any pass that ran.
-                                backoff.reset();
-                                // THE SAME DEFECT LIVED HERE TOO, verbatim: `atpkg update`'s
-                                // network set-completion announces `net-starting:` before
-                                // it moves gigabytes on an adopted machine, and `ok` was
-                                // computed two lines above and never consulted — an
-                                // announced network install that succeeded and exited 0
-                                // reported itself as a failed install. This lane is the
-                                // more exposed of the two: `atpkg seed` runs once at
-                                // launch, while this one runs every six hours for the
-                                // life of the process. Same seam, same guards (2026-09-11).
-                                let unanswered: &str = if why.is_empty() {
-                                    "atpkg exited without saying why"
-                                } else {
-                                    why.as_str()
-                                };
-                                if ok {
-                                    aterm_log::info!(
-                                        "atpkg {verb} announced an install and ended without \
-                                         answering it (exit 0): {unanswered}"
-                                    );
-                                } else {
-                                    aterm_log::warn!(
-                                        "atpkg {verb} announced an install and ended without \
-                                         answering it: {unanswered}"
-                                    );
-                                }
-                                let retire = seed_retire(
-                                    seen,
-                                    ok,
-                                    pkg_store_holds_programs(layout.as_ref()),
-                                );
-                                if let Some(event) = seed_retire_event(retire, &said) {
-                                    let _ = proxy.send_event(event);
-                                }
-                            }
-                            // A markerless non-zero exit that is NOT contention is the
-                            // CLI-edge `Io` refusal (or a signal): the quiet steady
-                            // state ("everything up to date", exit 0, no marker) stays
-                            // quiet ON SCREEN, but in the LOG every pass leaves a trace.
-                            PassVerdict::Refused => {
-                                backoff.reset();
-                                aterm_log::warn!(
-                                    "the ALab toolchain {verb} pass did not run: {}",
-                                    if why.is_empty() {
-                                        "atpkg exited without saying why"
-                                    } else {
-                                        &why
-                                    }
-                                );
-                                // A retried SEED keeps the seed lane's rule: its
-                                // refusal is the one failing path with no card
-                                // (docs/AUDIT-nux-first-open-toolchain-2026-08-31.md),
-                                // so it is said on screen, not only in the log.
-                                if seed_pending {
-                                    let _ = proxy.send_event(Wake::PkgSeedFailed {
-                                        detail: if why.is_empty() {
-                                            "atpkg ended without saying what happened".to_string()
-                                        } else {
-                                            why.clone()
-                                        },
-                                    });
-                                }
-                            }
                             // QUEUED BEHIND A SIBLING AND THE BOUND RAN OUT (exit 75):
                             // deferred, never failed. The park that follows is the
                             // backoff, not the interval, and the row says so — until
@@ -24073,48 +24655,66 @@ fn spawn_pkg_update_check(config: &Config, proxy: EventLoopProxy<Wake>) -> bool 
                             // `status.toml`, so the outcome line below is skipped:
                             // "(no status.toml)" would be a non-answer.
                             PassVerdict::Busy => {
-                                busy = true;
                                 let bound = human_park(Duration::from_secs(ATPKG_WAIT_LOCK_SECS));
-                                let park = backoff.park(holder_advanced);
+                                let backoff_park = backoff.park(run.holder_advanced);
                                 if backoff.wedged() {
                                     // WEDGED: three half-hour waits in a row with
                                     // nothing moving in the holder's file. The park
                                     // is an hour (`CONTENTION_WEDGE_PARK`), never
                                     // the six-hour interval, and never longer than
-                                    // the interval either.
-                                    let park = CONTENTION_WEDGE_PARK
-                                        .min(Duration::from_secs(interval.max(1)));
-                                    busy_park = Some(park);
-                                    aterm_log::warn!(
-                                        "another atpkg pass has held the store lock through {} \
-                                         consecutive {bound} waits of this window's {verb} pass \
-                                         with no visible progress \u{2014} trying again in {} (a \
-                                         stub run still triggers an early pass)",
-                                        backoff.consecutive,
-                                        human_park(park)
-                                    );
-                                    let _ = proxy.send_event(Wake::PkgLockTimedOut {
-                                        detail: format!(
-                                            "another install has held the store lock for over an \
-                                             hour with no visible progress \u{2014} this window \
-                                             tries again in {}",
+                                    // the interval either — and a once-pass has no
+                                    // park: it stands down for this launch (the
+                                    // break below), and says so rather than
+                                    // promising a retry ([`wedge_park`]).
+                                    if let Some(park) = wedge_park(interval) {
+                                        busy_park = Some(park);
+                                        aterm_log::warn!(
+                                            "another atpkg pass has held the store lock through \
+                                             {} consecutive {bound} waits of this window's {verb} \
+                                             pass with no visible progress \u{2014} trying again \
+                                             in {} (a stub run still triggers an early pass)",
+                                            backoff.consecutive,
                                             human_park(park)
-                                        ),
-                                    });
+                                        );
+                                        let _ = proxy.send_event(Wake::PkgLockTimedOut {
+                                            detail: format!(
+                                                "another install has held the store lock for over \
+                                                 an hour with no visible progress \u{2014} this \
+                                                 window tries again in {}",
+                                                human_park(park)
+                                            ),
+                                        });
+                                    } else {
+                                        aterm_log::warn!(
+                                            "another atpkg pass has held the store lock through \
+                                             {} consecutive {bound} waits of this window's {verb} \
+                                             pass with no visible progress \u{2014} standing down \
+                                             for this launch (ATPKG_UPDATE_INTERVAL_SECS=0); run: \
+                                             aterm pkg {verb}",
+                                            backoff.consecutive
+                                        );
+                                        let _ = proxy.send_event(Wake::PkgLockTimedOut {
+                                            detail: format!(
+                                                "another install has held the store lock for over \
+                                                 an hour with no visible progress \u{2014} this \
+                                                 window will not retry; run: aterm pkg {verb}"
+                                            ),
+                                        });
+                                    }
                                 } else {
-                                    busy_park = Some(park);
+                                    busy_park = Some(backoff_park);
                                     aterm_log::warn!(
                                         "the ALab toolchain {verb} pass waited {bound} for another \
                                          atpkg pass to release the store lock and stood aside{} \
                                          \u{2014} trying again in {}",
-                                        stood_aside_said(seen),
-                                        human_park(park)
+                                        stood_aside_said(run.seen),
+                                        human_park(backoff_park)
                                     );
                                     let _ = proxy.send_event(Wake::PkgLockTimedOut {
                                         detail: format!(
                                             "another install is still running \u{2014} trying \
                                              again in {} (each try waits up to {bound})",
-                                            human_park(park)
+                                            human_park(backoff_park)
                                         ),
                                     });
                                 }
@@ -24123,23 +24723,24 @@ fn spawn_pkg_update_check(config: &Config, proxy: EventLoopProxy<Wake>) -> bool 
                                 }
                                 wait_row_open = false;
                             }
-                            // The markers spoke, or the pass ran quietly: stderr,
-                            // whatever the exit and whether or not a marker was
-                            // printed — a pass that exits non-zero AFTER a marker,
-                            // or exits 0 with per-program failure lines, used to
-                            // drop its stderr entirely (2026-09-10).
-                            PassVerdict::Answered | PassVerdict::Quiet => {
-                                backoff.reset();
-                                if !why.is_empty() {
-                                    if ok {
-                                        aterm_log::info!("atpkg {verb} said: {why}");
-                                    } else {
-                                        aterm_log::warn!("atpkg {verb} said: {why}");
-                                    }
-                                }
-                            }
+                            // The shared arms. A retried SEED keeps the seed lane's
+                            // rule — its refusal is said on screen, not only in the
+                            // log; the update's stays a log line.
+                            other => report_pass_verdict(
+                                verb,
+                                other,
+                                &run,
+                                &why,
+                                layout.as_ref(),
+                                &proxy,
+                                seed_pending,
+                            ),
                         }
                         if verdict != PassVerdict::Busy {
+                            // A pass that RAN (it held the lock) or was refused at
+                            // the edge for a reason that is not contention: the
+                            // contention tally starts over.
+                            backoff.reset();
                             // One INFO line naming the outcome atpkg recorded, so "did
                             // the check run, and when?" has an answer beside status.toml.
                             let outcome = layout
@@ -24150,7 +24751,7 @@ fn spawn_pkg_update_check(config: &Config, proxy: EventLoopProxy<Wake>) -> bool 
                                 .unwrap_or_else(|| "(no status.toml)".to_string());
                             aterm_log::info!(
                                 "atpkg {verb} pass finished: exit={} outcome={outcome}",
-                                if ok { "ok" } else { "failed" }
+                                if run.ok { "ok" } else { "failed" }
                             );
                         }
                         if seed_pending && verdict != PassVerdict::Busy {
@@ -24182,7 +24783,7 @@ fn spawn_pkg_update_check(config: &Config, proxy: EventLoopProxy<Wake>) -> bool 
                 // — `prefs.rs`, `pkg_check.rs`, the streaming design §4 — say the
                 // same). A retried seed that ran `continue`d above, so the update
                 // it owes still runs before this can end the once-pass.
-                if interval == 0 && (!busy || backoff.wedged()) {
+                if interval == 0 && (busy_park.is_none() || backoff.wedged()) {
                     break;
                 }
                 // Park — for the interval in 5s slices watching `<prefix>/bump`
@@ -24459,13 +25060,20 @@ fn pkg_store_holds_programs(layout: Option<&atpkg::store::Layout>) -> bool {
     layout.is_some_and(|l| !atpkg::active_builds(l).is_empty())
 }
 
-/// The event that retires an announcement, or `None` when nothing must be said.
-fn seed_retire_event(verdict: SeedRetire, said: &str) -> Option<Wake> {
-    let detail = if said.trim().is_empty() {
+/// What a pass's stderr said, as a card's detail — or the one honest sentence for
+/// a child that said nothing. The one spelling both the retired announcement
+/// ([`seed_retire_event`]) and a refusal's card ([`report_pass_verdict`]) carry.
+fn pass_said_detail(said: &str) -> String {
+    if said.trim().is_empty() {
         "atpkg ended without saying what happened".to_string()
     } else {
         said.trim().to_string()
-    };
+    }
+}
+
+/// The event that retires an announcement, or `None` when nothing must be said.
+fn seed_retire_event(verdict: SeedRetire, said: &str) -> Option<Wake> {
+    let detail = pass_said_detail(said);
     match verdict {
         SeedRetire::Nothing => None,
         SeedRetire::Failed => Some(Wake::PkgSeedFailed { detail }),
@@ -25837,12 +26445,12 @@ pub fn main_entry(argv: Vec<std::ffi::OsString>) {
     }
     // NOTE (thread-safety floor): the font-warm spawn that used to live HERE was the
     // process's first thread. It moved to the first-present hook in `app_render.rs`
-    // (launch speed: its "read every system font's cmap" IO contended with GPU init
-    // + shell spawn on the first-present critical path; the `OnceLock` coordination
-    // is unchanged, so a pre-warm uncovered glyph blocks on the in-progress build —
-    // bounded, correct). The single-threaded-process requirement of the env
-    // mutations above (`remove_var`, `seamless::take_incoming`) still holds: NO
-    // process-env mutation past this line, and no thread spawns before it.
+    // and was then DELETED there: every GUI generation is sealed before its first
+    // pixel, and a sealed generation never consults the coverage index the warm
+    // built (see the note in `app_render.rs` where the spawn used to be). The
+    // single-threaded-process requirement of the env mutations above
+    // (`remove_var`, `seamless::take_incoming`) still holds: NO process-env
+    // mutation past this line, and no thread spawns before it.
     // Capture user config ONCE. The service validates the text and resolves the
     // bounded theme/rainbow kitty portion; the parallel config-runtime worker below
     // admits Trail/Sparkle feeds as one exact generation before publication.
@@ -26035,12 +26643,19 @@ pub fn main_entry(argv: Vec<std::ffi::OsString>) {
     // an invalid path in App state would let a later zoom/reload retry it and
     // silently substitute a different face. `None` truthfully names the built-in
     // candidate regime the startup renderer actually uses after rejection.
-    let startup_font_family_warning =
-        app_config::Config::font_family_warning(requested_font_family.as_deref());
-    let font_family = startup_font_family_warning
-        .is_none()
-        .then_some(requested_font_family)
-        .flatten();
+    //
+    // THE VERDICT IS THE WORKER'S. Resolving a family is a walk of the font
+    // directories and, for a style-suffixed family, a read+parse of `name`
+    // tables until a match (5-50 ms warm, seconds cold) — and the backend
+    // worker spawned just below resolves the very same family to build from.
+    // This thread used to run `font_family_warning` here too, concurrently,
+    // for a warning string. Now the worker resolves ONCE
+    // (`Config::font_family_admission`), builds from the admitted PATH, queues
+    // the warning on the deferred notice lane, and reports admission through
+    // its return; `font_family` is seeded optimistically and corrected at the
+    // join (`finalize_backend` windowed, the early join headless) before any
+    // rebuild can read it.
+    let mut font_family = requested_font_family;
     // Cold-launch overlap (#7): the backend build — GPU adapter/device init + font
     // resolve/raster, the two dominant serial startup costs — shares NO state with
     // the PTY spawn / engine / event loop, so build it on a background thread and
@@ -26096,8 +26711,22 @@ pub fn main_entry(argv: Vec<std::ffi::OsString>) {
     // the ledger can answer the question `backend_finalize_ns` cannot: how much
     // of this build had already finished by the time the join was reached.
     crate::metrics::mark_backend_worker_spawn();
-    let backend_handle = std::thread::spawn(move || -> (Backend, bool) {
+    let backend_handle = std::thread::spawn(move || -> (Backend, bool, bool) {
         let worker_entry = Instant::now();
+        // The one resolve of the configured family (see `font_family` above):
+        // an admitted family becomes the exact PATH to build from, so the
+        // renderer constructors below validate a file instead of walking the
+        // directories again; a rejected one falls back to the built-in
+        // candidates, exactly as before, and says so on the notice lane.
+        let (family_for_build, font_family_admitted) =
+            match app_config::Config::font_family_admission(family_for_build.as_deref()) {
+                Ok(path) => (path, true),
+                Err(warning) => {
+                    aterm_log::warn!("{warning}");
+                    crate::config_notice::queue_deferred(format!("config {warning}"));
+                    (None, false)
+                }
+            };
         let build_cpu = || -> Renderer {
             Renderer::from_system_with_family(family_for_build.as_deref(), font_px, theme)
                 .unwrap_or_else(|| {
@@ -26197,6 +26826,39 @@ pub fn main_entry(argv: Vec<std::ffi::OsString>) {
             backend.seal_admitted_font_sources();
         }
         let font_seal_ns = crate::metrics::leg_elapsed_ns(font_seal_started);
+        // Warm the prompt's glyphs HERE, after the seal, still on the worker,
+        // and AT THE FIRST WINDOW'S PREDICTED SIZE (`prewarm_px`, predicted on
+        // the main thread after the spawn and carried in the generation). The
+        // seal ends with a wholesale raster-memo drop, so the warm the GPU
+        // constructor's font thread used to run was discarded before any
+        // frame saw it; and a warm at the renderer's base px is invisible to
+        // a Retina first frame, whose keys are at the 2× target. Sealed, no
+        // I/O is possible; the worker overlaps the window-server round trip;
+        // and the first `build_atlas` becomes a copy for regular AND bold
+        // ASCII at the size it draws.
+        //
+        // The glyph-affecting knobs are pinned FIRST — the same setter list the
+        // join runs (`pin_backend_render_config_core`), the same values — so
+        // the join's re-pin early-outs everywhere. Pinned after the warm (or
+        // only at the join, as before), a configured `line_height`,
+        // `font_thicken`, `stem_gamma` or `adjust_baseline` would have its
+        // setter drop the glyph cache and the warm with it.
+        //
+        // Outside the seal leg so `startup_worker_font_seal_ms` keeps
+        // measuring the seal. Headless defers its seal (and so this too): its
+        // first pixel demand rasterizes on demand as before.
+        if !defer_seal {
+            let prewarm_started = Instant::now();
+            backend.pin_glyph_raster_knobs(&startup_fonts.raster_knobs);
+            let prewarm_px = startup_fonts.prewarm_px;
+            backend.prewarm_ascii_for_first_window(prewarm_px, font_px);
+            aterm_log::debug!(
+                "startup: post-seal ASCII prewarm (regular + bold) at {prewarm_px} px (renderer \
+                 base {font_px} px, {} glyphs resident) took {:?} on the backend worker",
+                backend.glyph_cache_len(),
+                prewarm_started.elapsed()
+            );
+        }
         // One transaction, then the done stamp: a snapshot can never observe a
         // finished worker whose legs are still missing.
         crate::metrics::record_backend_worker_legs(crate::metrics::StartupWorkerLegs {
@@ -26206,8 +26868,22 @@ pub fn main_entry(argv: Vec<std::ffi::OsString>) {
             font_apply_ns,
             font_seal_ns,
         });
+        // The same legs on the debug lane, for a launch whose control socket
+        // is not up: `font_admit` is the number every "resolve more on the
+        // main thread before the hand-off" change (the scale prediction
+        // included) has to be sized against.
+        aterm_log::debug!(
+            "startup: backend worker legs prelude {:.2} ms, gpu_build {:.2} ms, font_admit \
+             (wait for the main thread's hand-off) {:.2} ms, font_apply {:.2} ms, font_seal \
+             {:.2} ms",
+            prelude_ns as f64 / 1e6,
+            gpu_build_ns as f64 / 1e6,
+            font_admit_ns as f64 / 1e6,
+            font_apply_ns as f64 / 1e6,
+            font_seal_ns as f64 / 1e6,
+        );
         crate::metrics::mark_backend_worker_done();
-        (backend, use_gpu)
+        (backend, use_gpu, font_family_admitted)
     });
     // Resolve configured face names while the backend worker is constructing
     // the GPU device/pipelines and primary face. Hand the generation over
@@ -26215,11 +26891,44 @@ pub fn main_entry(argv: Vec<std::ffi::OsString>) {
     // launch task, including initial-session creation.
     let (font_config, font_cfg_warns) = app_config::FontConfig::from_config(&config);
     let (font_variations, vf_warns) = config.font_variation_requests();
+    // The glyph-affecting render knobs, resolved ONCE: the worker pins them
+    // before its warm, and `App` below is seeded from this same value, so the
+    // join's re-pin sees what the worker saw.
+    let raster_knobs = app_config::GlyphRasterKnobs::from_config(&config);
+    // The px the FIRST WINDOW will activate, predicted HERE — after the spawn,
+    // before the hand-off — so the worker's post-seal glyph warm is resident
+    // at THAT size. `attach_os_window` activates `hidpi_target_font_px(
+    // font_px_explicit, scale)` — round(12 × 2) = 24 on a 2× display — and a
+    // `GlyphKey` bakes `px_q`, so a warm at the 12 px base was invisible to a
+    // Retina first frame: every prompt key missed and was rasterized on the
+    // UI thread while the worker's rasters sat unused. The prediction's
+    // CoreGraphics display query is the process's first WindowServer call
+    // (~15 ms cold, 0.1 ms warm — the connection AppKit would otherwise open
+    // at event-loop creation, so the cost moves, it is not added); placed
+    // after the spawn it overlaps the worker's GPU build (~25 ms) instead of
+    // delaying the worker's start, and the debug line says what it cost.
+    // Headless defers its seal (and so the warm) and never asks the display;
+    // an explicit size needs no prediction (the target returns it verbatim).
+    let prewarm_px = if defer_seal {
+        font_px
+    } else {
+        let prediction_started = Instant::now();
+        let predicted_scale = predicted_first_window_scale();
+        let px = first_window_prewarm_px(font_px_explicit, font_px, predicted_scale);
+        aterm_log::debug!(
+            "startup: first-window scale prediction {predicted_scale} (warm at {px} px) took \
+             {:?} on the main thread, after the backend worker spawn",
+            prediction_started.elapsed()
+        );
+        px
+    };
     if startup_font_tx
         .send(StartupFontGeneration {
             config: font_config.clone(),
             variations: font_variations.clone(),
             dark_nudge: config.font_weight_dark_nudge_or_default(),
+            raster_knobs: raster_knobs.clone(),
+            prewarm_px,
         })
         .is_err()
     {
@@ -26875,26 +27584,20 @@ pub fn main_entry(argv: Vec<std::ffi::OsString>) {
         ),
         _ => (rows, cols),
     };
-    // Session 0: on the adopt path, the shell whose id matches the manifest's first leaf
-    // (so session 0 lands in its original first pane); fall back to any handed-off shell
-    // if the manifest is absent/unmatched. The chosen shell is REMOVED from the pool the
-    // rest of the layout adopts from, so it is never adopted twice. "First leaf" is the
-    // one the deferred restore grafts session 0 onto — `bootstrap_local_id`, the canonical
-    // tree's first terminal leaf. The legacy `tabs` mirror this used to read lists only
-    // all-terminal tabs, so a native/terminal split tab ahead of them put this shell in
-    // another shell's pane.
+    // Session 0: on the adopt path, the shell window 0's bootstrap leaf names — the leaf
+    // the deferred restore grafts session 0 onto (`bootstrap_local_id`, the canonical
+    // tree's first terminal leaf), so session 0 lands in its original pane. The chosen
+    // shell is REMOVED from the pool the rest of the layout adopts from, so it is never
+    // adopted twice. A window 0 with no terminal leaf names none, and session 0 is then a
+    // FRESH bootstrap its native-only rebuild retires, as on a cold restore: every shell's
+    // pane lies in a later window, which adopts it there. See
+    // `app_restore::take_session0_shell`.
     let adopt0 = if adopting {
-        let first_leaf_id = restore_manifest
-            .as_ref()
-            .and_then(|m| m.windows.first())
-            .and_then(restore::WindowLayout::bootstrap_local_id);
-        let idx = first_leaf_id
-            .and_then(|id| seamless_adopt.iter().position(|a| a.local_id == id))
-            .unwrap_or(0);
-        Some(seamless_adopt.remove(idx))
+        app_restore::take_session0_shell(&mut seamless_adopt, restore_manifest.as_ref())
     } else {
         None
     };
+    let session0_adopted = adopt0.is_some();
     let restore_cwd0: Option<String> = restore_manifest
         .as_ref()
         .and_then(|m| m.first_leaf_cwd())
@@ -26918,9 +27621,15 @@ pub fn main_entry(argv: Vec<std::ffi::OsString>) {
         adopt0,
     )
     .unwrap_or_else(|e| fatal_launch_error(headless, &format!("spawn failed: {e}")));
-    if adopting {
+    if session0_adopted {
         crate::logging::stderr_line!(
             "aterm-gui: SEAMLESS update — re-adopted the running shell (pid {}); no relaunch of the session",
+            session0.pid
+        );
+    } else if adopting {
+        crate::logging::stderr_line!(
+            "aterm-gui: SEAMLESS update — window 0 holds no terminal pane, so its bootstrap \
+             shell (pid {}) is fresh; every running shell is re-adopted in its own pane",
             session0.pid
         );
     }
@@ -26942,9 +27651,12 @@ pub fn main_entry(argv: Vec<std::ffi::OsString>) {
     // shaping + font-feature warnings) moves into `App::finalize_backend`, the
     // single join point.
     let (backend_slot, use_gpu) = if headless {
-        let (mut backend, use_gpu) = backend_handle
+        let (mut backend, use_gpu, font_family_admitted) = backend_handle
             .join()
             .expect("backend-build thread panicked");
+        if !font_family_admitted {
+            font_family = None;
+        }
         // Two-way, not one-way: the publication contract is that the worker's
         // seal state is EXACTLY the launch's `defer_font_seal` decision. A
         // deferred launch that arrived sealed anyway would be paying the 15.7 MB
@@ -27188,6 +27900,7 @@ pub fn main_entry(argv: Vec<std::ffi::OsString>) {
         term.clone(),
         master,
         app_sink.clone(),
+        session0.ctx.ui_waiting.clone(),
         0,
         rows,
         cols,
@@ -27266,12 +27979,10 @@ pub fn main_entry(argv: Vec<std::ffi::OsString>) {
         &startup_config_snapshot.text,
     ));
     // W5h: a misspelled `font_family` previously reduced to the built-in
-    // candidates with ZERO output — warn once (like themes) and ride the same
-    // in-window config-notice banner. `font_family` here is already the
-    // effective env-over-config value the backend build actually tried.
-    if let Some(w) = startup_font_family_warning {
-        cfg_warns.push(format!("config {w}"));
-    }
+    // candidates with ZERO output. The backend worker — the thread that
+    // resolves the family — queues that warning on the deferred notice lane
+    // (`config_notice::queue_deferred`), and the event loop drains it into
+    // this same banner on its first park; nothing is resolved here.
     // An unrecognized `cursor_trail_style` silently draws the DEFAULT style
     // instead of the requested one — surface the typo at startup exactly like
     // the reload path does.
@@ -27427,11 +28138,14 @@ pub fn main_entry(argv: Vec<std::ffi::OsString>) {
         os_appearance: aterm_types::Appearance::default(),
         // GLOBAL config (window-uniform): font family, Option-as-Meta, keybindings.
         font_family,
-        text_shaping: config.text_shaping(),
+        // The glyph-affecting knobs are the ONE value the backend worker was
+        // handed (`raster_knobs`), not a second resolve: the join's re-pin
+        // must see exactly what the worker pinned before its glyph warm.
+        text_shaping: raster_knobs.text_shaping,
         text_blending: config.text_blending_or_default(),
-        font_thicken: config.font_thicken_or_default(),
-        stem_gamma: config.stem_gamma_or_default(),
-        font_hinting: config.font_hinting_or_default(),
+        font_thicken: raster_knobs.font_thicken,
+        stem_gamma: raster_knobs.stem_gamma,
+        font_hinting: raster_knobs.font_hinting,
         font_subpixel: config.font_subpixel_or_default(),
         font_variations,
         font_weight_dark_nudge: config.font_weight_dark_nudge_or_default(),
@@ -27478,7 +28192,7 @@ pub fn main_entry(argv: Vec<std::ffi::OsString>) {
         // descriptors arrived). See the field's docs for why a wrong answer here
         // costs the automatic lane.
         handoff_device_proof_term: device_proof_term,
-        bootstrap_session_adopted: adopting,
+        handoff_successor: adopting,
         quit_capture: None,
         winit_to_window: HashMap::new(),
         headless,
@@ -27804,9 +28518,12 @@ fn stub_session(id: u64) -> Session {
 /// must observe bytes crossing the real per-session egress boundary.
 #[cfg(any(test, feature = "bench-support"))]
 fn stub_session_with_sink(id: u64, sink: Arc<SinkWriter>) -> Session {
+    let term = Arc::new(Mutex::new(Terminal::new(24, 80)));
     let ctx = Arc::new(SessionCtx {
         sink,
         output_echo: Arc::new(crate::app_input::OutputEchoTracker::default()),
+        modes: mode_mirror_of(&term),
+        ui_waiting: Arc::default(),
         edges: std::sync::Mutex::new(EdgeTable::new()),
         turn_lease: std::sync::Mutex::new(None),
         self_id: SessionId::generate(),
@@ -27831,7 +28548,7 @@ fn stub_session_with_sink(id: u64, sink: Arc<SinkWriter>) -> Session {
     Session {
         child_reaped: std::sync::atomic::AtomicBool::new(false),
         id,
-        term: Arc::new(Mutex::new(Terminal::new(24, 80))),
+        term,
         master: -1,
         pid: -1,
         handoff_local_id: None,
@@ -29666,19 +30383,25 @@ mod backend_slot_tests {
         // Swap in a Pending slot whose thread builds a real CPU backend — the
         // same `(Backend, use_gpu)` shape the windowed cold launch hands run_app.
         let theme = app.theme;
-        let handle = std::thread::spawn(move || -> (Backend, bool) {
+        let handle = std::thread::spawn(move || -> (Backend, bool, bool) {
             let mut r = Renderer::from_system(FONT_PX, theme).expect("system font for test build");
             r.seal_admitted_font_sources();
-            (Backend::Cpu(r), false)
+            (Backend::Cpu(r), false, true)
         });
         app.backend = BackendSlot::Pending(Some(handle));
         app.use_gpu = true; // wrong-on-purpose intent seed; the join must correct it
+        app.font_family = Some("Seeded Family".into()); // admitted: the seed survives
         assert!(app.backend.is_pending());
 
         app.finalize_backend();
 
         assert!(!app.backend.is_pending(), "slot Ready after the join");
         assert!(!app.use_gpu, "the build's ACTUAL outcome replaces the seed");
+        assert_eq!(
+            app.font_family.as_deref(),
+            Some("Seeded Family"),
+            "an ADMITTED family keeps its seed as the live rebuild source"
+        );
         assert_eq!(
             app.backend.pad(),
             pad_for_scale(1.0),
@@ -29690,6 +30413,30 @@ mod backend_slot_tests {
         assert_eq!(app.backend.pad(), pad_for_scale(1.0));
     }
 
+    /// The worker's font-family verdict lands at the join: a family the
+    /// worker REJECTED (built from the built-in candidates instead) must not
+    /// stay seeded in `App.font_family`, or a later zoom/reload would retry it
+    /// and silently substitute a different face. The main thread used to
+    /// decide this itself by resolving the family a second time.
+    #[test]
+    fn finalize_backend_drops_a_font_family_the_worker_rejected() {
+        let mut app = App::headless_for_test();
+        let theme = app.theme;
+        let handle = std::thread::spawn(move || -> (Backend, bool, bool) {
+            let mut r = Renderer::from_system(FONT_PX, theme).expect("system font for test build");
+            r.seal_admitted_font_sources();
+            (Backend::Cpu(r), false, false)
+        });
+        app.backend = BackendSlot::Pending(Some(handle));
+        app.font_family = Some("No Such Family".into());
+        app.finalize_backend();
+        assert_eq!(
+            app.font_family, None,
+            "a rejected family must be dropped at the join — the built-in candidate regime is \
+             what the startup renderer actually uses"
+        );
+    }
+
     /// Negative control for the worker-only publication contract: a raw
     /// renderer may never cross the deferred join as though its font
     /// generation had already been sealed.
@@ -29698,10 +30445,10 @@ mod backend_slot_tests {
     fn finalize_backend_rejects_unsealed_generation() {
         let mut app = App::headless_for_test();
         let theme = app.theme;
-        let handle = std::thread::spawn(move || -> (Backend, bool) {
+        let handle = std::thread::spawn(move || -> (Backend, bool, bool) {
             let renderer =
                 Renderer::from_system(FONT_PX, theme).expect("system font for test build");
-            (Backend::Cpu(renderer), false)
+            (Backend::Cpu(renderer), false, true)
         });
         app.backend = BackendSlot::Pending(Some(handle));
         app.finalize_backend();
@@ -29712,12 +30459,14 @@ mod backend_slot_tests {
     #[test]
     #[should_panic(expected = "before attach_os_window")]
     fn pending_slot_access_is_fail_loud() {
-        let slot = BackendSlot::Pending(Some(std::thread::spawn(move || -> (Backend, bool) {
-            let mut r = Renderer::from_system(FONT_PX, Theme::default())
-                .expect("system font for test build");
-            r.seal_admitted_font_sources();
-            (Backend::Cpu(r), false)
-        })));
+        let slot = BackendSlot::Pending(Some(std::thread::spawn(
+            move || -> (Backend, bool, bool) {
+                let mut r = Renderer::from_system(FONT_PX, Theme::default())
+                    .expect("system font for test build");
+                r.seal_admitted_font_sources();
+                (Backend::Cpu(r), false, true)
+            },
+        )));
         let _ = slot.cell_size();
     }
 
@@ -34947,6 +35696,7 @@ mod early_out_tests {
             // Fixed OS appearance in these unit frames (a flip is exercised by
             // `os_appearance_flip_repaints`).
             system_dark: false,
+            link_caption: None,
         }
     }
 
@@ -37982,9 +38732,12 @@ mod session_pool_tests {
     /// what we exercise here, not PTY teardown.
     fn test_session(id: u64) -> Session {
         let self_id = SessionId::generate();
+        let term = Arc::new(Mutex::new(Terminal::new(24, 80)));
         let ctx = Arc::new(SessionCtx {
             sink: Arc::new(SinkWriter::new(-1)),
             output_echo: Arc::new(crate::app_input::OutputEchoTracker::default()),
+            modes: mode_mirror_of(&term),
+            ui_waiting: Arc::default(),
             edges: std::sync::Mutex::new(EdgeTable::new()),
             turn_lease: std::sync::Mutex::new(None),
             self_id,
@@ -38009,7 +38762,7 @@ mod session_pool_tests {
         Session {
             child_reaped: std::sync::atomic::AtomicBool::new(false),
             id,
-            term: Arc::new(Mutex::new(Terminal::new(24, 80))),
+            term,
             master: -1,
             pid: -1,
             handoff_local_id: None,
@@ -39842,8 +40595,11 @@ mod spec_xref_gate {
         // echo ledger's ty-checked law, 88c9d82ff) adds one — 151 → 152. The
         // delivered-insert arm of the same day EXTENDS `CursorHintLicense`
         // (new actions and invariants on a registered machine) and adds none.
+        // 2026-09-13: `RosterPairRedo` (`roster_pair_redo_model`, the machine
+        // roster's redo transaction, b8adf2d44) adds one — 152 → 153; that
+        // commit registered the machine without moving this pin.
         assert_eq!(
-            total, 152,
+            total, 153,
             "update the live TrustIr report-shape regression when the registry changes"
         );
         let mut live_report = format!(
@@ -43028,9 +43784,14 @@ mod paste_banner_flow_tests {
     fn a_risky_paste_parks_fail_closed_until_enter_answers_it() {
         let (mut app, rx) = app_with_pty_observer();
         let wid = WindowId(0);
-        app.deliver_paste(wid, "ls\nrm -rf ~".to_string(), Source::Human);
+        let owner = app.focused_session_id(wid);
+        app.deliver_paste(wid, owner, "ls\nrm -rf ~".to_string(), Source::Human);
         let parked = app.paste_banner.as_ref().expect("the paste must park");
         assert_eq!(parked.wid, wid);
+        assert_eq!(
+            parked.session, owner,
+            "the banner remembers the gesture's owner"
+        );
         assert_eq!(parked.text(), "ls\nrm -rf ~");
         assert_no_bytes(rx, "parked text must not touch the PTY");
 
@@ -43040,7 +43801,7 @@ mod paste_banner_flow_tests {
         assert_no_bytes(rx, "a cancelled paste delivers NOTHING");
 
         // Enter on a fresh confirmation: the parked text — exactly it — delivers.
-        app.deliver_paste(wid, "ls\nrm -rf ~".to_string(), Source::Human);
+        app.deliver_paste(wid, owner, "ls\nrm -rf ~".to_string(), Source::Human);
         app.answer_paste_banner(true);
         assert!(app.paste_banner.is_none(), "accept consumes the banner");
         assert_eq!(
@@ -43058,8 +43819,9 @@ mod paste_banner_flow_tests {
     fn a_second_unconfirmed_paste_never_replaces_the_open_question() {
         let (mut app, rx) = app_with_pty_observer();
         let wid = WindowId(0);
-        app.deliver_paste(wid, "first\nquestion".to_string(), Source::Human);
-        app.deliver_paste(wid, "second\nsneaks-in".to_string(), Source::Human);
+        let owner = app.focused_session_id(wid);
+        app.deliver_paste(wid, owner, "first\nquestion".to_string(), Source::Human);
+        app.deliver_paste(wid, owner, "second\nsneaks-in".to_string(), Source::Human);
         assert_eq!(
             app.paste_banner.as_ref().expect("still parked").text(),
             "first\nquestion",
@@ -43092,8 +43854,9 @@ mod paste_banner_flow_tests {
     fn a_mode_flip_while_the_question_stands_cannot_reframe_the_answer() {
         let (mut app, rx) = app_with_pty_observer();
         let wid = WindowId(0);
+        let owner = app.focused_session_id(wid);
         set_bracketed(&app, wid, false);
-        app.deliver_paste(wid, "ls\nrm -rf ~".to_string(), Source::Human);
+        app.deliver_paste(wid, owner, "ls\nrm -rf ~".to_string(), Source::Human);
         assert!(
             app.paste_banner.is_some(),
             "the unbracketed question stands"
@@ -43149,11 +43912,12 @@ mod paste_banner_flow_tests {
     fn a_mode_flip_before_the_drain_cannot_unframe_a_paste_nobody_was_asked_about() {
         let (mut app, rx) = app_with_pty_observer();
         let wid = WindowId(0);
+        let owner = app.focused_session_id(wid);
         set_bracketed(&app, wid, true);
         // No newline in the wedge: it is plumbing, and the guard must stay silent
         // about it for the same reason it stays silent about the real paste.
-        app.deliver_paste(wid, "w".repeat(WEDGE_BYTES), Source::Human);
-        app.deliver_paste(wid, "ls\nrm -rf ~".to_string(), Source::Human);
+        app.deliver_paste(wid, owner, "w".repeat(WEDGE_BYTES), Source::Human);
+        app.deliver_paste(wid, owner, "ls\nrm -rf ~".to_string(), Source::Human);
         assert!(
             app.paste_banner.is_none(),
             "bracketed paste is never flagged — nobody was asked"
@@ -43173,8 +43937,10 @@ mod paste_banner_flow_tests {
     #[test]
     fn the_opt_out_keeps_the_direct_delivery_path() {
         let (mut app, rx) = app_with_pty_observer();
+        let wid = WindowId(0);
+        let owner = app.focused_session_id(wid);
         app.confirm_multiline_paste = false;
-        app.deliver_paste(WindowId(0), "a\nb".to_string(), Source::Human);
+        app.deliver_paste(wid, owner, "a\nb".to_string(), Source::Human);
         assert!(app.paste_banner.is_none(), "opt-out never parks");
         assert_eq!(drain(rx), b"a\rb");
     }
@@ -43204,6 +43970,131 @@ mod paste_banner_flow_tests {
         assert!(app.paste_banner.is_none(), "single-line never asks");
         assert_eq!(drain(rx), b"hello");
         crate::control::PRIMARY_STUB.with(|s| *s.borrow_mut() = None);
+    }
+}
+
+/// A DEFERRED paste (the Linux banner answer, the macOS sheet answer, or the
+/// worker-thread X11 clipboard read) is bound to the session that OWNED the
+/// gesture. These pin the delivery half that binding rests on —
+/// [`App::deliver_paste_confirmed`] routing through the session-pinned input
+/// seam — on any Unix, including macOS where the Linux banner module above is
+/// compiled out. The witness is a byte observation on two real pipe-backed
+/// session sinks: after a tab switch, the confirmed paste reaches the ORIGINAL
+/// (now hidden) owner's PTY and NOT the tab that came to the front.
+#[cfg(all(test, unix))]
+mod deferred_paste_owner_tests {
+    use std::sync::Arc;
+
+    use aterm_session::sink::SinkWriter;
+
+    use super::{App, Source, WindowId};
+    use crate::input::PasteFraming;
+
+    /// A nonblocking read end plus a `SinkWriter` on the write end: every byte a
+    /// session's egress writes is observable, and an empty pipe proves nothing
+    /// was delivered to it.
+    fn observer_pipe() -> (i32, Arc<SinkWriter>) {
+        let mut pipe = [0; 2];
+        assert_eq!(unsafe { libc::pipe(pipe.as_mut_ptr()) }, 0, "observer pipe");
+        let flags = unsafe { libc::fcntl(pipe[0], libc::F_GETFL) };
+        assert!(flags >= 0);
+        assert_eq!(
+            unsafe { libc::fcntl(pipe[0], libc::F_SETFL, flags | libc::O_NONBLOCK) },
+            0
+        );
+        (pipe[0], Arc::new(SinkWriter::new(pipe[1])))
+    }
+
+    /// Everything currently queued on `fd`, polling briefly so a delivery on the
+    /// per-session writer thread has time to land; empty after the deadline.
+    fn drain_within(fd: i32, ms: u64) -> Vec<u8> {
+        let deadline = std::time::Instant::now() + std::time::Duration::from_millis(ms);
+        let mut out = Vec::new();
+        let mut buf = [0u8; 256];
+        loop {
+            let n = unsafe { libc::read(fd, buf.as_mut_ptr().cast(), buf.len()) };
+            if n > 0 {
+                out.extend_from_slice(&buf[..n as usize]);
+                continue;
+            }
+            if !out.is_empty() || std::time::Instant::now() >= deadline {
+                return out;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        }
+    }
+
+    /// THE FIX: a paste confirmed for session A, delivered after the window
+    /// switched its front to a freshly-spawned tab B, lands on A's PTY (through
+    /// the hidden-session seam) and never on B's. Before the binding, the
+    /// confirmed delivery resolved "the current front terminal" and would have
+    /// hit B — pasting into whichever tab the switch put in front.
+    #[test]
+    fn a_confirmed_paste_reaches_its_owner_after_a_tab_switch_not_the_new_front() {
+        let (owner_rx, owner_sink) = observer_pipe();
+        let (front_rx, front_sink) = observer_pipe();
+        let mut app = App::headless_for_test_with_sink(owner_sink);
+        let wid = WindowId(0);
+        let owner = app
+            .focused_session_id(wid)
+            .expect("front session at gesture");
+
+        // A control-socket / mouse tab switch (NOT the keyboard-modal path) puts
+        // a new session in front of the same window between gesture and answer.
+        let new_id = app.next_session_id;
+        app.push_stub_tab(wid, crate::stub_session_with_sink(new_id, front_sink));
+        assert_ne!(
+            app.focused_session_id(wid),
+            Some(owner),
+            "the switch really moved the front off the owner"
+        );
+
+        // The answer arrives now, carrying the owner captured at the gesture.
+        app.deliver_paste_confirmed(
+            wid,
+            Some(owner),
+            "ls\nrm -rf ~".to_string(),
+            Source::Human,
+            PasteFraming::Gesture { bracketed: false },
+        );
+
+        assert_eq!(
+            drain_within(owner_rx, 2000),
+            b"ls\rrm -rf ~",
+            "the confirmed paste reaches the session that owned the gesture"
+        );
+        assert_eq!(
+            drain_within(front_rx, 150),
+            b"",
+            "the tab that came to the front receives nothing"
+        );
+
+        unsafe {
+            libc::close(owner_rx);
+            libc::close(front_rx);
+        }
+    }
+
+    /// The ordinary case is unchanged: with no switch, a confirmed paste for the
+    /// front session delivers to it exactly as `self.input(..)` did before the
+    /// owner rode along.
+    #[test]
+    fn a_confirmed_paste_with_no_switch_delivers_to_the_front() {
+        let (owner_rx, owner_sink) = observer_pipe();
+        let mut app = App::headless_for_test_with_sink(owner_sink);
+        let wid = WindowId(0);
+        let owner = app.focused_session_id(wid);
+
+        app.deliver_paste_confirmed(
+            wid,
+            owner,
+            "a\nb".to_string(),
+            Source::Human,
+            PasteFraming::Gesture { bracketed: false },
+        );
+
+        assert_eq!(drain_within(owner_rx, 2000), b"a\rb");
+        unsafe { libc::close(owner_rx) };
     }
 }
 
@@ -45665,5 +46556,182 @@ mod gpu_acquire_wait_tests {
         ));
         assert_eq!(requests, 1);
         assert!(ws.present_retry.present_attempt_allowed());
+    }
+}
+
+#[cfg(test)]
+mod first_window_prewarm_tests {
+    //! The post-seal glyph warm must be resident at the px the FIRST WINDOW
+    //! activates — the Retina default, not only the base the renderer was
+    //! built at.
+
+    use super::*;
+    use aterm_render::StyleBits;
+
+    const FONT: &[u8] = include_bytes!("../../aterm-render/assets/DejaVuSansMono.ttf");
+
+    fn sealed_backend_at_base() -> Backend {
+        let mut backend = Backend::Cpu(
+            Renderer::from_bytes(FONT, FONT_PX, Theme::default()).expect("fixture font parses"),
+        );
+        backend.seal_admitted_font_sources();
+        backend
+    }
+
+    /// Look the prompt's regular + BOLD keys up at the ACTIVE size and report
+    /// how many rasters that added — zero means every key was a hit.
+    fn prompt_lookups_added(backend: &mut Backend) -> usize {
+        let Backend::Cpu(r) = backend else {
+            unreachable!("CPU fixture")
+        };
+        let before = r.glyph_cache_len();
+        for ch in ['$', '>', 'a', 'Z', '~'] {
+            let regular = r.glyph_key(ch);
+            let bold = r.glyph_key_styled(ch, StyleBits::BOLD);
+            let _ = r.glyph_image(regular);
+            let _ = r.glyph_image(bold);
+        }
+        r.glyph_cache_len() - before
+    }
+
+    fn active_px(backend: &Backend) -> f32 {
+        let Backend::Cpu(r) = backend else {
+            unreachable!("CPU fixture")
+        };
+        r.px()
+    }
+
+    /// The default Retina launch: the worker seals and warms at the 12 px
+    /// base, then `attach_os_window` activates the 2× target. A `GlyphKey`
+    /// bakes `px_q`, so the base warm misses every key (the precondition half
+    /// pins that this is real, not a hypothetical); the warm at the predicted
+    /// px, handed back at the base, is what the attach's activation finds.
+    #[test]
+    fn the_post_seal_warm_is_resident_at_the_first_windows_predicted_px() {
+        let retina =
+            app_window::hidpi_target_font_px(false, 2.0).expect("the default auto-scales at 2x");
+        assert_eq!(retina, 24.0);
+
+        let mut base_warm = sealed_backend_at_base();
+        base_warm.prewarm_ascii();
+        base_warm.activate_px(retina);
+        assert!(
+            prompt_lookups_added(&mut base_warm) > 0,
+            "precondition: a base-px warm is invisible at the Retina target"
+        );
+
+        let mut predicted = sealed_backend_at_base();
+        predicted.prewarm_ascii_for_first_window(retina, FONT_PX);
+        assert_eq!(
+            active_px(&predicted),
+            active_px(&sealed_backend_at_base()),
+            "the helper hands the renderer back at the size it was given"
+        );
+        predicted.activate_px(retina);
+        assert_eq!(
+            prompt_lookups_added(&mut predicted),
+            0,
+            "the prompt's regular and BOLD keys at the first window's px must be cache hits"
+        );
+    }
+
+    /// A non-default typography config: the join re-pins `line_height`,
+    /// `font_thicken`, `stem_gamma`, `adjust_baseline` through setters that
+    /// drop the glyph cache on a CHANGE. Pinned only at the join (the old
+    /// wiring), each of them alone discards the worker's warm — the
+    /// precondition half pins that per knob. Pinned on the worker BEFORE the
+    /// warm with the same values, the join's re-pin is a no-op and the
+    /// first window's activation finds every prompt key resident.
+    #[test]
+    fn the_warm_survives_the_joins_re_pin_of_a_non_default_typography() {
+        let retina =
+            app_window::hidpi_target_font_px(false, 2.0).expect("the default auto-scales at 2x");
+        let defaults = app_config::GlyphRasterKnobs::from_config(&Config::default());
+        let deltas: [(&str, app_config::GlyphRasterKnobs); 4] = [
+            (
+                "line_height",
+                app_config::GlyphRasterKnobs {
+                    line_height: 1.2,
+                    ..defaults.clone()
+                },
+            ),
+            (
+                "font_thicken",
+                app_config::GlyphRasterKnobs {
+                    font_thicken: true,
+                    ..defaults.clone()
+                },
+            ),
+            (
+                "stem_gamma",
+                app_config::GlyphRasterKnobs {
+                    stem_gamma: 0.85,
+                    ..defaults.clone()
+                },
+            ),
+            (
+                "adjust_baseline",
+                app_config::GlyphRasterKnobs {
+                    adjust_baseline: 2,
+                    ..defaults.clone()
+                },
+            ),
+        ];
+        for (knob, knobs) in &deltas {
+            // The old wiring: seal, warm, then the join pins the knob.
+            let mut join_only = sealed_backend_at_base();
+            join_only.prewarm_ascii_for_first_window(retina, FONT_PX);
+            join_only.pin_glyph_raster_knobs(knobs);
+            join_only.activate_px(retina);
+            assert!(
+                prompt_lookups_added(&mut join_only) > 0,
+                "precondition: a {knob} pinned first at the join discards the warm"
+            );
+
+            // The fix: the worker pins, warms, and the join re-pins the same.
+            let mut worker_pinned = sealed_backend_at_base();
+            worker_pinned.pin_glyph_raster_knobs(knobs);
+            worker_pinned.prewarm_ascii_for_first_window(retina, FONT_PX);
+            worker_pinned.pin_glyph_raster_knobs(knobs);
+            worker_pinned.activate_px(retina);
+            assert_eq!(
+                prompt_lookups_added(&mut worker_pinned),
+                0,
+                "{knob}: the join's re-pin of the worker's values must keep the warm"
+            );
+        }
+    }
+
+    /// The knobs the worker is handed resolve from the config with the same
+    /// precedence the App's fields use, and a default config pins nothing the
+    /// constructor did not already have.
+    #[test]
+    fn the_glyph_raster_knobs_resolve_from_the_config_once() {
+        let config = Config {
+            line_height: Some(1.2),
+            font_thicken: Some(true),
+            adjust_baseline: Some(2),
+            ..Default::default()
+        };
+        let knobs = app_config::GlyphRasterKnobs::from_config(&config);
+        assert_eq!(knobs.line_height, config.line_height_or_default());
+        assert_eq!(knobs.font_thicken, config.font_thicken_or_default());
+        assert_eq!(knobs.adjust_baseline, config.adjust_baseline_or_default());
+        assert_eq!(knobs.stem_gamma, config.stem_gamma_or_default());
+        assert_eq!(knobs.font_hinting, config.font_hinting_or_default());
+        assert_eq!(knobs.text_shaping, config.text_shaping());
+        let render = app_config::RenderKnobs::from_config(&config);
+        assert_eq!(knobs.line_height, render.line_height);
+        assert_eq!(knobs.adjust_baseline, render.adjust_baseline);
+    }
+
+    /// The warm size is the attach path's own target for the predicted scale,
+    /// and the base wherever that target does not apply.
+    #[test]
+    fn the_prewarm_px_is_the_attach_paths_target_or_the_base() {
+        assert_eq!(first_window_prewarm_px(false, FONT_PX, 2.0), 24.0);
+        assert_eq!(first_window_prewarm_px(false, FONT_PX, 1.5), 18.0);
+        assert_eq!(first_window_prewarm_px(false, FONT_PX, 1.0), FONT_PX);
+        assert_eq!(first_window_prewarm_px(true, 14.0, 2.0), 14.0);
     }
 }

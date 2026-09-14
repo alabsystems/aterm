@@ -653,6 +653,7 @@ mod tests {
             pack: None,
             wake_persist_s: 0.0,
             ribbon_tall: false,
+            ribbon_flat: false,
             classic_mono: false,
         }
     }

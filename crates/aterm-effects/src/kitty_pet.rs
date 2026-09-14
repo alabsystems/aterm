@@ -3694,7 +3694,9 @@ impl PetBrain {
             return false;
         };
         let (a, b) = (col + INK_PAD, col + width - INK_PAD);
-        b > first && a < end
+        // Refine an existing ink claim only. An unfed or partial console map
+        // retains the legacy contract; an unfed ink seam remains inert.
+        b > first && a < end && self.observed_ink_overlaps(col, row, width).unwrap_or(true)
     }
 
     /// F1's retarget: nudge a station off glyphs to the nearest blank stand
@@ -3716,12 +3718,30 @@ impl PetBrain {
         let limit = (f32::from(cols) - width).max(0.0);
         let right = end + INK_GAP;
         let left = first - width - INK_GAP;
-        match (right <= limit, left >= 0.0) {
+        let beside = match (right <= limit, left >= 0.0) {
             (true, true) if (left - want).abs() < (right - want).abs() => left,
             (true, _) => right,
             (false, true) => left,
             (false, false) => want,
+        };
+        // A genuine glyph can invade the footprint while a distant particle
+        // extends the same hull. Before accepting that far endpoint, look for
+        // a fully observed local gap within the existing step-aside bound.
+        // Dense ink and hosts without a precise map keep the original ladder.
+        if (beside - want).abs() > INK_EVICT_MAX || self.ink_overlaps(beside, row, width) {
+            for step in 1..=INK_EVICT_MAX as u16 {
+                let step = f32::from(step);
+                for candidate in [want + step, want - step] {
+                    if candidate >= 0.0
+                        && candidate <= limit
+                        && self.observed_ink_overlaps(candidate, row, width) == Some(false)
+                    {
+                        return candidate;
+                    }
+                }
+            }
         }
+        beside
     }
 
     /// Where a stand at `want` on `row` actually goes — the **ink ladder**,
@@ -3736,6 +3756,8 @@ impl PetBrain {
     ///    has no blank ground beside it, but the line under it is almost
     ///    always empty, and a cat sitting one line off beside your cursor is
     ///    still WITH you.
+    ///    If both exact columns contain glyphs, a fully observed gap within
+    ///    the same step-aside bound on either neighbour is next.
     /// 4. The far stand beside this row's ink — the original F1 law, which
     ///    also carries its own walled-shut fallback (stand on the words; the
     ///    answer to "nowhere to stand" was never "leave"). Reached only when
@@ -3773,6 +3795,20 @@ impl PetBrain {
         for r in [row + 1.0, row - 1.0] {
             if r >= 0.0 && r < f32::from(rows) && !self.ink_overlaps(want, r, width) {
                 return (want, r);
+            }
+        }
+        // Sparse glyphs can obstruct this exact column on BOTH neighbouring
+        // rows while leaving a gap one cell aside. Keep the same-column row
+        // choices above first, then consider only certified nearby gaps
+        // before falling back to a distant endpoint on the caret's row.
+        for r in [row + 1.0, row - 1.0] {
+            if r >= 0.0 && r < f32::from(rows) {
+                let near = self.ink_safe_col(want, r, width, cols);
+                if (near - want).abs() <= INK_EVICT_MAX
+                    && self.observed_ink_overlaps(near, r, width) == Some(false)
+                {
+                    return (near, r);
+                }
             }
         }
         (beside, row)
@@ -4453,6 +4489,15 @@ impl PetBrain {
         self.arrive_t = (self.arrive_t - dt).max(0.0);
 
         let width = art_cols(sense.cell_w, sense.cell_h);
+        if self.console_observation_incoherent() {
+            // Keep the previous motion commitment and real caret/input
+            // history until geometry can be read again. Falling back to a
+            // stale first/last ink hull here launched a full-pane flight on
+            // one fractional-scroll frame; it became visible after the map
+            // recovered. Clocks above still advance, and emit already hides
+            // an incoherent surface without licensing guessed blank ground.
+            return self.emit(sense, width);
+        }
         self.begin_console_tick(sense, width);
         self.reseat_unshown_console_body(sense, width);
         if let Some(frame) = self.tick_console_resident(sense, width, dt) {
@@ -7107,7 +7152,11 @@ impl PetBrain {
     /// live state unchanged. Glass/video callers must continue using [`tick`].
     pub fn tick_static_capture(&mut self, sense: PetSense) -> PetFrame {
         let frame = self.tick(sense);
-        if sense.caret.is_some() && frame.alpha == 0 && self.needs_frames() {
+        if !self.console_observation_incoherent()
+            && sense.caret.is_some()
+            && frame.alpha == 0
+            && self.needs_frames()
+        {
             self.alpha = 1.0;
             return self.emit(sense, art_cols(sense.cell_w, sense.cell_h));
         }
@@ -18398,6 +18447,61 @@ mod tests {
             pet.ink_stand(40.0, 4.0, w, 100, 30),
             (40.0, 4.0),
             "blank ground under the want is answered first and alone"
+        );
+    }
+
+    #[test]
+    fn sparse_ink_refinement_keeps_real_glyphs_and_unknown_coverage_obstructed() {
+        use crate::pet_world::{PetPane, PetWorldFacts};
+        use aterm_core::terminal::Terminal;
+
+        let mut term = Terminal::new(8, 100);
+        term.process(b"\x1b[5;1Hx\x1b[5;100Hx\x1b[5;13H");
+        let mut pet = PetBrain::default();
+        let width = art_cols(10, 20);
+        let spans = vec![(0, 100); 8];
+        pet.sense_ink(0, &spans, Some(4));
+        assert!(
+            pet.ink_overlaps(13.0, 4.0, width),
+            "unobserved hull stays conservative"
+        );
+
+        let input = term.cell_frame(8, 100);
+        let facts = PetWorldFacts::read(&term, 7);
+        pet.observe_console(&input, &facts, PetPane::full(&input));
+        pet.set_console_presentable(true);
+        assert!(
+            !pet.ink_overlaps(13.0, 4.0, width),
+            "observed spaces are not glyphs"
+        );
+
+        // Move one real glyph into the body. It must cause a local step,
+        // even though the coarse hull touches both pane margins, making
+        // neither of the legacy span endpoints a viable stand.
+        term.process(b"\x1b[5;16Hx\x1b[5;13H");
+        let input = term.cell_frame(8, 100);
+        let facts = PetWorldFacts::read(&term, 7);
+        pet.observe_console(&input, &facts, PetPane::full(&input));
+        assert!(
+            pet.ink_overlaps(13.0, 4.0, width),
+            "actual glyph still obstructs the body"
+        );
+        let beside = pet.ink_safe_col(13.0, 4.0, width, 100);
+        assert!((beside - 13.0).abs() <= INK_EVICT_MAX);
+        assert!(!pet.ink_overlaps(beside, 4.0, width));
+
+        // An observation missing this footprint cannot certify it as blank.
+        let mut pane = PetPane::full(&input);
+        pane.cols = 8;
+        pet.observe_console(&input, &facts, pane);
+        assert_eq!(pet.observed_ink_overlaps(13.0, 4.0, width), None);
+        assert!(pet.ink_overlaps(13.0, 4.0, width));
+
+        pet.observe_console(&input, &facts, PetPane::full(&input));
+        pet.sense_ink(0, &[], None);
+        assert!(
+            !pet.ink_overlaps(13.0, 4.0, width),
+            "unfed ink seam stays inert"
         );
     }
 

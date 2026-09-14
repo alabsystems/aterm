@@ -7,6 +7,8 @@
 //! See handler modules (`handler_csi.rs`, `handler_esc.rs`, `handler_osc.rs`)
 //! for per-sequence documentation.
 
+/// The alt-screen scroll-off archive: rows a fullscreen app scrolled off its top.
+mod alt_archive;
 /// UAX #9 BiDi visual-reordering bridge (off-by-default `bidi` feature → `aterm-bidi`).
 #[cfg(feature = "bidi")]
 mod bidi_reorder;
@@ -51,6 +53,7 @@ mod keyboard_mode;
 pub mod kitty_graphics;
 /// Kitty graphics Unicode placeholder (U+10EEEE) diacritic decoding (M3).
 mod kitty_placeholder;
+mod mode_mirror;
 #[cfg(test)]
 pub mod mouse;
 #[cfg(not(test))]
@@ -107,6 +110,10 @@ use grouped_state::{
 use reset::{ResetGroups, reset_common_fields};
 use transient_state::{TransientState, Vt52CursorState};
 
+pub use alt_archive::{
+    ALT_ARCHIVE_DEFAULT_BUDGET, ALT_ARCHIVE_ENV, ALT_ARCHIVE_MAX_ROWS, ALT_ARCHIVE_ROW_OVERHEAD,
+    AltArchive, AltArchiveGap, AltArchiveGapKind, AltArchiveQuery, AltArchiveRead,
+};
 pub(crate) use aterm_types::charset::CharacterSetState;
 pub use aterm_types::{ColorPalette, Rgb};
 pub use aterm_types::{KittyKeyboardFlags, KittyKeyboardState};
@@ -120,6 +127,7 @@ pub use callbacks::{
 pub use checkpoint::CheckpointMeta;
 pub use checkpoint::{GridCursorRepr, HostBindings, StyleRepr, TerminalCheckpoint};
 pub use custody::CustodyTransition;
+pub use mode_mirror::ModeMirror;
 // The injected-clock seam, re-exported so an out-of-crate replay/lash harness
 // can feed a FIXED ClockReading and get bit-deterministic state regardless of
 // real wall-clock pacing (the determinism a faithful replay relies on).

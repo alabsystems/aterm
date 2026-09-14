@@ -110,6 +110,14 @@ struct Catalog {
     /// Bytes already read for a name-table probe. Reused as the immutable
     /// admitted asset if that path wins, closing a second-read TOCTOU window.
     bytes: HashMap<PathBuf, Arc<Vec<u8>>>,
+    /// Every directory the walk asked `read_dir` of — roots included, absent
+    /// or unreadable ones too — with the mtime observed at that moment. This
+    /// is the validity key of the [`system_font_files`] memo: a directory's
+    /// mtime moves when an entry is added, removed or renamed in it, so a font
+    /// installed anywhere in the tree, a vendor directory appearing under a
+    /// nested Linux root, or a root coming into existence all show up in a
+    /// stat of one of these, without walking the tree again.
+    visited: Vec<(PathBuf, Option<std::time::SystemTime>)>,
 }
 
 impl Catalog {
@@ -119,6 +127,7 @@ impl Catalog {
             files: Vec::new(),
             stats: Stats::default(),
             bytes: HashMap::new(),
+            visited: Vec::new(),
         };
         for dir in dirs {
             catalog.walk(dir, 0);
@@ -161,6 +170,7 @@ impl Catalog {
             return;
         }
         self.stats.dirs += 1;
+        self.visited.push((dir.to_path_buf(), dir_mtime(dir)));
         let Ok(read_dir) = std::fs::read_dir(dir) else {
             return;
         };
@@ -438,6 +448,7 @@ fn resolve_and_admit_in_dirs(requests: &[String], dirs: &[PathBuf], limits: Limi
             files: Vec::new(),
             stats: Stats::default(),
             bytes: HashMap::new(),
+            visited: Vec::new(),
         }
     };
     let paths = catalog.resolve_many(requests);
@@ -465,16 +476,145 @@ fn resolve_and_admit_in_dirs(requests: &[String], dirs: &[PathBuf], limits: Limi
     }
 }
 
+/// The modification time of a directory, `None` when it does not exist or
+/// cannot be stat'ed — a value in its own right, so a root that appears later
+/// invalidates a memo taken while it was absent.
+fn dir_mtime(dir: &Path) -> Option<std::time::SystemTime> {
+    std::fs::metadata(dir).ok().and_then(|m| m.modified().ok())
+}
+
+/// One remembered walk: the roots it was asked for, every directory it
+/// visited with the mtime seen then, and the files it found.
+struct FontFilesMemo {
+    roots: Vec<PathBuf>,
+    visited: Vec<(PathBuf, Option<std::time::SystemTime>)>,
+    files: Vec<PathBuf>,
+}
+
+impl FontFilesMemo {
+    /// Still describes the tree: every visited directory has the mtime it had.
+    fn current(&self) -> bool {
+        self.visited
+            .iter()
+            .all(|(dir, seen)| dir_mtime(dir) == *seen)
+    }
+}
+
+/// The walks this process remembers, keyed by their root list. In production
+/// there is exactly one root list (`font_search_dirs()`), so this is one
+/// entry; tests walk private fixture roots and must not evict each other's
+/// entries or the real one. Bounded so a pathological caller cannot grow it.
+static FONT_FILES_MEMOS: std::sync::Mutex<Vec<FontFilesMemo>> = std::sync::Mutex::new(Vec::new());
+const MAX_FONT_FILES_MEMOS: usize = 8;
+
+/// [`system_font_files`] over an explicit root list, remembered per process.
+///
+/// A hit costs one `stat` per directory the last walk visited (a few dozen on
+/// a Linux tree, a handful on macOS) instead of that many `read_dir`s plus a
+/// `stat`/`file_type` per entry (~660 on a Mac) and a sort per directory. The
+/// key is exact for the tree's SHAPE: adding, removing or renaming an entry in
+/// any visited directory moves that directory's mtime. What it does not see is
+/// a file rewritten in place under the same name — which changes no path in
+/// the list anyway, and the list is all this function returns. The walk's
+/// bounded-work caps apply to the walk, exactly as before; a capped walk is
+/// remembered as what it found, like an uncapped one.
+///
+/// The backend worker resolves the configured family through this on every
+/// launch, and `list-fonts` / a config reload / the coverage index used to
+/// re-walk the same tree from scratch; now they share the worker's walk until
+/// the tree changes.
+fn memoized_font_files(roots: &[PathBuf]) -> Vec<PathBuf> {
+    memoized_font_files_walked(roots).0
+}
+
+/// [`memoized_font_files`] plus whether THIS call walked the tree (`false` =
+/// answered from the memo). The proof observable is per call, not a
+/// process-global counter: the lib tests run in parallel and any of them may
+/// take the real tree's first walk inside another test's window, so a global
+/// count is a flake, while this answer is exact for the root list asked about.
+fn memoized_font_files_walked(roots: &[PathBuf]) -> (Vec<PathBuf>, bool) {
+    {
+        let memos = FONT_FILES_MEMOS
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if let Some(memo) = memos.iter().find(|m| m.roots == roots)
+            && memo.current()
+        {
+            return (memo.files.clone(), false);
+        }
+    }
+    // Walk OUTSIDE the lock: another thread asking for a different root list
+    // (or the same one — a duplicate walk is only wasted work, never a wrong
+    // answer, and the second publish simply replaces the first) must not wait
+    // behind this one.
+    let catalog = Catalog::scan(roots, Limits::default());
+    let mut memos = FONT_FILES_MEMOS
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    memos.retain(|m| m.roots != roots);
+    if memos.len() >= MAX_FONT_FILES_MEMOS {
+        memos.clear();
+    }
+    memos.push(FontFilesMemo {
+        roots: roots.to_vec(),
+        visited: catalog.visited,
+        files: catalog.files.clone(),
+    });
+    (catalog.files, true)
+}
+
 /// Bounded file list used by renderer diagnostics and runtime discovery. This
 /// preserves the stable directory/lexical ordering while removing their former
-/// unbounded recursion, entry collection, and file accumulation.
+/// unbounded recursion, entry collection, and file accumulation. Remembered
+/// per process and revalidated by directory mtimes ([`memoized_font_files`]),
+/// so the second and every later caller pays a few `stat`s, not a walk.
 pub(crate) fn system_font_files() -> Vec<PathBuf> {
-    Catalog::scan(&crate::font_search_dirs(), Limits::default()).files
+    memoized_font_files(&crate::font_search_dirs())
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The walk is recursive and keeps no seen-set, so a search root that lies
+    /// inside another root is walked twice and every font under it is listed
+    /// (and, by every full-read consumer, read) twice. `FONT_DIRS` carried
+    /// `/System/Library/Fonts/Supplemental` beside its parent for exactly that
+    /// cost — 290 faces / 131 MB twice per walk on a Mac. Structural, so it is
+    /// red on that list on every host, not only where the directory exists.
+    #[test]
+    fn search_dirs_are_never_nested_so_the_walk_visits_a_file_once() {
+        let dirs = crate::font_search_dirs();
+        for (i, outer) in dirs.iter().enumerate() {
+            for (j, inner) in dirs.iter().enumerate() {
+                assert!(
+                    i == j || !inner.starts_with(outer),
+                    "font search dir {} lies inside {} — the recursive walk already                      visits it, and listing it as a root walks every file under it twice",
+                    inner.display(),
+                    outer.display()
+                );
+            }
+        }
+    }
+
+    /// The same property observed on THIS host's real font tree: the catalogue
+    /// names each path once. (Raw paths, deliberately not canonical ones — a
+    /// user whose `~/.fonts` is a symlink to `~/.local/share/fonts` legitimately
+    /// sees the same files under two prefixes, and that is a property of their
+    /// home directory, not of the walk.)
+    #[test]
+    fn system_font_files_lists_each_path_once() {
+        let files = system_font_files();
+        let mut seen = std::collections::HashSet::new();
+        let duplicates: Vec<&PathBuf> = files.iter().filter(|p| !seen.insert(*p)).collect();
+        assert!(
+            duplicates.is_empty(),
+            "{} of {} catalogued font paths are listed more than once, e.g. {}",
+            duplicates.len(),
+            files.len(),
+            duplicates[0].display()
+        );
+    }
 
     fn fixture(label: &str) -> PathBuf {
         let root = std::env::temp_dir().join(format!(
@@ -485,6 +625,63 @@ mod tests {
         let _ = std::fs::remove_dir_all(&root);
         std::fs::create_dir_all(&root).unwrap();
         root
+    }
+
+    /// The memo: a second ask over an unchanged tree is answered without a
+    /// walk; a font installed anywhere in the tree — here in a NESTED vendor
+    /// directory, the Linux layout, so a root-mtime key would miss it — is a
+    /// miss, and the answer includes it; a root that did not exist when the
+    /// memo was taken invalidates it by appearing. Private fixture roots, so
+    /// no concurrent caller of the real `system_font_files()` shares this key.
+    #[test]
+    fn the_font_files_memo_is_revalidated_by_the_visited_directories_mtimes() {
+        let root = fixture("memo");
+        let vendor = root.join("truetype").join("vendor");
+        std::fs::create_dir_all(&vendor).unwrap();
+        std::fs::write(vendor.join("a.ttf"), b"a").unwrap();
+        // A SIBLING of `root`, not a child: the walk is recursive and the
+        // search dirs are never nested (`search_dirs_are_never_nested_...`).
+        let absent_root = fixture("memo-later");
+        std::fs::remove_dir_all(&absent_root).unwrap();
+        let roots = vec![root.clone(), absent_root.clone()];
+
+        let (first, walked) = memoized_font_files_walked(&roots);
+        assert_eq!(first, vec![vendor.join("a.ttf")]);
+        assert!(walked, "a cold ask walks");
+
+        let (again, walked) = memoized_font_files_walked(&roots);
+        assert_eq!(again, first);
+        assert!(!walked, "an unchanged tree is answered from the memo");
+
+        // A font lands in the NESTED directory: only `vendor/`'s mtime moves.
+        // (A same-instant write can share the directory's mtime tick on a
+        // coarse filesystem; nudge the clock past it before writing.)
+        std::thread::sleep(std::time::Duration::from_millis(20));
+        std::fs::write(vendor.join("b.ttf"), b"b").unwrap();
+        let (grown, walked) = memoized_font_files_walked(&roots);
+        assert_eq!(grown, vec![vendor.join("a.ttf"), vendor.join("b.ttf")]);
+        assert!(walked, "an entry added deep in the tree is a miss");
+
+        // The second root comes into existence with a font in it.
+        std::thread::sleep(std::time::Duration::from_millis(20));
+        std::fs::create_dir_all(&absent_root).unwrap();
+        std::fs::write(absent_root.join("c.otf"), b"c").unwrap();
+        let (with_root, walked) = memoized_font_files_walked(&roots);
+        assert_eq!(
+            with_root,
+            vec![
+                vendor.join("a.ttf"),
+                vendor.join("b.ttf"),
+                absent_root.join("c.otf")
+            ]
+        );
+        assert!(walked, "a root appearing is a miss");
+
+        let (remembered, walked) = memoized_font_files_walked(&roots);
+        assert_eq!(remembered, with_root);
+        assert!(!walked, "and the new state is remembered");
+        std::fs::remove_dir_all(root).unwrap();
+        std::fs::remove_dir_all(absent_root).unwrap();
     }
 
     #[test]

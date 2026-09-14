@@ -119,11 +119,20 @@ impl std::error::Error for StoreLockError {}
 /// (The other codes in use are 1, 2, 3 and 127; none of them may mean this.)
 pub const CONTENDED_EXIT: u8 = 75;
 
-/// How often a waiting acquisition re-tries the lock. A re-try is a fresh
-/// [`try_lock_store`] — `ensure_dir` plus one open — on purpose: an fd held across a
-/// prefix that was removed and re-created under it would "acquire" an orphan inode
-/// while a new process locks the real file, and a few syscalls every half second
-/// is nothing against a wait that is idle by definition.
+/// How often a waiting acquisition re-tries the lock. A re-try RE-OPENS the lock
+/// file by path ([`open_store_lock`]) on purpose: an fd held across a prefix that
+/// was removed and re-created under it would "acquire" an orphan inode while a new
+/// process locks the real file. It does NOT re-harden the prefix: the first attempt
+/// is the full [`try_lock_store`], whose `ensure_dir` chmods the prefix and sets
+/// the backup-exclusion xattr, and a poll that repeated it wrote the prefix inode
+/// twice a second for the whole bound — a same-value `setxattr` bumps ctime on
+/// APFS (measured 2026-09-13), so a half-hour wait was ~3,600 journaled metadata
+/// writes, each an FSEvents change for the backup watchers the attribute keeps
+/// away. An `lstat` of the prefix, an open and a `try_lock` every half second are
+/// nothing against a wait that is idle by definition; only a prefix that is no
+/// longer a REAL DIRECTORY under the wait — vanished, or swapped for a symlink (the
+/// F16 class the first attempt refuses) — is vetted again, by the full
+/// acquisition, on that poll: it re-creates the one and refuses the other.
 const WAIT_POLL: Duration = Duration::from_millis(500);
 
 /// How long a waiter stays SILENT before it announces the wait to its caller
@@ -140,8 +149,12 @@ pub const WAIT_ANNOUNCE_GRACE: Duration = Duration::from_secs(2);
 const WAIT_MAX: Duration = Duration::from_secs(7 * 24 * 60 * 60);
 
 /// Acquire the store-wide writer lock, WAITING up to `timeout` for a holder to
-/// release it: the same [`try_lock_store`] first, then a [`WAIT_POLL`] cadence until
-/// it succeeds, the deadline passes (`Err(Contended)` — the loud sentence, unchanged),
+/// release it: the same [`try_lock_store`] first, then a [`WAIT_POLL`] cadence of
+/// write-free re-opens ([`open_store_lock`], each behind one `lstat` of the prefix
+/// — [`prefix_is_a_real_dir`]; the prefix is HARDENED once, not per poll, and
+/// vetted again only when that lstat says it is no longer a real directory — see
+/// [`WAIT_POLL`]) until it succeeds, the deadline passes (`Err(Contended)`
+/// — the loud sentence, unchanged),
 /// or `still_wanted` says the caller has gone (also `Err(Contended)`, so a waiter
 /// whose window quit stands down instead of racing the successor's own waiter for
 /// the freed lock). `on_first_contention` fires ONCE, with the lock path, the first
@@ -162,8 +175,12 @@ pub fn lock_store_waiting(
     let started = Instant::now();
     let deadline = started + timeout.min(WAIT_MAX);
     let mut announce = Some(on_first_contention);
+    // The first attempt creates and vets the prefix; the polls only re-open the
+    // lock file, and fall back to the full acquisition when the prefix is gone
+    // or is no longer a real directory.
+    let mut attempt = try_lock_store(layout);
     loop {
-        match try_lock_store(layout) {
+        match attempt {
             Ok(guard) => return Ok(guard),
             Err(StoreLockError::Contended(path)) => {
                 // The orphan check comes FIRST: a waiter whose caller has gone
@@ -182,6 +199,25 @@ pub fn lock_store_waiting(
                     return Err(StoreLockError::Contended(path));
                 }
                 std::thread::sleep(WAIT_POLL.min(deadline.saturating_duration_since(now)));
+                // The prefix's SHAPE is read before the lock file is re-opened
+                // through it: a link swapped in under the wait (F16) must meet
+                // the same lstat refusal the first attempt gave it, not an
+                // open that follows it. One metadata read, no write.
+                attempt = if prefix_is_a_real_dir(&layout.prefix) {
+                    match open_store_lock(&path) {
+                        // Removed between the lstat and the open: vetted again.
+                        Err(StoreLockError::Io(_, e))
+                            if e.kind() == std::io::ErrorKind::NotFound =>
+                        {
+                            try_lock_store(layout)
+                        }
+                        polled => polled,
+                    }
+                } else {
+                    // Gone, a symlink, a junction, a plain file: the full
+                    // acquisition re-creates the first and refuses the rest.
+                    try_lock_store(layout)
+                };
             }
             Err(io) => return Err(io),
         }
@@ -201,6 +237,29 @@ pub fn try_lock_store(layout: &Layout) -> Result<StoreLock, StoreLockError> {
     if let Err(e) = layout.ensure_dir(&layout.prefix) {
         return Err(StoreLockError::Io(path, e));
     }
+    open_store_lock(&path)
+}
+
+/// Whether `prefix` is still a REAL directory — the one shape a waiting poll may
+/// re-open the lock file under without vetting it again. `lstat`, never `stat`: a
+/// symlink swapped in for the prefix mid-wait (the F16 class `ensure_private_dir`
+/// refuses at the first attempt) would pass a `stat` as the directory it points at,
+/// and the open that followed it would take the lock through the link, on a file
+/// the real store never sees. On Windows a directory junction is a link too
+/// ([`crate::platform::is_reparse`]). One metadata read, no write.
+fn prefix_is_a_real_dir(prefix: &Path) -> bool {
+    std::fs::symlink_metadata(prefix)
+        .is_ok_and(|md| md.file_type().is_dir() && !crate::platform::is_reparse(&md))
+}
+
+/// The open-and-`try_lock` half of [`try_lock_store`], over a prefix that has already
+/// been vetted: creates the lock file `0600` if it is missing and takes the flock
+/// without blocking. What a [`lock_store_waiting`] poll repeats — a re-open by path
+/// every time (see [`WAIT_POLL`]) and no write to the prefix itself — once
+/// [`prefix_is_a_real_dir`] has said the prefix is still one. A missing prefix is
+/// the `NotFound` the open reports, which the waiter answers with the full
+/// acquisition; a bare caller sees it as the same `Io` refusal as any other.
+fn open_store_lock(path: &Path) -> Result<StoreLock, StoreLockError> {
     let mut opts = std::fs::OpenOptions::new();
     // Never truncate: a lock file is a rendezvous, not data (the FileLock discipline).
     opts.create(true).read(true).write(true).truncate(false);
@@ -209,14 +268,16 @@ pub fn try_lock_store(layout: &Layout) -> Result<StoreLock, StoreLockError> {
         use std::os::unix::fs::OpenOptionsExt as _;
         opts.mode(0o600);
     }
-    let file = match opts.open(&path) {
+    let file = match opts.open(path) {
         Ok(f) => f,
-        Err(e) => return Err(StoreLockError::Io(path, e)),
+        Err(e) => return Err(StoreLockError::Io(path.to_path_buf(), e)),
     };
     match file.try_lock() {
         Ok(()) => Ok(StoreLock { _file: file }),
-        Err(std::fs::TryLockError::WouldBlock) => Err(StoreLockError::Contended(path)),
-        Err(std::fs::TryLockError::Error(e)) => Err(StoreLockError::Io(path, e)),
+        Err(std::fs::TryLockError::WouldBlock) => {
+            Err(StoreLockError::Contended(path.to_path_buf()))
+        }
+        Err(std::fs::TryLockError::Error(e)) => Err(StoreLockError::Io(path.to_path_buf(), e)),
     }
 }
 
@@ -425,6 +486,153 @@ mod tests {
         );
         assert_eq!(announced.get(), 1, "announced exactly once per wait");
         let _ = std::fs::remove_dir_all(&a.prefix);
+    }
+
+    /// A WAITING POLL RE-OPENS THE LOCK FILE BUT NEVER RE-HARDENS THE PREFIX. The
+    /// first attempt is the full [`try_lock_store`] (it creates and vets the prefix
+    /// and sets the backup-exclusion xattr once); every poll after it is one open
+    /// and one `try_lock`. The poll used to be the full acquisition, whose
+    /// `ensure_dir` re-chmods the prefix and re-sets the xattr on every try — and a
+    /// same-value `setxattr` bumps the directory's ctime (measured on APFS,
+    /// 2026-09-13; a same-mode chmod does not), so a queued launch child dirtied the
+    /// prefix inode twice a second for its whole half-hour bound: ~3,600 journaled
+    /// metadata writes, each an FSEvents change for the very backup watchers the
+    /// attribute exists to keep away. Pinned by the prefix's ctime: after a wait of
+    /// three polls it is no later than the first attempt's write.
+    #[cfg(unix)]
+    #[test]
+    fn lock_store_waiting_polls_without_rewriting_the_prefix() {
+        use std::os::unix::fs::MetadataExt as _;
+        let a = temp_layout("wait-idle");
+        let b = Layout {
+            prefix: a.prefix.clone(),
+        };
+        let _guard = try_lock_store(&a).expect("first acquisition succeeds");
+        // The first attempt's own write lands inside the first few milliseconds of
+        // the wait; a poll's would land 500 ms, 1000 ms, … after it.
+        let wall_start = std::time::SystemTime::now();
+        let timeout = Duration::from_millis(1500);
+        let err = match lock_store_waiting(&b, timeout, |_| {}, || true) {
+            Ok(_) => panic!("a lock held for the whole wait must refuse"),
+            Err(e) => e,
+        };
+        assert!(matches!(err, StoreLockError::Contended(..)), "{err:?}");
+        let md = std::fs::symlink_metadata(&a.prefix).unwrap();
+        let ctime = std::time::SystemTime::UNIX_EPOCH
+            + Duration::new(
+                u64::try_from(md.ctime()).unwrap_or(0),
+                u32::try_from(md.ctime_nsec()).unwrap_or(0),
+            );
+        let last_write = ctime.duration_since(wall_start).unwrap_or(Duration::ZERO);
+        assert!(
+            last_write < WAIT_POLL - Duration::from_millis(100),
+            "the prefix was last written {last_write:?} into a {timeout:?} wait: a poll \
+             re-hardened it (the first attempt's write is the only one allowed)"
+        );
+        let _ = std::fs::remove_dir_all(&a.prefix);
+    }
+
+    /// The one poll that DOES vet again: a prefix removed under the wait (the
+    /// holder's `gc`, a hand `rm -rf`) makes the re-open fail `NotFound`, and that
+    /// poll is the full acquisition — the prefix comes back hardened and the lock
+    /// is taken on the real, new file rather than an orphan inode.
+    ///
+    /// Unix only: the remover deletes a directory whose `store.lock` the holder
+    /// keeps open and flock'd, which Unix allows; on Windows the open
+    /// `LockFileEx`'d handle leaves the file delete-pending and the removal fails.
+    #[cfg(unix)]
+    #[test]
+    fn lock_store_waiting_re_vets_a_prefix_that_vanished_under_it() {
+        let a = temp_layout("wait-vanish");
+        let b = Layout {
+            prefix: a.prefix.clone(),
+        };
+        let guard = try_lock_store(&a).expect("first acquisition succeeds");
+        let prefix = a.prefix.clone();
+        let remover = std::thread::spawn(move || {
+            std::thread::sleep(Duration::from_millis(300));
+            std::fs::remove_dir_all(&prefix).expect("the prefix is removable under a holder");
+        });
+        let got = lock_store_waiting(&b, Duration::from_secs(10), |_| {}, || true);
+        assert!(
+            got.is_ok(),
+            "the re-created prefix's lock is free: {:?}",
+            got.err()
+        );
+        assert!(
+            b.store_lock().is_file(),
+            "store.lock re-created under the prefix"
+        );
+        let dir_mode = std::fs::metadata(&b.prefix).unwrap().permissions().mode();
+        assert_eq!(dir_mode & 0o777, 0o700, "the re-created prefix is hardened");
+        remover.join().unwrap();
+        drop(guard);
+        drop(got);
+        let _ = std::fs::remove_dir_all(&a.prefix);
+    }
+
+    /// A WAITING POLL RE-VETS THE PREFIX'S SHAPE, NOT ONLY ITS PRESENCE (F16, the
+    /// symlinked-prefix refusal). The first attempt's `ensure_dir` lstat-refuses a
+    /// prefix that is a symlink; a poll that only re-opened the lock file by path
+    /// would follow a link a same-uid actor swapped in mid-wait and take the lock
+    /// on whatever directory it points at — through the link, on a file the real
+    /// store never sees. Every poll now lstats the prefix first (one metadata read
+    /// per 500 ms and no write, so the no-rewrite property above stands), and
+    /// anything but a real directory goes to the full acquisition, which refuses
+    /// the link with the F16 error at that poll rather than at the bound.
+    ///
+    /// RED before the fix: `Ok` — the lock taken on `<elsewhere>/store.lock`.
+    /// Unix only: the swap renames a directory whose held lock file stays open.
+    #[cfg(unix)]
+    #[test]
+    fn lock_store_waiting_refuses_a_prefix_swapped_for_a_symlink_under_it() {
+        let a = temp_layout("wait-symlink");
+        let b = Layout {
+            prefix: a.prefix.clone(),
+        };
+        let guard = try_lock_store(&a).expect("first acquisition succeeds");
+        let elsewhere = temp_layout("wait-symlink-target");
+        std::fs::create_dir_all(&elsewhere.prefix).unwrap();
+        let prefix = a.prefix.clone();
+        let moved = PathBuf::from(format!("{}-moved", a.prefix.display()));
+        let target = elsewhere.prefix.clone();
+        let aside = moved.clone();
+        let swapper = std::thread::spawn(move || {
+            std::thread::sleep(Duration::from_millis(300));
+            // Two atomic renames inside the waiter's first poll sleep: the real
+            // prefix aside (its held lock file goes with it), then a link over
+            // its name — never a moment with nothing at the path.
+            std::fs::rename(&prefix, &aside).expect("the prefix moves aside under a holder");
+            std::os::unix::fs::symlink(&target, &prefix).expect("a link takes the prefix's name");
+        });
+        let started = Instant::now();
+        let err = match lock_store_waiting(&b, Duration::from_secs(10), |_| {}, || true) {
+            Ok(_) => panic!("the waiter locked THROUGH the link"),
+            Err(e) => e,
+        };
+        swapper.join().unwrap();
+        assert!(
+            matches!(
+                err,
+                StoreLockError::Io(_, ref e)
+                    if e.kind() == io::ErrorKind::PermissionDenied
+                        && e.to_string().contains("is a symlink; refusing")
+            ),
+            "the F16 refusal, from the full acquisition: {err:?}"
+        );
+        assert!(
+            started.elapsed() < Duration::from_secs(5),
+            "refused at the poll that saw the link, not at the bound: {:?}",
+            started.elapsed()
+        );
+        assert!(
+            !elsewhere.store_lock().exists(),
+            "nothing was opened through the link"
+        );
+        drop(guard);
+        let _ = std::fs::remove_file(&a.prefix);
+        let _ = std::fs::remove_dir_all(&moved);
+        let _ = std::fs::remove_dir_all(&elsewhere.prefix);
     }
 
     /// An unusable prefix is not something to wait on: the `Io` refusal comes back

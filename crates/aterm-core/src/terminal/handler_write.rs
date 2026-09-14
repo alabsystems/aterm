@@ -837,7 +837,9 @@ impl TerminalHandler<'_> {
             return;
         };
         self.grid.cell_extra_mut(row, col).add_combining(combining);
-        self.grid.damage_mut().mark_cell(row, col);
+        // Combining marks, variation selectors, and joined emoji change the
+        // grapheme even when no base cell is rewritten or cursor advanced.
+        self.grid.mark_content_cell(row, col);
     }
 
     /// Check if the previous cell ends with ZWJ (Zero Width Joiner).

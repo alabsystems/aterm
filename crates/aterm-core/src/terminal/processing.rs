@@ -91,6 +91,12 @@ impl Terminal {
         reason = "main entry point with sequential processing stages"
     )]
     pub fn process_at(&mut self, input: &[u8], clock: ClockReading) {
+        // MODE-MIRROR OBLIGATION: the lock-free word the input seam encodes
+        // against must still equal the live fold when a batch begins. Every
+        // host mutator outside this function refreshes it; one that forgot
+        // fails HERE, on the next byte of output, in every debug/test build.
+        #[cfg(debug_assertions)]
+        self.debug_assert_mode_mirror_in_sync();
         // Logical clocks for this batch: the single readings every downstream
         // time-dependent read observes. Set before the parser/post_process run.
         self.transient.process_now = clock.monotonic;
@@ -143,10 +149,10 @@ impl Terminal {
         if self.transient.pipeline_timestamps.profiling_enabled {
             let entry = aterm_time::Instant::now(); // CLOCK-EXEMPT: profiling diagnostic (gated), measures real latency, not grid state (aterm_time = std on native, JS clock on wasm)
             let parse_start = entry;
-            {
-                let (parser, mut handler) = self.split_for_process();
-                parser.advance_fast(input, &mut handler);
-            }
+            // Split after every ESU (and one byte short of every alt-screen exit)
+            // so the alt-screen archive sees each committed frame; otherwise one
+            // `advance_fast` over the whole input (see `alt_archive.rs`).
+            self.advance_parser_archiving(input);
             // RIS side effects the handler cannot reach (#7153). The parser is NOT
             // reset here: ESC c is an EscDispatch that already left it in Ground, so
             // a reset after the WHOLE slice (to 2026-09-12) only wiped the half-parsed
@@ -175,6 +181,9 @@ impl Terminal {
 
             let grid_start = aterm_time::Instant::now(); // CLOCK-EXEMPT: profiling diagnostic (gated), not grid state (aterm_time = std on native, JS clock on wasm)
             damage_class = self.post_process(lines_before, was_alt);
+            // Alt-screen archive: a sync-timeout close `post_process` just forced,
+            // and the rate-limited commit for apps that never use 2026.
+            self.alt_archive_epilogue();
             // Observation Kernel (L0): evaluate + latch armed watchers at the one
             // seam where this batch's mutation has landed. `process_now` is the
             // injected clock (never read here), so this is replay-deterministic.
@@ -188,10 +197,10 @@ impl Terminal {
                 input.len(),
             );
         } else {
-            {
-                let (parser, mut handler) = self.split_for_process();
-                parser.advance_fast(input, &mut handler);
-            }
+            // Split after every ESU (and one byte short of every alt-screen exit)
+            // so the alt-screen archive sees each committed frame; otherwise one
+            // `advance_fast` over the whole input (see `alt_archive.rs`).
+            self.advance_parser_archiving(input);
             // RIS side effects the handler cannot reach (#7153). The parser is NOT
             // reset here: ESC c is an EscDispatch that already left it in Ground, so
             // a reset after the WHOLE slice (to 2026-09-12) only wiped the half-parsed
@@ -217,6 +226,8 @@ impl Terminal {
                 self.transient.pending_parser_reset = false;
             }
             damage_class = self.post_process(lines_before, was_alt);
+            // Alt-screen archive epilogue: see the gated branch above.
+            self.alt_archive_epilogue();
             // Observation Kernel (L0): see the gated branch above — same seam,
             // same injected clock, replay-deterministic.
             self.observe_at(self.transient.process_now);
@@ -344,6 +355,11 @@ impl Terminal {
         // corrupts the grid trips here immediately.
         #[cfg(debug_assertions)]
         self.grid.assert_structural_invariants();
+
+        // Publish this batch's input-encoding fold for the lock-free seam read
+        // (see `ModeMirror`). Last thing before the guard drops, so a key
+        // encoded after this hold sees exactly the mode this batch left.
+        self.refresh_mode_mirror();
     }
 
     /// Store per-stage pipeline durations in transient state (#5560).
@@ -906,6 +922,12 @@ fn _terminal_field_exhaustiveness_check(t: &mut Terminal) {
         // Reused row-text scratch for the kernel's row scan — ephemeral,
         // observation-only, never VT state.
         row_text_scratch: _,
+        // Lock-free publication of the encoder fold for the input seam:
+        // derived FROM VT state under the lock, never an input to the handler.
+        mode_mirror: _,
+        // Alt-screen scroll-off archive: observation-only, driven by `process_at`
+        // between parser slices and at the epilogue, never by a VT dispatch.
+        alt_archive: _,
     } = t;
 }
 

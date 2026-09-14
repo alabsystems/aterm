@@ -117,6 +117,7 @@ impl Terminal {
     /// `reset()`/RIS like the `allow_*` bits.
     pub fn set_kitty_keyboard_enabled(&mut self, enabled: bool) {
         self.modes.kitty_keyboard_enabled = enabled;
+        self.refresh_mode_mirror();
     }
 
     /// Whether the Kitty keyboard protocol capability is enabled
@@ -820,11 +821,13 @@ impl Terminal {
 
     /// The ECHO ANCHOR: where the most recent PTY print run ended —
     /// `(row, col)` in ACTIVE-grid coordinates (the same space as
-    /// [`Self::cursor`]) plus a monotonic per-print-action sequence, so a
-    /// host can tell "output landed" apart from a stale sample even when the
-    /// end position did not move. `None` before the first print (or after a
-    /// reset). Observability for the cursor-effect host's hidden/parked-caret
-    /// lane; never read by the terminal itself.
+    /// [`Self::cursor`]), one past the last glyph — a pending wrap counts,
+    /// so a glyph at the last column reports `col == cols` while the cursor
+    /// itself stays on `cols - 1` — plus a monotonic per-print-action
+    /// sequence, so a host can tell "output landed" apart from a stale
+    /// sample even when the end position did not move. `None` before the
+    /// first print (or after a reset). Observability for the cursor-effect
+    /// host's hidden/parked-caret lane; never read by the terminal itself.
     #[must_use]
     pub fn print_anchor(&self) -> Option<(u16, u16, u64)> {
         self.transient

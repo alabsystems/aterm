@@ -179,6 +179,7 @@ fn glow_config() -> GlowConfig {
     GlowConfig {
         classic_mono: false,
         ribbon_tall: true,
+        ribbon_flat: false,
         enabled: true,
         dark_theme: true,
         theme_fg: 0x00C8_D3F5,

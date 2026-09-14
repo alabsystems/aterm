@@ -22,10 +22,11 @@ use std::time::{Duration, Instant};
 
 use super::classify::{DEFAULT_PYTHON_ALLOW, Verdict, classify_command_with};
 use super::phase::{
-    Phase, busy_signal, composer_text, has_composer_frame, is_placeholder, last_said_index,
-    last_said_row, status_row, worker_phase,
+    Phase, busy_signal, composer_draft, composer_text, context_left, has_composer_frame,
+    is_placeholder, last_said_index, last_said_row, status_row, survey_open, worker_phase,
 };
 use super::prompt::{Prompt, PromptKind, parse_prompt, prompt_box_span};
+use super::report::ReportOpts;
 use super::screen::{Screen, parse_text_json};
 
 /// One `aterm-ctl` exchange: the exit code, stdout and stderr.
@@ -190,6 +191,23 @@ pub struct SuperviseOpts {
     pub python_allow: Vec<String>,
     /// A notes file to append one line per action to.
     pub notes: Option<PathBuf>,
+    /// `watch --report`: an idle, question or limited point's EVENT line
+    /// carries `complete=<0|1> rows=<n>` of `report` before its summary.
+    pub report: bool,
+    /// `--dismiss-surveys`: when Claude Code's session survey appears, press
+    /// `0` on it with the guarded press (`key if=^●.How.is.Claude.doing 0`)
+    /// and, once it has left, say `DISMISSED survey seq=<n>`, instead of
+    /// saying `EVENT survey …`. `0` only, ever: a rating is the human's to give.
+    pub dismiss_surveys: bool,
+    /// `--context-warn`: the percentage of the worker's context left
+    /// ([`context_left`]) at or below which the loop says `EVENT context
+    /// seq=<n> <v>% until auto-compact`, once a descent, and after which the
+    /// indicator gone from a framed screen with no box up (or reading 30
+    /// points or more higher) is said as `EVENT compacted seq=<n>`. `0` says
+    /// neither — the default here; the CLI's is 10. The watch lasts one loop,
+    /// armed at its start: a compaction between two `supervise` runs is not
+    /// seen.
+    pub context_warn: u8,
 }
 
 impl SuperviseOpts {
@@ -212,6 +230,21 @@ const IDLE_MS: &str = "2000";
 const BUSY_FOOTER: &str = "esc.to.interrupt";
 /// The row `key if=` requires before pressing an option.
 const PROCEED: &str = "Do.you.want.to.proceed";
+/// The row `key if=` requires before pressing `0` on the session survey: its
+/// question row, `●` in column 0. The server tests the pattern against EVERY
+/// row on the screen, and a copy of the survey — a tool's output under the
+/// `⎿` gutter, the worker quoting it, this very pattern in an EVENT line or
+/// in `--help` — does not start its row with `●`, so a copy on the screen
+/// when the survey itself has gone lets nothing through to the composer. The
+/// one copy that does match is a worker message that opens with the question
+/// itself on a platform that draws the message glyph as `●`, not `⏺`.
+const SURVEY_ROW: &str = "^●.How.is.Claude.doing";
+/// How many points higher than its last reading the context indicator must
+/// read, after `EVENT context`, for the worker to have compacted — a
+/// compaction replaces the history with a summary and frees most of the
+/// context; a smaller rise is not taken for one. Not measured: how far the
+/// reading rises when `/model` switches the worker to a larger context.
+const COMPACTED_RISE: u8 = 30;
 /// How long the fallback press waits for the worker to take the digit before
 /// looking for one that landed in the composer.
 const STRAY_SETTLE: Duration = Duration::from_millis(2000);
@@ -247,7 +280,7 @@ const RECONNECT_PAUSE_MAX: Duration = Duration::from_secs(8);
 
 /// Why a request failed, as the loop needs to know it.
 #[derive(Debug, Clone, PartialEq, Eq)]
-enum Fail {
+pub(super) enum Fail {
     /// The request was not served ([`Session::unserved`]): ridden out
     /// ([`Session::ride_out`]).
     Lost(String),
@@ -337,6 +370,36 @@ struct Looking {
     /// in one wait's locals, so a busy spell read before a lost connection
     /// still counts after it.
     moved: bool,
+    /// Where the session survey stood at the last look ([`Session::survey`]).
+    survey: Survey,
+}
+
+/// The session survey, as the loop left it at a look ([`Session::survey`]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Survey {
+    /// Not open, or not yet said: one open at the next look (with no box up
+    /// and no draft typed) has appeared.
+    Closed,
+    /// Open and said (or handed over): nothing more is said or pressed while
+    /// it stays open. A read that shows it gone ends this, however briefly.
+    Said,
+    /// `--dismiss-surveys` tried its guarded `0`: `pressed` is the server's
+    /// stamp on a `0` it wrote, `None` a press it skipped. The next look
+    /// without a box or a draft says what came of it.
+    Tried { pressed: Option<u64> },
+}
+
+/// Where `--context-warn`'s watch on the context indicator stands
+/// ([`Session::watch_context`]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Context {
+    /// Not warned: the first reading at or below the threshold is said.
+    Armed,
+    /// Said (`EVENT context …`), `last` the latest reading since. The
+    /// indicator gone from a framed screen with no box up, or reading
+    /// [`COMPACTED_RISE`] points or more over `last`, is the compaction: said
+    /// once, and the watch is armed again.
+    Warned { last: u8 },
 }
 
 /// What [`Session::auto_read`] made of a turn.
@@ -353,9 +416,10 @@ enum Step {
 trait Review {
     /// A read-only prompt was approved; the press landed at `seq`.
     fn approved(&mut self, seq: u64, command: &str) -> Result<(), String>;
-    /// A new review point. `false` stops the loop with it (`supervise`);
-    /// `true` means it was reported and the loop keeps watching (`watch`).
-    fn review(&mut self, turn: &Turn) -> Result<bool, String>;
+    /// A new review point, with its report counted when `--report` asked for
+    /// one. `false` stops the loop with it (`supervise`); `true` means it was
+    /// reported and the loop keeps watching (`watch`).
+    fn review(&mut self, turn: &Turn, report: Option<ReportBrief>) -> Result<bool, String>;
     /// An informational line (`RECONNECT …`, `RECONNECTED …`), said as it
     /// happens.
     fn say(&mut self, line: &str) -> Result<(), String>;
@@ -371,7 +435,7 @@ impl Review for StopAtReview<'_> {
     fn approved(&mut self, _seq: u64, _command: &str) -> Result<(), String> {
         Ok(())
     }
-    fn review(&mut self, _turn: &Turn) -> Result<bool, String> {
+    fn review(&mut self, _turn: &Turn, _report: Option<ReportBrief>) -> Result<bool, String> {
         Ok(false)
     }
     fn say(&mut self, line: &str) -> Result<(), String> {
@@ -390,8 +454,12 @@ impl Review for Lines<'_> {
     fn approved(&mut self, seq: u64, command: &str) -> Result<(), String> {
         emit(self.out, &format!("APPROVED seq={seq} {}", clip(command)))
     }
-    fn review(&mut self, turn: &Turn) -> Result<bool, String> {
-        emit(self.out, &event_line(turn, self.allow))?;
+    fn review(&mut self, turn: &Turn, report: Option<ReportBrief>) -> Result<bool, String> {
+        let line = match report {
+            Some(brief) => reported_event_line(turn, self.allow, brief),
+            None => event_line(turn, self.allow),
+        };
+        emit(self.out, &line)?;
         Ok(true)
     }
     fn say(&mut self, line: &str) -> Result<(), String> {
@@ -417,10 +485,29 @@ enum Press {
 enum Pressing {
     /// The press was decided and seen through.
     Done(Press),
+    /// Nothing was written: the host has no guarded press, and the session
+    /// survey is open — an unguarded `1` that lands after the box resolved
+    /// is a rating (`1: Bad`), and leaves no stray digit to find.
+    Withheld,
     /// The connection was lost first. `known` is what the loop knows the press
     /// did — `None` when the press itself got no answer, so the `1` may or may
     /// not have been written — and `why` the failure.
     Lost { known: Option<Press>, why: String },
+}
+
+/// What `--dismiss-surveys`' guarded `0` did ([`Session::dismiss_survey`]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Dismiss {
+    /// The `0` was written while the survey was up; `seq` is the server's
+    /// stamp (the screen read before it, when it stamped none).
+    Pressed { seq: u64 },
+    /// Nothing was written: no row matched at the check — the survey had
+    /// left the screen first, or its row did not match (the next look finds
+    /// it still open and hands it over).
+    Skipped,
+    /// The host has no `key if=`: nothing is pressed unguarded, and the
+    /// survey is said as `EVENT survey …` instead.
+    Unguarded,
 }
 
 /// One driven session: the transport, the target selector, the probed caps,
@@ -450,6 +537,17 @@ pub struct Session<'a, C: Ctl> {
     /// because the connection was lost first: the command it answered. The
     /// next turn's screen is checked for it ([`Self::look`]).
     stray: Option<String>,
+    /// A screen read since the loop last looked at the session survey showed
+    /// none open ([`Self::screen`], [`Self::survey`]) — a busy read on the
+    /// way to a turn included, so a survey that leaves and comes back while
+    /// the worker is busy is a new appearance.
+    survey_gone: bool,
+    /// `--context-warn`'s threshold for the loop in progress
+    /// ([`Self::watch_context`]), set by [`Self::drive`] from its options:
+    /// `0` — off — until then, so `await-turn` says nothing about it.
+    context_warn: u8,
+    /// Where the watch on the context indicator stands.
+    context: Context,
 }
 
 impl<'a, C: Ctl> Session<'a, C> {
@@ -465,6 +563,9 @@ impl<'a, C: Ctl> Session<'a, C> {
             probing: false,
             last: None,
             stray: None,
+            survey_gone: false,
+            context_warn: 0,
+            context: Context::Armed,
         }
     }
 
@@ -485,7 +586,7 @@ impl<'a, C: Ctl> Session<'a, C> {
     /// progress; a request of the outage's kind served again ends it, and so
     /// does an `await seq` that latched — the content moved on the instance
     /// that answers now. The probe read's answer ends nothing.
-    fn call(&mut self, args: &[&str]) -> Result<CtlReply, Fail> {
+    pub(super) fn call(&mut self, args: &[&str]) -> Result<CtlReply, Fail> {
         let mut full: Vec<&str> = Vec::with_capacity(args.len() + 1);
         if let Some(sid) = &self.sid {
             full.push(sid.as_str());
@@ -521,13 +622,13 @@ impl<'a, C: Ctl> Session<'a, C> {
     /// request it forwards to the instance it replaces falls through to `ERR
     /// no such session` once that one is gone. Outside an outage `no such
     /// session` is the session gone, and final.
-    fn unserved(&self, r: &CtlReply) -> bool {
+    pub(super) fn unserved(&self, r: &CtlReply) -> bool {
         r.lost() || (self.outage.is_some() && r.is_err("no such session"))
     }
 
     /// A failed request's error, typed: [`Fail::Lost`] when it was not served
     /// ([`Self::unserved`]), else final.
-    fn fault(&self, r: &CtlReply, what: String) -> Fail {
+    pub(super) fn fault(&self, r: &CtlReply, what: String) -> Fail {
         if self.unserved(r) {
             Fail::Lost(what)
         } else {
@@ -550,6 +651,7 @@ impl<'a, C: Ctl> Session<'a, C> {
     /// re-entrant lock and fails the gate (2026-09-12, `press_one_guarded`).
     fn screen(&mut self) -> Result<Screen, Fail> {
         let screen = self.read_once()?;
+        self.survey_gone |= !survey_open(&screen.rows);
         self.last = Some(screen.clone());
         Ok(screen)
     }
@@ -651,7 +753,9 @@ impl<'a, C: Ctl> Session<'a, C> {
         let mut moved = false;
         loop {
             let remaining = deadline.saturating_duration_since(Instant::now());
-            match self.await_turn_from(remaining, gone_first, &mut moved) {
+            // `--context-warn` is the loops' (`drive` arms it): `await-turn`
+            // has no context line to say.
+            match self.await_turn_from(remaining, gone_first, &mut moved, &mut |_| Ok(())) {
                 Ok(turn) => return Ok(turn),
                 Err(Fail::Lost(why)) => {
                     let rode = self.ride_out(why, deadline, &mut |line| {
@@ -675,12 +779,17 @@ impl<'a, C: Ctl> Session<'a, C> {
     /// signal — the settle wait is the first one. Sets `saw_busy` when a read
     /// on the way was busy (the worker moved since the last look); the caller
     /// owns the flag, so what was read before a lost connection is not lost
-    /// with it.
+    /// with it. Every read before the deadline is shown to the context
+    /// indicator's watch ([`Self::watch_context`]), a busy one included — a
+    /// worker compacts in the middle of a turn — and what it has to say goes
+    /// to `say` as the read comes; a read at or after the deadline is not
+    /// shown to it, so it says nothing then.
     fn await_turn_from(
         &mut self,
         timeout: Duration,
         gone_first: bool,
         saw_busy: &mut bool,
+        say: &mut dyn FnMut(&str) -> Result<(), String>,
     ) -> Result<Turn, Fail> {
         let deadline = Instant::now() + timeout;
         let mut first = gone_first;
@@ -707,6 +816,9 @@ impl<'a, C: Ctl> Session<'a, C> {
             }
             first = false;
             let screen = self.screen()?;
+            if Instant::now() < deadline {
+                self.watch_context(&screen, say)?;
+            }
             let mut phase = worker_phase(&screen.rows);
             // No composer frame and the screen never held still: a build's or a
             // REPL's output still arriving, not the end of anything.
@@ -742,13 +854,70 @@ impl<'a, C: Ctl> Session<'a, C> {
         }
     }
 
+    /// `--context-warn` at one read: Claude Code's context indicator
+    /// ([`context_left`]) against the threshold. The first reading at or
+    /// below it says `EVENT context seq=<n> <v>% until auto-compact` — the
+    /// worker is about to compact, and a compaction replaces its history with
+    /// a summary, so this is the manager's moment to have it bring its
+    /// handoff notes up to date — and nothing more is said while it keeps
+    /// descending. After that, a read of the composer frame with no indicator
+    /// on it, or with one that reads [`COMPACTED_RISE`] points or more over
+    /// the last reading, is the compaction: `EVENT compacted seq=<n>` is said
+    /// once — the standing rules the manager gave may be gone with the
+    /// history — and the watch is armed again, so the next descent is said
+    /// too. A read without the frame (not Claude Code, or covered) shows
+    /// nothing either way, and one with a box up (the box stands where the
+    /// indicator is parked) is no sign that it has gone — a reading on it
+    /// still counts. Off at `0`: nothing is said, and no line either loop
+    /// prints changes.
+    fn watch_context(
+        &mut self,
+        screen: &Screen,
+        say: &mut dyn FnMut(&str) -> Result<(), String>,
+    ) -> Result<(), String> {
+        let warn = self.context_warn;
+        if warn == 0 {
+            return Ok(());
+        }
+        let rows = &screen.rows;
+        let left = context_left(rows);
+        match self.context {
+            Context::Armed => match left {
+                Some(left) if left <= warn => {
+                    self.context = Context::Warned { last: left };
+                    say(&format!(
+                        "EVENT context seq={} {left}% until auto-compact",
+                        screen.seq
+                    ))
+                }
+                _ => Ok(()),
+            },
+            Context::Warned { last } => {
+                let compacted = match left {
+                    Some(left) => left >= last.saturating_add(COMPACTED_RISE),
+                    // Gone, from where it would show: the frame up, no box.
+                    None => has_composer_frame(rows) && parse_prompt(rows).is_none(),
+                };
+                if compacted {
+                    self.context = Context::Armed;
+                    return say(&format!("EVENT compacted seq={}", screen.seq));
+                }
+                if let Some(left) = left {
+                    self.context = Context::Warned { last: left };
+                }
+                Ok(())
+            }
+        }
+    }
+
     /// The loop. Returns the text to print and the exit code: `0` with the
     /// compact result when the worker needs the manager (a non-read prompt, a
     /// question, a limit notice, an idle composer); [`EXIT_TIMEOUT`] with
     /// `TIMEOUT` and the last read's compact result when the budget is spent —
     /// a turn read at or after the deadline is the TIMEOUT, never pressed, and
     /// so is a budget spent while an outage is ridden out. An outage is ridden
-    /// out ([`Self::ride_out`]), its lines on stderr, never in the result.
+    /// out ([`Self::ride_out`]), its lines on stderr, never in the result; so
+    /// are the survey's and the context indicator's `EVENT` lines.
     pub fn supervise(&mut self, opts: &SuperviseOpts) -> Result<(String, u8), String> {
         self.supervise_to(opts, &mut std::io::stderr())
     }
@@ -760,6 +929,12 @@ impl<'a, C: Ctl> Session<'a, C> {
         log: &mut dyn Write,
     ) -> Result<(String, u8), String> {
         let allow = opts.allow();
+        // `report` counts into `watch`'s one line; `supervise` prints the rows
+        // themselves, so it reads none.
+        let opts = &SuperviseOpts {
+            report: false,
+            ..opts.clone()
+        };
         Ok(match self.drive(opts, &mut StopAtReview { log })? {
             End::Stopped(turn) => (render_result(&turn, &allow), 0),
             End::Timeout(turn) => (
@@ -792,7 +967,15 @@ impl<'a, C: Ctl> Session<'a, C> {
     /// (returns 1) when the session goes, the outage outlasts its reconnect
     /// window (`EXIT reconnect window lapsed: <the last failure>`) or the loop
     /// fails (a request, the notes file). Every line is flushed as it is
-    /// written.
+    /// written. With [`SuperviseOpts::report`], an idle, question or limited
+    /// point's line carries `complete=<0|1> rows=<n>` of the report read at
+    /// that point ([`reported_event_line`]); without it the line is
+    /// [`event_line`]'s. With [`SuperviseOpts::context_warn`] above 0, Claude
+    /// Code's context indicator is watched on every read of a turn, a busy
+    /// one included: `EVENT context seq=<n> <v>% until auto-compact` when it
+    /// first reads at or below the threshold, once a descent, then `EVENT
+    /// compacted seq=<n>` once it has gone (or jumped back up) — the worker
+    /// compacted, and the watch is armed again.
     pub fn watch(&mut self, opts: &SuperviseOpts, out: &mut dyn Write) -> u8 {
         let allow = opts.allow();
         let end = self.drive(
@@ -824,11 +1007,16 @@ impl<'a, C: Ctl> Session<'a, C> {
     fn drive(&mut self, opts: &SuperviseOpts, review: &mut dyn Review) -> Result<End, String> {
         let deadline = Instant::now() + opts.max;
         let allow = opts.allow();
+        // Every read of this loop's turns is shown to the context watch
+        // (`await_turn_from`), armed from the start.
+        self.context_warn = opts.context_warn;
+        self.context = Context::Armed;
         let mut state = Looking {
             approved: Vec::new(),
             gone_first: true,
             handed: None,
             moved: false,
+            survey: Survey::Closed,
         };
         loop {
             match self.look(opts, &allow, &mut state, deadline, review) {
@@ -861,7 +1049,13 @@ impl<'a, C: Ctl> Session<'a, C> {
     /// a review point over, or pass over the point already handed; `Some`
     /// ends the loop. First, if the fallback press may have left a `1` in the
     /// composer unchecked ([`Self::stray`]), the turn is checked for it: one
-    /// found is backspaced and noted, and the loop looks again.
+    /// found is backspaced and noted, and the loop looks again. Then the
+    /// session survey ([`Self::survey`]): one that just appeared is said
+    /// before the point — or, `--dismiss-surveys`, dismissed with a guarded
+    /// `0`, and the loop looks again from a fresh read, where what the `0`
+    /// did is said. The context watch's lines (`--context-warn`,
+    /// [`Self::watch_context`]) are said as the turn's reads come, ahead of
+    /// all of it.
     fn look(
         &mut self,
         opts: &SuperviseOpts,
@@ -871,7 +1065,9 @@ impl<'a, C: Ctl> Session<'a, C> {
         review: &mut dyn Review,
     ) -> Result<Option<End>, Fail> {
         let remaining = deadline.saturating_duration_since(Instant::now());
-        let turn = self.await_turn_from(remaining, state.gone_first, &mut state.moved)?;
+        // The context watch speaks as the reads come, mid-turn included.
+        let mut say = |line: &str| review.say(line);
+        let turn = self.await_turn_from(remaining, state.gone_first, &mut state.moved, &mut say)?;
         if std::mem::take(&mut state.moved) {
             state.handed = None;
         }
@@ -881,7 +1077,7 @@ impl<'a, C: Ctl> Session<'a, C> {
             return Ok(Some(End::Timeout(turn)));
         }
         if let Some(command) = self.stray.take()
-            && stray_digit(&turn.screen)
+            && stray_digit(&turn.screen, "1")
         {
             let r = self.call(&["key", "backspace"])?;
             if self.unserved(&r) {
@@ -898,6 +1094,10 @@ impl<'a, C: Ctl> Session<'a, C> {
                      connection was lost before the press was checked)"
                 ),
             )?;
+            state.gone_first = false;
+            return Ok(None);
+        }
+        if self.survey(&turn, opts, state, review)? {
             state.gone_first = false;
             return Ok(None);
         }
@@ -921,7 +1121,12 @@ impl<'a, C: Ctl> Session<'a, C> {
             if Instant::now() >= deadline {
                 return Ok(Some(End::Timeout(point)));
             }
-            if !review.review(&point)? {
+            let report = if opts.report && reported(&point.phase) {
+                Some(self.brief_report(opts)?)
+            } else {
+                None
+            };
+            if !review.review(&point, report)? {
                 return Ok(Some(End::Stopped(point)));
             }
             // The manager has the worker now, as after a fresh `supervise`.
@@ -934,6 +1139,214 @@ impl<'a, C: Ctl> Session<'a, C> {
         }
         state.gone_first = false;
         Ok(None)
+    }
+
+    /// The session survey at one look ([`survey_open`]). On the look where it
+    /// APPEARS — open now, and not said since a read last showed it gone
+    /// ([`Survey::Closed`]) — the loop says `EVENT survey seq=<n> dismiss
+    /// with: aterm ctl @<sid> key 'if=^●.How.is.Claude.doing' 0`
+    /// ([`survey_event_line`]). A survey that stays open is said once; one
+    /// that any read shows gone — a busy read on the way to the turn included
+    /// ([`Session::survey_gone`]) — and then open again has appeared again.
+    ///
+    /// With `--dismiss-surveys` the loop presses that `0` itself
+    /// ([`Self::dismiss_survey`]) and `true` has it look again from a fresh
+    /// read, where the `0` is judged ([`Survey::Tried`]): the survey gone,
+    /// the loop says `DISMISSED survey seq=<n>` (the press's stamp; noted in
+    /// `--notes` too), or nothing when the press was skipped; the survey
+    /// still open — the `0` did not take, or the guard matched no row of it —
+    /// is handed over with the `EVENT survey` line (and a note), never
+    /// pressed again; a `0` that landed in the composer instead is backspaced
+    /// and noted, nothing is said dismissed, and a survey still open then is
+    /// handed over the same way.
+    ///
+    /// While a box is up (`prompt`) or text is typed in the composer, the
+    /// survey waits — nothing is said or pressed: the box is handled first,
+    /// and a `0` would land in the draft — so a survey that appeared under a
+    /// box is said (or dismissed) at the first look without one; such a look
+    /// only settles a survey that has gone. A press whose answer never came
+    /// is ridden out with the survey not tried yet, so it is tried again from
+    /// the next read.
+    fn survey(
+        &mut self,
+        turn: &Turn,
+        opts: &SuperviseOpts,
+        state: &mut Looking,
+        review: &mut dyn Review,
+    ) -> Result<bool, Fail> {
+        let open = survey_open(&turn.screen.rows);
+        // The survey the last look left is gone if any read since showed
+        // none open (this turn's read among them).
+        let left = std::mem::take(&mut self.survey_gone);
+        if let Survey::Tried { pressed: Some(_) } = state.survey
+            && stray_digit(&turn.screen, "0")
+        {
+            let r = self.call(&["key", "backspace"])?;
+            if self.unserved(&r) {
+                self.survey_gone |= left;
+                return Err(Fail::Lost(format!(
+                    "key backspace failed: {}",
+                    r.stderr.trim()
+                )));
+            }
+            let why = if open {
+                "the survey, still open, did not take it"
+            } else {
+                "it had left first"
+            };
+            append_note(
+                opts.notes.as_deref(),
+                &format!(
+                    "backspaced a 0 left in the composer by the press for the session survey \
+                     ({why}; nothing was dismissed)"
+                ),
+            )?;
+            state.survey = Survey::Closed;
+            if open {
+                // Handed over, never pressed again while it stays open.
+                state.survey = Survey::Said;
+                review.say(&survey_event_line(turn.screen.seq, self.sid.as_deref()))?;
+            }
+            return Ok(true);
+        }
+        let waits = turn.phase == Phase::Prompt || typed_draft(&turn.screen);
+        match state.survey {
+            Survey::Tried { pressed } if left => {
+                if let Some(seq) = pressed {
+                    append_note(
+                        opts.notes.as_deref(),
+                        "dismissed the session survey (pressed 0; a rating is the human's)",
+                    )?;
+                    review.say(&format!("DISMISSED survey seq={seq}"))?;
+                }
+                state.survey = Survey::Closed;
+            }
+            // Still open under a box or a draft: judged at the first look
+            // without them.
+            Survey::Tried { .. } if waits => return Ok(false),
+            Survey::Tried { pressed } => {
+                let why = if pressed.is_some() {
+                    "still open after its guarded 0"
+                } else {
+                    "its guarded 0 matched no row, and it is still open"
+                };
+                self.hand_survey(turn, opts, state, review, why)?;
+                return Ok(false);
+            }
+            Survey::Said if left => state.survey = Survey::Closed,
+            Survey::Said | Survey::Closed => {}
+        }
+        if !open || waits || state.survey == Survey::Said {
+            return Ok(false);
+        }
+        if opts.dismiss_surveys {
+            match self.dismiss_survey(turn.screen.seq)? {
+                Dismiss::Pressed { seq } => {
+                    state.survey = Survey::Tried { pressed: Some(seq) };
+                    return Ok(true);
+                }
+                Dismiss::Skipped => {
+                    state.survey = Survey::Tried { pressed: None };
+                    return Ok(true);
+                }
+                Dismiss::Unguarded => {}
+            }
+        }
+        state.survey = Survey::Said;
+        review.say(&survey_event_line(turn.screen.seq, self.sid.as_deref()))?;
+        Ok(false)
+    }
+
+    /// Hand the open session survey to the manager when `--dismiss-surveys`'
+    /// `0` did not dismiss it: `why` noted, the `EVENT survey` line said, and
+    /// nothing pressed on it again while it stays open.
+    fn hand_survey(
+        &mut self,
+        turn: &Turn,
+        opts: &SuperviseOpts,
+        state: &mut Looking,
+        review: &mut dyn Review,
+        why: &str,
+    ) -> Result<(), Fail> {
+        append_note(
+            opts.notes.as_deref(),
+            &format!("handed the session survey to the manager ({why})"),
+        )?;
+        state.survey = Survey::Said;
+        review.say(&survey_event_line(turn.screen.seq, self.sid.as_deref()))?;
+        Ok(())
+    }
+
+    /// `--dismiss-surveys`' press: `key if=^●.How.is.Claude.doing 0`, the
+    /// check and the press under one server lock, as the approval press
+    /// guards its `1` — `OK skipped seq=<n>` means no row matched and nothing
+    /// was written, so a survey that left first never gets a `0` in the
+    /// composer (a copy quoted in the transcript does not match:
+    /// [`SURVEY_ROW`]).
+    /// `0` is the only key it ever presses. A host without the guard (a usage
+    /// line or a bare `ERR`) is never pressed unguarded: [`Dismiss::Unguarded`],
+    /// and the survey is said instead. `ERR busy sink` is retried as the
+    /// approval press retries it; a request not served is ridden out; any
+    /// other `ERR` ends the loop. `seen` is the seq of the screen read before.
+    fn dismiss_survey(&mut self, seen: u64) -> Result<Dismiss, Fail> {
+        if self.caps.key_if == Some(false) {
+            return Ok(Dismiss::Unguarded);
+        }
+        let cond = format!("if={SURVEY_ROW}");
+        let mut busy = 0;
+        loop {
+            let r = self.call(&["key", &cond, "0"])?;
+            if r.ok() {
+                self.caps.key_if = Some(true);
+                return Ok(if r.skipped() {
+                    Dismiss::Skipped
+                } else {
+                    Dismiss::Pressed {
+                        seq: r.seq().unwrap_or(seen),
+                    }
+                });
+            }
+            let why = format!("key {cond} 0 failed: {}", r.stderr.trim());
+            if self.unserved(&r) {
+                return Err(Fail::Lost(why));
+            }
+            if r.unknown_form() {
+                self.caps.key_if = Some(false);
+                return Ok(Dismiss::Unguarded);
+            }
+            if r.is_err("busy sink") && busy < BUSY_SINK_RETRIES {
+                busy += 1;
+                std::thread::sleep(BUSY_SINK_BACKOFF);
+                continue;
+            }
+            return Err(Fail::Hard(why));
+        }
+    }
+
+    /// `watch --report`'s count of the report at a point. A request not served
+    /// is ridden out like any other; a report that fails otherwise (a reply
+    /// that does not add up) does not end the loop — the point is reported
+    /// `complete=0 rows=0` and the failure noted — since the EVENT is what the
+    /// manager is woken for, and a session that is gone ends the loop at its
+    /// next request anyway.
+    fn brief_report(&mut self, opts: &SuperviseOpts) -> Result<ReportBrief, Fail> {
+        match self.gather_report(&ReportOpts::default()) {
+            Ok(r) => Ok(ReportBrief {
+                complete: r.complete(),
+                rows: r.rows.len(),
+            }),
+            Err(Fail::Lost(why)) => Err(Fail::Lost(why)),
+            Err(Fail::Hard(why)) => {
+                append_note(
+                    opts.notes.as_deref(),
+                    &format!("report failed: {}", one_line(&why)),
+                )?;
+                Ok(ReportBrief {
+                    complete: false,
+                    rows: 0,
+                })
+            }
+        }
     }
 
     /// Ride out an outage — a request the server did not serve
@@ -1041,10 +1454,12 @@ impl<'a, C: Ctl> Session<'a, C> {
     /// `review`), and the loop looks again once the box has LEFT; anything
     /// else — not a prompt, not Bash, not read-only, the same read back after
     /// two approvals, a guard that matched no row of this very box, a box that
-    /// did not move after the press — is a review point. When the connection
-    /// is lost before the press is seen through, what the loop knows it did is
-    /// noted — a `1` the server confirmed is an approval, a press whose answer
-    /// never came is noted as such and is not — and the loss is ridden out.
+    /// did not move after the press, a fallback press withheld because the
+    /// session survey is open ([`Pressing::Withheld`]) — is a review point.
+    /// When the connection is lost before the press is seen through, what the
+    /// loop knows it did is noted — a `1` the server confirmed is an approval,
+    /// a press whose answer never came is noted as such and is not — and the
+    /// loss is ridden out.
     fn auto_read(
         &mut self,
         turn: Turn,
@@ -1087,6 +1502,17 @@ impl<'a, C: Ctl> Session<'a, C> {
         };
         let press = match self.press_one_guarded(&p, &turn.screen)? {
             Pressing::Done(press) => press,
+            Pressing::Withheld => {
+                append_note(
+                    opts.notes.as_deref(),
+                    &format!(
+                        "handed to the manager (the session survey is open and this host has \
+                         no guarded press: an unguarded 1 could rate the session): {}",
+                        p.command
+                    ),
+                )?;
+                return Ok(Step::Review(turn));
+            }
             Pressing::Lost { known, why } => {
                 match known {
                     Some(Press::Pressed { seq }) => approve(seq)?,
@@ -1206,6 +1632,9 @@ impl<'a, C: Ctl> Session<'a, C> {
     /// skipped seq=<n>` means no row matched and nothing was written), else
     /// read → confirm the same box is still up → press → wait for the worker
     /// to take it → re-read → backspace a digit that landed in the composer.
+    /// The fallback presses nothing while the session survey is open on the
+    /// confirming read ([`Pressing::Withheld`]): a `1` that reaches the
+    /// survey instead of the box is a rating, and no digit is left to find.
     ///
     /// The capability probe is the reply: `OK …` proves the guard (pressed or
     /// skipped); a usage line or a bare `ERR` — what a build without `if=`
@@ -1259,6 +1688,14 @@ impl<'a, C: Ctl> Session<'a, C> {
             Some(q) if q.command == prompt.command => {}
             _ => return Ok(Pressing::Done(Press::Skipped { seq: now.seq })),
         }
+        // An unguarded `1` goes wherever keys go when it lands: to the box,
+        // or — the box resolved first — to the session survey parked above
+        // the composer, where it is the rating `Bad`, the human's to give, and
+        // leaves no digit in the composer to find. With the survey open,
+        // nothing is pressed: the box is the manager's.
+        if survey_open(&now.rows) {
+            return Ok(Pressing::Withheld);
+        }
         let r = self.call(&["key", "1"])?;
         if !r.ok() {
             let why = format!("key 1 failed: {}", r.stderr.trim());
@@ -1286,7 +1723,7 @@ impl<'a, C: Ctl> Session<'a, C> {
             }
             Err(e) => return Err(e),
         };
-        if stray_digit(&after) {
+        if stray_digit(&after, "1") {
             let r = self.call(&["key", "backspace"])?;
             let skipped = Press::Skipped { seq: after.seq };
             if self.unserved(&r) {
@@ -1311,13 +1748,68 @@ fn turn_of(screen: Screen) -> Turn {
     }
 }
 
-/// A `1` sitting alone in the composer with no box on the screen: the digit
-/// the fallback press wrote after the prompt had resolved on its own (typed
-/// text, not the placeholder the composer shows when empty).
-fn stray_digit(screen: &Screen) -> bool {
+/// `digit` sitting alone in the composer with no box on the screen: the
+/// digit a press wrote after what it answered had left on its own — the
+/// fallback press's `1` after the prompt resolved, `--dismiss-surveys`' `0`
+/// after the survey went (typed text, not the placeholder the composer shows
+/// when empty).
+fn stray_digit(screen: &Screen, digit: &str) -> bool {
     parse_prompt(&screen.rows).is_none()
-        && composer_text(&screen.rows).as_deref() == Some("1")
+        && composer_text(&screen.rows).as_deref() == Some(digit)
         && !is_placeholder(&screen.rows, screen.cursor_col)
+}
+
+/// Text typed into the composer — not the placeholder suggestion it shows
+/// when empty: a `0` pressed now could land in it. A draft can fill more
+/// than one row ([`composer_draft`]): text on any row under the caret row is
+/// typed (the placeholder is one row), and so is text on the caret row
+/// unless the cursor sits at column 2 of THAT row ([`is_placeholder`]'s
+/// measure) — a cursor at column 2 of another row of the composer is a
+/// draft's, after a line break. A cursor on no row read is judged by its
+/// column alone.
+fn typed_draft(screen: &Screen) -> bool {
+    let Some((caret, lines)) = composer_draft(&screen.rows) else {
+        return false;
+    };
+    if lines.iter().skip(1).any(|l| !l.is_empty()) {
+        return true;
+    }
+    if lines.first().is_none_or(|l| l.is_empty()) {
+        return false;
+    }
+    let on_caret_row = screen.cursor_index().is_none_or(|i| i == caret);
+    !(on_caret_row && screen.cursor_col == 2)
+}
+
+/// The line `watch` prints (and `supervise` says on stderr) when the session
+/// survey appears: `EVENT survey seq=<n> dismiss with: aterm ctl @<sid> key
+/// 'if=^●.How.is.Claude.doing' 0` — the guarded `0` that dismisses it, the
+/// one key that is the manager's to press there (with no `@sid` named, none
+/// is in the command either). The guard is quoted: `^` is a glob operator in
+/// a zsh with `extended_glob` set, where the bare word fails as `no matches
+/// found`. `EVENT`, so a monitor that wakes on EVENT lines wakes on it: a
+/// turn typed while it is open whose first character is 1, 2 or 3 is taken
+/// as a rating.
+fn survey_event_line(seq: u64, sid: Option<&str>) -> String {
+    let target = sid.map(|s| format!(" {s}")).unwrap_or_default();
+    format!("EVENT survey seq={seq} dismiss with: aterm ctl{target} key 'if={SURVEY_ROW}' 0")
+}
+
+/// What `phase` prints: [`render_phase`]'s lines, then `survey 0` when the
+/// session survey is open ([`survey_open`]) — the key that dismisses it. A
+/// rating is the human's; `0` is the one key a manager presses on it. Last,
+/// `context <n>%` when Claude Code's context indicator is up ([`context_left`]):
+/// that much is left before the worker auto-compacts. Without either, the
+/// lines are [`render_phase`]'s alone.
+pub fn render_phase_and_survey(turn: &Turn, python_allow: &[String]) -> String {
+    let mut out = render_phase(turn, python_allow);
+    if survey_open(&turn.screen.rows) {
+        out.push_str("survey 0\n");
+    }
+    if let Some(left) = context_left(&turn.screen.rows) {
+        out.push_str(&format!("context {left}%\n"));
+    }
+    out
 }
 
 /// The lines `phase` / `await-turn` print: the phase word, then for a prompt
@@ -1368,6 +1860,33 @@ pub fn event_line(turn: &Turn, python_allow: &[String]) -> String {
         "EVENT {} seq={} {}",
         turn.phase.name(),
         turn.screen.seq,
+        event_summary(turn, python_allow)
+    )
+}
+
+/// What `watch --report` adds to an EVENT line: whether `report` found
+/// nothing lost since the manager's turn, and how many rows it holds.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ReportBrief {
+    pub complete: bool,
+    pub rows: usize,
+}
+
+/// The review points `watch --report` counts a report for: the turn ended on
+/// words — idle, a question, a limit notice — not on a box or still busy.
+fn reported(phase: &Phase) -> bool {
+    matches!(phase, Phase::Idle | Phase::Question | Phase::Limited { .. })
+}
+
+/// [`event_line`] with `complete=<0|1> rows=<n>` between the seq and the
+/// summary (`watch --report`); the summary stays the free-text tail.
+pub fn reported_event_line(turn: &Turn, python_allow: &[String], report: ReportBrief) -> String {
+    format!(
+        "EVENT {} seq={} complete={} rows={} {}",
+        turn.phase.name(),
+        turn.screen.seq,
+        u8::from(report.complete),
+        report.rows,
         event_summary(turn, python_allow)
     )
 }
@@ -1605,9 +2124,11 @@ mod tests {
     /// every read; `await seq <n>` latches only while another screen is still
     /// to come (the worker moved on) and TIMES OUT on the last one (the screen
     /// sits unchanged); a modern `key if=` is judged against the screen last
-    /// served — `OK seq=<n>` when a row has `Do you want to proceed`, else `OK
-    /// skipped seq=<n>` — and an older host answers it with the bare `ERR`
-    /// measured on aterm 0.81.0.
+    /// served as the server judges it — the pattern compiled by the server's
+    /// own `aterm_observe::row_matcher` and tested against every row: `OK
+    /// seq=<n>` when a row matches, else `OK skipped seq=<n>` (`ERR badregex`
+    /// for a pattern that does not compile) — and an older host answers it
+    /// with the bare `ERR` measured on aterm 0.81.0.
     ///
     /// `await idle` answers at once by default, so every scripted screen is
     /// read. The real server's `await idle 2000` latches only once the content
@@ -1663,6 +2184,10 @@ mod tests {
         restart: Option<(usize, u64)>,
         /// How long the answer to the request at an index is held back.
         delay: BTreeMap<usize, Duration>,
+        /// The `history` reply (`None`: a host without the verb).
+        history: Option<CtlReply>,
+        /// `offscreen` replies, in order (none left: a host without the verb).
+        offscreen: VecDeque<CtlReply>,
     }
 
     fn ok(stdout: &str) -> CtlReply {
@@ -1732,6 +2257,8 @@ mod tests {
                 handoff_seq: None,
                 restart: None,
                 delay: BTreeMap::new(),
+                history: None,
+                offscreen: VecDeque::new(),
             }
         }
         fn last_served(&self) -> &[String] {
@@ -1745,7 +2272,7 @@ mod tests {
                 .iter()
                 .map(|r| format!("\"{}\"", r.replace('\\', "\\\\").replace('"', "\\\"")))
                 .collect();
-            let composer_col = if self.screens[i].iter().any(|r| r == "❯ 1") {
+            let composer_col = if self.screens[i].iter().any(|r| r == "❯ 1" || r == "❯ 0") {
                 3
             } else {
                 2
@@ -1818,21 +2345,30 @@ mod tests {
                     if let Some(r) = self.key_replies.pop_front() {
                         return Ok(r);
                     }
-                    let guarded = tail.first().is_some_and(|a| a.starts_with("if="));
-                    if guarded && !self.modern {
+                    let guard = tail.first().and_then(|a| a.strip_prefix("if="));
+                    if guard.is_some() && !self.modern {
                         return Ok(bare_err());
                     }
                     let seq = self.seq;
-                    if guarded
-                        && !self
-                            .last_served()
-                            .iter()
-                            .any(|r| r.contains("Do you want to proceed"))
-                    {
-                        return Ok(ok(&format!("OK skipped seq={seq}\n")));
+                    if let Some(pattern) = guard {
+                        let Ok(matcher) = aterm_observe::row_matcher(pattern) else {
+                            return Ok(err("badregex"));
+                        };
+                        if !self.last_served().iter().any(|r| matcher.matches(r)) {
+                            return Ok(ok(&format!("OK skipped seq={seq}\n")));
+                        }
                     }
                     Ok(ok(&format!("OK seq={seq}\n")))
                 }
+                // A host without the verbs answers what an older build does.
+                "history" => Ok(self
+                    .history
+                    .clone()
+                    .unwrap_or_else(|| err("unknown verb (try: help)"))),
+                "offscreen" => Ok(self
+                    .offscreen
+                    .pop_front()
+                    .unwrap_or_else(|| err("unknown verb (try: help)"))),
                 _ => Ok(self.replies.pop_front().unwrap_or_else(|| ok("OK\n"))),
             }
         }
@@ -1919,6 +2455,10 @@ mod tests {
             max: Duration::from_secs(max_s),
             python_allow: vec![],
             notes,
+            report: false,
+            dismiss_surveys: false,
+            // The CLI's default: with no indicator on a screen, nothing moves.
+            context_warn: 10,
         }
     }
 
@@ -2624,6 +3164,179 @@ mod tests {
         );
     }
 
+    /// An `offscreen … screen=1` reply as `aterm ctl` prints it: the rows on
+    /// stdout, the header on stderr.
+    fn offscreen_reply(first: u64, archived: &[&str], screen: &[String]) -> CtlReply {
+        let n = u64::try_from(archived.len()).expect("fits");
+        let mut stdout: String = archived.iter().map(|r| format!("{r}\n")).collect();
+        stdout.extend(screen.iter().map(|r| format!("{r}\n")));
+        CtlReply {
+            code: 0,
+            stdout,
+            stderr: format!(
+                "aterm-ctl: OK {} first={first} last={} lost=0 breaks=0 back=0 epoch=1 \
+                 origin=5 alt=1 seq=1 screen_rows={}\n",
+                archived.len() + screen.len(),
+                (first + n).saturating_sub(1),
+                screen.len()
+            ),
+        }
+    }
+
+    /// `watch --report`: an idle, question or limited point's EVENT line
+    /// carries `complete=<0|1> rows=<n>` of the report — read at the point,
+    /// `history` then one `offscreen` — before the summary; an approval and
+    /// a prompt's EVENT are as without the flag, and nothing else changes.
+    #[test]
+    fn watch_report_counts_the_report_into_the_events_that_end_on_words() {
+        let mut m = Mock::new(
+            true,
+            vec![
+                busy_screen(),
+                bash_one_row(),
+                busy_screen(),
+                question_screen(),
+                busy_screen(),
+                idle_screen(),
+            ],
+        );
+        m.vanish_after = Some(1);
+        m.history = Some(ok(
+            "turn 7 submitted=1 status=settled started_ms=1 dur_ms=2 seq=3 \
+             hash=0000000000000000 arch=5:40 text=Pick%20one\n",
+        ));
+        // At the question: the turn's row scrolled off (archived 41..=42).
+        m.offscreen.push_back(offscreen_reply(
+            41,
+            &["❯ Pick one", "⏺ Looking at both."],
+            &question_screen(),
+        ));
+        // At the idle point: the turn's row is nowhere to be read.
+        m.offscreen
+            .push_back(offscreen_reply(41, &[], &idle_screen()));
+        let opts = SuperviseOpts {
+            report: true,
+            ..auto(30, None)
+        };
+        let (lines, code) = watch_lines(&mut m, &opts);
+        assert_eq!(
+            lines,
+            [
+                "APPROVED seq=102 git log --oneline -5",
+                "EVENT question seq=104 complete=1 rows=3 ⏺ Keep the harness or rewrite it?",
+                "EVENT idle seq=106 complete=0 rows=3 ⏺ Done.",
+                "EXIT session gone (await seq 106 failed: aterm-ctl: ERR exited)",
+            ]
+        );
+        assert_eq!(code, 1);
+        let reads: Vec<&String> = m
+            .requests
+            .iter()
+            .filter(|r| r.starts_with("history") || r.starts_with("offscreen"))
+            .collect();
+        assert_eq!(
+            reads,
+            [
+                "history 8",
+                "offscreen since=5:40 max=8000 screen=1",
+                "history 8",
+                "offscreen since=5:40 max=8000 screen=1",
+            ]
+        );
+        // A prompt's point counts no report, and busy is never a point.
+        assert!(!reported(&Phase::Prompt) && !reported(&Phase::Busy));
+        let mut m = Mock::new(true, vec![write_prompt()]);
+        m.vanish_after = Some(1);
+        let (lines, _) = watch_lines(&mut m, &opts);
+        assert_eq!(
+            lines[0],
+            "EVENT prompt seq=101 kind=bash classify=not-read-only:rm command=rm -rf target"
+        );
+        assert!(
+            !m.requests
+                .iter()
+                .any(|r| r.starts_with("history") || r.starts_with("offscreen")),
+            "{:?}",
+            m.requests
+        );
+    }
+
+    /// `supervise` prints the rows themselves: `report` reads nothing there.
+    #[test]
+    fn supervise_reads_no_report() {
+        let mut m = Mock::new(true, vec![busy_screen(), idle_screen()]);
+        let opts = SuperviseOpts {
+            report: true,
+            ..auto(30, None)
+        };
+        let (out, code) = Session::new(&mut m, None)
+            .supervise(&opts)
+            .expect("supervise");
+        assert_eq!(code, 0);
+        assert!(out.starts_with("idle\n--\n"), "{out}");
+        assert!(
+            !m.requests
+                .iter()
+                .any(|r| r.starts_with("history") || r.starts_with("offscreen")),
+            "{:?}",
+            m.requests
+        );
+    }
+
+    /// A report that fails for any reason but a lost connection does not end
+    /// `watch`: the point is still reported, `complete=0 rows=0`, and the
+    /// failure goes to the notes.
+    #[test]
+    fn a_report_that_fails_still_reports_the_point() {
+        let (dir, notes) = notes_file("report-fails");
+        let mut m = Mock::new(true, vec![idle_screen()]);
+        m.vanish_after = Some(1);
+        m.offscreen.push_back(CtlReply {
+            code: 0,
+            stdout: "one row\n".to_string(),
+            stderr: "aterm-ctl: OK 3 first=1 last=1 lost=0 breaks=0 back=0 origin=5 alt=1\n"
+                .to_string(),
+        });
+        let opts = SuperviseOpts {
+            report: true,
+            ..auto(30, Some(notes.clone()))
+        };
+        let (lines, _) = watch_lines(&mut m, &opts);
+        assert_eq!(lines[0], "EVENT idle seq=101 complete=0 rows=0 ⏺ Done.");
+        let noted = read_notes(&dir, &notes);
+        assert!(
+            noted.len() == 1 && noted[0].contains("report failed: offscreen: the header counts 3"),
+            "{noted:?}"
+        );
+    }
+
+    /// `watch --report` against a host without `offscreen`: the report is the
+    /// screen alone (a full `text --json`), never complete.
+    #[test]
+    fn watch_report_on_an_old_host_reads_the_screen_alone() {
+        let mut m = Mock::new(true, vec![idle_screen()]);
+        m.vanish_after = Some(1);
+        let opts = SuperviseOpts {
+            report: true,
+            ..auto(30, None)
+        };
+        let (lines, _) = watch_lines(&mut m, &opts);
+        assert_eq!(lines[0], "EVENT idle seq=101 complete=0 rows=3 ⏺ Done.");
+        let at = m
+            .requests
+            .iter()
+            .position(|r| r == "history 8")
+            .expect("history read");
+        assert_eq!(
+            m.requests[at..at + 3],
+            [
+                "history 8",
+                "offscreen tail=8000 max=8000 screen=1",
+                "text --json"
+            ]
+        );
+    }
+
     /// The server as it is: `await idle 2000` waits straight through a short
     /// busy spell, so no read sees the worker busy between two points. A
     /// screen that moved with nothing the point is made of changed (a footer
@@ -2971,6 +3684,1007 @@ mod tests {
             exit_reason("await seq 633 failed: aterm-ctl: ERR exited"),
             "session gone (await seq 633 failed: aterm-ctl: ERR exited)"
         );
+    }
+
+    // ---- the session survey ----------------------------------------------
+
+    /// Claude Code's session survey, as it parks above the composer.
+    const SURVEY_ROWS: [&str; 2] = [
+        "● How is Claude doing this session? (optional)",
+        "  1: Bad    2: Fine   3: Good   0: Dismiss",
+    ];
+
+    /// `r` with the survey parked right above its composer's top rule.
+    fn with_survey(mut r: Vec<String>) -> Vec<String> {
+        let top = r
+            .iter()
+            .position(|row| row.starts_with('─'))
+            .expect("the top rule");
+        for (k, row) in SURVEY_ROWS.iter().enumerate() {
+            r.insert(top + k, (*row).to_string());
+        }
+        r
+    }
+
+    /// `phase` ends with `survey 0` when the survey is open — the key that
+    /// dismisses it, under whatever it printed before — and is `render_phase`
+    /// alone otherwise, a survey quoted in the transcript included.
+    #[test]
+    fn phase_names_the_key_that_dismisses_an_open_survey() {
+        let turn = |r: Vec<String>| Turn {
+            phase: worker_phase(&r),
+            screen: Screen {
+                rows: r,
+                ..Screen::default()
+            },
+            timed_out: false,
+        };
+        let open = turn(with_survey(idle_screen()));
+        assert_eq!(render_phase_and_survey(&open, &[]), "idle\nsurvey 0\n");
+        let busy = turn(with_survey(busy_screen()));
+        assert_eq!(
+            render_phase_and_survey(&busy, &[]),
+            "busy\nreason status row: spinner\nsurvey 0\n"
+        );
+        let quoted = turn(framed(&[
+            "⏺ It asked:",
+            "  ● How is Claude doing this session? (optional)",
+            "    1: Bad    2: Fine   3: Good   0: Dismiss",
+            "",
+        ]));
+        assert_eq!(render_phase_and_survey(&quoted, &[]), "idle\n");
+        let plain = turn(idle_screen());
+        assert_eq!(
+            render_phase_and_survey(&plain, &[]),
+            render_phase(&plain, &[])
+        );
+    }
+
+    /// A survey that appears on an idle screen is said ONCE, ahead of the
+    /// point: `EVENT survey seq=<n> dismiss with: aterm ctl … key
+    /// 'if=^●.How.is.Claude.doing' 0`. It stays open through the next turn
+    /// (busy under it) and the idle point after: nothing more is said about
+    /// it, and nothing is pressed.
+    #[test]
+    fn watch_says_a_survey_once_when_it_appears() {
+        let mut m = Mock::new(
+            true,
+            vec![
+                with_survey(idle_screen()),
+                with_survey(busy_screen()),
+                with_survey(said_idle("⏺ Pushed.")),
+            ],
+        );
+        m.vanish_after = Some(1);
+        let (lines, code) = watch_lines(&mut m, &auto(30, None));
+        assert_eq!(
+            lines,
+            [
+                "EVENT survey seq=101 dismiss with: aterm ctl key 'if=^●.How.is.Claude.doing' 0",
+                "EVENT idle seq=101 ⏺ Done.",
+                "EVENT idle seq=103 ⏺ Pushed.",
+                "EXIT session gone (await seq 103 failed: aterm-ctl: ERR exited)",
+            ]
+        );
+        assert_eq!(code, 1);
+        assert!(m.presses().is_empty(), "{:?}", m.requests);
+        assert_eq!(
+            survey_event_line(7, Some("@s-1")),
+            "EVENT survey seq=7 dismiss with: aterm ctl @s-1 key 'if=^●.How.is.Claude.doing' 0"
+        );
+    }
+
+    /// `--dismiss-surveys`: the survey that appears gets ONE guarded `0` —
+    /// `key if=^●.How.is.Claude.doing 0`, and no other key — and the loop
+    /// looks again from a fresh read: the survey gone there, the `0` is said
+    /// as `DISMISSED survey seq=<n>` (the press's seq) and noted, and the
+    /// point under it reported. `supervise` says the line on stderr, never in
+    /// its result.
+    #[test]
+    fn dismiss_surveys_presses_one_guarded_0() {
+        let (dir, notes) = notes_file("survey");
+        let mut m = Mock::new(true, vec![with_survey(idle_screen()), idle_screen()]);
+        m.vanish_after = Some(1);
+        let opts = SuperviseOpts {
+            dismiss_surveys: true,
+            ..auto(30, Some(notes.clone()))
+        };
+        let (lines, code) = watch_lines(&mut m, &opts);
+        assert_eq!(
+            lines,
+            [
+                "DISMISSED survey seq=101",
+                "EVENT idle seq=102 ⏺ Done.",
+                "EXIT session gone (await seq 102 failed: aterm-ctl: ERR exited)",
+            ]
+        );
+        assert_eq!(code, 1);
+        assert_eq!(
+            m.requests,
+            [
+                "await gone esc.to.interrupt timeout 20000",
+                "text --json tail=40",
+                "key if=^●.How.is.Claude.doing 0",
+                // Looked at again from a fresh read: the settle wait first.
+                "await idle 2000 timeout 20000",
+                "text --json tail=40",
+                "await seq 102 timeout 20000",
+                "text --json tail=40",
+                "await seq 102 timeout 20000",
+            ],
+            "{:?}",
+            m.requests
+        );
+        let noted = read_notes(&dir, &notes);
+        assert_eq!(noted.len(), 1, "{noted:?}");
+        assert!(
+            noted[0]
+                .ends_with("Z dismissed the session survey (pressed 0; a rating is the human's)"),
+            "{noted:?}"
+        );
+
+        let mut m = Mock::new(true, vec![with_survey(idle_screen()), idle_screen()]);
+        let opts = SuperviseOpts {
+            dismiss_surveys: true,
+            ..auto(30, None)
+        };
+        let mut log: Vec<u8> = Vec::new();
+        let (out, code) = Session::new(&mut m, Some("@s-1".to_string()))
+            .supervise_to(&opts, &mut log)
+            .expect("supervise");
+        assert_eq!(code, 0);
+        assert!(out.starts_with("idle\n--\n⏺ Done.\n"), "{out}");
+        assert!(!out.contains("DISMISSED"), "{out}");
+        let log = String::from_utf8(log).expect("utf-8");
+        assert_eq!(log, "DISMISSED survey seq=101\n");
+        assert_eq!(m.presses(), ["@s-1 key if=^●.How.is.Claude.doing 0"]);
+    }
+
+    /// A guarded `0` that finds no survey row — it left between the read and
+    /// the check, `OK skipped seq=<n>` — pressed nothing: no DISMISSED line,
+    /// no note, and the loop looks again (where the survey is gone).
+    #[test]
+    fn a_skipped_survey_press_says_nothing() {
+        let (dir, notes) = notes_file("survey-skipped");
+        let mut m = Mock::new(true, vec![with_survey(idle_screen()), idle_screen()]);
+        m.key_replies.push_back(ok("OK skipped seq=105\n"));
+        m.vanish_after = Some(0);
+        let opts = SuperviseOpts {
+            dismiss_surveys: true,
+            ..auto(30, Some(notes.clone()))
+        };
+        let (lines, code) = watch_lines(&mut m, &opts);
+        assert_eq!(
+            lines,
+            [
+                "EVENT idle seq=102 ⏺ Done.",
+                "EXIT session gone (await seq 102 failed: aterm-ctl: ERR exited)",
+            ]
+        );
+        assert_eq!(code, 1);
+        assert_eq!(m.presses(), ["key if=^●.How.is.Claude.doing 0"]);
+        let noted = read_notes(&dir, &notes);
+        assert!(noted.is_empty(), "{noted:?}");
+    }
+
+    /// A survey on a screen with a box waits for the box: the box is handled
+    /// first — a read approved, anything else reported — and while it is up
+    /// no `0` is pressed and the survey is not said. Once the box has gone
+    /// the survey is dismissed like any other, and said so once it has left.
+    #[test]
+    fn a_survey_waits_while_a_box_is_up() {
+        let mut m = Mock::new(
+            true,
+            vec![
+                with_survey(bash_one_row()),
+                with_survey(busy_screen()),
+                with_survey(idle_screen()),
+                idle_screen(),
+            ],
+        );
+        m.vanish_after = Some(1);
+        let opts = SuperviseOpts {
+            dismiss_surveys: true,
+            ..auto(30, None)
+        };
+        let (lines, _) = watch_lines(&mut m, &opts);
+        assert_eq!(
+            lines,
+            [
+                "APPROVED seq=101 git log --oneline -5",
+                "DISMISSED survey seq=103",
+                "EVENT idle seq=104 ⏺ Done.",
+                "EXIT session gone (await seq 104 failed: aterm-ctl: ERR exited)",
+            ]
+        );
+        assert_eq!(
+            m.presses(),
+            [
+                "key if=Do.you.want.to.proceed 1",
+                "key if=^●.How.is.Claude.doing 0"
+            ],
+            "{:?}",
+            m.requests
+        );
+
+        // A box handed over is reported, and the survey under it is neither
+        // pressed nor said — with --dismiss-surveys or without.
+        for dismiss_surveys in [true, false] {
+            let mut m = Mock::new(true, vec![with_survey(write_prompt())]);
+            m.vanish_after = Some(0);
+            let opts = SuperviseOpts {
+                dismiss_surveys,
+                ..auto(30, None)
+            };
+            let (lines, _) = watch_lines(&mut m, &opts);
+            assert_eq!(
+                lines,
+                [
+                    "EVENT prompt seq=101 kind=bash classify=not-read-only:rm command=rm -rf target",
+                    "EXIT session gone (await seq 101 failed: aterm-ctl: ERR exited)",
+                ],
+                "dismiss_surveys={dismiss_surveys}"
+            );
+            assert!(m.presses().is_empty(), "{:?}", m.requests);
+        }
+    }
+
+    /// A host without `key if=` never gets a `0`, guarded or not: the one
+    /// probe answers a bare `ERR`, and the survey is said instead.
+    #[test]
+    fn a_survey_on_a_host_without_the_guard_is_said_not_pressed() {
+        let mut m = Mock::new(false, vec![with_survey(idle_screen())]);
+        m.vanish_after = Some(0);
+        let opts = SuperviseOpts {
+            dismiss_surveys: true,
+            ..auto(30, None)
+        };
+        let (lines, _) = watch_lines(&mut m, &opts);
+        assert_eq!(
+            lines,
+            [
+                "EVENT survey seq=101 dismiss with: aterm ctl key 'if=^●.How.is.Claude.doing' 0",
+                "EVENT idle seq=101 ⏺ Done.",
+                "EXIT session gone (await seq 101 failed: aterm-ctl: ERR exited)",
+            ]
+        );
+        assert_eq!(m.presses(), ["key if=^●.How.is.Claude.doing 0"]);
+    }
+
+    /// `--dismiss-surveys` on the defaults of the other survey tests.
+    fn dismissing(notes: Option<PathBuf>) -> SuperviseOpts {
+        SuperviseOpts {
+            dismiss_surveys: true,
+            ..auto(30, notes)
+        }
+    }
+
+    /// The guard the survey's `0` is pressed under is tested against EVERY
+    /// row on the screen (the server's `row_matcher`), so it matches the open
+    /// survey's question row and no copy of it: a tool's output under `⎿`,
+    /// the worker quoting it, the guard's own words in an EVENT line or in
+    /// `--help`. Such a copy on the screen when the survey itself has gone
+    /// lets no `0` through to the composer. (Round-8 review, finding 1: the
+    /// bare `How.is.Claude.doing` matched all three.)
+    #[test]
+    fn the_survey_guard_matches_the_open_survey_and_no_copy_of_it() {
+        let guard = aterm_observe::row_matcher(SURVEY_ROW).expect("the guard compiles");
+        let open = with_survey(idle_screen());
+        assert!(survey_open(&open));
+        assert_eq!(
+            open.iter().filter(|r| guard.matches(r)).collect::<Vec<_>>(),
+            [SURVEY_ROWS[0]]
+        );
+        let event = survey_event_line(7, Some("@s-1"));
+        let help = format!("                       aterm ctl @sid key 'if={SURVEY_ROW}' 0");
+        for copy in [
+            framed(&[
+                "⏺ Bash(cat survey-open.txt)",
+                "  ⎿  ● How is Claude doing this session? (optional)",
+                "       1: Bad    2: Fine   3: Good   0: Dismiss",
+                "",
+            ]),
+            framed(&[
+                "⏺ Claude Code parks this above the composer:",
+                "  ● How is Claude doing this session? (optional)",
+                "    1: Bad    2: Fine   3: Good   0: Dismiss",
+                "",
+            ]),
+            framed(&[&event, &help, &format!("  ⎿  {event}"), ""]),
+        ] {
+            assert!(!survey_open(&copy), "{copy:?}");
+            assert!(!copy.iter().any(|r| guard.matches(r)), "{copy:?}");
+        }
+        // And the mock judges it as the server does: the copy skips.
+        let mut m = Mock::new(
+            true,
+            vec![framed(&[
+                "⏺ Bash(cat survey-open.txt)",
+                "  ⎿  ● How is Claude doing this session? (optional)",
+                "",
+            ])],
+        );
+        let r = Session::new(&mut m, None)
+            .dismiss_survey(101)
+            .expect("answered");
+        assert_eq!(r, Dismiss::Skipped);
+        assert_eq!(m.requests, ["key if=^●.How.is.Claude.doing 0"]);
+    }
+
+    /// A `0` pressed on a survey that is still open at the next look did not
+    /// dismiss it: no DISMISSED line — the survey is handed over with the
+    /// `EVENT survey` line and a note, and never pressed again while it stays
+    /// open. (Round-8 review, finding 2: `DISMISSED` came at the press.)
+    #[test]
+    fn a_survey_still_open_after_its_0_is_handed_over_not_dismissed() {
+        let (dir, notes) = notes_file("survey-stays");
+        let mut m = Mock::new(true, vec![with_survey(idle_screen())]);
+        m.vanish_after = Some(1);
+        let (lines, _) = watch_lines(&mut m, &dismissing(Some(notes.clone())));
+        assert_eq!(
+            lines,
+            [
+                "EVENT survey seq=102 dismiss with: aterm ctl key 'if=^●.How.is.Claude.doing' 0",
+                "EVENT idle seq=102 ⏺ Done.",
+                "EXIT session gone (await seq 102 failed: aterm-ctl: ERR exited)",
+            ]
+        );
+        assert_eq!(m.presses(), ["key if=^●.How.is.Claude.doing 0"]);
+        let noted = read_notes(&dir, &notes);
+        assert_eq!(noted.len(), 1, "{noted:?}");
+        assert!(
+            noted[0].ends_with(
+                "Z handed the session survey to the manager (still open after its guarded 0)"
+            ),
+            "{noted:?}"
+        );
+    }
+
+    /// A `0` that landed in the composer — the survey had left between the
+    /// check and the keystroke reaching it — is backspaced and noted, as the
+    /// fallback press's stray `1` is, and nothing is said dismissed.
+    /// (Round-8 review, finding 2: it was never backspaced.)
+    #[test]
+    fn a_0_that_landed_in_the_composer_is_backspaced_not_dismissed() {
+        let (dir, notes) = notes_file("survey-stray");
+        let mut zero = idle_screen();
+        let c = zero.iter().position(|r| r == "❯").expect("composer");
+        zero[c] = "❯ 0".to_string();
+        let mut m = Mock::new(true, vec![with_survey(idle_screen()), zero, idle_screen()]);
+        m.vanish_after = Some(0);
+        let (lines, _) = watch_lines(&mut m, &dismissing(Some(notes.clone())));
+        assert_eq!(
+            lines,
+            [
+                "EVENT idle seq=103 ⏺ Done.",
+                "EXIT session gone (await seq 103 failed: aterm-ctl: ERR exited)",
+            ]
+        );
+        assert_eq!(
+            m.presses(),
+            ["key if=^●.How.is.Claude.doing 0", "key backspace"]
+        );
+        let noted = read_notes(&dir, &notes);
+        assert_eq!(noted.len(), 1, "{noted:?}");
+        assert!(
+            noted[0].ends_with(
+                "Z backspaced a 0 left in the composer by the press for the session survey \
+                 (it had left first; nothing was dismissed)"
+            ),
+            "{noted:?}"
+        );
+
+        // The survey still open over the stray `0`: backspaced all the same,
+        // and the survey handed over — not pressed again.
+        let mut zero = with_survey(idle_screen());
+        let c = zero.iter().position(|r| r == "❯").expect("composer");
+        zero[c] = "❯ 0".to_string();
+        let mut m = Mock::new(
+            true,
+            vec![with_survey(idle_screen()), zero, with_survey(idle_screen())],
+        );
+        m.vanish_after = Some(0);
+        let (lines, _) = watch_lines(&mut m, &dismissing(None));
+        assert_eq!(
+            lines,
+            [
+                "EVENT survey seq=102 dismiss with: aterm ctl key 'if=^●.How.is.Claude.doing' 0",
+                "EVENT idle seq=103 ⏺ Done.",
+                "EXIT session gone (await seq 103 failed: aterm-ctl: ERR exited)",
+            ]
+        );
+        assert_eq!(
+            m.presses(),
+            ["key if=^●.How.is.Claude.doing 0", "key backspace"]
+        );
+    }
+
+    /// A survey that leaves during a busy spell and comes back has appeared
+    /// again: said again — or, `--dismiss-surveys`, pressed again — though
+    /// no look saw it gone, only a busy read on the way to the turn.
+    /// (Round-8 review, finding 4: the second was missed.)
+    #[test]
+    fn a_survey_back_after_a_busy_spell_is_a_new_appearance() {
+        let mut m = Mock::new(
+            true,
+            vec![
+                with_survey(idle_screen()),
+                busy_screen(),
+                with_survey(said_idle("⏺ Pushed.")),
+            ],
+        );
+        m.vanish_after = Some(0);
+        let (lines, _) = watch_lines(&mut m, &auto(30, None));
+        assert_eq!(
+            lines,
+            [
+                survey_event_line(101, None),
+                "EVENT idle seq=101 ⏺ Done.".to_string(),
+                survey_event_line(103, None),
+                "EVENT idle seq=103 ⏺ Pushed.".to_string(),
+                "EXIT session gone (await seq 103 failed: aterm-ctl: ERR exited)".to_string(),
+            ]
+        );
+        assert!(m.presses().is_empty(), "{:?}", m.requests);
+
+        let mut m = Mock::new(
+            true,
+            vec![
+                with_survey(idle_screen()),
+                busy_screen(),
+                with_survey(said_idle("⏺ Pushed.")),
+                said_idle("⏺ Pushed."),
+            ],
+        );
+        m.vanish_after = Some(0);
+        let (lines, _) = watch_lines(&mut m, &dismissing(None));
+        assert_eq!(
+            lines,
+            [
+                "DISMISSED survey seq=101",
+                "DISMISSED survey seq=103",
+                "EVENT idle seq=104 ⏺ Pushed.",
+                "EXIT session gone (await seq 104 failed: aterm-ctl: ERR exited)",
+            ]
+        );
+        assert_eq!(
+            m.presses(),
+            [
+                "key if=^●.How.is.Claude.doing 0",
+                "key if=^●.How.is.Claude.doing 0"
+            ]
+        );
+    }
+
+    /// A guarded `0` that was skipped, with the survey still open at the next
+    /// look (the guard matched no row of it), is handed over with the `EVENT
+    /// survey` line — never left unsaid, and never pressed again while it
+    /// stays. (Round-8 review, finding 5: it was marked handled.)
+    #[test]
+    fn a_skipped_0_on_a_survey_still_open_is_handed_over() {
+        let (dir, notes) = notes_file("survey-skip-stays");
+        let mut m = Mock::new(true, vec![with_survey(idle_screen())]);
+        m.key_replies.push_back(ok("OK skipped seq=101\n"));
+        m.vanish_after = Some(1);
+        let (lines, _) = watch_lines(&mut m, &dismissing(Some(notes.clone())));
+        assert_eq!(
+            lines,
+            [
+                "EVENT survey seq=102 dismiss with: aterm ctl key 'if=^●.How.is.Claude.doing' 0",
+                "EVENT idle seq=102 ⏺ Done.",
+                "EXIT session gone (await seq 102 failed: aterm-ctl: ERR exited)",
+            ]
+        );
+        assert_eq!(m.presses(), ["key if=^●.How.is.Claude.doing 0"]);
+        let noted = read_notes(&dir, &notes);
+        assert_eq!(noted.len(), 1, "{noted:?}");
+        assert!(
+            noted[0].ends_with(
+                "Z handed the session survey to the manager (its guarded 0 matched no row, and \
+                 it is still open)"
+            ),
+            "{noted:?}"
+        );
+    }
+
+    /// A host without `key if=` never gets an unguarded `1` while the session
+    /// survey is open on the confirming read: had the box resolved first, the
+    /// `1` would be the rating `Bad`, and no digit would be left in the
+    /// composer to find. The box is handed over (noted), whatever the
+    /// classifier says of it. (Round-8 review, finding 6.)
+    #[test]
+    fn the_fallback_press_withholds_its_1_while_the_survey_is_open() {
+        let (dir, notes) = notes_file("survey-fallback");
+        let mut m = Mock::new(
+            false,
+            vec![
+                with_survey(bash_one_row()),
+                with_survey(bash_one_row()),
+                with_survey(idle_screen()),
+            ],
+        );
+        let (out, code) = Session::new(&mut m, None)
+            .supervise(&auto(30, Some(notes.clone())))
+            .expect("supervise");
+        assert_eq!(code, 0);
+        assert!(
+            out.starts_with("prompt\nkind bash\ncommand git log --oneline -5\n"),
+            "{out}"
+        );
+        assert_eq!(
+            m.requests,
+            [
+                "await gone esc.to.interrupt timeout 20000",
+                "await idle 2000 timeout 20000",
+                "text --json tail=40",
+                "text --json",
+                "key if=Do.you.want.to.proceed 1",
+                "text --json",
+            ],
+            "{:?}",
+            m.requests
+        );
+        let noted = read_notes(&dir, &notes);
+        assert_eq!(noted.len(), 1, "{noted:?}");
+        assert!(
+            noted[0].ends_with(
+                "Z handed to the manager (the session survey is open and this host has no \
+                 guarded press: an unguarded 1 could rate the session): git log --oneline -5"
+            ),
+            "{noted:?}"
+        );
+
+        // With no survey the fallback presses as before.
+        let mut m = Mock::new(
+            false,
+            vec![bash_one_row(), bash_one_row(), busy_screen(), idle_screen()],
+        );
+        let (_, code) = Session::new(&mut m, None)
+            .supervise(&auto(30, None))
+            .expect("supervise");
+        assert_eq!(code, 0);
+        assert_eq!(m.presses(), ["key if=Do.you.want.to.proceed 1", "key 1"]);
+    }
+
+    /// A draft can fill more than one row of the composer, and a `0` pressed
+    /// then lands in it: text on a row under the caret row is typed — its
+    /// first row empty or not — and so is the caret row's text when the
+    /// cursor sits at column 2 of ANOTHER row (after a line break). The
+    /// one-row placeholder (the cursor at column 2 of the caret row) and an
+    /// empty composer are not. (Round-8 review, finding 7.)
+    #[test]
+    fn a_draft_of_more_than_one_row_is_typed() {
+        let draft = |composer_rows: &[&str], row: usize, col: usize, first: usize| {
+            let mut r = rows(&["⏺ Done.", "", "✻ Cogitated for 4s · done 2:41 PM", ""]);
+            let top = r.len();
+            r.push("─".repeat(120));
+            r.extend(rows(composer_rows));
+            r.push("─".repeat(120));
+            r.push("  ? for shortcuts".to_string());
+            Screen {
+                rows: r,
+                cursor_row: first + top + 1 + row,
+                cursor_col: col,
+                first,
+                ..Screen::default()
+            }
+        };
+        for first in [0, 30] {
+            assert!(typed_draft(&draft(&["❯ Fix the parser", ""], 1, 2, first)));
+            assert!(typed_draft(&draft(
+                &["❯ Fix the parser", "  and the lexer"],
+                1,
+                2,
+                first
+            )));
+            assert!(typed_draft(&draft(&["❯", "  and the lexer"], 1, 15, first)));
+            assert!(typed_draft(&draft(&["❯ hi"], 0, 4, first)));
+            assert!(!typed_draft(&draft(
+                &["❯ Try \"fix lint errors\""],
+                0,
+                2,
+                first
+            )));
+            assert!(!typed_draft(&draft(&["❯"], 0, 2, first)));
+        }
+        // A cursor on no row read is judged by its column alone.
+        let mut off = draft(&["❯ Try \"fix lint errors\""], 0, 2, 0);
+        off.cursor_row = 99;
+        assert!(!typed_draft(&off));
+    }
+
+    // ---- the context indicator: running low, and compacted ---------------
+
+    /// `r` with Claude Code's context indicator, `<left>% until
+    /// auto-compact`, right-aligned on the row above its composer's top rule
+    /// (ending two columns short of the 120-column rule, as measured).
+    fn with_context(mut r: Vec<String>, left: u8) -> Vec<String> {
+        let top = r
+            .iter()
+            .position(|row| row.starts_with('─'))
+            .expect("the top rule");
+        let text = format!("{left}% until auto-compact");
+        let row = format!("{}{text}", " ".repeat(118 - text.chars().count()));
+        r.insert(top, row);
+        r
+    }
+
+    /// A worker running low, then compacting, then running low again: 15%
+    /// (above the default threshold of 10), 9% and 4% while busy, the
+    /// indicator gone from the busy screen (the compaction), 12% busy, and 8%
+    /// at the idle point that ends the turn.
+    fn descent() -> Vec<Vec<String>> {
+        vec![
+            with_context(busy_screen(), 15),
+            with_context(busy_screen(), 9),
+            with_context(busy_screen(), 4),
+            busy_screen(),
+            with_context(busy_screen(), 12),
+            with_context(said_idle("⏺ Pushed."), 8),
+        ]
+    }
+
+    /// `phase` ends with `context <n>%` while the indicator is up — after
+    /// `survey 0` when the survey is open too — and is `render_phase` alone
+    /// without it, a copy quoted in a tool's output included.
+    #[test]
+    fn phase_ends_with_the_context_left() {
+        let turn = |r: Vec<String>| Turn {
+            phase: worker_phase(&r),
+            screen: Screen {
+                rows: r,
+                ..Screen::default()
+            },
+            timed_out: false,
+        };
+        let low = turn(with_context(idle_screen(), 7));
+        assert_eq!(render_phase_and_survey(&low, &[]), "idle\ncontext 7%\n");
+        let both = turn(with_context(with_survey(busy_screen()), 1));
+        assert_eq!(
+            render_phase_and_survey(&both, &[]),
+            "busy\nreason status row: spinner\nsurvey 0\ncontext 1%\n"
+        );
+        let quoted = turn(framed(&["⏺ It reads:", "  ⎿  7% until auto-compact", ""]));
+        assert_eq!(render_phase_and_survey(&quoted, &[]), "idle\n");
+        let plain = turn(idle_screen());
+        assert_eq!(
+            render_phase_and_survey(&plain, &[]),
+            render_phase(&plain, &[])
+        );
+    }
+
+    /// `EVENT context` is said once a descent — at 9%, the first reading at
+    /// or below 10, and not again at 4% — as the reads come, mid-turn. The
+    /// indicator gone from a framed screen is the compaction, said once,
+    /// and the next descent is said again, ahead of the idle point's own
+    /// line. Nothing is pressed.
+    #[test]
+    fn watch_says_a_descent_once_and_the_compaction_once() {
+        let mut m = Mock::new(true, descent());
+        m.vanish_after = Some(0);
+        let (lines, code) = watch_lines(&mut m, &auto(30, None));
+        assert_eq!(
+            lines,
+            [
+                "EVENT context seq=102 9% until auto-compact",
+                "EVENT compacted seq=104",
+                "EVENT context seq=106 8% until auto-compact",
+                "EVENT idle seq=106 ⏺ Pushed.",
+                "EXIT session gone (await seq 106 failed: aterm-ctl: ERR exited)",
+            ]
+        );
+        assert_eq!(code, 1);
+        assert!(m.presses().is_empty(), "{:?}", m.requests);
+    }
+
+    /// `--context-warn 0` says neither line: the same descent and compaction
+    /// — here down to 0%, which 0 would read as low if it were a threshold
+    /// and not off — print only the idle point, as without the indicator.
+    /// `await-turn` says nothing of the indicator, even on a session a loop
+    /// left a threshold on.
+    #[test]
+    fn context_warn_0_says_neither_line() {
+        let mut screens = descent();
+        screens.insert(3, with_context(busy_screen(), 0));
+        let mut m = Mock::new(true, screens);
+        m.vanish_after = Some(0);
+        let opts = SuperviseOpts {
+            context_warn: 0,
+            ..auto(30, None)
+        };
+        let (lines, _) = watch_lines(&mut m, &opts);
+        assert_eq!(
+            lines,
+            [
+                "EVENT idle seq=107 ⏺ Pushed.",
+                "EXIT session gone (await seq 107 failed: aterm-ctl: ERR exited)",
+            ]
+        );
+
+        let mut m = Mock::new(true, descent());
+        let mut log: Vec<u8> = Vec::new();
+        let mut s = Session::new(&mut m, None);
+        s.context_warn = 10;
+        let turn = s
+            .await_turn_to(Duration::from_secs(30), &mut log)
+            .expect("turn");
+        assert_eq!(turn.phase, Phase::Idle);
+        assert!(log.is_empty(), "{}", String::from_utf8_lossy(&log));
+    }
+
+    /// After `EVENT context`, a reading 30 points or more over the last one
+    /// is a compaction too (29 is not); the last one, not the one warned at:
+    /// 50 is 41 over the 9 but 12 over the 38 read after it. A box on the
+    /// screen, which stands where the indicator is parked, is no sign of one.
+    #[test]
+    fn a_jump_of_30_points_is_a_compaction_and_a_box_is_not() {
+        let mut m = Mock::new(
+            true,
+            vec![
+                with_context(busy_screen(), 9),
+                write_prompt(),
+                with_context(busy_screen(), 38),
+                with_context(busy_screen(), 50),
+                with_context(busy_screen(), 80),
+                with_context(said_idle("⏺ Pushed."), 60),
+            ],
+        );
+        m.vanish_after = Some(0);
+        let (lines, _) = watch_lines(&mut m, &auto(30, None));
+        assert_eq!(
+            lines,
+            [
+                "EVENT context seq=101 9% until auto-compact",
+                "EVENT prompt seq=102 kind=bash classify=not-read-only:rm command=rm -rf target",
+                "EVENT compacted seq=105",
+                "EVENT idle seq=106 ⏺ Pushed.",
+                "EXIT session gone (await seq 106 failed: aterm-ctl: ERR exited)",
+            ]
+        );
+    }
+
+    /// The indicator quoted in the transcript — the worker's words, a tool's
+    /// output — is not the indicator: however low it reads, no `EVENT
+    /// context`, and nothing to call a compaction when it goes.
+    #[test]
+    fn a_quoted_indicator_never_fires() {
+        let quoted = framed(&[
+            "⏺ Claude Code showed this, then compacted:",
+            "  1% until auto-compact",
+            "",
+            "⏺ Bash(tail -2 status.txt)",
+            "  ⎿  1% until auto-compact",
+            "     Context left until auto-compact: 7%",
+            "",
+        ]);
+        assert_eq!(context_left(&quoted), None);
+        let mut m = Mock::new(true, vec![quoted, idle_screen()]);
+        m.vanish_after = Some(0);
+        let (lines, _) = watch_lines(&mut m, &auto(30, None));
+        assert_eq!(
+            lines,
+            [
+                "EVENT idle seq=101 Context left until auto-compact: 7%",
+                "EVENT idle seq=102 ⏺ Done.",
+                "EXIT session gone (await seq 102 failed: aterm-ctl: ERR exited)",
+            ]
+        );
+    }
+
+    /// `supervise` says the context lines on stderr as they come — here while
+    /// the worker is busy — and never in its result, which is the idle
+    /// point's.
+    #[test]
+    fn supervise_says_the_context_lines_on_stderr() {
+        let mut m = Mock::new(
+            true,
+            vec![with_context(busy_screen(), 9), busy_screen(), idle_screen()],
+        );
+        let mut log: Vec<u8> = Vec::new();
+        let (out, code) = Session::new(&mut m, Some("@s-1".to_string()))
+            .supervise_to(&auto(30, None), &mut log)
+            .expect("supervise");
+        assert_eq!(code, 0);
+        assert!(out.starts_with("idle\n--\n⏺ Done.\n"), "{out}");
+        assert!(!out.contains("EVENT"), "{out}");
+        let log = String::from_utf8(log).expect("utf-8");
+        assert_eq!(
+            log,
+            "EVENT context seq=101 9% until auto-compact\nEVENT compacted seq=102\n"
+        );
+    }
+
+    /// A peer's indicator quoted in the last transcript block — `aterm ctl
+    /// @s-2 text` run on a 100-column peer, its row 82 columns in under the
+    /// `⎿` gutter, ending at column 103 of this 120-column screen — with a
+    /// box under the block and no status row between: the block's row, not
+    /// the indicator. No `EVENT context` at the box, and no `EVENT
+    /// compacted` once the box has gone and the copy with it.
+    #[test]
+    fn a_quoted_indicator_over_a_box_never_fires() {
+        let quote = format!("     {}1% until auto-compact", " ".repeat(77));
+        let boxed = bash_box(
+            &["⏺ Bash(aterm ctl @s-2 text)", "  ⎿  ✢ Booping…", &quote],
+            "git push",
+        );
+        assert_eq!(context_left(&boxed), None);
+        let mut m = Mock::new(true, vec![boxed, busy_screen(), idle_screen()]);
+        m.vanish_after = Some(0);
+        let (lines, _) = watch_lines(&mut m, &auto(30, None));
+        assert_eq!(
+            lines,
+            [
+                "EVENT prompt seq=101 kind=bash classify=not-read-only:git push command=git push",
+                "EVENT idle seq=103 ⏺ Done.",
+                "EXIT session gone (await seq 103 failed: aterm-ctl: ERR exited)",
+            ]
+        );
+    }
+
+    /// `r` with its composer's rules `width` columns wide and the context
+    /// indicator in its other spelling, `Context left until auto-compact:
+    /// <left>%`, parked against their right edge: the worker's pane narrowed.
+    fn narrowed(r: Vec<String>, width: usize, left: u8) -> Vec<String> {
+        let mut r: Vec<String> = r
+            .into_iter()
+            .map(|row| {
+                if row.starts_with('─') {
+                    "─".repeat(width)
+                } else {
+                    row
+                }
+            })
+            .collect();
+        let top = r
+            .iter()
+            .position(|row| row.starts_with('─'))
+            .expect("the top rule");
+        let text = format!("Context left until auto-compact: {left}%");
+        r.insert(
+            top,
+            format!("{}{text}", " ".repeat(width - 2 - text.chars().count())),
+        );
+        r
+    }
+
+    /// A pane narrowed under the watch is not a compaction: warned at 9% in
+    /// 120 columns, then 55, where `Context left until auto-compact: 8%`
+    /// starts at column 18 — still the indicator, against the right edge. No
+    /// `EVENT compacted`, and `phase` still ends with `context 8%`.
+    #[test]
+    fn a_narrowed_pane_is_not_a_compaction() {
+        let idle = narrowed(idle_screen(), 55, 8);
+        let turn = Turn {
+            phase: worker_phase(&idle),
+            screen: Screen {
+                rows: idle.clone(),
+                ..Screen::default()
+            },
+            timed_out: false,
+        };
+        assert_eq!(render_phase_and_survey(&turn, &[]), "idle\ncontext 8%\n");
+        let mut m = Mock::new(
+            true,
+            vec![
+                with_context(busy_screen(), 9),
+                narrowed(busy_screen(), 55, 8),
+                idle,
+            ],
+        );
+        m.vanish_after = Some(0);
+        let (lines, _) = watch_lines(&mut m, &auto(30, None));
+        assert_eq!(
+            lines,
+            [
+                "EVENT context seq=101 9% until auto-compact",
+                "EVENT idle seq=103 ⏺ Done.",
+                "EXIT session gone (await seq 103 failed: aterm-ctl: ERR exited)",
+            ]
+        );
+    }
+
+    /// `supervise`'s watch lasts one run — each run is a process of its own,
+    /// and starts armed: a run that starts with the indicator still low says
+    /// `EVENT context` again at its first read, and a compaction during it is
+    /// said. A compaction between two runs, while the manager acts on the
+    /// first one's result, leaves the next run nothing to see it by — no
+    /// indicator, as on a worker with room left — and it says nothing (the
+    /// help says so; `watch` keeps one watch for as long as it runs).
+    #[test]
+    fn supervise_watches_one_run() {
+        let run = |screens: Vec<Vec<String>>| {
+            let mut m = Mock::new(true, screens);
+            let mut log: Vec<u8> = Vec::new();
+            let (out, code) = Session::new(&mut m, Some("@s-1".to_string()))
+                .supervise_to(&auto(30, None), &mut log)
+                .expect("supervise");
+            assert_eq!(code, 0);
+            assert!(out.starts_with("idle\n"), "{out}");
+            String::from_utf8(log).expect("utf-8")
+        };
+        // The turn ends idle at 8%, warned at 9% on the way.
+        assert_eq!(
+            run(vec![
+                with_context(busy_screen(), 9),
+                with_context(idle_screen(), 8)
+            ]),
+            "EVENT context seq=101 9% until auto-compact\n"
+        );
+        // The next run, the indicator still low: warned again, and the
+        // compaction during it said.
+        assert_eq!(
+            run(vec![
+                with_context(busy_screen(), 8),
+                busy_screen(),
+                idle_screen()
+            ]),
+            "EVENT context seq=101 8% until auto-compact\nEVENT compacted seq=102\n"
+        );
+        // The next run, the worker compacted before it: nothing to say.
+        assert_eq!(run(vec![busy_screen(), idle_screen()]), "");
+    }
+
+    /// The watch, read by read: the threshold is inclusive — 11 is over 10,
+    /// 10 warns — and once warned, the indicator is gone only from a screen
+    /// that shows the composer frame with no box up. A blank screen, a
+    /// build's output, a question box that covers the composer: no
+    /// compaction, and neither is 29 points over the last reading. The framed
+    /// screen without it is one, and the watch is armed again: 10 warns anew.
+    #[test]
+    fn the_context_watch_is_inclusive_and_needs_the_frame() {
+        let mut question = rows(&[
+            "⏺ Which model?",
+            "",
+            " Select a model",
+            " ❯ 1. Opus",
+            "   2. Sonnet",
+            "",
+            " Esc to cancel",
+        ]);
+        question.extend(rows(&["", "  ? for shortcuts"]));
+        assert!(!has_composer_frame(&question));
+        assert!(parse_prompt(&question).is_some());
+        let reads: Vec<(Vec<String>, &[&str])> = vec![
+            (with_context(busy_screen(), 11), &[]),
+            (
+                with_context(busy_screen(), 10),
+                &["EVENT context seq=2 10% until auto-compact"],
+            ),
+            (vec![String::new(); 8], &[]),
+            (
+                rows(&[
+                    "   Compiling aterm-agent v0.84.0",
+                    "    Finished `test` profile [unoptimized + debuginfo]",
+                    "$ ",
+                ]),
+                &[],
+            ),
+            (question, &[]),
+            (with_context(busy_screen(), 39), &[]),
+            (busy_screen(), &["EVENT compacted seq=7"]),
+            (
+                with_context(busy_screen(), 10),
+                &["EVENT context seq=8 10% until auto-compact"],
+            ),
+        ];
+        let mut m = Mock::new(true, vec![]);
+        let mut s = Session::new(&mut m, None);
+        s.context_warn = 10;
+        for (k, (rows, want)) in reads.into_iter().enumerate() {
+            let seq = k as u64 + 1;
+            let screen = Screen {
+                rows,
+                seq,
+                ..Screen::default()
+            };
+            let mut said: Vec<String> = Vec::new();
+            s.watch_context(&screen, &mut |line| {
+                said.push(line.to_string());
+                Ok(())
+            })
+            .expect("said");
+            assert_eq!(said, want, "read {seq}");
+        }
     }
 
     // ---- an outage: an aterm self-update's handoff ------------------------

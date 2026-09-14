@@ -226,17 +226,80 @@ impl LineMetrics {
 /// question: a 53 MB `.ttc` copied because the constructor only took a slice is
 /// 53 MB of pure waste, permanently, in a process that already had it.
 ///
-/// The two arms are the two handle types the crate's byte stores actually use —
-/// `DISCOVERED_FONT_BYTES`/`PARSED_FONT_INTERN` hold `Arc<Vec<u8>>`, the styled
-/// and shared-face stores hold `Arc<[u8]>`. An `Arc<dyn AsRef<[u8]>>` would
-/// unify them on paper and cannot: `Arc<[u8]>` is already unsized and will not
-/// coerce again.
+/// The three arms are the three handle types the crate's byte stores actually
+/// use — the styled and shared-face stores hold `Arc<[u8]>`, the host-injection
+/// intern holds `Arc<Vec<u8>>`, and the discovery path (`DISCOVERED_FONT_BYTES`
+/// / `PARSED_FONT_INTERN`, the seal's broad / symbol / colour-emoji admissions)
+/// holds a read-only private MAPPING of the file
+/// ([`crate::font_file::MappedFontFile`]) when the file lives on the sealed
+/// system font volume, so a 192 MB emoji collection is file-backed and faulted
+/// in per glyph rather than copied into anonymous heap at every launch. An
+/// `Arc<dyn AsRef<[u8]>>` would unify them on paper and cannot: `Arc<[u8]>` is
+/// already unsized and will not coerce again.
+///
+/// This is the crate's ONE discovered-bytes handle: `FallbackFace`, the
+/// colour-emoji slot, the discovery intern and the parsed-face intern all
+/// carry it, so a face's file is held exactly once however it was admitted.
 #[derive(Clone)]
-enum FaceBytes {
+pub enum FaceBytes {
     /// The styled / shared-face store's handle.
     Slice(Arc<[u8]>),
-    /// The interned / discovered store's handle.
+    /// The host-injection intern's handle, and the copy arm of discovery.
     Vec(Arc<Vec<u8>>),
+    /// The mapping arm of discovery (`font_file::admit_font_file`).
+    Mapped(Arc<crate::font_file::MappedFontFile>),
+}
+
+impl FaceBytes {
+    /// Whether both handles are the SAME allocation or mapping — the O(1)
+    /// identity every pointer-keyed cache in the crate relies on, and the
+    /// fast path in front of any byte comparison.
+    #[must_use]
+    pub fn ptr_eq(&self, other: &Self) -> bool {
+        match (self, other) {
+            (FaceBytes::Slice(a), FaceBytes::Slice(b)) => Arc::ptr_eq(a, b),
+            (FaceBytes::Vec(a), FaceBytes::Vec(b)) => Arc::ptr_eq(a, b),
+            (FaceBytes::Mapped(a), FaceBytes::Mapped(b)) => Arc::ptr_eq(a, b),
+            _ => false,
+        }
+    }
+
+    /// Whether both handles hold the same BYTES, deciding it without touching a
+    /// page wherever identity already answers: the same handle, or two
+    /// mappings of one inode. Only two distinct heap blobs (or a blob against a
+    /// mapping) of equal length pay the compare — which is what the byte-keyed
+    /// interns did for every candidate before.
+    #[must_use]
+    pub fn same_bytes(&self, other: &Self) -> bool {
+        if self.ptr_eq(other) {
+            return true;
+        }
+        if let (FaceBytes::Mapped(a), FaceBytes::Mapped(b)) = (self, other)
+            && a.same_file(b)
+        {
+            return true;
+        }
+        self.len() == other.len() && self[..] == other[..]
+    }
+
+    /// Whether the bytes are a file mapping (file-backed, evictable, shared)
+    /// rather than anonymous heap. Diagnostics: the seal's residency proof.
+    #[must_use]
+    pub fn is_mapped(&self) -> bool {
+        matches!(self, FaceBytes::Mapped(_))
+    }
+}
+
+impl From<Arc<[u8]>> for FaceBytes {
+    fn from(bytes: Arc<[u8]>) -> Self {
+        FaceBytes::Slice(bytes)
+    }
+}
+
+impl From<Arc<Vec<u8>>> for FaceBytes {
+    fn from(bytes: Arc<Vec<u8>>) -> Self {
+        FaceBytes::Vec(bytes)
+    }
 }
 
 impl core::ops::Deref for FaceBytes {
@@ -246,7 +309,22 @@ impl core::ops::Deref for FaceBytes {
         match self {
             FaceBytes::Slice(b) => b,
             FaceBytes::Vec(b) => b,
+            FaceBytes::Mapped(b) => b,
         }
+    }
+}
+
+impl core::fmt::Debug for FaceBytes {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        let arm = match self {
+            FaceBytes::Slice(_) => "Slice",
+            FaceBytes::Vec(_) => "Vec",
+            FaceBytes::Mapped(_) => "Mapped",
+        };
+        f.debug_struct("FaceBytes")
+            .field("arm", &arm)
+            .field("len", &self.len())
+            .finish()
     }
 }
 
@@ -336,7 +414,14 @@ impl Font {
         Self::parse(FaceBytes::Vec(data), settings)
     }
 
-    /// The one parse all three constructors reach.
+    /// [`Font::from_bytes`] adopting a caller's [`FaceBytes`] whatever its arm
+    /// — the discovery path's handle, which may be a file mapping. Same
+    /// bargain as [`Font::from_shared_slice`].
+    pub fn from_shared(data: FaceBytes, settings: FontSettings) -> Result<Font, &'static str> {
+        Self::parse(data, settings)
+    }
+
+    /// The one parse all four constructors reach.
     fn parse(data: FaceBytes, settings: FontSettings) -> Result<Font, &'static str> {
         let index = settings.collection_index;
         let face = ttf_parser::Face::parse(&data, index).map_err(describe)?;

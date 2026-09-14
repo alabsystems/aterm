@@ -293,6 +293,231 @@ pub fn release_durable_post_intent_model() -> Model {
     }
 }
 
+/// Crash/restart and snapshot-CAS protocol for the machine-roster body/signature pair.
+///
+/// The pair has two independently renamed files, so the fixed redo directory is the
+/// durable commit point.  `body`/`signature` use the same small identity domain:
+/// `0` is the exact predecessor (including "absent" for first setup), `1` is the
+/// exact transaction target, and `2` is an unrelated/newer value.  A writer checks
+/// its snapshot while holding the shared lock, commits the complete redo record before
+/// either promotion, and recovery moves every predecessor/target mixture forward.
+/// Read-only acquisition reports a redo record without replaying it.
+///
+/// `Buggy=1` exposes the three regressions this protocol exists to prevent: retiring
+/// a body-only pair, overwriting unrelated bytes during replay, and mutating from the
+/// check-only lane. Tier-1 (`crates/atpkg-keys/tests/roster_redo_model.rs`) binds the
+/// real `lock_roster` / `lock_roster_read_only` / `commit_roster_pair` /
+/// `publish_roster_locked` filesystem operations to these decisions.
+#[must_use]
+#[cfg_attr(trust_verify, trust::skip)]
+pub fn roster_pair_redo_model() -> Model {
+    crate::ty_model! {
+        RosterPairRedo {
+            const Buggy = 0;
+            const MaxIdentity = 2;
+            const MaxWrites = 2;
+            var body = 0;
+            var signature = 0;
+            var redo = 0;
+            var writer_lock = 0;
+            var snapshot_checked = 0;
+            // result: 0 in progress, 1 exact success, 2 refused.
+            var result = 0;
+            var writer_writes = 0;
+            var readonly_checked = 0;
+            var readonly_refused = 0;
+            var readonly_writes = 0;
+            var foreign_seen = 0;
+            var foreign_overwritten = 0;
+            var crashes = 0;
+
+            // Environment changes before lock acquisition are precisely what the
+            // byte-for-byte snapshot comparison must reject.
+            action AdvanceBodyBeforeCas when (
+                result == 0 && writer_lock == 0 && redo == 0 && body == 0
+            ) {
+                body = 2;
+                foreign_seen = 1;
+            }
+            action AdvanceSignatureBeforeCas when (
+                result == 0 && writer_lock == 0 && redo == 0 && signature == 0
+            ) {
+                signature = 2;
+                foreign_seen = 1;
+            }
+            action AcquireWriter when (
+                result == 0 && writer_lock == 0 && redo == 0
+            ) {
+                writer_lock = 1;
+            }
+            action AcceptSnapshot when (
+                result == 0 && writer_lock == 1 && redo == 0 &&
+                body == 0 && signature == 0 && snapshot_checked == 0
+            ) {
+                snapshot_checked = 1;
+            }
+            action RejectStaleSnapshot when (
+                result == 0 && writer_lock == 1 && redo == 0 &&
+                (body == 2 || signature == 2)
+            ) {
+                result = 2;
+            }
+
+            // The public pair-publish call is one logical transition.  The crash-cut
+            // actions below expose each durable intermediate state of that call.
+            action PublishExact when (
+                result == 0 && writer_lock == 1 && snapshot_checked == 1 &&
+                redo == 0 && body == 0 && signature == 0
+            ) {
+                body = 1;
+                signature = 1;
+                result = 1;
+                writer_writes = 2;
+            }
+            action CrashAfterRedo when (
+                result == 0 && writer_lock == 1 && snapshot_checked == 1 &&
+                redo == 0 && body == 0 && signature == 0 && crashes == 0
+            ) {
+                redo = 1;
+                writer_lock = 0;
+                crashes = 1;
+            }
+            action CrashAfterBody when (
+                result == 0 && writer_lock == 1 && snapshot_checked == 1 &&
+                redo == 0 && body == 0 && signature == 0 && crashes == 0
+            ) {
+                body = 1;
+                redo = 1;
+                writer_lock = 0;
+                crashes = 1;
+                writer_writes = 1;
+            }
+            action CrashAfterPair when (
+                result == 0 && writer_lock == 1 && snapshot_checked == 1 &&
+                redo == 0 && body == 0 && signature == 0 && crashes == 0
+            ) {
+                body = 1;
+                signature = 1;
+                redo = 1;
+                writer_lock = 0;
+                crashes = 1;
+                writer_writes = 2;
+            }
+            action ReplaceBodyWhileDown when (
+                result == 0 && writer_lock == 0 && redo == 1 && body <= 1
+            ) {
+                body = 2;
+                foreign_seen = 1;
+            }
+            action ReplaceSignatureWhileDown when (
+                result == 0 && writer_lock == 0 && redo == 1 && signature <= 1
+            ) {
+                signature = 2;
+                foreign_seen = 1;
+            }
+            action RecoverKnown when (
+                result == 0 && writer_lock == 0 && redo == 1 &&
+                body <= 1 && signature <= 1
+            ) {
+                body = 1;
+                signature = 1;
+                redo = 0;
+                writer_lock = 1;
+                result = 1;
+                writer_writes = 2;
+            }
+            action RejectForeignRecovery when (
+                result == 0 && writer_lock == 0 && redo == 1 &&
+                (body > 1 || signature > 1)
+            ) {
+                result = 2;
+            }
+
+            action ReadOnlyObserveClean when (
+                result == 0 && writer_lock == 0 && redo == 0 &&
+                readonly_checked == 0
+            ) {
+                readonly_checked = 1;
+            }
+            action ReadOnlyRejectRedo when (
+                result == 0 && writer_lock == 0 && redo == 1 &&
+                readonly_checked == 0
+            ) {
+                readonly_checked = 1;
+                readonly_refused = 1;
+            }
+            action ReleaseSuccess when (result == 1 && writer_lock == 1) {
+                writer_lock = 0;
+            }
+            action ReleaseRefusal when (result == 2 && writer_lock == 1) {
+                writer_lock = 0;
+            }
+
+            action BuggyRetirePartial when (
+                Buggy > 0 && result == 0 && writer_lock == 0 && redo == 1 &&
+                body == 1 && signature == 0
+            ) {
+                redo = 0;
+                writer_lock = 1;
+                result = 1;
+            }
+            action BuggyOverwriteForeign when (
+                Buggy > 0 && result == 0 && writer_lock == 0 && redo == 1 &&
+                (body == 2 || signature == 2)
+            ) {
+                body = 1;
+                signature = 1;
+                redo = 0;
+                writer_lock = 1;
+                result = 1;
+                writer_writes = 2;
+                foreign_overwritten = 1;
+            }
+            action BuggyReadOnlyReplay when (
+                Buggy > 0 && result == 0 && writer_lock == 0 && redo == 1 &&
+                readonly_checked == 0
+            ) {
+                body = 1;
+                signature = 1;
+                redo = 0;
+                result = 1;
+                readonly_checked = 1;
+                readonly_writes = 2;
+            }
+            action Done when (result > 0 && writer_lock == 0) {
+                result = result;
+            }
+
+            invariant SuccessfulPairIsExact:
+                if result == 1 {
+                    body == 1 && signature == 1 && redo == 0
+                } else {
+                    result <= 2
+                };
+            invariant TargetHalfHasRedoAuthority:
+                if result == 0 && (body == 1 || signature == 1) {
+                    redo == 1
+                } else {
+                    redo <= 1
+                };
+            invariant StaleSnapshotWritesNothing:
+                if result == 2 && redo == 0 {
+                    writer_writes == 0
+                } else {
+                    writer_writes <= MaxWrites
+                };
+            invariant ForeignBytesAreNeverOverwritten: foreign_overwritten == 0;
+            invariant ReadOnlyNeverWrites: readonly_writes == 0;
+            invariant StateBounded:
+                body <= MaxIdentity && signature <= MaxIdentity && redo <= 1 &&
+                writer_lock <= 1 && snapshot_checked <= 1 && result <= 2 &&
+                writer_writes <= MaxWrites && readonly_checked <= 1 &&
+                readonly_refused <= 1 && readonly_writes <= MaxWrites &&
+                foreign_seen <= 1 && foreign_overwritten <= 1 && crashes <= 1;
+        }
+    }
+}
+
 /// Release-channel floor carry-forward and late-race policy.
 ///
 /// A cut resolves its manifest floor as the canonical maximum of the operator

@@ -118,6 +118,9 @@ impl AtermGpuTerminal {
     /// costs cosmetics, never correctness). Returns whether movement
     /// provenance armed; on decline the text-blind keystroke semantics
     /// (cadence heat, rain freeze, candidate cancellation) still apply.
+    /// The character is SPELLED to the rainbow engine (2026-09-13): a Space
+    /// rests the synth and deals no star, a capital or `!` earns its hero
+    /// star, exactly as the native seam prices them.
     pub fn note_typed_char(&mut self, ch: char) -> bool {
         // WF-1 twin bump (mirrored; see `note_host_visual_change`).
         self.note_host_visual_change();
@@ -126,15 +129,29 @@ impl AtermGpuTerminal {
     }
 
     /// Report one accepted input intent: `text`, `delete`, `navigate`,
-    /// `submit`, or `paste`. Call AFTER transport admission, once for an
+    /// `submit`, `paste`, `kill` (`^U`/`^W`: the caret moves) or
+    /// `kill-forward` (`^K`). Call AFTER transport admission, once for an
     /// entire committed IME run or paste, never for composition preview,
     /// formatting, or PTY output. Empty or sanitizer-empty input needs no note.
     ///
+    /// Since 2026-09-13 the kind reaches the CURSOR ENGINES too, with the
+    /// native app's laws: `delete` is the erase (the rainbow ribbon retracts
+    /// the erased cell and the sky throws its stars), `navigate` licenses
+    /// the hop it precedes without a typed credit, `submit` is the Enter
+    /// key (inert until its flight is observed), a kill drains the line.
+    /// Call it for every NON-TEXT key INSTEAD of [`Self::note_keystroke`]:
+    /// a Backspace reported as a text-blind keystroke is replayed as a typed
+    /// glyph — it advanced the ribbon's momentum, banked a press credit and
+    /// re-laid the very cell it erased, which nothing then retracted (the
+    /// ribbon left under blank cells right of the text). A page that keeps
+    /// calling `note_keystroke` keeps that old behaviour, byte for byte.
+    ///
     /// For a scalar already reported through [`Self::note_typed_char`], do
     /// not also call this method. For an IME bundle use this once instead of
-    /// calling `note_typed_char` per character. This supplies pet attention,
-    /// not cursor-motion credit or evidence of changed text. Text-blind
-    /// [`Self::note_keystroke`] may be called alongside it for cadence.
+    /// calling `note_typed_char` per character. `text` and `paste` supply pet
+    /// attention only — no cursor-motion credit, no evidence of changed
+    /// text. Do NOT also call [`Self::note_keystroke`] for a key reported
+    /// here: the erase and kill kinds carry their own cadence.
     /// Returns `false` for an unknown kind without scheduling a frame.
     pub fn note_console_input(&mut self, kind: &str) -> bool {
         let Some(kind) = aterm_effects::kitty_pet::PetInputKind::parse(kind) else {

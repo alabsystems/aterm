@@ -946,10 +946,23 @@ pub(crate) fn config_semantic_warnings(
         // foreign-owner X11 read is a blocking round-trip inside the terminal
         // lock, so only aterm's own selections answer today (spawn.rs, the
         // Query arm) — say that, and no more.
+        // macOS names the alert that read raises: on macOS 26 a programmatic
+        // pasteboard read shows the system's "<app> would like to paste from
+        // <app>" alert, attributed to aterm — the program asked, aterm is the one
+        // seen asking. Saying so here is the whole of the 2026-09-12 TCC audit's
+        // OSC 52 finding: the setting was already fail-closed; its help did not
+        // say which dialog it is.
         let message = if cfg!(target_os = "linux") {
             "allow_osc52_query is enabled: a program in the terminal can READ the \
              clipboard selections aterm itself owns (a foreign app's copy is not \
              readable on X11 today). Leave it off unless a specific tool needs it"
+        } else if cfg!(target_os = "macos") {
+            "allow_osc52_query is enabled: a program in the terminal can READ the \
+             system clipboard — including text copied in OTHER apps, such as a \
+             password manager. On macOS 26 that read is what raises the system's \
+             \"aterm would like to paste from …\" alert: the program asked, the \
+             alert names aterm. Leave it off unless a specific tool needs it \
+             (e.g. remote vim/tmux clipboard sync)"
         } else {
             "allow_osc52_query is enabled: a program in the terminal can READ the \
              system clipboard — including text copied in OTHER apps, such as a \
@@ -4246,6 +4259,13 @@ ink = "rainbow"
             assert!(
                 message.contains("OTHER apps"),
                 "off X11 the read is the whole pasteboard and must not be softened: {message}"
+            );
+            // The 2026-09-12 TCC audit: the query is the macOS 26 pasteboard-alert
+            // shape, and the setting's help has to name that dialog.
+            assert_eq!(
+                message.contains("macOS 26") && message.contains("paste from"),
+                cfg!(target_os = "macos"),
+                "the paste alert is macOS's to name, and only macOS's: {message}"
             );
         }
     }

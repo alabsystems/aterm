@@ -337,6 +337,12 @@ pub struct Terminal {
     /// `RowMatches` watcher no longer allocates one full-screen `Vec` plus one
     /// `String` per visible row on every processed batch.
     pub(super) row_text_scratch: Vec<Option<String>>,
+    /// The alt-screen scroll-off archive and its `process_at` hook state: the
+    /// rows a fullscreen app scrolled off the top of the alternate screen, which
+    /// has no scrollback. EPHEMERAL, observation-only (like `watchers`): never
+    /// checkpointed, never handed off, never forwarded to the handler — the hook
+    /// runs between parser slices and at the batch epilogue. See `alt_archive.rs`.
+    pub(super) alt_archive: super::alt_archive::AltArchiveState,
     /// Current working directory (OSC 7).
     ///
     /// Set by shells when the directory changes.
@@ -371,6 +377,12 @@ pub struct Terminal {
     pub(super) kitty_keyboard: KittyKeyboardState,
     /// xterm keyboard modifier/format options (XTMODKEYS/XTFMTKEYS).
     pub(super) xterm_keyboard: XtermKeyboardState,
+    /// Lock-free mirror of `keyboard_mode()` / `mouse_mode()` — see
+    /// [`super::ModeMirror`]. Shared (`Arc`) with the session's input seam,
+    /// which reads it per key press INSTEAD of taking this terminal's mutex.
+    /// Refreshed under the lock at the end of every `process()` batch and by
+    /// every host mutator that can move one of the fold's inputs.
+    pub(super) mode_mirror: std::sync::Arc<super::ModeMirror>,
     /// Grouped Sixel graphics processing state.
     #[cfg(feature = "sixel")]
     pub(super) sixel: SixelState,

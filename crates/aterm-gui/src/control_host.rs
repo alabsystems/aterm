@@ -364,6 +364,8 @@ mod tests {
         let ctx = Arc::new(crate::SessionCtx {
             sink: Arc::new(SinkWriter::new(master)),
             output_echo: Arc::new(crate::app_input::OutputEchoTracker::default()),
+            modes: crate::mode_mirror_of(term),
+            ui_waiting: Arc::default(),
             edges: std::sync::Mutex::new(EdgeTable::new()),
             turn_lease: std::sync::Mutex::new(None),
             self_id: sid.clone(),

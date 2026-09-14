@@ -6027,6 +6027,7 @@ mod tests {
             intensity: 1.0,
             duration: Duration::from_millis(900),
             ribbon_tall: true,
+            ribbon_flat: false,
             theme_fg: 0x00FF_FFFF,
             theme_bg: 0x0000_0000,
             reduced_motion: false,

@@ -72,7 +72,7 @@ USAGE
                            an older release: they do not miss this update, they
                            never update again.
 
-  targo --unverified ship provision --id <machine-id> [--check]
+  targo --unverified ship provision --id <machine-id> [--check] [--cert-dir <folder>]
                            ON A BARE MACHINE, RUN tools/bootstrap-publisher.sh
                            FIRST — provision refuses without a Trust toolchain.
                            Then: make THIS machine a publisher. Seeds the newest
@@ -90,6 +90,15 @@ USAGE
                            Idempotent: a provisioned machine is audited and
                            bound through the real authorize_cut gate, never
                            re-minted. Ends in a READY TO CUT verdict.
+        --cert-dir <folder>
+                           the one visible folder the Apple browser errand may
+                           use: the certificate request is copied there for the
+                           upload dialog, and the issued .cer is looked for there
+                           (and in ~/.aterm/apple). Without it every read stays
+                           inside ~/.aterm/apple — provision never touches
+                           ~/Downloads or another folder macOS guards on its own
+                           initiative; naming one is the consent, and a note says
+                           so before the errand.
         --check            audit only: no mint, no dist/ writes. Exits non-zero
                            if anything is open, so a caller can gate on it. The
                            mode to run when something is wrong and you do not
@@ -129,6 +138,10 @@ pub enum Cmd {
     Provision {
         id: String,
         check: bool,
+        /// `--cert-dir`: the ONE visible folder the browser errand may use — the request
+        /// is copied there and the certificate looked for there. `None` keeps every read
+        /// inside `~/.aterm/apple`; `~/Downloads` is never touched unasked.
+        cert_dir: Option<std::path::PathBuf>,
     },
     Status,
     Recover {
@@ -204,6 +217,7 @@ pub fn parse(args: &[String]) -> std::result::Result<Cmd, String> {
         "provision" => {
             let mut id: Option<String> = None;
             let mut check = false;
+            let mut cert_dir: Option<std::path::PathBuf> = None;
             while let Some(flag) = it.next() {
                 match flag {
                     "--id" => {
@@ -217,6 +231,20 @@ pub fn parse(args: &[String]) -> std::result::Result<Cmd, String> {
                         );
                     }
                     "--check" => check = true,
+                    "--cert-dir" => {
+                        if cert_dir.is_some() {
+                            return Err("--cert-dir given twice".to_string());
+                        }
+                        let dir = it
+                            .next()
+                            .ok_or("--cert-dir needs a folder (e.g. --cert-dir ~/Downloads)")?;
+                        if dir.is_empty() {
+                            return Err(
+                                "--cert-dir needs a folder, not an empty string".to_string()
+                            );
+                        }
+                        cert_dir = Some(std::path::PathBuf::from(dir));
+                    }
                     other => return Err(format!("unknown provision flag {other:?}")),
                 }
             }
@@ -224,7 +252,11 @@ pub fn parse(args: &[String]) -> std::result::Result<Cmd, String> {
                 "provision needs --id <machine-id> — the roster name this machine signs \
                  under (e.g. targo --unverified ship provision --id m2)",
             )?;
-            Ok(Cmd::Provision { id, check })
+            Ok(Cmd::Provision {
+                id,
+                check,
+                cert_dir,
+            })
         }
         "status" => {
             if let Some(extra) = it.next() {
@@ -467,7 +499,11 @@ fn dispatch(cmd: Cmd) -> ledger::Result<()> {
             ..
         } => verify::run_retire_unmirrored(&repo_root()?, &v),
         Cmd::Cut { opts, .. } => publish::run_cut(&repo_root()?, &opts),
-        Cmd::Provision { id, check } => crate::provision::run_provision(&repo_root()?, &id, check),
+        Cmd::Provision {
+            id,
+            check,
+            cert_dir,
+        } => crate::provision::run_provision(&repo_root()?, &id, check, cert_dir.as_deref()),
         Cmd::Status => verify::run_status(&repo_root()?),
         Cmd::Recover {
             version,

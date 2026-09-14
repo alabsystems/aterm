@@ -1,7 +1,9 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! Exercise the actual CLI's stdout/stderr split against a private protocol peer.
+//! Exercise the actual CLI's stdout/stderr split against a private protocol peer:
+//! the line-framed verbs whose header carries facts the rows do not (`inbox`,
+//! `offscreen`).
 //! No live aterm session is discovered or addressed by these tests.
 
 #![cfg(unix)]
@@ -23,6 +25,10 @@ impl Drop for Scratch {
 }
 
 fn run_inbox(args: &[&str], reply: &[u8]) -> Output {
+    run_verb("inbox", args, reply)
+}
+
+fn run_verb(verb: &str, args: &[&str], reply: &[u8]) -> Output {
     static NEXT: AtomicUsize = AtomicUsize::new(0);
     // Keep the socket below macOS's short sun_path limit.
     let directory = PathBuf::from("/tmp").join(format!(
@@ -72,12 +78,12 @@ fn run_inbox(args: &[&str], reply: &[u8]) -> Output {
     let output = command
         .arg("--sock")
         .arg(&socket)
-        .args(["--timeout", "2", "@s-0123456789abcdef0123", "inbox"])
+        .args(["--timeout", "2", "@s-0123456789abcdef0123", verb])
         .args(args)
         .output()
         .unwrap();
     let expected = std::iter::once("@s-0123456789abcdef0123")
-        .chain(std::iter::once("inbox"))
+        .chain(std::iter::once(verb))
         .chain(args.iter().copied())
         .collect::<Vec<_>>()
         .join(" ");
@@ -126,4 +132,28 @@ fn inbox_seen_remains_an_ordinary_status_reply() {
     assert!(output.status.success());
     assert_eq!(output.stdout, b"OK seen=8\n");
     assert!(output.stderr.is_empty());
+}
+
+/// `offscreen`'s header places its rows (`last=` is the next poll's `since=`,
+/// `screen_rows=` splits the archive from the screen): it goes to stderr with
+/// the rows on stdout, as `inbox`'s does — empty or not, once.
+#[test]
+fn offscreen_keeps_its_header_on_stderr_and_its_rows_on_stdout() {
+    let header = "OK 3 first=41 last=42 lost=0 breaks=0 back=1 epoch=2 origin=5 alt=1 seq=9 \
+                  screen_rows=1";
+    let body = "❯ Pick one\n⏺ Looking at both.\n⏺ Looking at both.\n";
+    let output = run_verb(
+        "offscreen",
+        &["since=5:40", "screen=1"],
+        format!("{header}\n{body}").as_bytes(),
+    );
+    assert!(output.status.success());
+    assert_eq!(output.stdout, body.as_bytes());
+    assert_eq!(output.stderr, format!("aterm-ctl: {header}\n").as_bytes());
+
+    let header = "OK 0 first=43 last=42 lost=0 breaks=0 back=0 epoch=2 origin=5 alt=1 seq=9";
+    let output = run_verb("offscreen", &["since=42"], format!("{header}\n").as_bytes());
+    assert!(output.status.success());
+    assert!(output.stdout.is_empty());
+    assert_eq!(output.stderr, format!("aterm-ctl: {header}\n").as_bytes());
 }

@@ -949,4 +949,52 @@ mod tests {
             Terminal::paste_insert_cells("±", true) >= Terminal::paste_insert_cells("±", false)
         );
     }
+
+    /// THE ECHO ANCHOR COUNTS THE PENDING-WRAP COLUMN (2026-09-12): a glyph
+    /// printed at the last column with DECAWM on leaves the DEC cursor ON
+    /// that column (the wrap deferred), and the anchor reports one past it
+    /// — the END of the print run, so the cursor-effect host can see the
+    /// hand's row advance by a cell that produced no cursor move. A cursor
+    /// address clears it; a TUI-model print (text, then an explicit CUP)
+    /// reports the cursor column as before.
+    #[test]
+    fn print_anchor_counts_the_pending_wrap_column() {
+        let mut t = Terminal::new(4, 10);
+        t.process(b"\x1b[?7h");
+        t.process(b"123456789");
+        let (row, col, seq) = t.print_anchor().expect("printed");
+        assert_eq!((row, col), (0, 9), "nine glyphs: the anchor is the cursor");
+        assert_eq!(t.cursor().col, 9);
+        t.process(b"0");
+        let (row, col, seq2) = t.print_anchor().expect("printed");
+        assert_eq!(
+            (row, col),
+            (0, 10),
+            "the tenth glyph: the anchor is one past the last column"
+        );
+        assert_eq!(t.cursor().col, 9, "…while the cursor stays parked on it");
+        assert!(t.grid().pending_wrap());
+        assert!(seq2 > seq);
+        // The wrap lands with the next glyph: anchor and cursor agree again.
+        t.process(b"a");
+        assert_eq!(t.print_anchor().map(|(r, c, _)| (r, c)), Some((1, 1)));
+        assert_eq!((t.cursor().row, t.cursor().col), (1, 1));
+        // The TUI model: text to the last column, then an explicit CUP to
+        // the next row — the anchor reports the print's own end, and the
+        // cursor address moves the cursor without touching it.
+        t.process(b"\x1b[3;1H");
+        t.process(b"abcdefghij");
+        assert_eq!(t.print_anchor().map(|(r, c, _)| (r, c)), Some((2, 10)));
+        t.process(b"\x1b[4;1H");
+        assert!(
+            !t.grid().pending_wrap(),
+            "a cursor address clears the deferred wrap"
+        );
+        assert_eq!((t.cursor().row, t.cursor().col), (3, 0));
+        assert_eq!(
+            t.print_anchor().map(|(r, c, _)| (r, c)),
+            Some((2, 10)),
+            "the anchor is the last PRINT's, not the cursor's"
+        );
+    }
 }

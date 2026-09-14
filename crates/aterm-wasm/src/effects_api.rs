@@ -124,15 +124,23 @@ impl AtermTerminal {
     }
 
     /// Report one accepted input intent: `text`, `delete`, `navigate`,
-    /// `submit`, or `paste`. Call AFTER transport admission, once for an
+    /// `submit`, `paste`, `kill` (`^U`/`^W`: the caret moves), or
+    /// `kill-forward` (`^K`). Call AFTER transport admission, once for an
     /// entire committed IME run or paste, never for composition preview,
     /// formatting, or PTY output. Empty or sanitizer-empty input needs no note.
     ///
+    /// Non-text kinds also reach the cursor engines: delete retracts erased
+    /// ribbon, navigation licenses a hop without typed credit, submit arms
+    /// Return, and kill drains the line. Use this INSTEAD OF
+    /// [`Self::note_keystroke`] for those keys; erase and kill carry their own
+    /// cadence. Adding a text-blind keystroke would incorrectly bank a typed
+    /// credit for the same non-text key.
+    ///
     /// For a scalar already reported through [`Self::note_typed_char`], do
     /// not also call this method. For an IME bundle use this once instead of
-    /// calling `note_typed_char` per character. This supplies pet attention,
-    /// not cursor-motion credit or evidence of changed text. Text-blind
-    /// [`Self::note_keystroke`] may be called alongside it for cadence.
+    /// calling `note_typed_char` per character. `text` and `paste` supply pet
+    /// attention without typed cursor-motion credit or evidence of changed
+    /// text. Do not also call [`Self::note_keystroke`] for a reported intent.
     /// Returns `false` for an unknown kind without scheduling a frame.
     pub fn note_console_input(&mut self, kind: &str) -> bool {
         let Some(kind) = aterm_effects::kitty_pet::PetInputKind::parse(kind) else {

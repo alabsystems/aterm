@@ -257,5 +257,12 @@ impl Terminal {
         // and discard — fail-closed by construction, not by a flag it could miss.
         let _ = self.grid.take_row_band_moves();
         self.content_scroll_state.invalidate();
+        // RIS moved every input of the encoder fold (kitty stack, xterm keyboard
+        // state, DECCKM/DECKPAM/mouse modes) without passing through
+        // `process()`, so republish the lock-free mirror here.
+        self.refresh_mode_mirror();
+        // The alt-screen archive: `reset_common_fields` bumped the reset
+        // generation, and this path never reaches `process_at`, so wipe here.
+        self.alt_archive_after_host_reset();
     }
 }

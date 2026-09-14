@@ -352,9 +352,8 @@ fn commit_layout_topology(
             // degrade and is deliberately left in the comparison too. It has to
             // stay there: the successor puts those five fields back on the
             // sessions it adopts FROM THE PENDING LAYOUT
-            // (`App::graft_restored_user_meta` for the session already running
-            // in each window's first pane, `App::seed_restored_user_meta` for
-            // the rest), so a `meta set` THIS process answers between the
+            // (`App::carry_restored_identity`, onto the shell each leaf's
+            // `local_id` names), so a `meta set` THIS process answers between the
             // capture and the Commit-time re-capture must reject this Commit:
             // admitting it would commit a successor that shows the value from
             // before the edit. That is all the comparison covers. A `meta set`

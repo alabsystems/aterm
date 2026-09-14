@@ -62,7 +62,7 @@ use aterm_spec::derive::{
     native_update_worker_queue_model, native_updater_model, net_capability_grant_model,
     net_dial_after_grant_model, nova_phase_model, one_shot_peek_model,
     operator_event_delivery_model, operator_fleet_fault_model, operator_leadership_model,
-    operator_resync_cursor_model, operator_wal_actuator_model,
+    operator_resync_cursor_model, operator_wal_actuator_model, output_streak_attribution_model,
     output_streak_episode_delivery_model, pad_absorption_model, pane_tree_model,
     path_feed_snapshot_model, per_window_metrics_model, predictive_echo_visibility_model,
     present_retry_model, presentation_gate_model, presented_frame_tap_model, press_custody_model,
@@ -74,7 +74,7 @@ use aterm_spec::derive::{
     release_historical_recovery_model, release_journal_prefix_model,
     release_key_epoch_transition_model, release_published_identity_model,
     release_publisher_fence_model, release_yank_successor_first_model,
-    restore_manifest_single_use_model, ring_model, scroll_glide_model,
+    restore_manifest_single_use_model, ring_model, roster_pair_redo_model, scroll_glide_model,
     scrollback_maintenance_lane_model, seamless_nonce_model, selection_custody_model,
     self_governor_model, semantic_prewarm_generation_model, semantic_prewarm_handshake_model,
     semantic_prewarm_request_swap_model, serious_mode_intent_queue_model, serious_mode_model,
@@ -3941,6 +3941,68 @@ fn derived_release_post_intents_are_durable_and_one_shot() {
     let mut unjournaled = buggy.init_state();
     assert!(buggy.fire("IssueCreatePost", &mut unjournaled));
     assert!(!buggy.check_invariant("CreatePostRequiresDurableIntent", &unjournaled));
+}
+
+/// The roster body and master signature commit through one durable redo marker.
+/// Every known crash cut recovers to the exact pair; a newer/unrelated half is a
+/// refusal, and check-only acquisition has no replay authority. Tier-1 lives in
+/// `crates/atpkg-keys/tests/roster_redo_model.rs`.
+#[test]
+fn derived_roster_pair_redo_proves_crash_recovery_and_foreign_preservation() {
+    let model = roster_pair_redo_model();
+    assert_proves_and_catches(&model);
+
+    let mut body_cut = model.init_state();
+    for action in ["AcquireWriter", "AcceptSnapshot", "CrashAfterBody"] {
+        assert!(model.fire(action, &mut body_cut), "disabled {action}");
+    }
+    assert_eq!(body_cut["body"], 1);
+    assert_eq!(body_cut["signature"], 0);
+    assert_eq!(body_cut["redo"], 1);
+    assert!(model.fire("ReadOnlyRejectRedo", &mut body_cut));
+    assert_eq!(body_cut["readonly_writes"], 0);
+    assert!(model.fire("RecoverKnown", &mut body_cut));
+    assert_eq!(body_cut["body"], 1);
+    assert_eq!(body_cut["signature"], 1);
+    assert_eq!(body_cut["redo"], 0);
+    assert_eq!(body_cut["result"], 1);
+
+    let mut foreign = model.init_state();
+    for action in [
+        "AcquireWriter",
+        "AcceptSnapshot",
+        "CrashAfterRedo",
+        "ReplaceSignatureWhileDown",
+        "RejectForeignRecovery",
+    ] {
+        assert!(model.fire(action, &mut foreign), "disabled {action}");
+    }
+    assert_eq!(foreign["signature"], 2);
+    assert_eq!(foreign["redo"], 1);
+    assert_eq!(foreign["foreign_overwritten"], 0);
+    assert_eq!(foreign["writer_writes"], 0);
+
+    // NEGATIVE CONTROLS: the healthy model cannot retire a mixed pair or replay
+    // over foreign bytes; Buggy=1 admits both and violates the named invariants.
+    let buggy = aterm_spec::interp::with_buggy(&model, 1);
+    let mut partial = buggy.init_state();
+    for action in ["AcquireWriter", "AcceptSnapshot", "CrashAfterBody"] {
+        assert!(buggy.fire(action, &mut partial), "disabled {action}");
+    }
+    assert!(buggy.fire("BuggyRetirePartial", &mut partial));
+    assert!(!buggy.check_invariant("SuccessfulPairIsExact", &partial));
+
+    let mut overwritten = buggy.init_state();
+    for action in [
+        "AcquireWriter",
+        "AcceptSnapshot",
+        "CrashAfterRedo",
+        "ReplaceBodyWhileDown",
+        "BuggyOverwriteForeign",
+    ] {
+        assert!(buggy.fire(action, &mut overwritten), "disabled {action}");
+    }
+    assert!(!buggy.check_invariant("ForeignBytesAreNeverOverwritten", &overwritten));
 }
 
 /// A release floor is frozen as channel state, survives resume unchanged, and is
@@ -8055,6 +8117,10 @@ fn derived_cursor_hint_license_proves_and_catches_cold_light() {
     assert_eq!(typed["births"], 1);
     assert_eq!(typed["licensed_tally"], 1);
     assert_eq!(typed["resident"], 1);
+    assert_eq!(
+        typed["spent"], 1,
+        "the echo SPENDS the press's credit (2026-09-10: a credit is spent by the cells it lays)"
+    );
     assert!(
         !model.fire("LicensedTypedMoveMintsLight", &mut typed),
         "a spent licence cannot fund a second echo"
@@ -8082,6 +8148,35 @@ fn derived_cursor_hint_license_proves_and_catches_cold_light() {
         !model.fire("LicensedTypedMoveMintsLight", &mut expiry),
         "a stale stamp licenses nothing"
     );
+    // …but the PRESS behind it is still in flight, and THAT licenses its own
+    // one-cell echo (2026-09-12, the stalled last key): spent on admission,
+    // so it funds one cell, once. The model carries no hop width, so at ONE
+    // press the refusal is enabled beside it — the engine's real transition
+    // for a hop wider than one cell: refused, and the press KEPT.
+    let mut wide = expiry.clone();
+    assert!(
+        model.fire("StaleStampMoveDeclines", &mut wide),
+        "one press against a wider hop is refused"
+    );
+    assert_eq!(wide["births"], 0);
+    assert_eq!(
+        wide["credit_arms"] - wide["spent"] - wide["forfeited"],
+        1,
+        "…and the press is kept, not forgotten"
+    );
+    let mut late = expiry.clone();
+    assert!(model.fire("InFlightPressEchoMintsLight", &mut late));
+    assert_eq!(late["births"], 1, "the press's own cell is lit");
+    assert_eq!(late["spent"], 1, "…and the press is spent");
+    assert_eq!(late["hint"], 2, "the stale stamp is left in place");
+    assert!(
+        !model.fire("InFlightPressEchoMintsLight", &mut late),
+        "one press, one cell, once"
+    );
+    // The stale stamp with NO press in flight — forgotten by an edge — is
+    // the shape `StaleStampMoveDeclines` is right about.
+    assert!(model.fire("UnexplainedHopForgetsCredits", &mut expiry));
+    assert_eq!(expiry["forfeited"], 1);
 
     // THE DELIVERED INSERT (2026-09-10): enqueue arms nothing; the writer
     // thread's completed write arms the insert's own slot; its echo spends
@@ -8141,6 +8236,20 @@ fn derived_cursor_hint_license_proves_and_catches_cold_light() {
     assert!(model.fire("RetireStaleLicense", &mut expiry));
     assert_eq!(expiry["spent"], 0);
     assert_eq!(expiry["credit_refunded"], 0);
+
+    // THE ONE-PRESS MUTANT: the late echo that does not spend — one press
+    // funds a second +1, and `PairedAdmissionsNeverExceedArms` names it.
+    let buggy_press = aterm_spec::interp::with_buggy(&model, 1);
+    let mut twice = buggy_press.init_state();
+    assert!(buggy_press.fire("PressArmsLicense", &mut twice));
+    assert!(buggy_press.fire("LicenseExpires", &mut twice));
+    assert!(buggy_press.fire("InFlightPressEchoMintsLight", &mut twice));
+    assert_eq!(twice["spent"], 0, "the mutant does not spend");
+    assert!(buggy_press.fire("InFlightPressEchoMintsLight", &mut twice));
+    assert!(
+        !buggy_press.check_invariant("PairedAdmissionsNeverExceedArms", &twice),
+        "two admissions on one arm must be caught"
+    );
 
     // THE PRESS CREDIT BUDGET, the one anti-stray law kept from the proof era.
     // Two banked cells pay for a two-cell coalesce and are spent by it; one
@@ -8307,10 +8416,13 @@ fn derived_cursor_hint_license_proves_and_catches_cold_light() {
         "the pre-licence cold fall-through must have its own counterexample"
     );
 
-    // The freshness window ignored: a stamp that is set but stale still paints.
+    // The freshness window ignored: a stamp that is set but stale still paints
+    // — with its press no longer in flight (the patience elapsed), so the
+    // stamp is all there is.
     let mut stale_light = buggy.init_state();
     assert!(buggy.fire("PressArmsLicense", &mut stale_light));
     assert!(buggy.fire("LicenseExpires", &mut stale_light));
+    assert!(buggy.fire("PatienceElapses", &mut stale_light));
     assert!(buggy.fire("StaleStampMoveDeclines", &mut stale_light));
     assert_eq!(stale_light["stale_admitted"], 1);
     assert!(!buggy.check_invariant("AStaleStampIsNotALicence", &stale_light));
@@ -8357,6 +8469,9 @@ fn derived_cursor_hint_license_proves_and_catches_cold_light() {
     // unlicensed, which is the only shape whose denial ran the wipe.
     assert!(buggy.fire("LicenseExpires", &mut wipe));
     assert!(buggy.fire("RetireStaleLicense", &mut wipe));
+    // The mutant refunded the credit too; forget it by the clock so the
+    // move finds an empty pool — the cold shape.
+    assert!(buggy.fire("PatienceElapses", &mut wipe));
     assert!(buggy.fire("ColdMoveOverEarnedLight", &mut wipe));
     assert_eq!(wipe["resident"], 0);
     assert_eq!(wipe["wiped"], 1);
@@ -9244,6 +9359,13 @@ fn derived_output_streak_delivery_proves_and_catches_lost_episode_edges() {
         ),
         (3, 1, 1, 0, 1)
     );
+}
+
+#[test]
+fn derived_output_streak_attribution_proves_and_catches_unrelated_output() {
+    let model = output_streak_attribution_model();
+    assert_proves_and_catches(&model);
+    assert_every_invariant_carries_a_mutant(&model, &["Bounded"]);
 }
 
 /// PHOSPHOR rain lifecycle (docs/matrix-rain-design.md §10): the

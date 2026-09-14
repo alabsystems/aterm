@@ -251,9 +251,9 @@ pub fn usage() -> String {
 /// so the help text names whatever [`crate::exec::DEFAULT_CHILD_CEILING`] is.
 fn ceiling_text(d: std::time::Duration) -> String {
     let secs = d.as_secs();
-    if secs % 3600 == 0 {
+    if secs.is_multiple_of(3600) {
         format!("{}-hour", secs / 3600)
-    } else if secs % 60 == 0 {
+    } else if secs.is_multiple_of(60) {
         format!("{}-minute", secs / 60)
     } else {
         format!("{secs}-second")

@@ -13350,7 +13350,7 @@ fn tick_composed_output_streak_pane(
     engine.note_output_cells(
         &snapshot.cells,
         (snapshot.cursor_row, snapshot.cursor_col),
-        usize::from(pane.place.rows),
+        (usize::from(pane.place.rows), usize::from(pane.place.cols)),
         content_seq,
         resolved.now,
         pane.echo.input_hot,
@@ -24197,6 +24197,12 @@ impl App {
             sparks: ws.cursor_glow.live_sparks(),
             momentum: ws.cursor_glow.typing_momentum(now),
             momentum_display: ws.cursor_glow.momentum_display(),
+            // The momentum GLOW's own reading, so a warm caret's status line
+            // explains itself (`block_fill=momentum` used to sit beside
+            // `momentum=0.00`). Read with the same τ the frame path ticks it on.
+            momentum_glow: ws
+                .momentum_glow
+                .value(now, aterm_effects::cursor_momentum::MOMENTUM_GLOW_TAU_S),
             glow_active: ws.cursor_glow.is_active(),
             pet_active: self.trail_is_kitty_pet() && ws.cursor_pet.is_active(),
             pet_action: &pet_action,
@@ -24511,16 +24517,20 @@ impl App {
         if let Some((session, same_session, batch)) = deliveries {
             let rainbow = matches!(glow_cfg.style, crate::cursor_glow::GlowStyle::RainbowKitty);
             if batch.evicted > 0 {
-                // The register is sized to the engine's typed bank; past it
-                // the receipts are gone and the licences they carried with
-                // them. Loud, never silent: a dark insert with this line in
-                // the log is a diagnosis, without it a mystery.
+                // The register holds a frame's worth of receipts
+                // (`DELIVERY_RING`, 32 — deliberately shallower than the
+                // engine's 128-deep press bank); past it the receipts are
+                // gone and the licences they carried with them. Loud, never
+                // silent: a dark insert with this line in the log is a
+                // diagnosis, without it a mystery.
                 aterm_log::warn!(
                     "delivery register overran: {} receipt(s) evicted unread (session {session}, latest {})",
                     batch.evicted,
                     batch.latest
                 );
             }
+            // A window with no baseline for this session (`!same_session`)
+            // was handed nothing to apply; the guard states the intent.
             if same_session {
                 for (at, ticket) in batch.items.iter().flatten() {
                     let fresh = frame_started.saturating_duration_since(*at).as_secs_f32()
@@ -24536,10 +24546,10 @@ impl App {
                         ws.cursor_trail.note_typed(*at);
                     }
                 }
-                ws.delivery_seen = Some((session, batch.latest));
-            } else {
-                ws.delivery_seen = Some((session, batch.latest));
             }
+            // Either way the head is recorded: applied receipts are seen,
+            // and a fresh baseline is the tracker's newest serial.
+            ws.delivery_seen = Some((session, batch.latest));
         }
         // ECHO-ANCHOR feed, immediately before the tick like the row probe:
         // where the terminal's last print run ended, so the hidden/parked-
@@ -24591,6 +24601,10 @@ impl App {
             // verdict is still cached from before the toggle). ONE author for
             // that rule across all three drain seams — see
             // `ToneTracker::effective`.
+            // Run the inference the keystrokes since the last frame marked due
+            // (P06: the classifier left the key handler) — BEFORE the tone is
+            // read, so every cue drained this tick carries the current verdict.
+            ws.tone_tracker.drain_pending_inference(frame_started);
             let tone = ws
                 .tone_tracker
                 .effective(self.config.tone_melody_or_default());
@@ -27323,31 +27337,23 @@ impl App {
         // acquisition and final-present waits remain in `redraw_total`.
         metrics::record_present(present_latency_ns, render_ns, startup_timing);
 
-        // Warm broad font coverage only after the first frame reaches the
-        // compositor, keeping system-font IO off time-to-glass.
-        {
-            static FONT_WARM: std::sync::Once = std::sync::Once::new();
-            FONT_WARM.call_once(|| {
-                std::thread::Builder::new()
-                    .name("aterm-font-warm".into())
-                    .spawn(|| {
-                        // QoS (port of 61a6c8b62): `Responsive`, NOT `Background`
-                        // as the branch had it. The warm initialises the
-                        // `font_coverage_index` `OnceLock`, and the UI thread's
-                        // first fallback-glyph miss (`runtime_fallback_scan_
-                        // candidates`) blocks on that same init if it lands
-                        // mid-scan. An in-progress `OnceLock` is a lock the UI
-                        // thread contends; demoting its initialiser below the UI
-                        // thread is a priority inversion, so it keeps the PTY
-                        // drain's class rather than dropping to UTILITY.
-                        crate::qos::set_self(crate::qos::Role::Responsive);
-                        aterm_render::warm_font_coverage_index();
-                    })
-                    .ok();
-            });
-        }
-        // Register the Windows taskbar jump list on the same off-critical-path
-        // schedule: once per process, only after the first frame reached the
+        // There is deliberately NO font-coverage warm here any more. The
+        // `aterm-font-warm` thread this hook used to spawn read EVERY system
+        // font whole (~373 files, ~700 MB on this Mac, the 192 MB emoji TTC
+        // included) to build `aterm_render`'s cmap-coverage index — a table
+        // only `runtime_fallback_scan_candidates` reads, on the
+        // `Tier::RuntimeDecisions` lane, which `font_chain` excludes for every
+        // SEALED generation. Every GUI renderer is sealed before its first
+        // pixel (the backend worker seals a windowed launch; headless seals in
+        // `redeem_deferred_font_seal` on the first pixel demand), so the warm
+        // was 0.4-0.8 s of one core and ~700 MB of page-cache reads per launch
+        // for an index no GUI process can consult. The lazy `OnceLock` stays
+        // in `aterm_render` for the UNSEALED CLI renderers (`aterm show-face`,
+        // tests); `tests/sealed_never_consults_coverage_index.rs` there pins
+        // that a sealed generation never builds it.
+        //
+        // Register the Windows taskbar jump list off the critical path:
+        // once per process, only after the first frame reached the
         // compositor, on its own short-lived thread (the shell round-trips
         // registry + profile-disk IO under CommitList). Startup (`main_entry`)
         // was rejected as the call site — it would sit squarely on
@@ -28224,7 +28230,13 @@ impl App {
             // `sparkle_on`): under an allowed sustained-overload latch we suspend
             // expensive per-frame decoration work. Explicit Full motion and the
             // adaptive opt-out leave this false, matching `motion_policy()`.
-            let mut term = term_lock(&front_terminal.term);
+            // LOCK A registers as a UI waiter while it blocks (P63): the reader
+            // yields its next slice to it instead of re-taking the unfair mutex.
+            // The acquire closes on the binding line on purpose: the L0 freeze
+            // guard tracks a let-bound guard only from a same-line acquire.
+            let ui_waiting = &front_terminal.ui_waiting;
+            let site = crate::metrics::TermWaitSite::RedrawA;
+            let mut term = crate::term_lock_ui(&front_terminal.term, ui_waiting, site);
             // Cursor (terminal coords). A pure cursor move marks no grid damage, so
             // these key terms force the post-move repaint; they also feed the aurora's
             // move detection.
@@ -28389,6 +28401,26 @@ impl App {
                 if (cpos.row as usize) + 1 < rows {
                     term.row_cols_into(cpos.row as usize + 1, &mut ws.poof_row_below_buf);
                 }
+                // THE CONTENT WITNESS's rows (2026-09-12, the abandoned
+                // band): the rows Rainbow Kitty's resident ribbon occupies,
+                // read under this SAME lock — the batch already applied, so
+                // a prompt redraw that put the same text back is seen as the
+                // same text — and the caret row from the probe just taken.
+                // The engine reads them right after its tick and retires the
+                // cells whose glyph has changed or gone
+                // (`CursorGlow::observe_ribbon_row`). Nothing for the nine
+                // other styles: `ribbon_rows` answers 0 and the slot copy is
+                // refused, so they pay one bool.
+                ws.cursor_glow
+                    .observe_ribbon_row(cpos.row, &ws.poof_row_buf);
+                let mut ribbon_rows = [0u16; aterm_effects::rainbow_kitty::witness::WITNESS_ROWS];
+                let n = ws.cursor_glow.ribbon_rows(&mut ribbon_rows);
+                for &r in &ribbon_rows[..n] {
+                    if usize::from(r) < rows && r != cpos.row {
+                        term.row_cols_into(usize::from(r), &mut ws.witness_row_buf);
+                        ws.cursor_glow.observe_ribbon_row(r, &ws.witness_row_buf);
+                    }
+                }
                 Some((cpos.row, cpos.col, probe_trust))
             } else {
                 None
@@ -28483,7 +28515,18 @@ impl App {
             let mut pet_world_facts = pet_console_owned.then(|| {
                 aterm_effects::pet_world::PetWorldFacts::read(&term, front_terminal.session)
             });
+            // The hover under a still pointer, re-probed against THIS hold when
+            // the fill above moved it (G04): a rescan frame is the frame, and
+            // its LOCK A is the acquisition the fill rode — so the probe rides
+            // it too, and can neither defer nor owe a retry. The `&mut self`
+            // call ends the `ws` borrow; it is re-taken right after.
+            if deco_rescan || rain_refresh {
+                self.refresh_hover_for_frame_locked(id, &term);
+            }
             drop(term);
+            let Some(ws) = self.windows.get_mut(&id) else {
+                return;
+            };
             // Rescan frames extracted under LOCK A and therefore keep these
             // LOCK-A colors. Non-rescan frames overwrite both under LOCK B
             // beside their newer grid extraction, preventing a PTY color write
@@ -28507,7 +28550,14 @@ impl App {
                 // recheck below is reached identically on both arms.
                 let (mut committed, uncontended) = match term_try_lock(&front_terminal.term) {
                     Some(committed) => (committed, true),
-                    None => (term_lock(&front_terminal.term), false),
+                    None => (
+                        crate::term_lock_ui(
+                            &front_terminal.term,
+                            &front_terminal.ui_waiting,
+                            crate::metrics::TermWaitSite::RedrawB,
+                        ),
+                        false,
+                    ),
                 };
                 let current_sync = SyncObservation {
                     terminal_id: committed.render_identity(),
@@ -28565,6 +28615,17 @@ impl App {
                         committed.cell_frame_damage_scoped_into(&mut ws.input_scratch, rows, cols);
                     metrics::note_frame_refill(refill);
                 }
+                // The hover under a still pointer, re-probed against THIS hold
+                // when the fill moved it (G04) — and when the motion path's
+                // non-blocking probe left it unanswered. LOCK B is the
+                // acquisition the fill rode; the probe rides it too, so it can
+                // neither defer nor owe a retry frame, and the answer reaches
+                // the key below (`link_caption`) on the frame that carries the
+                // fill. The reuse arm keys identically to the frame before it,
+                // so there the compare is the whole cost. (`&mut self` ends the
+                // `ws` borrow; nothing below this hold reads it before the
+                // re-take under the effect pass.)
+                self.refresh_hover_for_frame_locked(id, &committed);
                 let committed_generation = aterm_effects::cursor_trail::ContentGeneration {
                     process_sequence: committed.pipeline_timestamps().process_sequence,
                     terminal_id: committed.render_identity(),
@@ -29158,7 +29219,10 @@ impl App {
             // `last_cursor_px` (tracked on every CursorMoved) minus the
             // effects origin, over the cell metrics; `None` once it leaves
             // the grid. Pixels-to-cells only: the brain is its own motion
-            // sensor (the own-sensor doctrine).
+            // sensor (the own-sensor doctrine). The sampled pixel is stamped
+            // so the motion path's pet wake fires on a cell of DISPLACEMENT
+            // from here, not on every event (`pet_wake_wanted`).
+            ws.pet_pointer_sampled_px = Some(ws.last_cursor_px);
             let pet_pointer = pet_pointer_cell(
                 ws.last_cursor_px,
                 (i32::from(origin_x), i32::from(origin_y)),
@@ -30087,7 +30151,7 @@ impl App {
                     engine.note_output_cells(
                         &ws.input_scratch.cells,
                         (cpos.row as usize, cpos.col as usize),
-                        rows,
+                        (rows, cols),
                         content_seq,
                         frame_started,
                         output_echo.input_hot,
@@ -30368,6 +30432,10 @@ impl App {
                 // An OS appearance flip must reach the glass: the Settings preview's
                 // auto titlebar mock splits on it and no other term moves (main.rs).
                 system_dark: repaint_system_dark(self.os_appearance),
+                // The link caption: published by the motion path's settle or by
+                // the frame-time re-probe under LOCK A/B above, painted by the
+                // splice below this gate, dirtying no cell (see `RepaintKey`).
+                link_caption: ws.link_hover,
             };
             if !deco_rescan
                 // A rain refresh refilled the snapshot too — the frame MUST
@@ -31666,7 +31734,25 @@ impl App {
         }
     }
 
+    /// Present the window's input scratch, under the startup raster probe
+    /// ([`note_startup_present_rasters`]) while it is armed.
     fn present_input_scratch(
+        &mut self,
+        id: WindowId,
+        invert: bool,
+        overlay: Option<OverlayGlow>,
+    ) -> Result<Option<u64>, metrics::PresentDropReason> {
+        let probe_before = startup_raster_probe_armed().then(|| self.backend.glyph_cache_len());
+        let result = self.present_input_scratch_inner(id, invert, overlay);
+        // `Ok(None)` is a pending swapchain acquisition — nothing was presented,
+        // so the probe does not count it.
+        if let (Some(before), Ok(Some(_))) = (probe_before, &result) {
+            note_startup_present_rasters(before, self.backend.glyph_cache_len());
+        }
+        result
+    }
+
+    fn present_input_scratch_inner(
         &mut self,
         id: WindowId,
         invert: bool,
@@ -32564,6 +32650,10 @@ impl App {
                 }
                 (focus, cursor_fx_sample)
             };
+            // The hover under a still pointer, against this capture's own hold
+            // (G04): a headless capture is a frame too, and its caption splice
+            // reads the memo this refreshes.
+            self.refresh_hover_for_frame_locked(wid, &term);
             drop(term);
             // Deterministic tests can begin a synchronized update here. The
             // projection below consumes only the owned extraction sample and
@@ -32639,6 +32729,9 @@ impl App {
         for (pane_index, (view, session, focused, row, col, pane_rows, pane_cols, term)) in
             panes.into_iter().enumerate()
         {
+            // Re-taken per pane: the focused pane's hover refresh below is a
+            // `&mut self` call, which ends every borrow of `ws` before it.
+            let ws = self.windows.get_mut(&wid)?;
             let mut term = term_lock(&term);
             if let Some((now, timeout)) = sync_preflight.as_ref() {
                 let preflight = ws.composed_sync_observation_scratch[pane_index];
@@ -32691,6 +32784,13 @@ impl App {
                     .or_default()
                     .clone_from(&ws.pane_scratch);
             }
+            if focused {
+                // The hover under a still pointer, against this pane's own
+                // hold (G04): the composed capture's twin of the composed
+                // route's focused-pane call.
+                self.refresh_hover_for_frame_locked(wid, &term);
+            }
+            let ws = self.windows.get_mut(&wid)?;
             let blank = terminal_blank_cell(&term);
             if sole_pane {
                 sole_default_bg = Some(aterm_render::rgb_to_u32(blank.bg));
@@ -32787,6 +32887,7 @@ impl App {
                 term.take_damage();
             }
         }
+        let ws = self.windows.get_mut(&wid)?;
         ws.unfocused_pane_scratch
             .retain(|pane_index, _| leaves.get(*pane_index).is_some_and(|leaf| !leaf.focused));
         ws.input_scratch.default_bg = sole_default_bg.unwrap_or(aterm_core::render::COLOR_UNSET);
@@ -34419,6 +34520,13 @@ impl App {
                         focus_epoch,
                     );
                 }
+                // The hover under a still pointer, re-probed against THIS
+                // pane's hold when the focused fill above moved it (G04): the
+                // composed route's twin of the single-pane LOCK B call. The
+                // focused pane is the only one a hover can stand on (the
+                // resolver's gate requires the pointer inside it), so the
+                // background panes owe nothing here.
+                self.refresh_hover_for_frame_locked(wid, &term);
             } else if let Some(ws) = self.windows.get_mut(&wid) {
                 let staged = ws.unfocused_pane_scratch.entry(pane_index).or_default();
                 // THE ROOM (panel #9(d)): the sibling's content clock as of
@@ -34992,7 +35100,9 @@ impl App {
             let pet_wrapped = wrap_fact_edge(&mut ws.pet_wrap_serial, focus, focus_wrap_serial);
             // POINTER PLAY (wave 2): the single-pane pointer map at the
             // focused PANE's frame-space origin (`pet_origin` — the same
-            // origin the hit-rect stash uses), bounded by the pane grid.
+            // origin the hit-rect stash uses), bounded by the pane grid. The
+            // sampled pixel is stamped exactly as on the single-pane path.
+            ws.pet_pointer_sampled_px = Some(ws.last_cursor_px);
             let pet_pointer = pet_pointer_cell(
                 ws.last_cursor_px,
                 pet_origin,
@@ -35318,6 +35428,9 @@ impl App {
             conn_wire_fp,
             // Same appearance term as the single-pane key (see `RepaintKey`).
             system_dark: repaint_system_dark(self.os_appearance),
+            // Same caption term as the single-pane key: the focused pane's
+            // hold above re-probed it, the splice after this gate paints it.
+            link_caption: self.windows.get(&wid).and_then(|ws| ws.link_hover),
         };
         // Displayed (or just-erased) predictions bypass the skip exactly like the
         // single-pane path: a ghost paints/erases without perturbing the RepaintKey.
@@ -37557,12 +37670,14 @@ impl App {
     /// tab switch can put a different grid under it, a panel can open over the
     /// row. Re-reading is what makes the band say what is there NOW instead of
     /// what was there when the pointer last moved, and it is one seam rather
-    /// than a retirement rule on every path that can change a grid. The cost is
-    /// one short terminal lock per frame, and only while a link is hovered.
+    /// than a retirement rule on every path that can change a grid. The read is
+    /// the memoised resolver's (`HoverMemo`): one non-blocking probe per engine
+    /// fill under the still pointer, no lock and no copy on the frames between.
     ///
-    /// A modal overlay closes it: the palette/About card owns the pointer while
-    /// it is open, so a caption naming a link UNDER the card would be a promise
-    /// about a click that lands on the card instead. So does chrome standing on
+    /// A modal overlay closes it, and so does the tab context menu: the
+    /// palette/About/menu card owns the pointer while it is open, so a caption
+    /// naming a link UNDER the card would be a promise about a click that lands
+    /// on the card instead. So does chrome standing on
     /// the pointer's own row — the hidden cell is not what a press there would
     /// hit — and a front terminal that is not the one the hover was resolved
     /// over.
@@ -37590,11 +37705,26 @@ impl App {
         wid: WindowId,
         frame_plan: Option<&crate::tab_model::VisibleLeafPlan>,
     ) {
-        let Some(hover) = self
-            .windows
-            .get(&wid)
-            .and_then(|ws| ws.link_hover.filter(|_| ws.overlay.is_none()))
-        else {
+        // A CAPTION NAMES WHAT IS THERE NOW. The frame under a still pointer
+        // moves without the pointer hearing about it — output rewrites the
+        // row, a wheel scrolls the viewport — and the frame's ENGINE FILL is
+        // where that is answered: the fill site re-probed the memoised hover
+        // under its own hold IF the fill moved since the last probe
+        // (`App::refresh_hover_for_frame_locked`; one epoch compare otherwise —
+        // a frame that only carries host bands, this caption included, is not
+        // a new fill). So by the time this splice runs, `link_hover` and the
+        // memo already describe THIS frame, with no lock of the caption's own
+        // and no deferral possible. This is also what lets a link scrolled
+        // under a stationary pointer earn its caption with no synthesized
+        // pointer event.
+        // The tab context menu is the same kind of owner as the overlay slot
+        // (its own window-state surface, opened by keyboard with no pointer
+        // event to re-route): a caption naming a link under the card would be
+        // a promise about a click that lands on the card instead.
+        let Some(hover) = self.windows.get(&wid).and_then(|ws| {
+            ws.link_hover
+                .filter(|_| ws.overlay.is_none() && ws.tab_menu.is_none())
+        }) else {
             return; // the ordinary frame: no hover, no band, no cost
         };
         // The pointer must be ON THE GRID for the band to describe anything. The
@@ -37604,20 +37734,23 @@ impl App {
         if self.chrome_owns_terminal_row(wid, usize::from(hover.window_row)) {
             return;
         }
-        let Some(term) = self
+        if !self
             .front_terminal(wid)
-            .filter(|front| front.session == hover.session)
-            .map(|front| front.term.clone())
-        else {
+            .is_some_and(|front| front.session == hover.session)
+        {
             return;
-        };
-        // VIEWPORT rows, because the frame under the pointer is drawn in them:
-        // `hyperlink_at` keys the LIVE screen, so scrolled back it names the
-        // link on a line eight rows lower — a band whose whole purpose is to say
-        // truly where THIS link goes, confidently naming another one.
-        let Some(url) = term_lock(&term)
-            .hyperlink_at_visible(hover.cell.0, hover.cell.1)
-            .map(|url| url.to_string())
+        }
+        // The destination, from the resolution that produced this hover — the
+        // `Arc<str>` the grid handed the memoised probe, VIEWPORT-keyed there
+        // (`hyperlink_at` keys the LIVE screen, so scrolled back it would name
+        // the link on a line eight rows lower). No terminal lock and no String
+        // copy per presented frame: the refresh above already re-probed if the
+        // frame moved, so this is what the cell carries in THIS frame.
+        let Some(url) = self
+            .windows
+            .get(&wid)
+            .and_then(|ws| ws.hover_memo.as_ref())
+            .and_then(|memo| memo.url_for(&hover).cloned())
         else {
             return; // whatever was there, it is not a link any more
         };
@@ -37651,6 +37784,9 @@ impl App {
             return; // too narrow to name a site; the row stays the person's
         };
         let cell_h = self.win_cell_size(wid).1;
+        // The band's own write bumps `snapshot_seq`, which the hover memo does
+        // not key on (`HoverFrame` is the ENGINE fill), so the next redraw
+        // reads this caption as the host band it is, not as a new frame.
         self.splice_band_rows_at(wid, frame_row, vec![built], cols, cell_h);
     }
 
@@ -37733,12 +37869,21 @@ impl App {
     /// from [`Terminal::cursor_row_on_screen`] — the extraction's own
     /// projection, so this cannot drift from where the caret was drawn.
     ///
-    /// One short lock per visible pane, and only on the frames where a link is
-    /// hovered: [`Self::splice_link_target`] returns before this on every
-    /// ordinary frame.
+    /// One short lock per visible UNFOCUSED pane, and only on the frames where a
+    /// link is hovered: [`Self::splice_link_target`] returns before this on
+    /// every ordinary frame. The focused pane is not asked here: the frame
+    /// already carries its caret — `cell_frame_into` stamps `cursor_visible`
+    /// from this very `cursor_row_on_screen` and `cursor_row` from the same
+    /// projection — and [`Self::link_caption_row`] reads that (the caret a
+    /// person can SEE, which prediction and copy-mode steering may have moved
+    /// off the engine's own). So the everyday single-pane caption asks the
+    /// engine for nothing at all.
     fn visible_pane_caret_rows(&self, plan: &crate::tab_model::VisibleLeafPlan) -> Vec<usize> {
         let mut rows = Vec::with_capacity(plan.leaves.len());
         for leaf in &plan.leaves {
+            if leaf.focused {
+                continue; // the frame's own `cursor_row`/`cursor_visible` answer for it
+            }
             let Some(session) = self
                 .view_store
                 .get(leaf.view)
@@ -43919,6 +44064,9 @@ mod tone_melody_seam_tests {
         // conformance pin `tone_infer`'s unit test uses), so a miss here is a
         // broken SEAM, not a model that generalized differently today.
         type_line(&mut app, wid, "why is this broken again ugh");
+        // The verdict lands at the next frame's drain (P06: never in the key
+        // handler) — exactly when the first cue that could carry it is stamped.
+        tick(&mut app, wid);
         assert_eq!(
             app.windows[&wid].tone_tracker.current(),
             Tone::Frustrated,
@@ -43967,6 +44115,7 @@ mod tone_melody_seam_tests {
         let (mut app, wid) = app_with_capturing_audio();
         tick(&mut app, wid);
         type_line(&mut app, wid, "why is this broken again ugh");
+        tick(&mut app, wid); // the verdict lands at the frame drain (P06)
         assert_eq!(app.windows[&wid].tone_tracker.current(), Tone::Frustrated);
 
         app.config.tone_melody = Some(false);
@@ -45764,11 +45913,11 @@ mod cell_pixel_size_tests {
             .expect("window 0")
             .cell_px_reported = None;
         let theme = app.theme;
-        let handle = std::thread::spawn(move || -> (crate::Backend, bool) {
+        let handle = std::thread::spawn(move || -> (crate::Backend, bool, bool) {
             let mut r = aterm_render::Renderer::from_system(crate::FONT_PX, theme)
                 .expect("system font for the test build");
             r.seal_admitted_font_sources();
-            (crate::Backend::Cpu(r), false)
+            (crate::Backend::Cpu(r), false, true)
         });
         app.backend = crate::BackendSlot::Pending(Some(handle));
 
@@ -47449,6 +47598,742 @@ mod link_target_caption_tests {
         );
     }
 
+    /// G04 — the destination is resolved ONCE per (hover cell, ENGINE FILL) and
+    /// kept as the engine's own `Arc<str>`: a redraw whose engine fill did not
+    /// change re-paints the caption with NO terminal lock and no `String` copy
+    /// (it used to take a blocking lock and allocate on every presented frame
+    /// the pointer rested on a link — 60/s with the cat animating). A fill that
+    /// DID change re-reads exactly once, non-blocking, so the freshness the
+    /// swap test above pins is kept without the per-frame cost.
+    ///
+    /// Modelled as PRODUCTION redraws, not as two splices on one un-refilled
+    /// scratch: every redraw refills `input_scratch` (a caption band leaves
+    /// `snapshot_seq != engine_fill_seq`, which refuses the effect-only reuse),
+    /// the strip splice bumps `snapshot_seq`, and the caption's own write bumps
+    /// it again — none of which is a new engine fill. A memo keyed on
+    /// `snapshot_seq` re-probed on every such frame; the engine-fill key does
+    /// not.
+    ///
+    /// And the re-read, when a fill does move, RIDES THE FILL'S OWN HOLD
+    /// (`App::refresh_hover_for_frame_locked`): the frame's acquisition count
+    /// is the same whether or not the hover had to re-probe, and the splice
+    /// itself never acquires — under a changed fill exactly as under an
+    /// unchanged one.
+    #[test]
+    fn the_caption_reads_its_cached_destination_until_the_frame_moves() {
+        let mut app = App::headless_for_test();
+        let wid = WindowId(0);
+        feed(&app, wid, PHISH);
+        hover(&mut app, wid, 0, LINK_COL);
+        assert!(
+            compose(&mut app, wid)
+                .last()
+                .expect("rows")
+                .contains(TARGET),
+            "precondition: the destination is disclosed"
+        );
+        let acq = crate::term_lock_acquisitions_on_this_thread;
+        let fresh = |app: &App| {
+            let ws = &app.windows[&wid];
+            let session = app.front_terminal(wid).expect("terminal").session;
+            ws.hover_memo
+                .as_ref()
+                .is_some_and(|m| m.stands_for(ws, session))
+        };
+        // A redraw: refill, strip, caption — the order every production route
+        // uses. Returns (the frame's whole acquisition count, the splice's own).
+        let redraw = |app: &mut App| {
+            let frame_before = acq();
+            extract_only(app, wid);
+            app.splice_tab_strip(wid);
+            let splice_before = acq();
+            app.splice_link_target(wid);
+            let after = acq();
+            (after - frame_before, after - splice_before)
+        };
+
+        // Two redraws with no output: the engine fill is the same, the caption
+        // is re-painted from the memo, and the hover takes no lock at all.
+        let (frame_cost, _) = redraw(&mut app);
+        assert!(
+            frame_cost >= 1,
+            "precondition: the frame's own extraction locks"
+        );
+        for pass in 0..2 {
+            let (frame, splice) = redraw(&mut app);
+            assert_eq!(
+                (frame, splice),
+                (frame_cost, 0),
+                "redraw {pass} with an unchanged engine fill re-paints the caption lock-free"
+            );
+            assert!(
+                frame_rows(&app, wid).last().expect("rows").contains(TARGET),
+                "…and it still names the destination"
+            );
+        }
+
+        // Output elsewhere on the screen: a new engine fill under the still
+        // pointer. The re-read happens on the redraw that carries the fill,
+        // under that fill's own hold — the frame costs exactly what an
+        // unchanged frame costs, and the splice still acquires nothing.
+        feed(&app, wid, b"\x1b[3;1Hmore output on another row");
+        assert_eq!(
+            redraw(&mut app),
+            (frame_cost, 0),
+            "a changed engine fill re-reads under the frame's own hold: no acquisition of its own"
+        );
+        assert!(fresh(&app), "…and the memo stands on the new fill");
+        assert_eq!(redraw(&mut app), (frame_cost, 0), "and is cached again");
+        let rows = frame_rows(&app, wid);
+        assert!(
+            rows.last().expect("rows").contains(TARGET),
+            "the re-read names what the cell still carries: {rows:?}"
+        );
+    }
+
+    /// Whether the composed present of window `wid` currently names `TARGET`
+    /// on its caption row.
+    fn captioned(app: &App, wid: WindowId) -> bool {
+        frame_rows(app, wid)
+            .last()
+            .is_some_and(|row| row.contains(TARGET))
+    }
+
+    /// One frame through the PRODUCTION composed route: `redraw_compose` (the
+    /// focused pane's hold, the RepaintKey early-out, the composite) and — on
+    /// a frame that presents — the splices its caller runs after it, in the
+    /// caller's order: the strip (which opens this frame's chrome register; a
+    /// no-op band with no strip configured) and then the caption, last of the
+    /// row bands. Returns whether the frame presented. (On a frame that
+    /// early-outs `input_scratch` is a work buffer, not the glass: read the
+    /// rows only after a presenting frame.)
+    fn present_compose(app: &mut App, wid: WindowId, now: Instant) -> bool {
+        let presented = app
+            .redraw_compose(wid, 24, 80, false, false, None, 0, now)
+            .is_some();
+        if presented {
+            app.splice_tab_strip(wid);
+            app.splice_link_target(wid);
+        }
+        presented
+    }
+
+    /// Drive the PRODUCTION composed route until it settles on the RepaintKey
+    /// early-out, the way `settled_compose_early_out_tests` does; the
+    /// fixture's effects are idle, so one skipped frame is settled.
+    fn settle_compose(app: &mut App, wid: WindowId, now: &mut Instant) {
+        for _ in 0..40 {
+            *now += std::time::Duration::from_millis(16);
+            if !present_compose(app, wid, *now) {
+                return;
+            }
+        }
+        panic!("the fixture must reach a settled (skipping) state");
+    }
+
+    /// Two OSC 8 links on one row: `google.com` → `TARGET` at `LINK_COL`, and
+    /// `bing.com` → [`OTHER`] at [`OTHER_COL`].
+    const TWO_LINKS: &[u8] =
+        b"Visit \x1b]8;;https://evil.example/steal\x1b\\google.com\x1b]8;;\x1b\\ \
+        or \x1b]8;;https://other.example/\x1b\\bing.com\x1b]8;;\x1b\\";
+    const OTHER: &str = "https://other.example/";
+    /// Column of the `b` in `bing.com`: `Visit ` (6) + `google.com` (10) + ` or ` (4).
+    const OTHER_COL: u16 = 20;
+
+    /// A PROBE THE MOTION PATH HAD TO DEFER IS ANSWERED BY THE NEXT FRAME,
+    /// UNDER THAT FRAME'S OWN HOLD — through the production redraw route.
+    ///
+    /// The reader holds the mutex (its slice marks no grid damage and causes
+    /// no frame) while the pointer moves from one link to another on the same
+    /// row: the grid arm's non-blocking probe defers, the parked caption (the
+    /// FIRST link) stands, and the memo still names the cell the pointer left.
+    /// Nothing else changes before the next frame. That frame must present
+    /// the second link's destination — and it can only do so if (1) its fill
+    /// site re-probes under the hold it already has, gated on the memo's CELL
+    /// and not only its fill epoch (`HoverMemo::stands_for`), and (2) the
+    /// caption is a `RepaintKey` term, or an identical key takes the early-out
+    /// before the splice. Under the previous design the frame-time compare
+    /// saw an unchanged fill and re-probed nothing, the key was unchanged, and
+    /// the stale caption stood until the pointer moved again.
+    #[test]
+    fn a_probe_deferred_by_a_busy_mutex_is_answered_by_the_next_frame_under_its_own_hold() {
+        let mut app = App::headless_for_test();
+        let wid = WindowId(0);
+        let mut now = Instant::now();
+        feed(&app, wid, TWO_LINKS);
+        hover(&mut app, wid, 0, LINK_COL);
+        now += std::time::Duration::from_millis(16);
+        assert!(
+            present_compose(&mut app, wid, now),
+            "precondition: the first frame presents"
+        );
+        assert!(
+            captioned(&app, wid),
+            "precondition: the first link is disclosed"
+        );
+        // (`input_scratch` is a work buffer on a frame that early-outs — only a
+        // presenting frame's rows are the glass, so the caption is read right
+        // after one, never after the settle.)
+        settle_compose(&mut app, wid, &mut now);
+
+        // The reader holds the mutex while the pointer crosses to the second link.
+        let term = app
+            .front_terminal(wid)
+            .expect("front terminal")
+            .term
+            .clone();
+        let (held_tx, held_rx) = std::sync::mpsc::channel::<()>();
+        let (release_tx, release_rx) = std::sync::mpsc::channel::<()>();
+        let holder = std::thread::spawn(move || {
+            let guard = term.lock().unwrap_or_else(|p| p.into_inner());
+            held_tx.send(()).expect("test thread listening");
+            release_rx.recv().expect("release");
+            drop(guard);
+        });
+        held_rx.recv().expect("the holder took the mutex");
+        let acq = crate::term_lock_acquisitions_on_this_thread;
+        let before = acq();
+        hover(&mut app, wid, 0, OTHER_COL);
+        assert_eq!(
+            acq() - before,
+            0,
+            "the motion path never waits on the reader"
+        );
+        assert_eq!(
+            app.windows[&wid].link_hover.map(|h| h.cell),
+            Some((0, LINK_COL)),
+            "the probe deferred: the parked caption (the first link) stands"
+        );
+        release_tx.send(()).expect("holder waiting");
+        holder.join().expect("holder thread");
+
+        // The next frame, with no output and no other change: it presents,
+        // and it names the link the pointer is actually on.
+        now += std::time::Duration::from_millis(16);
+        assert!(
+            present_compose(&mut app, wid, now),
+            "the frame that answers the deferred probe presents"
+        );
+        assert_eq!(
+            app.windows[&wid].link_hover.map(|h| h.cell),
+            Some((0, OTHER_COL)),
+            "the hover names the cell the pointer rests on"
+        );
+        let rows = frame_rows(&app, wid);
+        assert!(
+            rows.last().is_some_and(|row| row.contains(OTHER)),
+            "the caption names the second link's destination: {rows:?}"
+        );
+        // Nothing further is owed: the frame after it takes the early-out.
+        now += std::time::Duration::from_millis(16);
+        assert!(
+            !present_compose(&mut app, wid, now),
+            "no retry frame is needed once the answer has presented"
+        );
+    }
+
+    /// The caption is a RepaintKey term. A hover that settles on a link with
+    /// nothing else moving (no output, no blink, no effect) must present, and
+    /// the hover leaving it must present again: both dirty no grid cell and
+    /// change no other key term, so without `link_caption` the settle's
+    /// requested frame took the early-out and the band never reached the glass.
+    #[test]
+    fn a_hover_settling_on_a_link_presents_with_nothing_else_moving() {
+        let mut app = App::headless_for_test();
+        let wid = WindowId(0);
+        let mut now = Instant::now();
+        feed(&app, wid, PHISH);
+        // The pointer rests OFF the link (row 3 is empty); the window settles.
+        hover(&mut app, wid, 3, LINK_COL);
+        settle_compose(&mut app, wid, &mut now);
+        assert!(!captioned(&app, wid), "precondition: nothing captioned");
+
+        // The pointer moves onto the link: the settle asks for a frame, and
+        // that frame — with no output since the last present — must present.
+        hover(&mut app, wid, 0, LINK_COL);
+        assert!(
+            app.windows[&wid].link_hover.is_some(),
+            "the motion path resolved the link"
+        );
+        now += std::time::Duration::from_millis(16);
+        assert!(
+            present_compose(&mut app, wid, now),
+            "the frame that discloses the destination presents"
+        );
+        assert!(
+            captioned(&app, wid),
+            "…naming it: {:?}",
+            frame_rows(&app, wid)
+        );
+        settle_compose(&mut app, wid, &mut now);
+
+        // And off again: the band's removal is a present too.
+        hover(&mut app, wid, 3, LINK_COL);
+        now += std::time::Duration::from_millis(16);
+        assert!(
+            present_compose(&mut app, wid, now),
+            "the frame that retires the caption presents"
+        );
+        assert!(!captioned(&app, wid), "…and the band is gone");
+    }
+
+    /// G14 — the frame under a STILL pointer is what re-resolves the hover, not
+    /// a synthesized pointer event. A wheel scroll moves a link under a pointer
+    /// that has not moved: the next frame discloses it with no `CursorMoved` at
+    /// all. And the `CursorMoved` macOS synthesizes at the same pixel before
+    /// every wheel tick costs no terminal acquisition — the memo answers the
+    /// hover, the mirror answers the mode, the seam is never entered — and the
+    /// caption comes back exactly as parked, where each such tick used to take
+    /// two blocking locks (the hover probe and the seam's mode read).
+    #[test]
+    fn a_link_scrolled_under_a_still_pointer_is_disclosed_by_the_frame() {
+        let mut app = App::headless_for_test();
+        let wid = WindowId(0);
+        let term = app
+            .front_terminal(wid)
+            .expect("front terminal")
+            .term
+            .clone();
+        let rows = usize::from(app.windows[&wid].rows);
+        // The link line, then enough filler to push it into history.
+        term_lock(&term).process(PHISH);
+        term_lock(&term).process(b"\r\n");
+        for _ in 0..rows {
+            term_lock(&term).process(b"filler\r\n");
+        }
+        // Where the link line will land once the viewport scrolls back `rows`.
+        let scroll = i32::try_from(rows).expect("a small viewport");
+        term_lock(&term).scroll_display(scroll);
+        let phish_row = u16::try_from(
+            (0..rows)
+                .find(|row| {
+                    term_lock(&term)
+                        .row_text(*row)
+                        .unwrap_or_default()
+                        .contains("Visit google.com for details")
+                })
+                .expect("the link line is on screen when scrolled back"),
+        )
+        .expect("a small viewport");
+        term_lock(&term).scroll_display(-scroll);
+        assert_eq!(term_lock(&term).grid().display_offset(), 0);
+
+        // The pointer rests on that cell while it still shows filler: no link.
+        hover(&mut app, wid, phish_row, LINK_COL);
+        assert!(
+            !compose(&mut app, wid).concat().contains("example"),
+            "precondition: the live row under the pointer carries no link"
+        );
+        assert!(app.windows[&wid].link_hover.is_none());
+
+        // The viewport scrolls (a wheel glide's tick) — the pointer does not move.
+        term_lock(&term).scroll_display(scroll);
+        let out = compose(&mut app, wid);
+        assert!(
+            out.last().expect("rows").contains(TARGET),
+            "the frame that scrolled the link under the pointer discloses it: {out:?}"
+        );
+        assert_eq!(
+            app.windows[&wid].link_hover.map(|h| h.cell),
+            Some((phish_row, LINK_COL)),
+            "the hover names the cell the frame put the link on"
+        );
+
+        // The synthesized same-pixel CursorMoved before a wheel tick: no lock.
+        let px = app.windows[&wid].last_cursor_px;
+        let acq = crate::term_lock_acquisitions_on_this_thread;
+        let before = acq();
+        app.on_cursor_moved(wid, px.0, px.1);
+        assert_eq!(
+            acq() - before,
+            0,
+            "a stationary pointer event takes no terminal lock"
+        );
+        assert_eq!(
+            app.windows[&wid].link_hover.map(|h| h.cell),
+            Some((phish_row, LINK_COL)),
+            "and hands the parked caption back untouched"
+        );
+    }
+
+    /// G14, the tracking-ON twin of the test above. With a VT mouse mode
+    /// live (tmux `mouse on` → 1000/1002/1006, vim `mouse=a`, less), the
+    /// same-pixel `CursorMoved` macOS synthesises before every wheel tick used
+    /// to reach the seam's MouseMove arm and its BLOCKING terminal lock — to
+    /// encode a motion report for a pointer that had not moved (nothing under
+    /// 1000/1002, a duplicate report under 1003). Now the stationary event
+    /// returns at the top of the routing: zero acquisitions, no bytes to the
+    /// PTY, and the parked caption handed straight back. The wheel tick that
+    /// follows is still reported, which is what proves the sink is watching.
+    #[cfg(unix)]
+    #[test]
+    fn a_stationary_pointer_event_under_mouse_tracking_takes_no_lock_and_reports_nothing() {
+        use std::sync::Arc;
+
+        use aterm_session::sink::SinkWriter;
+
+        let mut pipe = [0; 2];
+        assert_eq!(unsafe { libc::pipe(pipe.as_mut_ptr()) }, 0);
+        let flags = unsafe { libc::fcntl(pipe[0], libc::F_GETFL) };
+        assert!(flags >= 0);
+        assert_eq!(
+            unsafe { libc::fcntl(pipe[0], libc::F_SETFL, flags | libc::O_NONBLOCK) },
+            0
+        );
+        let drain = || {
+            let mut bytes = [0u8; 256];
+            let read = unsafe { libc::read(pipe[0], bytes.as_mut_ptr().cast(), bytes.len()) };
+            if read <= 0 {
+                Vec::new()
+            } else {
+                bytes[..read as usize].to_vec()
+            }
+        };
+        let mut app = App::headless_for_test_with_sink(Arc::new(SinkWriter::new(pipe[1])));
+        let wid = WindowId(0);
+        feed(&app, wid, PHISH);
+        let acq = crate::term_lock_acquisitions_on_this_thread;
+        for mode in [
+            &b"\x1b[?1000h\x1b[?1006h"[..],
+            &b"\x1b[?1002h"[..],
+            &b"\x1b[?1003h"[..],
+        ] {
+            feed(&app, wid, mode);
+            // A REAL move onto the link routes fully (and may report under
+            // 1003); whatever it wrote is not the stationary event's.
+            hover(&mut app, wid, 0, LINK_COL);
+            let _ = drain();
+            assert_eq!(
+                app.windows[&wid].link_hover.map(|h| h.cell),
+                Some((0, LINK_COL)),
+                "precondition ({mode:?}): the link is disclosed under tracking"
+            );
+
+            // The synthesized same-pixel CursorMoved before a wheel tick.
+            let px = app.windows[&wid].last_cursor_px;
+            let before = acq();
+            app.on_cursor_moved(wid, px.0, px.1);
+            assert_eq!(
+                acq() - before,
+                0,
+                "({mode:?}) a stationary pointer event takes no terminal lock with tracking on"
+            );
+            assert!(
+                drain().is_empty(),
+                "({mode:?}) …and reports no motion for a pointer that did not move"
+            );
+            assert_eq!(
+                app.windows[&wid].link_hover.map(|h| h.cell),
+                Some((0, LINK_COL)),
+                "({mode:?}) and hands the parked caption back untouched"
+            );
+
+            // The wheel tick itself is still the app's to hear.
+            app.on_mouse_wheel(wid, winit::event::MouseScrollDelta::LineDelta(0.0, -1.0));
+            let reported = drain();
+            assert!(
+                reported.starts_with(b"\x1b[<64;") || reported.starts_with(b"\x1b[<65;"),
+                "({mode:?}) the wheel notch is reported to the tracking app: {reported:?}"
+            );
+        }
+        unsafe {
+            libc::close(pipe[0]);
+        }
+    }
+
+    /// G14, the KEYBOARD-OWNER-CHANGE twin. The same-pixel early return stands
+    /// on the last routing decision, and that decision includes the
+    /// pane-local cell `refresh_mouse_cell` derived under the focused pane of
+    /// the moment. A split: the pointer rests over pane B while A holds the
+    /// keyboard, so `last_mouse_cell` is B's window cell CLAMPED into A's rect.
+    /// The user then focuses B by keyboard (B runs tmux / vim `mouse=a`,
+    /// tracking ON) and scrolls the trackpad without moving; macOS synthesises
+    /// the same-pixel `CursorMoved` first. With the early return keyed on the
+    /// pixel alone that event returned before the cell walk and the wheel
+    /// report carried A's clamped cell into B — the wrong tmux pane scrolled
+    /// until the hand moved. Now the same-pixel premise includes the MAPPING
+    /// (`HoverMapping`: front session, focused rect, geometry): the first
+    /// stationary event after the focus move routes fully and the SGR wheel
+    /// report names the pointer's window cell minus the NEW pane origin; the
+    /// second stationary event takes 0 locks again.
+    #[cfg(unix)]
+    #[test]
+    fn a_keyboard_focus_move_under_a_still_pointer_re_derives_the_cell_before_the_wheel_report() {
+        use std::sync::Arc;
+
+        use aterm_session::sink::SinkWriter;
+
+        let mut pipe = [0; 2];
+        assert_eq!(unsafe { libc::pipe(pipe.as_mut_ptr()) }, 0);
+        let flags = unsafe { libc::fcntl(pipe[0], libc::F_GETFL) };
+        assert!(flags >= 0);
+        assert_eq!(
+            unsafe { libc::fcntl(pipe[0], libc::F_SETFL, flags | libc::O_NONBLOCK) },
+            0
+        );
+        let drain = || {
+            let mut bytes = [0u8; 256];
+            let read = unsafe { libc::read(pipe[0], bytes.as_mut_ptr().cast(), bytes.len()) };
+            if read <= 0 {
+                Vec::new()
+            } else {
+                bytes[..read as usize].to_vec()
+            }
+        };
+        // Session 0 (the observed sink) is pane B: it turns tracking on while
+        // it is still the lone pane, then the split puts the NEW pane A on the
+        // right and hands A the keyboard.
+        let mut app = App::headless_for_test_with_sink(Arc::new(SinkWriter::new(pipe[1])));
+        let wid = WindowId(0);
+        feed(&app, wid, b"\x1b[?1000h\x1b[?1006h");
+        let a = app.split_active_stub_tab(wid);
+        assert_eq!(
+            app.front_terminal(wid).map(|t| t.session),
+            Some(a),
+            "precondition: the split leaves the new (right) pane focused"
+        );
+        let (_, a_col_off, _, _) = app.focused_pane_rect(wid);
+        const ROW: u16 = 3;
+        const COL: u16 = 5;
+        assert!(
+            COL < a_col_off,
+            "precondition: window column {COL} lies in pane B, left of A's origin {a_col_off}"
+        );
+
+        // The pointer rests over B while A is focused: the pane-local cell is
+        // clamped into A's rect (column 0 of A), not B's cell.
+        hover(&mut app, wid, ROW, COL);
+        let _ = drain();
+        assert_eq!(app.windows[&wid].last_mouse_window_cell, (ROW, COL));
+        assert_eq!(
+            app.windows[&wid].last_mouse_cell,
+            (ROW, 0),
+            "precondition: over the unfocused pane the parked cell is A's clamp"
+        );
+        assert!(
+            app.windows[&wid].hover_grid_owned,
+            "precondition: the grid arm ran"
+        );
+
+        // Keyboard: focus B. No pointer event.
+        assert!(app.focus_pane_in(wid, crate::pane::FocusDir::Left));
+        assert_eq!(
+            app.front_terminal(wid).map(|t| t.session),
+            Some(0),
+            "precondition: B (session 0) now holds the keyboard"
+        );
+        assert_eq!(
+            app.focused_pane_rect(wid).1,
+            0,
+            "precondition: B's origin column is 0"
+        );
+
+        // The synthesized same-pixel CursorMoved before the wheel tick: the
+        // mapping changed under the still pointer, so this one routes fully
+        // and re-derives the cell for the NEW owner.
+        let px = app.windows[&wid].last_cursor_px;
+        app.on_cursor_moved(wid, px.0, px.1);
+        assert_eq!(
+            app.windows[&wid].last_mouse_cell,
+            (ROW, COL),
+            "the first stationary event after a keyboard focus move re-derives the pane-local cell"
+        );
+        assert!(
+            drain().is_empty(),
+            "…and still reports no motion under 1000 for a pointer that did not move"
+        );
+        app.on_mouse_wheel(wid, winit::event::MouseScrollDelta::LineDelta(0.0, -1.0));
+        let reported = drain();
+        let expected_tail = format!(";{};{}M", COL + 1, ROW + 1);
+        assert!(
+            (reported.starts_with(b"\x1b[<64") || reported.starts_with(b"\x1b[<65"))
+                && reported.ends_with(expected_tail.as_bytes()),
+            "the wheel report names the pointer's window cell minus B's origin: {reported:?}"
+        );
+
+        // The second stationary event: the mapping is the one the parked cell
+        // was derived under again — 0 locks, no bytes, and the next notch
+        // still carries B's cell.
+        let acq = crate::term_lock_acquisitions_on_this_thread;
+        let before = acq();
+        app.on_cursor_moved(wid, px.0, px.1);
+        assert_eq!(
+            acq() - before,
+            0,
+            "a stationary pointer event under an unchanged mapping takes no terminal lock"
+        );
+        assert!(drain().is_empty());
+        assert_eq!(app.windows[&wid].last_mouse_cell, (ROW, COL));
+        app.on_mouse_wheel(wid, winit::event::MouseScrollDelta::LineDelta(0.0, -1.0));
+        let reported = drain();
+        assert!(
+            reported.ends_with(expected_tail.as_bytes()),
+            "the notch after the skipped event still names B's cell: {reported:?}"
+        );
+        unsafe {
+            libc::close(pipe[0]);
+        }
+    }
+
+    /// The window pixel at the centre of strip column `col` (row 0 of a
+    /// one-row strip).
+    fn strip_px(app: &App, wid: WindowId, col: u16) -> (f64, f64) {
+        let (cw, ch) = app.win_cell_size(wid);
+        (
+            app.win_pad(wid) as f64 + cw as f64 * (f64::from(col) + 0.5),
+            (app.win_pad_top(wid) + app.win_head(wid)) as f64 + ch as f64 * 0.5,
+        )
+    }
+
+    /// The frame-time refresh is a CONTINUATION of the last routing decision,
+    /// never an independent resolver. A connector drag owns the pointer for the
+    /// whole gesture: `conn_drag_motion` sets the grab cursor once when the
+    /// drag begins and every later motion returns at the top of the ladder. The
+    /// wire repaint then produces frames with no pointer event of the grid's —
+    /// and a frame that re-resolved the grid cell under the dragging hand would
+    /// swap the grab for an I-beam and caption a link the drop cannot reach.
+    #[test]
+    fn a_connector_drag_crossing_a_link_keeps_the_grab_and_earns_no_caption() {
+        let mut app = App::headless_for_test();
+        let wid = WindowId(0);
+        app.tab_strip_rows = 1;
+        app.splice_tab_strip(wid);
+        feed(&app, wid, PHISH);
+        // The grid arm has resolved once: a memo exists and the I-beam is up.
+        hover(&mut app, wid, 0, LINK_COL);
+        assert!(
+            compose(&mut app, wid)
+                .last()
+                .expect("rows")
+                .contains(TARGET),
+            "precondition: the destination is disclosed"
+        );
+        assert!(
+            app.windows[&wid].native_text_cursor,
+            "precondition: the grid's I-beam"
+        );
+        // Onto the strip (the arrow), press the connector, drag past the
+        // threshold and down across the link cell — every step through the
+        // real motion path, which the drag swallows.
+        let (sx, sy) = strip_px(&app, wid, 2);
+        app.on_cursor_moved(wid, sx, sy);
+        assert!(
+            !app.windows[&wid].native_text_cursor && !app.windows[&wid].hover_pointer,
+            "the strip resolves the plain arrow"
+        );
+        assert!(app.conn_drag_arm(wid, 0), "tab 0 has a session to drag");
+        let (ox, oy) = app.conn_drag.as_ref().expect("armed").origin;
+        app.on_cursor_moved(wid, ox + crate::conn_drag::CONN_DRAG_THRESHOLD_PX * 2.0, oy);
+        assert!(
+            app.conn_drag.as_ref().expect("armed").dragging,
+            "past the threshold: the grab cursor was set"
+        );
+        hover(&mut app, wid, 0, LINK_COL);
+        assert!(app.conn_drag.is_some(), "the drag swallowed the motion");
+        // Frames during the drag (the wire repaint): the grab stands, no
+        // caption is spliced, no hover is published.
+        for frame in 0..2 {
+            let rows = compose(&mut app, wid);
+            assert!(
+                !rows.concat().contains("example"),
+                "frame {frame}: no caption mid-drag: {rows:?}"
+            );
+            assert!(
+                app.windows[&wid].link_hover.is_none(),
+                "frame {frame}: no hover published under a drag"
+            );
+            assert!(
+                !app.windows[&wid].native_text_cursor && !app.windows[&wid].hover_pointer,
+                "frame {frame}: the frame did not replace the grab with an I-beam"
+            );
+        }
+        app.conn_drag_abort();
+    }
+
+    /// The tab context menu is a window-state surface of its own, not an
+    /// `Overlay` variant, and it owns the pointer while it is up: the motion
+    /// ladder returns at its arm. Its highlight tracking requests frames, so
+    /// with the card open over the link row a frame that resolved the cell
+    /// UNDER the card would paint an I-beam over the menu and caption a link no
+    /// press there can reach. Two openings: a pointer that walked onto the
+    /// card (the routing decision is the menu's), and a keyboard opening under
+    /// a pointer parked on the grid (the resolver's own guard answers).
+    #[test]
+    fn a_tab_menu_open_over_a_link_row_earns_no_caption_and_no_ibeam() {
+        let mut app = App::headless_for_test();
+        let wid = WindowId(0);
+        app.tab_strip_rows = 1;
+        app.splice_tab_strip(wid);
+        feed(&app, wid, PHISH);
+        hover(&mut app, wid, 0, LINK_COL);
+        assert!(
+            compose(&mut app, wid)
+                .last()
+                .expect("rows")
+                .contains(TARGET),
+            "precondition: the destination is disclosed"
+        );
+
+        // POINTER OPENING: onto the chip, the card pops at the chip, and the
+        // pointer walks down onto the card over the link row.
+        let (sx, sy) = strip_px(&app, wid, 2);
+        app.on_cursor_moved(wid, sx, sy);
+        assert!(
+            app.open_tab_context_menu_at_chip(wid, 0),
+            "the menu opens at the chip"
+        );
+        hover(&mut app, wid, 0, LINK_COL);
+        assert!(app.windows[&wid].tab_menu.is_some(), "the card is up");
+        for frame in 0..2 {
+            compose(&mut app, wid);
+            app.splice_tab_menu(wid);
+            let rows = frame_rows(&app, wid);
+            assert!(
+                !rows.concat().contains("example"),
+                "frame {frame}: no caption for a link under the card: {rows:?}"
+            );
+            assert!(
+                app.windows[&wid].link_hover.is_none(),
+                "frame {frame}: no hover published under the card"
+            );
+            assert!(
+                !app.windows[&wid].native_text_cursor,
+                "frame {frame}: no I-beam over the menu"
+            );
+        }
+
+        // KEYBOARD OPENING under a pointer PARKED on the grid — no pointer
+        // event re-routes anything, and no new engine fill re-resolves anything:
+        // the caption splice's own owner gate is what keeps the card's rows
+        // honest, and the hover comes back the frame the card closes (the
+        // pointer never left the link).
+        assert!(app.close_tab_menu(wid));
+        hover(&mut app, wid, 0, LINK_COL);
+        assert!(
+            compose(&mut app, wid)
+                .last()
+                .expect("rows")
+                .contains(TARGET),
+            "the caption is back once the card is gone"
+        );
+        assert!(app.open_tab_context_menu_at_chip(wid, 0));
+        compose(&mut app, wid);
+        app.splice_tab_menu(wid);
+        let rows = frame_rows(&app, wid);
+        assert!(
+            !rows.concat().contains("example"),
+            "a keyboard-opened card silences the caption under it: {rows:?}"
+        );
+        assert!(app.close_tab_menu(wid));
+        assert!(
+            compose(&mut app, wid)
+                .last()
+                .expect("rows")
+                .contains(TARGET),
+            "…and it returns when the card closes"
+        );
+    }
+
     /// THE COMMAND LINE IS NOT SPARE ROOM. The band REPLACES the cells of the
     /// row it takes, and the caret's row is the surface the person is typing
     /// into — most often the shell prompt on the bottom row, exactly where a
@@ -48192,5 +49077,96 @@ mod acquire_wait_publication_tests {
             [542_000_000, 80_000],
             "successful acquisition shares the same recorder"
         );
+    }
+}
+
+#[cfg(test)]
+mod font_coverage_warm_guard {
+    //! NO GUI CODE WARMS THE FONT-COVERAGE INDEX.
+    //!
+    //! The first-present finalizer used to spawn `aterm-font-warm`, a thread
+    //! that read every system font whole (~700 MB on a Mac) to build
+    //! `aterm_render`'s cmap-coverage index — a table only the UNSEALED
+    //! `Tier::RuntimeDecisions` lane reads, and every GUI generation is sealed
+    //! before its first pixel (`aterm-render/tests/sealed_never_consults_
+    //! coverage_index.rs` pins that half). The spawn is gone; this scan keeps
+    //! it gone: a call to the warm anywhere in this crate's shipping source is
+    //! ~0.4-0.8 s of one core and ~700 MB of page-cache reads per launch, for
+    //! nothing.
+
+    #[test]
+    fn no_gui_source_calls_the_font_coverage_warm() {
+        // Built at runtime so this test's own source never contains the
+        // contiguous token it scans for.
+        let needle = format!("warm_font_{}", "coverage_index");
+        let src_dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src");
+        for entry in std::fs::read_dir(&src_dir).expect("read src/") {
+            let path = entry.expect("dir entry").path();
+            if path.extension().and_then(|e| e.to_str()) != Some("rs") {
+                continue;
+            }
+            let name = path.file_name().unwrap().to_string_lossy().into_owned();
+            let content = std::fs::read_to_string(&path).expect("read source");
+            for (i, line) in content.lines().enumerate() {
+                if !line.contains(&needle) {
+                    continue;
+                }
+                let t = line.trim_start();
+                if t.starts_with("//") {
+                    continue;
+                }
+                panic!(
+                    "{name}:{}: GUI source calls the font-coverage warm — every GUI \
+                     generation is sealed, so the index it builds is unreachable; \
+                     delete the call (see the note in app_render.rs's first-present \
+                     finalizer)",
+                    i + 1
+                );
+            }
+        }
+    }
+}
+
+/// Windowed presents the STARTUP RASTER PROBE has observed; `u32::MAX` once
+/// it has reported the first present that rasterized anything. Process-global
+/// like `first_present`: startup is a fact about the process, not a window.
+static STARTUP_RASTER_PROBE: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+
+/// The probe disarms after this many presents without any UI-thread raster —
+/// a shell that never prints is not worth watching forever (one atomic load
+/// per present while armed; nothing after).
+const STARTUP_RASTER_PROBE_PRESENTS: u32 = 600;
+
+fn startup_raster_probe_armed() -> bool {
+    STARTUP_RASTER_PROBE.load(std::sync::atomic::Ordering::Relaxed) < STARTUP_RASTER_PROBE_PRESENTS
+}
+
+/// The P36 observable, from the launch log. The glyph cache's growth across a
+/// present is exactly the atlas build's misses (`ensure_atlases` →
+/// `build_atlas` → `glyph_image` rasterizes on a miss; nothing else adds an
+/// entry), so: the FIRST present's `before` says whether the backend worker's
+/// post-seal warm survived the join's re-pin (≈190 regular + bold ASCII
+/// rasters resident, or 0 when a setter dropped them), and the first present
+/// that grows the cache says what the first frame with content rasterized on
+/// the UI thread — the prompt's glyph count under the old wiring, only its
+/// non-ASCII under the warm. The first present usually lands before the shell
+/// has printed anything, which is why both lines exist.
+fn note_startup_present_rasters(before: usize, after: usize) {
+    use std::sync::atomic::Ordering::Relaxed;
+    let nth = STARTUP_RASTER_PROBE.fetch_add(1, Relaxed).saturating_add(1);
+    let grew = after.saturating_sub(before);
+    if nth == 1 {
+        aterm_log::debug!(
+            "startup: first present rasterized {grew} glyphs on the UI thread (glyph cache \
+             {before} -> {after}; the cache's size before it is the post-seal warm that \
+             survived the join)"
+        );
+    }
+    if grew > 0 {
+        aterm_log::debug!(
+            "startup: present #{nth} is the first to rasterize on the UI thread: {grew} glyphs \
+             (glyph cache {before} -> {after})"
+        );
+        STARTUP_RASTER_PROBE.store(u32::MAX, Relaxed);
     }
 }

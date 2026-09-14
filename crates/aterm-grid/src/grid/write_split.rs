@@ -8,6 +8,8 @@
 //! the terminal handler can apply cell extras (hyperlinks, non-BMP overflow,
 //! underline colors) at the correct position before the cursor advances
 //! and potentially triggers a scroll that shifts the written row.
+//! All write damage goes through `mark_content_*`: Unicode and styled writes
+//! must invalidate content-only readers just as the ASCII bulk path does.
 //!
 //! Also contains the bulk extras write path (`write_ascii_run_with_extras`)
 //! for ASCII runs with RGB/hyperlink styles, avoiding per-character fallback.
@@ -41,7 +43,7 @@ impl Grid {
             row.write_char_styled(cursor_col, c, fg, bg, flags);
         }
         self.remove_stale_extras_pair(cursor_row, cursor_col, stale);
-        self.storage.damage.mark_cell(cursor_row, cursor_col);
+        self.storage.mark_content_cell(cursor_row, cursor_col);
     }
 
     /// Write a styled character at cursor with pre-computed packed colors.
@@ -69,7 +71,7 @@ impl Grid {
         self.storage
             .extras
             .clear_rgb_ring_cell(cursor_row, cursor_col, 1);
-        self.storage.damage.mark_cell(cursor_row, cursor_col);
+        self.storage.mark_content_cell(cursor_row, cursor_col);
     }
 
     /// Write a wide (double-width) character at cursor WITHOUT advancing.
@@ -132,7 +134,7 @@ impl Grid {
             self.storage
                 .extras
                 .clear_rgb_ring_cell(cursor_row, cursor_col, 2);
-            self.storage.damage.mark_wide_cell(cursor_row, cursor_col);
+            self.storage.mark_content_wide_cell(cursor_row, cursor_col);
             return true;
         }
         false
@@ -190,7 +192,7 @@ impl Grid {
         if let Some(r) = self.storage.row_mut(row) {
             r.clear_range_with(col, ecols, fill);
         }
-        self.storage.damage.mark_row(row);
+        self.storage.mark_content_row(row);
     }
 
     /// Advance cursor by 1 column without wrapping.
@@ -405,7 +407,7 @@ impl Grid {
 
         // Row-level damage — same strategy as ASCII bulk path. Avoids per-char
         // min/max merge overhead of mark_wide_cell for sequential wide writes.
-        self.storage.damage.mark_row(cursor_row);
+        self.storage.mark_content_row(cursor_row);
 
         // Advance cursor with pending wrap at end of line
         let new_col = cursor_col + 2;
@@ -465,7 +467,7 @@ impl Grid {
         self.remove_stale_extras_pair(cursor_row, cursor_col, stale);
 
         // Row-level damage — same strategy as ASCII bulk path.
-        self.storage.damage.mark_row(cursor_row);
+        self.storage.mark_content_row(cursor_row);
 
         // Store complex char codepoint in ring buffer (O(1) flat array, no Arc)
         let visible_rows = self.storage.visible_rows;
@@ -521,7 +523,7 @@ impl Grid {
         self.remove_stale_extras_pair(cursor_row, cursor_col, stale);
 
         // Row-level damage — amortized for bulk runs
-        self.storage.damage.mark_row(cursor_row);
+        self.storage.mark_content_row(cursor_row);
 
         // Advance cursor with pending wrap at end of line.
         // Guard: double-width rows, DECLRMM margins.
@@ -681,7 +683,7 @@ impl Grid {
             }
 
             // Row-level damage — once per row, not per char
-            self.storage.damage.mark_row(cursor_row);
+            self.storage.mark_content_row(cursor_row);
 
             pos += to_write;
 
@@ -832,7 +834,7 @@ impl Grid {
             );
 
             // Row-level damage — once per row
-            self.storage.damage.mark_row(cursor_row);
+            self.storage.mark_content_row(cursor_row);
 
             pos += to_write;
             if end_col >= ecols {
@@ -979,7 +981,7 @@ impl Grid {
                 cols,
             );
 
-            self.storage.damage.mark_row(cursor_row);
+            self.storage.mark_content_row(cursor_row);
 
             pos += to_write;
             if end_col >= ecols {
@@ -1156,7 +1158,7 @@ impl Grid {
                 );
             }
 
-            self.storage.damage.mark_row(cursor_row);
+            self.storage.mark_content_row(cursor_row);
 
             if let Some(&last) = remaining[..to_write].last() {
                 *last_byte = Some(last);

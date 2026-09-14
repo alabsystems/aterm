@@ -6517,15 +6517,16 @@ impl GpuRenderer {
         let family_owned = family.map(String::from);
         let font_handle = std::thread::spawn(move || {
             let font_started = aterm_time::Instant::now();
-            // Warm the printable-ASCII glyph cache here (still off the critical path,
-            // overlapping GPU init) so the first frame's atlas build doesn't
-            // rasterize them on the hot path. Byte-identical output (cache fill only).
-            let cpu = Renderer::from_system_with_family(family_owned.as_deref(), px, theme).map(
-                |mut cpu| {
-                    cpu.prewarm_ascii();
-                    cpu
-                },
-            );
+            // NO glyph prewarm here any more. This thread used to
+            // `prewarm_ascii` the fresh renderer, but every GUI host seals the
+            // generation on its backend worker right after this constructor
+            // returns, and `Renderer::seal_admitted_font_sources` ends with a
+            // wholesale `glyphs.clear()` — so the 95 CoreText rasters spent
+            // here never survived to a first frame, which re-rasterized every
+            // visible key on the UI thread regardless. The host warms AFTER
+            // the seal instead ([`GpuRenderer::prewarm_ascii`]), where the
+            // rasters actually persist into the first atlas build.
+            let cpu = Renderer::from_system_with_family(family_owned.as_deref(), px, theme);
             crate::startup_probe::record(
                 crate::startup_probe::Leg::FontThread,
                 font_started.elapsed(),
@@ -7306,6 +7307,26 @@ impl GpuRenderer {
     /// same contract.
     pub fn seal_admitted_font_sources(&mut self) -> aterm_render::AdmittedFontSources {
         self.cpu.seal_admitted_font_sources()
+    }
+
+    /// Pre-rasterize regular + bold printable ASCII into the wrapped CPU
+    /// renderer's glyph cache, so the first frame's atlas build is a pure
+    /// copy for the prompt. Call it AFTER [`Self::seal_admitted_font_sources`]
+    /// — the seal drops every cached raster, which is why the constructor's
+    /// font thread no longer warms anything (see `new_with_family`).
+    pub fn prewarm_ascii(&mut self) {
+        self.cpu.prewarm_ascii();
+    }
+
+    /// DIAGNOSTIC: rasterized glyph images resident in the wrapped CPU face's
+    /// cache (see [`Renderer::glyph_cache_len`]). The host samples it around
+    /// the first present: growth there is exactly the number of glyphs the
+    /// first atlas build rasterized on the UI thread — zero when the worker's
+    /// post-seal warm survived to the frame. Not part of the rendering contract.
+    #[doc(hidden)]
+    #[must_use]
+    pub fn glyph_cache_len(&self) -> usize {
+        self.cpu.glyph_cache_len()
     }
 
     /// Rebuild the wrapped font at `px`/`theme` using only the sealed retained
@@ -24556,6 +24577,45 @@ ab\r\n",
             gpu.cpu.text_shaping().ligature_mode,
             aterm_types::text_shaping::LigatureMode::Disabled,
             "shaping must survive the face rebuild, not reset to Enabled"
+        );
+    }
+
+    /// The constructor's font thread no longer prewarms (the seal that every
+    /// host runs next would discard it), and the post-seal warm the host calls
+    /// instead is what the first atlas build finds resident: regular AND bold
+    /// ASCII, and a later look-up of either is a hit.
+    #[test]
+    fn the_font_thread_leaves_the_cache_cold_and_the_post_seal_prewarm_survives() {
+        let theme = Theme::default();
+        let mut gpu = match GpuRenderer::new(16.0, theme) {
+            Ok(gpu) => gpu,
+            Err(error) => {
+                crate::stderr_line!("SKIP: no GPU or system font available: {error}");
+                return;
+            }
+        };
+        assert_eq!(
+            gpu.cpu.glyph_cache_len(),
+            0,
+            "the font thread must not rasterize into a cache the seal is about to clear"
+        );
+        gpu.seal_admitted_font_sources();
+        gpu.prewarm_ascii();
+        let warmed = gpu.cpu.glyph_cache_len();
+        assert!(
+            warmed >= 2 * 95,
+            "regular + bold printable ASCII must be resident after the post-seal warm; got {warmed}"
+        );
+        for ch in ['$', '>', 'a', 'Z'] {
+            let regular = gpu.cpu.glyph_key(ch);
+            let bold = gpu.cpu.glyph_key_styled(ch, aterm_render::StyleBits::BOLD);
+            let _ = gpu.cpu.glyph_image(regular);
+            let _ = gpu.cpu.glyph_image(bold);
+        }
+        assert_eq!(
+            gpu.cpu.glyph_cache_len(),
+            warmed,
+            "the prompt's regular and bold keys must be cache hits after the warm"
         );
     }
 

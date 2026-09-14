@@ -8,6 +8,90 @@
 
 use super::*;
 
+/// The cell-observation snapshot protocol for PRISM WAKE. Token and glyph
+/// identity are each quotiented to two distinguishable values: OtherRow flips
+/// only the token; Echo consumes a glyph change without licensing it. Rebase
+/// forgets both. The Tier-1 bind drives real Terminal VT and the shipping
+/// OutputStreak, including an echo followed by unrelated output; retaining the
+/// pre-echo snapshot or trusting the global token would fail that observation.
+/// GeometryBaseline covers a reflow token; GeometryWithoutToken covers a host
+/// resize arriving before another terminal token. Both establish history
+/// silently. Geometry/span bounds are checked against emitted real quads.
+#[must_use]
+#[cfg_attr(trust_verify, trust::skip)]
+pub fn output_streak_attribution_model() -> Model {
+    crate::ty_model! {
+        OutputStreakAttribution {
+            const Buggy = 0;
+            var based = 0;
+            var token = 0;
+            var snapshot = 0;
+            var fresh = 0;
+            var echo = 0;
+            var moved = 0;
+            var licensed = 0;
+            var geometry_changed = 0;
+
+            action Baseline when (based == 0) {
+                based = 1; token = 0; snapshot = 1;
+                fresh = 0; echo = 0; moved = 0; licensed = 0;
+                geometry_changed = 0;
+            }
+            action StableToken when (based == 1) {
+                fresh = 0; echo = 0; moved = 0; licensed = 0;
+                geometry_changed = 0;
+            }
+            action OtherRow when (based == 1) {
+                token = 1 - token;
+                fresh = 0; echo = 0; moved = 0;
+                licensed = if Buggy == 1 { 1 } else { 0 };
+                geometry_changed = 0;
+            }
+            action ChangedRun when (based == 1) {
+                token = 1 - token; snapshot = 1 - snapshot;
+                fresh = 1; echo = 0; moved = 0; licensed = 1;
+                geometry_changed = 0;
+            }
+            action Echo when (based == 1) {
+                token = 1 - token; snapshot = 1 - snapshot;
+                fresh = 1; echo = 1; moved = 0; licensed = 0;
+                geometry_changed = 0;
+            }
+            action Relocated when (based == 1) {
+                token = 1 - token;
+                fresh = 1; echo = 0; moved = 1; licensed = 0;
+                geometry_changed = 0;
+            }
+            action GeometryBaseline when (based == 1) {
+                token = 1 - token; snapshot = 1 - snapshot;
+                fresh = if Buggy == 1 { 1 } else { 0 };
+                echo = 0; moved = 0;
+                licensed = if Buggy == 1 { 1 } else { 0 };
+                geometry_changed = 1;
+            }
+            action GeometryWithoutToken when (based == 1) {
+                fresh = 0; echo = 0; moved = 0; licensed = 0;
+                geometry_changed = 1;
+            }
+            action Rebase when (based == 1) {
+                based = 0; token = 0; snapshot = 0;
+                fresh = 0; echo = 0; moved = 0; licensed = 0;
+                geometry_changed = 0;
+            }
+            invariant Bounded:
+                based <= 1 && token <= 1 && snapshot <= 1 &&
+                fresh <= 1 && echo <= 1 && moved <= 1 && licensed <= 1 &&
+                geometry_changed <= 1;
+            invariant LicensedRequiresFreshUndiscountedInk:
+                if licensed == 1 {
+                    based == 1 && fresh == 1 && echo == 0 && moved == 0
+                } else { licensed == 0 };
+            invariant GeometryBaselineIsSilent:
+                if geometry_changed == 1 { licensed == 0 } else { licensed <= 1 };
+        }
+    }
+}
+
 /// GLYPH-KEY INJECTIVITY (W12) — px is part of every [`aterm_render::GlyphKey`] by
 /// construction, so a cache/atlas lookup for a glyph at one pixel size can NEVER
 /// collide with the SAME glyph rasterized at a different size. This underwrites the

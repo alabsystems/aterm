@@ -347,7 +347,7 @@ pub(crate) struct Config {
     /// Maximum comet length in cells (a long jump keeps the brightest cells
     /// nearest the cursor). Default 24.
     pub(crate) cursor_trail_length: Option<usize>,
-    /// Aurora brightness 0.0..=1.0 (LUMEN styles). Default 0.7.
+    /// Aurora brightness 0.0..=1.0 (LUMEN styles). Default 1.0.
     pub(crate) cursor_trail_intensity: Option<f32>,
     /// Bloom-crown radius in cells (LUMEN styles); 0 disables the crown. Default 0.6.
     pub(crate) cursor_trail_radius: Option<f32>,
@@ -958,10 +958,15 @@ pub(crate) struct Config {
     /// the configured value inside the valid domain rather than letting the
     /// clamp silently rewrite it. Hot-reloadable, like `window_padding`.
     pub(crate) window_padding_top: Option<f32>,
-    /// Compatibility security opt-in for OSC 52 clipboard queries (`Pd = "?"`).
-    /// Default OFF (fail-closed). The GUI callback currently drops every Query
-    /// and returns no clipboard contents, so enabling this has no shipping GUI
-    /// effect; Manual diagnoses an authored `true` value.
+    /// Security opt-in for OSC 52 clipboard QUERIES (`Pd = "?"`): a program in
+    /// the terminal reads the clipboard back. Default OFF (fail-closed). When on,
+    /// macOS/Windows answer with the SYSTEM pasteboard (`spawn.rs`, the Query arm
+    /// — remote vim/tmux clipboard sync is the use), so text copied in other apps
+    /// is readable by the program; Linux answers only the selections aterm owns.
+    /// On macOS 26 a programmatic pasteboard read is what raises the system's
+    /// paste alert ("aterm would like to paste from …"): the program asked, the
+    /// alert names aterm, because the read is aterm's. Manual diagnoses an
+    /// authored `true` value with that caveat.
     pub(crate) allow_osc52_query: Option<bool>,
     /// SECURE KEYBOARD ENTRY (`secure_keyboard_entry`, default OFF): while on
     /// AND aterm is frontmost, macOS blocks other processes from observing
@@ -988,7 +993,10 @@ pub(crate) struct Config {
     /// pair discloses the host's font metrics, so it rides the same mint.
     pub(crate) allow_window_ops: Option<bool>,
     /// Security opt-in: allow desktop notifications (OSC 9 / 99 / 777). Default
-    /// OFF. Maps to `allow_notifications`.
+    /// OFF. Maps to `allow_notifications`. Delivery is a subprocess running under
+    /// aterm's identity — `terminal-notifier` when installed, else `osascript` —
+    /// which is why a program's notification needs this opt-in (`notify.rs`,
+    /// *Identity and consent*: measured to preflight only, never to prompt).
     pub(crate) allow_notifications: Option<bool>,
     /// Security opt-in: allow apps to set indexed colors (OSC 4 / numeric OSC 21).
     /// Default OFF. Maps to `allow_palette_reconfigure`.
@@ -2117,6 +2125,9 @@ pub(crate) struct ResolvedTrailPresentation {
     pub(crate) style: ResolvedTrailStyle,
     pub(crate) beam: bool,
     pub(crate) ribbon_tall: bool,
+    /// The explicit `... flat` spelling: the 2026-09-13 flat body instead of
+    /// the default comet body and vivid rail (`RAINBOW-KITTY-V2.md` §30).
+    pub(crate) ribbon_flat: bool,
     /// The classic wake's COLOUR FACE — the spectrum (`false`) or the
     /// theme-following two-tone tracer (`true`). A spelling fork like the
     /// ribbon geometry beside it, not a style of its own.
@@ -2138,6 +2149,7 @@ impl Default for ResolvedTrailPresentation {
             },
             beam: aterm_effects::cursor_glow::style_has_beam_of(style, raw),
             ribbon_tall: true,
+            ribbon_flat: false,
             classic_mono: false,
             pet_species: Some(aterm_effects::kitty_pet::PetSpecies::Cat),
             comet: false,
@@ -3602,13 +3614,17 @@ impl Config {
             .trim()
     }
 
-    /// Aurora brightness, default 0.7, clamped 0.0..=1.0. A non-finite value
+    /// Aurora brightness, default 1.0 (0.7 until 2026-09-13: the rainbow bed
+    /// multiplies this knob under its legibility bar, so the shipped default
+    /// ran the bed 30 % under the one restraint the owner kept — "bright,
+    /// not dim" — and every offline golden was measured at 1.0), clamped
+    /// 0.0..=1.0. A non-finite value
     /// (`intensity = nan` is valid TOML) FAILS OFF to `0.0`: `clamp` passes NaN
     /// through, and NaN defeats every downstream `intensity <= 0.0` disable
     /// check (NaN compares false), so it would flow into the light math instead
     /// of provably disabling — the `sdr_glow_budget` "NaN fails OFF" posture.
     pub(crate) fn cursor_trail_intensity_or_default(&self) -> f32 {
-        let v = self.cursor_trail_intensity.unwrap_or(0.7);
+        let v = self.cursor_trail_intensity.unwrap_or(1.0);
         if v.is_finite() {
             v.clamp(0.0, 1.0)
         } else {
@@ -5331,10 +5347,28 @@ impl Config {
     /// EFFECTIVE family (env `$ATERM_FONT` > config), matching what the
     /// backend will actually try.
     pub(crate) fn font_family_warning(family: Option<&str>) -> Option<String> {
-        let fam = family.map(str::trim).filter(|s| !s.is_empty())?;
+        Self::font_family_admission(family).err()
+    }
+
+    /// The admission VERDICT behind [`Self::font_family_warning`], with the
+    /// resolved path when it admits: `Ok(None)` for no family requested,
+    /// `Ok(Some(path))` for an admissible one (the exact file — or `display:`
+    /// name — the backend should build from, so the build does not resolve
+    /// the family a second time), `Err(warning)` otherwise.
+    ///
+    /// This is the ONE resolve of a configured family at startup, and it runs
+    /// on the backend worker: it walks the font directories and, for a family
+    /// whose files carry style suffixes (`JetBrainsMono-Regular.ttf`), reads
+    /// and parses `name` tables until a match — 5-50 ms warm, seconds cold.
+    /// The main thread used to run the same resolve 20 lines after spawning
+    /// the worker that was about to run it again, for a warning string.
+    pub(crate) fn font_family_admission(family: Option<&str>) -> Result<Option<String>, String> {
+        let Some(fam) = family.map(str::trim).filter(|s| !s.is_empty()) else {
+            return Ok(None);
+        };
         match aterm_render::resolve_config_font(fam) {
-            Ok(_) => None,
-            Err(error) => Some(format!(
+            Ok(path) => Ok(Some(path)),
+            Err(error) => Err(format!(
                 "font_family {fam:?} is not an admissible font ({error}); keeping the current \
                  working font (see `aterm list-fonts` for resolvable families)"
             )),
@@ -5610,6 +5644,56 @@ impl RenderKnobs {
             out.push(KnobChange::BackgroundMaterial(new.background_material));
         }
         out
+    }
+}
+/// The App-owned renderer settings that BAKE INTO RASTERIZED COVERAGE or the
+/// cell box — the subset of [`crate::App::pin_backend_render_config_core`]'s
+/// list whose renderer setters drop the glyph cache when the value differs
+/// from the one the constructor started with: `set_text_shaping` (on an
+/// ambiguous-width change), `set_font_thicken`, `set_stem_gamma`,
+/// `set_font_hinting` (where the hint seam exists), `set_line_height` and
+/// `set_adjust_baseline`. Every other knob that path pins is blend-, blit- or
+/// present-time and keeps the cache.
+///
+/// One struct, applied by ONE setter list (`Backend::pin_glyph_raster_knobs`),
+/// because two callers must agree on it: the backend worker pins these BEFORE
+/// its post-seal glyph warm, and the join re-pins them from the App's fields.
+/// Only when the worker pinned the same values is the join's re-pin the no-op
+/// it already is for a default config — otherwise the first setter that
+/// differs discards the warm, and the first frame rasterizes the prompt on the
+/// UI thread (the P36 mechanism, back for any `line_height`, `font_thicken`,
+/// `stem_gamma` or `adjust_baseline` in aterm.toml).
+#[derive(Clone, PartialEq, Debug)]
+pub(crate) struct GlyphRasterKnobs {
+    /// `ligatures` / `font_features` / `merged_ligatures` → `set_text_shaping`.
+    pub(crate) text_shaping: aterm_render::TextShapingConfig,
+    /// `font_thicken` → `set_font_thicken`.
+    pub(crate) font_thicken: bool,
+    /// `stem_gamma` (env alias `ATERM_STEM_GAMMA`) → `set_stem_gamma`.
+    pub(crate) stem_gamma: f32,
+    /// `font_hinting` (env alias `ATERM_FONT_HINTING`) → `set_font_hinting`.
+    pub(crate) font_hinting: String,
+    /// `line_height` → `set_line_height`.
+    pub(crate) line_height: f32,
+    /// `adjust_baseline` → `set_adjust_baseline`.
+    pub(crate) adjust_baseline: i32,
+}
+
+impl GlyphRasterKnobs {
+    /// Resolve the knobs from a launch config with the same `*_or_default`
+    /// precedence the App's fields are seeded with (env alias > config key >
+    /// built-in default), so the worker's pin and the join's re-pin cannot
+    /// disagree. `main_entry` resolves this ONCE and hands the same value to
+    /// both.
+    pub(crate) fn from_config(cfg: &Config) -> Self {
+        Self {
+            text_shaping: cfg.text_shaping(),
+            font_thicken: cfg.font_thicken_or_default(),
+            stem_gamma: cfg.stem_gamma_or_default(),
+            font_hinting: cfg.font_hinting_or_default(),
+            line_height: cfg.line_height_or_default(),
+            adjust_baseline: cfg.adjust_baseline_or_default(),
+        }
     }
 }
 
@@ -7734,6 +7818,7 @@ pub(crate) fn resolve_trail_presentation_from_style(
         style,
         beam: style_has_beam_of(glow_style, token),
         ribbon_tall: !GlowStyle::style_names_underline_ribbon(token),
+        ribbon_flat: GlowStyle::style_names_flat_ribbon(token),
         classic_mono: GlowStyle::style_names_classic_mono(token),
         pet_species,
         comet: style.style == Some(GlowStyle::Comet),
@@ -7851,6 +7936,10 @@ pub(crate) fn resolve_cursor_glow(
         // which had flipped the default on a claimed ruling the owner did not
         // give; the explicit spellings for BOTH looks survive.
         ribbon_tall: presentation.ribbon_tall,
+        // The flat body is a spelling too (`rainbow kitty flat`): the A/B twin
+        // of the comet body and its vivid rail, which are the default
+        // (`RAINBOW-KITTY-V2.md` §30).
+        ribbon_flat: presentation.ribbon_flat,
         // The classic wake's colour face rides the RESOLVED spelling, exactly
         // as the ribbon geometry above does: plain `classic` is v0.28's
         // shipped spectrum, `classic mono` its theme-following tracer.
@@ -8904,25 +8993,38 @@ impl App {
         }
     }
 
+    /// The live glyph-affecting knobs, as the App holds them — the join's and
+    /// every rebuild's input to `Backend::pin_glyph_raster_knobs`. At launch
+    /// these ARE the values `main_entry` resolved once and handed the backend
+    /// worker (the fields are seeded from the same [`GlyphRasterKnobs`]).
+    pub(crate) fn glyph_raster_knobs(&self) -> GlyphRasterKnobs {
+        GlyphRasterKnobs {
+            text_shaping: self.text_shaping.clone(),
+            font_thicken: self.font_thicken,
+            stem_gamma: self.stem_gamma,
+            font_hinting: self.font_hinting.clone(),
+            line_height: self.render_knobs.line_height,
+            adjust_baseline: self.render_knobs.adjust_baseline,
+        }
+    }
+
     /// Re-pin every memory-backed App-owned renderer setting onto a freshly
     /// constructed or re-faced backend. Path-backed font generations cross
     /// their own worker-only prepare/seal boundary before publication.
     pub(crate) fn pin_backend_render_config_core(&mut self) {
-        self.backend.set_text_shaping(self.text_shaping.clone());
+        // The glyph-affecting subset goes through the ONE setter list the
+        // backend worker also ran before its post-seal warm
+        // (`GlyphRasterKnobs`): same values, so every setter here early-outs
+        // and the warm reaches the first frame.
+        let raster = self.glyph_raster_knobs();
+        self.backend.pin_glyph_raster_knobs(&raster);
         self.backend.set_text_blending(self.text_blending);
-        self.backend.set_font_thicken(self.font_thicken);
-        self.backend.set_stem_gamma(self.stem_gamma);
-        let hinting = self.font_hinting.clone();
-        self.backend.set_font_hinting(&hinting);
         let subpixel = self.font_subpixel.clone();
         self.backend.set_font_subpixel(&subpixel);
-        self.backend.set_line_height(self.render_knobs.line_height);
         self.backend
             .set_minimum_contrast(self.render_knobs.minimum_contrast);
         self.backend
             .set_selection_fg(self.render_knobs.selection_fg);
-        self.backend
-            .set_adjust_baseline(self.render_knobs.adjust_baseline);
         let (upos, uthick) = self.render_knobs.adjust_underline;
         self.backend.set_adjust_underline(upos, uthick);
         self.backend

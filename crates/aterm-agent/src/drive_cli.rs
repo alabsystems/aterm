@@ -13,8 +13,8 @@ use std::process::ExitCode;
 use std::time::Duration;
 
 use crate::supervise::{
-    self, EXIT_TIMEOUT, Session, SuperviseOpts, classify_command_with, exit_reason, render_phase,
-    worker_phase,
+    self, EXIT_TIMEOUT, Mark, ReportOpts, Session, SuperviseOpts, classify_command_with,
+    exit_reason, render_phase_and_survey, worker_phase,
 };
 use crate::{ControlClient, CtlClient, DRIVE_HELP, RelayClient, SelfGovernor, Turn};
 
@@ -280,6 +280,19 @@ struct SubArgs {
     reconnect_s: Option<u64>,
     allow_python: Vec<String>,
     notes: Option<PathBuf>,
+    /// `report --since <origin:i>`: start right after that archived row.
+    since: Option<Mark>,
+    /// `report --max-rows N`: the most archived rows read.
+    max_rows: Option<usize>,
+    /// `watch --report`: count a report into each idle/question/limited EVENT.
+    report: bool,
+    /// `watch` / `supervise --dismiss-surveys`: press `0` on the session
+    /// survey (guarded) instead of reporting it.
+    dismiss_surveys: bool,
+    /// `watch` / `supervise --context-warn <pct>`: say `EVENT context` when
+    /// the worker's context left first reads at or below it, then `EVENT
+    /// compacted` (`None` = [`DEFAULT_CONTEXT_WARN`]; `0` = neither).
+    context_warn: Option<u8>,
     /// Positional words (the command text for `classify`).
     rest: Vec<String>,
 }
@@ -327,6 +340,51 @@ fn parse_sub(verb: &str, args: &[String]) -> Result<SubArgs, String> {
                 it.next(),
             )?),
             "--notes" => out.notes = Some(PathBuf::from(need("--notes", "a FILE", it.next())?)),
+            "--since" => {
+                let what = "ORIGIN:INDEX (a report's last=) or INDEX";
+                let v = need("--since", what, it.next())?;
+                out.since =
+                    Some(Mark::parse(&v).ok_or_else(|| format!("{verb}: --since needs {what}"))?);
+            }
+            "--max-rows" => {
+                let what = "a positive row count";
+                let n = int("--max-rows", what, it.next())?;
+                out.max_rows = Some(
+                    usize::try_from(n)
+                        .ok()
+                        .filter(|&n| n > 0)
+                        .ok_or_else(|| format!("{verb}: --max-rows needs {what}"))?,
+                );
+            }
+            "--report" => out.report = true,
+            // Only the loops that see a survey appear press anything on it.
+            "--dismiss-surveys" => {
+                if !matches!(verb, "watch" | "supervise") {
+                    return Err(format!(
+                        "{verb}: --dismiss-surveys is watch's and supervise's (the loops that \
+                         see the session survey appear and press 0 on it)"
+                    ));
+                }
+                out.dismiss_surveys = true;
+            }
+            // Only the loops that watch the worker's turns see its context
+            // run low and the compaction that follows.
+            "--context-warn" => {
+                if !matches!(verb, "watch" | "supervise") {
+                    return Err(format!(
+                        "{verb}: --context-warn is watch's and supervise's (the loops that \
+                         see the worker's context run low and compact)"
+                    ));
+                }
+                let what = "a percentage from 0 to 100 (0: off)";
+                let n = int("--context-warn", what, it.next())?;
+                out.context_warn = Some(
+                    u8::try_from(n)
+                        .ok()
+                        .filter(|&n| n <= 100)
+                        .ok_or_else(|| format!("{verb}: --context-warn needs {what}"))?,
+                );
+            }
             other if other.starts_with("--") => {
                 return Err(format!(
                     "{verb}: unknown option '{other}'. Run `aterm-drive --help` for the flags."
@@ -415,6 +473,18 @@ pub fn main_entry(argv: Vec<std::ffi::OsString>) -> ExitCode {
 fn watch_exit_line(cmd: &[String], err: &str) -> Option<String> {
     (cmd.first().map(String::as_str) == Some("watch"))
         .then(|| format!("EXIT {}", exit_reason(err.lines().next().unwrap_or(err))))
+}
+
+/// What `phase` and `await-turn` print for a turn: the phase and its detail,
+/// then `survey 0` while the session survey is open and `context <n>%` while
+/// Claude Code's context indicator is up ([`render_phase_and_survey`]) —
+/// `await-turn` prints its turn exactly like `phase` — and exit 124 for a
+/// turn the timeout cut short.
+fn phase_reply(turn: &supervise::Turn, allow: &[String]) -> Reply {
+    Reply {
+        text: render_phase_and_survey(turn, allow),
+        code: if turn.timed_out { EXIT_TIMEOUT } else { 0 },
+    }
 }
 
 fn run(opts: &Opts) -> Result<Reply, String> {
@@ -511,7 +581,7 @@ fn run(opts: &Opts) -> Result<Reply, String> {
                 screen,
                 timed_out: false,
             };
-            Ok(Reply::text(render_phase(&turn, &allow)))
+            Ok(phase_reply(&turn, &allow))
         }
         "await-turn" => {
             let sub = parse_sub(verb, &opts.cmd[1..])?;
@@ -522,10 +592,7 @@ fn run(opts: &Opts) -> Result<Reply, String> {
             let mut session = Session::new(&mut client, sub.sid);
             set_reconnect(&mut session, reconnect);
             let turn = session.await_turn(timeout)?;
-            Ok(Reply {
-                text: render_phase(&turn, &allow),
-                code: if turn.timed_out { EXIT_TIMEOUT } else { 0 },
-            })
+            Ok(phase_reply(&turn, &allow))
         }
         "supervise" => {
             let sub = parse_sub(verb, &opts.cmd[1..])?;
@@ -553,6 +620,16 @@ fn run(opts: &Opts) -> Result<Reply, String> {
                 code,
             })
         }
+        // What the worker said since the manager's turn: the rows a fullscreen
+        // app scrolled away joined with the screen's.
+        "report" => {
+            let sub = parse_sub(verb, &opts.cmd[1..])?;
+            no_positionals(verb, &sub)?;
+            let ropts = report_opts(&sub);
+            let mut session = Session::new(&mut client, sub.sid);
+            let report = session.report(&ropts)?;
+            Ok(Reply::text(report.render()))
+        }
         "await" => {
             if opts.cmd.len() < 2 {
                 return Err(
@@ -575,7 +652,7 @@ fn run(opts: &Opts) -> Result<Reply, String> {
         }
         other => Err(format!(
             "unknown command '{other}'. Valid: prompt | read | await | shot | classify | phase | \
-             await-turn | supervise | watch | help.\n  \
+             await-turn | supervise | watch | report | help.\n  \
              Run `aterm-drive --help` for the full guide."
         )),
     }
@@ -585,6 +662,11 @@ fn run(opts: &Opts) -> Result<Reply, String> {
 /// unattended before the manager is told (30 min — the rate-limit wait the
 /// owner chose).
 const DEFAULT_MAX_S: u64 = 1800;
+
+/// `supervise`'s and `watch`'s default `--context-warn`: the worker's context
+/// left, in percent, at or below which `EVENT context` is said — room for
+/// one turn that brings its handoff notes up to date before it compacts.
+const DEFAULT_CONTEXT_WARN: u8 = 10;
 
 /// `--reconnect-s`, when given: how long the loop rides out an outage (an
 /// aterm self-update's handoff, from its first unserved request) before it
@@ -601,6 +683,16 @@ fn supervise_opts(sub: &SubArgs) -> SuperviseOpts {
         max: Duration::from_secs(sub.max_s.unwrap_or(DEFAULT_MAX_S)),
         python_allow: sub.allow_python.clone(),
         notes: sub.notes.clone(),
+        report: sub.report,
+        dismiss_surveys: sub.dismiss_surveys,
+        context_warn: sub.context_warn.unwrap_or(DEFAULT_CONTEXT_WARN),
+    }
+}
+
+fn report_opts(sub: &SubArgs) -> ReportOpts {
+    ReportOpts {
+        since: sub.since,
+        max_rows: sub.max_rows.unwrap_or(supervise::DEFAULT_MAX_ROWS),
     }
 }
 
@@ -613,7 +705,8 @@ mod tests {
     }
 
     /// `classify <cmd>`: the command is the positional text (joined), the
-    /// verdict is the exit code, `--allow-python` widens the python rule, and
+    /// verdict is the exit code, `--allow-python` REPLACES the python globs
+    /// (`python_allow` falls back to the defaults only when none is given), and
     /// no command is a usage error.
     #[test]
     fn classify_parses_the_command_and_exits_on_the_verdict() {
@@ -723,6 +816,11 @@ mod tests {
                 reconnect_s: None,
                 allow_python: args(&["tools/*.py", "scripts/*report*.py"]),
                 notes: Some(PathBuf::from("/tmp/notes.txt")),
+                since: None,
+                max_rows: None,
+                report: false,
+                dismiss_surveys: false,
+                context_warn: None,
                 rest: vec![],
             }
         );
@@ -769,8 +867,13 @@ mod tests {
                 max: Duration::from_secs(7200),
                 python_allow: args(&["tools/*.py"]),
                 notes: Some(PathBuf::from("notes.txt")),
+                report: false,
+                dismiss_surveys: false,
+                context_warn: 10,
             }
         );
+        let sub = parse_sub("watch", &args(&["@s-1", "--report"])).expect("parses");
+        assert!(supervise_opts(&sub).report, "watch --report");
         let sub = parse_sub("watch", &args(&[])).expect("parses");
         assert_eq!(supervise_opts(&sub).max, Duration::from_secs(DEFAULT_MAX_S));
         assert_eq!(sub.reconnect_s, None, "the loop's own default");
@@ -804,6 +907,227 @@ mod tests {
             Some("EXIT cannot reach a target aterm over the control socket (refused).")
         );
         assert_eq!(watch_exit_line(&args(&["supervise"]), &err), None);
+    }
+
+    /// `await-turn` prints its turn exactly like `phase` — the `survey 0`
+    /// line included while the session survey is open — and exits 124 on a
+    /// turn the timeout cut short; with no survey the text is the phase's
+    /// alone.
+    #[test]
+    fn await_turn_prints_like_phase_the_survey_line_included() {
+        let rule = "─".repeat(120);
+        let body = [
+            "⏺ Done.",
+            "",
+            "✻ Cogitated for 4s · done 2:41 PM",
+            "",
+            "● How is Claude doing this session? (optional)",
+            "  1: Bad    2: Fine   3: Good   0: Dismiss",
+            &rule,
+            "❯",
+            &rule,
+            "  ? for shortcuts",
+        ];
+        let turn = |rows: Vec<String>, timed_out| supervise::Turn {
+            phase: worker_phase(&rows),
+            screen: supervise::Screen {
+                rows,
+                ..supervise::Screen::default()
+            },
+            timed_out,
+        };
+        let rows: Vec<String> = body.iter().map(|r| r.to_string()).collect();
+        let r = phase_reply(&turn(rows.clone(), false), &[]);
+        assert_eq!((r.text.as_str(), r.code), ("idle\nsurvey 0\n", 0));
+        let r = phase_reply(&turn(rows.clone(), true), &[]);
+        assert_eq!(
+            (r.text.as_str(), r.code),
+            ("idle\nsurvey 0\n", EXIT_TIMEOUT)
+        );
+        let plain: Vec<String> = rows
+            .into_iter()
+            .filter(|r| !r.contains("How is Claude doing") && !r.contains("0: Dismiss"))
+            .collect();
+        assert_eq!(phase_reply(&turn(plain, false), &[]).text, "idle\n");
+    }
+
+    /// `--dismiss-surveys` is watch's and supervise's — the loops that see
+    /// the session survey appear — into the same option, off unless given;
+    /// every other verb refuses it rather than take it silently.
+    #[test]
+    fn dismiss_surveys_is_watchs_and_supervises_only() {
+        for verb in ["watch", "supervise"] {
+            let sub = parse_sub(verb, &args(&["@s-1", "--dismiss-surveys", "--auto-reads"]))
+                .expect("parses");
+            assert!(no_positionals(verb, &sub).is_ok());
+            assert_eq!(sub.sid.as_deref(), Some("@s-1"));
+            assert!(sub.dismiss_surveys && sub.auto_reads, "{verb}");
+            assert!(supervise_opts(&sub).dismiss_surveys, "{verb}");
+            let sub = parse_sub(verb, &args(&["@s-1"])).expect("parses");
+            assert!(
+                !supervise_opts(&sub).dismiss_surveys,
+                "{verb}: off by default"
+            );
+        }
+        for verb in ["phase", "await-turn", "report", "classify"] {
+            let err = parse_sub(verb, &args(&["--dismiss-surveys"])).expect_err(verb);
+            assert!(
+                err.starts_with(&format!(
+                    "{verb}: --dismiss-surveys is watch's and supervise's"
+                )),
+                "{err}"
+            );
+        }
+    }
+
+    /// `--context-warn <pct>` is watch's and supervise's — the loops that see
+    /// the worker's context run low and compact — a percentage from 0 (off)
+    /// to 100, 10 unless given. It needs a value; anything else, or a verb
+    /// that is not a loop, is refused rather than taken silently.
+    #[test]
+    fn context_warn_is_watchs_and_supervises_a_percentage() {
+        // What a value that is not one is told, after the verb.
+        const NEEDS: &str = ": --context-warn needs a percentage from 0 to 100 (0: off)";
+        for verb in ["watch", "supervise"] {
+            let sub = parse_sub(verb, &args(&["@s-1", "--context-warn", "25"])).expect("parses");
+            assert!(no_positionals(verb, &sub).is_ok());
+            assert_eq!(sub.sid.as_deref(), Some("@s-1"));
+            assert_eq!(sub.context_warn, Some(25), "{verb}");
+            assert_eq!(supervise_opts(&sub).context_warn, 25, "{verb}");
+            for (given, want) in [("0", 0), ("100", 100), ("7", 7)] {
+                let sub = parse_sub(verb, &args(&["--context-warn", given])).expect(given);
+                assert_eq!(supervise_opts(&sub).context_warn, want, "{verb} {given}");
+            }
+            let sub = parse_sub(verb, &args(&["@s-1"])).expect("parses");
+            assert_eq!(sub.context_warn, None, "{verb}");
+            // 10 unless given.
+            assert_eq!(supervise_opts(&sub).context_warn, 10, "{verb}");
+            for bad in ["101", "256", "-1", "ten", "", "1.5", "10%"] {
+                let err = parse_sub(verb, &args(&["--context-warn", bad])).expect_err(bad);
+                assert_eq!(err, format!("{verb}{NEEDS}"), "{bad}");
+            }
+            let err = parse_sub(verb, &args(&["--context-warn"])).expect_err("no value");
+            assert_eq!(err, format!("{verb}{NEEDS}"));
+        }
+        for verb in ["phase", "await-turn", "report", "classify"] {
+            let err = parse_sub(verb, &args(&["--context-warn", "10"])).expect_err(verb);
+            assert!(
+                err.starts_with(&format!(
+                    "{verb}: --context-warn is watch's and supervise's"
+                )),
+                "{err}"
+            );
+        }
+    }
+
+    /// `phase` and `await-turn` end with `context <n>%` while Claude Code's
+    /// context indicator is up above the composer — after the `survey 0`
+    /// line when the survey is open too — and a timed-out turn still exits
+    /// 124; without the indicator the text is as before.
+    #[test]
+    fn phase_and_await_turn_end_with_the_context_left() {
+        let rule = "─".repeat(120);
+        let indicator = format!("{}1% until auto-compact", " ".repeat(97));
+        let body = [
+            "⏺ Done.",
+            "",
+            "✻ Cogitated for 4s · done 2:41 PM",
+            "",
+            "● How is Claude doing this session? (optional)",
+            "  1: Bad    2: Fine   3: Good   0: Dismiss",
+            &indicator,
+            &rule,
+            "❯",
+            &rule,
+            "  ? for shortcuts",
+        ];
+        let turn = |rows: Vec<String>, timed_out| supervise::Turn {
+            phase: worker_phase(&rows),
+            screen: supervise::Screen {
+                rows,
+                ..supervise::Screen::default()
+            },
+            timed_out,
+        };
+        let rows: Vec<String> = body.iter().map(|r| r.to_string()).collect();
+        let r = phase_reply(&turn(rows.clone(), false), &[]);
+        assert_eq!(
+            (r.text.as_str(), r.code),
+            ("idle\nsurvey 0\ncontext 1%\n", 0)
+        );
+        let r = phase_reply(&turn(rows.clone(), true), &[]);
+        assert_eq!(
+            (r.text.as_str(), r.code),
+            ("idle\nsurvey 0\ncontext 1%\n", EXIT_TIMEOUT)
+        );
+        let no_survey: Vec<String> = rows
+            .iter()
+            .filter(|r| !r.contains("How is Claude doing") && !r.contains("0: Dismiss"))
+            .cloned()
+            .collect();
+        assert_eq!(
+            phase_reply(&turn(no_survey.clone(), false), &[]).text,
+            "idle\ncontext 1%\n"
+        );
+        let plain: Vec<String> = no_survey
+            .into_iter()
+            .filter(|r| !r.contains("until auto-compact"))
+            .collect();
+        assert_eq!(phase_reply(&turn(plain, false), &[]).text, "idle\n");
+    }
+
+    /// `report [@sid] [--since ORIGIN:I] [--max-rows N]`: the mark is a
+    /// report's `last=` (or a bare index), the row cap is positive, and the
+    /// defaults are your turn and 8000 rows.
+    #[test]
+    fn report_parses_since_and_max_rows() {
+        let sub = parse_sub(
+            "report",
+            &args(&["@s-9", "--since", "7730:1291", "--max-rows", "500"]),
+        )
+        .expect("parses");
+        assert!(no_positionals("report", &sub).is_ok());
+        assert_eq!(sub.sid.as_deref(), Some("@s-9"));
+        assert_eq!(
+            report_opts(&sub),
+            ReportOpts {
+                since: Some(Mark {
+                    origin: Some(7730),
+                    index: 1291
+                }),
+                max_rows: 500,
+            }
+        );
+        let sub = parse_sub("report", &args(&["--since", "42"])).expect("a bare index");
+        assert_eq!(
+            sub.since,
+            Some(Mark {
+                origin: None,
+                index: 42
+            })
+        );
+        let sub = parse_sub("report", &args(&[])).expect("parses");
+        assert_eq!(report_opts(&sub), ReportOpts::default());
+        assert_eq!(ReportOpts::default().max_rows, 8000);
+        for bad in ["", "x", "1:", ":1", "-1", "+3", "1:2:3", "7730: 1"] {
+            let err = parse_sub("report", &args(&["--since", bad])).expect_err(bad);
+            assert!(
+                err.contains("report: --since needs ORIGIN:INDEX"),
+                "{bad}: {err}"
+            );
+        }
+        let err = parse_sub("report", &args(&["--since"])).expect_err("missing");
+        assert!(err.contains("--since needs"), "{err}");
+        for bad in ["0", "-5", "many"] {
+            let err = parse_sub("report", &args(&["--max-rows", bad])).expect_err(bad);
+            assert!(
+                err.contains("report: --max-rows needs a positive row count"),
+                "{bad}: {err}"
+            );
+        }
+        let sub = parse_sub("report", &args(&["@s-9", "extra"])).expect("parses");
+        let err = no_positionals("report", &sub).expect_err("no positionals");
+        assert!(err.contains("unexpected: extra"), "{err}");
     }
 
     fn prompt_opts(socket: String) -> Opts {

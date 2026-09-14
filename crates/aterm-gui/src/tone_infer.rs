@@ -72,6 +72,12 @@ pub(crate) struct ToneTracker {
     keys_since_infer: u32,
     /// Stamp of the last inference (None ⇒ never ran).
     last_infer: Option<Instant>,
+    /// An inference became DUE on the key path and waits for the render-tick
+    /// drain ([`Self::drain_pending_inference`]). The classifier never runs
+    /// inside the key handler: its ~10-25 µs sat between the PTY write and the
+    /// echo's wake dispatch, on the hottest path, for a verdict the key's own
+    /// click had already been stamped without.
+    infer_pending: bool,
     /// Fixed classifier scratch — allocated once, inference allocates zero.
     scratch: ToneScratch,
     /// Reused `&str` bridge for the char window (the classifier takes text).
@@ -95,6 +101,7 @@ impl Default for ToneTracker {
             tone: Tone::Technical,
             keys_since_infer: 0,
             last_infer: None,
+            infer_pending: false,
             scratch: ToneScratch::default(),
             text_buf_slot: String::new(),
             inferences: 0,
@@ -148,7 +155,14 @@ impl ToneTracker {
         }
     }
 
-    /// Feed one committed printed keystroke and maybe re-infer.
+    /// Feed one committed printed keystroke and maybe MARK a re-inference due.
+    ///
+    /// THE CLASSIFIER DOES NOT RUN HERE. This is the key handler; a due
+    /// inference is only marked pending and runs at the next render tick
+    /// ([`Self::drain_pending_inference`]). No audible change: the key's own
+    /// click reads the tracker BEFORE the feeds, so it always carried the
+    /// previous verdict, and the frame drain (where every trail cue is stamped)
+    /// drains the pending inference before it reads the tone.
     ///
     /// WINDOW MAINTENANCE IS UNCONDITIONAL — the rekey and the bounded push
     /// run whether or not inference is active, so the window always mirrors
@@ -174,6 +188,17 @@ impl ToneTracker {
                 .last_infer
                 .is_none_or(|at| now.saturating_duration_since(at) >= INFER_INTERVAL);
         if due {
+            self.infer_pending = true;
+        }
+    }
+
+    /// Run the inference a keystroke marked due, if any. Called from the
+    /// render-tick sound drain immediately before the tone is read, so a
+    /// verdict is never more than one frame behind the key that earned it —
+    /// and never computed inside the key handler.
+    pub(crate) fn drain_pending_inference(&mut self, now: Instant) {
+        if self.infer_pending {
+            self.infer_pending = false;
             self.infer(now);
         }
     }
@@ -309,10 +334,35 @@ impl ToneStatus {
 mod tests {
     use super::*;
 
+    /// A live session interleaves a frame with every key (the echo redraws),
+    /// so the feed drains the pending inference after each keystroke exactly
+    /// as the render tick does.
     fn feed(t: &mut ToneTracker, now: Instant, session: u64, s: &str) {
         for c in s.chars() {
             t.note_char(now, session, c, true);
+            t.drain_pending_inference(now);
         }
+    }
+
+    /// P06 — the key path never runs the classifier: a whole frustrated line
+    /// fed WITHOUT a frame leaves the verdict neutral and the inference count
+    /// at zero; the first drain then classifies it. Red on the old tracker,
+    /// which inferred inside `note_char`.
+    #[test]
+    fn the_key_path_marks_inference_due_and_only_the_drain_runs_it() {
+        let mut t = ToneTracker::default();
+        let now = Instant::now();
+        for c in "why is this broken again ugh".chars() {
+            t.note_char(now, 1, c, true);
+        }
+        assert_eq!(t.inferences, 0, "no frame ⇒ the classifier has not run");
+        assert_eq!(t.current(), Tone::Technical);
+        assert!(t.infer_pending, "…but the keystrokes marked one due");
+        t.drain_pending_inference(now);
+        assert_eq!(t.inferences, 1, "one drain runs exactly one inference");
+        assert_eq!(t.current(), Tone::Frustrated);
+        t.drain_pending_inference(now);
+        assert_eq!(t.inferences, 1, "a drain with nothing pending is free");
     }
 
     /// Feed keystrokes with inference INACTIVE — window maintenance still
@@ -356,6 +406,7 @@ mod tests {
         feed(&mut t, start, 1, "abc");
         let before = t.inferences;
         t.note_char(start + INFER_INTERVAL, 1, 'd', true);
+        t.drain_pending_inference(start + INFER_INTERVAL);
         assert_eq!(
             t.inferences,
             before + 1,
@@ -426,6 +477,7 @@ mod tests {
         // …a pause (interval elapsed) then ONE char: inference is due and
         // runs over a 1-char window, which is below MIN_NGRAMS ⇒ abstains.
         t.note_char(start + INFER_INTERVAL, 1, 'x', true);
+        t.drain_pending_inference(start + INFER_INTERVAL);
         assert_eq!(t.buf, vec!['x'], "the window is the single new char");
         assert_eq!(
             t.current(),

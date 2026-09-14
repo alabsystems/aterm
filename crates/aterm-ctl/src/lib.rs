@@ -4530,7 +4530,12 @@ fn exchange(
         // results. Dropping that header hid the facts a consumer needs before
         // acknowledging a prefix. Emit it for BOTH empty and nonempty inboxes;
         // keep stdout as rows and avoid a duplicate empty-result diagnostic.
-        if verb == "inbox" {
+        // `offscreen` is the same: its header is what places the rows — `last=`
+        // is the next poll's `since=`, `screen_rows=` splits the archive from
+        // the screen, `lost=`/`breaks=` say whether anything is missing — and
+        // without it stdout is rows no reader can place (`aterm drive report`
+        // reads it from here).
+        if verb == "inbox" || verb == "offscreen" {
             stderr_line(status_line)?;
         } else if count == 0 {
             let mut msg = String::from(status_line);
@@ -5073,9 +5078,17 @@ mod tests {
             "edges",
             "grants",
             "controls",
+            // `offscreen` is `OK <n> first=… …` + n rows. Its neighbour `lines`
+            // is a status line, and a client that framed `offscreen` like it
+            // printed the header and dropped every row.
+            "offscreen",
         ] {
             assert!(streams_payload(verb, verb), "{verb} should stream");
         }
+        assert!(streams_payload(
+            "offscreen",
+            "@s-a offscreen since=3 screen=1"
+        ));
         // Single-line verbs echo their status line (even integer-tailed ones).
         for verb in ["cursor", "copy", "lines", "feed", "signal", "image"] {
             assert!(!streams_payload(verb, verb), "{verb} should not stream");

@@ -21,6 +21,61 @@ pub fn bb(p: u32) -> i32 {
     (p & 0xff) as i32
 }
 
+/// Render until the frame STOPS CHANGING (or `SETTLE_LIMIT` renders), and return
+/// the last one.
+///
+/// A renderer's fallback chain is parsed on a BACKGROUND thread and installed by
+/// whichever later render polls it: a cell that wanted a face the chain had not
+/// delivered yet is drawn `.notdef` and repainted on the epoch bump. That is the
+/// shipped design, and it makes any parity comparison that renders one backend
+/// MORE TIMES than the other unsound — the face can land BETWEEN the two arms,
+/// and then the frames differ for a reason that is not parity.
+///
+/// Measured 2026-09-13: `linear_mode_matches_cpu_and_keeps_procedural_exact`
+/// renders the CPU twice (a corrected frame, then the linear one) and the GPU
+/// once. Before the font seal mapped its faces the CJK chain was still parsing
+/// when the test ended, so BOTH arms were missing the ideographs and matched; as
+/// soon as mapping made that parse fast enough to land between the arms, the CPU
+/// arm drew 日本 and the GPU arm did not — 398 pixels over tolerance, worst delta
+/// 229, in a test that was reading a scheduling race as a pixel divergence.
+///
+/// Settling both arms to a fixed point removes the race without weakening
+/// anything: the tolerance is unchanged, and a real divergence still fails.
+pub fn settled_cpu(cpu: &mut Renderer, input: &aterm_render::RenderInput) -> Frame {
+    let mut last = cpu.render_input(input);
+    for _ in 0..SETTLE_LIMIT {
+        let next = cpu.render_input(input);
+        if next.pixels == last.pixels {
+            return next;
+        }
+        last = next;
+    }
+    last
+}
+
+/// [`settled_cpu`] for the GPU backend.
+pub fn settled_gpu(
+    gpu: &mut aterm_gpu::GpuRenderer,
+    win: &mut aterm_gpu::WindowGpu,
+    input: &aterm_render::RenderInput,
+) -> Frame {
+    let mut last = gpu.render_input(win, input, None);
+    for _ in 0..SETTLE_LIMIT {
+        let next = gpu.render_input(win, input, None);
+        if next.pixels == last.pixels {
+            return next;
+        }
+        last = next;
+    }
+    last
+}
+
+/// How many extra renders a backend gets to reach a fixed point. The chain is a
+/// handful of faces and each render of the demo grid is sub-millisecond, so this
+/// is generous by two orders of magnitude; a backend that never settles is a
+/// real defect and the caller's assertion says so.
+const SETTLE_LIMIT: usize = 64;
+
 /// Largest per-channel absolute delta between two pixel buffers.
 pub fn max_channel_delta(a: &[u32], b: &[u32]) -> i32 {
     let mut m = 0;

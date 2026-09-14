@@ -178,9 +178,13 @@ pub(crate) fn provenance_bundle_line(
         .map(|n| n.to_string_lossy().into_owned())
         .unwrap_or_default();
     let cause = match recorded {
+        // The RECORD's own reason, verbatim — never a mechanism this line picks. Two
+        // outcomes write the record (`install::decide_tracked_stage`): an in-process
+        // stage, and a KEPT lane tree that came back tagged. Naming the first as the
+        // cause made the second read "staged in-process … because the untracked lane
+        // ran", a sentence contradicting its own evidence.
         Some(why) => format!(
-            " — recorded cause: staged in-process by a provenance-tracked installer under \
-             {}=1 because {why}",
+            " — recorded cause ({}=1): {why}",
             crate::lay::ALLOW_TRACKED_ENV
         ),
         None => String::new(),
@@ -1168,15 +1172,29 @@ pub fn run_with(
             );
         } else if !exposed.is_empty() {
             let size = crate::noindex::size_of_all(&exposed, &crate::noindex::Budget::DOCTOR_SIZE);
+            // WHICH of them the unattended pass can reach. The pass renames only a
+            // target dir beside a Cargo.toml (`noindex::apply_under`, `require_repo`): a
+            // FREE-STANDING one — `$HOME/trust/build/bootstrap`, `$HOME/trust-verify-scratch/
+            // ay-check` — is pointed at by an env var or a build system the pass cannot
+            // re-point, so it is skipped on every pass, silently, and this line counted
+            // it as "the next update pass migrates" forever. The 2026-09-13 reading of an
+            // "8 of 44" that had not moved in a day was exactly that: all eight
+            // free-standing. Say which are which, and what moves the free ones — a count
+            // that never falls otherwise reads as a pass that is not doing its job.
+            let (in_repo, free): (Vec<&crate::noindex::Target>, Vec<&crate::noindex::Target>) =
+                exposed
+                    .iter()
+                    .copied()
+                    .partition(|t| crate::noindex::repo_of(&t.path).is_some());
+            let reach = spotlight_reach(in_repo.len(), &free);
             let _ = writeln!(
                 out,
                 "{p}: warn — {} of {} cargo target dir(s) under {} are indexed by Spotlight \
                  ({}) — `mds` grinding build output was one of the two amplifiers behind the \
-                 2026-09-01 WindowServer watchdog kill; the next update pass migrates the \
-                 ones beside a Cargo.toml — a git checkout keeps a `target` symlink and its \
-                 .cargo/config.toml untouched, the new name (and the link, when the ignore \
-                 entry is directory-only) excluded via .git/info/exclude ([machine] \
-                 spotlight_noindex, default on) — now: \
+                 2026-09-01 WindowServer watchdog kill; {reach} — a git checkout keeps a \
+                 `target` symlink and its .cargo/config.toml untouched, the new name (and \
+                 the link, when the ignore entry is directory-only) excluded via \
+                 .git/info/exclude ([machine] spotlight_noindex, default on) — now: \
                  `aterm pkg noindex apply --all`; `aterm pkg noindex` lists them, `aterm pkg \
                  noindex verify <dir>` measures one",
                 exposed.len(),
@@ -2099,6 +2117,48 @@ fn upstream_index_on_path(
             meta.is_file()
         }
     })
+}
+
+/// The clause of the Spotlight warning that says how far the unattended pass reaches:
+/// the exposed target dirs beside a Cargo.toml are the pass's to migrate; the
+/// FREE-STANDING ones (`free`, no Cargo.toml beside them) are pointed at by an env var
+/// or a build system the pass cannot re-point, so it never renames them and the
+/// operator has to — by name, after re-pointing. Up to three are named; a count that
+/// names nothing sends the reader to `aterm pkg noindex` to find out which.
+fn spotlight_reach(in_repo: usize, free: &[&crate::noindex::Target]) -> String {
+    const SHOWN: usize = 3;
+    let named = || {
+        let mut names: Vec<String> = free
+            .iter()
+            .take(SHOWN)
+            .map(|t| t.path.display().to_string())
+            .collect();
+        if free.len() > SHOWN {
+            names.push(format!("+{} more", free.len() - SHOWN));
+        }
+        names.join(", ")
+    };
+    match (in_repo, free.len()) {
+        (_, 0) => {
+            "the next update pass migrates them (every one is beside a Cargo.toml)".to_string()
+        }
+        (0, _) => format!(
+            "NONE is beside a Cargo.toml, so the update pass never renames any of them: each \
+             is a free-standing target dir an env var or a build system points at ({}) — \
+             re-point that, then `aterm pkg noindex apply <dir>` by name",
+            named()
+        ),
+        (r, f) => format!(
+            "the next update pass migrates the {r} beside a Cargo.toml; the other {f} \
+             {} free-standing — an env var or a build system points at {} ({}), which the \
+             pass cannot re-point, so it never renames {} — re-point that, then `aterm pkg \
+             noindex apply <dir>` by name",
+            if f == 1 { "is" } else { "are" },
+            if f == 1 { "it" } else { "each" },
+            named(),
+            if f == 1 { "it" } else { "them" },
+        ),
+    }
 }
 
 #[cfg(test)]
@@ -3810,6 +3870,105 @@ mod tests {
         dir
     }
 
+    /// The Spotlight warning says how far the UNATTENDED PASS reaches. The pass renames
+    /// only a target dir beside a Cargo.toml (`noindex::apply_under`, `require_repo`); a
+    /// free-standing one — an env var's, a build system's — is skipped on every pass, and
+    /// until 2026-09-13 this line counted it as "the next update pass migrates" all the
+    /// same. The "8 of 44" m3's doctor had reported for a day were eight free-standing
+    /// dirs (`$HOME/trust/build/bootstrap`, `$HOME/trust-verify-scratch/*`). The line now splits
+    /// the count and NAMES the free ones, in each of the three shapes.
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn spotlight_warning_separates_the_pass_reach_from_free_standing_dirs() {
+        let l = layout("reach");
+        install(&l, "ay", 19);
+        let home = synthetic_home("reach");
+        let manifest = "[package]\nname = \"a\"\nversion = \"0.0.0\"\n";
+        // Beside a Cargo.toml: the pass's to migrate.
+        std::fs::create_dir_all(home.join("repo-a")).unwrap();
+        std::fs::write(home.join("repo-a/Cargo.toml"), manifest).unwrap();
+        cargo_target(&home.join("repo-a"), "target");
+        // Free-standing: nothing beside it names it, so nothing the pass can re-point.
+        let free = cargo_target(&home.join("scratch"), "tgt");
+        let path = std::env::join_paths([l.bin_dir()]).unwrap();
+        let now = crate::flow::rfc3339_to_unix("2026-08-27T00:00:00Z").unwrap();
+        let run = || {
+            let mut out: Vec<u8> = Vec::new();
+            let mut err: Vec<u8> = Vec::new();
+            let ok = run_with(
+                &l,
+                Some(&home),
+                Some(&path),
+                now,
+                None,
+                None,
+                "doctor",
+                &Probes::default(),
+                &mut out,
+                &mut err,
+            );
+            (ok, String::from_utf8_lossy(&out).into_owned())
+        };
+
+        // Mixed: one of each.
+        let (ok, out) = run();
+        assert!(ok, "{out}");
+        assert!(
+            out.contains(&format!(
+                "doctor: warn — 2 of 2 cargo target dir(s) under {} are indexed by Spotlight",
+                home.display()
+            )),
+            "{out}"
+        );
+        assert!(
+            out.contains(
+                "the next update pass migrates the 1 beside a Cargo.toml; the other 1 is \
+                 free-standing"
+            ),
+            "{out}"
+        );
+        assert!(
+            out.contains(&free.display().to_string()),
+            "the free-standing dir must be NAMED, not counted: {out}"
+        );
+        assert!(
+            out.contains("`aterm pkg noindex apply <dir>` by name"),
+            "the free one has a verb, and it is the by-name one: {out}"
+        );
+        assert!(
+            out.contains("aterm pkg noindex apply --all"),
+            "the pass's own verb stays named: {out}"
+        );
+
+        // All free: the pass will never move any of them, and the line must say so
+        // instead of promising a migration that never comes.
+        std::fs::remove_file(home.join("repo-a/Cargo.toml")).unwrap();
+        let (ok, out) = run();
+        assert!(ok, "{out}");
+        assert!(
+            out.contains(
+                "NONE is beside a Cargo.toml, so the update pass never renames any of them"
+            ),
+            "{out}"
+        );
+        assert!(
+            out.contains(&free.display().to_string())
+                && out.contains(&home.join("repo-a/target").display().to_string()),
+            "both free-standing dirs are named: {out}"
+        );
+
+        // All in repos: no free-standing clause at all.
+        std::fs::write(home.join("repo-a/Cargo.toml"), manifest).unwrap();
+        std::fs::write(home.join("scratch/Cargo.toml"), manifest).unwrap();
+        let (ok, out) = run();
+        assert!(ok, "{out}");
+        assert!(
+            out.contains("the next update pass migrates them (every one is beside a Cargo.toml)"),
+            "{out}"
+        );
+        assert!(!out.contains("free-standing"), "{out}");
+    }
+
     /// A Spotlight-exposed target dir is a WARNING and exit stays 0.
     ///
     /// The 2026-09-01 01:54 watchdog kill had two amplifiers; `mds` grinding 2.0 TB of
@@ -4564,9 +4723,8 @@ mod tests {
             .unwrap_or_else(|| panic!("the bundle line is missing:\n{out}"));
         assert!(
             bundle_line.contains(
-                "recorded cause: staged in-process by a provenance-tracked installer under \
-                 ATPKG_ALLOW_TRACKED_INSTALL=1 because the untracked lane could not run \
-                 (launchctl submit failed)"
+                "recorded cause (ATPKG_ALLOW_TRACKED_INSTALL=1): the untracked lane could \
+                 not run (launchctl submit failed)"
             ),
             "{bundle_line}"
         );

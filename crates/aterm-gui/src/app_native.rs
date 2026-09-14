@@ -7266,7 +7266,8 @@ fn packages_child_failure(
         // lies to the user — "install completed" over an empty store,
         // or a red error they will keep re-clicking. Give it its own
         // words. (A single-program door exits 2 only for a usage
-        // error, which the admission gate above already refused.)
+        // error, which `packages_request_admissible` — run by the
+        // caller before any child is spawned — already refused.)
         Ok(status) if status.code() == Some(2) && verb.iter().any(|v| v == "--default-set") => {
             Some(
                 "Nothing was installed: the registry served no package \

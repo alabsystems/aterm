@@ -4,12 +4,17 @@
 
 //! The local enforcement gate — aterm's replacement for CI (there is NO CI).
 //!
-//! Run via `cargo run -p xtask -- gate <check>`. Four verbs are wrapped by
-//! `tools/verify.sh` (`drift`, `dormant`, `mainloop`, `counts`) and so also run
+//! Run via `cargo run -p xtask -- gate <check>`. The verbs named by
+//! [`WRAPPED_BY_VERIFY_SH`] are wrapped by `tools/verify.sh` and so also run
 //! under the opt-in `cargo ship cut --gate`, which shells out to
-//! `tools/verify.sh --full`; the rest are manual. Never a hook, never CI (owner
-//! decision). This header used to also claim an `aterm-dev gate` surface; there
-//! is none — that crate's `SUBS` registry lists visual-judge / audit /
+//! `tools/verify.sh --full`; the rest are manual. That list is DERIVED from the
+//! driver's own stage list by
+//! `the_wrapped_list_is_exactly_what_the_verify_driver_calls` — this sentence
+//! hand-typed "four verbs (`drift`, `dormant`, `mainloop`, `counts`)" while
+//! `cells` and `lint --fmt-only` were also in the plan, and no reader caught it.
+//! Never a hook, never CI (owner decision). This header used to also claim an
+//! `aterm-dev gate` surface; there is none — that crate's `SUBS` registry
+//! lists visual-judge / audit /
 //! verify-proofs / setup-trust and nothing else (checked 2026-07-31).
 //!
 //! The structured checks here are the ones plain shell cannot express:
@@ -503,11 +508,15 @@
 //! - `all`: the [`ALL_ROSTER`] gates — drift, dormant, mainloop, lockorder,
 //!   wasmloop, scope, lazyinit, fault, forge, counts, perf, lint, help-surfaces
 //!   — plus
-//!   `nonvacuity` at the end. That is every check above EXCEPT the four the
-//!   roster deliberately omits: `linux` (needs the Linux target), `web` (needs
-//!   the wasm32 target), `miri` (needs a nightly miri toolchain) and
-//!   `certified` (needs a Trust toolchain) — each opt-in because it depends on
-//!   something a plain checkout does not have. Until 2026-08-31 this sentence
+//!   `nonvacuity` at the end. That is every check above EXCEPT the ones
+//!   [`OPT_IN_OUTSIDE_ROSTER`] names: `linux` (needs the Linux target), `web`
+//!   (needs the wasm32 target), `cells` (needs a compiler per cell triple;
+//!   `tools/verify.sh --full` runs it), `miri` (needs a nightly miri toolchain)
+//!   and `certified` (needs a Trust toolchain) — each opt-in because it depends
+//!   on something a plain checkout does not have. That const is DERIVED from the
+//!   dispatch arms, because this sentence said "the four" for a day after
+//!   `cells` became the fifth while `main.rs`'s derived usage already said five.
+//!   That was the SECOND time this sentence drifted: until 2026-08-31 it
 //!   was inconsistent in BOTH directions: it excluded `web` and `certified`
 //!   from a bulleted list they had never been on, and it silently included
 //!   `scope`, which is dispatched and IS a roster entry but had no bullet. The
@@ -518,10 +527,10 @@
 //!   false twice over: `.githooks/pre-push` was demoted to ADVISORY on
 //!   2026-08-24 (it prints one line and exits 0 — it runs no gate at all, the
 //!   paint guard having made a blocking hook cost twelve minutes). Nothing
-//!   automatic runs this verb; tools/verify.sh invokes only `drift`, `dormant`,
-//!   `mainloop` and `counts`. So `fault`, `forge` and `perf` still have NO
-//!   automated caller: run them by hand, or wire them into verify.sh (`fault` is
-//!   cheap and toolchain-free; `perf` belongs behind `--full`).
+//!   automatic runs this verb; tools/verify.sh invokes only the verbs
+//!   [`WRAPPED_BY_VERIFY_SH`] names. So `fault`, `forge` and `perf` still have
+//!   NO automated caller: run them by hand, or wire them into verify.sh (`fault`
+//!   is cheap and toolchain-free; `perf` belongs behind `--full`).
 //!
 //!   `forge` IS GREEN, AND COST IS THE ONLY ARGUMENT LEFT AGAINST WIRING IT IN.
 //!   This paragraph used to say the verb "is RED on this tree today, so wiring
@@ -566,10 +575,15 @@
 //! 331) when a roster entry has neither. The registry's `drives` field states
 //! exactly what each fixture calls, so a COMPONENT-level demonstration can
 //! never be read as a VERB-level one. The same check runs as the verb
-//! `gate nonvacuity`, and at the END of `gate all` — so the honest score
-//! ("9/10 roster gates have a red fixture; KNOWN GAP: perf") is printed at the
-//! moment a human is about to read the word GREEN, and a violated obligation
-//! fails `gate all` itself.
+//! `gate nonvacuity`, and at the END of `gate all` — so the honest score is
+//! printed at the moment a human is about to read the word GREEN, and a
+//! violated obligation fails `gate all` itself. That score is three counts, not
+//! a fraction: "N/M roster gate(s) proven red at the VERB; C at a COMPONENT
+//! only; G never shown to fail", each derived from [`NON_VACUITY_REGISTRY`] by
+//! [`report_non_vacuity`] — read it there rather than from prose. This sentence
+//! quoted "9/10 … KNOWN GAP: perf" long after the roster reached thirteen and
+//! `perf` got a verb-level fixture, which is exactly the drift the split-count
+//! wording above it was introduced to prevent.
 //!
 //! See docs/EXCEED_GHOSTTY_PLAN.md.
 
@@ -581,10 +595,12 @@ use aterm_verify::scope::Scope;
 
 use crate::{collect_rs_files, workspace_root};
 
-/// `rest` is everything after the check name — today only `gate lint --no-fmt`
-/// reads it, and NOTHING in the tree passes it. `.githooks/pre-push` did until
-/// its 2026-08-24 demotion; the flag now exists only for a human who types it,
-/// which is exactly the shape [`LintLane`] argues an escape hatch should have.
+/// `rest` is everything after the check name. Three verbs read it — `gate cells`
+/// (`--cell NAME`), `gate lint` (`--no-fmt` / `--fmt-only`) and `gate
+/// help-surfaces` (`--diff PATH`) — and every other verb ignores it. NOTHING in
+/// the tree passes `--no-fmt`: `.githooks/pre-push` did until its 2026-08-24
+/// demotion; the flag now exists only for a human who types it, which is exactly
+/// the shape [`LintLane`] argues an escape hatch should have.
 pub(crate) fn run(check: Option<&str>, rest: &[String]) -> ExitCode {
     let ok = match check {
         Some("drift") => gate_drift(),
@@ -604,7 +620,7 @@ pub(crate) fn run(check: Option<&str>, rest: &[String]) -> ExitCode {
         Some("counts") => gate_counts(),
         Some("miri") => gate_miri(),
         Some("perf") => gate_perf(),
-        Some("help-surfaces") => crate::help_surfaces::gate_help_surfaces(),
+        Some("help-surfaces") => crate::help_surfaces::gate_help_surfaces_args(rest),
         // The meta-obligation on its own: cheap (a few file reads), so it can
         // be run without paying for the roster it audits. `all` runs it too.
         Some("nonvacuity") => report_non_vacuity(),
@@ -683,6 +699,32 @@ const ALL_ROSTER: &[RosterEntry] = &[
 pub(crate) fn roster_names() -> Vec<&'static str> {
     ALL_ROSTER.iter().map(|(name, _)| *name).collect()
 }
+
+/// The dispatched verbs [`ALL_ROSTER`] deliberately omits — each opt-in because
+/// it needs something a plain checkout does not have. ONE definition, read by
+/// the module doc above and by
+/// `the_opt_in_list_is_exactly_the_dispatched_verbs_outside_the_roster`, which
+/// derives it from the dispatch arms so the prose cannot drift again: the header
+/// said "the four" for a day after `cells` became the fifth.
+const OPT_IN_OUTSIDE_ROSTER: &[&str] = &["cells", "certified", "linux", "miri", "web"];
+
+/// [`OPT_IN_OUTSIDE_ROSTER`] for `main.rs`'s usage line, so the two surfaces
+/// cannot disagree the way they did when one said four and the other five.
+pub(crate) fn opt_in_names() -> Vec<&'static str> {
+    OPT_IN_OUTSIDE_ROSTER.to_vec()
+}
+
+/// The gate verbs `tools/verify.sh` wraps, and which therefore also run under
+/// `cargo ship cut --gate`. ONE definition, checked against the driver's own
+/// stage list by `the_wrapped_list_is_exactly_what_the_verify_driver_calls`.
+/// Hand-typed prose said "drift, dormant, mainloop and counts" from the day
+/// `cells` and `lint --fmt-only` joined the plan until 2026-09-13.
+/// Read by `the_wrapped_list_is_exactly_what_the_verify_driver_calls` and by the two
+/// doc paragraphs above that link it; no RUNTIME path consults it, so outside `cfg(test)`
+/// it is unused by construction rather than by oversight — say so here instead of letting
+/// `tippy` say it on every build.
+#[cfg_attr(not(test), allow(dead_code))]
+const WRAPPED_BY_VERIFY_SH: &[&str] = &["cells", "counts", "dormant", "drift", "lint", "mainloop"];
 
 /// How a roster gate's ABILITY TO GO RED is established.
 enum RedProof {
@@ -7541,6 +7583,86 @@ error: could not compile `aterm-gui` (lib) due to 1 previous error
             sorted.len(),
             names.len(),
             "duplicate roster entry: {names:?}"
+        );
+    }
+
+    /// [`OPT_IN_OUTSIDE_ROSTER`] is exactly the dispatched verbs that are not
+    /// roster entries, derived from the dispatch arms rather than counted by a
+    /// reader. The module header said `gate all` omits "the four" while `cells`
+    /// was a dispatched fifth, and `main.rs`'s own derived usage said five — two
+    /// surfaces of one fact, disagreeing.
+    #[test]
+    fn the_opt_in_list_is_exactly_the_dispatched_verbs_outside_the_roster() {
+        let src = std::fs::read_to_string(crate::workspace_root().join("crates/xtask/src/gate.rs"))
+            .expect("gate.rs is readable");
+        let body = src
+            .split_once("pub(crate) fn run(")
+            .expect("the dispatch exists")
+            .1;
+        let body = &body[..body.find("\n}\n").expect("the dispatch closes")];
+        // Meta-verbs, not checks: one runs the roster, one audits it.
+        let meta = ["all", "nonvacuity"];
+        let roster = roster_names();
+        let mut dispatched_outside: Vec<String> = Vec::new();
+        for (i, _) in body.match_indices("Some(\"") {
+            let rest = &body[i + "Some(\"".len()..];
+            let Some(end) = rest.find('"') else { continue };
+            let verb = &rest[..end];
+            if roster.contains(&verb) || meta.contains(&verb) {
+                continue;
+            }
+            dispatched_outside.push(verb.to_string());
+        }
+        dispatched_outside.sort_unstable();
+        dispatched_outside.dedup();
+        assert_eq!(
+            dispatched_outside, OPT_IN_OUTSIDE_ROSTER,
+            "OPT_IN_OUTSIDE_ROSTER must name every dispatched verb outside ALL_ROSTER"
+        );
+    }
+
+    /// [`WRAPPED_BY_VERIFY_SH`] is exactly the gate verbs the verify driver
+    /// calls, read out of its own stage list. `cells` and `lint --fmt-only`
+    /// joined the plan and two hand-typed sentences in this file did not move.
+    #[test]
+    fn the_wrapped_list_is_exactly_what_the_verify_driver_calls() {
+        let stages = std::fs::read_to_string(
+            crate::workspace_root().join("crates/aterm-verify/src/stages.rs"),
+        )
+        .expect("the verify driver's stage list is readable");
+        let mut wrapped: Vec<String> = Vec::new();
+        // `xtask_gate_args("counts")` and `xtask_gate_args_with("lint", …)`; the
+        // definitions themselves take an identifier, not a literal, and are skipped.
+        for (i, _) in stages.match_indices("xtask_gate_args") {
+            let rest = &stages[i..];
+            let Some(open) = rest.find('(') else { continue };
+            let after = rest[open + 1..].trim_start();
+            if let Some(lit) = after.strip_prefix('"')
+                && let Some(end) = lit.find('"')
+            {
+                wrapped.push(lit[..end].to_string());
+            }
+        }
+        // The loop form: `for gate in [...] { … xtask_gate_args(gate) … }`.
+        assert!(
+            stages.contains("xtask_gate_args(gate)"),
+            "the loop form is gone; this extractor needs re-reading"
+        );
+        let list = stages
+            .split_once("for gate in [")
+            .expect("the wrapped-verb loop exists")
+            .1;
+        for part in list[..list.find(']').expect("the loop array closes")].split(',') {
+            let verb = part.trim().trim_matches('"');
+            if !verb.is_empty() {
+                wrapped.push(verb.to_string());
+            }
+        }
+        wrapped.sort_unstable();
+        wrapped.dedup();
+        assert_eq!(
+            wrapped, WRAPPED_BY_VERIFY_SH,
+            "WRAPPED_BY_VERIFY_SH must name every gate verb tools/verify.sh calls"
         );
     }
 
