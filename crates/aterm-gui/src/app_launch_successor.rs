@@ -374,6 +374,11 @@ struct LaunchRequest {
 ///   to the fork lane with the user's windows untouched.
 ///
 /// Nothing here mutates process state, so a refusal needs no cleanup of its own.
+///
+/// Since 2026-09-14 the handoff calls [`begin_launch`] and waits on the
+/// [`LaunchInFlight`] AFTER the rendezvous accept; this blocking form remains
+/// the off-macOS test's pin of the validate-then-refuse contract.
+#[cfg(all(test, not(target_os = "macos")))]
 pub(crate) fn launch_app_bundle(
     bundle: &Path,
     arguments: &[OsString],
@@ -384,7 +389,53 @@ pub(crate) fn launch_app_bundle(
     // mistake fails the same way (and is caught by the same tests) wherever it is
     // built — the non-macOS stub then refuses the platform, not the request.
     let request = validate_request(bundle, arguments, environment)?;
-    launch_validated(&request, budget)
+    begin_launch_validated(&request)?.wait(budget)
+}
+
+/// [`launch_app_bundle`] split at the instant the call is ISSUED (2026-09-14):
+/// the request is validated and handed to LaunchServices, and the in-flight
+/// handle is returned at once so the caller can do other work — accept the
+/// successor's rendezvous dial — while the launch answer is still in flight.
+///
+/// Why the split exists: the successor dials right after its boot apply,
+/// BEFORE any NSApplication exists, and LaunchServices' completion needs the
+/// app to check in — so the dial is structurally ordered before the answer.
+/// A parent that waited out the answer before accepting spent the whole
+/// launch-answer budget (5 s) with the dial already queued in the listen
+/// backlog: every launched-lane handoff froze the terminal 5.3–5.8 s on this
+/// machine, against 272 ms on the fork lane. The answer was never the
+/// liveness signal; the dial is.
+pub(crate) fn begin_launch(
+    bundle: &Path,
+    arguments: &[OsString],
+    environment: &[(OsString, OsString)],
+) -> Result<LaunchInFlight, LaunchError> {
+    let request = validate_request(bundle, arguments, environment)?;
+    begin_launch_validated(&request)
+}
+
+/// A launch LaunchServices has been asked for, whose answer may still be in
+/// flight. [`Self::wait`] blocks for it within a budget; a caller that has
+/// already met the successor another way (its rendezvous dial) polls with a
+/// short budget purely to corroborate the pid.
+pub(crate) struct LaunchInFlight {
+    #[cfg(target_os = "macos")]
+    watch: LaunchWatch,
+}
+
+impl LaunchInFlight {
+    /// Block until the launch is answered or `budget` is spent.
+    pub(crate) fn wait(&self, budget: Duration) -> Result<LaunchedSuccessor, LaunchError> {
+        #[cfg(target_os = "macos")]
+        {
+            self.watch.wait(budget)
+        }
+        #[cfg(not(target_os = "macos"))]
+        {
+            let _ = budget;
+            Err(LaunchError::Unsupported)
+        }
+    }
 }
 
 /// The pure half: everything that can be refused without asking the system
@@ -503,10 +554,7 @@ fn env_key_fault(key: &str) -> Option<TextFault> {
 /// the same thing a reader of the fork-lane log wants to know — instead of
 /// vanishing into a bare error value.
 #[cfg(not(target_os = "macos"))]
-fn launch_validated(
-    request: &LaunchRequest,
-    _budget: Duration,
-) -> Result<LaunchedSuccessor, LaunchError> {
+fn begin_launch_validated(request: &LaunchRequest) -> Result<LaunchInFlight, LaunchError> {
     aterm_log::warn!(
         "no LaunchServices on this platform: declining to launch {} as its own job \
          ({} argument(s), {} environment key(s)); the caller keeps its windows and \
@@ -520,10 +568,7 @@ fn launch_validated(
 
 /// The AppKit half.
 #[cfg(target_os = "macos")]
-fn launch_validated(
-    request: &LaunchRequest,
-    budget: Duration,
-) -> Result<LaunchedSuccessor, LaunchError> {
+fn begin_launch_validated(request: &LaunchRequest) -> Result<LaunchInFlight, LaunchError> {
     use std::ffi::c_void;
 
     use aterm_objc::{Bool, Id, Obj, RcBlock, Sel, autoreleasepool, class, sel};
@@ -713,13 +758,12 @@ fn launch_validated(
         );
     });
 
-    // TAIL EXPRESSION ON PURPOSE: locals are dropped only after it is evaluated,
-    // so `handler` outlives the wait. AppKit copies a completion handler (that
+    // The handler may be dropped here: AppKit COPIES a completion handler (that
     // is why the binding takes `&Block`), and the block itself only touches an
-    // `Arc` that outlives us either way — but a block that is still ours while
-    // it can still be called costs nothing and is one less thing to be wrong
-    // about.
-    watch.wait(budget)
+    // `Arc` the watch keeps alive — a completion that lands after the caller
+    // stopped waiting writes into a slot nobody reads, never freed memory.
+    drop(handler);
+    Ok(LaunchInFlight { watch })
 }
 
 /// Turn the completion's `processIdentifier` into a successor, or say why it is

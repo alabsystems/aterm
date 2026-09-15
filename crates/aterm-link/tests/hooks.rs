@@ -846,3 +846,1965 @@ fn a_real_claude_continues_instead_of_stopping_and_rewakes() {
         assert!(w.verb(&format!("@{a} inbox seen {id} handled")).ok());
     }
 }
+
+// ---------------------------------------------------------------------------
+// Round 12 — the installer proves its command, `hook run` finds aterm the way
+// `aterm ctl` does, and nothing but a verdict ever blocks
+// ---------------------------------------------------------------------------
+
+/// Run `aterm-link hook <args…>` in a CONTROLLED environment: every inherited
+/// `ATERM_*` removed (this test may itself be running inside an aterm, and the
+/// hook must not find THAT instance), `HOME` and `XDG_RUNTIME_DIR` pointed
+/// under `home`, and then exactly `env` on top.
+///
+/// `XDG_RUNTIME_DIR` is `<home>/run` so the resolver's rendezvous dir is
+/// `<home>/run/aterm` — a World's own, when `home` is the World's `tmp`, and
+/// an empty one otherwise.
+fn hook_in(home: &std::path::Path, env: &[(&str, &str)], stdin: &[u8], args: &[&str]) -> Output {
+    hook_in_from(None, home, env, stdin, args)
+}
+
+/// [`hook_in`], run from `cwd` when one is given — the installer's own
+/// directory, which is what a relative `--exe` is relative to.
+fn hook_in_from(
+    cwd: Option<&std::path::Path>,
+    home: &std::path::Path,
+    env: &[(&str, &str)],
+    stdin: &[u8],
+    args: &[&str],
+) -> Output {
+    let mut cmd = Command::new(env!("CARGO_BIN_EXE_aterm-link"));
+    for (name, _) in std::env::vars_os() {
+        if name.to_string_lossy().starts_with("ATERM_") {
+            cmd.env_remove(&name);
+        }
+    }
+    if let Some(dir) = cwd {
+        cmd.current_dir(dir);
+    }
+    let _ = std::fs::create_dir_all(home.join("home"));
+    cmd.arg("hook")
+        .args(args)
+        .env("HOME", home.join("home"))
+        .env("XDG_RUNTIME_DIR", home.join("run"));
+    for (k, v) in env {
+        cmd.env(k, v);
+    }
+    cmd.stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped());
+    let mut child = cmd.spawn().expect("spawn the hook");
+    child
+        .stdin
+        .take()
+        .expect("the hook's stdin")
+        .write_all(stdin)
+        .expect("write the hook input");
+    child.wait_with_output().expect("the hook to finish")
+}
+
+/// A scratch directory of this test's own, under `/tmp` like the harness's.
+fn scratch(tag: &str) -> PathBuf {
+    let dir = PathBuf::from(format!("/tmp/atl-hook12-{tag}-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).expect("scratch dir");
+    dir
+}
+
+/// Write an executable shell script.
+fn script(path: &std::path::Path, body: &str) {
+    use std::os::unix::fs::PermissionsExt;
+    std::fs::create_dir_all(path.parent().unwrap()).expect("script dir");
+    std::fs::write(path, body).expect("write the script");
+    std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o755)).expect("chmod");
+}
+
+/// A stand-in for the multiplexed `aterm` front door, as far as a hook is
+/// concerned: `link …` reaches this crate's dispatch; anything else is the
+/// window's option parser, refusing exactly as it did on 2026-09-14.
+fn front_door_shim(dir: &std::path::Path) -> PathBuf {
+    let path = dir.join("bin").join("aterm");
+    script(
+        &path,
+        &format!(
+            "#!/bin/sh\n\
+             if [ \"$1\" = link ]; then shift; exec {} \"$@\"; fi\n\
+             echo \"aterm-gui: unknown option '$1'\" >&2\n\
+             exit 2\n",
+            env!("CARGO_BIN_EXE_aterm-link")
+        ),
+    );
+    path
+}
+
+/// Every `command` string in a settings file, with its event, in file order.
+fn commands_in(path: &std::path::Path) -> Vec<(String, String)> {
+    let text = std::fs::read_to_string(path).expect("read the settings file");
+    let doc = aterm_link::json::Json::parse(&text).unwrap_or_else(|e| panic!("{e}: {text}"));
+    let mut out = Vec::new();
+    for (event, groups) in doc.get("hooks").and_then(|h| h.as_object()).unwrap_or(&[]) {
+        for group in groups.as_array().unwrap_or(&[]) {
+            for entry in group.get("hooks").and_then(|h| h.as_array()).unwrap_or(&[]) {
+                if let Some(cmd) = entry.get("command").and_then(|c| c.as_str()) {
+                    out.push((event.clone(), cmd.to_string()));
+                }
+            }
+        }
+    }
+    out
+}
+
+/// The files in `dir` whose name starts with `prefix`.
+fn files_named(dir: &std::path::Path, prefix: &str) -> Vec<String> {
+    std::fs::read_dir(dir)
+        .map(|rd| {
+            rd.filter_map(Result::ok)
+                .map(|e| e.file_name().to_string_lossy().into_owned())
+                .filter(|n| n.starts_with(prefix))
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+/// **THE INSTALLER WRITES THE COMMAND THAT RUNS, UNDER BOTH SPELLINGS, AND
+/// PROVES IT FIRST.** Invoked as `aterm-link` the hooks are `<exe> hook run`;
+/// pointed (`--exe`) at the multiplexed front door they are `<exe> link hook
+/// run` — the spelling the 2026-09-14 install got wrong. Each install's four
+/// self-tests answer `ok` against the live instance, the file is written, and
+/// every command in it parses back to the spelling its executable accepts.
+#[test]
+fn the_installer_writes_the_command_that_runs_under_both_spellings() {
+    let w = World::boot("inst12", &["h-andrew"]);
+    w.wait_ready();
+    let (a, _b) = w.two_sessions();
+    let ledger = ledger_dir(&w, "inst12");
+    let env = [
+        ("ATERM_CONTROL_SOCK", w.ctl_sock.as_str()),
+        ("ATERM_CONTROL_TOKEN", w.token.as_str()),
+    ];
+    let front_door = front_door_shim(&w.tmp);
+
+    for (tag, exe, want) in [
+        (
+            "link",
+            None,
+            format!("{} hook run ", env!("CARGO_BIN_EXE_aterm-link")),
+        ),
+        (
+            "front",
+            Some(front_door.display().to_string()),
+            format!("{} link hook run ", front_door.display()),
+        ),
+    ] {
+        let settings = w.tmp.join(tag).join("settings.json");
+        let settings_s = settings.display().to_string();
+        let ledger_s = ledger.display().to_string();
+        let mut args = vec![
+            "install",
+            "claude",
+            "--settings",
+            &settings_s,
+            "--session",
+            &a,
+            "--state",
+            &ledger_s,
+            "--accept-from",
+            "h-andrew",
+        ];
+        if let Some(exe) = &exe {
+            args.push("--exe");
+            args.push(exe);
+        }
+
+        // A dry run self-tests and prints, and writes nothing.
+        let mut dry = args.clone();
+        dry.push("--dry-run");
+        let out = hook_in(&w.tmp, &env, b"", &dry);
+        let stderr = String::from_utf8_lossy(&out.stderr);
+        assert_eq!(code(&out), 0, "{tag}: {stderr}");
+        assert!(!settings.exists(), "{tag}: a dry run wrote the file");
+        assert!(
+            String::from_utf8_lossy(&out.stdout).contains("\"hooks\""),
+            "{tag}: the dry run prints the document"
+        );
+
+        let out = hook_in(&w.tmp, &env, b"", &args);
+        let stderr = String::from_utf8_lossy(&out.stderr);
+        assert_eq!(code(&out), 0, "{tag}: {stderr}");
+        for event in ["SessionStart", "UserPromptSubmit", "PreToolUse", "Stop"] {
+            let line = stderr
+                .lines()
+                .find(|l| l.contains(&format!("self-test {event}:")))
+                .unwrap_or_else(|| panic!("{tag}: no self-test line for {event}: {stderr}"));
+            assert!(
+                line.contains(&format!("ok session={a} sock=")),
+                "{tag}: {event} did not answer ok: {line}"
+            );
+        }
+        let cmds = commands_in(&settings);
+        assert_eq!(cmds.len(), 4, "{tag}: {cmds:?}");
+        for (event, cmd) in &cmds {
+            assert!(cmd.starts_with(&want), "{tag}: {event}: {cmd}");
+            assert!(
+                cmd.contains("--accept-from h-andrew") && cmd.contains(&ledger_s),
+                "{tag}: {event}: {cmd}"
+            );
+        }
+        // AND THE WRITTEN COMMAND REALLY RUNS, through the shell, as a hook
+        // would run it — not only its `--check`.
+        for (_, cmd) in &cmds {
+            let mut sh = Command::new("/bin/sh");
+            // The agent's environment, not this test's: an inherited
+            // `$ATERM_PARENT_SESSION_ID` would name the session running the
+            // suite, which the World does not host.
+            for (name, _) in std::env::vars_os() {
+                if name.to_string_lossy().starts_with("ATERM_") {
+                    sh.env_remove(&name);
+                }
+            }
+            let out = sh
+                .arg("-c")
+                .arg(format!("{cmd} --check"))
+                .env("ATERM_PARENT_SESSION_ID", &a)
+                .env("ATERM_CONTROL_SOCK", &w.ctl_sock)
+                .env("ATERM_CONTROL_TOKEN", &w.token)
+                .output()
+                .expect("sh");
+            let stdout = String::from_utf8_lossy(&out.stdout);
+            assert!(
+                out.status.success() && stdout.starts_with(&format!("ok session={a} ")),
+                "{tag}: {cmd}: {stdout} {}",
+                String::from_utf8_lossy(&out.stderr)
+            );
+        }
+    }
+}
+
+/// **A COMMAND THAT DOES NOT RUN REFUSES THE INSTALL AND TOUCHES NOTHING.**
+/// The executable is the incident's exactly: a front door that knows no
+/// `hook` and no `link` and answers `unknown option`. With no settings file
+/// there is none afterwards; with one and `--merge`, its bytes are unchanged
+/// and no backup and no temporary file were left beside it.
+#[test]
+fn a_command_that_does_not_run_makes_the_installer_refuse_and_touch_nothing() {
+    let dir = scratch("refuse");
+    let broken = dir.join("bin").join("aterm");
+    script(
+        &broken,
+        "#!/bin/sh\necho \"aterm-gui: unknown option '$1'\" >&2\nexit 2\n",
+    );
+    let broken_s = broken.display().to_string();
+
+    // No file: none afterwards.
+    let settings = dir.join("fresh").join("settings.json");
+    let settings_s = settings.display().to_string();
+    let out = hook_in(
+        &dir,
+        &[],
+        b"",
+        &[
+            "install",
+            "claude",
+            "--settings",
+            &settings_s,
+            "--session",
+            "s-abc",
+            "--exe",
+            &broken_s,
+        ],
+    );
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert_eq!(code(&out), 2, "refused: {stderr}");
+    assert!(!settings.exists(), "the refused install wrote a file");
+    assert!(!settings.parent().unwrap().exists(), "or its directory");
+    assert!(
+        stderr.contains("FAILED") && stderr.contains("unknown option"),
+        "the failure is printed with the command's own words: {stderr}"
+    );
+    assert!(
+        stderr.contains("link hook run"),
+        "the failing command is shown: {stderr}"
+    );
+    assert!(
+        out.stdout.is_empty(),
+        "nothing is printed before the self-test passes"
+    );
+
+    // An existing file and --merge: byte-identical, no backup, no temp file.
+    let existing = dir.join("merge").join("settings.json");
+    std::fs::create_dir_all(existing.parent().unwrap()).unwrap();
+    let original = "{\"permissions\": {\"allow\": [\"Read\"]}, \"hooks\": {}}\n";
+    std::fs::write(&existing, original).unwrap();
+    let existing_s = existing.display().to_string();
+    let out = hook_in(
+        &dir,
+        &[],
+        b"",
+        &[
+            "install",
+            "claude",
+            "--merge",
+            "--settings",
+            &existing_s,
+            "--session",
+            "s-abc",
+            "--exe",
+            &broken_s,
+        ],
+    );
+    assert_eq!(code(&out), 2, "{}", String::from_utf8_lossy(&out.stderr));
+    assert_eq!(std::fs::read_to_string(&existing).unwrap(), original);
+    assert_eq!(
+        files_named(existing.parent().unwrap(), "settings.json"),
+        ["settings.json"],
+        "no backup and no temporary file"
+    );
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// **`--merge` KEEPS THE OPERATOR'S FILE AND REPLACES ONLY ATERM'S ENTRIES,
+/// WITH A BACKUP FIRST.** Permissions, environment and a foreign hook under
+/// an event aterm also writes survive in place; the previous install's
+/// entries (under the old spelling, from an old path) are gone; the original
+/// bytes are at `<file>.bak-<unix>`; and without `--merge` the installer
+/// refuses, names the flag, and leaves the file as it was.
+#[test]
+fn merge_keeps_permissions_and_foreign_hooks_and_replaces_old_aterm_hooks_with_a_backup() {
+    let w = World::boot("merge12", &["h-andrew"]);
+    w.wait_ready();
+    let (a, _b) = w.two_sessions();
+    let env = [
+        ("ATERM_CONTROL_SOCK", w.ctl_sock.as_str()),
+        ("ATERM_CONTROL_TOKEN", w.token.as_str()),
+    ];
+    let dir = w.tmp.join("claude");
+    std::fs::create_dir_all(&dir).unwrap();
+    let settings = dir.join("settings.local.json");
+    let settings_s = settings.display().to_string();
+    let original = r#"{
+  "permissions": {
+    "allow": ["Bash(git status)", "Read"],
+    "deny": ["Bash(rm -rf *)"]
+  },
+  "env": {"EDITOR": "vim"},
+  "hooks": {
+    "PreToolUse": [
+      {"matcher": "Bash", "hooks": [{"type": "command", "command": "/usr/local/bin/lint-it"}]},
+      {"matcher": "*", "hooks": [{"type": "command", "command": "/Users//example/.local/bin/aterm hook run pre-tool-use --state /old"}]}
+    ],
+    "Stop": [
+      {"hooks": [{"type": "command", "command": "/Users//example/.local/bin/aterm hook run stop --state /old --wake-budget 6/1 --timeout 15", "async": true, "asyncRewake": true, "timeout": 600}]}
+    ],
+    "PostToolUse": [
+      {"hooks": [{"type": "command", "command": "/usr/local/bin/format-it"}]}
+    ]
+  }
+}
+"#;
+    std::fs::write(&settings, original).unwrap();
+    let ledger = ledger_dir(&w, "merge12");
+    let ledger_s = ledger.display().to_string();
+    let args = |merge: bool| {
+        let mut v = vec![
+            "install",
+            "claude",
+            "--rewake",
+            "--settings",
+            &settings_s,
+            "--session",
+            &a,
+            "--state",
+            &ledger_s,
+            "--accept-from",
+            "h-andrew",
+        ];
+        if merge {
+            v.push("--merge");
+        }
+        v
+    };
+
+    // Without --merge: refused by name, the file untouched, the block printed.
+    let out = hook_in(&w.tmp, &env, b"", &args(false));
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert_eq!(code(&out), 1, "{stderr}");
+    assert!(
+        stderr.contains("--merge"),
+        "the refusal names the flag: {stderr}"
+    );
+    assert!(
+        String::from_utf8_lossy(&out.stdout).contains("\"hooks\""),
+        "the block is printed for a hand merge"
+    );
+    assert_eq!(std::fs::read_to_string(&settings).unwrap(), original);
+    assert_eq!(
+        files_named(&dir, "settings.local.json"),
+        ["settings.local.json"]
+    );
+
+    // With --merge.
+    let out = hook_in(&w.tmp, &env, b"", &args(true));
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert_eq!(code(&out), 0, "{stderr}");
+    assert!(stderr.contains("merged into"), "{stderr}");
+    let backups: Vec<String> = files_named(&dir, "settings.local.json.bak-");
+    assert_eq!(backups.len(), 1, "one backup: {backups:?}");
+    assert_eq!(
+        std::fs::read_to_string(dir.join(&backups[0])).unwrap(),
+        original,
+        "the backup is the original, byte for byte"
+    );
+    assert!(
+        files_named(&dir, "settings.local.json.tmp-").is_empty(),
+        "no temporary file is left behind"
+    );
+
+    let merged = std::fs::read_to_string(&settings).unwrap();
+    let doc = aterm_link::json::Json::parse(&merged).expect("the merged file parses");
+    let keys: Vec<&str> = doc
+        .as_object()
+        .unwrap()
+        .iter()
+        .map(|(k, _)| k.as_str())
+        .collect();
+    assert_eq!(keys, ["permissions", "env", "hooks"], "{merged}");
+    assert!(
+        merged.contains("Bash(git status)") && merged.contains("Bash(rm -rf *)"),
+        "the permissions survived: {merged}"
+    );
+    assert!(merged.contains("\"EDITOR\": \"vim\""), "{merged}");
+
+    let cmds = commands_in(&settings);
+    let of = |event: &str| -> Vec<String> {
+        cmds.iter()
+            .filter(|(e, _)| e == event)
+            .map(|(_, c)| c.clone())
+            .collect()
+    };
+    let exe = env!("CARGO_BIN_EXE_aterm-link");
+    assert_eq!(of("PreToolUse").len(), 2, "{cmds:?}");
+    assert_eq!(of("PreToolUse")[0], "/usr/local/bin/lint-it");
+    assert!(of("PreToolUse")[1].starts_with(&format!("{exe} hook run pre-tool-use ")));
+    assert_eq!(of("PostToolUse"), ["/usr/local/bin/format-it".to_string()]);
+    assert_eq!(of("Stop").len(), 1, "{cmds:?}");
+    assert!(of("Stop")[0].starts_with(&format!("{exe} hook run stop ")));
+    assert_eq!(of("SessionStart").len(), 1);
+    assert_eq!(of("UserPromptSubmit").len(), 1);
+    assert!(
+        !merged.contains("/Users//example/.local/bin/aterm") && !merged.contains("/old"),
+        "the previous install is gone: {merged}"
+    );
+    // The rewake form survived the merge as JSON, not as text.
+    let stop = doc
+        .get("hooks")
+        .unwrap()
+        .get("Stop")
+        .unwrap()
+        .as_array()
+        .unwrap()[0]
+        .get("hooks")
+        .unwrap()
+        .as_array()
+        .unwrap()[0]
+        .clone();
+    assert_eq!(
+        stop.get("asyncRewake"),
+        Some(&aterm_link::json::Json::Bool(true))
+    );
+
+    // A second merge replaces the first and leaves a second backup: idempotent
+    // in content, and nothing accumulates but the backups.
+    std::thread::sleep(std::time::Duration::from_millis(1100));
+    let out = hook_in(&w.tmp, &env, b"", &args(true));
+    assert_eq!(code(&out), 0, "{}", String::from_utf8_lossy(&out.stderr));
+    assert_eq!(commands_in(&settings).len(), cmds.len());
+    assert_eq!(files_named(&dir, "settings.local.json.bak-").len(), 2);
+}
+
+/// **`--check` FINDS ATERM THROUGH THE RENDEZVOUS DIR WITH NOTHING BUT THE
+/// SESSION ID** — the environment an aterm child on macOS actually has. No
+/// `$ATERM_CONTROL_SOCK`, no `$ATERM_CONTROL_TOKEN`: the instance is found by
+/// the session's graph entry, the token beside its socket, and the line names
+/// the per-instance socket the entry recorded. Then a REAL run the same way
+/// carries the metadata, and an explicit `$ATERM_CONTROL_SOCK` still wins.
+#[test]
+fn check_resolves_the_socket_through_the_rendezvous_dir_with_only_the_session_id() {
+    let w = World::boot("rdv12", &["h-andrew"]);
+    w.wait_ready();
+    let (a, _b) = w.two_sessions();
+
+    // The graph entry the server publishes for the session, and the socket it
+    // names — what the resolver must arrive at.
+    let entry = w.tmp.join("run/aterm/graph").join(&a);
+    let body = until("the session's graph entry", || {
+        std::fs::read_to_string(&entry).ok()
+    });
+    let recorded = body
+        .lines()
+        .find_map(|l| l.strip_prefix("sock "))
+        .expect("a sock line")
+        .trim()
+        .to_string();
+    assert!(
+        recorded.starts_with(&w.tmp.join("run/aterm/aterm-").display().to_string())
+            && recorded.ends_with(".sock"),
+        "a per-instance socket: {recorded}"
+    );
+
+    let only_sid = [("ATERM_PARENT_SESSION_ID", a.as_str())];
+    for event in [
+        "session-start",
+        "user-prompt-submit",
+        "pre-tool-use",
+        "stop",
+    ] {
+        let out = hook_in(&w.tmp, &only_sid, b"{}", &["run", event, "--check"]);
+        let stdout = String::from_utf8_lossy(&out.stdout);
+        assert_eq!(
+            code(&out),
+            0,
+            "{event}: {}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+        assert_eq!(
+            stdout.trim(),
+            format!("ok session={a} sock={recorded}"),
+            "{event}: {stdout} {}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+    }
+
+    // A real run, the same way: the mail is seen.
+    send(&w, &a, "h-andrew", "task", 1, "read%20the%20spec");
+    until("the task to land", || {
+        (!rows(&w, &a).is_empty()).then_some(())
+    });
+    let out = hook_in(&w.tmp, &only_sid, b"{}", &["run", "user-prompt-submit"]);
+    assert_eq!(code(&out), 0);
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(
+        stdout.contains("from=h-andrew") && stdout.contains("kind=task"),
+        "the hook found aterm through the rendezvous dir: {stdout} {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert!(!stdout.contains("read%20the"), "{stdout}");
+
+    // An explicit socket variable is honoured first.
+    let explicit = [
+        ("ATERM_PARENT_SESSION_ID", a.as_str()),
+        ("ATERM_CONTROL_SOCK", w.ctl_sock.as_str()),
+    ];
+    let out = hook_in(
+        &w.tmp,
+        &explicit,
+        b"{}",
+        &["run", "session-start", "--check"],
+    );
+    assert_eq!(
+        String::from_utf8_lossy(&out.stdout).trim(),
+        format!("ok session={a} sock={}", w.ctl_sock)
+    );
+    // And a session nobody hosts is `not ok`, exit 0.
+    let out = hook_in(
+        &w.tmp,
+        &[("ATERM_PARENT_SESSION_ID", "s-0000000000000000dead")],
+        b"{}",
+        &["run", "session-start", "--check"],
+    );
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert_eq!(code(&out), 0);
+    assert!(stdout.starts_with("not ok "), "{stdout}");
+}
+
+/// One broken environment: what it is called, the variables it sets, the extra
+/// arguments it passes, and the stdin it feeds.
+type Broken<'a> = (&'a str, Vec<(&'a str, &'a str)>, Vec<&'a str>, &'a [u8]);
+
+/// Every way an environment can be broken short of a live aterm answering,
+/// for one event: the hook exits 0 and says why on stderr, and `--check` says
+/// `not ok` and exits 0 too.
+fn fails_open_in_every_broken_environment(event: &str) {
+    let dir = scratch(&format!("open-{event}"));
+    // A socket FILE nobody listens on — a crashed instance's leftover.
+    let dead = dir.join("dead.sock");
+    drop(std::os::unix::net::UnixListener::bind(&dead).expect("bind"));
+    assert!(dead.exists());
+    // A regular file where the state dir should be.
+    let not_a_dir = dir.join("state-is-a-file");
+    std::fs::write(&not_a_dir, "x").unwrap();
+    let nope = dir.join("nope.sock").display().to_string();
+    let dead_s = dead.display().to_string();
+    let not_a_dir_s = not_a_dir.display().to_string();
+
+    let cases: Vec<Broken> = vec![
+        (
+            "no such socket",
+            vec![("ATERM_CONTROL_SOCK", nope.as_str())],
+            vec!["--session", "s-abc"],
+            b"{}",
+        ),
+        (
+            "no aterm anywhere",
+            vec![("ATERM_PARENT_SESSION_ID", "s-0123abcd")],
+            vec![],
+            b"{}",
+        ),
+        ("no session at all", vec![], vec![], b"{}"),
+        (
+            "a socket nobody listens on",
+            vec![("ATERM_CONTROL_SOCK", dead_s.as_str())],
+            vec!["--session", "s-abc"],
+            b"{}",
+        ),
+        (
+            "malformed stdin",
+            vec![("ATERM_CONTROL_SOCK", nope.as_str())],
+            vec!["--session", "s-abc"],
+            b"\xff\xfe{{{{\"stop_hook_active\": nonsense",
+        ),
+        (
+            "an unreadable state dir",
+            vec![("ATERM_CONTROL_SOCK", nope.as_str())],
+            vec!["--session", "s-abc", "--state", not_a_dir_s.as_str()],
+            b"{}",
+        ),
+        (
+            "a token file that does not exist",
+            vec![("ATERM_CONTROL_SOCK", dead_s.as_str())],
+            vec!["--session", "s-abc", "--token-file", nope.as_str()],
+            b"{}",
+        ),
+        (
+            "the socket disabled by the environment",
+            vec![("ATERM_CONTROL_SOCK", "off")],
+            vec!["--session", "s-abc"],
+            b"{}",
+        ),
+    ];
+    for (what, env, extra, stdin) in cases {
+        let mut args = vec!["run", event];
+        args.extend(extra.iter().copied());
+        let out = hook_in(&dir, &env, stdin, &args);
+        let stderr = String::from_utf8_lossy(&out.stderr);
+        assert_eq!(
+            code(&out),
+            0,
+            "{event} with {what} must fail OPEN: {stderr}"
+        );
+        assert!(
+            !stderr.trim().is_empty(),
+            "{event} with {what}: the reason must be on stderr"
+        );
+        assert!(
+            out.stdout.is_empty(),
+            "{event} with {what}: nothing reaches the model's context: {}",
+            String::from_utf8_lossy(&out.stdout)
+        );
+        args.push("--check");
+        let out = hook_in(&dir, &env, stdin, &args);
+        let stdout = String::from_utf8_lossy(&out.stdout);
+        assert_eq!(code(&out), 0, "{event} --check with {what}");
+        assert!(
+            stdout.starts_with("not ok "),
+            "{event} --check with {what}: {stdout}"
+        );
+    }
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// **`session-start` fails open.** No aterm, no session, a dead socket, a
+/// malformed stdin, an unreadable state dir: exit 0, the reason on stderr.
+#[test]
+fn session_start_fails_open_in_a_broken_environment() {
+    fails_open_in_every_broken_environment("session-start");
+}
+
+/// **`user-prompt-submit` fails open** — this is the event whose block would
+/// have ERASED the human's prompt.
+#[test]
+fn user_prompt_submit_fails_open_in_a_broken_environment() {
+    fails_open_in_every_broken_environment("user-prompt-submit");
+}
+
+/// **`pre-tool-use` fails open** on everything that is not a hold — the hold
+/// verdict itself is
+/// [`pre_tool_use_blocks_the_tool_call_exactly_while_the_session_is_held`].
+#[test]
+fn pre_tool_use_fails_open_in_a_broken_environment() {
+    fails_open_in_every_broken_environment("pre-tool-use");
+}
+
+/// **`stop` fails open** on everything that is not a wake.
+#[test]
+fn stop_fails_open_in_a_broken_environment() {
+    fails_open_in_every_broken_environment("stop");
+}
+
+/// **A LIVE ATERM THAT REFUSES THE TOKEN, AND A STATE DIR THAT CANNOT BE
+/// WRITTEN, FAIL OPEN TOO.** The socket is real and answers; what it answers is
+/// `ERR auth` — a bus error, not a verdict — and every event carries on.
+/// Then, with the right token and an empty inbox, a state dir that is a
+/// regular file costs nothing but the ledger.
+#[test]
+fn a_refused_token_and_an_unwritable_state_dir_fail_open_for_every_event() {
+    let w = World::boot("auth12", &[]);
+    w.wait_ready();
+    let (a, _b) = w.two_sessions();
+    let wrong = "0".repeat(64);
+    let refused = [
+        ("ATERM_CONTROL_SOCK", w.ctl_sock.as_str()),
+        ("ATERM_CONTROL_TOKEN", wrong.as_str()),
+    ];
+    for event in [
+        "session-start",
+        "user-prompt-submit",
+        "pre-tool-use",
+        "stop",
+    ] {
+        let out = hook_in(
+            &w.tmp,
+            &refused,
+            b"{}",
+            &["run", event, "--session", &a, "--timeout", "0.3"],
+        );
+        let stderr = String::from_utf8_lossy(&out.stderr);
+        assert_eq!(code(&out), 0, "{event} under a refused token: {stderr}");
+        assert!(
+            !stderr.trim().is_empty(),
+            "{event}: the reason is on stderr"
+        );
+        assert!(
+            out.stdout.is_empty(),
+            "{event}: {}",
+            String::from_utf8_lossy(&out.stdout)
+        );
+        let out = hook_in(
+            &w.tmp,
+            &refused,
+            b"{}",
+            &["run", event, "--session", &a, "--check"],
+        );
+        let stdout = String::from_utf8_lossy(&out.stdout);
+        assert_eq!(code(&out), 0);
+        assert!(stdout.starts_with("not ok "), "{event}: {stdout}");
+    }
+
+    let not_a_dir = w.tmp.join("state-is-a-file");
+    std::fs::write(&not_a_dir, "x").unwrap();
+    let not_a_dir_s = not_a_dir.display().to_string();
+    let right = [
+        ("ATERM_CONTROL_SOCK", w.ctl_sock.as_str()),
+        ("ATERM_CONTROL_TOKEN", w.token.as_str()),
+    ];
+    for event in [
+        "session-start",
+        "user-prompt-submit",
+        "pre-tool-use",
+        "stop",
+    ] {
+        let out = hook_in(
+            &w.tmp,
+            &right,
+            b"{}",
+            &[
+                "run",
+                event,
+                "--session",
+                &a,
+                "--state",
+                &not_a_dir_s,
+                "--timeout",
+                "0.3",
+            ],
+        );
+        assert_eq!(
+            code(&out),
+            0,
+            "{event} with an unwritable state dir: {}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Round 12, the adversarial pass: a silent aterm, a symlinked settings file,
+// a 0600 settings file, a relative --exe
+// ---------------------------------------------------------------------------
+
+/// **A LIVE-BUT-SILENT ATERM CANNOT STALL A HOOK PAST ITS OWN DEADLINE.** The
+/// socket is real and ACCEPTS — an instance whose main thread is wedged, or
+/// one mid-shutdown with its listener still open — and then writes nothing.
+/// A hook used to sit in `read_line` for as long as the VENDOR allowed, which
+/// is 60 s per tool call, 30 s per prompt and 600 s per stop. Every event and
+/// every `--check` is now back within a few seconds, exit 0, saying why.
+#[test]
+fn a_live_but_silent_aterm_cannot_stall_a_hook_past_its_deadline() {
+    let dir = scratch("silent");
+    let sock = dir.join("silent.sock");
+    let listener = std::os::unix::net::UnixListener::bind(&sock).expect("bind the silent socket");
+    // Accept every connection and HOLD it, writing nothing, for the life of
+    // the test process: a peer that closed would be an EOF, which was never
+    // the problem.
+    std::thread::spawn(move || {
+        let mut held = Vec::new();
+        for conn in listener.incoming() {
+            match conn {
+                Ok(c) => held.push(c),
+                Err(_) => break,
+            }
+        }
+    });
+    let sock_s = sock.display().to_string();
+    let env = [
+        ("ATERM_CONTROL_SOCK", sock_s.as_str()),
+        ("ATERM_CONTROL_TOKEN", "abc"),
+    ];
+    for event in [
+        "session-start",
+        "user-prompt-submit",
+        "pre-tool-use",
+        "stop",
+    ] {
+        for check in [false, true] {
+            let mut args = vec!["run", event, "--session", "s-abc", "--timeout", "0.5"];
+            if check {
+                args.push("--check");
+            }
+            let started = std::time::Instant::now();
+            let out = hook_in(&dir, &env, b"{}", &args);
+            let took = started.elapsed();
+            let stdout = String::from_utf8_lossy(&out.stdout);
+            let stderr = String::from_utf8_lossy(&out.stderr);
+            assert!(
+                took < std::time::Duration::from_secs(8),
+                "{event} check={check}: a silent aterm held the hook for {took:?}"
+            );
+            assert_eq!(code(&out), 0, "{event} check={check}: {stderr}");
+            if check {
+                assert!(
+                    stdout.starts_with("not ok ") && stdout.contains("deadline"),
+                    "{event} --check names the deadline: {stdout} {stderr}"
+                );
+            } else {
+                assert!(
+                    out.stdout.is_empty(),
+                    "{event}: nothing reaches the model's context: {stdout}"
+                );
+                assert!(
+                    stderr.contains("deadline"),
+                    "{event}: the reason names the deadline: {stderr}"
+                );
+            }
+        }
+    }
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// **AN ATERM THAT ANSWERS THE LISTING AND THEN FALLS SILENT ON THE `await`
+/// HOLDS A `stop` FOR THE WAIT IT ASKED FOR PLUS THE LANE'S BOUND, AND NOT
+/// THE VENDOR'S TEN MINUTES — AND THE HOOK SAYS WHY.** The silent-aterm case
+/// above never reaches the `await`: the first `inbox` goes unanswered. This
+/// one answers every `inbox --peek --meta` with an empty ring and holds the
+/// `await inbox` open for ever, which is the one wait the hook deliberately
+/// parks on with its deadline raised. The module's rule is that every failure
+/// of the hook's own is exit 0 WITH ITS REASON ON STDERR, and this path used
+/// to return without a word.
+#[test]
+fn a_stop_whose_await_is_never_answered_names_the_deadline_and_carries_on() {
+    use std::io::{BufRead, BufReader, Write};
+    let dir = scratch("halfsilent");
+    let sock = dir.join("halfsilent.sock");
+    let listener = std::os::unix::net::UnixListener::bind(&sock).expect("bind the socket");
+    std::thread::spawn(move || {
+        let mut held = Vec::new();
+        for conn in listener.incoming() {
+            let Ok(conn) = conn else { break };
+            let mut reader = BufReader::new(conn.try_clone().expect("clone the lane"));
+            let mut writer = conn;
+            let mut line = String::new();
+            loop {
+                line.clear();
+                if reader.read_line(&mut line).unwrap_or(0) == 0 {
+                    break;
+                }
+                if line.contains(" inbox --peek --meta") {
+                    let _ = writer
+                        .write_all(b"OK 0 hold=0 holder=- seen=0 bus_head=0 dropped=0 pending=0\n");
+                    let _ = writer.flush();
+                } else if line.contains(" await inbox ") {
+                    // The wait the hook parks on: never answered, never closed.
+                    held.push((reader, writer));
+                    break;
+                }
+                // AUTH, and anything else, is read and left unanswered.
+            }
+        }
+    });
+    let sock_s = sock.display().to_string();
+    let env = [
+        ("ATERM_CONTROL_SOCK", sock_s.as_str()),
+        ("ATERM_CONTROL_TOKEN", "abc"),
+    ];
+    let started = std::time::Instant::now();
+    let out = hook_in(
+        &dir,
+        &env,
+        b"{}",
+        &["run", "stop", "--session", "s-abc", "--timeout", "0.5"],
+    );
+    let took = started.elapsed();
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        took < std::time::Duration::from_secs(8),
+        "an unanswered await held the stop hook for {took:?}"
+    );
+    assert_eq!(code(&out), 0, "{stderr}");
+    assert!(
+        out.stdout.is_empty(),
+        "nothing reaches the model's context: {stdout}"
+    );
+    assert!(
+        stderr.contains("await") && stderr.contains("deadline"),
+        "the reason names the await and the deadline: {stderr}"
+    );
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// **A SYMLINKED SETTINGS FILE STAYS A SYMLINK, ITS TARGET RECEIVES THE
+/// HOOKS, AND A `0600` FILE COMES BACK `0600` — BACKUP INCLUDED.** The link
+/// is relative, into a dotfiles checkout; the file holds an API key under
+/// `env` and was made owner-only. After the merge the link is the same link,
+/// the checkout's copy carries the hooks and the key at `0600`, the backup is
+/// beside the copy at `0600`, and nothing was left beside the link. Then a
+/// file that is not JSON: the dry run refuses exactly as the real run does,
+/// and a dry-run merge of a good file prints the MERGED document and writes
+/// nothing.
+#[test]
+fn merge_writes_through_a_symlink_and_keeps_the_targets_mode() {
+    use std::os::unix::fs::PermissionsExt;
+    let w = World::boot("link12", &["h-andrew"]);
+    w.wait_ready();
+    let (a, _b) = w.two_sessions();
+    let env = [
+        ("ATERM_CONTROL_SOCK", w.ctl_sock.as_str()),
+        ("ATERM_CONTROL_TOKEN", w.token.as_str()),
+    ];
+    let dotfiles = w.tmp.join("dotfiles");
+    let claude = w.tmp.join("claude");
+    std::fs::create_dir_all(&dotfiles).unwrap();
+    std::fs::create_dir_all(&claude).unwrap();
+    let target = dotfiles.join("claude.json");
+    let original = "{\n  \"env\": {\"SOME_API_KEY\": \"sk-live-0123\"},\n  \
+                    \"permissions\": {\"allow\": [\"Read\"]}\n}\n";
+    std::fs::write(&target, original).unwrap();
+    std::fs::set_permissions(&target, std::fs::Permissions::from_mode(0o600)).unwrap();
+    let link = claude.join("settings.json");
+    std::os::unix::fs::symlink("../dotfiles/claude.json", &link).unwrap();
+    let link_s = link.display().to_string();
+    let ledger = ledger_dir(&w, "link12");
+    let ledger_s = ledger.display().to_string();
+    let mode = |p: &std::path::Path| std::fs::metadata(p).unwrap().permissions().mode() & 0o777;
+    assert_eq!(mode(&target), 0o600, "the fixture is owner-only");
+
+    let out = hook_in(
+        &w.tmp,
+        &env,
+        b"",
+        &[
+            "install",
+            "claude",
+            "--merge",
+            "--settings",
+            &link_s,
+            "--session",
+            &a,
+            "--state",
+            &ledger_s,
+        ],
+    );
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert_eq!(code(&out), 0, "{stderr}");
+    assert!(stderr.contains("merged into"), "{stderr}");
+
+    let meta = std::fs::symlink_metadata(&link).unwrap();
+    assert!(
+        meta.file_type().is_symlink(),
+        "settings.json is no longer a symlink"
+    );
+    assert_eq!(
+        std::fs::read_link(&link).unwrap(),
+        PathBuf::from("../dotfiles/claude.json"),
+        "the link points where it did"
+    );
+    let cmds = commands_in(&target);
+    assert_eq!(
+        cmds.len(),
+        4,
+        "the link's target received the hooks: {cmds:?}"
+    );
+    let merged = std::fs::read_to_string(&target).unwrap();
+    assert!(
+        merged.contains("SOME_API_KEY") && merged.contains("\"Read\""),
+        "everything else survived: {merged}"
+    );
+    assert_eq!(
+        mode(&target),
+        0o600,
+        "the merged file came back {:o}",
+        mode(&target)
+    );
+    let backups = files_named(&dotfiles, "claude.json.bak-");
+    assert_eq!(
+        backups.len(),
+        1,
+        "one backup beside the target: {backups:?}"
+    );
+    let backup = dotfiles.join(&backups[0]);
+    assert_eq!(std::fs::read_to_string(&backup).unwrap(), original);
+    assert_eq!(
+        mode(&backup),
+        0o600,
+        "the backup came back {:o}",
+        mode(&backup)
+    );
+    assert_eq!(
+        files_named(&claude, "settings.json"),
+        ["settings.json"],
+        "nothing was left beside the link"
+    );
+    assert!(files_named(&dotfiles, "claude.json.tmp-").is_empty());
+
+    // A file that is not JSON: the dry run refuses, like the real run.
+    let bad = claude.join("bad.json");
+    std::fs::write(&bad, "{not json").unwrap();
+    let bad_s = bad.display().to_string();
+    let out = hook_in(
+        &w.tmp,
+        &env,
+        b"",
+        &[
+            "install",
+            "claude",
+            "--merge",
+            "--dry-run",
+            "--settings",
+            &bad_s,
+            "--session",
+            &a,
+            "--state",
+            &ledger_s,
+        ],
+    );
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert_eq!(
+        code(&out),
+        2,
+        "the dry run refuses what the real run would: {stderr}"
+    );
+    assert!(stderr.contains("does not parse"), "{stderr}");
+    assert!(
+        out.stdout.is_empty(),
+        "nothing is printed as if it would be written"
+    );
+    assert_eq!(std::fs::read_to_string(&bad).unwrap(), "{not json");
+    assert_eq!(files_named(&claude, "bad.json"), ["bad.json"]);
+
+    // A dry-run merge of a good file prints the merged document and writes
+    // nothing: the file's bytes and the one backup are as they were.
+    let before = std::fs::read_to_string(&target).unwrap();
+    let out = hook_in(
+        &w.tmp,
+        &env,
+        b"",
+        &[
+            "install",
+            "claude",
+            "--merge",
+            "--dry-run",
+            "--settings",
+            &link_s,
+            "--session",
+            &a,
+            "--state",
+            &ledger_s,
+        ],
+    );
+    assert_eq!(code(&out), 0, "{}", String::from_utf8_lossy(&out.stderr));
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(
+        stdout.contains("SOME_API_KEY") && stdout.contains(" hook run "),
+        "the dry run shows the merge it would make: {stdout}"
+    );
+    assert_eq!(std::fs::read_to_string(&target).unwrap(), before);
+    assert_eq!(files_named(&dotfiles, "claude.json.bak-").len(), 1);
+}
+
+/// **A RELATIVE `--exe` IS MADE ABSOLUTE BEFORE IT IS TESTED OR WRITTEN.** A
+/// hook runs from the vendor's directory, not the installer's: `--exe
+/// bin/aterm-link` self-tested from the project root and, written as given,
+/// was `No such file or directory` from anywhere else. Now the path with a
+/// slash is joined to the installer's directory, a bare name is found on
+/// `$PATH`, the written command starts with the absolute file, and every
+/// written command answers `ok` from `/`. A bare name on no `$PATH` entry
+/// refuses the install and writes nothing.
+#[test]
+fn a_relative_exe_is_made_absolute_before_it_is_tested_or_written() {
+    let w = World::boot("relexe12", &["h-andrew"]);
+    w.wait_ready();
+    let (a, _b) = w.two_sessions();
+    let project = w.tmp.join("project");
+    std::fs::create_dir_all(project.join("bin")).unwrap();
+    // The physical path: the installer's `current_dir()` is what the kernel
+    // answers, and `/tmp` is a link on macOS.
+    let root = project.canonicalize().unwrap();
+    std::os::unix::fs::symlink(
+        env!("CARGO_BIN_EXE_aterm-link"),
+        root.join("bin").join("aterm-link"),
+    )
+    .unwrap();
+    let want = format!(
+        "{} hook run ",
+        root.join("bin").join("aterm-link").display()
+    );
+    let ledger = ledger_dir(&w, "relexe12");
+    let ledger_s = ledger.display().to_string();
+    let on_path = format!("{}:/usr/bin:/bin", root.join("bin").display());
+
+    for (tag, exe, path_var) in [
+        ("slash", "bin/aterm-link", "/usr/bin:/bin"),
+        ("bare", "aterm-link", on_path.as_str()),
+    ] {
+        let settings = root.join(tag).join("settings.json");
+        let settings_s = settings.display().to_string();
+        let env = [
+            ("ATERM_CONTROL_SOCK", w.ctl_sock.as_str()),
+            ("ATERM_CONTROL_TOKEN", w.token.as_str()),
+            ("PATH", path_var),
+        ];
+        let out = hook_in_from(
+            Some(&root),
+            &w.tmp,
+            &env,
+            b"",
+            &[
+                "install",
+                "claude",
+                "--settings",
+                &settings_s,
+                "--session",
+                &a,
+                "--state",
+                &ledger_s,
+                "--exe",
+                exe,
+            ],
+        );
+        let stderr = String::from_utf8_lossy(&out.stderr);
+        assert_eq!(code(&out), 0, "{tag}: {stderr}");
+        let cmds = commands_in(&settings);
+        assert_eq!(cmds.len(), 4, "{tag}: {cmds:?}");
+        for (event, cmd) in &cmds {
+            assert!(
+                cmd.starts_with(&want),
+                "{tag}: {event} was written relative or resolved elsewhere: {cmd}"
+            );
+            // From a directory that is NOT the project, through the shell.
+            let mut sh = Command::new("/bin/sh");
+            for (name, _) in std::env::vars_os() {
+                if name.to_string_lossy().starts_with("ATERM_") {
+                    sh.env_remove(&name);
+                }
+            }
+            let out = sh
+                .arg("-c")
+                .arg(format!("{cmd} --check"))
+                .current_dir("/")
+                .env("PATH", "/usr/bin:/bin")
+                .env("ATERM_PARENT_SESSION_ID", &a)
+                .env("ATERM_CONTROL_SOCK", &w.ctl_sock)
+                .env("ATERM_CONTROL_TOKEN", &w.token)
+                .output()
+                .expect("sh");
+            let stdout = String::from_utf8_lossy(&out.stdout);
+            assert!(
+                out.status.success() && stdout.starts_with(&format!("ok session={a} ")),
+                "{tag}: {event} from /: {cmd}: {stdout} {}",
+                String::from_utf8_lossy(&out.stderr)
+            );
+        }
+    }
+
+    // A bare name nowhere on $PATH: refused, nothing written.
+    let nowhere = root.join("nowhere").join("settings.json");
+    let nowhere_s = nowhere.display().to_string();
+    let env = [
+        ("ATERM_CONTROL_SOCK", w.ctl_sock.as_str()),
+        ("ATERM_CONTROL_TOKEN", w.token.as_str()),
+        ("PATH", "/usr/bin:/bin"),
+    ];
+    let out = hook_in_from(
+        Some(&root),
+        &w.tmp,
+        &env,
+        b"",
+        &[
+            "install",
+            "claude",
+            "--settings",
+            &nowhere_s,
+            "--session",
+            &a,
+            "--exe",
+            "aterm-link",
+        ],
+    );
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert_eq!(code(&out), 2, "{stderr}");
+    assert!(stderr.contains("not on $PATH"), "{stderr}");
+    assert!(!nowhere.exists() && !nowhere.parent().unwrap().exists());
+    assert!(out.stdout.is_empty());
+}
+
+// ---------------------------------------------------------------------------
+// Round 14 — the end-of-turn report is structural: `--report-to`
+// ---------------------------------------------------------------------------
+
+/// A SYNTHETIC transcript in the vendor's JSONL shape (one object per line;
+/// a turn's text, `tool_use` and `thinking` blocks on lines of their own; a
+/// tool result quoting the assistant marker as a string value), ending in
+/// `last` as the final assistant text. Never a real one.
+fn transcript(dir: &std::path::Path, name: &str, last: &str) -> String {
+    let path = dir.join(name);
+    let text = aterm_link::json::string(last);
+    let lines = [
+        r#"{"type":"user","uuid":"u1","message":{"role":"user","content":"run the suite"}}"#.to_string(),
+        r#"{"type":"assistant","uuid":"a1","message":{"role":"assistant","content":[{"type":"text","text":"On it."}]}}"#.to_string(),
+        r#"{"type":"assistant","uuid":"a2","message":{"role":"assistant","content":[{"type":"tool_use","id":"t1","name":"Bash","input":{"command":"targo test"}}]}}"#.to_string(),
+        r#"{"type":"user","uuid":"u2","message":{"role":"user","content":[{"type":"tool_result","tool_use_id":"t1","content":"{\"type\":\"assistant\",\"message\":{\"content\":[{\"type\":\"text\",\"text\":\"QUOTED\"}]}} 3 passed"}]}}"#.to_string(),
+        r#"{"type":"assistant","uuid":"a3","message":{"role":"assistant","content":[{"type":"thinking","thinking":"private"}]}}"#.to_string(),
+        format!(
+            r#"{{"type":"assistant","uuid":"{name}","isSidechain":false,"message":{{"role":"assistant","content":[{{"type":"text","text":{text}}}]}}}}"#
+        ),
+        r#"{"type":"system","subtype":"turn_duration","uuid":"s1","durationMs":1200}"#.to_string(),
+    ];
+    std::fs::write(&path, lines.join("\n") + "\n").expect("write the transcript");
+    path.display().to_string()
+}
+
+/// The vendor's `Stop` input naming `path` as the transcript.
+fn stop_input(path: &str, active: bool) -> String {
+    format!(
+        "{{\"session_id\":\"x\",\"transcript_path\":{},\"hook_event_name\":\"Stop\",\"stop_hook_active\":{active}}}",
+        aterm_link::json::string(path)
+    )
+}
+
+/// The `msg` rows of `sid`'s inbox that are reports.
+fn reports(w: &World, sid: &str) -> Vec<String> {
+    rows(w, sid)
+        .into_iter()
+        .filter(|r| r.contains("kind=report"))
+        .collect()
+}
+
+/// The id of a `msg` row.
+fn row_id(row: &str) -> u64 {
+    row.split_whitespace()
+        .nth(1)
+        .and_then(|n| n.parse().ok())
+        .unwrap_or_else(|| panic!("a row id: {row}"))
+}
+
+/// The whole body of `sid`'s row `id`, through `inbox get`.
+fn body_of(w: &World, sid: &str, id: u64) -> String {
+    let reply = w.verb(&format!("@{sid} inbox get {id}"));
+    assert!(reply.ok(), "inbox get {id}: {}", reply.header());
+    String::from_utf8_lossy(reply.body()).into_owned()
+}
+
+/// **THE RUNG.** `hook run stop --report-to @<manager>` posts the worker's
+/// last assistant message — from a transcript the vendor's hook input names —
+/// into the manager's inbox as `kind=report`, from the worker's own session,
+/// with the whole body readable by `inbox get`; without an unhandled task the
+/// row carries no `re=`; a success says nothing on stderr; and `--check` names
+/// the recipient on its `ok` line.
+#[test]
+fn the_stop_hook_posts_the_workers_last_message_as_a_report() {
+    let w = World::boot("report14", &["h-andrew"]);
+    w.wait_ready();
+    let (a, b) = w.two_sessions();
+    let dir = ledger_dir(&w, "report14");
+    let state = dir.display().to_string();
+    let to = format!("@{b}");
+    let said = "All 248 tests pass; the branch is ready.\nNext: the e2e suite.";
+    let path = transcript(&w.tmp, "t1.jsonl", said);
+
+    let out = hook(
+        &w,
+        &stop_input(&path, false),
+        &[
+            "run",
+            "stop",
+            "--session",
+            &a,
+            "--state",
+            &state,
+            "--report-to",
+            &to,
+            "--timeout",
+            "0.2",
+        ],
+    );
+    assert_eq!(code(&out), 0, "{}", String::from_utf8_lossy(&out.stderr));
+    assert!(
+        out.stderr.is_empty(),
+        "a report that posted has nothing to say: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let row = until("the report to land in the manager's inbox", || {
+        reports(&w, &b).into_iter().next()
+    });
+    assert!(row.contains(&format!("from={a}@{}", w.node)), "{row}");
+    assert!(row.contains("trust=agent"), "{row}");
+    assert!(!row.contains(" re="), "no unhandled task, no re=: {row}");
+    assert_eq!(body_of(&w, &b, row_id(&row)), said);
+    assert_eq!(reports(&w, &b).len(), 1);
+    assert!(
+        dir.join("report").join(&a).exists(),
+        "the content key of the post is kept beside the wake ledger"
+    );
+    assert!(
+        dir.join("wake").join(&a).exists(),
+        "and the post was charged"
+    );
+
+    let out = hook(
+        &w,
+        "{}",
+        &[
+            "run",
+            "stop",
+            "--session",
+            &a,
+            "--report-to",
+            &to,
+            "--check",
+        ],
+    );
+    assert_eq!(code(&out), 0);
+    assert_eq!(
+        String::from_utf8_lossy(&out.stdout).trim(),
+        format!("ok session={a} sock={} report-to={b}", w.ctl_sock)
+    );
+}
+
+/// **`re=` IS THE NEWEST UNHANDLED TASK, AND A RE-FIRED STOP POSTS NOTHING
+/// TWICE.** Two tasks wait in the worker's inbox: the report answers the
+/// newer one (and the tasks are also what wakes the worker, so the hook
+/// exits 2 AFTER the report went). The same transcript under
+/// `stop_hook_active: true` — the vendor's re-fire — posts nothing and exits
+/// 0 at once; under `false` it still posts nothing. Once the tasks are
+/// handled, a new message is a new report, with no `re=`.
+#[test]
+fn a_report_answers_the_newest_unhandled_task_and_a_re_fired_stop_posts_nothing_twice() {
+    let w = World::boot("report14re", &["h-andrew"]);
+    w.wait_ready();
+    let (a, b) = w.two_sessions();
+    let state = ledger_dir(&w, "report14re").display().to_string();
+    let to = format!("@{b}");
+    let args = |input: &str| -> Output {
+        hook(
+            &w,
+            input,
+            &[
+                "run",
+                "stop",
+                "--session",
+                &a,
+                "--state",
+                &state,
+                "--report-to",
+                &to,
+                "--timeout",
+                "0.2",
+            ],
+        )
+    };
+
+    send(&w, &a, "h-andrew", "task", 1, "the%20first%20task");
+    let newest = send(&w, &a, "h-andrew", "task", 2, "the%20second%20task");
+    until("both tasks to land", || {
+        (rows(&w, &a).len() >= 2).then_some(())
+    });
+
+    let path = transcript(&w.tmp, "t2.jsonl", "Second task done.");
+    let out = args(&stop_input(&path, false));
+    assert_eq!(
+        code(&out),
+        2,
+        "the unhandled tasks wake the worker, after the report: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let row = until("the report to land", || reports(&w, &b).into_iter().next());
+    assert!(row.contains(&format!(" re={newest} ")), "{row}");
+    assert_eq!(body_of(&w, &b, row_id(&row)), "Second task done.");
+
+    // The re-fire: the same line, the vendor's flag — nothing posted, and the
+    // loop breaker still honoured (no wake, exit 0).
+    let out = args(&stop_input(&path, true));
+    assert_eq!(code(&out), 0, "{}", String::from_utf8_lossy(&out.stderr));
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(stderr.contains("already reported"), "{stderr}");
+    assert!(stderr.contains("nothing posted"), "{stderr}");
+    // And without the flag: the same message is still not a second report.
+    let out = args(&stop_input(&path, false));
+    assert_eq!(code(&out), 2);
+    assert!(
+        String::from_utf8_lossy(&out.stderr).contains("already reported"),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert_eq!(reports(&w, &b).len(), 1, "{:?}", reports(&w, &b));
+
+    // The tasks handled, a new message: a new report, no `re=`, exit 0.
+    let last_id = rows(&w, &a).iter().map(|r| row_id(r)).max().unwrap();
+    assert!(w.verb(&format!("@{a} inbox seen {last_id} handled")).ok());
+    let path = transcript(&w.tmp, "t3.jsonl", "Nothing else on my desk.");
+    let out = args(&stop_input(&path, false));
+    assert_eq!(code(&out), 0, "{}", String::from_utf8_lossy(&out.stderr));
+    let two = until("the second report", || {
+        let r = reports(&w, &b);
+        (r.len() >= 2).then_some(r)
+    });
+    let newest_row = two.iter().max_by_key(|r| row_id(r)).unwrap();
+    assert!(!newest_row.contains(" re="), "{newest_row}");
+    assert_eq!(
+        body_of(&w, &b, row_id(newest_row)),
+        "Nothing else on my desk."
+    );
+}
+
+/// **FAIL-OPEN.** No `transcript_path`, a path nobody wrote, a file that is
+/// not a transcript, a JSONL with no assistant line, a stdin that is not JSON:
+/// exit 0, the reason on stderr, nothing posted — and the wait that follows
+/// is the round-12 one (an empty inbox, nothing to wake for).
+#[test]
+fn a_missing_or_malformed_transcript_posts_nothing_and_exits_zero() {
+    let w = World::boot("report14nil", &[]);
+    w.wait_ready();
+    let (a, b) = w.two_sessions();
+    let state = ledger_dir(&w, "report14nil").display().to_string();
+    let to = format!("@{b}");
+
+    let prose = w.tmp.join("prose.txt");
+    std::fs::write(&prose, "the assistant said hello\n").unwrap();
+    let no_assistant = w.tmp.join("noassist.jsonl");
+    std::fs::write(
+        &no_assistant,
+        "{\"type\":\"user\",\"message\":{\"content\":\"assistant?\"}}\n",
+    )
+    .unwrap();
+    let missing = w.tmp.join("missing.jsonl");
+    let cases: Vec<(&str, String)> = vec![
+        ("no transcript_path", "{}".to_string()),
+        (
+            "a missing file",
+            stop_input(&missing.display().to_string(), false),
+        ),
+        ("prose", stop_input(&prose.display().to_string(), false)),
+        (
+            "no assistant line",
+            stop_input(&no_assistant.display().to_string(), false),
+        ),
+        (
+            "malformed stdin",
+            "{{{{\"transcript_path\": nonsense".to_string(),
+        ),
+    ];
+    for (what, input) in cases {
+        let out = hook(
+            &w,
+            &input,
+            &[
+                "run",
+                "stop",
+                "--session",
+                &a,
+                "--state",
+                &state,
+                "--report-to",
+                &to,
+                "--timeout",
+                "0.2",
+            ],
+        );
+        let stderr = String::from_utf8_lossy(&out.stderr);
+        assert_eq!(code(&out), 0, "{what}: {stderr}");
+        assert!(
+            stderr.contains("nothing posted"),
+            "{what}: the reason must be on stderr: {stderr}"
+        );
+        assert!(out.stdout.is_empty(), "{what}");
+    }
+    assert!(reports(&w, &b).is_empty(), "{:?}", reports(&w, &b));
+    assert!(
+        !std::path::Path::new(&state).join("wake").join(&a).exists(),
+        "nothing was charged"
+    );
+}
+
+/// **THE WAKE BUDGET BOUNDS REPORTS TOO.** Three turns under `2/min`: two
+/// reports, and the third says the budget is spent and posts nothing.
+#[test]
+fn a_report_is_charged_to_the_wake_budget() {
+    let w = World::boot("report14budget", &[]);
+    w.wait_ready();
+    let (a, b) = w.two_sessions();
+    let dir = ledger_dir(&w, "report14budget");
+    let state = dir.display().to_string();
+    let to = format!("@{b}");
+    let mut spent = 0;
+    for (n, said) in ["first turn", "second turn", "third turn"]
+        .iter()
+        .enumerate()
+    {
+        let path = transcript(&w.tmp, &format!("b{n}.jsonl"), said);
+        let out = hook(
+            &w,
+            &stop_input(&path, false),
+            &[
+                "run",
+                "stop",
+                "--session",
+                &a,
+                "--state",
+                &state,
+                "--report-to",
+                &to,
+                "--wake-budget",
+                "2/min",
+                "--timeout",
+                "0.2",
+            ],
+        );
+        assert_eq!(code(&out), 0, "{}", String::from_utf8_lossy(&out.stderr));
+        if String::from_utf8_lossy(&out.stderr).contains("wake budget is spent") {
+            spent += 1;
+        }
+    }
+    assert_eq!(spent, 1, "exactly the third turn is over budget");
+    until("two reports to land", || {
+        (reports(&w, &b).len() >= 2).then_some(())
+    });
+    let stamps = std::fs::read_to_string(dir.join("wake").join(&a)).expect("the ledger");
+    assert_eq!(stamps.lines().count(), 2, "{stamps}");
+    assert_eq!(reports(&w, &b).len(), 2);
+}
+
+/// **THE INSTALLER WRITES THE FLAG ON THE STOP COMMAND, PROVES IT, AND
+/// REFUSES A RECIPIENT THE INSTANCE DOES NOT HOST.** The self-test line for
+/// `Stop` ends `report-to=<sid>`; the other three commands do not carry the
+/// flag; the written `Stop` command answers `ok … report-to=<sid>` through the
+/// shell; and `--report-to` naming nobody is exit 2 with nothing written.
+#[test]
+fn the_installer_writes_report_to_and_refuses_a_recipient_that_does_not_exist() {
+    let w = World::boot("inst14", &["h-andrew"]);
+    w.wait_ready();
+    let (a, b) = w.two_sessions();
+    let ledger = ledger_dir(&w, "inst14").display().to_string();
+    let env = [
+        ("ATERM_CONTROL_SOCK", w.ctl_sock.as_str()),
+        ("ATERM_CONTROL_TOKEN", w.token.as_str()),
+    ];
+    let settings = w.tmp.join("r14").join("settings.json");
+    let settings_s = settings.display().to_string();
+    let to = format!("@{b}");
+    let out = hook_in(
+        &w.tmp,
+        &env,
+        b"",
+        &[
+            "install",
+            "claude",
+            "--settings",
+            &settings_s,
+            "--session",
+            &a,
+            "--state",
+            &ledger,
+            "--report-to",
+            &to,
+        ],
+    );
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert_eq!(code(&out), 0, "{stderr}");
+    for event in ["SessionStart", "UserPromptSubmit", "PreToolUse", "Stop"] {
+        let line = stderr
+            .lines()
+            .find(|l| l.contains(&format!("self-test {event}:")))
+            .unwrap_or_else(|| panic!("no self-test line for {event}: {stderr}"));
+        assert_eq!(
+            line.contains(&format!("report-to={b}")),
+            event == "Stop",
+            "{line}"
+        );
+    }
+    let cmds = commands_in(&settings);
+    assert_eq!(cmds.len(), 4);
+    for (event, cmd) in &cmds {
+        assert_eq!(
+            cmd.contains(&format!("--report-to @{b}")),
+            event == "Stop",
+            "{event}: {cmd}"
+        );
+    }
+    let stop = &cmds.iter().find(|(e, _)| e == "Stop").unwrap().1;
+    let mut sh = Command::new("/bin/sh");
+    for (name, _) in std::env::vars_os() {
+        if name.to_string_lossy().starts_with("ATERM_") {
+            sh.env_remove(&name);
+        }
+    }
+    let out = sh
+        .arg("-c")
+        .arg(format!("{stop} --check"))
+        .env("ATERM_PARENT_SESSION_ID", &a)
+        .env("ATERM_CONTROL_SOCK", &w.ctl_sock)
+        .env("ATERM_CONTROL_TOKEN", &w.token)
+        .output()
+        .expect("sh");
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert_eq!(
+        stdout.trim(),
+        format!("ok session={a} sock={} report-to={b}", w.ctl_sock),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+
+    // A recipient nobody hosts: refused, nothing written, the flag named.
+    let nope = w.tmp.join("r14-nope").join("settings.json");
+    let nope_s = nope.display().to_string();
+    let out = hook_in(
+        &w.tmp,
+        &env,
+        b"",
+        &[
+            "install",
+            "claude",
+            "--settings",
+            &nope_s,
+            "--session",
+            &a,
+            "--state",
+            &ledger,
+            "--report-to",
+            "@s-0000000000000000dead",
+        ],
+    );
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert_eq!(code(&out), 2, "{stderr}");
+    assert!(!nope.exists(), "the refused install wrote a file");
+    assert!(
+        stderr.contains("self-test Stop FAILED")
+            && stderr.contains("--report-to @s-0000000000000000dead"),
+        "{stderr}"
+    );
+    assert!(out.stdout.is_empty());
+}
+
+/// **A REPORT ANSWERS THE TASK THE WORKER JUST FINISHED, HANDLED OR NOT.** The
+/// fabric skill tells a worker to `inbox seen <id> handled` when it is done, so
+/// in the documented flow the task is handled by the time the Stop hook runs —
+/// and the report must still carry `re=<off>`, or `drive task --wait` (which
+/// correlates on it) times out on a report that landed. A task answered once
+/// is not answered again by the next report; a new task is.
+#[test]
+fn a_report_answers_the_task_the_worker_just_marked_handled() {
+    let w = World::boot("r14handled", &["h-andrew"]);
+    w.wait_ready();
+    let (a, b) = w.two_sessions();
+    let state = ledger_dir(&w, "r14handled").display().to_string();
+    let to = format!("@{b}");
+    let stop = |path: &str| -> Output {
+        hook(
+            &w,
+            &stop_input(path, false),
+            &[
+                "run",
+                "stop",
+                "--session",
+                &a,
+                "--state",
+                &state,
+                "--report-to",
+                &to,
+                "--timeout",
+                "0.2",
+            ],
+        )
+    };
+    let off = send(&w, &a, "h-andrew", "task", 1, "do%20the%20thing");
+    until("the task to land", || {
+        (!rows(&w, &a).is_empty()).then_some(())
+    });
+    let id = rows(&w, &a).iter().map(|r| row_id(r)).max().unwrap();
+    assert!(w.verb(&format!("@{a} inbox seen {id} handled")).ok());
+    let path = transcript(&w.tmp, "handled.jsonl", "The thing is done.");
+    let out = stop(&path);
+    assert_eq!(code(&out), 0, "{}", String::from_utf8_lossy(&out.stderr));
+    let row = until("the report", || reports(&w, &b).into_iter().next());
+    assert!(
+        row.contains(&format!(" re={off} ")),
+        "the report must answer the task the worker just finished: {row}"
+    );
+    assert!(
+        out.stderr.is_empty(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+
+    // The next report, nothing new in the inbox: answers nothing.
+    let path = transcript(&w.tmp, "handled2.jsonl", "Idle now.");
+    let out = stop(&path);
+    assert_eq!(code(&out), 0, "{}", String::from_utf8_lossy(&out.stderr));
+    let two = until("the second report", || {
+        let r = reports(&w, &b);
+        (r.len() >= 2).then_some(r)
+    });
+    let newest = two.iter().max_by_key(|r| row_id(r)).unwrap();
+    assert!(!newest.contains(" re="), "{newest}");
+
+    // A new task, handled at once: answered by the report after it.
+    let off2 = send(&w, &a, "h-andrew", "task", 2, "and%20another");
+    until("the second task to land", || {
+        (rows(&w, &a).len() >= 2).then_some(())
+    });
+    let id = rows(&w, &a).iter().map(|r| row_id(r)).max().unwrap();
+    assert!(w.verb(&format!("@{a} inbox seen {id} handled")).ok());
+    let path = transcript(&w.tmp, "handled3.jsonl", "Another done.");
+    let out = stop(&path);
+    assert_eq!(code(&out), 0, "{}", String::from_utf8_lossy(&out.stderr));
+    let three = until("the third report", || {
+        let r = reports(&w, &b);
+        (r.len() >= 3).then_some(r)
+    });
+    let newest = three.iter().max_by_key(|r| row_id(r)).unwrap();
+    assert!(newest.contains(&format!(" re={off2} ")), "{newest}");
+}
+
+/// **A RECIPIENT THAT VANISHED AFTER INSTALL IS NAMED, NOT SILENTLY CHARGED.**
+/// `--check` passed at install; the manager's session is then closed. The next
+/// Stop must post nothing to nobody: the reason on stderr, no charge, no
+/// content key kept — so the message is reported to the next manager.
+#[test]
+fn a_recipient_that_vanished_after_install_is_named_not_silently_charged() {
+    let w = World::boot("r14gone", &[]);
+    w.wait_ready();
+    let (a, b) = w.two_sessions();
+    let dir = ledger_dir(&w, "r14gone");
+    let state = dir.display().to_string();
+    let to = format!("@{b}");
+    let out = hook(
+        &w,
+        "{}",
+        &[
+            "run",
+            "stop",
+            "--session",
+            &a,
+            "--report-to",
+            &to,
+            "--check",
+        ],
+    );
+    assert!(
+        String::from_utf8_lossy(&out.stdout).starts_with("ok "),
+        "{}",
+        String::from_utf8_lossy(&out.stdout)
+    );
+    let reply = w.verb(&format!("@{b} close"));
+    assert!(reply.ok(), "close: {}", reply.header());
+    until("the session to leave the registry", || {
+        (w.sessions().len() < 2).then_some(())
+    });
+    let path = transcript(&w.tmp, "gone.jsonl", "Said into the void.");
+    let started = std::time::Instant::now();
+    let out = hook(
+        &w,
+        &stop_input(&path, false),
+        &[
+            "run",
+            "stop",
+            "--session",
+            &a,
+            "--state",
+            &state,
+            "--report-to",
+            &to,
+            "--timeout",
+            "0.2",
+        ],
+    );
+    let took = started.elapsed();
+    let stderr = String::from_utf8_lossy(&out.stderr).into_owned();
+    let posts = w.verb(&format!("@{a} inbox --peek --meta")).rows().to_vec();
+    assert_eq!(code(&out), 0);
+    assert!(took < std::time::Duration::from_secs(5), "{took:?}");
+    assert!(
+        stderr.contains("not hosted") && stderr.contains("nothing posted"),
+        "a post to a session nobody hosts must say so: {stderr:?}, outbox rows {posts:?}"
+    );
+    assert!(
+        !posts.iter().any(|r| r.starts_with("post ")),
+        "nothing was posted: {posts:?}"
+    );
+    assert!(!dir.join("wake").join(&a).exists(), "nothing was charged");
+    assert!(
+        !dir.join("report").join(&a).exists(),
+        "no content key kept for a report nobody got"
+    );
+}
+
+/// **NO BROKER: THE STOP HOOK NEITHER STALLS NOR LIES.** The bridge is pointed
+/// at a path nothing listens on: the post cannot land, the endpoint says
+/// `queued=1` at once, and the hook exits 0 within the lane deadline, SAYS the
+/// report is queued, keys it (a re-fired Stop posts nothing twice) and charges
+/// it (it will land, and wake).
+#[test]
+fn no_broker_the_stop_hook_says_the_report_is_queued() {
+    let dead = scratch("r14dead").join("nobody.sock").display().to_string();
+    let w = World::boot_at("r14nobroker", &[], &[], Some(&dead));
+    let (a, b) = w.two_sessions();
+    let dir = ledger_dir(&w, "r14nobroker");
+    let state = dir.display().to_string();
+    let to = format!("@{b}");
+    let path = transcript(&w.tmp, "nobroker.jsonl", "Nobody will carry this yet.");
+    let started = std::time::Instant::now();
+    let out = hook(
+        &w,
+        &stop_input(&path, false),
+        &[
+            "run",
+            "stop",
+            "--session",
+            &a,
+            "--state",
+            &state,
+            "--report-to",
+            &to,
+            "--timeout",
+            "0.2",
+        ],
+    );
+    let took = started.elapsed();
+    let stderr = String::from_utf8_lossy(&out.stderr).into_owned();
+    assert_eq!(code(&out), 0, "{stderr}");
+    assert!(took < std::time::Duration::from_secs(5), "{took:?}");
+    assert!(
+        stderr.contains("queued") && stderr.contains("never re-post"),
+        "{stderr:?}"
+    );
+    assert!(
+        dir.join("report").join(&a).exists(),
+        "the key is kept: it will land"
+    );
+    assert!(dir.join("wake").join(&a).exists(), "charged: it will wake");
+    // The re-fire: nothing posted twice into the outbox.
+    let out = hook(
+        &w,
+        &stop_input(&path, true),
+        &[
+            "run",
+            "stop",
+            "--session",
+            &a,
+            "--state",
+            &state,
+            "--report-to",
+            &to,
+            "--timeout",
+            "0.2",
+        ],
+    );
+    assert!(
+        String::from_utf8_lossy(&out.stderr).contains("already reported"),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let posts: Vec<String> = w
+        .verb(&format!("@{a} inbox --peek --meta"))
+        .rows()
+        .iter()
+        .filter(|r| r.starts_with("post "))
+        .cloned()
+        .collect();
+    assert_eq!(posts.len(), 1, "{posts:?}");
+}
+
+/// **A FIFO AT transcript_path DOES NOT PARK THE STOP HOOK.** The real binary,
+/// a FIFO nobody writes: the hook must exit (0, the reason on stderr) at once,
+/// not sit in `open(2)` until the vendor's 600 s Stop timeout.
+#[test]
+fn a_fifo_transcript_does_not_park_the_stop_hook() {
+    let w = World::boot("r14fifo", &[]);
+    w.wait_ready();
+    let (a, b) = w.two_sessions();
+    let state = ledger_dir(&w, "r14fifo").display().to_string();
+    let to = format!("@{b}");
+    let fifo = w.tmp.join("fifo.jsonl");
+    assert!(Command::new("mkfifo")
+        .arg(&fifo)
+        .status()
+        .unwrap()
+        .success());
+    let p = fifo.display().to_string();
+    let mut cmd = Command::new(env!("CARGO_BIN_EXE_aterm-link"));
+    cmd.args([
+        "hook",
+        "run",
+        "stop",
+        "--session",
+        &a,
+        "--state",
+        &state,
+        "--report-to",
+        &to,
+        "--timeout",
+        "0.2",
+    ])
+    .env("ATERM_CONTROL_SOCK", &w.ctl_sock)
+    .env("ATERM_CONTROL_TOKEN", &w.token)
+    .env_remove("ATERM_PARENT_SESSION_ID")
+    .env_remove("ATERM_SESSION_ID")
+    .stdin(Stdio::piped())
+    .stdout(Stdio::piped())
+    .stderr(Stdio::piped());
+    let mut child = cmd.spawn().unwrap();
+    child
+        .stdin
+        .take()
+        .unwrap()
+        .write_all(stop_input(&p, false).as_bytes())
+        .unwrap();
+    let started = std::time::Instant::now();
+    let deadline = std::time::Duration::from_secs(8);
+    loop {
+        if let Some(status) = child.try_wait().unwrap() {
+            assert_eq!(status.code(), Some(0), "{status}");
+            break;
+        }
+        if started.elapsed() > deadline {
+            let _ = child.kill();
+            panic!("the Stop hook was still parked on the FIFO at {p} after {deadline:?}");
+        }
+        std::thread::sleep(std::time::Duration::from_millis(50));
+    }
+    let out = child.wait_with_output().unwrap();
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        stderr.contains("not a regular file") && stderr.contains("nothing posted"),
+        "{stderr}"
+    );
+    assert!(reports(&w, &b).is_empty());
+}

@@ -2,16 +2,22 @@
 // SPDX-License-Identifier: Apache-2.0
 
 //! The untracked staging lane end to end (`atpkg::stage_helper`), against the REAL
-//! `atpkg` binary this build produced: the hidden verb answers through the result file
+//! `atpkg` binary this build produced and the current one-binary `aterm` front door:
+//! the hidden verb answers through the result file
 //! with the same `tree_root` the in-process lane folds over the same bytes; the whole
 //! launchd round trip lays down an identical tree; a helper that cannot speak the verb
 //! is detected inside the exit grace and leaves the destination empty for the caller's
-//! policy to act on (refuse by default, an in-process stage under the escape hatch);
-//! and — when the test process happens to be provenance-tracked, which is the case that
-//! matters and the one this lane exists for — the files the job laid down are CLEAN
-//! while the ones this process writes are tagged.
+//! policy to act on (an in-process stage, recorded, by default; a refusal under
+//! `ATPKG_REFUSE_TRACKED_INSTALL=1`); a tagged BUNDLE executable — the shipped app's
+//! shape — serves BOTH hidden verbs from a whole-bundle fixture; and — when the test
+//! process happens
+//! to be provenance-tracked, which is the case that matters and the one this lane exists
+//! for — the files the job laid down are CLEAN while the ones this process writes are
+//! tagged.
 //!
 //! macOS only: the tag and launchd exist nowhere else.
+//! The installed/notarized application's separate smoke is explicitly ignored by
+//! default: its version is not the source under test and may predate these verbs.
 
 #![cfg(target_os = "macos")]
 
@@ -25,6 +31,20 @@ use atpkg::provenance::{carries_provenance, measure_tracked};
 use atpkg::stage_helper::{
     HIDDEN_VERB, HelperPlan, decode_spec, encode_spec, plan_for_exe, stage_untracked,
 };
+
+// Share paint/spin's current-source RELEASE preparation instead of building a
+// second freshness mechanism. The dedicated target avoids the outer test build's
+// artifact lock; an explicit test override names the artifact actually exercised.
+#[path = "../../aterm-conformance/tests/support/mod.rs"]
+mod current_artifact;
+
+fn current_aterm_exe() -> PathBuf {
+    let root = Path::new(env!("CARGO_MANIFEST_DIR"))
+        .ancestors()
+        .nth(2)
+        .expect("atpkg lives under the workspace crates directory");
+    current_artifact::release_bin(root, &["ATERM_UNTRACKED_STAGE_BIN"])
+}
 
 fn scratch(label: &str) -> PathBuf {
     let d = std::env::temp_dir().join(format!(
@@ -240,8 +260,8 @@ fn the_launchd_lane_lays_an_identical_tree_and_a_clean_one_when_the_caller_is_tr
 
 /// A helper that is not an atpkg/aterm binary is refused up front; one that is spelled
 /// right but answers nothing is detected inside the exit grace — and either way the
-/// destination is left empty, as the caller's policy requires (a refused stage removes
-/// it; the escape hatch stages into it in-process).
+/// destination is left empty, as the caller's policy requires (the default stages into
+/// it in-process and records the fact; a refusal removes it).
 #[test]
 fn a_helper_that_cannot_answer_is_detected_and_the_destination_is_left_empty() {
     let d = scratch("noanswer");
@@ -449,5 +469,140 @@ fn a_label_whose_owning_pid_is_dead_is_swept_by_the_next_job() {
     let _ = Command::new("/bin/launchctl")
         .args(["remove", &orphan])
         .output();
+    let _ = std::fs::remove_dir_all(&d);
+}
+
+/// A tagged BUNDLE executable — the shipped app's shape, `<bundle>.app/Contents/MacOS/
+/// <exe>` beside an `Info.plist` — is run from a copy of its WHOLE bundle, made by the
+/// job: a fixture `.app` around the CURRENT one-binary executable. Its name is
+/// `aterm`, so the atpkg argv0 alias cannot hide a missing front-door dispatch of
+/// `__stage-payload` or `__lay-files` (the installed 0.81 app lacks the latter).
+/// Both verbs must actually answer. The copy carries the tag exactly
+/// when this process is tracked (it is what wrote the copy), and then the plan reads
+/// `CopyBundleThenExec` and the tree the lane stages is CLEAN; under an untracked shell
+/// the copy is clean, the plan reads `ExecOriginal`, and the in-place half is what runs —
+/// the tag cannot be minted by hand, so this test says which case it exercised. Either
+/// way the lane stages the identical tree. Before 2026-09-14 the tracked case was
+/// REFUSED, which on a self-updated app (its bundle tagged by its own updater) was every
+/// install.
+#[test]
+fn the_current_one_binary_bundle_serves_both_hidden_verbs() {
+    let current = current_aterm_exe();
+    let d = scratch("bundle-copy");
+    let bundle = d.join("fake.app");
+    let contents = bundle.join("Contents");
+    std::fs::create_dir_all(contents.join("MacOS")).unwrap();
+    std::fs::write(contents.join("Info.plist"), b"<plist/>").unwrap();
+    let exe = contents.join("MacOS").join("aterm");
+    std::fs::copy(&current, &exe).unwrap();
+    std::os::unix::fs::symlink("aterm", contents.join("MacOS").join("atpkg")).unwrap();
+    let tracked = measure_tracked(&d).unwrap_or(false);
+    let tagged = carries_provenance(&exe);
+    let plan = plan_for_exe(&exe).expect("the fake bundle's binary can be inspected");
+    assert_eq!(
+        plan,
+        if tagged {
+            HelperPlan::CopyBundleThenExec {
+                bundle: bundle.clone(),
+            }
+        } else {
+            HelperPlan::ExecOriginal
+        },
+        "the plan follows the measured tag and the bundle shape ({})",
+        exe.display()
+    );
+
+    let archive = bundle_archive(&d);
+    let reference = d.join("reference");
+    std::fs::create_dir_all(&reference).unwrap();
+    let expected = stage_payload_spec(&spec(), &archive, &reference).unwrap();
+    let dest = d.join("incoming");
+    std::fs::create_dir_all(&dest).unwrap();
+    let staged = stage_untracked(&exe, &spec(), &archive, &dest, &d)
+        .unwrap_or_else(|why| panic!("the bundle lane must run on this macOS: {why}"));
+    assert_eq!(staged.root, expected);
+    assert!(!staged.witness_tagged, "what the job laid is clean");
+    assert_eq!(tree(&dest), tree(&reference));
+    assert!(
+        !carries_provenance(&dest.join("bin/tool")),
+        "a clean bundle copy run by launchd writes clean files"
+    );
+    let laid = d.join("laid-by-current-front-door");
+    let body = b"#!/bin/sh\necho current-front-door\n";
+    atpkg::lay::lay_untracked(
+        &exe,
+        &[atpkg::lay::Executable::new(&laid, body.to_vec())],
+        &d,
+    )
+    .unwrap_or_else(|why| panic!("the current aterm front door must serve __lay-files: {why}"));
+    assert_eq!(std::fs::read(&laid).unwrap(), body);
+    assert!(
+        !carries_provenance(&laid),
+        "the current front door lays clean files through the same bundle lane"
+    );
+    if tracked {
+        assert!(tagged, "a copy this tracked process made carries the tag");
+        assert!(
+            carries_provenance(&reference.join("bin/tool")),
+            "the in-process reference is tagged when this process is tracked"
+        );
+    }
+    eprintln!(
+        "current artifact={}, test process tracked={tracked}, bundle binary tagged={tagged} → plan {plan:?}; \
+         laid clean (in-process reference tagged={})",
+        current.display(),
+        carries_provenance(&reference.join("bin/tool"))
+    );
+    let _ = std::fs::remove_dir_all(&d);
+}
+
+/// The shipped app itself, when it is installed on this Mac and carries the tag — which a
+/// self-updated or browser-downloaded `aterm.app` does — is the helper: the lane runs its
+/// hidden verb from a copy of the whole notarized bundle (the copy keeps its seal; a lone
+/// copy of the executable is killed at exec) and the file it lays is CLEAN. This is the
+/// measurement of 2026-09-14 kept as an OPT-IN installed-artifact smoke, separate
+/// from the current-source regression above. Run with:
+/// ```sh
+/// targo --unverified test -p atpkg --test untracked_stage \
+///   the_shipped_app_bundle_when_tagged_lays_clean_files_from_a_whole_bundle_copy \
+///   -- --ignored --exact --nocapture
+/// ```
+/// The installed version may predate the hidden verbs, in which case this smoke
+/// truthfully fails for that artifact.
+#[test]
+#[ignore = "installed tagged/notarized artifact smoke; current-source coverage runs above"]
+fn the_shipped_app_bundle_when_tagged_lays_clean_files_from_a_whole_bundle_copy() {
+    let app = Path::new("/Applications/aterm.app/Contents/MacOS/aterm");
+    assert!(
+        app.is_file(),
+        "installed-artifact smoke requires {}",
+        app.display()
+    );
+    assert!(
+        carries_provenance(app),
+        "installed-artifact smoke requires a tagged bundle at {}; the tag cannot be minted by hand",
+        app.display()
+    );
+    let d = scratch("shipped-app");
+    assert_eq!(
+        plan_for_exe(app).unwrap(),
+        HelperPlan::CopyBundleThenExec {
+            bundle: PathBuf::from("/Applications/aterm.app"),
+        }
+    );
+    let laid = d.join("laid-by-the-app-copy");
+    let files = vec![atpkg::lay::Executable::new(&laid, "#!/bin/sh\necho laid\n")];
+    atpkg::lay::lay_untracked(app, &files, &d).unwrap_or_else(|why| {
+        panic!("the shipped app must serve the lane from a whole-bundle copy: {why}")
+    });
+    assert_eq!(std::fs::read(&laid).unwrap(), b"#!/bin/sh\necho laid\n");
+    assert!(
+        !carries_provenance(&laid),
+        "a file laid by the untracked copy of the tagged app is clean"
+    );
+    eprintln!(
+        "the tagged shipped app ({}) laid a clean file through a whole-bundle copy",
+        app.display()
+    );
     let _ = std::fs::remove_dir_all(&d);
 }

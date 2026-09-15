@@ -24,25 +24,33 @@
 //! human's cross-host escalation view. Both are printed here, in that order, and
 //! `--attention` keeps only the rows carrying one.
 //!
-//! FOUR OF THOSE COLUMNS HAVE NO WRITER IN THIS FABRIC YET, and they print `-`
+//! THREE OF THOSE COLUMNS HAVE NO WRITER IN THIS FABRIC YET, and they print `-`
 //! rather than being dropped, because `-` is the truth ("unknown") and a missing
 //! column is a reader silently disagreeing with the design:
 //!
-//! * `role=`, `detail=` and `driving=` are in §4.2's presence body but
-//!   [`crate::bridge::Bridge::publish_session_presence`] does not publish
-//!   them, so every row shows `-` today.
+//! * `driving=` is in §4.2's presence body but
+//!   [`crate::bridge::Bridge::publish_session_presence`] does not publish it,
+//!   so every row shows `-` today. (`role=` and `detail=` HAVE a writer since
+//!   round 13 — the bridge's presence sampler, [`crate::presence`] — on a
+//!   bridge running with `presence = "meta"`, the default; a `minimal` bridge
+//!   and one that predates round 13 still show `-`.)
 //! * `host=` and `fabric=` are published on the NODE's own presence row only
 //!   (`bridge.rs`'s `bring_presence_up`), deliberately: `fabric=` on a session
 //!   row was a constant nothing could falsify, and the bridge's own header says
 //!   why it was removed. A session row therefore shows `-` for both, and the
 //!   node row above it carries the real answer.
 //!
-//! THREE COLUMNS ARE ADDED to §7's set, at the end, because each has a real
+//! SIX COLUMNS ARE ADDED to §7's set, at the end, because each has a real
 //! writer and a real reader: `gen=` (§6.6's `<content_seq>:<fp16>`, what a
 //! `gen=`-bound approval is minted against), `observer=` (§11.2's watching,
-//! non-hosting attachment — a row an operator must not read as a host), and
-//! `epoch=` (the launch nonce a drive record is fenced on). Dropping them to
-//! match §7 exactly would lose the only face they have.
+//! non-hosting attachment — a row an operator must not read as a host),
+//! `epoch=` (the launch nonce a drive record is fenced on), and round 13's
+//! `phase=` (busy | idle | prompt | question | limited | survey — the word
+//! `aterm drive phase` prints, from the same reader), `context=` (`<n>%` when
+//! Claude Code shows its indicator) and `title=` (the session's `meta set
+//! title` user title, else `-`; NEVER the terminal's title, which the program
+//! writes — [`crate::presence`]; 128 bytes). Dropping them to match §7
+//! exactly would lose the only face they have.
 //!
 //! EVERY PRINTED FIELD IS UNTRUSTED. A presence body is written by whatever node
 //! holds `rw,p=<n>:/f/<F>/pub/<n>/>`, and `attention=` is free text a session
@@ -61,13 +69,23 @@ aterm-link — the aterm fabric bridge
 
   aterm-link serve --fleet <F> --broker <ep> --cap-file <path>... [options]
   aterm-link ls    --fleet <F> --broker <ep> --cap-file <path>... [--attention]
-  aterm-link hook  install claude [--rewake] | run <event>   (`hook` for its own usage)
+  aterm-link hook  install claude [--merge] [--dry-run] [--rewake] [--report-to @sid] | run <event> [--check]   (`hook` for its own usage)
   aterm-link notify --on <attention|ask:<p>|halt>,... --exec <cmd>  (`notify` for its own usage)
   aterm-link mirror <root> --sock <path>            (the file plane; `mirror` for its own usage)
   aterm-link glance --fleet <F> --broker <ep> --cap-file <path>...   (writes <state>/fabric/glance.json)
-  aterm-link tui    --fleet <F> --broker <ep> --cap-file <path>... [--from <offset>]\n\
-  aterm-link broker <socket> [log]                  the local bus itself (`broker` for its usage)\n\
+  aterm-link tui    --fleet <F> --broker <ep> --cap-file <path>... [--from <offset>]
+  aterm-link broker <socket> [log]                  the local bus itself (`broker` for its usage)
   aterm-link mint   <grant> --secret-file <path>    one capability line for --cap-file
+  aterm-link fabric [status [--json] | tail [--bodies] [--from <offset>]
+                    | on [--dry-run] [--service ...] | off [--dry-run] | doctor]
+                    the fabric's state on one screen, read from aterm's [fabric] command,
+                    and the one command that turns it on and proves it
+                    (`aterm fabric` is the same code; `fabric help` for its usage)
+
+`ls`, `glance`, `tui` and `mirror` default their flags from the rendezvous file
+`aterm fabric on` writes beside the instance control sockets (fabric.toml):
+--fleet, --broker, --cap-file and --state for the first three, --sock for mirror.
+A flag given on the command line wins.
 
   --fleet <F>            the fleet name (the `/f/<F>/` subtree)
   --broker <ep>          the broker: a Unix socket path, or <host>:<port> with --tcp
@@ -79,11 +97,26 @@ aterm-link — the aterm fabric bridge
   --screen <sid|all>,... publish these sessions' screens on the bus (OFF by default)
   --sock <path>          hand-started OBSERVER mode against a control socket
   --token-file <path>    the instance token, for --sock
+  --presence <mode>      `serve` only: what a session's presence row carries.
+                         meta (the default) adds role= detail= phase= context=
+                         title= beside attention=. phase= is Claude Code's turn
+                         phase read off the last 40 rows of the screen, only when
+                         the session's status revision moved; a session running
+                         anything else reads idle (its detail= says what runs).
+                         title= is `meta set title` alone — never the terminal's
+                         title, which a program writes (Claude Code puts a
+                         summary of the conversation there) — and never any
+                         transcript text. minimal is attention= alone and never
+                         reads a screen. Without the flag, `[fabric] presence`
+                         in aterm.toml, else meta.
   --attention            `ls` only: keep only rows carrying an `attention=` (§9.3)
 
 `ls` prints §7's row — <node> <host> <sid> state= inc= role= detail= driving=
-holder= hold= fabric= attention= — then gen=, observer= and epoch=. `role=`,
-`detail=` and `driving=` have no writer in this fabric yet and always read `-`;
+holder= hold= fabric= attention= — then gen=, observer=, epoch=, phase=,
+context= and title=. `role=`, `detail=`, `phase=`, `context=` and `title=` are
+written by a round-13 bridge in `meta` mode (a `minimal` or older bridge leaves
+them `-`); every column is printed pct-encoded, so `context=12%` reads
+`context=12%25`; `driving=` has no writer in this fabric yet and always reads `-`;
 `host=` and `fabric=` are on the NODE row only, so a session row reads `-` for
 both and the node's own row above it carries them.
 
@@ -95,7 +128,7 @@ shipped `aterm` binary): a default build parses the flags and then refuses with
 astream also builds an ephemeral-X25519 (`handshake`) and a mutual signed-DH
 (`identity`) transport; neither is offered here, because each would add a
 third-party crypto dependency to a crate whose dependency set the design pins,
-and `asb` serves no `identity` listener to reach.
+and `aterm link broker` serves no `identity` listener to reach.
 
 Later rungs own `wake`, `pin` and `lash`.
 ";
@@ -111,19 +144,40 @@ Later rungs own `wake`, `pin` and `lash`.
 pub fn dispatch(args: &[String]) -> ExitCode {
     match args.first().map(String::as_str) {
         Some("serve") => run(&args[1..], true),
-        Some("ls") => run(&args[1..], false),
+        // THE READ-SIDE VERBS DEFAULT THEIR FLAGS from the rendezvous file
+        // (`crate::enable`); `serve` does not, because aterm launches it with
+        // every flag spelled out and a bridge that silently took a different
+        // broker than its config names would be the report lying about itself.
+        Some("ls") => run(&crate::enable::with_rendezvous_defaults(&args[1..]), false),
         Some("notify") => crate::notify::main(&args[1..]),
         Some("hook") => crate::hook::main(&args[1..]),
-        Some("mirror") => crate::mirror::main(&args[1..]),
-        Some("glance") => crate::glance::main(&args[1..]),
-        Some("tui") => crate::tui::main(&args[1..]),
+        Some("mirror") => crate::mirror::main(&crate::enable::with_default_sock(&args[1..])),
+        Some("glance") => crate::glance::main(&crate::enable::with_rendezvous_defaults(&args[1..])),
+        Some("tui") => crate::tui::main(&crate::enable::with_rendezvous_defaults(&args[1..])),
         Some("broker") => broker(&args[1..]),
         Some("mint") => mint(&args[1..]),
+        Some("fabric") => crate::fabric::main(&args[1..]),
         Some(other @ ("wake" | "pin" | "lash")) => {
             eprintln!("aterm-link: `{other}` is a later rung and is not implemented yet");
             ExitCode::from(2)
         }
-        _ => {
+        // Asked for: stdout, exit 0 — the same contract `aterm --help` and the
+        // `broker -h` / `mint -h` children keep. Before this the front door
+        // answered its own `--help` with exit 2 on stderr, disagreeing with
+        // every one of its children.
+        Some("-h" | "--help" | "help") => {
+            print!("{USAGE}");
+            ExitCode::SUCCESS
+        }
+        // Refused BY NAME, the rule this file's header states. An unknown word
+        // used to print the usage indistinguishably from `--help`, so a typo
+        // read as a request for help rather than as the mistake it was.
+        Some(other) => {
+            eprintln!("aterm-link: unknown subcommand `{other}`");
+            eprint!("{USAGE}");
+            ExitCode::from(2)
+        }
+        None => {
             eprint!("{USAGE}");
             ExitCode::from(2)
         }
@@ -148,7 +202,15 @@ fn run(args: &[String], serve: bool) -> ExitCode {
             eprint!("{USAGE}");
             return ExitCode::from(2);
         }
-        match Bridge::new(parsed.cfg).and_then(Bridge::run) {
+        let mut cfg = parsed.cfg;
+        // THE ONE FLAG `serve` DOES DEFAULT FROM A FILE: `[fabric] presence`
+        // is a knob on what the bridge publishes, not on which broker it
+        // reaches, so reading it from aterm.toml cannot make the report lie
+        // about the bus — and it is where the design says the knob lives.
+        if !parsed.presence_given {
+            cfg.presence = crate::fabric::presence_from_config();
+        }
+        match Bridge::new(cfg).and_then(Bridge::run) {
             Ok(()) => ExitCode::SUCCESS,
             Err(e) => {
                 eprintln!("aterm-link serve: {e}");
@@ -168,10 +230,13 @@ fn run(args: &[String], serve: bool) -> ExitCode {
 
 /// What `parse` answers: the bridge's own config, plus the flags that belong to
 /// the command line rather than to a running bridge.
-struct Parsed {
-    cfg: Config,
+pub(crate) struct Parsed {
+    pub(crate) cfg: Config,
     /// `ls --attention` (§9.3): keep only the rows carrying an escalation.
-    attention: bool,
+    pub(crate) attention: bool,
+    /// Whether `--presence` was on the command line — else `serve` reads
+    /// `[fabric] presence` from aterm.toml ([`crate::fabric::presence_from_config`]).
+    pub(crate) presence_given: bool,
 }
 
 /// One printed column, made safe and made a single token.
@@ -185,7 +250,7 @@ struct Parsed {
 fn column(raw: &str) -> String {
     let mut safe = crate::pct::encode(&crate::pct::decode(raw));
     // AND IT IS BOUNDED, by the SAME number the other two readers of a presence
-    // token use. `bridge.rs`'s `attention_of` caps what it publishes at
+    // token use. `presence.rs`'s `token` caps what the bridge publishes at
     // [`crate::glance::ATTENTION_CAP`] and `glance.rs` caps what it renders
     // at the same constant; a roster that printed the token whole would be a
     // third reader of one field with a bound of its own — which is the shape of
@@ -193,7 +258,7 @@ fn column(raw: &str) -> String {
     // nothing on the bus obliges it to have used the bridge's own writer.
     //
     // The truncation is on an ESCAPE boundary, never inside a `%XX`, which is
-    // the rule `attention_of` already applies; the mark is `pct::encode("…")`,
+    // the rule `presence::token` already applies; the mark is `pct::encode("…")`,
     // the same ellipsis `glance::truncate` appends, kept ASCII so the row is
     // still one printable token per column.
     if safe.len() > crate::glance::ATTENTION_CAP {
@@ -279,7 +344,8 @@ fn row(subject: &str, body: &crate::body::Body) -> (String, bool) {
     let escalating = attention != "-";
     let line = format!(
         "{node} {} {owner} state={} inc={} role={} detail={} driving={} \
-         holder={} hold={} fabric={} attention={attention} gen={} observer={} epoch={}",
+         holder={} hold={} fabric={} attention={attention} gen={} observer={} epoch={} \
+         phase={} context={} title={}",
         field("host"),
         field("state"),
         field("inc"),
@@ -299,14 +365,24 @@ fn row(subject: &str, body: &crate::body::Body) -> (String, bool) {
             .get("observer")
             .map_or_else(|| "0".to_string(), |v| column(v)),
         body.epoch.as_deref().map_or_else(|| "-".into(), column),
+        // ROUND 13'S THREE: the phase word, the context percentage and the
+        // title, written by a `meta`-mode bridge; `-` from any other.
+        field("phase"),
+        field("context"),
+        field("title"),
     );
     (line, escalating)
 }
 
 /// Parse argv. Every flag takes a value; a flag without one is a usage error
 /// rather than a silently defaulted setting.
-fn parse(args: &[String]) -> Result<Parsed, String> {
+///
+/// `pub(crate)` because `aterm fabric` reads the fleet, broker, cap files and
+/// state dir out of `[fabric] command` with THIS parser — the one the bridge it
+/// describes was started with — rather than a second one that could disagree.
+pub(crate) fn parse(args: &[String]) -> Result<Parsed, String> {
     let mut attention = false;
+    let mut presence_given = false;
     let mut cfg = Config {
         fleet: String::new(),
         broker: String::new(),
@@ -317,6 +393,7 @@ fn parse(args: &[String]) -> Result<Parsed, String> {
         screen: Vec::new(),
         sock: None,
         token: None,
+        presence: crate::presence::Mode::Meta,
     };
     let mut token_file: Option<String> = None;
     let mut tcp = false;
@@ -353,6 +430,12 @@ fn parse(args: &[String]) -> Result<Parsed, String> {
             }
             "--screen" => cfg.screen.extend(value()?.split(',').map(str::to_string)),
             "--attention" => attention = true,
+            "--presence" => {
+                let v = value()?;
+                cfg.presence = crate::presence::Mode::parse(&v)
+                    .ok_or_else(|| format!("--presence {v}: `meta` or `minimal`"))?;
+                presence_given = true;
+            }
             "--sock" => cfg.sock = Some(value()?),
             "--token-file" => token_file = Some(value()?),
             other => return Err(format!("unknown flag {other}")),
@@ -416,7 +499,11 @@ fn parse(args: &[String]) -> Result<Parsed, String> {
             return Err(format!("--screen {s} is not `all` or an @s-<sid>"));
         }
     }
-    Ok(Parsed { cfg, attention })
+    Ok(Parsed {
+        cfg,
+        attention,
+        presence_given,
+    })
 }
 
 /// `$XDG_STATE_HOME/aterm-link`, else `$HOME/.local/state/aterm-link`, else the
@@ -445,8 +532,9 @@ fn default_state_dir() -> String {
 /// build another repository's CLI by hand to turn on a feature the shipped
 /// binary otherwise supports end to end. Thirty lines here close that.
 ///
-/// It is deliberately the PLAIN local broker: a Unix socket, whose boundary is
-/// the filesystem (put it in a 0700 directory; it is same-uid only). Capability
+/// It is deliberately the PLAIN local broker: a Unix socket created
+/// world-connectable — nothing chmods it and no peer uid is checked — so the
+/// boundary is the DIRECTORY you put it in, 0700. Capability
 /// enforcement on attach is `Broker::open_guarded`, which needs a mint secret
 /// this verb does not take, and the sealed TCP wire needs the `sealed` feature
 /// this build does not enable. Both are named here rather than implied, because
@@ -460,7 +548,7 @@ usage: aterm link broker <socket> [log]
 
 The local bus: no capability enforcement on attach, no TLS, and the SOCKET ITSELF
 is created world-connectable — so the boundary is the DIRECTORY you put it in.
-Use a 0700 one (tools/fabric-enable.sh does). Guarded and sealed transports are
+Use a 0700 one (`aterm fabric on` does). Guarded and sealed transports are
 astream's `Broker::open_guarded` / the `sealed` feature; neither is reachable
 from here.
 ";
@@ -472,10 +560,23 @@ from here.
         print!("{USAGE}");
         return ExitCode::SUCCESS;
     }
+    // A surplus word is refused, never dropped: `broker d/b.sock d/b.log --guarded`
+    // used to run happily with `--guarded` vanished, which is exactly the
+    // "parses and does nothing" failure this file's header names.
+    if let Some(extra) = args.get(2) {
+        eprintln!("aterm link broker: unexpected argument `{extra}`");
+        eprint!("{USAGE}");
+        return ExitCode::from(2);
+    }
     let log = args
         .get(1)
         .cloned()
         .unwrap_or_else(|| format!("{sock}.log"));
+    // Whether THIS call is the one creating the log: `open` creates it, and a
+    // bind refused afterwards (`a broker is already listening on this socket`)
+    // used to leave an empty `b2.log` behind every typo'd retry — stray files
+    // that later read as real bus records.
+    let log_created_here = !std::path::Path::new(&log).exists();
     let broker = match astream_broker::Broker::open(&log) {
         Ok(b) => b,
         Err(e) => {
@@ -487,6 +588,14 @@ from here.
         Ok(h) => h,
         Err(e) => {
             eprintln!("aterm link broker: serve {sock}: {e}");
+            if log_created_here
+                && std::fs::metadata(&log)
+                    .map(|m| m.len() == 0)
+                    .unwrap_or(false)
+            {
+                drop(broker);
+                let _ = std::fs::remove_file(&log);
+            }
             return ExitCode::FAILURE;
         }
     };
@@ -528,6 +637,13 @@ Prints one `<grant> <tag-hex>` line — append it to the file `serve --cap-file`
     while i < args.len() {
         match args[i].as_str() {
             "--secret-file" => {
+                // Once. A repeated flag used to win last silently, so
+                // `--secret-file good --secret-file empty` minted with the empty
+                // key and exited 0.
+                if secret.is_some() {
+                    eprintln!("aterm link mint: --secret-file given twice");
+                    return ExitCode::from(2);
+                }
                 i += 1;
                 match args.get(i) {
                     Some(v) => secret = Some(v),
@@ -623,7 +739,7 @@ mod tests {
                 .attention
         );
 
-        // §7'S ROW, IN §7'S ORDER, then the three documented additions.
+        // §7'S ROW, IN §7'S ORDER, then the six documented additions.
         let (body, _) = crate::body::Body::decode(
             b"v=1 t=1 inc=4 epoch=ab12 gen=9:beef state=live hold=0 holder=h-andrew \
               attention=needs%20a%20key",
@@ -655,7 +771,10 @@ mod tests {
                 "attention",
                 "gen",
                 "observer",
-                "epoch"
+                "epoch",
+                "phase",
+                "context",
+                "title"
             ],
             "the row must be §7's columns in §7's order, then the additions: {line}"
         );
@@ -663,10 +782,36 @@ mod tests {
             line.contains(" attention=needs%20a%20key ") && line.contains(" gen=9:beef "),
             "{line}"
         );
-        // The four columns §4.2 specifies and this fabric has no writer for read
-        // `-`, which is "unknown" and not a promise.
-        for absent in ["role=-", "detail=-", "driving=-", "fabric=-"] {
+        // The columns this row's writer did not fill read `-`, which is
+        // "unknown" and not a promise — `driving=` and `fabric=` have no
+        // session-row writer at all; `role=`, `detail=`, `phase=`, `context=`
+        // and `title=` have one since round 13, and this body (an older or
+        // `minimal` bridge's) carries none of them.
+        for absent in [
+            "role=-",
+            "detail=-",
+            "driving=-",
+            "fabric=-",
+            "phase=-",
+            "context=-",
+            "title=-",
+        ] {
             assert!(line.contains(absent), "{absent} missing from: {line}");
+        }
+        // A ROUND-13 ROW: the five are printed as written, in their columns.
+        let (body, _) = crate::body::Body::decode(
+            b"v=1 t=1 inc=4 state=live hold=0 holder=- attention=- role=worker \
+              detail=claude phase=busy context=12%25 title=satcomp%20run",
+        );
+        let (line, _) = row("/f/f1/pub/n-a/s-w/presence", &body);
+        for present in [
+            " role=worker ",
+            " detail=claude ",
+            " phase=busy ",
+            " context=12%25 ",
+            " title=satcomp%20run",
+        ] {
+            assert!(line.contains(present), "{present} missing from: {line}");
         }
 
         // A ROW WITH NO ESCALATION IS NOT ONE, in all three spellings — absent,
@@ -695,7 +840,7 @@ mod tests {
         );
         assert_eq!(
             line.split_whitespace().count(),
-            15,
+            18,
             "one token per column, always: {line:?}"
         );
 

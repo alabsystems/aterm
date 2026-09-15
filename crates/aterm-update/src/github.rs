@@ -78,6 +78,17 @@ static LANE: AtomicU8 = AtomicU8::new(0);
 /// LENGTHEN the next wait without recording a failure: weather, not a broken updater.
 static RATE_LIMITED: AtomicBool = AtomicBool::new(false);
 
+/// THIS check fell from a rate-limited token lane onto the web host (2026-09-14,
+/// audit CC-8). Set by `acquire` when the LIST answers `RateLimited`, read by the
+/// web lane's pointer resolution so a 404 there is "not readable without the
+/// credential" rather than "the channel is unreadable"; cleared at every check's
+/// start. Process-wide like the sibling latches, for the same reason.
+static RATE_LIMIT_FALLBACK: AtomicBool = AtomicBool::new(false);
+
+/// The fallback has been logged once this process; a saturated shared token is
+/// re-observed on every check until its window renews.
+static ANNOUNCED_RATE_LIMIT_FALLBACK: AtomicBool = AtomicBool::new(false);
+
 /// Whether this process has already logged which lane it is on. Once per process: it
 /// is a standing condition, not an event.
 static ANNOUNCED_LANE: AtomicBool = AtomicBool::new(false);
@@ -842,6 +853,35 @@ impl RosterPolicy<'static> {
     };
 }
 
+/// The marker a refusal carries when it is THIS BUILD's trust anchor that cannot
+/// verify the channel, rather than the channel that is broken (2026-09-14): the
+/// compiled-in keyset cannot verify a signed appcast (a key rotation this build
+/// predates), or the pinned paper master cannot verify the machine roster (a master
+/// rotation it predates). Both are permanent for the build — selection yields one
+/// candidate and nothing falls back — so the persistent wording must name the one
+/// remedy, a reinstall, instead of "fixed at the publisher". A forged release lands
+/// on the same arms and gets the same advice; a reinstall from the publisher's own
+/// site is right for it too.
+pub const STALE_ANCHOR_KEY: &str = "cannot verify the channel's releases";
+
+/// The remedy a stranded client is told, beside [`STALE_ANCHOR_KEY`].
+pub const STALE_ANCHOR_REMEDY: &str = "reinstall aterm from the current release (tools/install.sh, \
+     or drag it from the release DMG) to get a build whose anchor matches the channel";
+
+/// Whether a `manifest`-class reason is the stranded-client refusal: the build's
+/// anchor, not the publisher, is what has to change.
+pub fn is_stale_anchor_refusal(reason: &str) -> bool {
+    reason.contains(STALE_ANCHOR_KEY)
+}
+
+fn stale_anchor_refusal(what: &str, error: &str, tag: &str) -> String {
+    format!(
+        "{what} ({error}); this build's trust anchor {STALE_ANCHOR_KEY} (a rotation it \
+         predates, or a release that is not the publisher's) — {STALE_ANCHOR_REMEDY}; \
+         refusing authoritative {tag}"
+    )
+}
+
 #[derive(Default)]
 struct AuthoritativeFetch {
     /// Manifest, its release, and the already-proved unique canonical container
@@ -859,6 +899,15 @@ struct AuthoritativeFetch {
     /// weather on either lane, and never a `pipeline`-class failure.
     asset_fetch_rate_limited: bool,
     manifest_rejected: bool,
+    /// WHY the manifest was rejected, in the words the log got (2026-09-14). The
+    /// health ledger used to book every rejection as the one fixed string
+    /// "manifest(s) fetched but rejected (signature/parse)", so `health.toml`,
+    /// `status.toml` and the pull-down could not tell a forged release from a
+    /// revoked signer from a client whose compiled-in anchor simply predates a key
+    /// or master rotation — and the last of those, the STRANDED client, was told
+    /// the publisher was broken and never that a reinstall is its only way out
+    /// ([`STALE_ANCHOR_KEY`]).
+    rejection_reason: Option<String>,
     /// Candidate-manifest fetches only. Detached-signature downloads are a
     /// subordinate verification step and intentionally do not increment this.
     #[cfg(test)]
@@ -912,6 +961,17 @@ fn unix_now() -> i64 {
 /// Why the roster chain did not produce an attribution — split into the two classes the
 /// health ledger must never confuse.
 ///
+impl AuthoritativeFetch {
+    /// Refuse the candidate: WARN the reason and carry it to the ledger. Every
+    /// rejection arm goes through here so the reason `health.toml` records is the
+    /// one the log printed.
+    fn refuse(&mut self, reason: String) {
+        crate::warn(&reason);
+        self.manifest_rejected = true;
+        self.rejection_reason = Some(reason);
+    }
+}
+
 /// Both are REFUSALS; neither is ever a fallthrough. The distinction is only about what
 /// the operator is told, and it matters because the wordings are not interchangeable:
 /// a `pipeline`-class transport failure is postponed-and-will-retry, while a `manifest`
@@ -1019,8 +1079,13 @@ fn authorize_by_roster(
     // (3)(4) Verify under the paper master, then parse — in that order, by construction.
     let verified =
         verify_roster(policy.master_pubkeys, roster_bytes, &roster_sig).map_err(|e| {
+            // The stranded-client arm of the armed tier: a master rotation this build
+            // predates (or a roster that is not the publisher's). The build cannot
+            // recover by retrying; the wording names the reinstall (2026-09-14).
             Refused(format!(
-                "machine roster did not verify under the pinned master ({e:?})"
+                "machine roster did not verify under the pinned master ({e:?}); this \
+                 build's trust anchor {STALE_ANCHOR_KEY} (a rotation it predates, or a \
+                 roster that is not the publisher's) — {STALE_ANCHOR_REMEDY}"
             ))
         })?;
     if verified.master_index() != 0 {
@@ -1174,11 +1239,12 @@ fn fetch_authoritative_release(
                     candidate.release.tag_name
                 )),
                 Err(error) => {
-                    crate::warn(&format!(
-                        "release manifest signature did not verify ({error:?}); refusing authoritative {}",
-                        candidate.release.tag_name
+                    fetched.refuse(stale_anchor_refusal(
+                        "release manifest signature did not verify against this build's \
+                         channel keyset",
+                        &format!("{error:?}"),
+                        &candidate.release.tag_name,
                     ));
-                    fetched.manifest_rejected = true;
                     return fetched;
                 }
             }
@@ -1231,11 +1297,10 @@ fn fetch_authoritative_release(
                 return fetched;
             }
             Err(RosterFailure::Refused(error)) => {
-                crate::warn(&format!(
+                fetched.refuse(format!(
                     "{error}; refusing authoritative {}",
                     candidate.release.tag_name
                 ));
-                fetched.manifest_rejected = true;
                 return fetched;
             }
         }
@@ -1244,11 +1309,10 @@ fn fetch_authoritative_release(
     let text = match String::from_utf8(bytes) {
         Ok(text) => text,
         Err(error) => {
-            crate::warn(&format!(
+            fetched.refuse(format!(
                 "authoritative {} appcast is not UTF-8: {error}",
                 candidate.release.tag_name
             ));
-            fetched.manifest_rejected = true;
             return fetched;
         }
     };
@@ -1261,12 +1325,11 @@ fn fetch_authoritative_release(
             if let Some(who) = &attribution
                 && let Err(reject) = who.bind(manifest.machine_id.as_deref(), manifest.roster_seq)
             {
-                crate::warn(&format!(
+                fetched.refuse(format!(
                     "authoritative {} verified under machine {} but its own attribution \
                      does not agree ({reject:?}); refusing",
                     candidate.release.tag_name, who.machine_id
                 ));
-                fetched.manifest_rejected = true;
                 return fetched;
             }
             if let Some(who) = &attribution {
@@ -1309,26 +1372,17 @@ fn fetch_authoritative_release(
                 Ok(artifact) => {
                     fetched.selected = Some((manifest, candidate.release, artifact));
                 }
-                Err(error) => {
-                    crate::warn(&error);
-                    fetched.manifest_rejected = true;
-                }
+                Err(error) => fetched.refuse(error),
             }
         }
-        Ok(manifest) => {
-            crate::warn(&format!(
-                "authoritative {} carries manifest version {:?}, expected {:?}",
-                candidate.release.tag_name, manifest.version, candidate.version
-            ));
-            fetched.manifest_rejected = true;
-        }
-        Err(error) => {
-            crate::warn(&format!(
-                "parse authoritative {} appcast: {error}",
-                candidate.release.tag_name
-            ));
-            fetched.manifest_rejected = true;
-        }
+        Ok(manifest) => fetched.refuse(format!(
+            "authoritative {} carries manifest version {:?}, expected {:?}",
+            candidate.release.tag_name, manifest.version, candidate.version
+        )),
+        Err(error) => fetched.refuse(format!(
+            "parse authoritative {} appcast: {error}",
+            candidate.release.tag_name
+        )),
     }
     fetched
 }
@@ -1402,10 +1456,12 @@ fn record_covered_stage_status(staging: &Staging, current_build: u64, manifest: 
     // that case we still record a decision — naming the candidate instead of inventing
     // a stage — because leaving the previous line standing is the very failure above.
     let msg = match Ready::read_publishable(staging) {
-        Some(ready) => format!(
-            "staged {} (build {}) — verified and ready to apply; release build {} needs \
-             no download",
-            ready.version, ready.build_number, manifest.build_number
+        Some(ready) => covered_stage_line(
+            staging,
+            current_build,
+            &ready.version,
+            ready.build_number,
+            manifest.build_number,
         ),
         None => format!(
             "a verified stage already covers release build {}",
@@ -1413,6 +1469,43 @@ fn record_covered_stage_status(staging: &Staging, current_build: u64, manifest: 
         ),
     };
     crate::status::record(staging, current_build, &msg);
+}
+
+/// The one-line verdict for a stage the check found already in place — WITH the
+/// apply lane's standing answer about that very build (2026-09-14). The check
+/// lane used to write "verified and ready to apply" over the apply lane's
+/// "did not apply: …" every half hour: for the ~6 h between two stand-downs on
+/// 2026-09-14 the ledger's outcome alternated back to "ready" twenty times
+/// while the apply lane had exhausted its budget on that build. The ledger
+/// knows both facts; the line says both.
+fn covered_stage_line(
+    staging: &Staging,
+    current_build: u64,
+    version: &str,
+    staged_build: u64,
+    release_build: u64,
+) -> String {
+    let mut msg = format!(
+        "staged {version} (build {staged_build}) — verified and ready to apply; release \
+         build {release_build} needs no download"
+    );
+    let ledger = crate::health::Health::read(&staging.health());
+    if ledger.last_apply_failure_target_build == staged_build
+        && ledger.apply_failures_for_target > 0
+    {
+        msg.push_str(&format!(
+            "; the apply lane has failed it {} time(s) — did not apply: {}",
+            ledger.apply_failures_for_target, ledger.last_apply_error
+        ));
+    } else if ledger.apply_refusal_applies_to(current_build)
+        && !ledger.last_apply_refusal.is_empty()
+    {
+        msg.push_str(&format!(
+            "; last apply refused: {}",
+            ledger.last_apply_refusal
+        ));
+    }
+    msg
 }
 
 /// The download path's counterpart to `install::sweep_stale_mounts` /
@@ -1591,11 +1684,17 @@ struct ListContext<'a> {
 enum Listing {
     /// Every page, in listing order.
     Releases(Vec<Release>),
-    /// A NON-failure end — channel unreadable (announced) or rate limited (status
-    /// recorded). The check is over.
+    /// A NON-failure end — channel unreadable (announced). The check is over.
     Ended,
     /// GitHub rejected the token: the check continues on the web lane.
     TokenRejected,
+    /// The token's budget ran out (2026-09-14, audit CC-8). The token-lane HOLD is
+    /// already recorded — siblings and the next LIST honour the server's reset — but
+    /// THIS check continues on the unmetered web host, exactly as a rejected token
+    /// does: a public repointed repo whose shared credential (`gh auth token`, a CI
+    /// PAT) was exhausted elsewhere used to sit out the whole window, up to an hour,
+    /// while one HEAD of the download host would have named the head.
+    RateLimited,
 }
 
 /// What one page GET produced.
@@ -1603,6 +1702,7 @@ enum Page {
     Body(Vec<u8>),
     Ended,
     TokenRejected,
+    RateLimited,
 }
 
 impl ListContext<'_> {
@@ -1662,7 +1762,7 @@ impl ListContext<'_> {
                     self.current_build,
                     &format!("update check deferred: {message}"),
                 );
-                Ok(Page::Ended)
+                Ok(Page::RateLimited)
             }
             ListDecision::Failed(message) => {
                 crate::health::Health::record_failure(&self.staging.health(), "network", &message);
@@ -1688,6 +1788,7 @@ fn list_releases(ctx: &mut ListContext<'_>) -> Result<Listing, String> {
             Page::Body(body) => body,
             Page::Ended => return Ok(Listing::Ended),
             Page::TokenRejected => return Ok(Listing::TokenRejected),
+            Page::RateLimited => return Ok(Listing::RateLimited),
         };
         // Unparseable list JSON is the same `network` class (the LIST layer failed —
         // a proxy/portal mangling the response looks exactly like this).
@@ -1741,6 +1842,11 @@ enum WebHead {
     /// A NON-failure end — the channel has no published release (announced, loud) or
     /// the host asked us to wait (deferred). The check is over.
     Ended,
+    /// The pointer names a release of this channel that is not an APP release
+    /// (2026-09-14): the newest app release is elected from the listing, exactly
+    /// as for a source-only head — and, like that head, the tag is NOT recorded
+    /// as authorized, so a later app cut that outranks it is seen next check.
+    NonAppHead { tag: String },
 }
 
 /// The names of every asset the web lane may fetch for release `tag`, in the index
@@ -1826,6 +1932,19 @@ fn resolve_web_head(
     );
     let pointer = match pointer {
         Ok(pointer) => pointer,
+        Err(PointerError::NoRelease { .. }) if RATE_LIMIT_FALLBACK.load(Ordering::Relaxed) => {
+            // A private repo reached on the rate-limit fallback (2026-09-14): the
+            // web host cannot read it without the credential the token lane holds.
+            // That is not "cannot read the channel" — the token-lane hold already
+            // on the ledger is the whole story, and the next LIST after the reset
+            // reads it again. Announce nothing; the check simply ends.
+            crate::log(&format!(
+                "github.com/{}/{} is not readable without the credential whose budget \
+                 ran out; the token-lane hold stands",
+                source.owner, source.repo
+            ));
+            return Ok(WebHead::Ended);
+        }
         Err(PointerError::NoRelease { .. }) => {
             crate::no_token::announce_unreadable(
                 staging,
@@ -1841,6 +1960,19 @@ fn resolve_web_head(
                 &format!("update check deferred: {error}"),
             );
             return Ok(WebHead::Ended);
+        }
+        // THE NON-APP HEAD (2026-09-14). This repository, this asset name, a safe
+        // tag this client does not install from — an index cut published as a
+        // normal release. It used to be filed as a `network` failure (the one
+        // class that never escalates) with no listing consulted, so every
+        // web-lane client silently stopped updating until the next app cut
+        // outranked it. It takes the source-only head's road instead.
+        Err(PointerError::OtherTag { tag }) => {
+            crate::warn(&format!(
+                "channel head {tag} is not an app release; electing the newest published \
+                 release that carries an app manifest"
+            ));
+            return Ok(WebHead::NonAppHead { tag });
         }
         // A refused redirect, an unexpected status, an unsafe source, a transport
         // failure: the historical `network`-class failure. A refusal in particular is
@@ -1927,6 +2059,29 @@ fn web_head_fallback(
         "channel head {head_tag} has no app manifest (a source-only release); electing the \
          newest published release that carries one"
     ));
+    elect_from_listing(
+        staging,
+        current_build,
+        source,
+        head_tag,
+        list,
+        pinned_update_pubkeys,
+    )
+}
+
+/// The listing election both fallbacks share: the source-only head (above) and
+/// the NON-APP head (2026-09-14 — an `atpkg-index-<n>` or similar cut published
+/// as a normal release captures `/releases/latest`; the app releases below it
+/// are intact). One anonymous LIST, `head_tag` excluded by name, the newest
+/// published release carrying a manifest rebuilt under the derived URLs.
+fn elect_from_listing(
+    staging: &Staging,
+    current_build: u64,
+    source: &Source,
+    head_tag: &str,
+    list: ListFetch<'_>,
+    pinned_update_pubkeys: &[&str],
+) -> Result<HeadFallback, String> {
     let mut catalog: Vec<Release> = Vec::new();
     for page in 1..=MAX_PAGES {
         let url = releases_page_url(source, page);
@@ -2105,6 +2260,11 @@ enum Acquisition {
 /// compare EQUAL on the numeric triple — a version test could not tell them
 /// apart, and build metadata is explicitly not ordered (`VERSIONING.md`).
 pub fn check_and_stage(current_build: u64, source: &Source) -> Result<Option<String>, String> {
+    if bundle::resolve().is_none() {
+        return Ok(None);
+    }
+    RATE_LIMITED.store(false, Ordering::Relaxed);
+    RATE_LIMIT_RESET.store(0, Ordering::Relaxed);
     let result = check_and_stage_inner(current_build, source);
     // EVERY exit writes status, including the failing ones. The eight `Err` paths
     // below all returned without recording, so `status.toml` kept advertising the
@@ -2132,6 +2292,15 @@ pub fn check_and_stage(current_build: u64, source: &Source) -> Result<Option<Str
         crate::progress::report(crate::progress::Progress::Failed {
             detail: error.clone(),
         });
+    }
+    if let Some(staging) = Staging::resolve() {
+        crate::check_receipt::record(
+            &staging,
+            current_build,
+            source,
+            rate_limited(),
+            rate_limit_reset(),
+        );
     }
     result
 }
@@ -2203,6 +2372,20 @@ fn acquire(
             // the web lane's definition. Fall through with the diagnosis the rejection
             // implies (the chain did resolve something; it just does not work).
             Listing::TokenRejected => {}
+            // The token's budget ran out: the hold is on the ledger, and this check
+            // falls to the unmetered host (2026-09-14). Throttled: a saturated shared
+            // token is re-observed on every check until the reset.
+            Listing::RateLimited => {
+                RATE_LIMIT_FALLBACK.store(true, Ordering::Relaxed);
+                if !ANNOUNCED_RATE_LIMIT_FALLBACK.swap(true, Ordering::Relaxed) {
+                    crate::log(&format!(
+                        "the update token's API budget ran out; the token lane holds until \
+                         it renews, and this check continues over the unmetered download \
+                         host for github.com/{}/{}",
+                        source.owner, source.repo
+                    ));
+                }
+            }
         }
     } else if let Some(diagnosis) = diagnosis.as_ref() {
         // A token that our own chain refused (a chmod 644 file, a mangled paste)
@@ -2214,7 +2397,7 @@ fn acquire(
     // THE WEB LANE. The recorded tag is trusted only when the ledger still describes
     // THIS build's verdict on THIS source (`status::latest_tag`).
     let known_tag = crate::status::latest_tag(staging, current_build, source);
-    match resolve_web_head(
+    let web = resolve_web_head(
         staging,
         current_build,
         source,
@@ -2222,7 +2405,16 @@ fn acquire(
         diagnosis.as_ref(),
         crate::PINNED_UPDATE_PUBKEYS,
         head,
-    )? {
+    )?;
+    if RATE_LIMIT_FALLBACK.load(Ordering::Relaxed) {
+        // A readable web head cleared the process latches (`note_readable`), but
+        // the token lane is still out of budget: re-assert the hold the LIST
+        // recorded so the loop waits for the reset rather than re-spending the
+        // budget on the next tick. The ledger's `held_until` carries the epoch.
+        RATE_LIMITED.store(true, Ordering::Relaxed);
+        let _ = hold_until_reset(staging);
+    }
+    match web {
         WebHead::Ended => Ok(Acquisition::Ended),
         WebHead::Unchanged { tag } => {
             note_delivery(staging, Lane::Web, None);
@@ -2236,6 +2428,46 @@ fn acquire(
                 web_tag: Some(candidate.release.tag_name.clone()),
                 candidate: Some(candidate),
             }))
+        }
+        WebHead::NonAppHead { tag } => {
+            note_readable(Lane::Web, source);
+            note_delivery(staging, Lane::Web, None);
+            match elect_from_listing(
+                staging,
+                current_build,
+                source,
+                &tag,
+                list,
+                crate::PINNED_UPDATE_PUBKEYS,
+            )? {
+                HeadFallback::Candidate(candidate) => {
+                    let elected = candidate.release.tag_name.clone();
+                    crate::status::set_check_note(format!(
+                        "channel head {tag} is not an app release; the newest app release is \
+                         {elected}"
+                    ));
+                    Ok(Acquisition::Proceed(Acquired {
+                        lane: Lane::Web,
+                        tok: None,
+                        web_tag: Some(elected),
+                        candidate: Some(candidate),
+                    }))
+                }
+                HeadFallback::Nothing => {
+                    crate::health::Health::record_success(&staging.health());
+                    crate::status::record(
+                        staging,
+                        current_build,
+                        &format!(
+                            "channel head {tag} is not an app release, and no published \
+                             release carries an app manifest{}",
+                            lane_note(source)
+                        ),
+                    );
+                    Ok(Acquisition::Ended)
+                }
+                HeadFallback::NotNeeded | HeadFallback::Ended => Ok(Acquisition::Ended),
+            }
         }
     }
 }
@@ -2314,16 +2546,23 @@ fn reclaim_retired_state(staging: &Staging) {
 
 fn check_and_stage_inner(current_build: u64, source: &Source) -> Result<Option<String>, String> {
     // Only stage for a real installed bundle (a dev build has nothing to swap).
-    if bundle::resolve().is_none() {
+    let Some(installed) = bundle::resolve() else {
         return Ok(None);
-    }
+    };
     let staging = Staging::resolve().ok_or("could not resolve Updates dir")?;
+    // Recursive copy cleanup runs in this checker worker. Both staging and
+    // cross-volume apply leave isolated attempts on their destination volume.
+    install::reap_abandoned_copy_attempts(&staging.staged_dir());
+    if let Some(parent) = installed.app_root.parent() {
+        install::reap_abandoned_copy_attempts(parent);
+    }
     reclaim_retired_state(&staging);
     crate::status::clear_check_note();
     // The hold epoch is THIS check's to set or not: a previous check's reset must never
     // be read back by the loop as this one's (a rate-limited LIST whose headers carry
     // no reset would otherwise "hold" to an epoch already in the past).
     RATE_LIMIT_RESET.store(0, Ordering::Relaxed);
+    RATE_LIMIT_FALLBACK.store(false, Ordering::Relaxed);
     // A surviving apply streak recorded by a DIFFERENT build is proven stale
     // — the machine moved by SOME means (channel, manual install, boot swap)
     // — so every check heals it here rather than letting `update status`
@@ -2373,18 +2612,31 @@ fn check_and_stage_inner(current_build: u64, source: &Source) -> Result<Option<S
             // THE STEADY STATE, on one request. The pointer names the tag this ledger
             // last authorized, so nothing is fetched and nothing is re-judged: the
             // release was accepted or declined on a previous check under the same
-            // gates, and only a MOVED pointer can change that answer. A terminal
+            // gates, and its required local stage still covers that decision. A terminal
             // healthy outcome — the channel was read.
             crate::health::Health::record_success(&staging.health());
-            crate::status::set_latest_tag(&tag, source);
-            crate::status::record(
-                &staging,
-                current_build,
-                &format!("up to date (channel head {tag}){}", lane_note(source)),
-            );
+            // A strictly newer build already staged is the fact this line must
+            // carry (2026-09-14): "up to date" beside `staged_build = <newer>`
+            // and six failed applies told an operator the machine was current.
+            let stage = applicable_stage(&staging, current_build);
+            let line = match (&stage, Ready::read_publishable(&staging)) {
+                (Some(_), Some(ready)) => format!(
+                    "{}; channel head {tag} unchanged{}",
+                    covered_stage_line(
+                        &staging,
+                        current_build,
+                        &ready.version,
+                        ready.build_number,
+                        ready.build_number,
+                    ),
+                    lane_note(source)
+                ),
+                _ => format!("up to date (channel head {tag}){}", lane_note(source)),
+            };
+            crate::status::record(&staging, current_build, &line);
             // …still answering `Some` for a stage a sibling won the race to publish,
             // so this process's apply lane arms too (see the covered arms below).
-            return Ok(applicable_stage(&staging, current_build));
+            return Ok(stage);
         }
     };
     let Acquired {
@@ -2485,12 +2737,9 @@ fn check_and_stage_inner(current_build: u64, source: &Source) -> Result<Option<S
         && let Some((manifest, release, _)) = fetched.selected.as_ref()
         && let Err(error) = web_container_url_agrees(source, &release.tag_name, manifest)
     {
-        crate::warn(&format!(
-            "{error}; refusing authoritative {}",
-            release.tag_name
-        ));
+        let reason = format!("{error}; refusing authoritative {}", release.tag_name);
         fetched.selected = None;
-        fetched.manifest_rejected = true;
+        fetched.refuse(reason);
     }
     // ATTRIBUTION, recorded where a human will find it later: the updater's own status
     // file, beside the release it describes. The owner's requirement is "I can track
@@ -2507,6 +2756,7 @@ fn check_and_stage_inner(current_build: u64, source: &Source) -> Result<Option<S
     let appcast_fetch_error = fetched.appcast_fetch_error;
     let asset_fetch_rate_limited = fetched.asset_fetch_rate_limited;
     let manifest_rejected = fetched.manifest_rejected;
+    let rejection_reason = fetched.rejection_reason.take();
     let observed_roster_seq = fetched.observed_roster_seq;
     let best = fetched.selected;
     let seen_min_build = best
@@ -2645,23 +2895,31 @@ fn check_and_stage_inner(current_build: u64, source: &Source) -> Result<Option<S
             // Manifests were FETCHED but rejected (unsigned / bad signature /
             // unparseable / a version or URL that does not bind to the tag): the
             // pipeline works; the release side (or an attacker) is the problem. Its
-            // own class — it must not clear a streak.
-            let h = crate::health::Health::record_failure(
-                &staging.health(),
-                "manifest",
-                "manifest(s) fetched but rejected (signature/parse)",
-            );
+            // own class — it must not clear a streak. The ledger gets the reason the
+            // log printed (2026-09-14), and a STRANDED client — one whose own anchor
+            // cannot verify the channel — is told to reinstall, not to wait for the
+            // publisher.
+            let reason = rejection_reason
+                .as_deref()
+                .unwrap_or("manifest(s) fetched but rejected (signature/parse)");
+            let h = crate::health::Health::record_failure(&staging.health(), "manifest", reason);
             if h.manifest_failures >= crate::PERSISTENT_AFTER {
-                format!(
-                    "FAILING ({} consecutive checks since {}): manifest(s) fetched but \
-                     rejected (signature/parse) — this machine cannot install any release \
-                     until that is fixed at the publisher",
-                    h.manifest_failures,
-                    h.class_since("manifest")
-                )
+                if is_stale_anchor_refusal(reason) {
+                    format!(
+                        "FAILING ({} consecutive checks since {}): {reason}",
+                        h.manifest_failures,
+                        h.class_since("manifest")
+                    )
+                } else {
+                    format!(
+                        "FAILING ({} consecutive checks since {}): {reason} — this machine \
+                         cannot install any release until that is fixed at the publisher",
+                        h.manifest_failures,
+                        h.class_since("manifest")
+                    )
+                }
             } else {
-                "no stageable release: manifest(s) fetched but rejected (signature/parse)"
-                    .to_string()
+                format!("no stageable release: {reason}")
             }
         } else {
             // The check itself ran fine (the head was read, nothing carries a
@@ -2691,7 +2949,7 @@ fn check_and_stage_inner(current_build: u64, source: &Source) -> Result<Option<S
     if manifest.build_number <= current_build {
         crate::health::Health::record_success(&staging.health());
         if let Some(tag) = web_tag.as_deref() {
-            crate::status::set_latest_tag(tag, source);
+            crate::status::set_latest_tag(tag, source, current_build, manifest.build_number);
         }
         crate::status::record(
             &staging,
@@ -2755,7 +3013,7 @@ fn check_and_stage_inner(current_build: u64, source: &Source) -> Result<Option<S
     if publishable_stage_covers(&staging, &manifest) {
         crate::health::Health::record_success(&staging.health());
         if let Some(tag) = web_tag.as_deref() {
-            crate::status::set_latest_tag(tag, source);
+            crate::status::set_latest_tag(tag, source, current_build, manifest.build_number);
         }
         record_covered_stage_status(&staging, current_build, &manifest);
         // ANSWER `Some`, exactly as the check loop's contract says: "the check
@@ -2829,7 +3087,7 @@ fn check_and_stage_inner(current_build: u64, source: &Source) -> Result<Option<S
     if publishable_stage_covers(&staging, &manifest) {
         crate::health::Health::record_success(&staging.health());
         if let Some(tag) = web_tag.as_deref() {
-            crate::status::set_latest_tag(tag, source);
+            crate::status::set_latest_tag(tag, source, current_build, manifest.build_number);
         }
         record_covered_stage_status(&staging, current_build, &manifest);
         return Ok(Ready::read_publishable(&staging).map(|ready| ready.version));
@@ -3030,7 +3288,7 @@ fn check_and_stage_inner(current_build: u64, source: &Source) -> Result<Option<S
     crate::manifest::Floor::bump_and_write(&staging.floor(), 0, manifest.build_number, 0);
     // …and remember the tag, so the next web-lane check is one HEAD.
     if let Some(tag) = web_tag.as_deref() {
-        crate::status::set_latest_tag(tag, source);
+        crate::status::set_latest_tag(tag, source, current_build, manifest.build_number);
     }
 
     // NOT "applies on next launch". The stager has no idea whether it does: the
@@ -6010,6 +6268,107 @@ mod tests {
         assert!(replayed.selected.is_none() && replayed.manifest_rejected);
     }
 
+    /// A STRANDED CLIENT IS TOLD TO REINSTALL, NOT TO WAIT FOR THE PUBLISHER
+    /// (2026-09-14, audit LT-3).
+    ///
+    /// Two refusals are permanent for the BUILD rather than for the channel: the
+    /// compiled-in keyset cannot verify a signed appcast (a key rotation this build
+    /// predates — every pre-roster client on this channel today), and the pinned paper
+    /// master cannot verify the roster (a master rotation it predates). Selection
+    /// yields one candidate with no fallback, so retrying changes nothing and no
+    /// release the publisher cuts will ever verify here. The refusal used to reach the
+    /// ledger as the fixed "manifest(s) fetched but rejected (signature/parse)" and the
+    /// persistent line blamed the publisher; now the reason itself travels
+    /// ([`AuthoritativeFetch::rejection_reason`]) and the anchor arms carry
+    /// [`STALE_ANCHOR_KEY`] and the reinstall remedy. The OTHER roster refusals (a
+    /// missing roster, a lapsed or rolled-back generation) are the publisher's to
+    /// fix and must NOT carry the key — a reinstall would change nothing for them.
+    #[test]
+    fn a_stale_anchor_names_the_reinstall_and_a_publisher_fault_does_not() {
+        // (A) The keyset tier: a signature by a key this build never held.
+        let retired = Ed25519KeyPair::from_seed_unchecked(&SIGNING_SEED).unwrap();
+        let current = Ed25519KeyPair::from_seed_unchecked(&[42u8; 32]).unwrap();
+        let k_current = b64(current.public_key().as_ref());
+        let manifest = manifest_bytes("0.10.0", 10, 0);
+        let signature = retired.sign(&manifest).as_ref().to_vec();
+        let keyset = [k_current.as_str()];
+        let selected = select_authoritative_release(
+            vec![release_with_signed_appcast("v0.10.0", "m-url", "sig-url")],
+            &keyset,
+        )
+        .unwrap()
+        .unwrap();
+        let mut download = |url: &str, _max: u64| match url {
+            "m-url" => Ok(manifest.clone()),
+            "sig-url" => Ok(signature.clone()),
+            other => Err(format!("unexpected fetch {other}")),
+        };
+        let unverifiable = fetch_authoritative_release(
+            Some(selected),
+            &keyset,
+            &mut download,
+            &RosterPolicy::INERT,
+        );
+        assert!(unverifiable.manifest_rejected);
+        let reason = unverifiable
+            .rejection_reason
+            .as_deref()
+            .expect("a rejection carries its reason to the ledger");
+        assert!(
+            is_stale_anchor_refusal(reason) && reason.contains(STALE_ANCHOR_REMEDY),
+            "the keyset arm is the stranded client's: {reason}"
+        );
+        assert!(
+            reason.contains("v0.10.0"),
+            "the reason still names the release it refused: {reason}"
+        );
+
+        // (B) The armed tier: a roster signed by a master this build does not pin.
+        let m3_pub = pub_b64(&M3_SEED_FIXTURE);
+        let keyset = [m3_pub.as_str()];
+        let good = chain(
+            &[("m3", M3_SEED_FIXTURE)],
+            &[],
+            ("m3", M3_SEED_FIXTURE),
+            4,
+            &MASTER_SEED_FIXTURE,
+            4,
+        );
+        let masters = [good.master_pub.as_str()];
+        let wrong_master = chain(
+            &[("m3", M3_SEED_FIXTURE)],
+            &[],
+            ("m3", M3_SEED_FIXTURE),
+            4,
+            &OTHER_MASTER_FIXTURE,
+            4,
+        );
+        let (forged, _) = run_chain(&wrong_master, &keyset, &masters, 0, ROSTER_NOW);
+        let reason = forged.rejection_reason.as_deref().expect("reason");
+        assert!(
+            is_stale_anchor_refusal(reason) && reason.contains(STALE_ANCHOR_REMEDY),
+            "an unverifiable roster is the stranded client's other arm: {reason}"
+        );
+
+        // (C) The publisher's faults keep the publisher wording: a lapsed roster and a
+        //     rolled-back one are refused with a reason that carries NO reinstall.
+        let (lapsed, _) = run_chain(&good, &keyset, &masters, 0, 1_900_000_000);
+        let reason = lapsed.rejection_reason.as_deref().expect("reason");
+        assert!(
+            lapsed.manifest_rejected && !is_stale_anchor_refusal(reason),
+            "a lapsed roster is the publisher's to refresh, not a reinstall: {reason}"
+        );
+        let (replayed, _) = run_chain(&good, &keyset, &masters, 5, ROSTER_NOW);
+        let reason = replayed.rejection_reason.as_deref().expect("reason");
+        assert!(
+            replayed.manifest_rejected && !is_stale_anchor_refusal(reason),
+            "a rolled-back roster is a replay, not a stale anchor: {reason}"
+        );
+        // And a verified, accepted release carries no reason at all.
+        let (accepted, _) = run_chain(&good, &keyset, &masters, 0, ROSTER_NOW);
+        assert!(accepted.selected.is_some() && accepted.rejection_reason.is_none());
+    }
+
     /// A ROSTER ASSET THAT WILL NOT DOWNLOAD is a TRANSPORT failure, not a publisher
     /// error — and it still refuses.
     ///
@@ -6457,7 +6816,8 @@ mod tests {
             &staging.status,
             format!(
                 "schema = 1\noutcome = \"x\"\ncurrent_build = {build}\nlatest_tag = {tag:?}\n\
-                 latest_source = {source:?}\n"
+                 latest_source = {source:?}\nlatest_authorized_build = {build}\n\
+                 latest_release_build = {build}\n"
             ),
         )
         .unwrap();
@@ -6613,6 +6973,94 @@ mod tests {
             );
         }
         let _ = std::fs::remove_dir_all(&staging.root);
+    }
+
+    #[test]
+    fn an_unchanged_web_head_refetches_a_signed_release_after_its_stage_is_lost() {
+        let _guard = crate::STRANDED_TEST_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let staging = Staging::scratch("web-lost-stage");
+        let source = test_source();
+        let mut channel = web_channel(Some(&tag_url(WEB_TAG, "aterm-0.10.0.dmg")));
+        // The generic transport fixture omits commit identity. This publication
+        // test needs one, covered by the same real detached signature.
+        channel
+            .appcast
+            .extend_from_slice(b"commit = \"0123456789abcdef0123456789abcdef01234567\"\n");
+        let signer = Ed25519KeyPair::from_seed_unchecked(&M3_SEED_FIXTURE).unwrap();
+        channel.appcast_sig = signer.sign(&channel.appcast).as_ref().to_vec();
+        let masters = [channel.master_pub.as_str()];
+        crate::status::clear_check_note();
+        let (outcome, _) = acquire_web_from(&staging, &source, || redirect_to(WEB_TAG));
+        let Ok(Acquisition::Proceed(acquired)) = outcome else {
+            panic!("the first check must acquire its authority: {outcome:?}");
+        };
+        let fetched = fetch_authoritative_release(
+            acquired.candidate,
+            crate::PINNED_UPDATE_PUBKEYS,
+            &mut |url, _| channel.serve(url),
+            &channel.policy(&masters),
+        );
+        let (manifest, _, _) = fetched.selected.expect("the real signature chain accepts");
+        let commit = manifest.commit.as_deref().expect("signed identity");
+        write_ready(&staging, manifest.build_number, commit, &manifest.sha256);
+        write_bundle_identity(&staging, manifest.build_number, commit);
+        crate::status::set_latest_tag(WEB_TAG, &source, WEB_BUILD, manifest.build_number);
+        crate::status::record(&staging, WEB_BUILD, "verified stage published");
+        let (outcome, heads) = acquire_web_from(&staging, &source, || redirect_to(WEB_TAG));
+        assert_eq!(heads, vec![evergreen_url()]);
+        assert!(matches!(outcome, Ok(Acquisition::UpToDate { .. })));
+
+        // Publication invalidates a previous marker before committing the next
+        // one. A failed commit or interrupted writer leaves exactly this state,
+        // with no call to retire_published to clear the cached tag.
+        std::fs::remove_file(&staging.ready).unwrap();
+        crate::status::clear_check_note();
+        crate::status::record(&staging, WEB_BUILD, "replacement publication failed");
+        assert!(Ready::read_publishable(&staging).is_none());
+        let (outcome, heads) = acquire_web_from(&staging, &source, || redirect_to(WEB_TAG));
+        assert_eq!(heads, vec![evergreen_url()]);
+        let Ok(Acquisition::Proceed(acquired)) = outcome else {
+            panic!("the unchanged head must retry the lost stage: {outcome:?}");
+        };
+        let mut gets = Vec::new();
+        let recovered = fetch_authoritative_release(
+            acquired.candidate,
+            crate::PINNED_UPDATE_PUBKEYS,
+            &mut |url, _| {
+                gets.push(url.to_string());
+                channel.serve(url)
+            },
+            &channel.policy(&masters),
+        );
+        assert_eq!(
+            recovered.selected.unwrap().0.build_number,
+            manifest.build_number
+        );
+        assert_eq!(
+            gets.len(),
+            4,
+            "recovery repeats the complete signature chain"
+        );
+        assert!(gets.iter().all(|url| url.starts_with(&tag_prefix(WEB_TAG))));
+
+        // Historical negative control: trusting the bare tag still takes the
+        // shortcut and would never reach those four verification fetches.
+        assert!(matches!(
+            resolve_web_head(
+                &staging,
+                WEB_BUILD,
+                &source,
+                Some(WEB_TAG),
+                None,
+                crate::PINNED_UPDATE_PUBKEYS,
+                &mut |_| redirect_to(WEB_TAG),
+            ),
+            Ok(WebHead::Unchanged { .. })
+        ));
+        crate::status::clear_check_note();
+        let _ = std::fs::remove_dir_all(staging.root);
     }
 
     /// Every way the pointer can fail ends the check WITHOUT an API request: a 404 is
@@ -7272,7 +7720,11 @@ mod tests {
             token_source: Some("$ATERM_UPDATE_TOKEN"),
             fetch: &mut limited,
         };
-        assert!(matches!(list_releases(&mut ctx), Ok(Listing::Ended)));
+        assert!(
+            matches!(list_releases(&mut ctx), Ok(Listing::RateLimited)),
+            "a rate-limited LIST records its hold and continues on the web lane \
+             (2026-09-14, audit CC-8)"
+        );
         assert!(rate_limited());
         assert!(
             rate_limit_reset().is_some(),
@@ -7410,7 +7862,7 @@ mod tests {
         // This build, this source: the steady state — written the way the check writes
         // it, through `set_latest_tag` + `record`.
         crate::status::clear_check_note();
-        crate::status::set_latest_tag(WEB_TAG, &source);
+        crate::status::set_latest_tag(WEB_TAG, &source, WEB_BUILD, WEB_BUILD);
         crate::status::record(&staging, WEB_BUILD, "staged 0.10.0 (build 10)");
         let (outcome, heads) = acquire_web_from(&staging, &source, || redirect_to(WEB_TAG));
         assert_eq!(heads.len(), 1);
@@ -7522,6 +7974,127 @@ mod tests {
         assert!(!text.contains("rotate"), "{text}");
         let text = unreadable_explanation(404, &mirror, Some(&unprovisioned()));
         assert!(text.contains("no update token is provisioned"), "{text}");
+    }
+
+    /// A RATE-LIMITED TOKEN LANE FALLS TO THE UNMETERED HOST (2026-09-14, audit
+    /// CC-8). A repointed PUBLIC source whose shared credential ran out used to sit
+    /// out the whole window (up to an hour) although one HEAD of the download host
+    /// would have named the head: the LIST now records the token-lane hold as before
+    /// and THIS check continues on the web lane, the pointer's tag is the candidate,
+    /// and the loop still holds to the reset. A PRIVATE source reached the same way
+    /// answers 404 on the host — that is "not readable without the credential", not
+    /// "the channel is unreadable": nothing is announced, the hold stands.
+    #[test]
+    fn a_rate_limited_token_lane_continues_this_check_over_the_web_host() {
+        use std::os::unix::fs::PermissionsExt as _;
+        let _guard = crate::STRANDED_TEST_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let staging = Staging::scratch("rate-limit-fallback");
+        crate::status::clear_check_note();
+        crate::no_token::clear();
+        let _ = std::fs::remove_file(&staging.status);
+        let support = support_dir(&staging);
+        let token_file = support.join("update-token");
+        std::fs::write(&token_file, "ghp_shared_and_exhausted\n").unwrap();
+        std::fs::set_permissions(&token_file, std::fs::Permissions::from_mode(0o600)).unwrap();
+        let source = Source {
+            owner: "example".into(),
+            repo: "public-mirror".into(),
+        };
+        let reset = unix_now_secs() + 20 * 60;
+        std::fs::write(
+            staging.list_headers(),
+            format!(
+                "HTTP/2 403 \r\nx-ratelimit-limit: 5000\r\nx-ratelimit-remaining: 0\r\n\
+                 x-ratelimit-reset: {reset}\r\n\r\n"
+            ),
+        )
+        .unwrap();
+        let mut lists = 0usize;
+        let mut list = |url: &str, _token: &str| {
+            lists += 1;
+            Err(HttpError::RateLimited {
+                code: 403,
+                url: url.to_string(),
+                authenticated: true,
+            })
+        };
+        let mut heads = Vec::new();
+        let mut head = |url: &str| {
+            heads.push(url.to_string());
+            Ok(HeadAnswer {
+                code: 302,
+                location: Some(
+                    aterm_update_core::cdn::release_download_url(
+                        "example",
+                        "public-mirror",
+                        WEB_TAG,
+                        APPCAST_ASSET,
+                    )
+                    .unwrap(),
+                ),
+            })
+        };
+        let outcome = acquire(&staging, WEB_BUILD, &source, &support, &mut list, &mut head);
+        assert_eq!(lists, 1, "one LIST, rate limited");
+        assert_eq!(
+            heads.len(),
+            1,
+            "then one HEAD of the unmetered host: {heads:?}"
+        );
+        let Ok(Acquisition::Proceed(acquired)) = outcome else {
+            panic!("the check continues on the web lane: {outcome:?}");
+        };
+        assert_eq!(acquired.lane, Lane::Web);
+        assert_eq!(acquired.web_tag.as_deref(), Some(WEB_TAG));
+        assert!(
+            rate_limited() && rate_limit_reset().is_some(),
+            "the token lane's hold survives the web read, so the loop waits for the reset"
+        );
+        let text = std::fs::read_to_string(&staging.status).unwrap();
+        assert!(
+            text.contains("held_until"),
+            "the ledger holds siblings too: {text}"
+        );
+        assert!(!staging.health().exists(), "weather is not a fault");
+        assert!(!crate::no_token::is_stranded());
+
+        // The private shape: the host answers 404. Nothing is announced.
+        crate::status::clear_check_note();
+        let mut list = |url: &str, _token: &str| {
+            Err(HttpError::RateLimited {
+                code: 403,
+                url: url.to_string(),
+                authenticated: true,
+            })
+        };
+        let mut head = |_url: &str| {
+            Ok(HeadAnswer {
+                code: 404,
+                location: None,
+            })
+        };
+        let private = Source {
+            owner: "example".into(),
+            repo: "private-mirror".into(),
+        };
+        let outcome = acquire(
+            &staging, WEB_BUILD, &private, &support, &mut list, &mut head,
+        );
+        assert!(
+            matches!(outcome, Ok(Acquisition::Ended)),
+            "a private repo on the fallback simply ends the check: {outcome:?}"
+        );
+        assert!(
+            !crate::no_token::is_stranded(),
+            "\"cannot read the channel\" is not announced for a budget that will renew"
+        );
+        assert!(rate_limited(), "the hold stands");
+        note_readable(Lane::Token, &source);
+        RATE_LIMIT_FALLBACK.store(false, Ordering::Relaxed);
+        let _ = std::fs::remove_file(&token_file);
+        let _ = std::fs::remove_dir_all(&staging.root);
     }
 
     /// The memo files of the retired conditional-request design are reclaimed from the
@@ -7767,6 +8340,180 @@ mod tests {
         );
         assert!(!staging.health().exists(), "still no health.toml");
         note_readable(Lane::Web, &test_source());
+        let _ = std::fs::remove_dir_all(&staging.root);
+    }
+
+    // -----------------------------------------------------------------------------
+    // CHECK-CHANNEL AUDIT, 2026-09-14. Failing tests; see also
+    // `crate::check_channel_audit_tests`.
+    // -----------------------------------------------------------------------------
+
+    /// The channel repository as the releases API listed it on 2026-09-14: app
+    /// releases beside `atpkg-index-<n>` and `atpkg-claude-<date>` releases, which
+    /// carry no appcast and stay off `/releases/latest` ONLY because the index tool
+    /// passes `--prerelease`. One of them published without the flag — the exact
+    /// mistake `tools/atpkg-index.sh`'s fallback text (line 1128) warns "captures
+    /// /releases/latest away from the app releases" — is the head here.
+    fn non_app_head_listing() -> Vec<u8> {
+        br#"[
+          {"tag_name":"atpkg-index-31","draft":false,"prerelease":false,"assets":[
+            {"name":"aterm-machines.toml","url":"https://api.github.com/repos/alabsystems/aterm/releases/assets/100","size":427},
+            {"name":"aterm-machines.toml.sig","url":"https://api.github.com/repos/alabsystems/aterm/releases/assets/101","size":64},
+            {"name":"index.toml","url":"https://api.github.com/repos/alabsystems/aterm/releases/assets/102","size":9000},
+            {"name":"index.toml.sig","url":"https://api.github.com/repos/alabsystems/aterm/releases/assets/103","size":64}]},
+          {"tag_name":"v0.79.0","draft":false,"prerelease":false,"assets":[
+            {"name":"aterm-appcast.toml","url":"https://api.github.com/repos/alabsystems/aterm/releases/assets/60","size":512},
+            {"name":"aterm-appcast.toml.sig","url":"https://api.github.com/repos/alabsystems/aterm/releases/assets/61","size":64},
+            {"name":"aterm-machines.toml","url":"https://api.github.com/repos/alabsystems/aterm/releases/assets/62","size":541},
+            {"name":"aterm-0.79.0.dmg","url":"https://api.github.com/repos/alabsystems/aterm/releases/assets/63","size":1}]},
+          {"tag_name":"atpkg-index-30","draft":false,"prerelease":true,"assets":[
+            {"name":"index.toml","url":"https://api.github.com/repos/alabsystems/aterm/releases/assets/90","size":9000}]},
+          {"tag_name":"v0.78.0","draft":false,"prerelease":false,"assets":[
+            {"name":"aterm-appcast.toml","url":"https://api.github.com/repos/alabsystems/aterm/releases/assets/50","size":512},
+            {"name":"aterm-appcast.toml.sig","url":"https://api.github.com/repos/alabsystems/aterm/releases/assets/51","size":64}]}
+        ]"#
+        .to_vec()
+    }
+
+    /// A NON-APP HEAD OF THIS CHANNEL IS THE SOURCE-ONLY HEAD ONE HOP EARLIER. The
+    /// pointer's `Location` is this repository's appcast URL under a tag the app
+    /// grammar refuses (`atpkg-index-31`): same host, same owner/repo, same asset
+    /// name, a safe path segment — nothing hostile, just not an app release. Today
+    /// `resolve_web_head` files that as a `network` failure ("the evergreen release
+    /// pointer redirected somewhere this client refuses to follow") and ends the
+    /// check: no listing is consulted, `network` is the one class that never
+    /// escalates, so every web-lane client on the fleet silently stops updating —
+    /// with `latest_tag` never recorded, re-failing every 30 minutes — until an app
+    /// cut outranks the index release. The head whose appcast 404s already takes
+    /// the listing fallback (`web_head_fallback`); this head must take the same road,
+    /// electing the newest published app release below it under DERIVED URLs. A
+    /// redirect to ANOTHER repository, host or asset stays refused and unfetched
+    /// (`every_web_lane_failure_path_ends_without_an_api_request`).
+    #[test]
+    fn check_channel_audit_a_non_app_head_of_this_channel_elects_from_the_listing() {
+        let _guard = crate::STRANDED_TEST_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let staging = Staging::scratch("non-app-head");
+        crate::status::clear_check_note();
+        let _ = std::fs::remove_file(&staging.status);
+        let source = test_source();
+        let mut heads = Vec::new();
+        let mut head = |url: &str| {
+            heads.push(url.to_string());
+            Ok(HeadAnswer {
+                code: 302,
+                location: Some(tag_url("atpkg-index-31", APPCAST_ASSET)),
+            })
+        };
+        let mut lists: Vec<(String, String)> = Vec::new();
+        let mut list = |url: &str, token: &str| {
+            lists.push((url.to_string(), token.to_string()));
+            Ok(non_app_head_listing())
+        };
+        let outcome = acquire(
+            &staging,
+            WEB_BUILD,
+            &source,
+            &support_dir(&staging),
+            &mut list,
+            &mut head,
+        );
+        assert_eq!(
+            heads,
+            vec![evergreen_url()],
+            "one HEAD of the evergreen URL"
+        );
+        assert_eq!(
+            crate::health::Health::read(&staging.health()).network_failures,
+            0,
+            "a non-app head of this very channel is not a network fault: {outcome:?}"
+        );
+        let Ok(Acquisition::Proceed(acquired)) = outcome else {
+            panic!("the newest app release below the non-app head is elected: {outcome:?}");
+        };
+        assert_eq!(acquired.lane, Lane::Web);
+        assert!(acquired.tok.is_none());
+        let candidate = acquired.candidate.expect("an elected candidate");
+        assert_eq!(candidate.release.tag_name, "v0.79.0");
+        assert_eq!(candidate.version, "0.79.0");
+        for asset in &candidate.release.assets {
+            assert_eq!(
+                asset.url,
+                tag_url("v0.79.0", &asset.name),
+                "every asset URL is the derived tag-specific one, never the listing's"
+            );
+        }
+        assert_eq!(
+            acquired.web_tag.as_deref(),
+            Some("v0.79.0"),
+            "the tag recorded as authorized is the release actually judged, so the head \
+             is re-read next check"
+        );
+        assert_eq!(lists.len(), 1, "one anonymous LIST: {lists:?}");
+        assert!(
+            lists[0].1.is_empty(),
+            "no credential rides the web lane's LIST"
+        );
+        note_readable(Lane::Web, &source);
+        let _ = std::fs::remove_dir_all(&staging.root);
+    }
+
+    /// THE COVERED-STAGE LINE ERASES THE STANDING APPLY VERDICT EVERY CHECK. On
+    /// 2026-09-14 the apply lane failed the staged v0.85.0 six times over ~8 h and
+    /// stood down for ~6 h between attempts; every 30 minutes in between the check
+    /// lane found the stage already covering the candidate and rewrote `status.toml`'s
+    /// one `outcome` line to "staged 0.85.0 (build …) — verified and ready to apply;
+    /// release build … needs no download" — over the apply lane's "staged build did
+    /// not apply: …". An operator reading the file (or the update screen, which
+    /// renders it) in those hours saw a build that was "ready to apply" and nothing
+    /// about the attempt that had just refused it. The check lane knows the apply
+    /// lane's answer — `Health::last_apply_failure_target_build` names this very
+    /// artifact — and its steady-state line must carry it rather than overwrite it.
+    #[test]
+    fn check_channel_audit_a_covered_stage_line_keeps_the_standing_apply_verdict() {
+        let staging = Staging::scratch("covered-vs-apply");
+        let manifest = candidate_manifest();
+        let commit = manifest.commit.as_deref().unwrap();
+        write_ready(&staging, manifest.build_number, commit, &manifest.sha256);
+        write_bundle_identity(&staging, manifest.build_number, commit);
+        assert!(
+            publishable_stage_covers(&staging, &manifest),
+            "precondition"
+        );
+        let running = 1;
+        // The apply lane's terminal verdict on THIS artifact, exactly as
+        // `crate::record_apply_failure` leaves both ledgers.
+        let reason = "PreparationFailed: the installed bundle at /Applications/aterm.app \
+                      cannot be the rollback source the swap installs";
+        crate::health::Health::record_apply_failure(
+            &staging.health(),
+            running,
+            manifest.build_number,
+            reason,
+        );
+        crate::status::record(
+            &staging,
+            running,
+            &format!("staged build did not apply: {reason}"),
+        );
+        // The next check, 30 minutes later, finds the stage covering the candidate.
+        record_covered_stage_status(&staging, running, &manifest);
+        let text = std::fs::read_to_string(&staging.status).expect("status written");
+        let outcome = text
+            .parse::<aterm_toml::Value>()
+            .ok()
+            .and_then(|v| {
+                v.get("outcome")
+                    .and_then(aterm_toml::Value::as_str)
+                    .map(str::to_string)
+            })
+            .expect("an outcome line");
+        assert!(
+            outcome.contains("did not apply") || outcome.contains("rollback source"),
+            "the covered-stage line must carry the standing apply verdict on the very \
+             build it calls ready, not erase it: {outcome}"
+        );
         let _ = std::fs::remove_dir_all(&staging.root);
     }
 }

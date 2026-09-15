@@ -748,7 +748,9 @@ pub fn report(root: &Path) -> (bool, String) {
 }
 
 /// `[OB-1]` Every VENDORED patch key resolves to a real `vendor/<dir>` with
-/// sources. Every vendor directory is claimed by such a patch or by the
+/// sources. Every vendor directory is claimed by one of THREE shapes — such a
+/// patch, a row on [`crate::provenance::FIRST_PARTY_VENDORED`] that a member
+/// really reaches by `path = …` (on the root that roster describes), or the
 /// separately verified direct-bundle record. Patch forks are cross-checked
 /// against the census registry when this root IS the workspace it describes.
 ///

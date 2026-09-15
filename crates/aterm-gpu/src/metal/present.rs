@@ -158,6 +158,43 @@ impl MetalWindowSurface {
         self.worker.is_some()
     }
 
+    /// **ASK FOR THE NEXT FRAME'S DRAWABLE NOW** (2026-09-14, the performance
+    /// audit).
+    ///
+    /// The only non-test `try_request` used to live inside [`Self::acquire`],
+    /// so `ready` was ALWAYS empty on a frame's first attempt: every frame
+    /// composed once, reached the present seam, found no drawable, issued the
+    /// request, returned `Pending` — and then composed the whole frame AGAIN
+    /// on the next turn of the loop. Measured `n_pre_present / frames` was
+    /// exactly 2.00 on five independent runs (the owner's live window included,
+    /// 250 165 / 125 082), and the discarded compose costs the same as the one
+    /// that presents.
+    ///
+    /// Called AFTER a successful present, never at the top of a redraw. That
+    /// placement matters and is not a style choice: a redraw that early-outs
+    /// (16% of them, measured) would hand an unpresented drawable back, and a
+    /// just-dropped drawable is not instantly re-vendable — the W6 flip drill
+    /// measured exactly that shape pinning every later acquire in
+    /// CoreAnimation's internal wait for ~a display period. After a present we
+    /// know a frame really was drawn, so the next one is worth prefetching.
+    ///
+    /// Idempotent and non-blocking: no worker, a result already waiting, or a
+    /// request already in flight all return without doing anything.
+    pub(crate) fn prefetch_drawable(&mut self) {
+        if self.ready.is_some() {
+            return;
+        }
+        let generation = self.generation;
+        let request = self.swapchain.acquire_request();
+        let Some(worker) = self.worker.as_mut() else {
+            return;
+        };
+        if worker.is_pending() {
+            return;
+        }
+        let _ = worker.try_request(generation, request);
+    }
+
     /// Invalidating never touches the layer or waits for the worker. In-flight
     /// results retain their old epoch, including resize-away-and-back cases.
     pub(crate) fn discard_pending_acquire(&mut self) {

@@ -690,11 +690,12 @@ fn install_inner(
         .ok_or_else(|| FlowError::NotReachable(program.to_string(), index_roster(&index)))?
         .repo
         .clone();
+    // The channel AS SEEN FROM THIS HOST: a per-target pin overlay, if the index
+    // carries one for `triple`, is resolved here and nowhere else.
     let ch = index
-        .channels
-        .iter()
-        .find(|c| c.name == channel)
+        .channel_for(channel, triple)
         .ok_or_else(|| FlowError::NoChannel(channel.to_string()))?;
+    let ch = &ch;
     let &pinned = ch
         .pin
         .get(program)
@@ -1482,7 +1483,7 @@ fn abort_activated_install(layout: &Layout, channel: &str, program: &str, staged
 ///       a DirFetcher on the sealed seed;
 ///   (d) poke the running GUI with `aterm ctl update check` (Owner-only), whose `check` arm
 ///       must post `Wake::UpdateStaged` for a strictly-newer stage so the App's reconcile
-///       arms the ~2-min auto-apply (today only the `apply` arm posts a Wake);
+///       arms automatic apply after validating the durable stage;
 ///   (e) the only user-visible sentence is "staged for aterm to apply in-session" — never
 ///       spawn, exec, or prompt.
 fn app_apply_gate_refused(
@@ -1885,7 +1886,8 @@ pub fn group_missing_triple(
     triple: &str,
     members: &[String],
 ) -> Option<String> {
-    let ch = index.channels.iter().find(|c| c.name == channel)?;
+    let ch = index.channel_for(channel, triple)?;
+    let ch = &ch;
     for m in members {
         let Some((_, _, pkg)) = verified_pkg(fetcher, index, ch, m) else {
             continue;

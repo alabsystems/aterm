@@ -29,6 +29,11 @@ path = "src/bin/aterm-fleet.rs"
 # Predicate constructors (idle/seq/block/row-match). Agent knowledge lives HERE;
 # the engine core knows nothing of "a turn" or "a Claude prompt".
 aterm-observe = { workspace = true }
+# The worker-phase reader and the approval-box parser (`supervise::phase`,
+# `supervise::prompt` are re-exports of it). A crate of its own since round 13
+# so the fabric bridge publishes `phase=` from the SAME reader `aterm drive
+# phase` prints. No dependencies.
+aterm-phase = { workspace = true }
 # The portable control-socket stream (std-only): `RelayClient`'s local-connect /
 # `dial` constructors talk raw control protocol over a `CtlStream`. No external deps.
 aterm-uds = { workspace = true }

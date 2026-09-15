@@ -134,6 +134,7 @@ while True:
                 phase.join("cfg/aterm"),
                 phase.join("state"),
                 phase.join("run"),
+                phase.join("home"),
             ] {
                 fs::create_dir(&dir).map_err(|e| e.to_string())?;
                 fs::set_permissions(&dir, fs::Permissions::from_mode(0o700))
@@ -150,7 +151,9 @@ while True:
                         "shell = \"/usr/bin/python3\"\nshell_args = [\"-S\", \"-u\", {}]\n",
                         "restore_session = false\nfont_px = 20\n",
                         "cursor_trail = false\nload_adaptive_motion = false\n",
+                        "agents_auto_prime = false\n",
                         "[packages]\nenabled = false\n",
+                        "[machine]\nspotlight_noindex = false\nuniversal_control = \"leave\"\n",
                     ),
                     program_path
                 ),
@@ -170,6 +173,8 @@ while True:
             }
             command
                 .env("ATERM_CONTROL_SOCK", phase.join("ctl.sock"))
+                .env("HOME", phase.join("home"))
+                .env("ATERM_NO_REROUTE", "1")
                 .env("XDG_RUNTIME_DIR", phase.join("run"))
                 .env("XDG_CONFIG_HOME", phase.join("cfg"))
                 .env("XDG_STATE_HOME", phase.join("state"))

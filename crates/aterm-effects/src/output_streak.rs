@@ -58,9 +58,19 @@
 //!    firehose cannot accumulate more drama than a trickle; its `low_crossing`
 //!    gives the episode edges analytically, at any frame rate.
 //! 2. **[`SPAWN_MIN_GAP_MS`] — the ignition floor.** At 700 ms this is ≤1.43
-//!    spawns/second, inside the ≤2/s WCAG rolling-ignition budget the word-nova
-//!    limiter keeps for the same window; because a sound cue is recorded only on
-//!    a spawn edge, ONE clamp bounds eye and ear together.
+//!    ignitions/second, and it is this engine's OWN floor over its OWN clock —
+//!    per pane, because the engine is per pane. It is NOT a draw on the
+//!    word-nova's `FlashLimiterWindow`: nothing in this file reserves against
+//!    that limiter, and the host makes no reservation on the engine's behalf.
+//!    (This header used to say the floor sat "inside the ≤2/s budget the
+//!    word-nova limiter keeps for the same window", which invoked a budget
+//!    nothing here spends from; which budget IS window-wide, and why this floor
+//!    is not, is on [`OutputStreak`].) Every edge that puts light on a cell or
+//!    takes it off spends from this floor — a comet spawn and a flood-ribbon
+//!    re-home (`OutputStreak::refresh_ribbon` shares `last_spawn`) — so there is
+//!    ONE ignition clock per engine, not one per emitter. And because a sound
+//!    cue is recorded only on a spawn edge, the same clamp bounds eye and ear
+//!    together.
 //! 3. **[`MAX_COMETS`] + per-row dedup.** A row already carrying a comet cannot
 //!    respawn until it retires.
 //! 4. **Flood coalescing.** Past [`SATURATED`] momentum, per-row spawning STOPS
@@ -77,6 +87,21 @@
 //! Decay is guaranteed from three directions: the momentum τ, the ribbon's
 //! [`RIBBON_LINGER_MS`], and the mandatory idle drain
 //! ([`StreakConfig::idle_secs`], clamped by the host to a finite band).
+//!
+//! ## What the floor buys, and what it does not
+//!
+//! WCAG 2.3.1 is breached only when AMPLITUDE and RATE and AREA hold together,
+//! and this effect's conformance rests on the RATE arm: the threshold is
+//! measured at a point on the retina, a cell belongs to exactly one pane, and a
+//! comet's envelope is monotone over any one cell (one rise as the head arrives,
+//! one fall as the tail passes — never a train), so the per-cell flash rate is a
+//! function of governor 2's floor alone, and N panes do not multiply it. That
+//! is what makes a PER-PANE floor safe without any window-wide budget behind
+//! it. N panes DO multiply the flashing AREA, and the amplitude arm depends on
+//! the ground a comet is composited over — neither arm supplies the margin the
+//! earlier prose implied. The measurements behind that sentence are in
+//! `docs/SESSION-gates-and-prism-wake-2026-09-01.md` §2 and are deliberately
+//! not restated here: a figure belongs beside the harness that pins it.
 //!
 //! ## Contract
 //!
@@ -119,10 +144,22 @@ use crate::typing_momentum::TypingMomentum;
 /// output-activity consumers cannot disagree about what "your own typing" is.
 pub const ECHO_DISCOUNT_MS: u64 = 250;
 
-/// The ignition floor between two comet spawns. 700 ms is ≤1.43 spawns/second —
-/// inside the ≤2/s rolling WCAG ignition budget — and because a sound cue is
-/// recorded only on a spawn edge, this one clamp limits the eye and the ear
-/// together (the one-event law).
+/// THE ENGINE'S ONE IGNITION FLOOR. 700 ms between any two edges that put light
+/// on a cell or take it off — a comet spawn, and a flood-ribbon re-home
+/// (`OutputStreak::refresh_ribbon` shares `last_spawn`) — so ≤1.43
+/// ignitions/second per engine; and because a sound cue is recorded only on a
+/// spawn edge, this one clamp limits the eye and the ear together (the
+/// one-event law).
+///
+/// IT IS THIS ENGINE'S OWN FLOOR, NOT A DRAW ON ANOTHER BUDGET. Nothing here
+/// reserves against the word-nova's `FlashLimiterWindow`, and the host does not
+/// reserve on this engine's behalf; the older wording ("inside the ≤2/s rolling
+/// WCAG ignition budget") named a budget this engine has never spent from. The
+/// floor is per pane because the engine is per pane, and that is safe because
+/// WCAG 2.3.1's rate arm is measured per cell and a cell belongs to exactly one
+/// pane (module docs, [`OutputStreak`]). The test
+/// `the_engine_makes_no_flash_limiter_reservation_so_its_docs_may_say_so`
+/// keeps the first sentence of this paragraph a check rather than a claim.
 pub const SPAWN_MIN_GAP_MS: u64 = 700;
 
 /// The voice's own floor, on top of the episode law: even across episode
@@ -131,8 +168,12 @@ pub const SPAWN_MIN_GAP_MS: u64 = 700;
 pub const SOUND_MIN_GAP_MS: u64 = 1_500;
 
 /// Comet sweep duration band. The floor is above the 350 ms WCAG twinkle floor
-/// with room to spare, and the whole envelope is MONOTONE — a comet fades once,
-/// never oscillates, so no comet has a flash rate at all.
+/// with room to spare, and the whole envelope is MONOTONE — `shape = (1 − u)²`
+/// lights a cell as the head reaches it and thins as the tail leaves it, scaled
+/// by a `life` that only decays. So ONE comet over one cell is one rise and one
+/// fall: a single luminance pair, never a train. That is what makes the per-cell
+/// flash RATE a function of [`SPAWN_MIN_GAP_MS`] alone, which is the arm the
+/// effect's WCAG 2.3.1 conformance rests on (module docs).
 pub const COMET_MS_MIN: u32 = 420;
 /// Upper end of the sweep band (see [`COMET_MS_MIN`]).
 pub const COMET_MS_MAX: u32 = 900;
@@ -168,8 +209,17 @@ pub const RIBBON_LINGER_MS: u64 = 600;
 /// bar laid over the user's text.
 pub const HUE_SPAN: f32 = 0.22;
 
-/// Ribbon hue drift, turns/second — three orders under the 3.2 Hz
-/// photosensitivity invariant, and a drift rather than a cycle.
+/// Ribbon hue drift, turns/second — a drift rather than a cycle.
+///
+/// It is not luminance-flat, and the old "three orders under the 3.2 Hz
+/// photosensitivity invariant" overstated the margin: 0.25 turns/s is about one
+/// order under 3.2 Hz, not three, and the spectrum's relative luminance rises
+/// and falls more than once across a turn, so the cell under a drifting ribbon
+/// sees a slow luminance rhythm of a fraction of a hertz — not a thousandth of
+/// one. What bounds the ribbon's contribution to any cell's flash RATE is not
+/// this constant but the ignition floor: a re-home is an edge and spends from
+/// [`SPAWN_MIN_GAP_MS`] (`OutputStreak::refresh_ribbon`), while the drift only
+/// recolours light already there.
 pub const RIBBON_DRIFT: f32 = 0.25;
 
 /// The most comets that may be resident at once (the host clamps its own
@@ -366,12 +416,23 @@ impl ObservedGlyph {
 /// `output_streak: Option<Box<OutputStreak>>` beside it is the SINGLE-PANE
 /// present, not a second scope.
 ///
-/// The one budget that IS window-wide is the ≤2/s WCAG rolling ignition
-/// allowance this engine spends from, and it does not live here: it belongs to
-/// the word-nova's `FlashLimiterWindow`, which is a registered, machine-checked
-/// window-scope claim (`aterm_census::scope_census`, id `flash-limiter`).
-/// Saying "one per window" here claimed that budget's scope for a per-pane
-/// state machine, which is the exact confusion OB-17 exists to catch.
+/// THE WINDOW-WIDE BUDGET IN THIS FAMILY IS SOMEBODY ELSE'S, AND THIS ENGINE
+/// DOES NOT SPEND FROM IT. The ≤2/s WCAG rolling ignition allowance belongs to
+/// the word-nova's `FlashLimiterWindow` — a registered, machine-checked
+/// window-scope claim (`aterm_census::scope_census`, id `flash-limiter`) whose
+/// scope is window-wide because a retina sees every pane at once. PRISM WAKE
+/// never reserves against it: there is no `FlashLimiter` call in this file, and
+/// the host makes none on this engine's behalf. Saying "one per window" HERE
+/// would claim that budget's scope for a per-pane state machine, which is the
+/// exact confusion OB-17 exists to catch — and the module header used to make
+/// the mirror-image mistake, citing that window-wide budget as the thing
+/// [`SPAWN_MIN_GAP_MS`] fits inside.
+///
+/// What makes the per-pane shape SAFE is not a shared budget but the shape of
+/// the threshold: WCAG 2.3.1's rate arm is measured at a point on the retina,
+/// and a cell belongs to exactly one pane, so N engines do not multiply any
+/// cell's flash count. They DO multiply the flashing AREA, an arm these docs
+/// claim no margin on (module docs).
 #[derive(Default)]
 pub struct OutputStreak {
     /// The output metric — [`TypingMomentum`]'s law, a separate instance, fed
@@ -1047,8 +1108,9 @@ impl OutputStreak {
 
         if let Some(r) = self.ribbon {
             // The ribbon is a FLAT, constant-cost texture: no head, no sweep,
-            // one steady low-amplitude wash whose hue drifts far under the
-            // photosensitivity invariant.
+            // one steady low-amplitude wash whose hue drifts at `RIBBON_DRIFT`
+            // (a fraction of a hertz in luminance — see its doc; the re-home,
+            // not the drift, is the edge the ignition floor charges).
             let fade =
                 1.0 - (r.since_output_s / (RIBBON_LINGER_MS as f32 / 1000.0)).clamp(0.0, 1.0) * 0.5;
             for col in r.from_col..=r.to_col {
@@ -2051,5 +2113,48 @@ mod tests {
                 assert_eq!(pair[1] - pair[0], 1, "the sweep must be gapless: {xs:?}");
             }
         }
+    }
+
+    /// The docs on [`SPAWN_MIN_GAP_MS`] and [`OutputStreak`] say this engine
+    /// never reserves against the word-nova's flash limiter — that its 700 ms
+    /// floor is its OWN clock, not a draw on the window-wide budget. Prose is
+    /// not a check (the lesson `aterm_census::scope_census` OB-17 encodes), so
+    /// this pins the sentence to the source: the non-test half of this file has
+    /// no CODE line naming the limiter or its reservation entry points. Doc and
+    /// comment lines may name it — that is the DISCLAIMER the census's
+    /// `covers_prose_in` entry exists to keep — so they are skipped. Whoever
+    /// adds a real reservation here must rewrite those docs, and this test is
+    /// what tells them.
+    #[test]
+    fn the_engine_makes_no_flash_limiter_reservation_so_its_docs_may_say_so() {
+        let src = include_str!("output_streak.rs");
+        let (engine, _tests) = src
+            .split_once("#[cfg(test)]")
+            .expect("this file has exactly one test-module marker");
+        // Assembled at runtime so the needles never appear as code text in the
+        // scanned half — the test module sits after the split anyway, but a
+        // future move of this test must not make it match itself.
+        let needles: Vec<String> = [
+            ("Flash", "Limiter"),
+            ("Ignition", "Reservation"),
+            ("grant_", "ignition"),
+            ("grant_pane_", "ignition"),
+        ]
+        .iter()
+        .map(|(a, b)| format!("{a}{b}"))
+        .collect();
+        let offending: Vec<(usize, &str)> = engine
+            .lines()
+            .enumerate()
+            .filter(|(_, line)| !line.trim_start().starts_with("//"))
+            .filter(|(_, line)| needles.iter().any(|n| line.contains(n.as_str())))
+            .map(|(i, line)| (i + 1, line))
+            .collect();
+        assert!(
+            offending.is_empty(),
+            "output_streak.rs now names the word-nova's flash limiter in CODE: {offending:?}. \
+             If the engine has started reserving against it, rewrite the docs on \
+             SPAWN_MIN_GAP_MS, OutputStreak and the module header, which say it does not."
+        );
     }
 }

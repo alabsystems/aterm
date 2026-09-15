@@ -114,7 +114,12 @@ const ANNOUNCE_STALE: Duration = Duration::from_secs(20 * 60);
 /// (`crate::ATPKG_WAIT_LOCK_SECS`; a test pins the order).
 const WAIT_STALE: Duration = Duration::from_secs(35 * 60);
 /// The title of that row — also how [`Bar::is_waiting`] recognises it.
-const WAITING_TITLE: &str = "Waiting for another aterm's toolchain install";
+/// The waiting row's title. No "lock" and no "blocked" anywhere in it: the owner read
+/// the 2026-09-14 row (a self-update's successor queued behind the outgoing window's
+/// pass) as "an error about a lock blocking atpkg installation" and relaunched the
+/// app. The state is benign — another aterm process is installing, and this window's
+/// pass runs when it finishes — so the row says exactly that.
+const WAITING_TITLE: &str = "Another aterm is installing the ALab toolchain";
 /// The cap on a LIVE update bar. The updater's download poller reports only on
 /// size CHANGE and its verify phase (codesign / Gatekeeper) can sit silent for
 /// tens of seconds, so this is long — but a check is bounded by curl's own
@@ -177,7 +182,7 @@ pub(crate) enum ApplyPosture {
     ManualOnlyLatched { lapses: bool },
     /// The in-session handoff cannot run in this process — `why` names the
     /// reason ([`HandoffUnavailable`]: the `ATERM_NO_SEAMLESS_UPDATE` opt-out,
-    /// an explicit `--control-sock`, `--headless`, no event loop), read from the
+    /// `--headless`, no event loop), read from the
     /// SAME predicate the apply gate reads (`App::seamless_handoff_unavailable`).
     /// That is NOT "a cold re-exec instead": the admission classifier
     /// (`native_update_admission::classify`) admits the cold lane only with
@@ -568,8 +573,7 @@ fn waiting_bar(since: Instant) -> Bar {
         text: BarText {
             glyph: '\u{2139}',
             title: WAITING_TITLE.to_string(),
-            detail: "it holds the store lock \u{2014} this window continues when it finishes"
-                .to_string(),
+            detail: "this window continues when it finishes".to_string(),
             stats: String::new(),
             tone: Tone::Info,
         },
@@ -616,19 +620,22 @@ pub(crate) struct StatusBars {
     /// and a lane holds one bar; replacement by assignment showed only the last
     /// and DROPPED the rest, unrecorded (they never folded, so they never reached
     /// the ledger). Queued rows are read in order and each retires into the
-    /// ledger like any other.
+    /// ledger like any other. An ANNOUNCEMENT still replaces a held row on glass
+    /// (a new pass is the lane's newest truth) but records it as a fold does
+    /// ([`Self::record_displaced_toolchain`]).
     toolchain_queue: std::collections::VecDeque<(Bar, Duration)>,
-    /// A store-lock wait ([`Self::toolchain_waiting`]) that arrived while a
-    /// TERMINAL row held the lane, as the instant it was announced: the held row
-    /// keeps the lane (it was meant to be read), and the waiting row goes up
-    /// when the lane frees — behind anything queued — capped from this instant
-    /// ([`Self::settle_with`]). atpkg announces a wait ONCE per child, so a wait
-    /// the lane could not show at once has to be remembered or it is never
-    /// shown: a quiet launch seed's ✓ managed-current row (15 s) covered the
-    /// update child's announcement, and the lane then stood empty for up to the
-    /// whole half-hour wait while the launch thread believed its row was open
-    /// (2026-09-13). Cleared by whatever would have retired the row itself:
-    /// the child's exit (`toolchain_snapshot(None)`) and any terminal post.
+    /// A store-lock wait ([`Self::toolchain_waiting`]) announced while a TERMINAL
+    /// row or the sibling holder's LIVE meter held the lane, as the instant it was
+    /// announced. That bar keeps the lane (a sentence meant to be read; a meter
+    /// that says more) and the wait is REMEMBERED — atpkg announces it once per
+    /// child, so a wait the lane could not show at once is otherwise never shown,
+    /// and the lane stood empty for up to the whole half-hour wait — and takes the
+    /// lane when that bar leaves, behind anything queued, capped from this instant
+    /// ([`Self::settle_with`]). Cleared by whatever would retire the row itself:
+    /// the child's exit (`toolchain_snapshot(None)`), any terminal post, the
+    /// child's own acquisition ([`Self::toolchain_wait_over`]), and a tailed
+    /// writer that is no longer running (the holder's pass ended: the lock frees
+    /// for our child within a poll).
     waiting_behind: Option<Instant>,
     /// The `managed-current:` wire text the lane last raised a row for. atpkg
     /// prints the marker on EVERY pass, changed or not, and the recurring 6 h
@@ -787,6 +794,31 @@ impl StatusBars {
         self.ledger.push_back(row);
     }
 
+    /// A HELD terminal row an announcement displaces leaves the glass into the
+    /// ledger exactly as a fold would ([`Self::settle_with`]): an announcement
+    /// opens a NEW pass, so what it covers is a finished activity, never its own
+    /// words — the second window's tailer posts the first window's "✓ all N
+    /// installed", and that window's own update child announces seconds later.
+    /// Replacement by assignment alone dropped the row unrecorded (2026-09-14
+    /// audit; the defect `toolchain_queue` closed for terminal posts). A LIVE bar
+    /// is not a finished activity and records nothing; a terminal replacing a
+    /// terminal (`toolchain_failed` over `toolchain_installed`) is the same pass
+    /// superseding itself and stays replacement by assignment — duplicate-free.
+    fn record_displaced_toolchain(&mut self, now: Instant) {
+        if let Some(bar) = self.toolchain.take_if(|bar| bar.terminal()) {
+            self.record(LedgerRow {
+                lane: Lane::Toolchain,
+                title: without_affordance(&bar.text.title).to_string(),
+                detail: bar.text.detail,
+                outcome: match bar.text.tone {
+                    Tone::Warn => Outcome::Warn,
+                    Tone::Info | Tone::Success => Outcome::Ok,
+                },
+                finished: now,
+            });
+        }
+    }
+
     /// The finished activities, oldest first — the `appstatus` ledger.
     pub(crate) fn ledger(&self) -> impl Iterator<Item = &LedgerRow> {
         self.ledger.iter()
@@ -894,14 +926,14 @@ impl StatusBars {
     /// is indistinguishable from one that is misbehaving. `detail` is atpkg's
     /// own sentence; its trailing "(…)" carries the size, which the bar keeps.
     pub(crate) fn toolchain_announced(&mut self, detail: &str, now: Instant) {
-        // This child holds the lock now: a wait remembered behind a held row is over.
-        self.waiting_behind = None;
+        // The held row, if one is up, is a finished activity: recorded.
+        self.record_displaced_toolchain(now);
         let size = detail
             .rsplit_once('(')
             .and_then(|(_, t)| t.strip_suffix(')'))
             .map(|s| sanitize_for_tty(s, 40))
             .filter(|s| !s.is_empty());
-        self.toolchain = Some(Bar {
+        self.replace_toolchain(Bar {
             text: BarText {
                 glyph: '\u{21e3}',
                 title: "Installing the ALab toolchain".to_string(),
@@ -919,28 +951,48 @@ impl StatusBars {
         });
     }
 
+    /// An announcement or a terminal takes the lane outright, and a wait
+    /// remembered behind whatever was up is over: this child holds the lock, or
+    /// its outcome is in ([`Self::waiting_behind`]).
+    fn replace_toolchain(&mut self, bar: Bar) {
+        self.waiting_behind = None;
+        self.toolchain = Some(bar);
+    }
+
     /// The launch-time child is QUEUED behind another atpkg process at the store
-    /// lock (`lock-waiting:`, the `--wait-lock` lanes — 2026-09-10): a LIVE Info
-    /// row with no meter, so the sibling's own tailed snapshot replaces it with the
-    /// real install, a terminal marker outranks it, and `toolchain_snapshot(None)`
-    /// clears it at the child's exit. It fills only an EMPTY lane or refreshes
-    /// itself: a live meter already up (the sibling's pass, tailed before the
-    /// marker line was read) says more, and a held terminal row is a sentence the
-    /// user was meant to read — so the wait is REMEMBERED behind it
-    /// (`waiting_behind`) and goes up when that row folds, since atpkg says it
-    /// only once; it reaches the log either way. Capped at [`WAIT_STALE`] from
-    /// the announce. Never the failure bar: the incident of 2026-09-10 rendered
-    /// this exact event as "⚠ ALab toolchain install failed".
+    /// lock (`lock-waiting:`, the `--wait-lock` lanes): a LIVE Info row with no
+    /// meter, capped at [`WAIT_STALE`] from the announce, which the sibling's own
+    /// tailed snapshot replaces with the real install, a terminal marker outranks,
+    /// the child's own acquisition retires ([`Self::toolchain_wait_over`]) and
+    /// `toolchain_snapshot(None)` clears at the child's exit. It fills only an
+    /// EMPTY lane or refreshes itself: behind a live meter or a held terminal row
+    /// the wait is REMEMBERED instead ([`Self::waiting_behind`]) and goes up when
+    /// that bar leaves. Never the failure bar: a deferred pass is not a failed one.
     pub(crate) fn toolchain_waiting(&mut self, now: Instant) {
-        match self.toolchain.as_ref() {
-            Some(live) if live.terminal() => {
-                self.waiting_behind = Some(now);
-                return;
-            }
-            Some(live) if !live.is_waiting() => return,
-            _ => {}
+        if self
+            .toolchain
+            .as_ref()
+            .is_some_and(|live| live.terminal() || !live.is_waiting())
+        {
+            self.waiting_behind = Some(now);
+            return;
         }
         self.toolchain = Some(waiting_bar(now));
+    }
+
+    /// The wait ENDED IN THE LOCK (`lock-acquired:`, 2026-09-14): the waiting row
+    /// leaves, and so does a wait remembered behind another bar — and nothing
+    /// else: a meter is the tailer's to replace, and a held terminal row (the
+    /// sibling's outcome, posted at the holder's exit — the very thing that freed
+    /// the lock) is still a sentence meant to be read. atpkg used to print
+    /// nothing between acquisition and exit, so a child that waited and then ran
+    /// a QUIET verb kept the row up for the length of its own work under the lock
+    /// (a seed's index read: 6–18 s online, minutes offline).
+    pub(crate) fn toolchain_wait_over(&mut self) {
+        self.waiting_behind = None;
+        if self.toolchain.as_ref().is_some_and(Bar::is_waiting) {
+            self.toolchain = None;
+        }
     }
 
     /// The wait ran out (atpkg exit 75): the pass is DEFERRED — the loop retries on
@@ -995,6 +1047,14 @@ impl StatusBars {
             return;
         };
         let f = &snap.file;
+        // The tailed writer is NOT running — its pass ended, or it died and this is
+        // our own child's final read — so the lock our child was queued on frees
+        // within one poll: a wait remembered behind the meter is over, whatever
+        // this read goes on to show. (Kept only while the writer RUNS: that is the
+        // holder our child waits for.)
+        if !snap.running {
+            self.waiting_behind = None;
+        }
         if self.toolchain.as_ref().is_some_and(Bar::terminal) {
             if let Some(bar) = self.toolchain.as_mut()
                 && bar.fill.is_some()
@@ -1170,13 +1230,12 @@ impl StatusBars {
     /// the same sentence the pill used to carry (roster + the "open a new tab"
     /// clause, or the shell-integration caveat), authored by the caller.
     pub(crate) fn toolchain_installed(&mut self, text: &str, now: Instant) {
-        self.waiting_behind = None;
         // The sentence was authored for a pill with no title of its own; the
         // bar has one, so its opening is not repeated as the detail.
         let detail = text
             .strip_prefix("\u{2713} ALab toolchain installed: ")
             .unwrap_or(text);
-        self.toolchain = Some(Bar {
+        self.replace_toolchain(Bar {
             text: BarText {
                 glyph: '\u{2713}',
                 title: "ALab toolchain installed".to_string(),
@@ -1198,8 +1257,7 @@ impl StatusBars {
     /// which claims a roster; this one retires the announcement and claims nothing
     /// beyond the sentence atpkg itself printed.
     pub(crate) fn toolchain_ended(&mut self, detail: &str, now: Instant) {
-        self.waiting_behind = None;
-        self.toolchain = Some(Bar {
+        self.replace_toolchain(Bar {
             text: BarText {
                 glyph: '\u{2713}',
                 title: "ALab toolchain".to_string(),
@@ -1222,7 +1280,6 @@ impl StatusBars {
     /// store-lock wait or its timeout — those are [`Self::toolchain_waiting`] and
     /// [`Self::toolchain_deferred`] (2026-09-10).
     pub(crate) fn toolchain_failed(&mut self, what: &str, now: Instant) {
-        self.waiting_behind = None;
         // A FAILURE ROW NEVER INHERITS A FINISHED METER. Carrying the fill over is
         // honest while the bar being replaced is this pass's LIVE meter — the reader
         // sees how far it got before it broke. It was not honest when the bar being
@@ -1238,7 +1295,7 @@ impl StatusBars {
             .as_ref()
             .filter(|b| !b.terminal())
             .and_then(|b| b.fill);
-        self.toolchain = Some(Bar {
+        self.replace_toolchain(Bar {
             text: BarText {
                 glyph: '\u{26a0}',
                 title: "ALab toolchain".to_string(),
@@ -2595,6 +2652,63 @@ mod tests {
         assert_eq!(bars.rows(), 0, "announced, then ended empty: folded");
     }
 
+    /// An ANNOUNCEMENT over a HELD terminal row still replaces it on glass — a new
+    /// pass is the lane's newest truth — but what it covers is a FINISHED activity
+    /// and leaves into the ledger as a fold would, at the instant it was covered.
+    /// Replacement by assignment alone dropped it unrecorded: the second window's
+    /// tailer posts the first window's "✓ all N installed" (or "⚠ 3 of 10 —
+    /// 7 failed"), and its own update child's `net-starting:` lands seconds later,
+    /// so `appstatus` had no row for the outcome the user may not have read
+    /// (2026-09-14 audit; the defect `toolchain_queue` closed for terminal posts).
+    #[test]
+    fn an_announcement_over_a_held_row_records_it() {
+        let now = t0();
+        let mut bars = StatusBars::default();
+        bars.toolchain_installed("\u{2713} ALab toolchain installed: ay, trust", now);
+        assert_eq!(bars.ledger().count(), 0);
+        bars.toolchain_announced(
+            "installing 1 program(s) over the network: ty",
+            now + Duration::from_secs(1),
+        );
+        assert_eq!(
+            bars.bars().next().unwrap().1.text.title,
+            "Installing the ALab toolchain",
+            "the new pass takes the glass"
+        );
+        assert_eq!(bars.ledger().count(), 1, "…and the held row is recorded");
+        let row = bars.ledger().next().unwrap();
+        assert_eq!(row.lane, Lane::Toolchain);
+        assert_eq!(row.title, "ALab toolchain installed");
+        assert_eq!(row.detail, "ay, trust");
+        assert_eq!(row.outcome, Outcome::Ok);
+        assert_eq!(row.finished, now + Duration::from_secs(1));
+        // A Warn row records as Warn.
+        let mut bars = StatusBars::default();
+        bars.toolchain_failed("partly installed", now);
+        bars.toolchain_announced("installing 1", now + Duration::from_secs(1));
+        assert_eq!(bars.ledger().next().unwrap().outcome, Outcome::Warn);
+        // A LIVE bar (a meter, the waiting row) is not a finished activity: an
+        // announcement over one records nothing, as before.
+        let mut bars = StatusBars::default();
+        bars.toolchain_waiting(now);
+        bars.toolchain_announced("installing 1", now + Duration::from_secs(1));
+        assert_eq!(bars.ledger().count(), 0);
+        let mut bars = StatusBars::default();
+        bars.toolchain_snapshot(Some(&snap(true)), now);
+        bars.toolchain_announced("installing 1", now + Duration::from_secs(1));
+        assert_eq!(bars.ledger().count(), 0);
+        // The negative twin: a TERMINAL replacing a held terminal is the same
+        // pass superseding its own words, and still yields exactly one ledger row —
+        // the one that folds — never a duplicate.
+        let mut bars = StatusBars::default();
+        bars.toolchain_installed("\u{2713} ALab toolchain installed: ay, trust", now);
+        bars.toolchain_failed("partly installed", now + Duration::from_secs(1));
+        assert_eq!(bars.ledger().count(), 0, "supersession records nothing");
+        assert!(bars.settle(now + Duration::from_secs(1) + HOLD_WARN));
+        assert_eq!(bars.ledger().count(), 1);
+        assert_eq!(bars.ledger().next().unwrap().outcome, Outcome::Warn);
+    }
+
     #[test]
     fn a_live_meter_never_runs_backwards_within_a_pass() {
         let mut bars = StatusBars::default();
@@ -2659,12 +2773,18 @@ mod tests {
         assert_eq!(lane, Lane::Toolchain);
         assert_eq!(
             bar.text.title,
-            "Waiting for another aterm's toolchain install"
+            "Another aterm is installing the ALab toolchain"
         );
-        assert_eq!(
-            bar.text.detail,
-            "it holds the store lock \u{2014} this window continues when it finishes"
+        // Neither word the owner read as a fault (2026-09-14): no "lock", no "blocked".
+        assert!(
+            !format!("{} {}", bar.text.title, bar.text.detail)
+                .to_ascii_lowercase()
+                .contains("lock"),
+            "{} — {}",
+            bar.text.title,
+            bar.text.detail
         );
+        assert_eq!(bar.text.detail, "this window continues when it finishes");
         assert_eq!(bar.text.tone, Tone::Info);
         assert_eq!(bar.text.glyph, '\u{2139}');
         assert_eq!(bar.fill, None, "no meter of its own");
@@ -2711,8 +2831,9 @@ mod tests {
 
     /// The waiting row never covers what says more: a live meter already up (the
     /// sibling's pass, tailed before the marker line was read) stays, and a held
-    /// terminal outcome the user was meant to read stays — the wait is logged, not
-    /// shown, in those two orderings.
+    /// terminal outcome the user was meant to read stays — the wait is logged and
+    /// remembered, not shown, in those two orderings (the two tests after the next
+    /// pin what the remembered wait does).
     #[test]
     fn the_waiting_row_never_covers_a_meter_or_a_held_outcome() {
         let now = t0();
@@ -2833,6 +2954,133 @@ mod tests {
         }
     }
 
+    /// …and not dropped behind a LIVE meter either (2026-09-14 audit): the same
+    /// once-per-child announcement lands while the sibling's tailed meter is up —
+    /// the common ordering, since the tailer follows the holder's file from the
+    /// spawn and the wait is announced after a 2 s grace — and the meter says more,
+    /// so it keeps the lane. But a meter folds on its own staleness cap when the
+    /// holder wedges (a SIGSTOPped sibling, a heartbeat thread that died: the
+    /// tailer classifies the file as a dead writer's and posts nothing), and our
+    /// child is still queued behind it for up to its whole half-hour bound. The
+    /// wait is remembered behind the meter exactly as it is behind a held row, and
+    /// takes the lane when the meter folds, capped from the announce.
+    #[test]
+    fn a_wait_behind_a_live_meter_takes_the_lane_when_that_meter_folds() {
+        let now = t0();
+        let mut bars = StatusBars::default();
+        bars.toolchain_snapshot(Some(&snap(true)), now);
+        bars.toolchain_waiting(now + Duration::from_secs(2));
+        let bar = bars.bars().next().unwrap().1;
+        assert_eq!(
+            bar.text.title, "Installing the ALab toolchain",
+            "the meter keeps the lane"
+        );
+        assert!(bar.fill.is_some());
+        assert!(!bars.settle(now + TAILED_STALE / 2));
+        assert!(
+            bars.settle(now + TAILED_STALE),
+            "the wedged holder's meter folds on its cap and the fold promotes the wait"
+        );
+        assert_eq!(bars.rows(), 1);
+        let bar = bars.bars().next().unwrap().1;
+        assert_eq!(bar.text.title, WAITING_TITLE);
+        assert!(!bar.terminal(), "live, as the row itself is");
+        assert_eq!(
+            bar.stale_at,
+            Some(now + Duration::from_secs(2) + WAIT_STALE),
+            "capped from the announce, not the fold"
+        );
+        assert_eq!(bars.ledger().count(), 1, "the meter was recorded");
+        assert!(
+            !bars.settle(now + TAILED_STALE + Duration::from_secs(1)),
+            "one wait, promoted once"
+        );
+    }
+
+    /// …but never a FALSE wait: the sibling's pass ENDING (its file's `ended_unix`
+    /// set, posted as the ✓ terminal row) frees the lock for our child within one
+    /// poll, so the wait remembered behind the meter is over — the ✓ folds after
+    /// its hold and the lane is empty while our child runs, exactly as it is after
+    /// the child's own exit. (A THIRD holder taking the freed lock ahead of our
+    /// child is not distinguished: that needs the bars to know our child's pid.)
+    #[test]
+    fn a_wait_behind_a_live_meter_is_over_when_the_sibling_ends() {
+        let now = t0();
+        let mut bars = StatusBars::default();
+        bars.toolchain_snapshot(Some(&snap(true)), now);
+        bars.toolchain_waiting(now + Duration::from_secs(2));
+        let mut ended = file(None, "net");
+        ended.ended_unix = Some(1_700_000_030);
+        ended.overall.programs_done = 10;
+        bars.toolchain_snapshot(
+            Some(&crate::PkgProgressSnapshot {
+                file: ended,
+                running: false,
+            }),
+            now + Duration::from_secs(30),
+        );
+        let bar = bars.bars().next().unwrap().1;
+        assert_eq!(bar.text.glyph, '\u{2713}', "the sibling's ✓ outcome");
+        assert!(bar.terminal());
+        assert!(
+            bars.settle(now + Duration::from_secs(30) + HOLD_OK),
+            "the ✓ folds"
+        );
+        assert_eq!(
+            bars.rows(),
+            0,
+            "no wait is promoted: the lock is free and our child is running"
+        );
+        assert!(!bars.settle(now + Duration::from_secs(600)));
+        assert_eq!(bars.rows(), 0);
+    }
+
+    /// The wait ENDS IN THE LOCK (`lock-acquired:`, 2026-09-14): the waiting row
+    /// leaves, and so does a wait remembered behind a held row — and nothing else
+    /// does. atpkg used to print nothing between acquisition and exit, so a child
+    /// that waited and then ran a QUIET verb (a seed's index read under the lock:
+    /// 6–18 s online, minutes offline) kept "waiting for another aterm's install"
+    /// on the glass for the length of its own work.
+    #[test]
+    fn the_wait_ends_when_the_child_takes_the_lock() {
+        let now = t0();
+        let mut bars = StatusBars::default();
+        bars.toolchain_waiting(now);
+        assert_eq!(bars.rows(), 1);
+        bars.toolchain_wait_over();
+        assert_eq!(bars.rows(), 0, "the waiting row is retired");
+        assert_eq!(bars.ledger().count(), 0, "…quietly: nothing finished");
+        assert!(!bars.settle(now + WAIT_STALE), "nothing left to fold");
+        // Remembered behind a held row: the row stands, the wait is forgotten.
+        let mut bars = StatusBars::default();
+        bars.toolchain_managed_current("claude 2.1.267 (build 2026091001)", now);
+        bars.toolchain_waiting(now + Duration::from_secs(2));
+        bars.toolchain_wait_over();
+        assert_eq!(bars.bars().next().unwrap().1.text.glyph, '\u{2713}');
+        assert!(bars.settle(now + HOLD_MANAGED), "the held row folds");
+        assert_eq!(bars.rows(), 0, "…and promotes no wait");
+        // A sibling's terminal outcome posted at the holder's exit — the very
+        // thing that let our child take the lock — keeps standing.
+        let mut bars = StatusBars::default();
+        bars.toolchain_waiting(now);
+        bars.toolchain_ended("finished", now + Duration::from_secs(1));
+        bars.toolchain_wait_over();
+        assert_eq!(bars.rows(), 1);
+        assert!(bars.bars().next().unwrap().1.terminal());
+        // A live meter is never touched: it is the tailer's to replace.
+        let mut bars = StatusBars::default();
+        bars.toolchain_snapshot(Some(&snap(true)), now);
+        bars.toolchain_waiting(now + Duration::from_secs(2));
+        bars.toolchain_wait_over();
+        assert_eq!(bars.rows(), 1);
+        assert!(bars.bars().next().unwrap().1.fill.is_some());
+        assert!(
+            bars.settle(now + TAILED_STALE),
+            "the meter folds on its cap"
+        );
+        assert_eq!(bars.rows(), 0, "…and promotes no wait: it is over");
+    }
+
     /// Its backstop: with nothing retiring it, the waiting row folds at its cap
     /// into an Ok ledger row (nothing was wrong), and the `appstatus` grammar for
     /// the live row is the ordinary live one.
@@ -2855,7 +3103,7 @@ mod tests {
         assert_eq!(bars.rows(), 0);
         let row = bars.ledger().next().expect("recorded");
         assert_eq!(row.outcome, Outcome::Ok);
-        assert_eq!(row.title, "Waiting for another aterm's toolchain install");
+        assert_eq!(row.title, "Another aterm is installing the ALab toolchain");
     }
 
     /// The cap must outlast the child's own wait, or a still-queued child would
@@ -4915,14 +5163,11 @@ mod tests {
             staged_detail(
                 7,
                 ApplyPosture::HandoffDisabled {
-                    why: HandoffUnavailable::ExplicitControlSock,
+                    why: HandoffUnavailable::Headless,
                     veto: None
                 }
             )
-            .starts_with(
-                "build 7 — verified; $ATERM_CONTROL_SOCK names an explicit socket path \
-                 (--control-sock) — "
-            )
+            .starts_with("build 7 — verified; --headless (no window) — ")
         );
         // The vetoed twin: names the veto, points at the manual affordance
         // (qualified by the zero-terminal admission), keeps the true

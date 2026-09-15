@@ -151,6 +151,19 @@ pub const ENV_DENY_VARS: &[&str] = &[
     "ATERM_DEBUG_RELAUNCH_NUDGE",
     "ATERM_UPDATE_ROOT",
     "ATERM_UPDATE_INTERVAL_SECS",
+    // The channel repoint, the credential and the handoff QA tunable too
+    // (2026-09-14, audit LT-7). A nested aterm run from an aterm shell used to
+    // inherit the parent's env repoint — the QA-seam recipe does exactly this —
+    // and a token set at GUI launch reached every child process of every shell.
+    // A repoint meant for the machine belongs in the config file (`[update]
+    // owner`/`repo`), which the window, the headless `aterm update check` and a
+    // nested instance all read identically; the env form is a per-launch
+    // override and stops at the launch. A token a shell should carry belongs in
+    // that shell's own rc, not in the launcher's secret environment.
+    "ATERM_UPDATE_OWNER",
+    "ATERM_UPDATE_REPO",
+    "ATERM_UPDATE_TOKEN",
+    "ATERM_HANDOFF_READY_TIMEOUT_MS",
     // Network-drive selectors: never inherit, so a nested aterm cannot open a
     // second network control surface and the operator's key path is not fanned
     // into every descendant (only the explicitly-configured root binds).
@@ -323,6 +336,11 @@ mod tests {
             "ATERM_DEBUG_RELAUNCH_NUDGE",
             "ATERM_UPDATE_ROOT",
             "ATERM_UPDATE_INTERVAL_SECS",
+            // The repoint, the credential and the handoff tunable (2026-09-14).
+            "ATERM_UPDATE_OWNER",
+            "ATERM_UPDATE_REPO",
+            "ATERM_UPDATE_TOKEN",
+            "ATERM_HANDOFF_READY_TIMEOUT_MS",
         ] {
             assert!(is_ai_env_var(v), "{v} must be deny-listed for inheritance");
         }

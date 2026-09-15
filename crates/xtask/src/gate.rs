@@ -597,10 +597,10 @@ use crate::{collect_rs_files, workspace_root};
 
 /// `rest` is everything after the check name. Three verbs read it — `gate cells`
 /// (`--cell NAME`), `gate lint` (`--no-fmt` / `--fmt-only`) and `gate
-/// help-surfaces` (`--diff PATH`) — and every other verb ignores it. NOTHING in
-/// the tree passes `--no-fmt`: `.githooks/pre-push` did until its 2026-08-24
-/// demotion; the flag now exists only for a human who types it, which is exactly
-/// the shape [`LintLane`] argues an escape hatch should have.
+/// help-surfaces` (`--diff PATH` / `--drift`) — and every other verb ignores it.
+/// NOTHING in the tree passes `--no-fmt`: `.githooks/pre-push` did until its
+/// 2026-08-24 demotion; the flag now exists only for a human who types it, which
+/// is exactly the shape [`LintLane`] argues an escape hatch should have.
 pub(crate) fn run(check: Option<&str>, rest: &[String]) -> ExitCode {
     let ok = match check {
         Some("drift") => gate_drift(),

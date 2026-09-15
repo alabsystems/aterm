@@ -25,6 +25,9 @@ pub(crate) struct DiagInfo {
     /// SHA-256(raw 32-byte compiled updater key), or the explicit `empty` /
     /// `invalid` state. Read from shipping updater code, not binary text.
     pub update_pin_sha256: String,
+    /// SHA-256(raw 32-byte paper master), or `empty` / `invalid` — the anchor
+    /// that authorizes releases once the roster tier is armed (2026-09-14).
+    pub master_pin_sha256: String,
     pub renderer_default: &'static str,
     /// What shell-integration preparation ACTUALLY did for the shell this
     /// configuration spawns — distinct from the `shell_integration` row in the
@@ -83,6 +86,7 @@ impl DiagInfo {
         );
         let _ = writeln!(s, "compiler:  {}", self.compiler);
         let _ = writeln!(s, "update-pin-sha256: {}", self.update_pin_sha256);
+        let _ = writeln!(s, "master-pin-sha256: {}", self.master_pin_sha256);
         let _ = writeln!(s, "renderer:  {}", self.renderer_default);
         let _ = writeln!(s, "shell-int: {}", self.shell_integration_runtime);
         let _ = writeln!(s, "primer:    {}", self.agent_primer);
@@ -321,6 +325,7 @@ pub(crate) fn collect() -> DiagInfo {
         },
         compiler: crate::build_info::compiler_summary(),
         update_pin_sha256: aterm_update::compiled_update_pin_sha256(),
+        master_pin_sha256: aterm_update::compiled_master_pin_sha256(),
         renderer_default,
         shell_integration_runtime: shell_integration_runtime(&config),
         agent_primer: agent_primer_line(&config),
@@ -3755,7 +3760,8 @@ ink = "rainbow"
                 "rustc 1.96.0 (ac68faa2) \u{00b7} rust \u{00b7} release \u{00b7} trust_verify off"
                     .into(),
             update_pin_sha256: "66687aadf862bd776c8fc18b8e9f8e20089714856ee233b3902a591d0d5f2925"
-                .into(),
+                .to_string(),
+            master_pin_sha256: "empty".into(),
             renderer_default: "cpu",
             shell_integration_runtime: "active (Zsh loader prepared)".into(),
             agent_primer: "claude installed, codex not detected — auto-prime: on \

@@ -8,9 +8,32 @@
 //! toolchain link` naming wherever the operator last built the compiler, and it
 //! dangled whenever the tree under it moved. This module makes the entry a symlink
 //! atpkg lays and re-asserts: `<rustup_home>/toolchains/<name>` ->
-//! `<prefix>/store/trust/current`. Every rustup-driven `cargo` in a pinned tree then
-//! runs whatever build atpkg has live, and the link survives every update because
-//! it names `current`, never a numbered build.
+//! `<prefix>/rustup/<name>`, atpkg's VIEW of the live trust build.
+//!
+//! WHY A VIEW AND NOT THE STORE. rustup's proxies and cargo's doctest phase resolve
+//! the STOCK names — `rustc`, `cargo`, `rustdoc` — and the Trust distribution ships
+//! only Trust's names: `trustc`, `targo`, `trustdoc` (trust `dist.rs`, 2026-09-14).
+//! Until then the bundle carried a second COPY of each under the stock name, and one
+//! compiler as two files needed a proof that they were the same compiler wherever one
+//! of them was handed authority — a proof macOS makes impossible, because an ad-hoc
+//! code signature bakes the file's own name into itself (measured on bundle 8595:
+//! 2,428 differing bytes, every one inside the signature). tippy refused a correct
+//! toolchain on that proof. The store is also content-addressed (`aterm pkg verify`),
+//! so nothing may be laid inside a build after it is staged. The view answers both:
+//! `<prefix>/rustup/<name>/bin/` holds one HARD LINK per tool in
+//! `store/trust/current/bin/` under its own name, plus each stock name as a hard link
+//! to its Trust tool ([`STOCK_NAMES`]) — one inode per tool, no copy, nothing to
+//! authenticate, the store untouched — and `lib/`, `libexec/`, `share/`, `etc/`
+//! MIRRORED the same way, every regular file a hard link, every symlink recreated,
+//! so the view is a complete sysroot and every frontend read from it answers the
+//! VIEW as its sysroot. That last clause is why they are mirrored and not symlinked:
+//! rustc finds its sysroot through the real path of the driver dylib it loaded, so a
+//! symlinked `lib/` made `rustc --print sysroot` answer the STORE, and every script
+//! that finds the frontends beside that answer (`$(rustc --print sysroot)/bin/targo`,
+//! the clean repo's ruled spelling) ran the store's tippy beside the store's copy —
+//! measured 2026-09-15, the day the symlink form shipped. It is rebuilt
+//! ([`refresh_view`]) by every attach and every re-assertion, so it follows
+//! `current` across updates and rollbacks.
 //!
 //! The rules, all fail-closed:
 //!
@@ -19,21 +42,27 @@
 //! * If `<rustup_home>/toolchains` does not exist, rustup is not installed: attach is
 //!   a no-op that says so. `~/.rustup` is NEVER created.
 //! * An ABSENT entry is created atomically (temp symlink + `rename(2)` — the same
-//!   primitive as `store/<p>/current`, [`crate::activate::atomic_symlink`]). An
-//!   existing symlink that resolves into `<prefix>/store/trust/` is ADOPTED untouched,
-//!   or re-pointed at `current` if it named a numbered build. Anything else — a real
-//!   directory, a regular file, a symlink elsewhere — is REFUSED with the one fix,
-//!   [`DETACH_FIX`]. Nothing here ever follows an existing link.
+//!   primitive as `store/<p>/current`, [`crate::activate::atomic_symlink`]) after the
+//!   view is refreshed. An existing symlink that resolves into `<prefix>/rustup/` or
+//!   `<prefix>/store/trust/` is atpkg's: ADOPTED untouched when it names the view,
+//!   RE-POINTED at the view when it names the store (`current`, or a numbered build —
+//!   the layouts from before the view existed). Anything else — a real directory, a
+//!   regular file, a symlink elsewhere — is REFUSED with the one fix, [`DETACH_FIX`].
+//!   Nothing here ever follows an existing link.
+//! * A view's `bin/` is built beside the live one and swapped in by `rename(2)`. A
+//!   hard link that cannot be made (the store on another volume) REFUSES the attach:
+//!   a copy would be the two-files problem again.
 //! * A successful attach is RECORDED in `status.toml` as `seams = ["rustup:trust"]`
 //!   (load, modify, save through the atomic writer — other fields are never clobbered).
 //! * Detach removes the entry only when it is a symlink resolving into the prefix (or
 //!   `--force`, which also moves a real directory ASIDE rather than deleting it: a
-//!   tree atpkg did not lay is never recursively removed) and drops the record.
+//!   tree atpkg did not lay is never recursively removed), removes the view atpkg
+//!   owned, and drops the record.
 //! * The seam is RE-ASSERTED after every successful activation of `trust`, after a
 //!   rollback of `trust`, and at the end of the unattended `update` pass, so a deleted
-//!   or dangling entry heals on the next pass. Every recorded seam is re-asserted,
-//!   plus a FIRST attach of `trust` when rustup is present and the entry is absent
-//!   (creating a name nothing else owns is safe by construction).
+//!   or dangling entry heals on the next pass and the view follows the build. Every
+//!   recorded seam is re-asserted, plus a FIRST attach of `trust` when rustup is present
+//!   and the entry is absent (creating a name nothing else owns is safe by construction).
 //! * `uninstall --all` detaches every recorded seam with the toolset it removes
 //!   ([`detach_recorded`], from the CLI edge, before the build trees go).
 //!
@@ -134,16 +163,238 @@ pub fn seam_path(rustup_home: &Path, name: &str) -> PathBuf {
     toolchains_dir(rustup_home).join(name)
 }
 
-/// `<prefix>/store/trust` — the only tree a seam may resolve into.
+/// `<prefix>/store/trust` — the store tree a seam laid before the view existed
+/// resolves into; recognised as atpkg's so it can be re-pointed, never adopted.
 #[must_use]
 pub fn owned_root(layout: &Layout) -> PathBuf {
     layout.prefix.join("store").join(SEAM_PROGRAM)
 }
 
-/// `<prefix>/store/trust/current` — what every seam targets.
+/// `<prefix>/store/trust/current` — the build every view mirrors.
 #[must_use]
-pub fn seam_target(layout: &Layout) -> PathBuf {
+pub fn store_current(layout: &Layout) -> PathBuf {
     layout.program_current(SEAM_PROGRAM)
+}
+
+/// `<prefix>/rustup/` — every view sits under it.
+#[must_use]
+pub fn views_root(layout: &Layout) -> PathBuf {
+    layout.prefix.join("rustup")
+}
+
+/// `<prefix>/rustup/<name>/` — the view the seam `name` targets.
+#[must_use]
+pub fn view_dir(layout: &Layout, name: &str) -> PathBuf {
+    views_root(layout).join(name)
+}
+
+/// What the seam `name` targets: its view.
+#[must_use]
+pub fn seam_target(layout: &Layout, name: &str) -> PathBuf {
+    view_dir(layout, name)
+}
+
+/// The stock names rustup's proxies and cargo's doctest phase resolve, each laid in a
+/// view as a hard link to the Trust-named tool beside it. The distribution ships only
+/// the Trust names (trust `dist.rs`, 2026-09-14); these exist for rustup alone, and
+/// nothing inside the toolchain resolves them — `targo` asks for `trustc` and
+/// `trustdoc` by name, and tippy runs `trustc`.
+pub const STOCK_NAMES: &[(&str, &str)] = &[
+    ("rustc", "trustc"),
+    ("cargo", "targo"),
+    ("rustdoc", "trustdoc"),
+];
+
+/// The directories beside `bin/` a sysroot is read through, MIRRORED into the view
+/// (hard links, not a directory symlink — see the module doc) so a tool run from it
+/// finds its own `lib/rustlib`, `libexec/` helpers and `share/` docs, and reports the
+/// view as its sysroot.
+const VIEW_DIRS: &[&str] = &["lib", "libexec", "share", "etc"];
+
+/// Mirror `src` at `dst`: directories created, regular files hard-linked, symlinks
+/// recreated with the same target, anything else skipped. `dst` must not exist.
+fn mirror_tree(layout: &Layout, src: &Path, dst: &Path) -> io::Result<()> {
+    layout.ensure_dir(dst)?;
+    for entry in std::fs::read_dir(src)? {
+        let entry = entry?;
+        let from = entry.path();
+        let to = dst.join(entry.file_name());
+        let meta = std::fs::symlink_metadata(&from)?;
+        let kind = meta.file_type();
+        if kind.is_symlink() {
+            let target = std::fs::read_link(&from)?;
+            #[cfg(unix)]
+            std::os::unix::fs::symlink(&target, &to)?;
+            #[cfg(windows)]
+            if std::fs::metadata(&from)
+                .map(|m| m.is_dir())
+                .unwrap_or(false)
+            {
+                std::os::windows::fs::symlink_dir(&target, &to)?;
+            } else {
+                std::os::windows::fs::symlink_file(&target, &to)?;
+            }
+        } else if kind.is_dir() {
+            mirror_tree(layout, &from, &to)?;
+        } else if kind.is_file() {
+            std::fs::hard_link(&from, &to).map_err(|e| {
+                io::Error::new(
+                    e.kind(),
+                    format!(
+                        "cannot hard-link {} into the view ({e}); the view keeps one file ONE \
+                         file and never copies, so the store and the view must share a volume",
+                        from.display()
+                    ),
+                )
+            })?;
+        }
+    }
+    Ok(())
+}
+
+/// What [`refresh_view`] found and did.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Refreshed {
+    /// The numbered build `store/trust/current` named.
+    pub build: PathBuf,
+    /// Tools linked under their own names.
+    pub tools: usize,
+    /// Stock names laid, each with the Trust tool it is a link to.
+    pub stock: Vec<(&'static str, &'static str)>,
+    /// Whether the view's `bin/` changed (a rebuild that produced the same set is silent).
+    pub changed: bool,
+}
+
+/// Build, or rebuild, the view for `name` from `store/trust/current`.
+///
+/// `bin/` is assembled beside the live one — one hard link per regular file in the
+/// build's `bin/`, then each of [`STOCK_NAMES`] as a hard link to its Trust tool,
+/// replacing any copy an older bundle shipped under the stock name — and swapped in
+/// by `rename(2)`. A build whose `bin/` holds a symlink does not get that entry: every
+/// Trust frontend refuses a symlinked sibling, so the view never presents one.
+///
+/// # Errors
+/// `store/trust/current` is not a link atpkg can read, the build's `bin/` cannot be
+/// listed, or a hard link cannot be made — the last is the store on another volume,
+/// and it refuses rather than copying, because a copy is the two-files problem again.
+pub fn refresh_view(layout: &Layout, name: &str) -> io::Result<Refreshed> {
+    let current = store_current(layout);
+    let build = std::fs::read_link(&current).map(|raw| absolute_target(&raw, &current))?;
+    let src_bin = build.join("bin");
+    let view = view_dir(layout, name);
+    layout.ensure_dir(&views_root(layout))?;
+    layout.ensure_dir(&view)?;
+    let pid = crate::dec_u64(u64::from(std::process::id()));
+    let staged = view.join(format!(".bin.tmp-{pid}"));
+    let _ = std::fs::remove_dir_all(&staged);
+    layout.ensure_dir(&staged)?;
+    let mut names: std::collections::BTreeSet<std::ffi::OsString> = Default::default();
+    let mut tools = 0usize;
+    for entry in std::fs::read_dir(&src_bin)? {
+        let entry = entry?;
+        let src = entry.path();
+        if !std::fs::symlink_metadata(&src)?.is_file() {
+            continue;
+        }
+        let dest = staged.join(entry.file_name());
+        std::fs::hard_link(&src, &dest).map_err(|e| {
+            io::Error::new(
+                e.kind(),
+                format!(
+                    "cannot hard-link {} into the view ({e}); the view keeps one tool ONE file \
+                     and never copies, so the store and {} must share a volume",
+                    src.display(),
+                    views_root(layout).display()
+                ),
+            )
+        })?;
+        names.insert(entry.file_name());
+        tools += 1;
+    }
+    let mut stock = Vec::new();
+    for (public, trust) in STOCK_NAMES {
+        if !names.contains(OsStr::new(trust)) {
+            continue;
+        }
+        let at = staged.join(public);
+        if names.contains(OsStr::new(public)) {
+            // An older bundle shipped a copy under the stock name; the view presents
+            // the Trust tool itself under it.
+            std::fs::remove_file(&at)?;
+        }
+        std::fs::hard_link(staged.join(trust), &at)?;
+        stock.push((*public, *trust));
+    }
+    let live = view.join("bin");
+    let changed = !same_bin(&live, &staged);
+    if changed {
+        let old = view.join(format!(".bin.old-{pid}"));
+        let _ = std::fs::remove_dir_all(&old);
+        if std::fs::symlink_metadata(&live).is_ok() {
+            std::fs::rename(&live, &old)?;
+        }
+        std::fs::rename(&staged, &live)?;
+        let _ = std::fs::remove_dir_all(&old);
+    } else {
+        let _ = std::fs::remove_dir_all(&staged);
+    }
+    for dir in VIEW_DIRS {
+        let src = build.join(dir);
+        let at = view.join(dir);
+        let old = view.join(format!(".{dir}.old-{pid}"));
+        let _ = std::fs::remove_dir_all(&old);
+        if !src.is_dir() {
+            // Not in this build: drop whatever an older build left under the name.
+            if std::fs::symlink_metadata(&at).is_ok() {
+                std::fs::rename(&at, &old)?;
+                let _ = std::fs::remove_dir_all(&old);
+                crate::platform::remove_link(&old);
+            }
+            continue;
+        }
+        let staged = view.join(format!(".{dir}.tmp-{pid}"));
+        let _ = std::fs::remove_dir_all(&staged);
+        mirror_tree(layout, &src, &staged)?;
+        // A directory SYMLINK from the form that shipped before mirroring is a link,
+        // not a tree: `rename` moves it as a link and `remove_link` drops it.
+        if std::fs::symlink_metadata(&at).is_ok() {
+            std::fs::rename(&at, &old)?;
+        }
+        std::fs::rename(&staged, &at)?;
+        let _ = std::fs::remove_dir_all(&old);
+        crate::platform::remove_link(&old);
+    }
+    Ok(Refreshed {
+        build,
+        tools,
+        stock,
+        changed,
+    })
+}
+
+/// Whether two `bin/` directories present the same name -> file identity map. Unix
+/// compares device and inode; elsewhere a rebuild always counts as a change.
+fn same_bin(live: &Path, staged: &Path) -> bool {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt;
+        let map =
+            |dir: &Path| -> Option<std::collections::BTreeMap<std::ffi::OsString, (u64, u64)>> {
+                let mut out = std::collections::BTreeMap::new();
+                for entry in std::fs::read_dir(dir).ok()? {
+                    let entry = entry.ok()?;
+                    let meta = std::fs::symlink_metadata(entry.path()).ok()?;
+                    out.insert(entry.file_name(), (meta.dev(), meta.ino()));
+                }
+                Some(out)
+            };
+        matches!((map(live), map(staged)), (Some(a), Some(b)) if a == b)
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = (live, staged);
+        false
+    }
 }
 
 /// What sits at the seam path, by `lstat` — never following a link.
@@ -167,8 +418,9 @@ impl Entry {
         match self {
             Entry::Absent => "absent".to_string(),
             Entry::Link(raw) => format!(
-                "a symlink to {} outside {}",
+                "a symlink to {} outside {} and {}",
                 raw.display(),
+                views_root(layout).display(),
                 owned_root(layout).display()
             ),
             Entry::Dir => "a real directory".to_string(),
@@ -224,25 +476,28 @@ fn absolute_target(raw: &Path, link: &Path) -> PathBuf {
     normalize(&base.join(raw))
 }
 
-/// Whether an absolute target lies inside `<prefix>/store/trust/`: lexically first,
-/// then by canonical path when both sides resolve (so a prefix reached through a
-/// symlinked ancestor still counts). A dangling target decides lexically alone.
+/// Whether an absolute target lies inside `<prefix>/rustup/` or `<prefix>/store/trust/`
+/// — the two trees a seam atpkg laid can name: lexically first, then by canonical path
+/// when both sides resolve (so a prefix reached through a symlinked ancestor still
+/// counts). A dangling target decides lexically alone.
 fn resolves_into_prefix(layout: &Layout, abs: &Path) -> bool {
-    let root = normalize(&owned_root(layout));
-    if abs.starts_with(&root) {
-        return true;
-    }
-    match (std::fs::canonicalize(abs), std::fs::canonicalize(&root)) {
-        (Ok(a), Ok(r)) => a.starts_with(&r),
-        _ => false,
-    }
+    [views_root(layout), owned_root(layout)].iter().any(|root| {
+        let root = normalize(root);
+        if abs.starts_with(&root) {
+            return true;
+        }
+        match (std::fs::canonicalize(abs), std::fs::canonicalize(&root)) {
+            (Ok(a), Ok(r)) => a.starts_with(&r),
+            _ => false,
+        }
+    })
 }
 
-/// Whether an absolute target IS `<prefix>/store/trust/current` — lexically only, on
-/// purpose: canonicalizing `current` yields the numbered build it names, which would
-/// make a link to that build look like a link to `current`.
-fn targets_current(layout: &Layout, abs: &Path) -> bool {
-    abs == normalize(&seam_target(layout))
+/// Whether an absolute target IS the view for `name` — lexically only, on purpose: a
+/// link into the store (`current`, or a numbered build) is atpkg's and gets RE-POINTED
+/// here, so it must not read as already right.
+fn targets_view(layout: &Layout, name: &str, abs: &Path) -> bool {
+    abs == normalize(&seam_target(layout, name))
 }
 
 /// Everything the verbs decide on, gathered by one `lstat` + `readlink`.
@@ -254,10 +509,10 @@ pub struct Probe {
     pub entry: Entry,
     /// For a link: its target made absolute and normalized.
     pub target: Option<PathBuf>,
-    /// For a link: whether the target lies inside `<prefix>/store/trust/`.
+    /// For a link: whether the target lies inside `<prefix>/rustup/` or `<prefix>/store/trust/`.
     pub in_prefix: bool,
-    /// For a link: whether the target is exactly `<prefix>/store/trust/current`.
-    pub targets_current: bool,
+    /// For a link: whether the target is exactly the view, `<prefix>/rustup/<name>`.
+    pub targets_view: bool,
 }
 
 /// Inspect the seam entry for `name` without changing anything.
@@ -274,15 +529,15 @@ pub fn probe(layout: &Layout, rustup_home: &Path, name: &str) -> io::Result<Prob
     let in_prefix = target
         .as_deref()
         .is_some_and(|t| resolves_into_prefix(layout, t));
-    let targets_current = target
+    let targets_view = target
         .as_deref()
-        .is_some_and(|t| targets_current(layout, t));
+        .is_some_and(|t| targets_view(layout, name, t));
     Ok(Probe {
         path,
         entry,
         target,
         in_prefix,
-        targets_current,
+        targets_view,
     })
 }
 
@@ -291,19 +546,19 @@ pub fn probe(layout: &Layout, rustup_home: &Path, name: &str) -> io::Result<Prob
 pub enum Attached {
     /// `<rustup_home>/toolchains` is absent: rustup is not installed, nothing done.
     NoRustup { key: String, toolchains: PathBuf },
-    /// The entry was absent and is now a link to `current`.
+    /// The entry was absent and is now a link to the view.
     Created {
         key: String,
         path: PathBuf,
         target: PathBuf,
     },
-    /// The entry already linked to `current`; left byte-for-byte alone.
+    /// The entry already linked to the view; left byte-for-byte alone.
     Adopted {
         key: String,
         path: PathBuf,
         target: PathBuf,
     },
-    /// The entry linked into the prefix but at a numbered build; now `current`.
+    /// The entry linked into the store (`current`, or a numbered build); now the view.
     Repointed {
         key: String,
         path: PathBuf,
@@ -353,7 +608,7 @@ impl fmt::Display for Attached {
                 to,
             } => write!(
                 f,
-                "{key}: re-pointed {} -> {} (was {}, a numbered build)",
+                "{key}: re-pointed {} -> {} (was {}, inside the store)",
                 path.display(),
                 to.display(),
                 from.display()
@@ -368,7 +623,7 @@ impl fmt::Display for Attached {
 pub enum Refusal {
     /// Not on [`SEAM_NAMES`].
     BadName(String),
-    /// `<prefix>/store/trust/current` does not exist: there is nothing to point at.
+    /// `<prefix>/store/trust/current` does not exist: there is nothing to build a view of.
     NotInstalled { target: PathBuf },
     /// The entry exists and is not atpkg's — the one fix is [`DETACH_FIX`].
     Foreign { path: PathBuf, what: String },
@@ -407,12 +662,13 @@ impl fmt::Display for Refusal {
 
 impl std::error::Error for Refusal {}
 
-/// Attach the seam `name`: lay `<rustup_home>/toolchains/<name>` ->
-/// `<prefix>/store/trust/current` and record it. See the module doc for the rules.
+/// Attach the seam `name`: refresh the view, lay `<rustup_home>/toolchains/<name>` ->
+/// `<prefix>/rustup/<name>` and record it. See the module doc for the rules.
 ///
 /// # Errors
 /// [`Refusal`] — the name is not allowed, trust is not installed, the entry is not
-/// atpkg's, or the filesystem failed. Nothing changed on any `Err`.
+/// atpkg's, the view could not be built, or the filesystem failed. The rustup entry is
+/// unchanged on any `Err`.
 pub fn attach(layout: &Layout, rustup_home: &Path, name: &str) -> Result<Attached, Refusal> {
     if !name_allowed(name) {
         return Err(Refusal::BadName(name.to_string()));
@@ -422,13 +678,31 @@ pub fn attach(layout: &Layout, rustup_home: &Path, name: &str) -> Result<Attache
     if !toolchains.is_dir() {
         return Ok(Attached::NoRustup { key, toolchains });
     }
-    let target = seam_target(layout);
+    let target = seam_target(layout, name);
     let p = probe(layout, rustup_home, name)?;
+    // Foreign entries are refused BEFORE the view is touched, so a refusal changes
+    // nothing on disk, as the contract says.
+    if let Entry::Link(raw) = &p.entry
+        && !p.in_prefix
+    {
+        return Err(Refusal::Foreign {
+            what: Entry::Link(raw.clone()).describe(layout),
+            path: p.path,
+        });
+    }
+    if !matches!(p.entry, Entry::Absent | Entry::Link(_)) {
+        return Err(Refusal::Foreign {
+            what: p.entry.describe(layout),
+            path: p.path,
+        });
+    }
+    let current = store_current(layout);
+    if std::fs::symlink_metadata(&current).is_err() {
+        return Err(Refusal::NotInstalled { target: current });
+    }
+    refresh_view(layout, name)?;
     match p.entry {
         Entry::Absent => {
-            if std::fs::symlink_metadata(&target).is_err() {
-                return Err(Refusal::NotInstalled { target });
-            }
             crate::activate::atomic_symlink(&target, &p.path)?;
             record(layout, name)?;
             Ok(Attached::Created {
@@ -438,13 +712,7 @@ pub fn attach(layout: &Layout, rustup_home: &Path, name: &str) -> Result<Attache
             })
         }
         Entry::Link(raw) => {
-            if !p.in_prefix {
-                return Err(Refusal::Foreign {
-                    what: Entry::Link(raw).describe(layout),
-                    path: p.path,
-                });
-            }
-            if p.targets_current {
+            if p.targets_view {
                 record(layout, name)?;
                 return Ok(Attached::Adopted {
                     key,
@@ -452,8 +720,9 @@ pub fn attach(layout: &Layout, rustup_home: &Path, name: &str) -> Result<Attache
                     target,
                 });
             }
-            // A link into the prefix at a numbered build: `rename(2)` a fresh link over
-            // it — the existing link is replaced, never followed.
+            // A link into the store — `current`, or a numbered build — from before the
+            // view existed: `rename(2)` a fresh link over it. The existing link is
+            // replaced, never followed.
             crate::activate::atomic_symlink(&target, &p.path)?;
             record(layout, name)?;
             Ok(Attached::Repointed {
@@ -463,6 +732,7 @@ pub fn attach(layout: &Layout, rustup_home: &Path, name: &str) -> Result<Attache
                 to: target,
             })
         }
+        // Every other shape was refused above.
         other => Err(Refusal::Foreign {
             what: other.describe(layout),
             path: p.path,
@@ -594,6 +864,9 @@ pub fn detach(
         }
         Entry::Link(raw) if p.in_prefix => {
             unlink_checked(&p.path)?;
+            // The view is atpkg's own, laid for this seam alone; it goes with the entry.
+            // The store it mirrored is never touched.
+            let _ = std::fs::remove_dir_all(view_dir(layout, name));
             unrecord(layout, name)?;
             Ok(Detached::Removed {
                 key,
@@ -650,10 +923,10 @@ pub struct SeamStatus {
     pub entry: Result<Entry, String>,
     /// For a link: its absolute target.
     pub target: Option<PathBuf>,
-    /// For a link: inside `<prefix>/store/trust/`.
+    /// For a link: inside `<prefix>/rustup/` or `<prefix>/store/trust/`.
     pub in_prefix: bool,
-    /// For a link: exactly `<prefix>/store/trust/current`.
-    pub targets_current: bool,
+    /// For a link: exactly the view, `<prefix>/rustup/<name>`.
+    pub targets_view: bool,
 }
 
 impl fmt::Display for SeamStatus {
@@ -670,12 +943,12 @@ impl fmt::Display for SeamStatus {
         };
         write!(
             f,
-            "{}: recorded={} path={} target={target} in-prefix={} targets-current={}",
+            "{}: recorded={} path={} target={target} in-prefix={} targets-view={}",
             self.key,
             yn(self.recorded),
             self.path.display(),
             yn(self.in_prefix),
-            yn(self.targets_current)
+            yn(self.targets_view)
         )?;
         if !self.rustup_present {
             write!(
@@ -708,7 +981,7 @@ pub fn status(layout: &Layout, rustup_home: &Path, name: &str) -> SeamStatus {
             entry: Ok(p.entry),
             target: p.target,
             in_prefix: p.in_prefix,
-            targets_current: p.targets_current,
+            targets_view: p.targets_view,
         },
         Err(e) => SeamStatus {
             key,
@@ -718,7 +991,7 @@ pub fn status(layout: &Layout, rustup_home: &Path, name: &str) -> SeamStatus {
             entry: Err(e.to_string()),
             target: None,
             in_prefix: false,
-            targets_current: false,
+            targets_view: false,
         },
     }
 }
@@ -853,7 +1126,7 @@ pub fn reassert(layout: &Layout, rustup_home: &Path) -> Vec<String> {
     // foreign entry is now SAID and RECORDED each pass instead of silently skipped:
     // m21 ran seven weeks with `~/.rustup/toolchains/trust` pointing at a dev stage2,
     // `seams = []`, and every pass walking an empty name set (2026-09-10 audit).
-    if !names.contains(DEFAULT_SEAM) && std::fs::symlink_metadata(seam_target(layout)).is_ok() {
+    if !names.contains(DEFAULT_SEAM) && std::fs::symlink_metadata(store_current(layout)).is_ok() {
         names.insert(DEFAULT_SEAM.to_string());
     }
     for name in names {
@@ -961,11 +1234,32 @@ mod tests {
             }
         }
 
-        /// Lay `store/trust/<build>/` and `store/trust/current -> <build>`.
+        /// Lay `store/trust/<build>/` — the Trust-named tools in `bin/`, a `lib/` — and
+        /// `store/trust/current -> <build>`. A build ships NO stock names: that is the
+        /// distribution's shape since 2026-09-14, and the view's job.
         fn install_trust(&self, build: u64) -> PathBuf {
             let dir = self.layout.build_dir("trust", build);
             std::fs::create_dir_all(dir.join("bin")).unwrap();
-            crate::activate::atomic_symlink(&dir, &seam_target(&self.layout)).unwrap();
+            std::fs::create_dir_all(dir.join("lib").join("rustlib")).unwrap();
+            std::fs::write(
+                dir.join("lib").join("libtrust.dylib"),
+                format!("driver of {build}"),
+            )
+            .unwrap();
+            #[cfg(unix)]
+            std::os::unix::fs::symlink(
+                "../../etc",
+                dir.join("lib").join("rustlib").join("etc-link"),
+            )
+            .unwrap();
+            for tool in ["trustc", "targo", "trustdoc", "tippy"] {
+                std::fs::write(
+                    dir.join("bin").join(tool),
+                    format!("{tool} of build {build}"),
+                )
+                .unwrap();
+            }
+            crate::activate::atomic_symlink(&dir, &store_current(&self.layout)).unwrap();
             dir
         }
 
@@ -987,6 +1281,14 @@ mod tests {
     #[cfg(unix)]
     fn link(target: &Path, at: &Path) {
         std::os::unix::fs::symlink(target, at).unwrap();
+    }
+
+    /// `(dev, ino)` of a path, following nothing.
+    #[cfg(unix)]
+    fn ident(path: &Path) -> (u64, u64) {
+        use std::os::unix::fs::MetadataExt;
+        let m = std::fs::symlink_metadata(path).unwrap();
+        (m.dev(), m.ino())
     }
 
     #[test]
@@ -1079,8 +1381,8 @@ mod tests {
         assert!(out.changed());
         assert_eq!(
             std::fs::read_link(fx.seam("trust")).unwrap(),
-            seam_target(&fx.layout),
-            "the link names `current`, never the numbered build"
+            seam_target(&fx.layout, "trust"),
+            "the link names the view, never the store"
         );
         assert_eq!(fx.seams_recorded(), vec!["rustup:trust".to_string()]);
         // No temp link left behind in toolchains/.
@@ -1092,13 +1394,13 @@ mod tests {
         assert!(leftovers.is_empty(), "no temp symlink remains");
 
         let after = status(&fx.layout, &fx.rustup, "trust");
-        assert!(after.recorded && after.in_prefix && after.targets_current);
+        assert!(after.recorded && after.in_prefix && after.targets_view);
         let line = after.to_string();
         assert!(
             line.starts_with("rustup:trust: recorded=yes path="),
             "{line}"
         );
-        assert!(line.contains("in-prefix=yes targets-current=yes"), "{line}");
+        assert!(line.contains("in-prefix=yes targets-view=yes"), "{line}");
         assert!(!line.contains('\n'), "one line");
 
         // A second attach ADOPTS: byte-identical link, still one record.
@@ -1127,14 +1429,15 @@ mod tests {
     fn existing_link_into_prefix_is_adopted_untouched() {
         let fx = Fixture::new("adopt");
         fx.install_trust(6808);
-        link(&seam_target(&fx.layout), &fx.seam("trust"));
+        refresh_view(&fx.layout, "trust").unwrap();
+        link(&seam_target(&fx.layout, "trust"), &fx.seam("trust"));
         let ino_before = std::fs::symlink_metadata(fx.seam("trust")).unwrap();
         let out = attach(&fx.layout, &fx.rustup, "trust").unwrap();
         assert!(matches!(out, Attached::Adopted { .. }), "{out}");
         assert!(out.to_string().contains("adopted"));
         assert_eq!(
             std::fs::read_link(fx.seam("trust")).unwrap(),
-            seam_target(&fx.layout)
+            seam_target(&fx.layout, "trust")
         );
         // Leave the bytes alone: the same inode, not a rewritten link.
         use std::os::unix::fs::MetadataExt;
@@ -1148,20 +1451,18 @@ mod tests {
     fn relative_link_into_prefix_is_adopted() {
         let fx = Fixture::new("relative");
         fx.install_trust(6808);
-        // `toolchains/trust -> ../../prefix/store/trust/current` — relative to the link.
-        link(
-            Path::new("../../prefix/store/trust/current"),
-            &fx.seam("trust"),
-        );
+        // `toolchains/trust -> ../../prefix/rustup/trust` — relative to the link.
+        refresh_view(&fx.layout, "trust").unwrap();
+        link(Path::new("../../prefix/rustup/trust"), &fx.seam("trust"));
         let p = probe(&fx.layout, &fx.rustup, "trust").unwrap();
-        assert!(p.in_prefix && p.targets_current, "{p:?}");
+        assert!(p.in_prefix && p.targets_view, "{p:?}");
         let out = attach(&fx.layout, &fx.rustup, "trust").unwrap();
         assert!(matches!(out, Attached::Adopted { .. }), "{out}");
     }
 
     #[cfg(unix)]
     #[test]
-    fn numbered_build_link_is_repointed_to_current() {
+    fn numbered_build_link_is_repointed_to_the_view() {
         let fx = Fixture::new("repoint");
         let build = fx.install_trust(6808);
         link(&build, &fx.seam("trust"));
@@ -1169,16 +1470,16 @@ mod tests {
         match &out {
             Attached::Repointed { from, to, .. } => {
                 assert_eq!(from, &build);
-                assert_eq!(to, &seam_target(&fx.layout));
+                assert_eq!(to, &seam_target(&fx.layout, "trust"));
             }
             other => panic!("expected Repointed, got {other}"),
         }
         assert!(out.changed());
         assert!(out.to_string().contains("re-pointed"), "{out}");
-        assert!(out.to_string().contains("numbered build"), "{out}");
+        assert!(out.to_string().contains("inside the store"), "{out}");
         assert_eq!(
             std::fs::read_link(fx.seam("trust")).unwrap(),
-            seam_target(&fx.layout)
+            seam_target(&fx.layout, "trust")
         );
         assert_eq!(fx.seams_recorded(), vec!["rustup:trust".to_string()]);
         // The build tree itself was never followed into or touched.
@@ -1239,7 +1540,8 @@ mod tests {
         // The user re-points the entry into the store; the next pass adopts it and
         // the refusal leaves the record, replaced by the seam itself.
         std::fs::remove_file(fx.seam("trust")).unwrap();
-        link(&seam_target(&fx.layout), &fx.seam("trust"));
+        refresh_view(&fx.layout, "trust").unwrap();
+        link(&seam_target(&fx.layout, "trust"), &fx.seam("trust"));
         let lines = reassert(&fx.layout, &fx.rustup);
         assert!(lines.is_empty(), "an adoption is quiet: {lines:?}");
         assert!(refusals(&fx.layout).is_empty());
@@ -1264,7 +1566,7 @@ mod tests {
         assert!(fx.seams_recorded().is_empty());
         let s = status(&fx.layout, &fx.rustup, "trust");
         assert!(
-            s.to_string().contains("in-prefix=no targets-current=no"),
+            s.to_string().contains("in-prefix=no targets-view=no"),
             "{s}"
         );
     }
@@ -1292,8 +1594,9 @@ mod tests {
         assert!(matches!(out, Detached::Removed { .. }), "{out}");
         assert!(std::fs::symlink_metadata(fx.seam("trust")).is_err());
         assert!(fx.seams_recorded().is_empty());
-        // The store's own `current` is untouched — only the rustup entry went.
-        assert!(std::fs::symlink_metadata(seam_target(&fx.layout)).is_ok());
+        // The store's own `current` is untouched — the rustup entry and the view went.
+        assert!(std::fs::symlink_metadata(store_current(&fx.layout)).is_ok());
+        assert!(std::fs::symlink_metadata(view_dir(&fx.layout, "trust")).is_err());
 
         // Absent: nothing to remove, exit clean.
         let out = detach(&fx.layout, &fx.rustup, "trust", false).unwrap();
@@ -1410,7 +1713,7 @@ mod tests {
         );
         assert_eq!(
             std::fs::read_link(fx.seam("trust-dev")).unwrap(),
-            seam_target(&fx.layout)
+            seam_target(&fx.layout, "trust-dev")
         );
         detach(&fx.layout, &fx.rustup, "trust-dev", false).unwrap();
         assert_eq!(fx.seams_recorded(), vec!["rustup:trust".to_string()]);
@@ -1507,5 +1810,156 @@ mod tests {
         assert!(reassert_if_armed(&fx.layout).is_empty());
         assert!(std::fs::symlink_metadata(fx.seam("trust")).is_err());
         assert!(fx.seams_recorded().is_empty());
+    }
+
+    /// THE VIEW. One hard link per tool under its own name, each stock name a hard link
+    /// to its Trust tool — one inode, never a copy — and `lib/` a symlink into the build.
+    #[cfg(unix)]
+    #[test]
+    fn the_view_is_one_inode_per_tool_with_the_stock_names_laid() {
+        let fx = Fixture::new("view");
+        let build = fx.install_trust(6808);
+        let r = refresh_view(&fx.layout, "trust").unwrap();
+        assert_eq!(r.build, build);
+        assert_eq!(r.tools, 4);
+        assert_eq!(
+            r.stock,
+            vec![
+                ("rustc", "trustc"),
+                ("cargo", "targo"),
+                ("rustdoc", "trustdoc")
+            ]
+        );
+        assert!(r.changed);
+        let bin = view_dir(&fx.layout, "trust").join("bin");
+        for (public, trust) in STOCK_NAMES {
+            assert_eq!(
+                ident(&bin.join(public)),
+                ident(&build.join("bin").join(trust)),
+                "{public} is the store's {trust}, not a copy of it"
+            );
+        }
+        assert_eq!(
+            ident(&bin.join("tippy")),
+            ident(&build.join("bin").join("tippy"))
+        );
+        // `lib/` is a mirror, not a directory symlink: the file inside is the store's
+        // inode, and the directory itself is real, so a tool run from the view
+        // resolves its sysroot to the VIEW.
+        let lib = view_dir(&fx.layout, "trust").join("lib");
+        assert!(
+            std::fs::symlink_metadata(&lib).unwrap().is_dir(),
+            "a real directory"
+        );
+        assert_eq!(
+            ident(&lib.join("libtrust.dylib")),
+            ident(&build.join("lib").join("libtrust.dylib"))
+        );
+        assert_eq!(
+            std::fs::read_link(lib.join("rustlib").join("etc-link")).unwrap(),
+            Path::new("../../etc")
+        );
+        // Idempotent: the same set is not a change.
+        assert!(!refresh_view(&fx.layout, "trust").unwrap().changed);
+    }
+
+    /// A stock-name COPY an older bundle shipped is not what the view presents: the
+    /// view's `rustc` is the store's `trustc`, whatever `bin/rustc` in the bundle holds.
+    #[cfg(unix)]
+    #[test]
+    fn a_stock_copy_the_bundle_shipped_is_replaced_by_the_link() {
+        let fx = Fixture::new("view-copy");
+        let build = fx.install_trust(8595);
+        std::fs::write(build.join("bin").join("rustc"), b"a second copy of trustc").unwrap();
+        let r = refresh_view(&fx.layout, "trust").unwrap();
+        assert_eq!(r.tools, 5);
+        let bin = view_dir(&fx.layout, "trust").join("bin");
+        assert_eq!(
+            ident(&bin.join("rustc")),
+            ident(&build.join("bin").join("trustc"))
+        );
+        assert_eq!(
+            std::fs::read(bin.join("rustc")).unwrap(),
+            b"trustc of build 8595"
+        );
+    }
+
+    /// The view follows `current`: after an update the stock names are the NEW build's
+    /// tools, and the old build's inodes are released.
+    #[cfg(unix)]
+    #[test]
+    fn the_view_follows_current_across_an_update() {
+        let fx = Fixture::new("view-update");
+        let old = fx.install_trust(6808);
+        attach(&fx.layout, &fx.rustup, "trust").unwrap();
+        let bin = view_dir(&fx.layout, "trust").join("bin");
+        assert_eq!(
+            ident(&bin.join("rustc")),
+            ident(&old.join("bin").join("trustc"))
+        );
+        let new = fx.install_trust(6809);
+        let lines = reassert(&fx.layout, &fx.rustup);
+        assert!(
+            lines.is_empty(),
+            "an adoption is quiet even when the view moved: {lines:?}"
+        );
+        assert_eq!(
+            ident(&bin.join("rustc")),
+            ident(&new.join("bin").join("trustc"))
+        );
+        assert_eq!(
+            std::fs::read(bin.join("cargo")).unwrap(),
+            b"targo of build 6809"
+        );
+        assert_eq!(
+            std::fs::read_link(fx.seam("trust")).unwrap(),
+            seam_target(&fx.layout, "trust"),
+            "the rustup entry never moved; only the view's contents did"
+        );
+    }
+
+    /// The layout from before the view: a seam pointing at `store/trust/current`. It is
+    /// atpkg's, so it is re-pointed at the view — and said, since the change is real.
+    #[cfg(unix)]
+    #[test]
+    fn a_legacy_link_to_store_current_is_repointed_to_the_view() {
+        let fx = Fixture::new("legacy");
+        fx.install_trust(6808);
+        link(&store_current(&fx.layout), &fx.seam("trust"));
+        let p = probe(&fx.layout, &fx.rustup, "trust").unwrap();
+        assert!(p.in_prefix && !p.targets_view, "{p:?}");
+        let lines = reassert(&fx.layout, &fx.rustup);
+        assert_eq!(lines.len(), 1, "{lines:?}");
+        assert!(
+            lines[0].contains("re-pointed") && lines[0].contains("inside the store"),
+            "{lines:?}"
+        );
+        assert_eq!(
+            std::fs::read_link(fx.seam("trust")).unwrap(),
+            seam_target(&fx.layout, "trust")
+        );
+        assert!(
+            view_dir(&fx.layout, "trust")
+                .join("bin")
+                .join("rustc")
+                .is_file()
+        );
+    }
+
+    /// A symlinked tool in the bundle's `bin/` is not presented: every Trust frontend
+    /// refuses a symlinked sibling, so the view would only move the refusal.
+    #[cfg(unix)]
+    #[test]
+    fn a_symlinked_tool_in_the_bundle_is_left_out_of_the_view() {
+        let fx = Fixture::new("view-symlink");
+        let build = fx.install_trust(6808);
+        std::fs::remove_file(build.join("bin").join("trustc")).unwrap();
+        link(Path::new("targo"), &build.join("bin").join("trustc"));
+        let r = refresh_view(&fx.layout, "trust").unwrap();
+        assert_eq!(r.tools, 3);
+        assert_eq!(r.stock, vec![("cargo", "targo"), ("rustdoc", "trustdoc")]);
+        let bin = view_dir(&fx.layout, "trust").join("bin");
+        assert!(std::fs::symlink_metadata(bin.join("trustc")).is_err());
+        assert!(std::fs::symlink_metadata(bin.join("rustc")).is_err());
     }
 }

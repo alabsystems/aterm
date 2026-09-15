@@ -7,6 +7,8 @@
 //! agents read these runs top to bottom and know where to look. Concurrency
 //! changes when a stage RUNS, never where it PRINTS.
 
+use std::path::{Path, PathBuf};
+
 use crate::Ctx;
 use crate::cli::Mode;
 
@@ -18,7 +20,9 @@ use crate::cli::Mode;
 pub enum Lane {
     /// Shells out to nothing that touches a target dir.
     Pure,
-    /// `target/` — the workspace build, its tests, the xtask gates, the smokes.
+    /// `target/` — the workspace build, its tests and doctests, and the three
+    /// `--full` tiers. (Until 2026-09-13 also the regex lane, the xtask verbs
+    /// and every driven binary; those have their own lanes below.)
     MainTarget,
     /// `target-tippy/` — the lint keeps a SEPARATE target dir so the trust
     /// toolchain's artifacts stay off the stock build. That is also what makes
@@ -30,6 +34,32 @@ pub enum Lane {
     /// and its emitted-symbol gate. The oracle owns both directories and may
     /// run beside the main workspace without contending for Cargo's lock.
     LibcOracleTarget,
+    /// `target-regex/` — the regex search lane alone. Moved off `target/` on
+    /// 2026-09-13: `-p aterm-search --features regex` resolves a feature set
+    /// the workspace test never builds, so in `target/` it compiled its own
+    /// variants serially, after the doctests. Same argv, own lock, t0.
+    RegexTarget,
+    /// `target-sealed/` — build the harness's GUI, then run
+    /// `-p aterm-link --features sealed --test two_nodes_sealed`. Preparing the
+    /// GUI here keeps the test off MainTarget's concurrently rebuilt artifact.
+    /// The ONE test covering the vendored astream-aead is `#![cfg(feature =
+    /// "sealed")]`, so the workspace test run compiles it to nothing; until this
+    /// lane it ran on nobody's cadence but a hand's (audit 2026-09-12). Its own
+    /// dir for the regex lane's reason: a feature set the workspace never builds
+    /// would otherwise recompile its variants serially in `target/`.
+    SealedTarget,
+    /// `target-xtask/` — the xtask-verb stages (formatting, feature gates, the
+    /// proof inventory). The verbs they run spawn no cargo (grep of
+    /// `crates/xtask/src/gate.rs`, 2026-09-13), so the only lock they take is
+    /// the one `targo run -p xtask` takes to build xtask.
+    XtaskTarget,
+    /// `target-drivers/` — every binary the gate DRIVES rather than tests: the
+    /// smokes' `aterm-gui`/`aterm-ctl`, the redraw harness, the eight objc
+    /// drivers, and the `driver builds` stage that pre-compiles all of them.
+    /// Only stages in this lane write its uplifted binaries, so no other stage
+    /// can relink one under a smoke (in `target/` the test stage relinked
+    /// `aterm-gui` with dev features).
+    DriverTarget,
 }
 
 /// Every stage of the gate.
@@ -39,6 +69,8 @@ pub enum StageId {
     Test,
     Doctests,
     RegexLane,
+    /// The sealed cross-host rung of the fabric bridge, `--features sealed`.
+    SealedLane,
     Tippy,
     Formatting,
     GrepGuards,
@@ -52,6 +84,7 @@ pub enum StageId {
     LibcOracle,
     FreezeGate,
     ProofInventory,
+    DriverBuilds,
     ControlSocketSmoke,
     GuiSmoke,
     RedrawConformance,
@@ -79,6 +112,51 @@ pub struct StageSpec {
     /// they measure frame rates and latencies: a stage whose verdict depends on
     /// how busy the machine is must own the machine.
     pub exclusive: bool,
+    /// Lanes whose stages must all have FINISHED before this one starts —
+    /// apart from stages behind an exclusive barrier declared after it, which
+    /// cannot overlap it anyway (see `crate::sched`). Only the test run uses
+    /// it: it measures (paint, spin), and before 2026-09-13 the regex lane, the
+    /// xtask verbs and the driver builds were serialised behind it in
+    /// `target/`, so waiting for their new lanes keeps it at least as isolated.
+    pub after_lanes: Vec<Lane>,
+}
+
+/// The target directory a lane's cargo children use. `None` for [`Lane::Pure`],
+/// which has none.
+///
+/// `MainTarget` keeps the rule it always had: the caller's `CARGO_TARGET_DIR`
+/// (relative to the root, as cargo reads it) or `<root>/target`, and its
+/// children inherit the variable rather than being handed one. The side lanes
+/// are absolute paths under the root, because they ARE handed to children whose
+/// cwd is the root and a relative one would be read twice.
+#[must_use]
+pub fn lane_dir(ctx: &Ctx, lane: Lane) -> Option<PathBuf> {
+    let under_root = |rel: &str| {
+        let p = ctx.root.join(rel);
+        Some(std::path::absolute(&p).unwrap_or(p))
+    };
+    match lane {
+        Lane::Pure => None,
+        Lane::MainTarget => Some(ctx.env.cargo_target_dir.as_deref().map_or_else(
+            || ctx.root.join("target"),
+            |d| {
+                let d = Path::new(d);
+                if d.is_absolute() {
+                    d.to_path_buf()
+                } else {
+                    ctx.root.join(d)
+                }
+            },
+        )),
+        // Spelled as `stages::tippy_cmd` spells it, which is unchanged.
+        Lane::TippyTarget => Some(ctx.root.join("target-tippy")),
+        Lane::FreezeGateTarget => under_root("tools/freeze-safety-gate/target"),
+        Lane::LibcOracleTarget => under_root("libc-oracle/target"),
+        Lane::RegexTarget => under_root("target-regex"),
+        Lane::SealedTarget => under_root("target-sealed"),
+        Lane::XtaskTarget => under_root("target-xtask"),
+        Lane::DriverTarget => under_root("target-drivers"),
+    }
 }
 
 /// Build the run's stage list.
@@ -96,7 +174,18 @@ pub fn plan(ctx: &Ctx) -> Vec<StageSpec> {
     let label = ctx.scope.label();
     let mut v = vec![
         spec(StageId::Build, format!("build ({label})"), Lane::MainTarget),
-        spec(StageId::Test, format!("test ({label})"), Lane::MainTarget),
+        // THE TEST RUN WAITS FOR THE SIDE LANES (2026-09-13). They start at t0
+        // beside the build; the test run still owns the machine's cargo work
+        // the way it did when they queued behind it in `target/`.
+        StageSpec {
+            after_lanes: vec![
+                Lane::RegexTarget,
+                Lane::SealedTarget,
+                Lane::XtaskTarget,
+                Lane::DriverTarget,
+            ],
+            ..spec(StageId::Test, format!("test ({label})"), Lane::MainTarget)
+        },
         spec(
             StageId::Doctests,
             format!("doctests ({label})"),
@@ -107,7 +196,14 @@ pub fn plan(ctx: &Ctx) -> Vec<StageSpec> {
         v.push(spec(
             StageId::RegexLane,
             "regex search lane (aterm-search --features regex)",
-            Lane::MainTarget,
+            Lane::RegexTarget,
+        ));
+    }
+    if ctx.scope.includes_sealed_lane() {
+        v.push(spec(
+            StageId::SealedLane,
+            "sealed fabric lane (aterm-link --features sealed)",
+            Lane::SealedTarget,
         ));
     }
     v.push(spec(
@@ -118,7 +214,7 @@ pub fn plan(ctx: &Ctx) -> Vec<StageSpec> {
     // FORMATTING, right after the lint it belongs beside. It is `xtask gate
     // lint --fmt-only`: both passes of the formatter lane — `targo-fmt --all`
     // over the workspace and the per-file sweep over the sources `--all` cannot
-    // reach — and no other lane. `MainTarget` because it runs through the xtask
+    // reach — and no other lane. `XtaskTarget` because it runs through the xtask
     // binary; the check itself needs no compiler and cost 7.5 s over 1,761 files
     // on two measured runs.
     //
@@ -132,7 +228,7 @@ pub fn plan(ctx: &Ctx) -> Vec<StageSpec> {
     v.push(spec(
         StageId::Formatting,
         "formatting (targo-fmt --all + the per-file sweep)",
-        Lane::MainTarget,
+        Lane::XtaskTarget,
     ));
     v.push(spec(StageId::GrepGuards, "grep guards", Lane::Pure));
     v.push(spec(
@@ -164,7 +260,7 @@ pub fn plan(ctx: &Ctx) -> Vec<StageSpec> {
     v.push(spec(
         StageId::FeatureGates,
         "feature gates (drift/dormant)",
-        Lane::MainTarget,
+        Lane::XtaskTarget,
     ));
     v.push(spec(
         StageId::LibcOracle,
@@ -179,27 +275,39 @@ pub fn plan(ctx: &Ctx) -> Vec<StageSpec> {
     v.push(spec(
         StageId::ProofInventory,
         "computed proof inventory",
-        Lane::MainTarget,
+        Lane::XtaskTarget,
+    ));
+    // DRIVER BUILDS (2026-09-13): the smoke, redraw and objc binaries,
+    // compiled at t0 in their own lane. Every driver stage below still runs its
+    // own build argv — a fingerprint no-op after this — so nothing is proven
+    // from this row's binaries that its own stage did not ask cargo for. What
+    // it removes is those compiles running one after another inside the
+    // exclusive tail. Declared here, before the smokes, because a stage after
+    // an exclusive barrier could not start until the barrier finished.
+    v.push(spec(
+        StageId::DriverBuilds,
+        "driver builds (smoke, redraw and objc binaries)",
+        Lane::DriverTarget,
     ));
     v.push(exclusive(
         StageId::ControlSocketSmoke,
         "control-socket smoke",
-        Lane::MainTarget,
+        Lane::DriverTarget,
     ));
     v.push(exclusive(
         StageId::GuiSmoke,
         "gui typing-pacing smoke",
-        Lane::MainTarget,
+        Lane::DriverTarget,
     ));
-    // LAST in the main-target lane: it builds aterm-gui under a non-default
-    // feature, so it runs after the two smokes have finished with the default
-    // binaries. Never conditional on the scope — the claim it makes is about the
-    // shipped GUI, and a gate that a narrowing can remove is a gate that stops
-    // running exactly when someone is in a hurry.
+    // After the two smokes in the driver lane: it builds aterm-gui under a
+    // non-default feature, so it runs after the two smokes have finished with
+    // the default binaries. Never conditional on the scope — the claim it makes
+    // is about the shipped GUI, and a gate that a narrowing can remove is a gate
+    // that stops running exactly when someone is in a hurry.
     v.push(spec(
         StageId::RedrawConformance,
         "control redraw conformance (a select repaints a real window)",
-        Lane::MainTarget,
+        Lane::DriverTarget,
     ));
     // AND THE OTHER THING ONLY A `fn main` CAN SEE. `vendor/winit`'s
     // `WinitWindowDelegate` is declared by `aterm_objc::declare_class!` since
@@ -214,7 +322,7 @@ pub fn plan(ctx: &Ctx) -> Vec<StageSpec> {
     v.push(spec(
         StageId::ObjcClassAudit,
         "objc live-class audit (the registered WinitWindowDelegate and WinitView, against the runtime)",
-        Lane::MainTarget,
+        Lane::DriverTarget,
     ));
     // The auditor's twin, and a SEPARATE stage because it asks a separate
     // question. The audit proves the ported `WinitView` is SHAPED right — 44
@@ -229,7 +337,7 @@ pub fn plan(ctx: &Ctx) -> Vec<StageSpec> {
     v.push(spec(
         StageId::ObjcImeDrive,
         "objc IME drive (a composition through the ported WinitView's NSTextInputClient rows)",
-        Lane::MainTarget,
+        Lane::DriverTarget,
     ));
     // AND THE SAME OBLIGATION, ONE FILE OVER. Both stages above audit
     // `vendor/winit`; `crates/aterm-gui/src/toolbar.rs` is the LARGEST ported
@@ -248,7 +356,7 @@ pub fn plan(ctx: &Ctx) -> Vec<StageSpec> {
     v.push(spec(
         StageId::ObjcToolbarDrive,
         "objc toolbar drive (the real tab strip: 27 drawn states, and all four declared classes off live objects)",
-        Lane::MainTarget,
+        Lane::DriverTarget,
     ));
     // THE WINDOW DRIVER (W8), and it is unconditional for the same reason its
     // three siblings are. `window_delegate.rs` is the largest file in the
@@ -259,7 +367,7 @@ pub fn plan(ctx: &Ctx) -> Vec<StageSpec> {
     v.push(spec(
         StageId::ObjcWindowDrive,
         "objc window drive (the real window: title, style mask, geometry, limits, theme, tabs, drag-and-drop, close and fullscreen)",
-        Lane::MainTarget,
+        Lane::DriverTarget,
     ));
     // THE EVENT DRIVER, unconditional for the same reason as its three
     // siblings — and it is the row they were missing. The auditor proved the
@@ -277,7 +385,7 @@ pub fn plan(ctx: &Ctx) -> Vec<StageSpec> {
     v.push(spec(
         StageId::ObjcEventDrive,
         "objc event drive (every NSEvent-taking WinitView row and sendEvent:, with a real NSEvent of every type AppKit can deliver)",
-        Lane::MainTarget,
+        Lane::DriverTarget,
     ));
     // THE MODAL DRIVER (W13), unconditional like the five above it. W13 ported
     // `aterm-gui`'s last five `objc2` files, and four of them are one
@@ -295,7 +403,7 @@ pub fn plan(ctx: &Ctx) -> Vec<StageSpec> {
     v.push(spec(
         StageId::ObjcAlertDrive,
         "objc alert drive (the real NSAlert: its buttons and key equivalent, the sheet and its copied completion block, the local key monitor, the menu bar walk and the chrome capture)",
-        Lane::MainTarget,
+        Lane::DriverTarget,
     ));
     // THE SWIZZLE DRIVER (W12), unconditional for the reason its module
     // states: NO ENCODING CHECK CAN SEE A SWIZZLE. `SwizzleSite` is what
@@ -310,7 +418,7 @@ pub fn plan(ctx: &Ctx) -> Vec<StageSpec> {
     v.push(spec(
         StageId::ObjcSwizzleDrive,
         "objc swizzle drive (SwizzleSite against the live -[NSApplication sendEvent:]: Apple's encoding, the IMP's image, a real NSEvent through both halves of the chain, and the refusal)",
-        Lane::MainTarget,
+        Lane::DriverTarget,
     ));
     // THE CONTAINER DRIVER (W12), unconditional because its obligation has no
     // type-system half. `MainThreadBound<T>` is `Send + Sync` for every `T`
@@ -324,7 +432,7 @@ pub fn plan(ctx: &Ctx) -> Vec<StageSpec> {
     v.push(spec(
         StageId::ObjcBoundDrive,
         "objc bound drive (MainThreadBound's main-thread drop against an unsound twin, a declared class's -dealloc, and the needs_drop hang differential)",
-        Lane::MainTarget,
+        Lane::DriverTarget,
     ));
     if ctx.mode == Mode::Full {
         v.push(spec(
@@ -389,6 +497,7 @@ fn spec(id: StageId, title: impl Into<String>, lane: Lane) -> StageSpec {
         title: title.into(),
         lane,
         exclusive: false,
+        after_lanes: Vec::new(),
     }
 }
 
@@ -398,6 +507,7 @@ fn exclusive(id: StageId, title: impl Into<String>, lane: Lane) -> StageSpec {
         title: title.into(),
         lane,
         exclusive: true,
+        after_lanes: Vec::new(),
     }
 }
 
@@ -432,6 +542,7 @@ mod tests {
                 StageId::Test,
                 StageId::Doctests,
                 StageId::RegexLane,
+                StageId::SealedLane,
                 StageId::Tippy,
                 StageId::Formatting,
                 StageId::GrepGuards,
@@ -445,6 +556,7 @@ mod tests {
                 StageId::LibcOracle,
                 StageId::FreezeGate,
                 StageId::ProofInventory,
+                StageId::DriverBuilds,
                 StageId::ControlSocketSmoke,
                 StageId::GuiSmoke,
                 StageId::RedrawConformance,
@@ -458,6 +570,145 @@ mod tests {
                 StageId::ObjcBoundDrive,
             ]
         );
+    }
+
+    /// THE STAGE-SET PROOF, as ids. The 2026-09-13 speed round was allowed to
+    /// ADD one row (driver builds) and move stages between lanes; it was not
+    /// allowed to lose one. This is the 18f19eea6 ladder as a literal — its 28
+    /// `--fast` stages and the 3 `--full` tiers — and every one must still be
+    /// planned, in that order, in every mode and scope that planned it then.
+    #[test]
+    fn every_stage_of_the_18f19eea6_ladder_is_still_planned_in_order() {
+        const FAST_18F19EEA6: [StageId; 29] = [
+            StageId::Build,
+            StageId::Test,
+            StageId::Doctests,
+            StageId::RegexLane,
+            StageId::SealedLane,
+            StageId::Tippy,
+            StageId::Formatting,
+            StageId::GrepGuards,
+            StageId::InstallChannel,
+            StageId::AtpkgTooling,
+            StageId::TrustGateVerdict,
+            StageId::TrustContractProbe,
+            StageId::StartCompare,
+            StageId::LicenseHeaders,
+            StageId::FeatureGates,
+            StageId::LibcOracle,
+            StageId::FreezeGate,
+            StageId::ProofInventory,
+            StageId::ControlSocketSmoke,
+            StageId::GuiSmoke,
+            StageId::RedrawConformance,
+            StageId::ObjcClassAudit,
+            StageId::ObjcImeDrive,
+            StageId::ObjcToolbarDrive,
+            StageId::ObjcWindowDrive,
+            StageId::ObjcEventDrive,
+            StageId::ObjcAlertDrive,
+            StageId::ObjcSwizzleDrive,
+            StageId::ObjcBoundDrive,
+        ];
+        const FULL_18F19EEA6: [StageId; 3] = [
+            StageId::DifferentialOracle,
+            StageId::KaniFloor,
+            StageId::CrossCells,
+        ];
+        for mode in [Mode::Fast, Mode::Full] {
+            for scope in [
+                Scope::workspace(),
+                Scope::crate_only("aterm-grid"),
+                Scope::crate_only("aterm-search"),
+                Scope::changed("main", vec!["aterm-gui".into()], true),
+                Scope::changed("main", vec![], true),
+            ] {
+                let c = ctx(mode, scope.clone());
+                let mut old: Vec<StageId> = FAST_18F19EEA6
+                    .into_iter()
+                    .filter(|id| match id {
+                        StageId::RegexLane => c.scope.includes_regex_lane(),
+                        StageId::SealedLane => c.scope.includes_sealed_lane(),
+                        _ => true,
+                    })
+                    .collect();
+                if mode == Mode::Full {
+                    old.extend(FULL_18F19EEA6);
+                }
+                let new = ids(&c);
+                let mut rest = new.iter();
+                for id in &old {
+                    assert!(
+                        rest.any(|n| n == id),
+                        "{mode:?} / {}: {id:?} is missing or out of order in {new:?}",
+                        scope.label()
+                    );
+                }
+                assert_eq!(
+                    new.len(),
+                    old.len() + 1,
+                    "{mode:?} / {}: the only new row is driver builds: {new:?}",
+                    scope.label()
+                );
+                assert!(new.contains(&StageId::DriverBuilds));
+            }
+        }
+    }
+
+    /// The test run measures, and until 2026-09-13 the regex lane, the xtask
+    /// verbs and every driver build queued behind it in `target/`. Now they
+    /// have lanes of their own and start at t0, so the test run must wait for
+    /// all three — and for every stage of theirs that is not behind an
+    /// exclusive barrier (those cannot overlap it by the barrier rule).
+    #[test]
+    fn the_test_run_waits_for_every_new_side_lane() {
+        for mode in [Mode::Fast, Mode::Full] {
+            let p = plan(&ctx(mode, Scope::workspace()));
+            let test = p.iter().position(|s| s.id == StageId::Test).expect("test");
+            assert_eq!(
+                p[test].after_lanes,
+                [
+                    Lane::RegexTarget,
+                    Lane::SealedTarget,
+                    Lane::XtaskTarget,
+                    Lane::DriverTarget
+                ]
+            );
+            let awaited: Vec<StageId> = crate::sched::awaited(&p, test).map(|j| p[j].id).collect();
+            assert_eq!(
+                awaited,
+                [
+                    StageId::RegexLane,
+                    StageId::SealedLane,
+                    StageId::Formatting,
+                    StageId::FeatureGates,
+                    StageId::ProofInventory,
+                    StageId::DriverBuilds,
+                ],
+                "{mode:?}"
+            );
+            // Everything else in those lanes sits behind the smokes' barrier.
+            let barrier = p
+                .iter()
+                .position(|s| s.exclusive)
+                .expect("an exclusive stage");
+            for (j, s) in p.iter().enumerate() {
+                if p[test].after_lanes.contains(&s.lane) && !awaited.contains(&s.id) {
+                    assert!(
+                        j >= barrier,
+                        "{:?} is neither awaited nor behind the barrier",
+                        s.id
+                    );
+                }
+            }
+            // No other stage waits on lanes.
+            assert!(
+                p.iter()
+                    .filter(|s| s.id != StageId::Test)
+                    .all(|s| s.after_lanes.is_empty())
+            );
+            crate::sched::check_after_lanes(&p).expect("the plan cannot deadlock");
+        }
     }
 
     /// A GATE NOBODY INVOKES IS NOT A GATE. The redraw harness is the only check
@@ -585,17 +836,24 @@ mod tests {
 
     #[test]
     fn scoping_away_from_aterm_search_removes_the_regex_lane_only() {
+        // Two feature lanes, each following its own crate: the regex lane is
+        // aterm-search's and the sealed lane is aterm-link's. A scope that holds
+        // neither drops exactly those two and nothing else.
         let scoped = ids(&ctx(Mode::Fast, Scope::crate_only("aterm-grid")));
         assert!(!scoped.contains(&StageId::RegexLane));
+        assert!(!scoped.contains(&StageId::SealedLane));
         let full = ids(&ctx(Mode::Fast, Scope::workspace()));
         let expected: Vec<StageId> = full
             .into_iter()
-            .filter(|i| *i != StageId::RegexLane)
+            .filter(|i| *i != StageId::RegexLane && *i != StageId::SealedLane)
             .collect();
         assert_eq!(scoped, expected, "no other stage is dropped by a scope");
         assert!(
             ids(&ctx(Mode::Fast, Scope::crate_only("aterm-search"))).contains(&StageId::RegexLane)
         );
+        let link_only = ids(&ctx(Mode::Fast, Scope::crate_only("aterm-link")));
+        assert!(link_only.contains(&StageId::SealedLane));
+        assert!(!link_only.contains(&StageId::RegexLane));
     }
 
     #[test]
@@ -614,6 +872,23 @@ mod tests {
                 StageId::Tippy => Lane::TippyTarget,
                 StageId::FreezeGate => Lane::FreezeGateTarget,
                 StageId::LibcOracle => Lane::LibcOracleTarget,
+                StageId::RegexLane => Lane::RegexTarget,
+                StageId::SealedLane => Lane::SealedTarget,
+                StageId::Formatting | StageId::FeatureGates | StageId::ProofInventory => {
+                    Lane::XtaskTarget
+                }
+                StageId::DriverBuilds
+                | StageId::ControlSocketSmoke
+                | StageId::GuiSmoke
+                | StageId::RedrawConformance
+                | StageId::ObjcClassAudit
+                | StageId::ObjcImeDrive
+                | StageId::ObjcToolbarDrive
+                | StageId::ObjcWindowDrive
+                | StageId::ObjcEventDrive
+                | StageId::ObjcAlertDrive
+                | StageId::ObjcSwizzleDrive
+                | StageId::ObjcBoundDrive => Lane::DriverTarget,
                 StageId::GrepGuards
                 | StageId::InstallChannel
                 | StageId::AtpkgTooling
@@ -628,6 +903,59 @@ mod tests {
     }
 
     #[test]
+    fn each_cargo_lane_names_its_own_target_dir() {
+        let mut c = ctx(Mode::Fast, Scope::workspace());
+        let dir = |c: &Ctx, l| lane_dir(c, l).map(|p| p.display().to_string());
+        assert_eq!(dir(&c, Lane::Pure), None);
+        assert_eq!(dir(&c, Lane::MainTarget).as_deref(), Some("/repo/target"));
+        assert_eq!(
+            dir(&c, Lane::TippyTarget).as_deref(),
+            Some("/repo/target-tippy")
+        );
+        assert_eq!(
+            dir(&c, Lane::RegexTarget).as_deref(),
+            Some("/repo/target-regex")
+        );
+        assert_eq!(
+            dir(&c, Lane::XtaskTarget).as_deref(),
+            Some("/repo/target-xtask")
+        );
+        assert_eq!(
+            dir(&c, Lane::DriverTarget).as_deref(),
+            Some("/repo/target-drivers")
+        );
+        assert_eq!(
+            dir(&c, Lane::FreezeGateTarget).as_deref(),
+            Some("/repo/tools/freeze-safety-gate/target")
+        );
+        assert_eq!(
+            dir(&c, Lane::LibcOracleTarget).as_deref(),
+            Some("/repo/libc-oracle/target")
+        );
+        // The main lane alone follows the caller's redirect, as cargo does.
+        c.env.cargo_target_dir = Some("rel".into());
+        assert_eq!(dir(&c, Lane::MainTarget).as_deref(), Some("/repo/rel"));
+        assert_eq!(
+            dir(&c, Lane::DriverTarget).as_deref(),
+            Some("/repo/target-drivers")
+        );
+        c.env.cargo_target_dir = Some("/abs".into());
+        assert_eq!(dir(&c, Lane::MainTarget).as_deref(), Some("/abs"));
+        assert_eq!(
+            dir(&c, Lane::RegexTarget).as_deref(),
+            Some("/repo/target-regex")
+        );
+        // A relative root still yields absolute side-lane dirs.
+        c.root = PathBuf::from("relative-repo");
+        let d = lane_dir(&c, Lane::XtaskTarget).expect("a cargo lane");
+        assert!(
+            d.is_absolute() && d.ends_with("relative-repo/target-xtask"),
+            "{}",
+            d.display()
+        );
+    }
+
+    #[test]
     fn a_missing_tool_never_removes_a_stage() {
         // Toolchain absence is invisible in the plan: it becomes a skip INSIDE
         // the stage, so the ladder still shows the row and the verdict still
@@ -635,6 +963,9 @@ mod tests {
         let nothing_installed = ctx(Mode::Full, Scope::workspace());
         assert!(!nothing_installed.tools.have_targo());
         // 31 since 2026-09-08: the atpkg publish-tooling suites joined the ladder.
-        assert_eq!(plan(&nothing_installed).len(), 31);
+        // 32 since 2026-09-13: the driver builds row.
+        // 33 since 2026-09-14: the sealed fabric lane — the one test covering the
+        // vendored astream-aead is feature-gated and ran on no cadence before it.
+        assert_eq!(plan(&nothing_installed).len(), 33);
     }
 }

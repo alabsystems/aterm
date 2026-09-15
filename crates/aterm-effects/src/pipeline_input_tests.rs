@@ -7,6 +7,25 @@
 
 use super::*;
 
+/// The three glow streams after the shipping pipeline hands them to the host.
+/// Equality includes every field, stream boundary and element order.
+#[derive(Debug, PartialEq, Eq)]
+struct GlowFrame<'a> {
+    under: &'a [GlowQuad],
+    over: &'a [GlowQuad],
+    halos: &'a [RainHalo],
+}
+
+impl<'a> GlowFrame<'a> {
+    fn read(input: &'a RenderInput) -> Self {
+        Self {
+            under: &input.glow_under,
+            over: &input.cursor_glow_add,
+            halos: &input.glow_halo,
+        }
+    }
+}
+
 struct Host {
     pipeline: EffectsPipeline,
     term: Terminal,
@@ -74,9 +93,60 @@ impl Host {
         self.pipeline.glow.in_flight_tally().credits
     }
 
-    fn glow_fingerprint(&self) -> u64 {
-        self.pipeline.glow.v2_status().unwrap().fp
+    /// Compare emitted content in tests; production `Status::fp` remains the
+    /// inexpensive idle/non-idle sentinel. Summary counts cannot distinguish
+    /// equal-sized frames with different geometry, color or blend fields.
+    fn glow_frame(&self) -> GlowFrame<'_> {
+        GlowFrame::read(&self.input)
     }
+}
+
+#[test]
+fn glow_frame_equality_rejects_equal_count_changed_content() {
+    // Replay the count-only observer as the negative control, against a frame
+    // genuinely emitted by the pipeline before corrupting one rendered field.
+    fn count_only(host: &Host) -> [u64; 7] {
+        let status = host.pipeline.glow.v2_status().unwrap();
+        [
+            u64::from(status.quads),
+            u64::from(status.halos),
+            u64::from(status.stars),
+            u64::from(status.meteors),
+            u64::from(status.cells),
+            u64::from(status.bridged),
+            status.fp,
+        ]
+    }
+
+    let mut host = Host::new(Instant::now());
+    for ch in "primer".chars() {
+        host.note(ch);
+        host.echo(ch);
+    }
+    let original = host.input.clone();
+    let expected = GlowFrame::read(&original);
+    assert!(
+        !expected.under.is_empty(),
+        "the real emitter must draw a ribbon"
+    );
+    assert_ne!(host.pipeline.glow.v2_status().unwrap().fp, 0);
+    assert_eq!(host.glow_frame(), expected);
+    let summary = count_only(&host);
+
+    host.input.glow_under[0].color ^= 1;
+    assert_eq!(host.input.glow_under.len(), expected.under.len());
+    assert_eq!(host.input.cursor_glow_add.len(), expected.over.len());
+    assert_eq!(host.input.glow_halo.len(), expected.halos.len());
+    assert_eq!(
+        count_only(&host),
+        summary,
+        "the old observer misses changed content"
+    );
+    assert_ne!(
+        host.glow_frame(),
+        expected,
+        "the stream comparison must catch it"
+    );
 }
 
 #[test]
@@ -127,18 +197,17 @@ fn web_glyph_classes_reach_the_real_rainbow_renderer() {
                 host.echo(ch);
             }
             assert_eq!(
-                web.glow_fingerprint(),
-                explicit.glow_fingerprint(),
+                web.glow_frame(),
+                explicit.glow_frame(),
                 "web {ch:?} must render like the explicitly classified engine event"
             );
-            differs_from_unclassified |= web.glow_fingerprint() != historical.glow_fingerprint();
+            differs_from_unclassified |= web.glow_frame() != historical.glow_frame();
             for _ in 0..2 {
                 for host in [&mut web, &mut explicit, &mut historical] {
                     host.present();
                 }
-                assert_eq!(web.glow_fingerprint(), explicit.glow_fingerprint());
-                differs_from_unclassified |=
-                    web.glow_fingerprint() != historical.glow_fingerprint();
+                assert_eq!(web.glow_frame(), explicit.glow_frame());
+                differs_from_unclassified |= web.glow_frame() != historical.glow_frame();
             }
         }
         // Space must rest the sky, and hero classes must earn their stars.

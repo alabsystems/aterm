@@ -57,6 +57,13 @@ fn run_verb(verb: &str, args: &[&str], reply: &[u8]) -> Output {
                 Err(error) => panic!("accept: {error}"),
             }
         };
+        // macOS (like every BSD) hands `accept` a socket that INHERITS the
+        // listener's O_NONBLOCK, which would make the timeouts below dead
+        // letters: a CLI preempted between `connect` and its request write
+        // read as EAGAIN (`Os { code: 35, kind: WouldBlock }`) instead of
+        // waiting. Blocking reads bounded by the timeouts wait for a slow peer
+        // and still fail a peer that never speaks.
+        connection.set_nonblocking(false).unwrap();
         connection
             .set_read_timeout(Some(Duration::from_secs(2)))
             .unwrap();

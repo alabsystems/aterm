@@ -291,10 +291,19 @@ pub(crate) enum RendezvousError {
     PeerPid { expected: i32, actual: i32 },
     /// The kernel would not attest the peer at all.
     PeerUnattested(String),
-    /// The one descriptor-carrying `sendmsg`, or the body write after it,
-    /// failed. Whether the peer got the descriptors is exactly what `sendmsg`
-    /// answered, so this is a failed transfer and never a partial one.
-    Transfer(String),
+    /// The transfer failed BEFORE the one descriptor-carrying `sendmsg`
+    /// succeeded — an unencodable grant, a socket the write timeout would not
+    /// take, or the `sendmsg` itself. No descriptor of ours left this process,
+    /// which is the whole of what `NeverTransferred` rests on.
+    TransferNotSent(String),
+    /// The descriptors LEFT (the `sendmsg` succeeded) and a write after it — the
+    /// tail of a short header send, the body, the flush — failed (2026-09-14).
+    /// The peer holds duplicates of every master and both pipes; a successor
+    /// that receives descriptors and no body refuses the grant and exits, but
+    /// the parent may not ASSUME that: this is the ordinary kill-and-prove
+    /// disposition, never `NeverTransferred`. Before this both shapes were one
+    /// variant and the warrant's stated proof was not what the code established.
+    TransferPartial(String),
 
     /// SUCCESSOR SIDE: the launch environment carries no rendezvous.
     NoRendezvous,
@@ -360,7 +369,16 @@ impl std::fmt::Display for RendezvousError {
             Self::PeerUnattested(error) => {
                 write!(f, "the kernel would not attest the dialer: {error}")
             }
-            Self::Transfer(error) => write!(f, "the descriptor transfer failed: {error}"),
+            Self::TransferNotSent(error) => {
+                write!(
+                    f,
+                    "the descriptor transfer failed before any descriptor left: {error}"
+                )
+            }
+            Self::TransferPartial(error) => write!(
+                f,
+                "the descriptors were delivered but the grant body was not: {error}"
+            ),
             Self::NoRendezvous => f.write_str("this launch carries no rendezvous"),
             Self::HalfRendezvous { present, missing } => write!(
                 f,
@@ -953,32 +971,37 @@ impl ClaimedPeer {
                 limit: MAX_RENDEZVOUS_SESSIONS,
             });
         }
-        let malformed =
-            || RendezvousError::Transfer("the grant body exceeds its wire format".to_string());
+        let malformed = || {
+            RendezvousError::TransferNotSent("the grant body exceeds its wire format".to_string())
+        };
         let body = encode_grant_body(nonce, sessions).ok_or_else(malformed)?;
         let header = grant_header(body.len()).ok_or_else(malformed)?;
         let remaining = remaining_io_budget(deadline)?;
         self.stream
             .set_write_timeout(Some(remaining))
-            .map_err(|error| RendezvousError::Transfer(error.to_string()))?;
+            .map_err(|error| RendezvousError::TransferNotSent(error.to_string()))?;
         let mut descriptors = Vec::with_capacity(sessions.len() + RENDEZVOUS_CHANNEL_FDS);
         descriptors.extend(sessions.iter().map(|(_, _, master)| *master));
         descriptors.push(ready);
         descriptors.push(commit);
         let sent = fdpass::send_with_fds(&self.stream, &header, &descriptors)
-            .map_err(|error| RendezvousError::Transfer(error.to_string()))?;
+            .map_err(|error| RendezvousError::TransferNotSent(error.to_string()))?;
+        // FROM HERE THE DESCRIPTORS ARE THE PEER'S TOO: every failure below is a
+        // partial transfer, and the caller owes the candidate a proof of death
+        // before it resumes its readers.
+        //
         // A short send is possible in principle on a stream socket, and the
         // descriptors went with the first byte — so the remainder is finished
         // with an ordinary write rather than resent.
         if sent < header.len() {
             (&self.stream)
                 .write_all(&header[sent..])
-                .map_err(|error| RendezvousError::Transfer(error.to_string()))?;
+                .map_err(|error| RendezvousError::TransferPartial(error.to_string()))?;
         }
         (&self.stream)
             .write_all(body.as_bytes())
             .and_then(|()| (&self.stream).flush())
-            .map_err(|error| RendezvousError::Transfer(error.to_string()))?;
+            .map_err(|error| RendezvousError::TransferPartial(error.to_string()))?;
         Ok(())
     }
 }
@@ -1691,6 +1714,115 @@ mod tests {
         drop((ready_rd, ready_wr, commit_rd, commit_wr));
         aterm_pty::close_fd(master);
         aterm_pty::close_fd(slave);
+    }
+
+    /// WHICH SIDE OF THE `sendmsg` A TRANSFER FAILURE FELL ON (2026-09-14, audit
+    /// AH-6). A peer that has closed BEFORE the parent transfers makes the
+    /// descriptor-carrying `sendmsg` itself fail: `TransferNotSent`, the one shape
+    /// `NeverTransferred` may rest on. A peer that dequeues the header — and with it
+    /// every descriptor — and then closes can only produce `Ok` (the body was
+    /// buffered before the close) or `TransferPartial`: never `TransferNotSent`,
+    /// because the descriptors are already the peer's. The second half is a race
+    /// the kernel decides, so it is pinned as the invariant rather than as one
+    /// outcome.
+    #[test]
+    fn a_transfer_failure_says_whether_the_descriptors_left() {
+        let Some(rendezvous) = bind_for_test() else {
+            return;
+        };
+        let (ready_rd, ready_wr) = pipe_for_test();
+        let (commit_rd, commit_wr) = pipe_for_test();
+        let (fake_master_rd, _fake_master_wr) = pipe_for_test();
+        let claim = rendezvous.claim().to_string();
+        let path = rendezvous.path().to_path_buf();
+
+        // (1) Closed before the send: the claim is presented and accepted, then
+        //     the socket is gone before the parent transfers anything.
+        let (close_tx, close_rx) = std::sync::mpsc::channel::<()>();
+        let (closed_tx, closed_rx) = std::sync::mpsc::channel::<()>();
+        let dialer = std::thread::spawn(move || {
+            let stream = CtlStream::connect(&path).expect("dial");
+            (&stream)
+                .write_all(&claim_frame(&claim))
+                .and_then(|()| (&stream).flush())
+                .expect("claim");
+            close_rx.recv().expect("told to close");
+            drop(stream);
+            closed_tx.send(()).expect("signal");
+        });
+        let peer = rendezvous
+            .accept_claim(
+                Some(own_pid()),
+                Instant::now() + Duration::from_secs(10),
+                &|| false,
+            )
+            .expect("the claim was presented");
+        close_tx.send(()).expect("tell the dialer to close");
+        closed_rx.recv().expect("the dialer closed");
+        dialer.join().expect("dialer thread");
+        let borrowed = fake_master_rd.as_fd();
+        let error = peer
+            .transfer(
+                TEST_NONCE,
+                &[(11, 4242, borrowed)],
+                ready_wr.as_fd(),
+                commit_rd.as_fd(),
+                Instant::now() + Duration::from_secs(5),
+            )
+            .expect_err("a closed peer cannot take the descriptors");
+        assert!(
+            matches!(error, RendezvousError::TransferNotSent(_)),
+            "the sendmsg itself failed, so no descriptor left: {error}"
+        );
+        drop(peer);
+        drop(rendezvous);
+
+        // (2) Closed after the header: the peer dequeues the descriptors, then
+        //     closes without reading the body.
+        let Some(rendezvous) = bind_for_test() else {
+            return;
+        };
+        let claim = rendezvous.claim().to_string();
+        let path = rendezvous.path().to_path_buf();
+        let dialer = std::thread::spawn(move || {
+            let stream = CtlStream::connect(&path).expect("dial");
+            (&stream)
+                .write_all(&claim_frame(&claim))
+                .and_then(|()| (&stream).flush())
+                .expect("claim");
+            let mut header = [0u8; GRANT_HEADER_LEN];
+            let received = fdpass::recv_with_fds(&stream, &mut header, fdpass::MAX_FDS)
+                .expect("the header and its descriptors");
+            let count = received.fds.len();
+            drop(received);
+            drop(stream);
+            count
+        });
+        let peer = rendezvous
+            .accept_claim(
+                Some(own_pid()),
+                Instant::now() + Duration::from_secs(10),
+                &|| false,
+            )
+            .expect("claimed");
+        let outcome = peer.transfer(
+            TEST_NONCE,
+            &[(11, 4242, fake_master_rd.as_fd())],
+            ready_wr.as_fd(),
+            commit_rd.as_fd(),
+            Instant::now() + Duration::from_secs(5),
+        );
+        let received = dialer.join().expect("dialer thread");
+        assert_eq!(received, 3, "the master and both pipes reached the peer");
+        match outcome {
+            Ok(()) => {}
+            Err(RendezvousError::TransferPartial(_)) => {}
+            Err(other) => panic!(
+                "after a delivered header the failure can never claim the descriptors \
+                 stayed home: {other}"
+            ),
+        }
+        drop((ready_rd, ready_wr, commit_rd, commit_wr));
     }
 
     /// A dialer that does not know the secret is refused, and when nobody better

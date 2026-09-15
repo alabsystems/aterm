@@ -239,8 +239,25 @@ fn corpus() -> Vec<PathBuf> {
         .and_then(Path::parent)
         .expect("crate lives two levels under the repository root")
         .to_path_buf();
+    corpus_under(&root)
+}
+
+/// Whether the corpus walk stays out of the directory `name` inside `parent`:
+/// `target` and `.git` at any depth, and at the repository root every
+/// `target-*` sibling build dir (the gate's per-lane dirs) and the gate's
+/// `.aterm-verify` state dir, which the checked-in .gitignore names as
+/// `/target-*` and `/.aterm-verify/`.
+fn corpus_skips(root: &Path, parent: &Path, name: &str) -> bool {
+    name == "target"
+        || name == ".git"
+        || (parent == root && (name.starts_with("target-") || name == ".aterm-verify"))
+}
+
+/// Every `.png` under `root`, sorted, minus the directories [`corpus_skips`]
+/// names.
+fn corpus_under(root: &Path) -> Vec<PathBuf> {
     let mut found = Vec::new();
-    let mut stack = vec![root];
+    let mut stack = vec![root.to_path_buf()];
     while let Some(dir) = stack.pop() {
         let Ok(entries) = std::fs::read_dir(&dir) else {
             continue;
@@ -250,7 +267,7 @@ fn corpus() -> Vec<PathBuf> {
             let name = entry.file_name();
             let name = name.to_string_lossy();
             if path.is_dir() {
-                if name != "target" && name != ".git" {
+                if !corpus_skips(root, &dir, &name) {
                     stack.push(path);
                 }
             } else if name.to_ascii_lowercase().ends_with(".png") {
@@ -260,6 +277,39 @@ fn corpus() -> Vec<PathBuf> {
     }
     found.sort();
     found
+}
+
+/// The walk stays out of the gate's sibling build dirs (`target-regex/`,
+/// `target-xtask/`, `target-drivers/`, `target-gate/`) and its `.aterm-verify/`
+/// state dir at the repository root — gigabytes of build output — while a
+/// `target-*` name deeper in the tree is still walked.
+#[test]
+fn the_corpus_walk_skips_root_lane_dirs_and_verify_state() {
+    let root = std::env::temp_dir().join(format!("aterm-png-corpus-skip-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&root);
+    for rel in [
+        "target-regex/debug/build/x/out/golden.png",
+        "target-xtask/frame.png",
+        ".aterm-verify/trash/shot.png",
+        "target/debug/y.png",
+        "assets/a.png",
+        "assets/target-input/c.png",
+    ] {
+        let path = root.join(rel);
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        std::fs::write(&path, b"not decoded by this test").unwrap();
+    }
+    let found: Vec<String> = corpus_under(&root)
+        .iter()
+        .map(|p| {
+            p.strip_prefix(&root)
+                .unwrap()
+                .to_string_lossy()
+                .replace('\\', "/")
+        })
+        .collect();
+    std::fs::remove_dir_all(&root).unwrap();
+    assert_eq!(found, ["assets/a.png", "assets/target-input/c.png"]);
 }
 
 /// Every `.png` this checkout holds, under BOTH transform settings.

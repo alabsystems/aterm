@@ -2068,9 +2068,12 @@ impl crate::App {
         // bridge state, which is the other half of the same question: a
         // `disconnected` bridge is itself a held state, because the halt does not
         // depend on that process staying alive. Both are plain flag reads on leaf
-        // state, so they cost this polled record nothing.
+        // state, so they cost this polled record nothing. The tail after it —
+        // `fabric_rtt_ms=` / `fabric_link_age_ms=` (round 13) — is the bridge's
+        // last reported ack to the BROKER and its age: one leaf-mutex read.
         let hold = u8::from(pooled.ctx.fabric.hold().is_some());
         let fabric = crate::fabric::fabric_state();
+        let fabric_tail = crate::fabric::fabric_status_tail();
         let pin = {
             let meta = pooled.ctx.meta.lock().unwrap_or_else(|p| p.into_inner());
             meta.presentation_value("title")
@@ -2141,7 +2144,7 @@ impl crate::App {
                 "schema=1 sid={session} subject={} subject_source={subject_source} observed=false \
                  phase=unknown since_ms=- outcome=none exit_code=- signal=- detail={} \
                  confidence=unknown reasons=- attribution={} fs_consent={} conflict=false \
-                 revision=0 enabled={enabled} hold={hold} fabric={fabric}",
+                 revision=0 enabled={enabled} hold={hold} fabric={fabric} {fabric_tail}",
                 opt(subject.as_deref()),
                 opt(detail.as_deref()),
                 consent.attribution.as_str(),
@@ -2178,7 +2181,7 @@ impl crate::App {
             "schema=1 sid={session} subject={} subject_source={subject_source} observed=true \
              phase={} since_ms={since_ms} outcome={} exit_code={exit_code} signal={signal} \
              detail={} confidence={} reasons={reasons} attribution={} fs_consent={} \
-             conflict={} revision={} enabled={enabled} hold={hold} fabric={fabric}",
+             conflict={} revision={} enabled={enabled} hold={hold} fabric={fabric} {fabric_tail}",
             opt(subject.as_deref()),
             status.phase.as_str(),
             status.last_outcome.as_str(),
@@ -3116,7 +3119,12 @@ mod tests {
         let record = app.session_status_record(0).expect("live session");
         assert!(record.contains(" observed=false "), "the unobserved arm");
         assert!(record.contains(" hold=0 "), "{record}");
-        assert!(record.contains(" fabric=absent"), "{record}");
+        assert!(record.contains(" fabric=absent "), "{record}");
+        // The round-13 tail: no bridge, so no ack and no age.
+        assert!(
+            record.ends_with(" fabric=absent fabric_rtt_ms=- fabric_link_age_ms=-"),
+            "{record}"
+        );
         assert!(
             record.starts_with("schema=1 "),
             "additive, not a new schema"
@@ -3187,12 +3195,16 @@ mod tests {
         app.config.tab_status = Some(false);
         let record = app.session_status_record(0).expect("live session");
         // `enabled=` was the LAST field when this was written, and the assertion
-        // said so with `ends_with`. Two ADDITIVE fabric fields now follow it
-        // (`hold=`, `fabric=`), which is exactly what the record's own help
-        // promises a consumer — fields are appended and never bump `schema=`. So
-        // pin the VALUE, and let the tail keep growing.
+        // said so with `ends_with`. Four ADDITIVE fabric fields now follow it
+        // (`hold=`, `fabric=`, `fabric_rtt_ms=`, `fabric_link_age_ms=`), which is
+        // exactly what the record's own help promises a consumer — fields are
+        // appended and never bump `schema=`. So pin the VALUE, and let the tail
+        // keep growing.
         assert!(record.contains(" enabled=false "), "{record}");
-        assert!(record.ends_with(" fabric=absent"), "{record}");
+        assert!(
+            record.ends_with(" fabric=absent fabric_rtt_ms=- fabric_link_age_ms=-"),
+            "{record}"
+        );
 
         assert!(
             app.session_status_record(9999).is_err(),

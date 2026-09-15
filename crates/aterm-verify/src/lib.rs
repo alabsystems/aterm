@@ -88,6 +88,15 @@
 //!    stop. `--base=` is a usage error for the same reason: in bash it set an
 //!    empty ref, which then failed to find a merge-base and WIDENED the run
 //!    without the caller ever learning the flag was malformed.
+//!  * A run in a git checkout verifies a pinned SNAPSHOT of the caller's tree
+//!    ([`snapshot`], 2026-09-13; `--in-place` opts out, and `--selftest` runs
+//!    in place), and a compiler (or, in a git checkout, the source tree) that
+//!    moves under a run stops every stage not yet started and adds a `source
+//!    identity` COULD NOT RUN row ([`identity`]): a run with nothing failed ends
+//!    COULD NOT RUN (exit 3), and a stage that already FAILED keeps FAIL (exit
+//!    1). The 14 h `--fast` run that motivated both was pulled four times
+//!    mid-ladder in a live, shared checkout and still printed one verdict.
+//!    Neither changes any stage's argv.
 //!  * The change-scoped SELECTION is a pure function of (diff paths, manifests,
 //!    members, inverted graph), so its seeds, its reverse-dependency closure and
 //!    every one of its widening triggers are unit-testable without a repo. In
@@ -98,12 +107,14 @@ pub mod changed;
 pub mod cli;
 pub mod exec;
 pub mod glob;
+pub mod identity;
 pub mod ladder;
 pub mod plan;
 pub mod sched;
 pub mod scope;
 pub mod smoke;
 pub mod smoke_stages;
+pub mod snapshot;
 pub mod stages;
 pub mod toolchain;
 pub mod verdict;
@@ -112,7 +123,8 @@ use std::ffi::{OsStr, OsString};
 use std::io::{IsTerminal, Write};
 use std::path::{Path, PathBuf};
 use std::process::Command;
-use std::time::Instant;
+use std::sync::Mutex;
+use std::time::{Duration, Instant};
 
 pub use cli::Mode;
 pub use ladder::{Entry, Outcome, Report, Severity, Tally};
@@ -177,6 +189,11 @@ pub struct EnvSnapshot {
     /// same escape hatch verify.sh's header sanctions for flag-spelling skew),
     /// never grounds for a COULD-NOT-RUN.
     pub rustdoc_override: Option<OsString>,
+    /// `ATERM_VERIFY_SNAPSHOT` — where the snapshot lives, when not
+    /// `<caller-root>-verify.noindex` ([`snapshot`]).
+    pub verify_snapshot: Option<PathBuf>,
+    /// `ATERM_VERIFY_TIMINGS` — the per-child timing TSV ([`exec::Timings`]).
+    pub verify_timings: Option<PathBuf>,
 }
 
 impl EnvSnapshot {
@@ -206,6 +223,8 @@ impl EnvSnapshot {
             // names whose binding it was.
             rustdoc_override: std::env::var_os("RUSTDOC")
                 .or_else(|| std::env::var_os("CARGO_BUILD_RUSTDOC")),
+            verify_snapshot: var_path(snapshot::SNAPSHOT_ENV).filter(|p| !p.as_os_str().is_empty()),
+            verify_timings: var_path("ATERM_VERIFY_TIMINGS").filter(|p| !p.as_os_str().is_empty()),
         }
     }
 }
@@ -233,7 +252,27 @@ pub struct Ctx {
     /// tallied like any other stage, and subject to the same rule that a stage
     /// recording no outcome cannot be counted.
     pub prelude: Vec<Report>,
+    /// Where the stages run: the caller's checkout, or a snapshot of it.
+    pub source_mode: snapshot::SourceMode,
+    /// `verify: …` header lines — the snapshot's (cold or pruned lanes), or why
+    /// a root that is not a git checkout runs in place — printed under the
+    /// source line.
+    pub notes: Vec<String>,
+    /// Variables removed from every child's inherited environment
+    /// ([`exec::ExecEnv::remove_env`]).
+    pub child_env_remove: Vec<&'static str>,
+    /// The `ATERM_VERIFY_TIMINGS` sink, when one was opened.
+    pub timings: Option<exec::Timings>,
+    /// The source state a snapshot's sync verified. The tripwire arms on it
+    /// (and compares it with a fresh capture) rather than re-arming from
+    /// whatever the root holds by the time the ladder starts.
+    pub source_baseline: Option<identity::TreeState>,
 }
+
+/// The gate's own side channels, removed from every child in every mode: a
+/// child that re-invoked the gate would otherwise truncate this run's timings
+/// TSV and aim at this run's own snapshot, which this run holds locked.
+pub const GATE_CHANNELS: [&str; 2] = ["ATERM_VERIFY_TIMINGS", snapshot::SNAPSHOT_ENV];
 
 impl Ctx {
     /// Build the run context. `scratch` must already exist.
@@ -268,7 +307,49 @@ impl Ctx {
             scratch,
             env,
             prelude: Vec::new(),
+            source_mode: snapshot::SourceMode::InPlace,
+            notes: Vec::new(),
+            child_env_remove: GATE_CHANNELS.to_vec(),
+            timings: None,
+            source_baseline: None,
         }
+    }
+
+    /// This run's root is a snapshot of `caller`. The caller's
+    /// `CARGO_TARGET_DIR` stops applying: the snapshot's lanes are its own
+    /// directories, so the redirect is dropped from the snapshot AND removed
+    /// from every child's environment — otherwise cargo would build in the
+    /// caller's contended target dir while the stages looked for binaries in
+    /// the snapshot's.
+    ///
+    /// `tree` is the state the sync verified; the run's tripwire arms on it.
+    #[must_use]
+    pub fn in_snapshot_of(
+        mut self,
+        caller: PathBuf,
+        tree: identity::TreeState,
+        notes: Vec<String>,
+    ) -> Self {
+        self.source_mode = snapshot::SourceMode::Snapshot { caller };
+        self.source_baseline = Some(tree);
+        self.env.cargo_target_dir = None;
+        self.child_env_remove.push("CARGO_TARGET_DIR");
+        self.notes.extend(notes);
+        self
+    }
+
+    /// Extra `verify: …` header lines.
+    #[must_use]
+    pub fn with_notes(mut self, notes: impl IntoIterator<Item = String>) -> Self {
+        self.notes.extend(notes);
+        self
+    }
+
+    /// Write per-child timing rows to `timings`.
+    #[must_use]
+    pub fn with_timings(mut self, timings: Option<exec::Timings>) -> Self {
+        self.timings = timings;
+        self
     }
 
     /// Attach a stage decided before the plan existed (see [`Ctx::prelude`]).
@@ -290,6 +371,8 @@ impl Ctx {
             path: &self.path_env,
             scratch: &self.scratch,
             child_ceiling: exec::ceiling_from_env(self.env.stage_timeout.as_deref()),
+            remove_env: &self.child_env_remove,
+            timings: self.timings.as_ref(),
         }
     }
 
@@ -349,9 +432,16 @@ pub fn toolchain_header(ctx: &Ctx) -> String {
 /// Run the whole gate: hooks, ladder, verdict. Returns the process exit code.
 ///
 /// `out` receives, in this order: the [`toolchain_header`] line, the prelude rungs,
-/// the `hooks pinned:` note when `pin_hooks` had to set `core.hooksPath`, the ladder
-/// in declared order, and the verdict (or the gate-defect `FAIL` and `VERIFY: COULD
-/// NOT RUN` lines) — byte-for-byte in the vocabulary `tools/verify.sh` established.
+/// the `hooks pinned:` note when `pin_hooks` had to set `core.hooksPath`, the
+/// `verify: source …` line (a git root only) and any `verify:` notes (the
+/// snapshot's lanes, or why the run is in place), the ladder in declared order
+/// with a `  time  ` line under each stage — or, in its place, a `source
+/// identity` COULD NOT RUN row for a git checkout the gate cannot read, except
+/// under `--selftest`, which keeps its own ladder — the `source identity` row
+/// when the toolchain (or, in a git checkout, the source tree) moved mid-run,
+/// and the verdict
+/// (or the gate-defect `FAIL` and `VERIFY: COULD NOT RUN` lines) — byte-for-byte
+/// in the vocabulary `tools/verify.sh` established.
 /// Live progress goes to stderr so a long stage is not silent without polluting the
 /// scannable part.
 ///
@@ -375,10 +465,55 @@ pub fn run(ctx: &Ctx, out: &mut dyn Write) -> std::io::Result<i32> {
     }
     pin_hooks(ctx, out)?;
 
+    // WHAT THIS RUN IS VERIFYING, captured before anything is planned and
+    // re-checked while it runs (2026-09-13). The 14 h run this answers was
+    // pulled four times mid-ladder and printed one verdict over all of them.
+    let tripwire = identity::Tripwire::arm_against(
+        &ctx.root,
+        &ctx.path_env,
+        ctx.source_baseline.clone(),
+        ctx.tools.identity(&ctx.path_env, &ctx.scratch),
+    );
+    if let Some(line) = tripwire.header_line(&ctx.source_mode.place(&ctx.root)) {
+        out.write_all(line.as_bytes())?;
+    }
+    for note in &ctx.notes {
+        writeln!(out, "{note}")?;
+    }
+
+    // A GIT CHECKOUT THE GATE CANNOT READ is not a root without a source
+    // (2026-09-13): with no identity there is no tripwire, and a run on it
+    // could go green on a tree nothing watched. No stage runs. A selftest
+    // builds nothing and claims nothing about the tree, so it keeps its own
+    // ladder: turning it into SELFTEST FAIL over one unreadable file would be a
+    // finding about the driver that is not true.
+    if !ctx.selftest
+        && let identity::SourceIdentity::Unreadable(why) = &tripwire.source
+    {
+        let mut r = Report::new("source identity");
+        r.cannot_run(identity::unreadable_label(why));
+        out.write_all(r.render().as_bytes())?;
+        let mut reports = ctx.prelude.clone();
+        reports.push(r);
+        let verdict =
+            verdict::verdict(ctx.mode, &ctx.scope, ctx.selftest, &ladder::tally(&reports));
+        out.write_all(verdict.text.as_bytes())?;
+        out.flush()?;
+        return Ok(verdict.exit);
+    }
+
     let plan = plan::plan(ctx);
     let mut reports: Vec<Report> = ctx.prelude.clone();
     reports.reserve(plan.len());
     let mut err = None;
+
+    // Per-stage (start offset, running time), for the `  time  ` line under
+    // each stage. STDOUT, not only a terminal's stderr (2026-09-13): 430 of a
+    // 14 h run's minutes sat inside one stage, and the captured log could not
+    // say which — the progress lines that could have were never written to a
+    // file. The line decides nothing; `decisions` readers skip it.
+    let t0 = Instant::now();
+    let clocks: Mutex<Vec<Option<(Duration, Duration)>>> = Mutex::new(vec![None; plan.len()]);
 
     // Stages run concurrently, so a long one would otherwise be silent until its
     // turn to print arrives. Progress is stderr-only and terminal-only: stdout
@@ -390,24 +525,59 @@ pub fn run(ctx: &Ctx, out: &mut dyn Write) -> std::io::Result<i32> {
         &plan,
         |spec| {
             let started = Instant::now();
+            let begun = t0.elapsed();
+            let stamp_start = ctx.timings.as_ref().map(exec::Timings::now);
             if progress {
                 eprintln!("verify: start  {}", spec.title);
             }
-            let report = stages::run_stage(ctx, spec);
+            let lane = format!("{:?}", spec.lane);
+            let report = exec::with_stage(&spec.title, &lane, || {
+                // A stage that would build or drive something must not start
+                // on a tree or a compiler other than the one this run named.
+                if spec.lane != plan::Lane::Pure
+                    && let Some(why) = tripwire.check(identity::CHECK_CACHE)
+                {
+                    let mut r = Report::new(spec.title.clone());
+                    r.cannot_run(format!("not run: {}", identity::tripped_label(&why)));
+                    return r;
+                }
+                stages::run_stage(ctx, spec)
+            });
+            tripwire.stage_finished();
+            let ran = started.elapsed();
             if progress {
-                let secs = started.elapsed().as_secs_f64();
-                eprintln!("verify: finish {} ({secs:.1}s)", spec.title);
+                eprintln!("verify: finish {} ({:.1}s)", spec.title, ran.as_secs_f64());
+            }
+            if let Some(i) = plan.iter().position(|s| std::ptr::eq(s, spec))
+                && let Ok(mut c) = clocks.lock()
+            {
+                c[i] = Some((begun, ran));
+            }
+            if let (Some(t), Some(start)) = (&ctx.timings, stamp_start) {
+                t.row(&exec::TimingRow {
+                    stage: &spec.title,
+                    child: "(stage)",
+                    lane: &lane,
+                    start,
+                    end: t.now(),
+                    how: outcome_word(&report),
+                    load_start: None,
+                    load_end: None,
+                });
             }
             report
         },
-        |_, report| {
+        |i, report| {
             // Flush per stage: the ladder is a live record, and a developer
             // watching a ten-minute run must see each rung as it is decided —
             // the script wrote unbuffered, and a buffered port would look hung.
+            let clock = clocks.lock().ok().and_then(|c| c.get(i).copied().flatten());
+            let mut text = report.render();
+            if let Some((begun, ran)) = clock {
+                text.push_str(&time_line(begun, ran));
+            }
             if err.is_none()
-                && let Err(e) = out
-                    .write_all(report.render().as_bytes())
-                    .and_then(|()| out.flush())
+                && let Err(e) = out.write_all(text.as_bytes()).and_then(|()| out.flush())
             {
                 err = Some(e);
             }
@@ -417,6 +587,16 @@ pub fn run(ctx: &Ctx, out: &mut dyn Write) -> std::io::Result<i32> {
         return Err(e);
     }
     reports.extend(done);
+
+    // The check a stage start may have cached is never cached here: a tree
+    // that moved during the LAST stage is as unverified as one that moved
+    // during the first.
+    if let Some(why) = tripwire.check(Duration::ZERO) {
+        let mut r = Report::new("source identity");
+        r.cannot_run(identity::tripped_label(&why));
+        out.write_all(r.render().as_bytes())?;
+        reports.push(r);
+    }
 
     // A PLANNED STAGE THAT DECIDED NOTHING IS INVISIBLE TO THE VERDICT.
     //
@@ -452,6 +632,34 @@ pub fn run(ctx: &Ctx, out: &mut dyn Write) -> std::io::Result<i32> {
     out.write_all(verdict.text.as_bytes())?;
     out.flush()?;
     Ok(verdict.exit)
+}
+
+/// The `  time  ` line under a stage: how long it ran, and when it started
+/// relative to the ladder — that offset is time spent waiting to start: for its
+/// lane, an earlier exclusive stage, or the lanes it is ordered after; an
+/// EXCLUSIVE stage also waits for every earlier unfinished stage in any lane,
+/// `Pure` included, and until nothing else is running.
+#[must_use]
+pub fn time_line(begun: Duration, ran: Duration) -> String {
+    format!(
+        "  time  {:.1}s (started +{:.1}s)\n",
+        ran.as_secs_f64(),
+        begun.as_secs_f64()
+    )
+}
+
+/// A stage's outcome in one word, for its timing row.
+fn outcome_word(report: &Report) -> &'static str {
+    let mut word = "ok";
+    for (o, _) in report.outcomes() {
+        match o {
+            Outcome::Fail(Severity::CouldNotRun) => return "could-not-run",
+            Outcome::Fail(Severity::GateFailed) => word = "FAIL",
+            Outcome::Skip if word == "ok" => word = "skip",
+            _ => {}
+        }
+    }
+    word
 }
 
 /// Stage 0 of the script: pin `core.hooksPath` at `.githooks`, so a clone runs

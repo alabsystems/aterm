@@ -276,6 +276,10 @@ impl Turn {
 pub struct CtlClient {
     ctl: std::path::PathBuf,
     socket: Option<String>,
+    /// The `aterm-ctl` in flight, by pid, for [`CtlClient::cutter`].
+    running: std::sync::Arc<std::sync::Mutex<Option<u32>>>,
+    /// Set by the cutter: every request from then on is cut short.
+    cut: std::sync::Arc<std::sync::atomic::AtomicBool>,
 }
 
 impl CtlClient {
@@ -285,6 +289,39 @@ impl CtlClient {
         Self {
             ctl: ctl.into(),
             socket,
+            running: std::sync::Arc::default(),
+            cut: std::sync::Arc::default(),
+        }
+    }
+
+    /// A handle that cuts the request in flight short from another thread —
+    /// `SIGTERM` to the `aterm-ctl` running it — and every request after it:
+    /// the client is DONE once cut. This is what ends the mail lane's parked
+    /// `await inbox` (20 s a step) the moment its loop has its result
+    /// ([`supervise::Ctl::interrupter`]). Unix only: `None` elsewhere, and
+    /// the loop then ends within one step.
+    #[must_use]
+    pub fn cutter(&self) -> Option<supervise::Interrupter> {
+        #[cfg(unix)]
+        {
+            let running = std::sync::Arc::clone(&self.running);
+            let cut = std::sync::Arc::clone(&self.cut);
+            Some(Box::new(move || {
+                cut.store(true, std::sync::atomic::Ordering::SeqCst);
+                let pid = running.lock().unwrap_or_else(|p| p.into_inner()).take();
+                if let Some(pid) = pid {
+                    // SAFETY: a plain `kill(2)` on a pid this client spawned and
+                    // has not yet reaped (`running` is cleared after the wait,
+                    // under the same lock), so the pid cannot have been reused.
+                    unsafe {
+                        libc::kill(libc::pid_t::try_from(pid).unwrap_or(0), libc::SIGTERM);
+                    }
+                }
+            }))
+        }
+        #[cfg(not(unix))]
+        {
+            None
         }
     }
 
@@ -303,14 +340,35 @@ impl CtlClient {
     /// usage` (an older host) apart from a failure. `Err` only when the client
     /// could not be launched at all.
     pub fn run_raw(&self, args: &[&str]) -> Result<supervise::CtlReply, String> {
+        use std::sync::atomic::Ordering;
         let mut cmd = std::process::Command::new(&self.ctl);
         if let Some(s) = &self.socket {
             cmd.arg("--sock").arg(s);
         }
-        cmd.args(args);
-        let out = cmd
-            .output()
+        cmd.args(args)
+            .stdin(std::process::Stdio::null())
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::piped());
+        let mut child = cmd
+            .spawn()
             .map_err(|e| format!("could not run {}: {e}", self.ctl.display()))?;
+        // Registered under the lock the cutter takes, and checked after it:
+        // a cut that came between the spawn and the registration still
+        // ends this request, not the next one.
+        {
+            let mut running = self.running.lock().unwrap_or_else(|p| p.into_inner());
+            if self.cut.load(Ordering::SeqCst) {
+                let _ = child.kill();
+            } else {
+                *running = Some(child.id());
+            }
+        }
+        let out = child.wait_with_output();
+        self.running
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .take();
+        let out = out.map_err(|e| format!("could not run {}: {e}", self.ctl.display()))?;
         Ok(supervise::CtlReply {
             code: out.status.code().unwrap_or(1),
             stdout: String::from_utf8_lossy(&out.stdout).into_owned(),
@@ -586,9 +644,13 @@ USAGE
               | await-turn [@sid] [--timeout MS] [--reconnect-s S]
               | supervise [@sid] [--auto-reads] [--max-s S] [--allow-python GLOB]... [--notes FILE]
                           [--reconnect-s S] [--dismiss-surveys] [--context-warn PCT]
+                          [--journal FILE] [--mail [--inbox @sid] [--report-window S] [--idle-grace S]]
               | watch [@sid] [--auto-reads] [--allow-python GLOB]... [--notes FILE] [--max-s S]
                       [--reconnect-s S] [--report] [--dismiss-surveys] [--context-warn PCT]
-              | report [@sid] [--since ORIGIN:I] [--max-rows N]
+                      [--journal FILE] [--mail [--inbox @sid] [--report-window S] [--idle-grace S]]
+              | task @sid [--deadline S] [--wait] [--no-nudge] [--inbox @sid] <text...>
+              | report [@sid] [--since ORIGIN:I] [--max-rows N] [--final | --messages]
+              | ledger [@sid] [--journal FILE] [--since TIME] [--format text|md|html] [--out PATH]
 
 COMMANDS
     prompt <text...>   Type <text>, press Enter, then BLOCK until the agent's turn
@@ -820,7 +882,51 @@ SUPERVISING A WORKER (a Claude Code session in another tab; `@sid` from `aterm c
                        points or more), the worker having compacted:
                          EVENT compacted seq=<n>
                        (see --context-warn). With no indicator on the screen,
-                       every line is as above.
+                       every line is as above. With --mail (see there) the
+                       worker's end-of-turn report comes by mail and its idle
+                       point prints as ONE line, `EVENT turn seq=<n>
+                       report=<id> rows=<n> <summary>`; without the flag every
+                       line is as above, byte for byte.
+    task @sid [--deadline S] [--wait] [--no-nudge] [--inbox @sid] <text...>
+                       Give the worker its work BY MAIL: `post to=@sid
+                       kind=task [dl=<S*1000>] <text>` from your own session
+                       (@self: $ATERM_PARENT_SESSION_ID, or --inbox), so the
+                       body never goes through the PTY, then — unless
+                       --no-nudge — one read of the worker's screen, and ONLY
+                       when its phase is idle, the one-line nudge
+                         Inbox: task @<off>
+                       typed as a `turn` (idle=600 timeout=2500, not waited
+                       on: its verdict may say status=timeout — submitted=1 is
+                       what counts) — a busy worker gets the mail alone, and
+                       reads it at its next look at the inbox (a worker with
+                       round 12's wake hooks installed, and your sid in their
+                       --accept-from — every human is accepted, a session only
+                       when listed — reads it on its next Stop, which is why
+                       such a worker needs --no-nudge: the hook wakes it, and
+                       a nudge typed over that is a second turn). Prints
+                       `task @<off> nudged=0|1` once the post
+                       LANDED (the broker's offset, which the worker's `inbox`
+                       row shows as `off=` and its answer carries as `re=`).
+                       A post that did not land is the error, in the server's
+                       words: `queued=1` says it is in the outbox and WILL land
+                       when a bridge drains it (do not re-post), `no-bridge=1`
+                       that this instance has no bridge to drain it, `ERR
+                       timeout id=<n>` that the landing was not seen in time
+                       (queued all the same), `unroutable|ambiguous|
+                       undeliverable` that the address is wrong. --wait parks
+                       `await inbox` on your inbox (from the newest row id
+                       read BEFORE the post, so nothing lands unseen) for an
+                       `answer`, `report` or `ack` whose `re=` is that offset
+                       — a row of those kinds answering something else re-arms
+                       the wait — and prints its `MAIL id=<n> off=<o>
+                       from=<sid> kind=<k> len=<n> re=<o>` line, then its body
+                       (`inbox get`); bounded by --deadline, else the global
+                       --timeout (ms) — the host clamps one wait at 600 s, so
+                       a bound above it is re-armed until spent: the last line
+                       is then `TIMEOUT no answer, report or ack re=<off>
+                       within <S> s`, exit 124.
+                       --deadline S also rides on the post as the advisory
+                       `dl=` the worker's row shows.
     report [@sid] [--since ORIGIN:I] [--max-rows N]
                        What the worker said since your turn, in full. Read it
                        instead of the screen: Claude Code runs on the ALTERNATE
@@ -839,8 +945,9 @@ SUPERVISING A WORKER (a Claude Code session in another tab; `@sid` from `aterm c
                        the turn's text is a paste (a line break, or 200+
                        characters) Claude Code shows as `[Pasted text #N +L
                        lines]`, the last such row if its L fits the text. With no
-                       turn in the ledger (you typed with `prompt` or by hand):
-                       the last `❯` row (marker=user-row). --since ORIGIN:I (a
+                       turn in the ledger (you typed with `prompt` or by hand, or
+                       an aterm self-update could not carry the ledger): the
+                       last `❯` row (marker=user-row). --since ORIGIN:I (a
                        `last=` from an earlier report) starts right after that
                        archived row (marker=since). The rows come from ONE
                        `offscreen … max=<--max-rows> screen=1` read (`since=<mark>`,
@@ -864,10 +971,13 @@ SUPERVISING A WORKER (a Claude Code session in another tab; `@sid` from `aterm c
                        relay the rows: the screen alone), main-screen (the worker
                        is not on the alternate screen — not a fullscreen app, or
                        it left one: its main screen's scrollback is not read),
-                       archive-reset (the host restarted or handed the session
-                       over since the mark), archive-gap (rows evicted, or a
-                       redraw with no overlap, a resize or a reset after the
-                       start: something may be missing), max-rows (more rows
+                       archive-reset (the host restarted since the mark, or an
+                       aterm self-update could not carry the archive — one that
+                       could keeps it, turn ledger and all), archive-gap (rows
+                       evicted, or a redraw with no overlap, a resize or a reset
+                       after the start: something may be missing; a resize as a
+                       self-update takes over loses nothing, rows may repeat),
+                       max-rows (more rows
                        than --max-rows: some were not read; raise it),
                        marker-not-found (everything read, from the top). With a
                        start found in the archive, a gap the read counts after
@@ -875,6 +985,143 @@ SUPERVISING A WORKER (a Claude Code session in another tab; `@sid` from `aterm c
                        read: one just before your turn (a resize) is not a gap in
                        it. Exit 0 whatever complete= says; 1 when a request fails
                        (the session gone, the host unreachable).
+                       --final prints ONLY the worker's last message block —
+                       from its last `⏺` message row (never a tool row: a call
+                       like `⏺ Bash(` or `⏺ Workflow(`, one of Claude Code's
+                       `Background command \"…\"` / `Dynamic workflow \"…\"` /
+                       `Task Output` / `Stop Task` notices, a head whose `⎿`
+                       output hangs on the very next row, or a collapsed
+                       `Ran 3 shell commands` group, running or finished)
+                       through the done row that
+                       ended the turn. --messages prints every message block
+                       and every `❯` row of yours, the done rows with them, and
+                       no tool row or `⎿` output at all. A table, a bullet, a
+                       todo item or indented code inside a message is kept, as
+                       it is without a view. Both add
+                       ` view=<final|messages> kept=<n>` to the header after
+                       `last=`; `rows=` still counts every row the report
+                       holds, and without either flag the output is byte for
+                       byte what it always was. Measured 2026-09-14: a manager
+                       read whole reports of 689 and 249 rows to find a final
+                       message of about 70.
+    ledger [@sid] [--journal FILE] [--since TIME] [--format text|md|html] [--out PATH]
+                       How the loop RAN, replayed on one time axis: what you
+                       sent, what the watcher decided, how big the worker's
+                       replies were, and the fabric mail in between. It joins
+                       four sources, and names the ones it could not read:
+                         * the worker's turn ledger (`history`): every turn, its
+                           start, and how the `turn` verb settled (`settled in
+                           1.8s`, `timeout after 6.0s`);
+                         * the size of the reply each turn drew, in rows, from
+                           ONE `offscreen tail=20000 max=20000 screen=1` read
+                           joined as `report` joins it — the rows from the
+                           turn's `❯` row to the next turn's (a turn whose own
+                           row is nowhere, queued or lost to a restart, is named
+                           in the count that holds its reply);
+                         * the watcher's --journal (below), when given: every
+                           EVENT, APPROVED, DISMISSED, RECONNECT, TIMEOUT and
+                           EXIT line, with the wall-clock time it was printed;
+                         * this session's fabric mail with that worker — the
+                           `inbox --peek --meta` rows from it (nothing is listed
+                           or handled) and the `post` rows of this session's
+                           `timeline` addressed to it.
+                       SUMMARY counts the turns, the worker's busy time, your
+                       response latency (median and max from each EVENT idle or
+                       question to the next turn's start), approvals,
+                       dismissals, context warnings and compactions,
+                       reconnects, mail in and out, and how many reports were
+                       complete. TIMELINE is one row per item in time order:
+                       time, lane (manager | worker | watcher | fabric), what,
+                       and the duration or latency. --format text (the default)
+                       aligns columns, md writes tables, html writes ONE
+                       self-contained page — inline style and script, nothing
+                       fetched — with the manager, watcher and worker swimlanes
+                       on a time axis and the fabric's mail on a fourth, turns
+                       as bars, the whole line on hover, and the same rows as a
+                       table under it. --out PATH writes it there, created
+                       0600, and prints the path instead. --since takes Unix
+                       milliseconds or a time word (`2026-09-14`,
+                       `2026-09-14T10:30`, with `Z` or `±HH:MM`; a bare date or
+                       time is local) and drops everything before it. With no
+                       @sid the worker is the one the journal's own lines name.
+                       `history`, the inbox and the timeline are stamped by the
+                       aterm process's own clock, not wall time; they are
+                       placed by the BIRTH TIME of that instance's control
+                       socket (measured 2026-09-14: within 0.12 s of the fabric
+                       bus's own stamps on the same three messages, where the
+                       process's start time was 5.3 s early). Without that the
+                       times are marked `~` and no latency is claimed, and a
+                       turn an aterm self-update carried from an earlier
+                       process (`carried=1`) is on that process's clock and has
+                       no time at all. It only reads: exit 0 even when a source
+                       was missing.
+    --mail             (supervise, watch) Mail is your channel; the screen is
+                       the safety net. The loop parks ONE `await inbox
+                       since=<id>` on YOUR session (@self, or --inbox @sid)
+                       from a thread of its own with a control client of its
+                       own — the worker's socket sees not one request more,
+                       except one read per 20 s step while an idle point is
+                       held (below) — re-armed after each delivery from the
+                       newest row id and after each 20 s step it runs out (no
+                       polling), and prints, on stdout with every other line
+                       as each row lands:
+                         MAIL id=<n> off=<o> from=<sid> kind=<k> len=<n> [re=<o>]
+                       (id: the row `inbox get <id>` reads; off: the bus
+                       offset an answer names as re=; from: the attested
+                       sender; nothing of the body — trust= is in the inbox
+                       row, and the body is yours to read). The worker's
+                       end-of-turn `report` (round 12's hooks post it from
+                       the Stop hook, `aterm link hook install claude
+                       --report-to @<you>`) is folded into the idle point of
+                       the same turn: the point is HELD — nothing printed —
+                       until the report lands or --idle-grace S (default 180)
+                       runs out, the screen read once per 20 s step of the
+                       hold as the safety net (a prompt, a question or the
+                       worker busy again has superseded the point: it is said
+                       as idle-no-report, and what followed right after; a
+                       footer tick is the same point, held on), and prints as
+                         EVENT turn seq=<n> report=<id> rows=<n> <summary>
+                       ONE line per worker turn — report= the row id, rows=
+                       the body's row count, the summary the last row said —
+                       when the report is THIS turn's: one that came after
+                       the worker was read busy for the turn (however long
+                       ago: a report posted mid-turn) or after the point; one
+                       from before the last point handed over, or between it
+                       and the worker's next busy read (the ended turn's late
+                       report), never is; one from before the turn was seen
+                       to begin at all — the loop's first turn, a turn too
+                       short to be read busy — is, when it came within
+                       --report-window S (default 120) before the point, the
+                       only thing then known about it. With none in the grace,
+                         EVENT idle-no-report seq=<n> [complete=<0|1> rows=<n>] <summary>
+                       (--report's brief rides only on that line: a folded
+                       turn reads no report from the screen, the mail IS what
+                       was said). Measured 2026-09-14: one wake and one 2 KB
+                       `inbox get` per turn, where the same turn was a 689-row
+                       `report` read. A question, a limit notice, a prompt
+                       are not held: they print as they always did, between
+                       the MAIL lines. --journal records the MAIL lines (kind
+                       `mail`) and the fold (`report`, `rows`). The lane that
+                       cannot go on — a host without the fabric verbs, no
+                       $ATERM_PARENT_SESSION_ID for @self, its reconnect
+                       window lapsed — says `MAIL lane off: <why> (the loop
+                       goes on without mail)` once, and from then on the
+                       lines are as without the flag; the budget bounds the
+                       hold as it bounds every wait. supervise --mail says
+                       the MAIL lines on stderr, holds its idle review point
+                       the same way, and adds `report <id> rows=<n>` (or
+                       `report -`) after the phase lines of its result; the
+                       journal gets the `EVENT turn` line. --mail needs the
+                       worker's @sid (only that worker's report is folded).
+                       The lane's parked wait is cut short when the loop ends
+                       (its aterm-ctl is signalled), so supervise --mail hands
+                       its result back the moment the point is reached and
+                       watch --mail's process ends with its last line; a
+                       parked wait that outlives an aterm self-update lists
+                       the successor's inbox whole and takes up from the bus
+                       offset (the successor counts its rows from 1 again).
+                       Without the flag, every line is byte for byte what it
+                       was.
     --reconnect-s S    (await-turn, supervise, watch) An aterm self-update hands
                        every session to the new instance under the same @sid, and
                        a request in flight may get no answer (`server closed the
@@ -966,6 +1213,26 @@ SUPERVISING A WORKER (a Claude Code session in another tab; `@sid` from `aterm c
                        `EVENT compacted`, re-send your standing rules in one
                        turn. Never type /compact or /clear into the worker for it
                        without the human.
+    --journal FILE     (supervise, watch) Append one JSON object per line the
+                       loop prints — and, for supervise, per line watch WOULD
+                       have printed for what it decides silently: its
+                       approvals, its review point, its TIMEOUT, or `EXIT
+                       <reason>` for the error it ends on.
+                         {\"t\":<unix ms>,\"sid\":\"<sid>\"|null,\"kind\":\"event|
+                          approved|dismissed|reconnect|timeout|exit\",\"phase\":
+                          \"idle|question|prompt|limited|survey|context|
+                          compacted|-\",\"seq\":<n>|null,\"complete\":0|1|null,
+                          \"rows\":<n>|null,\"summary\":\"<the line's free-text
+                          tail>\",\"line\":\"<the exact line>\",\"turn\":<id>|null}
+                       Every field is read from the line itself, so the record
+                       and the line cannot disagree; `turn` is the ledger turn
+                       `--report` counted its report from. The file is opened
+                       append-only and created 0600 when missing — one that is
+                       already there keeps its mode and its lines — and a
+                       failure to open or write it is said ONCE on stderr and
+                       never stops the loop. `aterm drive ledger --journal
+                       FILE` replays it. --notes is still what it was: one line
+                       per Bash-prompt decision, and nothing else.
 
 OPTIONS
     --socket PATH   The target aterm's control socket. Defaults to

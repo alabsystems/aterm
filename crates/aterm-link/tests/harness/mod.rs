@@ -13,7 +13,7 @@
 
 #![allow(dead_code)]
 
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
 use std::time::{Duration, Instant};
 
@@ -514,8 +514,10 @@ impl Auditor {
 /// variable whose name begins with `ATERM_` is removed, whatever it is called
 /// and whenever it was invented. The exceptions are NAMED rather than assumed —
 /// the caller re-sets `ATERM_LINES`, `ATERM_COLUMNS` and `ATERM_FABRIC_COMMAND`
-/// after this runs. A variable the test wants is one the test states; a variable
-/// it inherits is one nobody chose.
+/// after this runs. The baseline also disables reroute installation and automatic
+/// update checks; explicit per-test overrides are applied afterwards. A variable
+/// the test wants is one the test states; a variable it inherits is one nobody
+/// chose.
 ///
 /// AND THE PRICE OF THAT TRADE, stated because the next deny-by-default written
 /// in this tree will meet it: **a deny-by-default that runs after its allow-list
@@ -527,16 +529,47 @@ impl Auditor {
 /// completeness and takes on SEQUENCING as a new obligation; the enumerated
 /// version's one virtue was that it could not get the order wrong. Get it wrong
 /// here and three suites go red with no error pointing anywhere near the cause.
-fn strip_inherited_identity(cmd: &mut Command) {
+pub fn prepare_gui_environment(cmd: &mut Command) {
     for (name, _) in std::env::vars_os() {
         if name.to_string_lossy().starts_with("ATERM_") {
             cmd.env_remove(&name);
         }
     }
+    cmd.env("ATERM_NO_REROUTE", "1")
+        .env("ATERM_NO_AUTO_UPDATE", "1");
+}
+
+/// These Fabric fixtures do not exercise package or machine configuration.
+/// Automatic primer installation is off too. Package opt-out alone still runs
+/// machine settings, and a scratch HOME does not isolate macOS preferences, so
+/// both machine policies are explicit.
+pub const FIXTURE_GUI_CONFIG: &str = "agents_auto_prime = false\n\n[packages]\nenabled = false\n\n[machine]\nspotlight_noindex = false\nuniversal_control = \"leave\"\n";
+
+/// Seed a private config once; an intentional fixture edit survives relaunch.
+pub fn prepare_fixture_config(tmp: &Path) {
+    use std::io::Write;
+
+    let dir = tmp.join("cfg/aterm");
+    std::fs::create_dir_all(&dir).expect("scratch config dir");
+    match std::fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(dir.join("aterm.toml"))
+    {
+        Ok(mut file) => file
+            .write_all(FIXTURE_GUI_CONFIG.as_bytes())
+            .expect("write isolated GUI config"),
+        Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {}
+        Err(error) => panic!("create isolated GUI config: {error}"),
+    }
 }
 
 /// One booted world: a guarded broker, a headless aterm, and the bridge child
 /// aterm launched. Torn down on every exit path, panics included.
+/// The grants a node's cap file holds, as a function of its node id — what
+/// [`World::boot_with_grants`] takes in place of the whole node ring.
+pub type GrantsFor<'a> = &'a dyn Fn(&str) -> Vec<String>;
+
 pub struct World {
     pub tmp: PathBuf,
     pub broker: Option<Broker>,
@@ -769,13 +802,14 @@ pub fn built_binary(name: &str, krate: &str, env_var: &str) -> PathBuf {
 /// on it, when touched, makes `cargo build -p aterm-gui` produce a new binary.
 ///
 /// TWO KINDS OF ENTRY ARE SKIPPED, and both are build STAMPS rather than sources:
-/// anything under a `.git` directory (`aterm-gui`'s build script depends on `.git/HEAD`
-/// and `.git/index`, which churn on every `git add` in a shared worktree and would
-/// demand a 134 MB relink before every e2e run), and anything under the binary's OWN
-/// target root, which is a build script's OUT_DIR output rather than something a human
-/// edits. The second is matched by PATH PREFIX, not by a component named `target`: a
-/// crate is entitled to a `src/target/` module, and a guard that silently drops a real
-/// source is the failure this whole function exists to stop.
+/// anything under a `.git` directory (`aterm-gui`'s build script watches the
+/// git-resolved HEAD, the loose ref it names and `packed-refs`, which move on every
+/// commit or checkout in a shared worktree and would demand a 134 MB relink before
+/// every e2e run), and anything under the binary's OWN target root, which is a build
+/// script's OUT_DIR output rather than something a human edits. The second is matched
+/// by PATH PREFIX, not by a component named `target`: a crate is entitled to a
+/// `src/target/` module, and a guard that silently drops a real source is the failure
+/// this whole function exists to stop.
 ///
 /// If the depfile is missing — a binary copied in from elsewhere — the walk falls back
 /// to `crates/<krate>/src`, which is narrower than the claim above and says so here
@@ -800,6 +834,32 @@ pub fn refuse_a_stale_binary(bin: &std::path::Path, krate: &str, env_var: &str) 
     let Ok(built) = std::fs::metadata(bin).and_then(|m| m.modified()) else {
         return;
     };
+    // AND IT WAITS FOR THE RELINK BEFORE IT ACCUSES. Under `targo test --workspace`
+    // the BIN target this suite drives is not a dependency of any test target, so
+    // cargo may still be relinking it while this test runs: measured 2026-09-14 in the
+    // release gate, where the binary was four minutes NEWER than the input it was
+    // accused of trailing, because the check ran before the link finished. A guard
+    // that reads one instant of a clock it does not control reports the race, not the
+    // staleness. Poll until the binary is current, then judge — a binary that is
+    // genuinely stale never becomes current and still fails, just later, which is the
+    // same bargain every hang detector in this harness makes.
+    let mut built = built;
+    if let Some((changed, _)) = newest_input(bin, krate) {
+        // FIVE MINUTES, because the thing being waited for is a LINK measured at 90 s
+        // in this release's own gate (source 21:55:53, binary 21:57:23) on a machine
+        // saturated by the workspace build — a 90 s patience missed it by seconds. The
+        // number bounds how long a genuinely stale binary takes to be NAMED, not how
+        // long the suite is willing to be wrong: a binary that never becomes current
+        // still fails, with the same message.
+        let until = std::time::Instant::now() + std::time::Duration::from_secs(300);
+        while changed > built && std::time::Instant::now() < until {
+            std::thread::sleep(std::time::Duration::from_millis(250));
+            match std::fs::metadata(bin).and_then(|m| m.modified()) {
+                Ok(now) => built = now,
+                Err(_) => break,
+            }
+        }
+    }
     if let Some((changed, path)) = newest_input(bin, krate) {
         assert!(
             changed <= built,
@@ -942,6 +1002,43 @@ impl World {
     /// [`World::boot`] with extra environment for the bridge child (the fault
     /// injection the crash tests arm).
     pub fn boot_with(tag: &str, accept_from: &[&str], env: &[(&str, &str)]) -> Self {
+        Self::boot_at(tag, accept_from, env, None)
+    }
+
+    /// [`World::boot_with`] with the bridge pointed at `broker_at` INSTEAD of a
+    /// broker this harness serves — a path nothing listens on, or a stub the
+    /// test serves itself. `broker` and `handle` are `None`; `broker_sock` is
+    /// that path. Nothing here waits for `fabric=connected`, which such a
+    /// world may never reach: that is what the round-13 link tests are about.
+    pub fn boot_at(
+        tag: &str,
+        accept_from: &[&str],
+        env: &[(&str, &str)],
+        broker_at: Option<&str>,
+    ) -> Self {
+        Self::boot_full(tag, accept_from, env, broker_at, &[], None)
+    }
+
+    /// [`World::boot`] with extra flags on the bridge's `serve` line (round
+    /// 13's `--presence minimal`, say).
+    pub fn boot_flags(tag: &str, extra_serve_flags: &[&str]) -> Self {
+        Self::boot_full(tag, &[], &[], None, extra_serve_flags, None)
+    }
+
+    /// [`World::boot`] with the node's cap file holding `grants(node)` instead
+    /// of the whole node ring — a bridge whose cap is short of something.
+    pub fn boot_with_grants(tag: &str, grants: GrantsFor<'_>) -> Self {
+        Self::boot_full(tag, &[], &[], None, &[], Some(grants))
+    }
+
+    fn boot_full(
+        tag: &str,
+        accept_from: &[&str],
+        env: &[(&str, &str)],
+        broker_at: Option<&str>,
+        extra_serve_flags: &[&str],
+        grants: Option<GrantsFor<'_>>,
+    ) -> Self {
         // ONE PERMIT PER STACK COMING UP (see [`boot_permit`]). Dropped when this
         // function returns, which is after the control socket answers — so the
         // window it bounds is exactly the expensive one.
@@ -949,7 +1046,7 @@ impl World {
         let tmp = PathBuf::from(format!("/tmp/atl-{tag}-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&tmp);
         std::fs::create_dir_all(tmp.join("run/aterm")).expect("scratch runtime dir");
-        std::fs::create_dir_all(tmp.join("cfg/aterm")).expect("scratch config dir");
+        prepare_fixture_config(&tmp);
         let state = tmp.join("link");
         std::fs::create_dir_all(&state).expect("bridge state dir");
 
@@ -959,7 +1056,10 @@ impl World {
         let node = format!("n-{:016x}", fnv(tag));
         std::fs::write(state.join("node"), format!("{node}\n")).expect("seed the node id");
 
-        let broker_sock = tmp.join("b.sock").to_string_lossy().into_owned();
+        let broker_sock = broker_at.map_or_else(
+            || tmp.join("b.sock").to_string_lossy().into_owned(),
+            str::to_string,
+        );
         let broker_log = tmp.join("b.log").to_string_lossy().into_owned();
         let ctl_sock = tmp
             .join("run/aterm/aterm.sock")
@@ -972,11 +1072,18 @@ impl World {
             );
         }
 
-        let broker = Broker::open_guarded(&broker_log, SECRET.to_vec()).expect("guarded broker");
-        let handle = broker.serve(&broker_sock).expect("serve the broker");
+        let (broker, handle) = if broker_at.is_some() {
+            (None, None)
+        } else {
+            let broker =
+                Broker::open_guarded(&broker_log, SECRET.to_vec()).expect("guarded broker");
+            let handle = broker.serve(&broker_sock).expect("serve the broker");
+            (Some(broker), Some(handle))
+        };
 
         let cap_path = tmp.join("node.cap");
-        let caps: String = node_grants(&node).iter().map(|g| cap_line(g)).collect();
+        let grants = grants.map_or_else(|| node_grants(&node), |f| f(&node));
+        let caps: String = grants.iter().map(|g| cap_line(g)).collect();
         std::fs::write(&cap_path, caps).expect("write the node cap file");
 
         let mut fabric_cmd = format!(
@@ -988,6 +1095,10 @@ impl World {
         if !accept_from.is_empty() {
             fabric_cmd.push_str(&format!(" --accept-from {}", accept_from.join(",")));
         }
+        for flag in extra_serve_flags {
+            fabric_cmd.push(' ');
+            fabric_cmd.push_str(flag);
+        }
 
         std::fs::write(tmp.join("fabric.cmd"), &fabric_cmd).expect("record the fabric command");
         let gui_log = tmp.join("gui.log");
@@ -997,7 +1108,7 @@ impl World {
         // BEFORE the explicit `.env` calls below, never after: `Command`
         // applies env operations in order, so a blanket removal that ran last
         // would delete the three variables this harness deliberately sets.
-        strip_inherited_identity(&mut cmd);
+        prepare_gui_environment(&mut cmd);
         cmd.arg("--headless")
             .env("HOME", scratch_home(&tmp))
             .env("XDG_RUNTIME_DIR", tmp.join("run"))
@@ -1016,8 +1127,8 @@ impl World {
 
         let mut world = World {
             tmp,
-            broker: Some(broker),
-            handle: Some(handle),
+            broker,
+            handle,
             broker_sock,
             broker_log,
             gui: Some(gui),
@@ -1237,7 +1348,7 @@ impl World {
         // BEFORE the explicit `.env` calls below, never after: `Command`
         // applies env operations in order, so a blanket removal that ran last
         // would delete the three variables this harness deliberately sets.
-        strip_inherited_identity(&mut cmd);
+        prepare_gui_environment(&mut cmd);
         cmd.arg("--headless")
             .env("HOME", scratch_home(&w.tmp))
             .env("XDG_RUNTIME_DIR", w.tmp.join("run"))
@@ -1567,7 +1678,7 @@ pub struct Node {
     fabric_cmd: String,
     /// Extra environment for the `aterm-gui` this node runs — and therefore for
     /// the bridge child it launches. Applied AFTER
-    /// [`strip_inherited_identity`], which deliberately removes
+    /// [`prepare_gui_environment`], which deliberately removes
     /// `ATERM_LINK_FAULT` from an inherited environment: a test that arms a
     /// fault must say so explicitly, and must never have one leak in from the
     /// aterm the test itself is running inside.
@@ -1600,7 +1711,7 @@ impl Node {
         let _boot = boot_permit();
         let tmp = fleet.tmp.join(format!("n{ordinal}"));
         std::fs::create_dir_all(tmp.join("run/aterm")).expect("scratch runtime dir");
-        std::fs::create_dir_all(tmp.join("cfg/aterm")).expect("scratch config dir");
+        prepare_fixture_config(&tmp);
         let state = tmp.join("link");
         std::fs::create_dir_all(&state).expect("bridge state dir");
 
@@ -1671,7 +1782,7 @@ impl Node {
         // BEFORE the explicit `.env` calls below, never after: `Command`
         // applies env operations in order, so a blanket removal that ran last
         // would delete the three variables this harness deliberately sets.
-        strip_inherited_identity(&mut cmd);
+        prepare_gui_environment(&mut cmd);
         cmd.arg("--headless")
             .env("HOME", scratch_home(&self.tmp))
             .env("XDG_RUNTIME_DIR", self.tmp.join("run"))
@@ -1796,6 +1907,62 @@ impl Node {
         let lines: Vec<&str> = body.lines().collect();
         lines[lines.len().saturating_sub(20)..].join("\n")
     }
+}
+
+#[test]
+fn gui_fixture_defaults_disable_machine_writes_and_preserve_explicit_edits() {
+    let dir = std::env::temp_dir().join(format!("atl-isolation-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    prepare_fixture_config(&dir);
+    let path = dir.join("cfg/aterm/aterm.toml");
+    let text = std::fs::read_to_string(&path).expect("fixture config");
+    let config: aterm_toml::Table = aterm_toml::from_str(&text).expect("valid fixture config");
+    assert_eq!(
+        config.get("agents_auto_prime").and_then(|v| v.as_bool()),
+        Some(false)
+    );
+    let packages = config.get("packages").and_then(|v| v.as_table()).unwrap();
+    let machine = config.get("machine").and_then(|v| v.as_table()).unwrap();
+    assert_eq!(
+        packages.get("enabled").and_then(|v| v.as_bool()),
+        Some(false)
+    );
+    assert_eq!(
+        machine.get("spotlight_noindex").and_then(|v| v.as_bool()),
+        Some(false)
+    );
+    assert_eq!(
+        machine.get("universal_control").and_then(|v| v.as_str()),
+        Some("leave")
+    );
+
+    let edited = format!("{text}\n[fabric]\npresence = \"minimal\"\n");
+    std::fs::write(&path, &edited).expect("intentional fixture edit");
+    prepare_fixture_config(&dir);
+    assert_eq!(std::fs::read_to_string(&path).unwrap(), edited);
+
+    let mut command = Command::new("unused-fixture-program");
+    prepare_gui_environment(&mut command);
+    for name in ["ATERM_NO_REROUTE", "ATERM_NO_AUTO_UPDATE"] {
+        assert_eq!(
+            command
+                .get_envs()
+                .find(|(key, _)| *key == name)
+                .map(|(_, value)| value),
+            Some(Some(std::ffi::OsStr::new("1"))),
+            "{name} must be explicit after inherited environment removal"
+        );
+    }
+    command.env("ATERM_NO_REROUTE", "0");
+    assert_eq!(
+        command
+            .get_envs()
+            .find(|(key, _)| *key == "ATERM_NO_REROUTE")
+            .map(|(_, value)| value),
+        Some(Some(std::ffi::OsStr::new("0"))),
+        "an explicit behavior test may override the baseline"
+    );
+    std::fs::remove_dir_all(dir).expect("remove owned fixture");
 }
 
 /// The age reader must be able to read OUR OWN age.

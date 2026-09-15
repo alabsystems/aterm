@@ -1722,8 +1722,10 @@ pub(crate) fn offscreen_args(rest: &str) -> Result<OffscreenArgs, String> {
 ///   read stopped at (0 = nothing yet) — so the next page or poll is always
 ///   `since=<last>`.
 /// * `since=` is EXCLUSIVE. An index minted under another origin (`<origin>:<i>`
-///   from a restarted or handed-off process) reads from the start of this archive
-///   — `origin=` shows the reset; an index past `last` is [`OFFSCREEN_BAD_SINCE`].
+///   from a restarted process, or one whose self-update handoff could not carry
+///   the archive — one that did keeps its origin) reads from the start of this
+///   archive — `origin=` shows the reset; an index past `last` is
+///   [`OFFSCREEN_BAD_SINCE`].
 /// * At most `max=` rows (default [`OFFSCREEN_DEFAULT_MAX`]): the oldest ones after
 ///   `since`, or with `tail=<n>` the newest `n`; `more=1` when rows were left out.
 /// * `lost=` counts rows after `since` evicted before this read, `breaks=` the
@@ -7165,9 +7167,7 @@ mod offscreen_tests {
     fn offscreen_counts_evicted_rows_as_lost() {
         let mut t = scrolled_engine(1);
         // Each row costs its bytes plus a fixed overhead: ten rows fit.
-        t.set_alt_archive_budget(
-            10 * (row(0).len() + aterm_core::terminal::ALT_ARCHIVE_ROW_OVERHEAD),
-        );
+        t.set_alt_archive_budget(10 * aterm_core::terminal::alt_archive_row_charge(row(0).len()));
         for s in 1..31 {
             paint(&mut t, s);
         }

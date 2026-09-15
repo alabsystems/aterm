@@ -2330,8 +2330,7 @@ pub fn echo_ledger_bridge_model() -> Model {
             }
             // THE UNSWEPT ECHO: a licensed `Batch`-cell typed move the host
             // did not sweep — a non-coalesced re-anchor, or a batch its press
-            // credits (in flight for `IN_FLIGHT_PATIENCE_S`,
-            // `RAINBOW_COALESCE_CREDIT_LIFE` by alias)
+            // credits (in flight for `IN_FLIGHT_PATIENCE_S`)
             // could not pay for. With no key clock there is no partition:
             // only a move starting AT the mirror is attributed, to the oldest
             // presses, and every cell is laid.

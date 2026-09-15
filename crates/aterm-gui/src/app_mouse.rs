@@ -719,7 +719,9 @@ impl App {
 
     /// Click-to-focus in window `wid`: if its last pointer position (window cell)
     /// lands on a pane OTHER than the focused one, move focus there (re-mirroring the
-    /// control socket + renderer onto it) and re-derive the pane-local mouse cell.
+    /// control socket + renderer onto it through `resync_active_or_window`, which
+    /// also re-publishes the global `ActiveHandle` for a frontmost window) and
+    /// re-derive the pane-local mouse cell.
     /// Returns `true` iff focus moved (the caller then swallows the press). A press
     /// in the already-focused pane, on a divider, or in a single-pane tab returns
     /// `false` (the press proceeds to the normal selection/tracking path).
@@ -783,12 +785,13 @@ impl App {
             debug_assert!(synced);
         }
         // Re-derive the pane-local mouse cell for the newly-focused pane so any
-        // follow-up gesture uses its grid; re-mirror term/master/socket onto it.
+        // follow-up gesture uses its grid; re-mirror term/master/socket onto it
+        // and, for the frontmost window, the global handle (2026-09-14 audit).
         let (ro, co) = hit_origin;
         if let Some(ws) = self.windows.get_mut(&wid) {
             ws.last_mouse_cell = (wr.saturating_sub(ro), wc.saturating_sub(co));
         }
-        self.sync_window(wid);
+        self.resync_active_or_window(wid);
         true
     }
 

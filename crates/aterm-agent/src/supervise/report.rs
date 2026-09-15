@@ -32,16 +32,18 @@
 //! archived row instead.
 //!
 //! `complete=1` says nothing was lost between that start and the end: the
-//! start was found, the archive is the one the mark named (a restart or a
-//! handoff starts a new one), the worker is on the alternate screen, no gap
-//! (a redraw with no overlap, a resize, a reset) and no eviction lies after
-//! the start, and `--max-rows` held every row. Otherwise `reason=` says why.
+//! start was found, the archive is the one the mark named (a restart starts a
+//! new one; an aterm self-update carries it, marks and turn ledger included,
+//! unless it could not), the worker is on the alternate screen, no gap (a
+//! redraw with no overlap, a resize, a reset) and no eviction lies after the
+//! start, and `--max-rows` held every row. Otherwise `reason=` says why.
 //! A host without `offscreen` — or whose archive is off (`enabled=0`), or an
 //! `aterm ctl` too old to relay the rows — gets the screen alone
 //! (`reason=no-archive`).
 
 use std::fmt;
 
+use super::blocks::{View, view_rows};
 use super::phase::transcript_end;
 use super::run::{Ctl, CtlReply, Fail, Session};
 use super::screen::parse_text_json;
@@ -54,7 +56,7 @@ const HISTORY_DEPTH: &str = "8";
 /// begin with. The ledger keeps up to 512 bytes of it.
 pub const MARKER_CHARS: usize = 60;
 /// How Claude Code shows a long paste in its transcript.
-const PASTED: &str = "[Pasted text";
+pub(super) const PASTED: &str = "[Pasted text";
 /// A single-line turn at least this long (chars) may be shown as a paste.
 const PASTE_CHARS: usize = 200;
 /// The ledger keeps up to 512 bytes of a turn's text: one this long may have
@@ -66,7 +68,8 @@ const LEDGER_CUT_BYTES: usize = 500;
 /// takes it; a bare `<index>` names no origin.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Mark {
-    /// The archive's host-assigned origin (unique per aterm process).
+    /// The archive's host-assigned origin (unique per aterm process that
+    /// started the archive, and kept by a self-update that carries it).
     pub origin: Option<u64>,
     /// The archived row index (0 = before the first row).
     pub index: u64,
@@ -98,7 +101,7 @@ impl fmt::Display for Mark {
 }
 
 /// ASCII digits and nothing else (no sign, no space).
-fn decimal(s: &str) -> Option<u64> {
+pub(super) fn decimal(s: &str) -> Option<u64> {
     if s.is_empty() || !s.bytes().all(|b| b.is_ascii_digit()) {
         return None;
     }
@@ -112,6 +115,9 @@ pub struct ReportOpts {
     pub since: Option<Mark>,
     /// `--max-rows`: the most archived rows read.
     pub max_rows: usize,
+    /// `--final` / `--messages`: which of the rows are printed
+    /// ([`Report::render_view`]); the rows read are the same.
+    pub view: View,
 }
 
 impl Default for ReportOpts {
@@ -119,6 +125,7 @@ impl Default for ReportOpts {
         Self {
             since: None,
             max_rows: DEFAULT_MAX_ROWS,
+            view: View::All,
         }
     }
 }
@@ -153,11 +160,13 @@ pub enum Reason {
     /// The worker is not on the alternate screen: not a fullscreen app, or it
     /// left; the archive holds nothing of what it prints now.
     MainScreen,
-    /// The archive is not the one the mark named: the host restarted or
-    /// handed the session to a new instance since.
+    /// The archive is not the one the mark named: the host restarted since,
+    /// or handed the session to a new instance that could not carry the
+    /// archive (one that can keeps it and its origin).
     ArchiveReset,
     /// Rows after the start were evicted, or a gap (a redraw with no overlap,
-    /// a resize, a reset) lies after it.
+    /// a resize, a reset) lies after it. A resize as a self-update's new
+    /// instance takes over is one that loses nothing (rows may repeat).
     ArchiveGap,
     /// More archived rows than `--max-rows`: the middle is missing.
     MaxRows,
@@ -234,6 +243,25 @@ impl Report {
         }
         out
     }
+
+    /// [`Self::render`] for `view`: `View::All` is exactly it; `--final` and
+    /// `--messages` print the same header with ` view=<final|messages>
+    /// kept=<n>` after it — `rows=` still counts every row the report holds —
+    /// a `--` line, then only the rows the view keeps
+    /// ([`super::blocks::view_rows`]).
+    pub fn render_view(&self, view: View) -> String {
+        if view == View::All {
+            return self.render();
+        }
+        let kept = view_rows(&self.rows, view);
+        let mut out = format!("{} view={} kept={}", self.header(), view.name(), kept.len());
+        out.push_str("\n--\n");
+        for row in &kept {
+            out.push_str(row);
+            out.push('\n');
+        }
+        out
+    }
 }
 
 /// One `history` record, as a report reads it.
@@ -292,7 +320,7 @@ fn newest_turn(turns: Vec<LedgerTurn>) -> Option<LedgerTurn> {
 /// graphic, and `%`). TOTAL: a malformed escape passes through verbatim and
 /// invalid UTF-8 decodes lossily. The same rule as `aterm_control::wire::
 /// pct_decode`, which this crate does not depend on.
-fn pct_decode(s: &str) -> String {
+pub(super) fn pct_decode(s: &str) -> String {
     let bytes = s.as_bytes();
     let mut out = Vec::with_capacity(bytes.len());
     let mut i = 0;
@@ -438,14 +466,14 @@ fn header(line: &str) -> Option<(usize, Vec<(&str, &str)>)> {
 
 /// The archived rows and the screen's transcript rows, joined at the seam.
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
-struct Joined {
-    rows: Vec<String>,
+pub(super) struct Joined {
+    pub(super) rows: Vec<String>,
     /// How many of `rows`, from the top, came from the archive.
-    archived: usize,
+    pub(super) archived: usize,
     /// The archive index of `rows[0]` (when `archived > 0`).
-    first: u64,
+    pub(super) first: u64,
     /// The newest archived index read (the page's `last`).
-    upto: u64,
+    pub(super) upto: u64,
 }
 
 /// Join an `offscreen … screen=1` read: every archived row, then the screen's
@@ -454,7 +482,7 @@ struct Joined {
 /// `m < back`, so a pinned header above them stays, and a re-shown row the
 /// read did not get (a page cut short by `--max-rows`, a row from before the
 /// mark) is kept from the screen: a duplicate, never a loss.
-fn join(off: &Offscreen) -> Joined {
+pub(super) fn join(off: &Offscreen) -> Joined {
     let count = u64::try_from(off.archived.len()).unwrap_or(u64::MAX);
     let upto = if count > 0 {
         off.first.saturating_add(count - 1)
@@ -489,7 +517,7 @@ fn join(off: &Offscreen) -> Joined {
 /// a prompt's options (`❯ 1. Yes`) — are indented, and its composer is in the
 /// live zone, which [`transcript_end`] already cut; so a message that starts
 /// with `1.` is still a user row.
-fn is_user_row(row: &str) -> bool {
+pub(super) fn is_user_row(row: &str) -> bool {
     row.strip_prefix('❯')
         .is_some_and(|rest| rest.starts_with(char::is_whitespace))
 }
@@ -497,7 +525,7 @@ fn is_user_row(row: &str) -> bool {
 /// The first `need` non-whitespace characters of the user block at `at`: its
 /// `❯` row, then the rows it wrapped onto (indented, or blank), up to the
 /// first row back in column 0 (the worker's `⏺`, a done row).
-fn user_text(rows: &[String], at: usize, need: usize) -> String {
+pub(super) fn user_text(rows: &[String], at: usize, need: usize) -> String {
     let head = rows[at].strip_prefix('❯').unwrap_or(&rows[at]);
     let tail = rows[at + 1..]
         .iter()
@@ -513,7 +541,7 @@ fn user_text(rows: &[String], at: usize, need: usize) -> String {
 
 /// Whether `text` may show as a `[Pasted text …]` row: it has a line break,
 /// or is long.
-fn paste_like(text: &str) -> bool {
+pub(super) fn paste_like(text: &str) -> bool {
     text.contains('\n') || text.chars().count() >= PASTE_CHARS
 }
 
@@ -521,7 +549,7 @@ fn paste_like(text: &str) -> bool {
 /// counts the text's line breaks, give or take one (a trailing break, lines
 /// against breaks) — and at most N+1 of them when the ledger may have cut the
 /// text short.
-fn paste_fits(row: &str, text: &str) -> bool {
+pub(super) fn paste_fits(row: &str, text: &str) -> bool {
     let Some(n) = row
         .split_once(" +")
         .and_then(|(_, rest)| rest.split_once(" line"))
@@ -816,7 +844,7 @@ impl<C: Ctl> Session<'_, C> {
 /// The host does not know the verb: an older build answers `ERR unknown verb`
 /// (or, for a verb aimed at another session, `ERR denied` — an unknown verb
 /// has no op class to authorize), a usage line or a bare `ERR`.
-fn without_verb(r: &CtlReply) -> bool {
+pub(super) fn without_verb(r: &CtlReply) -> bool {
     r.unknown_form() || r.is_err("unknown verb") || r.is_err("denied")
 }
 

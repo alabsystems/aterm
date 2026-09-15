@@ -144,17 +144,17 @@ impl FdaState {
 /// How far a Full Disk Access grant reaches: to the running process, or only
 /// to processes started later.
 ///
-/// Apple's own Settings sheet implies the latter, but it was never measured
-/// for aterm's shape (design §7 S1, BLOCKING), so this stays
-/// [`FdaScope::Unknown`] and callers must render it as unknown rather than
-/// guessing.
+/// Propagation of a changed grant was not measured for aterm's shape (design
+/// §7 S1), so that evidence stays [`FdaScope::Unknown`]. A successful access
+/// probe may separately establish [`FdaScope::ThisProcess`] for its observing
+/// host; it says nothing about existing sessions or future process launches.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default)]
 pub enum FdaScope {
     /// The running process observes the grant.
     ThisProcess,
     /// Only a process started after the grant observes it.
     NewProcesses,
-    /// Not measured. The value every caller sees today.
+    /// Neither current observation nor measured propagation establishes scope.
     #[default]
     Unknown,
 }

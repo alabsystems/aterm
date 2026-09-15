@@ -21,7 +21,10 @@
 //!    run`. (1) Timing: the test stage links `aterm-gui`'s dev-deps with
 //!    `spec-anchors` ON, which invalidates its non-test build, so a `run` here
 //!    would rebuild and the bounded socket-poll budget would expire MID-BUILD,
-//!    reporting a false "socket never appeared" on healthy code. (2) Output
+//!    reporting a false "socket never appeared" on healthy code. (Since
+//!    2026-09-13 both binaries build into `target-drivers/`, which the test
+//!    stage never writes, and the `driver builds` row has usually compiled
+//!    them already — the build here is then a fingerprint no-op.) (2) Output
 //!    purity: the driver writes lane diagnostics to stderr, and these round trips
 //!    capture stderr to catch real errors — through `run` that banner lands in the
 //!    reply and every `OK`-prefix match fails.
@@ -89,6 +92,7 @@ struct Sandbox {
 impl Sandbox {
     fn new(tag: &str) -> Option<Self> {
         let tmp = crate::mktemp_dir(tag).ok()?;
+        std::fs::create_dir(tmp.join("home")).ok()?;
         // The per-user runtime dir the server and client both resolve to
         // ($XDG_RUNTIME_DIR/aterm); 0700 so the same-uid check holds.
         let rundir = tmp.join("run");
@@ -101,14 +105,22 @@ impl Sandbox {
         // LATENCIES, and the owner's live config sets `cursor_trail_style`, so
         // without this the pacing smoke measures whatever effect that machine
         // happens to have enabled. Config resolution has no probe marker, so the
-        // launch env is the only lever; empty (NOT a copy of the caller's) is the
-        // right seed here, because the gate's verdict must be machine-independent.
+        // launch env is the only lever. Keep rendering at its shipped defaults,
+        // but explicitly opt out of unrelated package and host maintenance.
+        // `[packages].enabled = false` alone still runs `machine apply`, whose
+        // defaults change per-user settings even with a scratch config directory.
         // It closes a write path too: `aterm-ctl` auto-presents the token and
         // owner scope satisfies `ConfigWrite`, which is how a probe rewrote the
         // owner's font on 2026-08-10.
         let cfgdir = tmp.join("cfg");
         std::fs::create_dir_all(cfgdir.join("aterm")).ok()?;
         chmod_700(&cfgdir)?;
+        std::fs::write(
+            cfgdir.join("aterm/aterm.toml"),
+            "agents_auto_prime = false\n[packages]\nenabled = false\n\
+             [machine]\nspotlight_noindex = false\nuniversal_control = \"leave\"\n",
+        )
+        .ok()?;
         let gui_log = tmp.join("gui.log");
         Some(Self {
             tmp,
@@ -168,8 +180,7 @@ fn bring_up(
     log_label: &str,
     headless: bool,
 ) -> Ready {
-    let build = Cmd::new(&ctx.tools.targo)
-        .args(smoke_build_args())
+    let build = crate::stages::driver_build_cmd(ctx, smoke_build_args())
         .capture(Capture::Append(sb.gui_log.clone()));
     if !exec_run(&build, ctx.exec_env()).ok {
         r.fail(format!(
@@ -178,9 +189,11 @@ fn bring_up(
         r.raw(smoke_log_tail(log_label, &sb.gui_log));
         return Ready::Stopped;
     }
-    let target_dir = ctx.env.cargo_target_dir.as_deref();
-    let gui = debug_bin(&ctx.root, target_dir, "aterm-gui");
-    let ctl = debug_bin(&ctx.root, target_dir, "aterm-ctl");
+    // The driver lane's dir, never the caller's `CARGO_TARGET_DIR`: that is where
+    // the build above put them.
+    let drivers = crate::stages::drivers_dir(ctx);
+    let gui = debug_bin(&ctx.root, Some(drivers.as_os_str()), "aterm-gui");
+    let ctl = debug_bin(&ctx.root, Some(drivers.as_os_str()), "aterm-ctl");
     if !crate::is_executable_file(&gui) || !crate::is_executable_file(&ctl) {
         r.cannot_run(format!(
             "{tag}: just-built binaries missing ({}, {})",
@@ -207,10 +220,23 @@ fn bring_up(
     // SHELL forced to a quiet, always-present /bin/sh so the engine's PTY child
     // cannot drag a developer's rc files into a gate.
     let mut cmd = Command::new(&gui);
+    // A fixture has no inherited session, capability, handoff, fabric or
+    // update authority. Apply its explicit private bindings only after this
+    // removal, just as the shared Fabric harness does.
+    for (name, _) in std::env::vars_os() {
+        if name.to_string_lossy().starts_with("ATERM_") {
+            cmd.env_remove(name);
+        }
+    }
     cmd.current_dir(&ctx.root)
         .env("PATH", &ctx.path_env)
+        .env("HOME", sb.tmp.join("home"))
         .env("XDG_RUNTIME_DIR", &sb.rundir)
         .env("XDG_CONFIG_HOME", &sb.cfgdir)
+        .env("ATERM_CONTROL_SOCK", sb.sock())
+        .env("ATERM_NO_REROUTE", "1")
+        .env("ATERM_NO_AUTO_UPDATE", "1")
+        .env("ATERM_NO_AUTO_APPLY", "1")
         .env("SHELL", "/bin/sh")
         .stdout(log)
         .stderr(log2);
@@ -259,6 +285,11 @@ fn child_exited(sb: &mut Sandbox) -> bool {
 fn ctl(ctx: &Ctx, sb: &Sandbox, ctl_bin: &Path, args: &[&str]) -> String {
     let cmd = Cmd::new(ctl_bin)
         .args(args.iter().copied())
+        // Current ctl reads its token beside this exact socket; there is no
+        // token/token-file/cap environment override. Defeat the independent
+        // ambient disable selector too, without changing product auth tests.
+        .env("ATERM_CONTROL_SOCK", sb.sock())
+        .env("ATERM_NO_CONTROL_SOCK", "0")
         .env("XDG_RUNTIME_DIR", &sb.rundir)
         .env("XDG_CONFIG_HOME", &sb.cfgdir);
     capture_reply(&cmd, ctx.exec_env())
@@ -267,6 +298,8 @@ fn ctl(ctx: &Ctx, sb: &Sandbox, ctl_bin: &Path, args: &[&str]) -> String {
 fn ctl_quiet(ctx: &Ctx, sb: &Sandbox, ctl_bin: &Path, args: &[&str]) {
     let cmd = Cmd::new(ctl_bin)
         .args(args.iter().copied())
+        .env("ATERM_CONTROL_SOCK", sb.sock())
+        .env("ATERM_NO_CONTROL_SOCK", "0")
         .env("XDG_RUNTIME_DIR", &sb.rundir)
         .env("XDG_CONFIG_HOME", &sb.cfgdir)
         .capture(Capture::Silent);
@@ -581,6 +614,37 @@ mod tests {
                 "-p",
                 "aterm-ctl"
             ]
+        );
+    }
+
+    #[test]
+    fn the_smoke_build_is_a_driver_lane_build() {
+        let c = ctx();
+        let cmd = crate::stages::driver_build_cmd(&c, smoke_build_args());
+        let env: Vec<(String, String)> = cmd
+            .envs
+            .iter()
+            .map(|(k, v)| {
+                (
+                    k.to_string_lossy().into_owned(),
+                    v.to_string_lossy().into_owned(),
+                )
+            })
+            .collect();
+        assert_eq!(
+            env,
+            [
+                (
+                    "CARGO_TARGET_DIR".to_string(),
+                    "/repo/target-drivers".to_string()
+                ),
+                ("CARGO_BUILD_JOBS".to_string(), "8".to_string()),
+            ]
+        );
+        assert_eq!(cmd.argv()[1..], smoke_build_args()[..]);
+        assert_eq!(
+            crate::stages::drivers_dir(&c),
+            PathBuf::from("/repo/target-drivers")
         );
     }
 

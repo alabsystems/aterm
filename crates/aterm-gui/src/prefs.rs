@@ -419,6 +419,15 @@ pub(crate) const EDIT_PACKAGES_AUTO_INSTALL: &str = "packages.auto_install";
 /// first run into an announced offer instead. Distinct from
 /// [`EDIT_PACKAGES_AUTO_INSTALL`], which governs NETWORK installs.
 pub(crate) const EDIT_PACKAGES_SEED_INSTALL: &str = "packages.seed_install";
+/// `[machine] universal_control` — `"off"` (default) disables macOS Universal Control
+/// for this host on every package pass; `"leave"` never touches it. Applied by the
+/// CO-LOCATED atpkg, which reads the same table; the Security page shows the measured
+/// state beside the switch.
+pub(crate) const EDIT_MACHINE_UNIVERSAL_CONTROL: &str = "machine.universal_control";
+/// `[machine] spotlight_noindex` — rename cargo target dirs under `$HOME` to
+/// `.noindex` (with a `target` symlink left in place) so Spotlight never indexes
+/// build output. Default ON.
+pub(crate) const EDIT_MACHINE_SPOTLIGHT_NOINDEX: &str = "machine.spotlight_noindex";
 
 /// The security opt-in toggles — ALL fail-closed (default OFF). Grouped so `edit_kind`
 /// and the schema rows agree they are booleans, and so the Settings UI can label them
@@ -445,6 +454,8 @@ pub(crate) const EDIT_AMBIGUOUS_WIDTH: &str = "ambiguous_width";
 // parsers in `app_config.rs` (a hand-typed alias outside this set resolves at load).
 // The underline option is retired (owner: block + "|" only; DECSCUSR still honored).
 pub(crate) const CURSOR_STYLES: &[&str] = &["block", "bar"];
+/// `[machine] universal_control` — the two spellings `atpkg::config` resolves.
+pub(crate) const UNIVERSAL_CONTROL_POLICIES: &[&str] = &["off", "leave"];
 pub(crate) const WINDOW_THEMES: &[&str] = &["auto", "light", "dark"];
 pub(crate) const BIDI_MODES: &[&str] = &["implicit", "disabled", "explicit"];
 pub(crate) const AMBIGUOUS_WIDTHS: &[&str] = &["narrow", "wide"];
@@ -1657,12 +1668,18 @@ pub(crate) fn edit_kind(key: &str) -> EditKind {
         | EDIT_PACKAGES_AUTO_UPDATE
         | EDIT_PACKAGES_AUTO_INSTALL
         | EDIT_PACKAGES_SEED_INSTALL
+        // CRITICAL for the same reason: `[machine]` is a table the CO-LOCATED atpkg
+        // parses too, and a Text write would hand its serde `Option<bool>` a string.
+        | EDIT_MACHINE_SPOTLIGHT_NOINDEX
         | EDIT_WALLPAPER_TEXT_TINT => EditKind::Bool,
         EDIT_CURSOR_TRAIL_STYLE => EditKind::Enum {
             options: CURSOR_TRAIL_STYLES,
         },
         EDIT_TRAIL_SOUND_STYLE => EditKind::Enum {
             options: TRAIL_SOUND_STYLES,
+        },
+        EDIT_MACHINE_UNIVERSAL_CONTROL => EditKind::Enum {
+            options: UNIVERSAL_CONTROL_POLICIES,
         },
         _ => EditKind::Text,
     }
@@ -2564,6 +2581,10 @@ pub(crate) fn section_of(key: &str) -> Section {
         | EDIT_PACKAGES_AUTO_UPDATE
         | EDIT_PACKAGES_AUTO_INSTALL
         | EDIT_PACKAGES_SEED_INSTALL => Section::Packages,
+        // The [machine] host settings live on the Security page, beside the
+        // permissions they resemble: each is a switch about what this Mac lets
+        // happen to it, and the page's "This Mac" card confirms the measured state.
+        EDIT_MACHINE_UNIVERSAL_CONTROL | EDIT_MACHINE_SPOTLIGHT_NOINDEX => Section::Security,
         EDIT_CURSOR_STYLE
         | EDIT_CURSOR_BLINK
         | EDIT_CURSOR_MOMENTUM_GLOW
@@ -2659,6 +2680,9 @@ pub(crate) fn group_of(key: &str) -> (&'static str, u8) {
     }
     if SECURITY_BOOL_KEYS.contains(&key) {
         return ("Permissions", 0);
+    }
+    if key == EDIT_MACHINE_UNIVERSAL_CONTROL || key == EDIT_MACHINE_SPOTLIGHT_NOINDEX {
+        return ("This Mac", 1);
     }
     // Nested tables group by PREFIX — one box per table, keeping their (many)
     // leaves out of the per-section "General" catch-all.
@@ -2795,6 +2819,13 @@ pub(crate) fn group_of(key: &str) -> (&'static str, u8) {
 pub(crate) fn group_footnote(caption: &str) -> Option<&'static str> {
     Some(match caption {
         "Colors" => "Blank uses the theme's color.",
+        // Short on purpose: at 2× Dynamic Type on a 320-wide page the footnote
+        // shares the page with one row. The revert lines live in `aterm pkg
+        // machine` and `aterm explain-config`.
+        "This Mac" => {
+            "Every package pass applies these first; Apply now applies them here. Off keeps \
+             the cursor on this Mac; .noindex hides build output from Spotlight."
+        }
         "Text & Contrast" => {
             "Minimum contrast 1.0 leaves opaque colors unchanged. Translucent backgrounds enforce at least a 4.5:1 ratio."
         }
@@ -2928,6 +2959,9 @@ pub(crate) fn application_timing(key: &str) -> Option<&'static str> {
         | "packages.include"
         | "packages.exclude"
         | "packages.links" => Some("Applies on the next package operation"),
+        EDIT_MACHINE_UNIVERSAL_CONTROL | EDIT_MACHINE_SPOTLIGHT_NOINDEX => {
+            Some("Applies on the next package pass, or Apply now")
+        }
         "update.owner" | "update.repo" => {
             Some("Manual checks use this now; automatic checks use it next launch")
         }
@@ -3353,6 +3387,25 @@ pub(crate) fn keywords_of(key: &str) -> &'static [&'static str] {
             "master",
         ],
         EDIT_PACKAGES_AUTO_UPDATE => &["packages", "toolchain", "atpkg", "tools", "alab"],
+        EDIT_MACHINE_UNIVERSAL_CONTROL => &[
+            "machine",
+            "universal control",
+            "cursor",
+            "ipad",
+            "mac",
+            "host",
+            "roam",
+        ],
+        EDIT_MACHINE_SPOTLIGHT_NOINDEX => &[
+            "machine",
+            "spotlight",
+            "noindex",
+            "build",
+            "target",
+            "cargo",
+            "index",
+            "host",
+        ],
         EDIT_PACKAGES_SEED_INSTALL => &[
             "packages",
             "toolchain",
@@ -4702,6 +4755,34 @@ pub(crate) fn editable_fields(cfg: &Config) -> Vec<EditField> {
             key: EDIT_PACKAGES_SEED_INSTALL,
             kind: EditKind::Bool,
             seed: Some(cfg.packages_seed_install().to_string()),
+            placeholder: String::new(),
+        },
+        EditField {
+            // `[machine] universal_control` (dotted key): the co-located atpkg
+            // disables macOS Universal Control for this host at the top of every
+            // package pass unless this says "leave". Enum rows seed the CONFIGURED
+            // raw value (blank when unset) with the effective default in the
+            // placeholder — the same law as every other non-Bool row.
+            label: "Universal Control on this Mac",
+            key: EDIT_MACHINE_UNIVERSAL_CONTROL,
+            kind: EditKind::Enum {
+                options: UNIVERSAL_CONTROL_POLICIES,
+            },
+            seed: configured_str(
+                cfg.machine
+                    .as_ref()
+                    .and_then(|m| m.universal_control.as_deref()),
+            ),
+            placeholder: "off".to_string(),
+        },
+        EditField {
+            // `[machine] spotlight_noindex`: rename cargo target dirs under $HOME to
+            // .noindex (a `target` symlink keeps cargo working) so Spotlight never
+            // indexes build output. Bools seed the RESOLVED value.
+            label: "Hide build output from Spotlight (.noindex)",
+            key: EDIT_MACHINE_SPOTLIGHT_NOINDEX,
+            kind: EditKind::Bool,
+            seed: Some(cfg.machine_spotlight_noindex().to_string()),
             placeholder: String::new(),
         },
     ];
@@ -7153,6 +7234,19 @@ listen = \"127.0.0.1:7777\" # local only
         ] {
             assert_eq!(super::application_timing(key), Some("Applies next launch"));
         }
+        // The [machine] rows are applied by the co-located atpkg — on its next
+        // pass, or on the Security page's Apply now — so they are NOT in the
+        // "Applies next launch" set and never will be.
+        for key in [
+            super::EDIT_MACHINE_UNIVERSAL_CONTROL,
+            super::EDIT_MACHINE_SPOTLIGHT_NOINDEX,
+        ] {
+            assert_eq!(
+                super::application_timing(key),
+                Some("Applies on the next package pass, or Apply now")
+            );
+            assert!(!super::application_has_live_effect(key));
+        }
         for key in [
             super::EDIT_ALLOW_KITTY_FILE_TRANSFER,
             super::EDIT_TEMPORAL_RECORDING,
@@ -7292,12 +7386,16 @@ listen = \"127.0.0.1:7777\" # local only
     /// spelling the config loader accepts — the loader mappings are tested in app_config).
     #[test]
     fn enum_domain_keys_classify_and_round_trip_canonical() {
-        let cases: [(&str, &[&str]); 5] = [
+        let cases: [(&str, &[&str]); 6] = [
             (EDIT_CURSOR_STYLE, super::CURSOR_STYLES),
             (super::EDIT_WINDOW_THEME, super::WINDOW_THEMES),
             (super::EDIT_BIDI, super::BIDI_MODES),
             (super::EDIT_AMBIGUOUS_WIDTH, super::AMBIGUOUS_WIDTHS),
             (super::EDIT_TRAIL_SOUND_STYLE, super::TRAIL_SOUND_STYLES),
+            (
+                super::EDIT_MACHINE_UNIVERSAL_CONTROL,
+                super::UNIVERSAL_CONTROL_POLICIES,
+            ),
         ];
         for (key, opts) in cases {
             match super::edit_kind(key) {
@@ -7306,10 +7404,18 @@ listen = \"127.0.0.1:7777\" # local only
             }
             for &o in opts {
                 let out = apply_prefs_edits("", &[(key, set(o))]).unwrap();
+                // A dotted key (`machine.universal_control`) writes its leaf under
+                // its table header; a top-level key writes itself.
+                let (table, leaf) = key
+                    .rsplit_once('.')
+                    .map_or((None, key), |(t, l)| (Some(t), l));
                 assert!(
-                    out.contains(&format!("{key} = \"{o}\"")),
+                    out.contains(&format!("{leaf} = \"{o}\"")),
                     "{key}={o} writes its canonical string: {out}"
                 );
+                if let Some(table) = table {
+                    assert!(out.contains(&format!("[{table}]")), "{key}={o}: {out}");
+                }
             }
         }
     }
@@ -7970,6 +8076,19 @@ listen = \"127.0.0.1:7777\" # local only
             })
         );
         assert_eq!(seed(EDIT_LIGATURES).as_deref(), Some("true"));
+        // The [machine] rows follow the same law: the Enum seeds the configured
+        // raw value (blank — "off" is the placeholder, never authored by a
+        // default), the Bool seeds its resolved default.
+        assert_eq!(seed(super::EDIT_MACHINE_UNIVERSAL_CONTROL), None);
+        assert_eq!(
+            seed(super::EDIT_MACHINE_SPOTLIGHT_NOINDEX).as_deref(),
+            Some("true")
+        );
+        let placeholder = fields
+            .iter()
+            .find(|f| f.key == super::EDIT_MACHINE_UNIVERSAL_CONTROL)
+            .map(|f| f.placeholder.as_str());
+        assert_eq!(placeholder, Some("off"));
     }
 
     /// Every numeric control must be DELIBERATELY classified as either a bounded slider

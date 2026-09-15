@@ -566,6 +566,49 @@ impl SessionFabric {
 const FABRIC_ABSENT: u8 = 0;
 const FABRIC_CONNECTED: u8 = 1;
 const FABRIC_DISCONNECTED: u8 = 2;
+/// A bridge is ATTACHED (both lanes served, the process alive) but its own link
+/// to the broker is DOWN — the dial failed, the broker closed on it, or an ack
+/// never came. The state a killed broker, a wrong socket path and a wedged
+/// broker all produce, and the one `connected` used to hide (measured
+/// 2026-09-12: a bridge pointed at a socket nothing served reported
+/// `connected` for as long as it lived). See [`link_report`].
+const FABRIC_STALLED: u8 = 3;
+
+/// The reason token the link carries between a bridge's attach and its first
+/// report: no dial has been answered yet, one way or the other.
+const LINK_STARTING: &str = "starting";
+/// The reason [`bridge_lost`] stamps: the bridge itself is gone, so its link is
+/// by definition not up.
+const LINK_BRIDGE_LOST: &str = "bridge-lost";
+/// The most bytes a `link down reason=` token is kept at.
+const LINK_REASON_MAX: usize = 32;
+
+/// What the bridge last said about ITS broker link — the record behind
+/// `status`'s `fabric_rtt_ms=` / `fabric_link_age_ms=` and `fabric status`'s
+/// `reason=`.
+///
+/// NO HEARTBEAT. The bridge sends a `link` record on every change and after an
+/// ack that moved the round trip by more than 2x (and, so the age stays honest on
+/// a busy link, after an ack at most once per 2 s otherwise); a quiet link sends
+/// nothing, and `acked_at` simply ages. That is the design's rule (§7 forbids a
+/// heartbeat storm): the endpoint reports what the bridge OBSERVED, and how long
+/// ago, and never infers liveness from silence.
+struct LinkReport {
+    /// Whether the last report said the link was up.
+    up: bool,
+    /// The last `down` reason, or [`LINK_STARTING`] / [`LINK_BRIDGE_LOST`].
+    /// Empty while up.
+    reason: String,
+    /// The round trip of the last acknowledged exchange, in ms.
+    rtt_ms: Option<u64>,
+    /// When that ack was reported.
+    acked_at: Option<std::time::Instant>,
+    /// Whether THIS incarnation has ever sent a `link` record. A bridge from
+    /// before the link report (0.85 and earlier) never does, and for one the
+    /// endpoint takes a delivery or a landing as the evidence it is — see
+    /// [`link_evidence`].
+    reported: bool,
+}
 
 /// The instance's view of its bridge. Process-global because the bridge is
 /// per-INSTANCE, not per-session: one child, one pair of inherited fds, whatever
@@ -621,6 +664,11 @@ struct FabricLink {
     /// forever and a supervisor that has run is a bridge that can come back. See
     /// [`fabric_wait_refusal`].
     supervised: AtomicBool,
+    /// The bridge's last word on its broker link. WRITTEN ONLY under
+    /// `generation`, like `state`, because a report and an attach/loss must not
+    /// interleave: a `link up` from a ghost lane landing between a newer attach's
+    /// compare and its store is the exact shape [`BridgeGeneration`] closes.
+    link: Mutex<LinkReport>,
 }
 
 static LINK: FabricLink = FabricLink {
@@ -628,7 +676,36 @@ static LINK: FabricLink = FabricLink {
     generation: Mutex::new(0),
     touched: Mutex::new(BTreeMap::new()),
     supervised: AtomicBool::new(false),
+    link: Mutex::new(LinkReport {
+        up: false,
+        reason: String::new(),
+        rtt_ms: None,
+        acked_at: None,
+        reported: false,
+    }),
 };
+
+thread_local! {
+    /// The [`BridgeGeneration`] the CURRENT THREAD's bridge lane was served
+    /// under, set by `control::serve_bridge` for the life of that lane. A
+    /// `link` report is accepted only for the generation that owns the link,
+    /// and the dispatch — which has the verb line and the registry, but not the
+    /// lane — reads it from here. `None` on any other thread (a test calling the
+    /// handler directly, an Owner connection that is refused before it gets
+    /// here).
+    static LANE_GENERATION: std::cell::Cell<Option<BridgeGeneration>> =
+        const { std::cell::Cell::new(None) };
+}
+
+/// Record, for this thread, which bridge incarnation it is serving a lane of.
+pub(crate) fn set_lane_generation(generation: BridgeGeneration) {
+    LANE_GENERATION.with(|g| g.set(Some(generation)));
+}
+
+/// The generation the calling thread's bridge lane belongs to, if it is one.
+pub(crate) fn lane_generation() -> Option<BridgeGeneration> {
+    LANE_GENERATION.with(std::cell::Cell::get)
+}
 
 /// One registry's governed sids, held under [`FabricLink::touched`].
 ///
@@ -679,7 +756,7 @@ const TOUCHED_PRUNE_AT: usize = 1024;
 /// short-circuited with `ERR fabric disconnected` for every message the live
 /// bridge went on to publish.
 ///
-/// This is the link-state analogue of the hold's `converge_hold`/`reconcile_halt`
+/// This is the link-state analogue of the hold's `converge_hold`/`apply_fleet_halts`
 /// (`aterm-link/src/bridge.rs`), which fixed the same interleaving for the HOLD
 /// half only. A generation is the cheaper answer here because, unlike the hold,
 /// `fabric=` has no external source of truth to reconcile against.
@@ -735,8 +812,37 @@ pub(crate) fn fabric_state() -> &'static str {
     match LINK.state.load(Ordering::Relaxed) {
         FABRIC_CONNECTED => "connected",
         FABRIC_DISCONNECTED => "disconnected",
+        FABRIC_STALLED => "stalled",
         _ => "absent",
     }
+}
+
+/// The link's three reported facts, as `status` and `fabric status` print them:
+/// `(reason, rtt_ms, link_age_ms)` — `reason` is `-` while the link is up or no
+/// bridge has attached, and the two numbers are `None` before the first ack.
+///
+/// The age is computed at READ time from the ack's own instant, so two readers a
+/// second apart see it grow by a second whether or not the bridge said anything
+/// in between — which is the whole point of carrying an age rather than a flag.
+pub(crate) fn fabric_link_facts() -> (String, Option<u64>, Option<u64>) {
+    let link = LINK.link.lock().unwrap_or_else(|p| p.into_inner());
+    let reason = if link.up || link.reason.is_empty() {
+        "-".to_string()
+    } else {
+        link.reason.clone()
+    };
+    let age = link
+        .acked_at
+        .map(|t| u64::try_from(t.elapsed().as_millis()).unwrap_or(u64::MAX));
+    (reason, link.rtt_ms, age)
+}
+
+/// The tail `status` appends after `fabric=`: `fabric_rtt_ms=<n|->
+/// fabric_link_age_ms=<n|->`.
+pub(crate) fn fabric_status_tail() -> String {
+    let (_, rtt, age) = fabric_link_facts();
+    let n = |v: Option<u64>| v.map_or_else(|| "-".to_string(), |n| n.to_string());
+    format!("fabric_rtt_ms={} fabric_link_age_ms={}", n(rtt), n(age))
 }
 
 /// A bridge connection has been served. Called from the control server as it
@@ -761,13 +867,219 @@ pub(crate) fn fabric_state() -> &'static str {
 /// not be able to store it AGAIN after its sibling's death already reported the
 /// link lost. Either fd closing means the link is gone (§11.2), and a halt a
 /// racing attach lifts is not a halt.
+///
+/// AN ATTACH IS `stalled`, NOT `connected`. A served lane proves a bridge
+/// PROCESS exists; whether that process can reach a broker is the bridge's to
+/// report, and it has not yet. Storing `connected` here was the measured lie
+/// (a bridge pointed at a socket nothing served stayed `connected` for life),
+/// so the link starts down with reason [`LINK_STARTING`] and the bridge's own
+/// `link up` ([`link_report`]) moves it — which, for a broker that answers, is
+/// milliseconds after this call — or, for a bridge that never reports, its
+/// first delivery or landing does ([`link_evidence`]).
 pub(crate) fn bridge_attached(generation: BridgeGeneration) {
     let mut owner = LINK.generation.lock().unwrap_or_else(|p| p.into_inner());
     if generation.0 <= *owner {
         return;
     }
     *owner = generation.0;
+    {
+        let mut link = LINK.link.lock().unwrap_or_else(|p| p.into_inner());
+        link.up = false;
+        link.reason = LINK_STARTING.to_string();
+        // A NEW incarnation has no ack to its name. The old one's numbers are
+        // history, and `fabric_rtt_ms=-` on a fresh attach is the truth.
+        link.rtt_ms = None;
+        link.acked_at = None;
+        link.reported = false;
+    }
+    LINK.state.store(FABRIC_STALLED, Ordering::Relaxed);
+}
+
+/// A BRIDGE THAT NEVER REPORTS ITS LINK IS READ BY WHAT IT DOES. Called from
+/// the two bridge verbs that can only follow a broker exchange — `deliver`
+/// (a record fetched from the bus) and `outbox sent` / `deliver landed=` (a
+/// publish the broker acknowledged). While the attached incarnation has sent
+/// no `link` record at all (`reported == false`: a bridge from before the
+/// report, 0.85 and earlier), such a verb is the proof its link is up, and
+/// `fabric=` moves to `connected` with no round trip (`fabric_rtt_ms=-`) and
+/// the verb's arrival as the ack.
+///
+/// Measured 2026-09-14 (the round-13 review): the installed 0.85.0 bridge
+/// under this endpoint read `stalled reason=starting` for life while its mail
+/// flowed, every `post --wait` from its sessions failed at once with `ERR
+/// fabric stalled`, and `aterm fabric on` could not arm it. Once an
+/// incarnation HAS reported, its word stands and this does nothing: a bridge
+/// that said `down` is down, whatever else it manages to do.
+///
+/// Under the generation lock like every other writer of `state`, and only for
+/// the explicit incarnation that owns the link: an unscoped or ghost lane's
+/// delivery proves nothing about the live bridge.
+pub(crate) fn link_evidence(generation: Option<BridgeGeneration>) {
+    // A SIBLING TEST'S `deliver` SPEAKS FOR NO BRIDGE (see [`LINK_SECTION`]).
+    #[cfg(test)]
+    if link_write_is_foreign() {
+        return;
+    }
+    let owner = LINK.generation.lock().unwrap_or_else(|p| p.into_inner());
+    if !generation.is_some_and(|g| g.0 == *owner) || *owner == 0 {
+        return;
+    }
+    if LINK.state.load(Ordering::Relaxed) != FABRIC_STALLED {
+        return;
+    }
+    let mut link = LINK.link.lock().unwrap_or_else(|p| p.into_inner());
+    if link.reported || link.reason != LINK_STARTING {
+        return;
+    }
+    link.up = true;
+    link.reason.clear();
+    link.rtt_ms = None;
+    link.acked_at = Some(std::time::Instant::now());
     LINK.state.store(FABRIC_CONNECTED, Ordering::Relaxed);
+}
+
+/// THE BRIDGE'S REPORT OF ITS BROKER LINK — the `link` verb's handler, and
+/// the writer of `fabric=connected` for every bridge that reports (the one
+/// other writer, [`link_evidence`], speaks only for a bridge that never has).
+///
+/// Accepted only from an explicit incarnation that OWNS the link (`generation` is the
+/// lane's, read from [`lane_generation`] by the dispatch), and never once that
+/// incarnation's guard has fired: either fd closing means the link is gone
+/// (§11.2), and a `link up` still in flight on the surviving lane must not
+/// resurrect it. Both checks and the store happen under the generation lock,
+/// for the reason [`bridge_lost`] gives.
+///
+/// A transition to DOWN wakes every parked `post --wait` on every session the
+/// registry holds — the same sweep [`bridge_lost`] makes, for the same reason:
+/// a waiter re-reads [`fabric_state`] only when it is signalled, and a link that
+/// stalls under a parked waiter would otherwise cost it its whole timeout for a
+/// landing the bridge already knows cannot be reported. The FIRST report of a
+/// fresh attach counts as a transition too when it is `down`: a waiter parked
+/// under `reason=starting` ([`wait_is_futile`]) has to hear that the dial
+/// failed.
+///
+/// `true` when the report was applied; `false` for unscoped, stale or already
+/// disconnected incarnations.
+pub(crate) fn link_report(
+    store: &Store,
+    generation: Option<BridgeGeneration>,
+    up: bool,
+    reason: &str,
+    rtt_ms: Option<u64>,
+) -> bool {
+    let went_down = {
+        let owner = LINK.generation.lock().unwrap_or_else(|p| p.into_inner());
+        if !generation.is_some_and(|g| g.0 == *owner) || *owner == 0 {
+            return false;
+        }
+        if LINK.state.load(Ordering::Relaxed) == FABRIC_DISCONNECTED {
+            return false;
+        }
+        let mut link = LINK.link.lock().unwrap_or_else(|p| p.into_inner());
+        let was_up = link.up;
+        let was_starting = link.reason == LINK_STARTING;
+        link.up = up;
+        link.reported = true;
+        if up {
+            link.reason.clear();
+            link.rtt_ms = rtt_ms;
+            link.acked_at = Some(std::time::Instant::now());
+        } else {
+            link.reason = reason.to_string();
+            if rtt_ms.is_some() {
+                link.rtt_ms = rtt_ms;
+            }
+        }
+        LINK.state.store(
+            if up { FABRIC_CONNECTED } else { FABRIC_STALLED },
+            Ordering::Relaxed,
+        );
+        (was_up || was_starting) && !up
+    };
+    if went_down {
+        wake_parked(store);
+    }
+    true
+}
+
+const LINK_USAGE: &str = "ERR usage: link up rtt=<ms> | link down reason=<token> [rtt=<ms>]\n";
+
+/// `link up rtt=<ms>` / `link down reason=<token> [rtt=<ms>]`, from the bridge
+/// lane whose generation `generation` is. See [`link_report`].
+pub(crate) fn cmd_link(store: &Store, rest: &str, generation: Option<BridgeGeneration>) -> String {
+    let mut toks = rest.split_whitespace();
+    let up = match toks.next() {
+        Some("up") => true,
+        Some("down") => false,
+        _ => return LINK_USAGE.to_string(),
+    };
+    let mut rtt: Option<u64> = None;
+    let mut reason: Option<String> = None;
+    for tok in toks {
+        if let Some(v) = kv(tok, "rtt") {
+            match v.parse::<u64>() {
+                Ok(n) => rtt = Some(n),
+                Err(_) => return LINK_USAGE.to_string(),
+            }
+        } else if let Some(v) = kv(tok, "reason") {
+            reason = Some(link_reason_token(v));
+        } else {
+            return LINK_USAGE.to_string();
+        }
+    }
+    if up && (rtt.is_none() || reason.is_some()) {
+        return LINK_USAGE.to_string();
+    }
+    let reason = match (up, reason) {
+        (true, _) => String::new(),
+        (false, Some(r)) => r,
+        (false, None) => return LINK_USAGE.to_string(),
+    };
+    if link_report(store, generation, up, &reason, rtt) {
+        "OK\n".to_string()
+    } else {
+        "OK stale=1\n".to_string()
+    }
+}
+
+/// A `link down reason=` token, kept to the shape every reader prints
+/// verbatim: lowercase ASCII letters, digits and `-`, at most
+/// [`LINK_REASON_MAX`] bytes, never empty.
+fn link_reason_token(raw: &str) -> String {
+    let out: String = raw
+        .chars()
+        .filter(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || *c == '-')
+        .take(LINK_REASON_MAX)
+        .collect();
+    if out.is_empty() {
+        "unknown".to_string()
+    } else {
+        out
+    }
+}
+
+/// Wake every parked `post --wait` and `await inbox` on every live session of
+/// `store`, so each re-reads [`fabric_state`].
+///
+/// Ctxs are cloned out from under the registry guard first: the fabric lock is
+/// a leaf and is never taken while the store is held. Each condvar is signalled
+/// UNDER its session's own fabric lock, after the caller's state store. A `post
+/// --wait` reads `fabric_state()` while holding that lock and releases it only
+/// inside `wait_timeout`, so mutual exclusion gives the whole property: either
+/// this lock waits until the waiter is parked (and the signal reaches it), or it
+/// wins the lock first — in which case the waiter's next read already sees the
+/// new state. A `notify_all` outside the lock is the classic lost wakeup, and
+/// losing this one costs the caller its entire `--wait`.
+fn wake_parked(store: &Store) {
+    let parked: Vec<_> = {
+        let g = store.read().unwrap_or_else(|p| p.into_inner());
+        g.live_handles().map(|h| h.ctx.clone()).collect()
+    };
+    for ctx in &parked {
+        let guard = ctx.fabric.lock();
+        ctx.fabric.changed.notify_all();
+        drop(guard);
+    }
 }
 
 /// Record that the bridge has governed this session — the membership test
@@ -853,6 +1165,12 @@ pub(crate) fn bridge_lost(store: &Store, generation: BridgeGeneration) -> usize 
         let owner = LINK.generation.lock().unwrap_or_else(|p| p.into_inner());
         if *owner == generation.0 {
             LINK.state.store(FABRIC_DISCONNECTED, Ordering::Relaxed);
+            // The link goes with the bridge. The last rtt and its age are kept
+            // — they are history, and `fabric_link_age_ms=` growing past the
+            // loss is the honest shape — but nothing about them is `up`.
+            let mut link = LINK.link.lock().unwrap_or_else(|p| p.into_inner());
+            link.up = false;
+            link.reason = LINK_BRIDGE_LOST.to_string();
         }
     }
     // EVERY registry's sids, not just this store's. Each one is looked up in
@@ -896,26 +1214,9 @@ pub(crate) fn bridge_lost(store: &Store, generation: BridgeGeneration) -> usize 
     // (§11.2 deviation 9) exists to avoid. The waiter re-reads `fabric_state()`
     // on each wake and answers `ERR fabric disconnected id=<n> queued=1` instead
     // — see [`fabric_wait_refusal`] for why the queued token is not decoration.
-    //
-    // Ctxs are cloned out from under the registry guard first: the fabric lock is
-    // a leaf and is never taken while the store is held.
-    let parked: Vec<_> = {
-        let g = store.read().unwrap_or_else(|p| p.into_inner());
-        g.live_handles().map(|h| h.ctx.clone()).collect()
-    };
-    for ctx in &parked {
-        // Signalled UNDER the session's own fabric lock, and after the state
-        // store above. A `post --wait` reads `fabric_state()` while holding that
-        // lock and releases it only inside `wait_timeout`, so mutual exclusion
-        // gives the whole property: either this lock waits until the waiter is
-        // parked (and the signal reaches it), or it wins the lock first — in
-        // which case the waiter's next read of `fabric_state()` already sees
-        // `disconnected`. A `notify_all` outside the lock is the classic lost
-        // wakeup, and losing this one costs the caller its entire `--wait`.
-        let guard = ctx.fabric.lock();
-        ctx.fabric.changed.notify_all();
-        drop(guard);
-    }
+    // The same sweep, for the same reason, runs when the bridge reports its
+    // link DOWN ([`link_report`]); the lock discipline is on [`wake_parked`].
+    wake_parked(store);
     held
 }
 
@@ -1325,6 +1626,42 @@ fn apply_hold(ctx: &SessionCtx, hold: Option<Hold>, issuer: HoldIssuer) -> Appli
     }
 }
 
+/// **THE LINK SECTION'S OWN THREAD**, test-only — `None` while no
+/// [`with_link_reset`] section is running.
+///
+/// [`with_link_reset`] serializes every test that MOVES the link, and that was
+/// not enough: [`link_evidence`] is reached from `deliver` and `outbox sent`,
+/// which sibling tests call OUTSIDE that mutex, and in a test there is no
+/// serving lane — so `lane_generation()` is `None`, which is exactly the shape
+/// `link_evidence`'s own gate accepts ("a bridge from before the report"). Such
+/// a call found the SECTION's fresh attach (`stalled reason=starting`, a
+/// non-zero owner) and flipped it to `connected` under the test that was
+/// measuring it.
+///
+/// Measured on the 0.86 candidate, 2026-09-14: `-p aterm-gui` went red about
+/// one run in three with the victim varying by schedule
+/// (`a_ghost_lanes_link_report_is_dropped_and_a_lost_bridge_stays_lost`,
+/// `a_waiter_parked_under_starting_is_woken_by_the_first_down_report`,
+/// `review_an_old_bridge_that_delivers_mail_reads_connected`), green every
+/// time under `--test-threads=1`; an `eprintln` in `link_evidence`'s store
+/// named the flipping thread as a sibling test's each time. So the link's
+/// state is writable only from INSIDE the section, and only by the thread
+/// that owns it — the sibling's `deliver` still delivers, it just no longer
+/// speaks for a bridge it did not attach.
+#[cfg(test)]
+static LINK_SECTION: Mutex<Option<std::thread::ThreadId>> = Mutex::new(None);
+
+/// True when a [`with_link_reset`] section is live on ANOTHER thread, so this
+/// caller's write to the link would land inside someone else's measurement.
+/// Test-only; production has one bridge and one instance.
+#[cfg(test)]
+fn link_write_is_foreign() -> bool {
+    LINK_SECTION
+        .lock()
+        .unwrap_or_else(|p| p.into_inner())
+        .is_some_and(|owner| owner != std::thread::current().id())
+}
+
 /// Run `f` with the process-wide bridge link RESET to "never launched", and reset
 /// it again on the way out — on an unwind too, through the guard's `Drop`.
 ///
@@ -1341,6 +1678,13 @@ pub(crate) fn with_link_reset<T>(f: impl FnOnce() -> T) -> T {
         LINK.state.store(FABRIC_ABSENT, Ordering::Relaxed);
         LINK.supervised.store(false, Ordering::Relaxed);
         *LINK.generation.lock().unwrap_or_else(|p| p.into_inner()) = 0;
+        {
+            let mut link = LINK.link.lock().unwrap_or_else(|p| p.into_inner());
+            link.up = false;
+            link.reason.clear();
+            link.rtt_ms = None;
+            link.acked_at = None;
+        }
         LINK.touched
             .lock()
             .unwrap_or_else(|p| p.into_inner())
@@ -1378,6 +1722,9 @@ pub(crate) fn with_link_reset<T>(f: impl FnOnce() -> T) -> T {
                 LINK_TESTS.try_lock().is_err(),
                 "the link reset ran outside the lock that serializes it"
             );
+            // Released BEFORE the reset and while the lock is still held, so no
+            // window exists in which the state is live and unowned.
+            *LINK_SECTION.lock().unwrap_or_else(|p| p.into_inner()) = None;
             reset_now();
         }
     }
@@ -1385,6 +1732,7 @@ pub(crate) fn with_link_reset<T>(f: impl FnOnce() -> T) -> T {
     let _section = Section {
         _lock: LINK_TESTS.lock().unwrap_or_else(|p| p.into_inner()),
     };
+    *LINK_SECTION.lock().unwrap_or_else(|p| p.into_inner()) = Some(std::thread::current().id());
     reset_now();
     f()
 }
@@ -1536,6 +1884,7 @@ pub(crate) fn cmd_deliver(store: &Store, rest: &str) -> String {
     };
     let rest_toks: Vec<&str> = toks.collect();
     note_bridge_touched(store, sid);
+    link_evidence(lane_generation());
     if rest_toks.iter().any(|t| t.starts_with("landed=")) {
         return deliver_landed(&ctx, &rest_toks);
     }
@@ -1771,6 +2120,7 @@ pub(crate) fn cmd_outbox_sent(store: &Store, rest: &str) -> String {
         }
     };
     note_bridge_touched(store, sid);
+    link_evidence(lane_generation());
     match retire_post(&ctx, post_id, off, reason) {
         Ok(()) => "OK\n".to_string(),
         Err(e) => e,
@@ -2474,7 +2824,11 @@ pub(crate) fn cmd_post(ctx: &SessionCtx, rest: &str, body: Option<Vec<u8>>) -> S
     };
     // Waiting for a landing that nothing can report is a guaranteed timeout, so
     // say so at once and name the id: the post IS queued, and `inbox` lists it.
-    if fabric_state() != "connected" {
+    // `stalled` is refused here exactly like `disconnected`: the bridge has
+    // said its broker link is down, and a wait on it would burn its whole
+    // timeout for an ack the bridge itself is not getting. `stalled` with
+    // NOTHING said yet is not that — see [`wait_is_futile`].
+    if wait_is_futile() {
         return fabric_wait_refusal(id);
     }
     let deadline = std::time::Instant::now()
@@ -2507,7 +2861,7 @@ pub(crate) fn cmd_post(ctx: &SessionCtx, rest: &str, body: Option<Vec<u8>>) -> S
         // alone left that caller sitting out its whole `--wait` (up to
         // `WAIT_MAX_MS` = 600 s) for the `ERR timeout` the check exists to
         // replace. `bridge_lost` wakes every registered session so this runs.
-        if fabric_state() != "connected" {
+        if wait_is_futile() {
             return fabric_wait_refusal(id);
         }
         let now = std::time::Instant::now();
@@ -2552,6 +2906,31 @@ pub(crate) fn cmd_post(ctx: &SessionCtx, rest: &str, body: Option<Vec<u8>>) -> S
 /// seconds before the FIRST bridge finishes attaching, where `queued=1` is
 /// exactly right. [`bridge_reachable`] asks the question that actually
 /// distinguishes them: has a supervisor started, or has a bridge ever been up.
+///
+/// `stalled` is always `queued=1`: a bridge IS attached, it is redialing the
+/// broker with back-off, and it drains this same outbox the moment its link
+/// comes up — so `ERR fabric stalled id=<n> queued=1` is "wait, do not re-post",
+/// answered at once rather than after the wait a landing could not end.
+/// Whether a `post --wait` parked now could only time out: no bridge, a
+/// bridge that is gone, or a bridge that has SAID its link is down. A bridge
+/// that is attached and has said nothing yet (`stalled reason=starting`) is
+/// none of those: a round-13 bridge reports within milliseconds either way
+/// and a `down` wakes the waiter ([`link_report`]); a bridge from before the
+/// report never says anything and lands the post all the same, and the
+/// landing itself is what moves the state ([`link_evidence`]). Refusing the
+/// wait on `starting` failed every `ask`/`task` from such a bridge's
+/// sessions at once (measured 2026-09-14).
+fn wait_is_futile() -> bool {
+    match LINK.state.load(Ordering::Relaxed) {
+        FABRIC_CONNECTED => false,
+        FABRIC_STALLED => {
+            let link = LINK.link.lock().unwrap_or_else(|p| p.into_inner());
+            link.reported || link.reason != LINK_STARTING
+        }
+        _ => true,
+    }
+}
+
 fn fabric_wait_refusal(id: u64) -> String {
     let state = fabric_state();
     if bridge_reachable() {
@@ -2693,6 +3072,27 @@ mod inbox_hold {
     /// tests drive the same `ctx.fabric` the dispatch reaches.
     fn registered(store: &Store) -> (String, std::sync::Arc<SessionCtx>) {
         registered_as(store, 1)
+    }
+
+    /// Attach one incarnation AND bring its link up — what a bridge whose
+    /// broker answers does within milliseconds of being served. An attach on
+    /// its own is `stalled` (round 13): the link is the bridge's to report.
+    fn attach_up(store: &Store, generation: BridgeGeneration) {
+        bridge_attached(generation);
+        assert!(link_report(store, Some(generation), true, "", Some(1)));
+    }
+
+    /// Mirror serve_bridge's thread-local identity for one fixture operation.
+    fn on_lane<T>(generation: BridgeGeneration, f: impl FnOnce() -> T) -> T {
+        struct Restore(Option<BridgeGeneration>);
+        impl Drop for Restore {
+            fn drop(&mut self) {
+                LANE_GENERATION.with(|lane| lane.set(self.0));
+            }
+        }
+        let _restore = Restore(lane_generation());
+        set_lane_generation(generation);
+        f()
     }
 
     /// [`registered`] with an explicit `local_id`, for the tests that need two
@@ -3454,6 +3854,12 @@ mod inbox_hold {
             assert_eq!(fabric_state(), "absent");
             let generation = next_bridge_generation();
             bridge_attached(generation);
+            assert_eq!(
+                fabric_state(),
+                "stalled",
+                "attached is not connected: the link is the bridge's to report"
+            );
+            assert!(link_report(&store, Some(generation), true, "", Some(1)));
             assert_eq!(fabric_state(), "connected");
             assert_eq!(deliver(&store, &sid, 7, "h-a", "task", "go"), "OK 1\n");
             assert!(halt_refusal(&ctx, "turn").is_none());
@@ -3472,6 +3878,390 @@ mod inbox_hold {
             // losing the bridge twice is idempotent rather than an escalation.
             assert_eq!(bridge_lost(&store, generation), 1);
             assert!(cmd_inbox(&ctx, "--peek").contains(" hold=1 "));
+        });
+    }
+
+    /// THE LINK IS THE BRIDGE'S TO REPORT (round 13). An attach is `stalled`
+    /// with `reason=starting` and no numbers; `link up rtt=` is the ONLY way to
+    /// `connected` and stamps the ack; `link down reason=` is `stalled` with
+    /// that reason, keeps the last rtt as history, and a `post --wait` under it
+    /// answers `ERR fabric stalled id=<n> queued=1` AT ONCE — measured here
+    /// against a 30 s wait — rather than after the wait a landing could not end.
+    #[test]
+    fn the_link_is_the_bridges_to_report_and_stalled_refuses_a_wait_at_once() {
+        with_link(|| {
+            let store = new_store();
+            let (_sid, ctx) = registered(&store);
+            let generation = next_bridge_generation();
+            bridge_attached(generation);
+            assert_eq!(fabric_state(), "stalled");
+            assert_eq!(
+                fabric_link_facts(),
+                (LINK_STARTING.to_string(), None, None),
+                "before the first report: no ack, no age"
+            );
+            assert_eq!(fabric_status_tail(), "fabric_rtt_ms=- fabric_link_age_ms=-");
+
+            assert_eq!(cmd_link(&store, "up rtt=3", Some(generation)), "OK\n");
+            assert_eq!(fabric_state(), "connected");
+            let (reason, rtt, age) = fabric_link_facts();
+            assert_eq!((reason.as_str(), rtt), ("-", Some(3)));
+            assert!(age.is_some_and(|a| a < 5_000), "a fresh ack: {age:?}");
+            assert!(
+                fabric_status_tail().starts_with("fabric_rtt_ms=3 fabric_link_age_ms="),
+                "{}",
+                fabric_status_tail()
+            );
+            // Connected and nothing lands: the wait runs its course.
+            assert_eq!(
+                cmd_post(&ctx, "to=h-andrew kind=ask --wait=0 up?", None),
+                "ERR timeout id=1\n"
+            );
+
+            assert_eq!(
+                cmd_link(&store, "down reason=refused", Some(generation)),
+                "OK\n"
+            );
+            assert_eq!(fabric_state(), "stalled");
+            let (reason, rtt, _) = fabric_link_facts();
+            assert_eq!(
+                (reason.as_str(), rtt),
+                ("refused", Some(3)),
+                "the reason is the bridge's word; the last rtt is kept as history"
+            );
+            let started = std::time::Instant::now();
+            assert_eq!(
+                cmd_post(&ctx, "to=h-andrew kind=ask --wait=30000 down?", None),
+                "ERR fabric stalled id=2 queued=1\n"
+            );
+            assert!(
+                started.elapsed() < std::time::Duration::from_secs(5),
+                "a stalled wait is refused at once, not after its timeout: {:?}",
+                started.elapsed()
+            );
+
+            // The grammar, and the reason token's shape.
+            for bad in [
+                "",
+                "up",
+                "up rtt=x",
+                "down",
+                "down rtt=1",
+                "sideways",
+                "up rtt=1 reason=x",
+            ] {
+                assert_eq!(
+                    cmd_link(&store, bad, Some(generation)),
+                    LINK_USAGE,
+                    "{bad:?}"
+                );
+            }
+            assert_eq!(
+                cmd_link(&store, "down reason=NO%20ACK", Some(generation)),
+                "OK\n"
+            );
+            assert_eq!(
+                fabric_link_facts().0,
+                "20",
+                "a reason is lowercase ascii, digits and '-' only"
+            );
+            assert_eq!(
+                cmd_link(&store, "down reason=!!!", Some(generation)),
+                "OK\n"
+            );
+            assert_eq!(fabric_link_facts().0, "unknown");
+        });
+    }
+
+    /// A REPORT FROM A GHOST LANE IS DROPPED, and a lost bridge cannot be talked
+    /// back to life by a report still in flight. The generation gate that keeps a
+    /// dead incarnation's guard from reporting the live one disconnected keeps
+    /// its `link up` from reporting the live one's link, too — and once either
+    /// lane's guard has fired, `disconnected` outranks anything the other lane
+    /// still says (§11.2: either fd closing is the link lost).
+    #[test]
+    fn a_ghost_lanes_link_report_is_dropped_and_a_lost_bridge_stays_lost() {
+        with_link(|| {
+            let store = new_store();
+            let (_sid, _ctx) = registered(&store);
+            let first = next_bridge_generation();
+            attach_up(&store, first);
+            let second = next_bridge_generation();
+            bridge_attached(second);
+            assert_eq!(
+                fabric_state(),
+                "stalled",
+                "the replacement has not reported yet"
+            );
+            assert_eq!(
+                cmd_link(&store, "up rtt=1", Some(first)),
+                "OK stale=1\n",
+                "a ghost's report is dropped"
+            );
+            assert_eq!(fabric_state(), "stalled");
+            assert_eq!(cmd_link(&store, "up rtt=1", None), "OK stale=1\n");
+            let (other_sid, _) = registered_as(&store, 2);
+            assert_eq!(
+                deliver(
+                    &store,
+                    &other_sid,
+                    1,
+                    "s-peer",
+                    "note",
+                    "unscoped%20fixture"
+                ),
+                "OK 1\n"
+            );
+            assert_eq!(
+                fabric_state(),
+                "stalled",
+                "an unrelated unscoped delivery cannot supply this bridge's link evidence"
+            );
+            assert_eq!(cmd_link(&store, "up rtt=2", Some(second)), "OK\n");
+            assert_eq!(fabric_state(), "connected");
+
+            assert_eq!(
+                bridge_lost(&store, second),
+                1,
+                "the delivered fixture session is governed"
+            );
+            assert_eq!(fabric_state(), "disconnected");
+            assert_eq!(fabric_link_facts().0, LINK_BRIDGE_LOST);
+            assert_eq!(
+                cmd_link(&store, "up rtt=2", Some(second)),
+                "OK stale=1\n",
+                "a report after the guard fired cannot resurrect the link"
+            );
+            assert_eq!(fabric_state(), "disconnected");
+
+            // A lane with no generation at all (nothing served) reports nothing.
+            assert_eq!(cmd_link(&store, "up rtt=2", None), "OK stale=1\n");
+        });
+    }
+
+    fn link_generation_admission_model() -> aterm_spec::derive::Model {
+        aterm_spec::ty_model! {
+            FabricLinkGenerationAdmission {
+                const Buggy = 0;
+                var owner = 2;
+                var actor = 0;
+                var lost = 0;
+                var accepted = 0;
+                action PickCurrent when (actor == 0 && accepted == 0) { actor = 2; }
+                action PickStale when (actor == 0 && accepted == 0) { actor = 1; }
+                action Lose when (lost == 0) { lost = 1; accepted = 0; }
+                action Connect when (accepted == 0 && lost == 0 && owner > 0 &&
+                    (actor == owner || (Buggy == 1 && actor == 0))) { accepted = 1; }
+                invariant ExplicitLiveOwnerOnly:
+                    accepted == 0 || (actor == owner && actor > 0 && lost == 0);
+            }
+        }
+    }
+
+    #[test]
+    fn link_generation_admission_proves_and_catches_unscoped_evidence() {
+        aterm_spec::verify::prove_and_catch_scalar(
+            &link_generation_admission_model(),
+            "fabric link generation admission",
+        );
+    }
+
+    #[test]
+    fn link_reports_and_legacy_evidence_require_the_explicit_live_owner() {
+        with_link(|| {
+            let store = new_store();
+            let model = link_generation_admission_model();
+            for lost in [false, true] {
+                for actor in 0..=2 {
+                    for report in [false, true] {
+                        let stale = next_bridge_generation();
+                        let current = next_bridge_generation();
+                        bridge_attached(current);
+                        if lost {
+                            bridge_lost(&store, current);
+                        }
+                        let generation = match actor {
+                            0 => None,
+                            1 => Some(stale),
+                            _ => Some(current),
+                        };
+                        let mut state = model.init_state();
+                        state.insert("actor", actor);
+                        state.insert("lost", i64::from(lost));
+                        let admitted = model.action_enabled("Connect", &state);
+                        if report {
+                            assert_eq!(
+                                link_report(&store, generation, true, "", Some(2)),
+                                admitted
+                            );
+                        } else {
+                            link_evidence(generation);
+                        }
+                        assert_eq!(
+                            fabric_state() == "connected",
+                            admitted,
+                            "report={report}, {state:?}"
+                        );
+                        if lost {
+                            assert_eq!(fabric_state(), "disconnected");
+                        }
+                        if actor == 0 && !lost {
+                            // Historical is_some_and(mismatch) treated None as authority.
+                            assert!(!generation.is_some_and(|g| g.0 != current.0));
+                            state.insert("accepted", 1);
+                            assert!(!model.check_invariant("ExplicitLiveOwnerOnly", &state));
+                        }
+                    }
+                }
+            }
+        });
+    }
+
+    /// A BRIDGE THAT NEVER REPORTS ITS LINK IS READ BY WHAT IT DOES (the
+    /// round-13 review's finding 1). Both lanes of a 0.85 bridge attach and
+    /// no `link` record ever comes; its first delivery moves the endpoint to
+    /// `connected` with no round trip and the delivery as the ack, and a
+    /// `post --wait` under `stalled reason=starting` PARKS (here: runs its
+    /// zero-length wait to `ERR timeout`) rather than failing fast. A bridge
+    /// that HAS reported `down` is not moved by a delivery — its word stands —
+    /// and a wait under it fails fast as before.
+    #[test]
+    fn review_an_old_bridge_that_delivers_mail_reads_connected() {
+        with_link(|| {
+            let store = new_store();
+            let (sid, ctx) = registered(&store);
+            let generation = next_bridge_generation();
+            bridge_attached(generation);
+            bridge_attached(generation);
+            assert_eq!(fabric_state(), "stalled");
+            assert_eq!(fabric_link_facts().0, LINK_STARTING);
+            assert_eq!(
+                cmd_post(&ctx, "to=h-andrew kind=ask --wait=0 up?", None),
+                "ERR timeout id=1\n",
+                "under `starting` the wait parks and runs its course; it is not refused"
+            );
+            let delivered = on_lane(generation, || {
+                deliver(&store, &sid, 3, "s-peer", "note", "hi")
+            });
+            assert!(delivered.starts_with("OK"), "{delivered}");
+            assert_eq!(fabric_state(), "connected");
+            let (reason, rtt, age) = fabric_link_facts();
+            assert_eq!(
+                (reason.as_str(), rtt),
+                ("-", None),
+                "no round trip was ever reported; the delivery is the ack"
+            );
+            assert!(age.is_some_and(|a| a < 5_000), "{age:?}");
+            let tail = fabric_status_tail();
+            assert!(
+                tail.starts_with("fabric_rtt_ms=- fabric_link_age_ms=")
+                    && !tail.ends_with("fabric_link_age_ms=-"),
+                "{tail}"
+            );
+
+            // A REPORTED link is the bridge's word, whatever it delivers.
+            assert_eq!(
+                cmd_link(&store, "down reason=closed", Some(generation)),
+                "OK\n"
+            );
+            assert_eq!(fabric_state(), "stalled");
+            let delivered = on_lane(generation, || {
+                deliver(&store, &sid, 4, "s-peer", "note", "again")
+            });
+            assert!(delivered.starts_with("OK"), "{delivered}");
+            assert_eq!(fabric_state(), "stalled");
+            assert_eq!(
+                cmd_post(&ctx, "to=h-andrew kind=ask --wait=0 up?", None),
+                "ERR fabric stalled id=2 queued=1\n"
+            );
+            // And a fresh attach (a relaunched bridge) starts over: unreported.
+            let next = next_bridge_generation();
+            bridge_attached(next);
+            assert_eq!(fabric_state(), "stalled");
+            assert_eq!(fabric_link_facts().0, LINK_STARTING);
+            let delivered = on_lane(next, || deliver(&store, &sid, 5, "s-peer", "note", "third"));
+            assert!(delivered.starts_with("OK"), "{delivered}");
+            assert_eq!(fabric_state(), "connected");
+        });
+    }
+
+    /// A WAITER PARKED UNDER `starting` HEARS THE FIRST REPORT when it is a
+    /// `down`: the dial failed, and the wait would otherwise sit out its
+    /// whole timeout under a state that was never going to land its post.
+    #[test]
+    fn a_waiter_parked_under_starting_is_woken_by_the_first_down_report() {
+        with_link(|| {
+            let store = new_store();
+            let (_sid, ctx) = registered(&store);
+            let generation = next_bridge_generation();
+            bridge_attached(generation);
+            assert_eq!(fabric_link_facts().0, LINK_STARTING);
+            let poster = {
+                let ctx = ctx.clone();
+                std::thread::spawn(move || {
+                    cmd_post(
+                        &ctx,
+                        "to=@s-peer kind=ask --wait=600000 which branch?",
+                        None,
+                    )
+                })
+            };
+            for spin in 0.. {
+                assert!(spin < 5_000_000, "the post never reached the outbox");
+                if cmd_inbox(&ctx, "--peek").contains("post 1 ") {
+                    break;
+                }
+                std::thread::yield_now();
+            }
+            assert_eq!(
+                cmd_link(&store, "down reason=no-socket", Some(generation)),
+                "OK\n"
+            );
+            assert_eq!(
+                poster.join().expect("the poster thread"),
+                "ERR fabric stalled id=1 queued=1\n",
+                "the first report, a down, must wake a waiter parked under starting"
+            );
+        });
+    }
+
+    /// A PARKED WAITER WAKES WHEN THE LINK STALLS — the `link down` twin of
+    /// `a_parked_post_learns_the_bridge_died_rather_than_timing_out`, for a
+    /// session the bridge never touched.
+    #[test]
+    fn a_parked_post_learns_the_link_stalled_rather_than_timing_out() {
+        with_link(|| {
+            let store = new_store();
+            let (_sid, ctx) = registered(&store);
+            let generation = next_bridge_generation();
+            attach_up(&store, generation);
+
+            let poster = {
+                let ctx = ctx.clone();
+                std::thread::spawn(move || {
+                    cmd_post(
+                        &ctx,
+                        "to=@s-peer kind=ask --wait=600000 which branch?",
+                        None,
+                    )
+                })
+            };
+            for spin in 0.. {
+                assert!(spin < 5_000_000, "the post never reached the outbox");
+                if cmd_inbox(&ctx, "--peek").contains("post 1 ") {
+                    break;
+                }
+                std::thread::yield_now();
+            }
+            assert_eq!(
+                cmd_link(&store, "down reason=closed", Some(generation)),
+                "OK\n"
+            );
+            assert_eq!(
+                poster.join().expect("the poster thread"),
+                "ERR fabric stalled id=1 queued=1\n",
+                "a parked waiter must learn the link stalled, not sit out its timeout"
+            );
         });
     }
 
@@ -3793,7 +4583,7 @@ mod inbox_hold {
         with_link(|| {
             let store = new_store();
             let (sid, ctx) = registered(&store);
-            bridge_attached(next_bridge_generation());
+            attach_up(&store, next_bridge_generation());
             let poster = {
                 let ctx = ctx.clone();
                 std::thread::spawn(move || {
@@ -4163,7 +4953,7 @@ mod inbox_hold {
         with_link(|| {
             let store = new_store();
             let (sid, ctx) = registered(&store);
-            bridge_attached(next_bridge_generation());
+            attach_up(&store, next_bridge_generation());
             for (post_id, off_tok, expect) in [
                 (1u64, "off=91".to_string(), "OK 1 off=91\n".to_string()),
                 (
@@ -4288,19 +5078,21 @@ mod inbox_hold {
             let store = new_store();
             let (sid, ctx) = registered(&store);
 
-            // Incarnation 1: one generation, both lanes.
+            // Incarnation 1: one generation, both lanes, and its link up.
             let first = next_bridge_generation();
             bridge_attached(first);
             bridge_attached(first);
+            assert!(link_report(&store, Some(first), true, "", Some(1)));
             assert_eq!(deliver(&store, &sid, 7, "h-a", "task", "go"), "OK 1\n");
 
             // Its verb lane sees EOF at once.
             assert_eq!(bridge_lost(&store, first), 1);
             assert_eq!(fabric_state(), "disconnected");
 
-            // The supervisor relaunches; incarnation 2 attaches and lifts nothing.
+            // The supervisor relaunches; incarnation 2 attaches, its link comes
+            // up, and it lifts nothing.
             let second = next_bridge_generation();
-            bridge_attached(second);
+            attach_up(&store, second);
             assert_eq!(fabric_state(), "connected");
 
             // NOW incarnation 1's push-lane guard finally unwinds. Its HOLD sweep
@@ -4354,7 +5146,7 @@ mod inbox_hold {
             let store = new_store();
             let (_sid, ctx) = registered(&store);
             let generation = next_bridge_generation();
-            bridge_attached(generation);
+            attach_up(&store, generation);
 
             let poster = {
                 let ctx = ctx.clone();
@@ -4658,7 +5450,7 @@ mod inbox_hold {
 
             // The replacement is up and CONNECTED.
             let second = next_bridge_generation();
-            bridge_attached(second);
+            attach_up(&store, second);
             assert_eq!(fabric_state(), "connected");
 
             // NOW the dead launch's second lane finally runs its attach. It must
@@ -4997,10 +5789,10 @@ mod inbox_hold {
                 "ERR fabric absent id=2 queued=1\n"
             );
 
-            // The PER-WAKE check: a bridge attached, took the post's session, and
-            // died while the waiter was parked.
+            // The PER-WAKE check: a bridge attached, its link came up, it took
+            // the post's session, and died while the waiter was parked.
             let generation = next_bridge_generation();
-            bridge_attached(generation);
+            attach_up(&store, generation);
             assert_eq!(deliver(&store, &sid, 1, "h-a", "note", "x"), "OK 1\n");
             std::thread::scope(|scope| {
                 scope.spawn(|| {
@@ -5144,6 +5936,12 @@ mod inbox_hold {
             ),
             ("hold", "the verb that LIFTS the halt"),
             (
+                "link",
+                "the bridge reporting its own broker link; it puts no bytes on a PTY, \
+                 and a halt that silenced it would hide the one fact that says why \
+                 mail is not moving under the halt",
+            ),
+            (
                 "outbox sent",
                 "retires an outbound post the bridge already published; refusing it \
                  would strand the body and re-publish it forever",
@@ -5179,7 +5977,7 @@ mod inbox_hold {
                 "spawn",
                 "MINTS a session rather than driving or retiring one, and a halt \
                  stops drivers. The new session is itself held the moment the \
-                 bridge attaches it (`reconcile_halt`), and halting `spawn` would \
+                 bridge attaches it (`apply_fleet_halts`), and halting `spawn` would \
                  refuse a human's `aterm new-tab`, which arrives on this same seam \
                  and is indistinguishable from a driver's. RESIDUAL, stated rather \
                  than hidden and recorded in `is_pty_reaching`'s doc as well: \
@@ -5545,7 +6343,7 @@ mod inbox_hold {
     fn the_link_reset_runs_inside_the_lock_that_serializes_it() {
         with_link(|| {
             assert_eq!(fabric_state(), "absent", "a section starts from absent");
-            bridge_attached(next_bridge_generation());
+            attach_up(&new_store(), next_bridge_generation());
             assert_eq!(fabric_state(), "connected");
         });
         assert_eq!(

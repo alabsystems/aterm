@@ -43,6 +43,7 @@ fn context(now: Instant, cfg: &Config, caret: (u16, u16)) -> Ctx<'_> {
         phase: 0.0,
         caret,
         caret_t: 0.0,
+        caret_walk: None,
         mend: None,
         surge: 0.0,
         flow: Default::default(),

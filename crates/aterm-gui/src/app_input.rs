@@ -12,7 +12,7 @@ use std::sync::{Arc, Mutex};
 
 use aterm_core::selection::SelectionType;
 use aterm_core::terminal::{CustodyTransition, ModeMirror, Terminal};
-use aterm_effects::cursor_glow::InsertWidth;
+use aterm_effects::cursor_glow::{DeliveredClass, InsertWidth};
 use aterm_effects::kitty_pet::PetInputKind;
 use aterm_session::sink::{AcceptedOrder, SinkWriter};
 use winit::event::{ElementState, KeyEvent};
@@ -70,17 +70,15 @@ pub(crate) struct OutputEchoTracker {
     published: Mutex<OutputEchoPublished>,
 }
 
-/// WHAT A QUEUED WRITE'S COMPLETION RE-STAMPS on the cursor engines
-/// (2026-09-10, "the image insert breaks the rainbow"). A paste, and every
-/// key typed while one drains, is written on the `aterm-egress-order`
-/// thread; its arrival-time licence is revoked at enqueue because enqueue
-/// is not delivery, and the writer's completed write is the delivery edge
-/// nothing used to report. The ticket rides on the FIFO job and is
-/// published as a [`DeliveryReceipt`] when the sink accepts the bytes; the
-/// render prelude applies it to the window's engines
-/// (`App::tick_cursor_fx`). Inline writes carry no ticket: their arrival
+/// WHAT A QUEUED WRITE'S COMPLETION RE-STAMPS on the cursor engines. A
+/// paste, and every key typed while one drains, is written on the
+/// `aterm-egress-order` thread; enqueue is not delivery, so the licences its
+/// enqueue revoked come back at the writer's completed write. The ticket
+/// rides the FIFO job, is published as a [`DeliveryReceipt`] when the sink
+/// accepts the bytes, and the render prelude applies it to the window's
+/// engines (`App::tick_cursor_fx`). Inline writes carry none: their arrival
 /// stamp IS the licence.
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) struct DeliveryTicket {
     /// A delivered INSERT's width — a paste PRICED from its text
     /// (`Terminal::paste_insert_cells`), or the UNKNOWN class (a Tab, a ⌃V,
@@ -88,15 +86,41 @@ pub(crate) struct DeliveryTicket {
     /// A type, not a sentinel width: the two classes are spent under
     /// different row laws.
     pub(crate) insert: Option<InsertWidth>,
-    /// A plain typed key whose arrival stamp was revoked at enqueue —
-    /// `CursorGlow::note_typed_stamp_delivered` (its credit and v2 press
-    /// were banked at dispatch and never revoked).
-    pub(crate) typed: bool,
+    /// THE WINDOW THAT DISPATCHED A KEY — the one whose engines banked the
+    /// press at dispatch, and the only one the key class below is re-stamped
+    /// on: a second window fronting the same session banked nothing and
+    /// re-banks nothing (handed the typed stamp anyway it holds a licence
+    /// with zero credits, where the same key written inline leaves it
+    /// unlicensed). `None` for a paste: the insert half is session-wide — a
+    /// paste needs no per-window credit.
+    /// scope-waiver: "session-wide" here names the insert half's FAN-OUT — it
+    /// is applied on whichever window reads the session's receipt — not a
+    /// safety budget or a multiplying enforcer; the only thing it arms is the
+    /// paste's own insert licence on each engine that reads it.
+    pub(crate) window: Option<WindowId>,
+    /// The KEY's licence class, revoked at enqueue and re-stamped at
+    /// delivery as a pure stamp on [`Self::window`]
+    /// (`CursorGlow::note_delivered`): a typed glyph's stamp, a plain
+    /// Enter's return, a navigation key's jump, a Backspace's erase, a
+    /// composer newline, a kill chord, a Tab's / ⌃V's gesture — every class
+    /// `revoke_input_hints_at` clears — so the response, the jump, the
+    /// erase, the box growth, the kill's retreat or the cross-row
+    /// completion after a paste is licensed exactly as the inline key's
+    /// (the measured "one unlit notch per Enter" for Cmd-V then Enter into
+    /// a slow child). One key, one class.
+    pub(crate) key: Option<DeliveredClass>,
+    /// WHEN THE BYTES WERE DISPATCHED — the event-loop instant the key or
+    /// paste was accepted at the input seam, carried to the delivery edge
+    /// so the insert's late-receipt claim
+    /// (`CursorGlow::note_insert_delivered_from`) reaches back no further
+    /// than the press itself: a Tab queued behind a short-draining paste
+    /// could otherwise claim a program hop refused before its own dispatch.
+    pub(crate) dispatched_at: std::time::Instant,
 }
 
 impl DeliveryTicket {
     fn is_empty(self) -> bool {
-        self.insert.is_none() && !self.typed
+        self.insert.is_none() && self.key.is_none()
     }
 }
 
@@ -159,6 +183,37 @@ struct OutputEchoPublished {
     deliveries: [Option<DeliveryReceipt>; DELIVERY_RING],
     delivery_head: usize,
     delivery_serial: u64,
+}
+
+impl OutputEchoPublished {
+    /// A receipt held in the spill settles at the first instant the spill
+    /// is observed empty: its bytes reached the kernel no later than that,
+    /// so `stamp_us` — a drained publish's own stamp, or a drained read's
+    /// clock — is the instant every still-held receipt takes. Settled at
+    /// the publish as well as the read so the ring's instants stay
+    /// monotone in serial order and a spill that starts again before the
+    /// next read cannot re-hold receipts already on the wire.
+    fn settle_held_receipts(&mut self, stamp_us: u64) {
+        for r in self.deliveries.iter_mut().flatten() {
+            if r.delivered_us == 0 {
+                r.delivered_us = stamp_us;
+            }
+        }
+    }
+}
+
+/// A metrics-clock stamp (`crate::metrics::now_us`) reconstructed on the
+/// frame's injected clock: `now` less the time the stamp trails the clock
+/// sampled beside it, never later than `now`.
+fn stamp_on_frame_clock(
+    stamp_us: u64,
+    clock_us: u64,
+    now: std::time::Instant,
+) -> std::time::Instant {
+    now.checked_sub(std::time::Duration::from_micros(
+        clock_us.saturating_sub(stamp_us),
+    ))
+    .unwrap_or(now)
 }
 
 /// One coherent render-time view of a session's echo evidence.
@@ -260,13 +315,28 @@ impl OutputEchoTracker {
     /// instant is the sink's acceptance when the spill is already drained,
     /// else pending until the reader sees it drain (the `sample()` rule for
     /// `last_accepted_us`).
+    ///
+    /// WRITER THREADS ONLY (the FIFO writer, the detached paste fallback —
+    /// inline writes carry no ticket), so the spill is probed with the
+    /// PARKING predicate: a contended mutex is not bytes in the spill, and a
+    /// receipt held on a non-parking `None` — with nothing in the spill —
+    /// requests no follow-up frame and resolves at the next unrelated redraw
+    /// with a then-fresh instant, arming a licence long after its echo was
+    /// drawn. Every spill hold is microseconds (the drainer writes with the
+    /// fd lock, not the spill's; the cap wait is a condvar wait), so this
+    /// never waits behind the kernel; probed BEFORE `published` so the
+    /// prelude's blocking read is never behind it. A held receipt then means
+    /// exactly "bytes still in the spill", resolved at the drain.
     fn publish_delivery(&self, ticket: DeliveryTicket, stamp: u64, sink: &SinkWriter) {
+        let drained = sink.egress_drained_to_kernel();
         let mut published = self
             .published
             .lock()
             .unwrap_or_else(|poison| poison.into_inner());
         published.delivery_serial += 1;
-        let drained = sink.try_egress_drained_to_kernel() == Some(true);
+        if drained {
+            published.settle_held_receipts(stamp);
+        }
         let receipt = DeliveryReceipt {
             serial: published.delivery_serial,
             delivered_us: if drained { stamp } else { 0 },
@@ -278,10 +348,12 @@ impl OutputEchoTracker {
     }
 
     /// THE RENDER PRELUDE'S READ: every delivery newer than `after`, oldest
-    /// first, with its instant reconstructed on the frame's clock exactly as
-    /// [`Self::sample`] reconstructs `last_accepted_at`. A receipt whose bytes
-    /// are still in the spill is resolved here once the sink reports the
-    /// spill drained, and holds `latest` back until it is.
+    /// first, with its instant reconstructed on the frame's clock
+    /// ([`stamp_on_frame_clock`], as [`Self::sample`] reconstructs
+    /// `last_accepted_at`). A receipt whose bytes are still in the spill is
+    /// resolved here once the sink reports the spill drained
+    /// ([`OutputEchoPublished::settle_held_receipts`]), and holds `latest`
+    /// back until it is.
     ///
     /// A BLOCKING lock, unlike `sample()`'s: the only other holder is the
     /// writer thread inside `publish`/`publish_delivery` — a few field
@@ -325,18 +397,8 @@ impl OutputEchoTracker {
             .any(|r| r.delivered_us == 0)
             && sink.try_egress_drained_to_kernel() == Some(true);
         if drained {
-            for r in published.deliveries.iter_mut().flatten() {
-                if r.delivered_us == 0 {
-                    r.delivered_us = clock_us;
-                }
-            }
+            published.settle_held_receipts(clock_us);
         }
-        let at = |stamp: u64| {
-            now.checked_sub(std::time::Duration::from_micros(
-                clock_us.saturating_sub(stamp),
-            ))
-            .unwrap_or(now)
-        };
         // Read OLDEST FIRST straight off the ring, no sort: `publish_delivery`
         // writes at `delivery_head` with a monotone serial, so a walk from
         // the head wraps through the receipts in serial order. The apply
@@ -361,7 +423,10 @@ impl OutputEchoTracker {
             let Some(slot) = slots.next() else {
                 break;
             };
-            *slot = Some((at(r.delivered_us), r.ticket));
+            *slot = Some((
+                stamp_on_frame_clock(r.delivered_us, clock_us, now),
+                r.ticket,
+            ));
             out.latest = r.serial;
         }
         // The serials past the baseline the ring no longer holds: evicted
@@ -417,12 +482,7 @@ impl OutputEchoTracker {
         let last_us = published.last_accepted_us;
         let boundary_us = published.last_boundary_us;
         let debt = published.spill_debt.is_some();
-        let at = |stamp| {
-            now.checked_sub(std::time::Duration::from_micros(
-                clock_us.saturating_sub(stamp),
-            ))
-            .unwrap_or(now)
-        };
+        let at = |stamp| stamp_on_frame_clock(stamp, clock_us, now);
         let last_accepted_at = (last_us != 0).then(|| at(last_us));
         let last_boundary_at = (boundary_us != 0).then(|| at(boundary_us));
         OutputEchoSample {
@@ -530,7 +590,25 @@ pub(crate) fn tracked_egress(
     ev: &InputEvent,
     mode: input::EgressMode,
 ) -> input::EgressReceipt {
-    let write = tracker.begin_event(ev);
+    tracked_egress_ticketed(term, modes, sink, tracker, ev, mode, None)
+}
+
+/// THE ONE EGRESS LAW: begin the echo write (its kind derived from the
+/// event, its ticket — if any — published as a [`DeliveryReceipt`] on
+/// acceptance), write through the seam, finish with the receipt. Every
+/// tracked write in the process — inline, the FIFO writer, the detached
+/// paste fallback, a control-thread target — is this fn, so a ticket has
+/// one place it can be published from and a kind one place it is derived.
+pub(crate) fn tracked_egress_ticketed(
+    term: &Mutex<Terminal>,
+    modes: &ModeMirror,
+    sink: &SinkWriter,
+    tracker: &OutputEchoTracker,
+    ev: &InputEvent,
+    mode: input::EgressMode,
+    ticket: Option<DeliveryTicket>,
+) -> input::EgressReceipt {
+    let write = tracker.begin_ticketed(OutputEchoInput::of(ev), ticket);
     let receipt = input::seam_egress_receipt(term, modes, sink, ev, mode);
     write.finish(receipt, sink);
     receipt
@@ -646,7 +724,9 @@ mod output_echo_tracker_tests {
         let ev = InputEvent::KeySequence(b"x".to_vec());
         let ticket = |cells: u16| DeliveryTicket {
             insert: Some(InsertWidth::Cells(cells)),
-            typed: false,
+            window: None,
+            key: None,
+            dispatched_at: now,
         };
 
         // No baseline: the newest serial, nothing to apply.
@@ -698,7 +778,9 @@ mod output_echo_tracker_tests {
             OutputEchoInput::Echoable,
             Some(DeliveryTicket {
                 insert: None,
-                typed: true,
+                window: Some(WindowId(0)),
+                key: Some(DeliveredClass::Typed),
+                dispatched_at: now,
             }),
         );
         let typed_receipt = input::seam_egress_receipt(
@@ -715,13 +797,22 @@ mod output_echo_tracker_tests {
             batch.items[0].map(|(_, t)| t),
             Some(DeliveryTicket {
                 insert: None,
-                typed: true,
+                window: Some(WindowId(0)),
+                key: Some(DeliveredClass::Typed),
+                dispatched_at: now,
             })
         );
 
         // An EMPTY ticket and an un-ticketed write publish nothing.
-        let empty =
-            tracker.begin_ticketed(OutputEchoInput::Echoable, Some(DeliveryTicket::default()));
+        let empty = tracker.begin_ticketed(
+            OutputEchoInput::Echoable,
+            Some(DeliveryTicket {
+                insert: None,
+                window: None,
+                key: None,
+                dispatched_at: now,
+            }),
+        );
         let r = input::seam_egress_receipt(
             &term,
             &crate::mode_mirror_of(&term),
@@ -791,7 +882,9 @@ mod output_echo_tracker_tests {
                 OutputEchoInput::Echoable,
                 Some(DeliveryTicket {
                     insert: Some(InsertWidth::Cells(cells)),
-                    typed: false,
+                    window: None,
+                    key: None,
+                    dispatched_at: now,
                 }),
             );
             let receipt = input::seam_egress_receipt(
@@ -916,7 +1009,9 @@ mod output_echo_tracker_tests {
                 OutputEchoInput::Echoable,
                 Some(DeliveryTicket {
                     insert: Some(InsertWidth::Cells(cells)),
-                    typed: false,
+                    window: None,
+                    key: None,
+                    dispatched_at: now,
                 }),
             );
             let receipt = input::seam_egress_receipt(
@@ -1269,6 +1364,244 @@ mod output_echo_tracker_tests {
         }
     }
 
+    /// A pipe whose write end is wedged (O_NONBLOCK, filled to EAGAIN), so
+    /// a write through the sink spills and a drainer is arranged.
+    #[cfg(unix)]
+    fn wedged_pipe() -> [i32; 2] {
+        let mut pipe = [0; 2];
+        assert_eq!(unsafe { libc::pipe(pipe.as_mut_ptr()) }, 0, "pipe");
+        aterm_pty::set_nonblocking(pipe[1], true).expect("nonblocking pipe writer");
+        aterm_pty::set_nonblocking(pipe[0], true).expect("nonblocking pipe reader");
+        fill_pipe(pipe[1]);
+        pipe
+    }
+
+    #[cfg(unix)]
+    fn fill_pipe(writer: i32) {
+        let mut filled = 0_usize;
+        loop {
+            match aterm_pty::write_some(writer, &[b'.'; 4096]) {
+                Ok(n) if n > 0 => filled += n,
+                Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => break,
+                other => panic!("unexpected pipe fill result: {other:?}"),
+            }
+        }
+        assert!(filled > 0);
+    }
+
+    /// Read the pipe out until the sink reports its spill drained.
+    #[cfg(unix)]
+    fn drain_pipe(reader: &mut std::fs::File, sink: &SinkWriter) {
+        use std::io::Read;
+        let mut buf = vec![0_u8; 64 * 1024];
+        for _ in 0..10_000 {
+            if sink.egress_drained_to_kernel() {
+                break;
+            }
+            match reader.read(&mut buf) {
+                Ok(0) => break,
+                Ok(_) => {}
+                Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                    std::thread::sleep(std::time::Duration::from_millis(1));
+                }
+                Err(error) => panic!("pipe read: {error}"),
+            }
+        }
+        assert!(sink.egress_drained_to_kernel(), "the spill drained");
+    }
+
+    /// A DRAINED PUBLISH SETTLES EVERY RECEIPT THE SPILL HAD HELD (2026-09-13
+    /// audit, host-seam R1-4). `publish_delivery` stamped `delivered_us`
+    /// only when the spill was drained at ITS publish; an older receipt
+    /// held back by a wedge stayed held until the prelude's read settled
+    /// it at the READ's clock. So when the spill drained and a later
+    /// ticketed write published drained before the next read, the older
+    /// receipt resolved LATER than the newer one: serial order kept,
+    /// instants not monotone, the held receipt's licence freshness
+    /// measured from the read rather than the delivery — and a spill that
+    /// started again before the read re-held the older receipt, which
+    /// withheld the newer, already-delivered one with it. A drained
+    /// publish now settles every held receipt at its own stamp: the spill
+    /// is empty at that instant, so they reached the kernel no later than
+    /// this write.
+    ///
+    /// RED before the fix: `A(serial 1)` resolved ~65 ms AFTER `B(serial
+    /// 2)`; and under the re-wedge the read handed over nothing.
+    #[cfg(unix)]
+    #[test]
+    fn a_drained_publish_settles_every_receipt_the_spill_had_held() {
+        use std::os::fd::FromRawFd;
+        for rewedge in [false, true] {
+            let pipe = wedged_pipe();
+            let sink = SinkWriter::new(pipe[1]);
+            sink.note_master_nonblocking(true);
+            let term = Mutex::new(Terminal::new(24, 80));
+            let tracker = OutputEchoTracker::default();
+            let ev = InputEvent::KeySequence(b"x".to_vec());
+            let publish = |cells: u16| {
+                let write = tracker.begin_ticketed(
+                    OutputEchoInput::Echoable,
+                    Some(DeliveryTicket {
+                        insert: Some(InsertWidth::Cells(cells)),
+                        window: None,
+                        key: None,
+                        dispatched_at: std::time::Instant::now(),
+                    }),
+                );
+                let receipt = input::seam_egress_receipt(
+                    &term,
+                    &crate::mode_mirror_of(&term),
+                    &sink,
+                    &ev,
+                    input::EgressMode::Backpressured,
+                );
+                write.finish(receipt, &sink);
+            };
+            // Seed the spill with one non-parking byte: the sink is wedged.
+            let seed = tracker.begin_event(&ev);
+            let receipt = input::seam_egress_receipt(
+                &term,
+                &crate::mode_mirror_of(&term),
+                &sink,
+                &ev,
+                input::EgressMode::Interactive,
+            );
+            seed.finish(receipt, &sink);
+            assert!(!sink.egress_drained_to_kernel(), "wedged");
+            // A: ticketed, held (the spill is non-empty at its publish).
+            publish(1);
+            {
+                let p = tracker.published.lock().unwrap();
+                assert_eq!(p.deliveries[0].unwrap().delivered_us, 0, "A is spill-held");
+            }
+            // The child reads: the drainer lands the spill.
+            let mut reader = unsafe { std::fs::File::from_raw_fd(pipe[0]) };
+            drain_pipe(&mut reader, &sink);
+            std::thread::sleep(std::time::Duration::from_millis(30));
+            // B: ticketed, lands direct — and settles A at the same stamp.
+            publish(2);
+            {
+                let p = tracker.published.lock().unwrap();
+                let a = p.deliveries[0].unwrap();
+                let b = p.deliveries[1].unwrap();
+                assert_ne!(b.delivered_us, 0, "B is stamped at publish");
+                assert_eq!(
+                    a.delivered_us, b.delivered_us,
+                    "rewedge={rewedge}: A reached the kernel no later than B: settled at B's stamp"
+                );
+            }
+            if rewedge {
+                // A new spill starts before the next read (a third paste
+                // into a re-wedged child inside the same frame gap).
+                fill_pipe(pipe[1]);
+                let seed = tracker.begin_event(&ev);
+                let receipt = input::seam_egress_receipt(
+                    &term,
+                    &crate::mode_mirror_of(&term),
+                    &sink,
+                    &ev,
+                    input::EgressMode::Interactive,
+                );
+                seed.finish(receipt, &sink);
+                assert!(!sink.egress_drained_to_kernel(), "re-wedged");
+            }
+            let now = std::time::Instant::now();
+            let batch = tracker.deliveries_after(&sink, Some(0), now);
+            assert_eq!(
+                batch.latest, 2,
+                "rewedge={rewedge}: both receipts handed over"
+            );
+            let items: Vec<_> = batch.items.iter().flatten().copied().collect();
+            assert_eq!(items.len(), 2);
+            let (a_at, a_t) = items[0];
+            let (b_at, b_t) = items[1];
+            assert_eq!(a_t.insert, Some(InsertWidth::Cells(1)));
+            assert_eq!(b_t.insert, Some(InsertWidth::Cells(2)));
+            assert!(
+                a_at <= b_at,
+                "rewedge={rewedge}: instants monotone in serial order (A {:?} before B {:?})",
+                now.saturating_duration_since(a_at),
+                now.saturating_duration_since(b_at)
+            );
+            drop(reader);
+            drop(sink);
+            unsafe {
+                libc::close(pipe[1]);
+            }
+        }
+    }
+
+    /// A CONTENDED SPILL PROBE NEVER HOLDS A RECEIPT ON A DRAINED SINK
+    /// (2026-09-13 audit, host-seam R1-5). `publish_delivery` probed the
+    /// spill with the NON-parking predicate: a probe that lost the mutex to
+    /// another thread for an instant answered `None`, the receipt was held
+    /// (`delivered_us == 0`) though nothing was in the spill, and a held
+    /// receipt requests no follow-up frame — on an idle engine it resolved
+    /// at the next unrelated redraw with a then-fresh instant, past the
+    /// retro window, arming a licence long after its echo was drawn. The
+    /// writer thread now probes with the PARKING predicate (before taking
+    /// `published`, so the prelude's blocking read is never behind it): a
+    /// held receipt then means exactly "bytes still in the spill".
+    ///
+    /// A thread spinning on the parking probe contends the spill mutex
+    /// while ticketed writes publish on a drained sink: every receipt must
+    /// be stamped at its publish. RED (with high probability) before the
+    /// fix: some receipts held.
+    #[cfg(unix)]
+    #[test]
+    fn a_contended_spill_probe_never_holds_a_receipt_on_a_drained_sink() {
+        use std::sync::atomic::{AtomicBool, Ordering};
+        let mut pipe = [0; 2];
+        assert_eq!(unsafe { libc::pipe(pipe.as_mut_ptr()) }, 0, "pipe");
+        let sink = SinkWriter::new(pipe[1]);
+        let term = Mutex::new(Terminal::new(24, 80));
+        let tracker = OutputEchoTracker::default();
+        let ev = InputEvent::KeySequence(b"x".to_vec());
+        let stop = AtomicBool::new(false);
+        std::thread::scope(|scope| {
+            let contender = &sink;
+            scope.spawn(|| {
+                while !stop.load(Ordering::Relaxed) {
+                    let _ = contender.egress_drained_to_kernel();
+                }
+            });
+            let mut held = 0_u32;
+            for _ in 0..400 {
+                let write = tracker.begin_ticketed(
+                    OutputEchoInput::Echoable,
+                    Some(DeliveryTicket {
+                        insert: None,
+                        window: Some(WindowId(0)),
+                        key: Some(DeliveredClass::Typed),
+                        dispatched_at: std::time::Instant::now(),
+                    }),
+                );
+                let receipt = input::seam_egress_receipt(
+                    &term,
+                    &crate::mode_mirror_of(&term),
+                    &sink,
+                    &ev,
+                    input::EgressMode::Interactive,
+                );
+                write.finish(receipt, &sink);
+                let p = tracker.published.lock().unwrap();
+                let head = (p.delivery_head + DELIVERY_RING - 1) % DELIVERY_RING;
+                if p.deliveries[head].is_some_and(|r| r.delivered_us == 0) {
+                    held += 1;
+                }
+            }
+            stop.store(true, Ordering::Relaxed);
+            assert_eq!(
+                held, 0,
+                "receipts held on a drained sink by a contended probe"
+            );
+        });
+        drop(sink);
+        unsafe {
+            libc::close(pipe[0]);
+        }
+    }
+
     #[test]
     fn fifo_admission_receipt_is_not_pty_acceptance() {
         let receipt = input::EgressReceipt::deferred_full();
@@ -1613,7 +1946,8 @@ pub(crate) mod paste_order {
     use std::sync::{Arc, LazyLock, Mutex, Weak};
 
     use super::{
-        DeliveryTicket, InputEvent, OutputEchoInput, OutputEchoTracker, SinkWriter, Terminal,
+        DeliveryTicket, InputEvent, OutputEchoTracker, SinkWriter, Terminal,
+        tracked_egress_ticketed,
     };
     use aterm_core::terminal::ModeMirror;
 
@@ -1623,7 +1957,6 @@ pub(crate) mod paste_order {
         modes: Arc<ModeMirror>,
         sink: Arc<SinkWriter>,
         echo: Arc<OutputEchoTracker>,
-        echo_kind: OutputEchoInput,
         ev: InputEvent,
         pending: Arc<AtomicUsize>,
         /// What this write's completion re-stamps on the cursor engines
@@ -1659,21 +1992,21 @@ pub(crate) mod paste_order {
         while let Ok(job) = rx.recv() {
             // The egress-order writer thread is expendable: block under SPILL_CAP so
             // a wedged foreground applies backpressure HERE, not by growing the spill.
-            let write = job.echo.begin_ticketed(job.echo_kind, job.ticket);
-            let receipt = crate::input::seam_egress_receipt(
+            // The bytes are on the wire when this returns: the write's finish
+            // publishes the job's delivery ticket with the acceptance (the
+            // cursor engines' delivered-insert / delivered-key stamps, applied
+            // by the render prelude), then the slice the UI thread could not
+            // book: hardware key arrival → completed write, including the
+            // time this job spent queued behind the paste ahead of it.
+            tracked_egress_ticketed(
                 &job.term,
                 &job.modes,
                 &job.sink,
+                &job.echo,
                 &job.ev,
                 crate::input::EgressMode::Backpressured,
+                job.ticket,
             );
-            // The bytes are on the wire NOW. `finish` publishes the job's
-            // delivery ticket with the acceptance (the cursor engines'
-            // delivered-insert / delivered-typed stamps, applied by the
-            // render prelude), then the slice the UI thread could not book:
-            // hardware key arrival → completed write, including the time this
-            // job spent queued behind the paste ahead of it.
-            write.finish(receipt, &job.sink);
             crate::metrics::note_pty_write_at(job.key_ns);
             job.pending.fetch_sub(1, Ordering::AcqRel);
             ACTIVE.fetch_sub(1, Ordering::AcqRel);
@@ -1734,9 +2067,8 @@ pub(crate) mod paste_order {
     }
 
     /// Enqueue `ev` onto `master`'s FIFO so it reaches the PTY in submission order.
-    /// Returns whether the new job joined an already-pending FIFO. `Err(ev)`
-    /// hands the event back when no writer is available, so the caller falls
-    /// back to an inline write.
+    /// `Err(ev)` hands the event back when no writer is available, so the
+    /// caller falls back to an inline write.
     pub(super) fn enqueue(
         term: &Arc<Mutex<Terminal>>,
         modes: &Arc<ModeMirror>,
@@ -1744,7 +2076,7 @@ pub(crate) mod paste_order {
         echo: &Arc<OutputEchoTracker>,
         ev: InputEvent,
         ticket: Option<DeliveryTicket>,
-    ) -> Result<bool, InputEvent> {
+    ) -> Result<(), InputEvent> {
         let master = sink.master();
         let (tx, pending) = {
             let mut reg = REG.lock().unwrap_or_else(|p| p.into_inner());
@@ -1758,7 +2090,7 @@ pub(crate) mod paste_order {
         };
         // Claim the FIFO slot BEFORE releasing to the writer: a later keystroke on
         // this same (UI) thread then observes pending > 0 and queues behind us.
-        let queued_behind_existing = pending.fetch_add(1, Ordering::AcqRel) > 0;
+        pending.fetch_add(1, Ordering::AcqRel);
         ACTIVE.fetch_add(1, Ordering::AcqRel);
         // Claim the arrival here so the UI thread's `note_pty_write` cannot
         // consume it on the way out and book a channel push as the write.
@@ -1776,20 +2108,18 @@ pub(crate) mod paste_order {
         } else {
             crate::metrics::take_key_arrival()
         };
-        let echo_kind = OutputEchoInput::of(&ev);
         let job = Job {
             term: term.clone(),
             modes: modes.clone(),
             sink: sink.clone(),
             echo: echo.clone(),
-            echo_kind,
             ev,
             pending,
             key_ns,
             ticket,
         };
         match tx.send(job) {
-            Ok(()) => Ok(queued_behind_existing),
+            Ok(()) => Ok(()),
             Err(std::sync::mpsc::SendError(job)) => {
                 // Writer gone (should not happen while the entry lives): undo the
                 // counters and hand the event back for an inline write. Give the
@@ -1823,19 +2153,17 @@ pub(crate) mod paste_order {
     ) -> (crate::input::EgressReceipt, bool) {
         if is_ordering(sink.master()) {
             match enqueue(term, modes, sink, echo, ev.clone(), ticket) {
-                Ok(_) => (crate::input::EgressReceipt::deferred_full(), false),
-                Err(ev) => {
-                    let write = echo.begin(OutputEchoInput::of(&ev));
-                    let receipt = crate::input::seam_egress_receipt(term, modes, sink, &ev, mode);
-                    write.finish(receipt, sink);
-                    (receipt, true)
-                }
+                Ok(()) => (crate::input::EgressReceipt::deferred_full(), false),
+                Err(ev) => (
+                    tracked_egress_ticketed(term, modes, sink, echo, &ev, mode, None),
+                    true,
+                ),
             }
         } else {
-            let write = echo.begin(OutputEchoInput::of(ev));
-            let receipt = crate::input::seam_egress_receipt(term, modes, sink, ev, mode);
-            write.finish(receipt, sink);
-            (receipt, true)
+            (
+                tracked_egress_ticketed(term, modes, sink, echo, ev, mode, None),
+                true,
+            )
         }
     }
 
@@ -2508,8 +2836,6 @@ fn committed_text_moves_cursor(text: &str) -> bool {
 /// families, while underpricing VS16 emoji such as `⚠️`; either mismatch leaves
 /// surplus/short typed credits that can be spent by a later TUI cursor hop.
 fn committed_text_cells(text: &str, ambiguous_width_double: bool) -> u16 {
-    use aterm_types::text_shaping::{AmbiguousWidth, TextShapingConfig};
-
     // A base-less run of combining marks/selectors/joiners does not advance
     // the terminal even if the grapheme classifier groups those scalars into
     // an emoji-shaped cluster. Preserve the no-licence law before applying
@@ -2517,16 +2843,28 @@ fn committed_text_cells(text: &str, ambiguous_width_double: bool) -> u16 {
     if aterm_grapheme::str_width(text) == 0 {
         return 0;
     }
-    let shaping = TextShapingConfig {
+    let shaping = ambiguous_width_shaping(ambiguous_width_double);
+    u16::try_from(aterm_grapheme::grapheme_width_with_config(text, &shaping).display_width)
+        .unwrap_or(u16::MAX)
+}
+
+/// The shaping the committed-text pricers share: the terminal's
+/// ambiguous-width setting (single, or the CJK double), every other knob at
+/// its default, so the host prices the same clusters at the same widths the
+/// grid materializes.
+fn ambiguous_width_shaping(
+    ambiguous_width_double: bool,
+) -> aterm_types::text_shaping::TextShapingConfig {
+    use aterm_types::text_shaping::{AmbiguousWidth, TextShapingConfig};
+
+    TextShapingConfig {
         ambiguous_width: if ambiguous_width_double {
             AmbiguousWidth::Double
         } else {
             AmbiguousWidth::Single
         },
         ..TextShapingConfig::default()
-    };
-    u16::try_from(aterm_grapheme::grapheme_width_with_config(text, &shaping).display_width)
-        .unwrap_or(u16::MAX)
+    }
 }
 
 /// The per-grapheme cell widths of one committed Text/IME event, in order,
@@ -2540,23 +2878,87 @@ fn committed_text_cells(text: &str, ambiguous_width_double: bool) -> u16 {
 /// nothing about — the one retires no cell of any press, the other the whole
 /// newest press.
 fn committed_grapheme_cells_into(text: &str, ambiguous_width_double: bool, out: &mut Vec<u16>) {
-    use aterm_types::text_shaping::{AmbiguousWidth, TextShapingConfig};
-
     if aterm_grapheme::str_width(text) == 0 {
         return;
     }
-    let shaping = TextShapingConfig {
-        ambiguous_width: if ambiguous_width_double {
-            AmbiguousWidth::Double
-        } else {
-            AmbiguousWidth::Single
-        },
-        ..TextShapingConfig::default()
-    };
+    let shaping = ambiguous_width_shaping(ambiguous_width_double);
     out.extend(
         aterm_grapheme::split_graphemes_with_config(text, &shaping)
             .map(|g| u16::try_from(g.width).unwrap_or(u16::MAX)),
     );
+}
+
+/// THE BACKSPACE PRICE MEMORY: the cell widths of the row's erasable tail,
+/// in order, so a Backspace can price the one glyph it erases for the glow
+/// engine's press ring
+/// ([`crate::cursor_glow::CursorGlow::note_backspace_erasing`]) — the
+/// engine banks a committed IME run as ONE press at its summed width, and a
+/// Backspace erases one glyph of it, not the run. A typed press APPENDS its
+/// widths (a plain key one, a committed run one per grapheme); a
+/// movement-capable paste appends a priced 0 per pasted grapheme (its
+/// glyphs banked no press, so the erase that takes one of them retires
+/// nothing of the press behind them); each Backspace pops the newest entry
+/// (a priced 0 retires nothing; an EMPTY memory prices `None`, and the
+/// engine retires the whole newest press, as it always did for a plain
+/// key); any other press closes the memory, since a Backspace after it
+/// erases something this host did not price. The memory as a whole is
+/// bounded at [`Self::CAP`], oldest entries out first, whatever grew it —
+/// the bound lives here so no grower can forget it. Capacity is reused
+/// across commits: the steady typing path allocates nothing.
+#[derive(Default)]
+pub(crate) struct ErasePriceMemory(Vec<u16>);
+
+impl ErasePriceMemory {
+    /// How many entries the memory keeps: the engine's press bank depth
+    /// (`TYPED_STAMP_DEPTH`) — a Backspace past it erases something no press
+    /// in the ring can still be charged for, and the whole-press retire it
+    /// falls to takes at most one press per erase.
+    pub(crate) const CAP: usize = crate::cursor_glow::TYPED_STAMP_DEPTH;
+
+    /// One typed glyph's width, behind everything already priced.
+    fn push(&mut self, width: u16) {
+        self.0.push(width);
+        self.trim();
+    }
+
+    /// A committed Text/IME run, one width per grapheme in order
+    /// ([`committed_grapheme_cells_into`]).
+    fn price_graphemes(&mut self, text: &str, ambiguous_width_double: bool) {
+        committed_grapheme_cells_into(text, ambiguous_width_double, &mut self.0);
+        self.trim();
+    }
+
+    /// `n` priced zeros — a paste's graphemes, each an erase that retires
+    /// nothing of the press ring.
+    fn push_zeros(&mut self, n: usize) {
+        self.0.extend(std::iter::repeat_n(0u16, n));
+        self.trim();
+    }
+
+    /// The price of the glyph the newest Backspace erases: the newest entry,
+    /// or `None` for the engine's whole-press retire.
+    fn pop(&mut self) -> Option<u16> {
+        self.0.pop()
+    }
+
+    /// Close the memory: a press that moved the erase point, took the row
+    /// or banked nothing.
+    fn clear(&mut self) {
+        self.0.clear();
+    }
+
+    /// The bound: newest kept (a Backspace prices from the back).
+    fn trim(&mut self) {
+        let excess = self.0.len().saturating_sub(Self::CAP);
+        if excess > 0 {
+            self.0.drain(..excess);
+        }
+    }
+
+    #[cfg(test)]
+    fn widths(&self) -> &[u16] {
+        &self.0
+    }
 }
 
 fn committed_char_cells(ch: char, ambiguous_width_double: bool) -> u16 {
@@ -3078,6 +3480,23 @@ fn feed_classified_press<T>(
             }
         }
     }
+}
+
+/// Revoke the cohort of one dispatch that did not reach the wire, on both
+/// engines: a key queued behind a draining paste, a paste enqueued or
+/// handed to a detached writer, an inline write that failed. A QUEUED
+/// dispatch keeps its press credit — the bytes will reach the wire and
+/// echo, and the credit pays for that echo (the licence itself comes back
+/// at delivery through the ticket) — where a FAILED write takes the credit
+/// too; the classic trail follows the glow's stamp either way. Timestamp
+/// matched, so a newer dispatch's licence is untouched.
+fn revoke_dispatch(ws: &mut crate::WindowState, at: std::time::Instant, write_failed: bool) {
+    if write_failed {
+        ws.cursor_glow.revoke_failed_input_at(at);
+    } else {
+        ws.cursor_glow.revoke_input_hints_at(at);
+    }
+    ws.cursor_trail.revoke_input_hints_at(at);
 }
 
 impl App {
@@ -4180,44 +4599,32 @@ impl App {
                 // are indistinguishable in every observable variable and can
                 // therefore only be told apart by what this seam knew.
                 let press_kind = PressKind::of(is_release, is_repeat, inert_modifier);
-                // A PRESS THE TTY WILL NOT ECHO BANKS NO CREDIT
-                // (2026-09-12, the `read -s` half of the same-row
-                // swallowed-press residual). iTerm2's password-mode
-                // rule, read off the session's pty master at the key
-                // (`SinkWriter::tty_echo`, one `tcgetattr`; the
-                // master reflects the slave's termios — aterm-pty's
-                // `spawned_pty_carries_iutf8_and_b230400`): in
-                // CANONICAL NO-ECHO mode (`ECHO` clear, `ICANON` set —
-                // `read -s`, `sudo`, an `ssh` passphrase, `passwd`,
-                // `getpass`) the kernel owns the echo and has said it
-                // will not do it, so this press will never land on
-                // the screen and there is no cell for its credit to
-                // pay for. It arms no typed licence, banks no press
-                // credit and publishes no typed delivery ticket —
-                // nothing a program write on that row inside the
-                // ten-second patience could spend as a phantom.
-                // Deliberately NOT the raw case (`ECHO` clear, `ICANON`
-                // clear): a program that took the tty raw — Claude
-                // Code's `setRawMode`, vim, less, and readline / ZLE
-                // at rest between keys (measured 2026-09-12: the bash
-                // and zsh prompts sit in exactly `read -s -n 3`'s
-                // lflag) — draws its own echo, and those presses
-                // banking is the stall fix's whole premise. `None`
-                // (a pipe sink, the `-1` sentinel, ConPTY) learns
-                // nothing and banks as ever: the read can only ever
-                // WITHHOLD on positive evidence. Everything else
-                // about the press — the PTY write, the pet, the click,
-                // the cadence, the classic trail — is unchanged. One
-                // `ioctl` per PRINTABLE PRESS only: a release, a chord
-                // and a nav key never read the tty.
+                // A PRESS THE TTY WILL NOT ECHO BANKS NOTHING — iTerm2's
+                // password-mode rule, read off the session's pty master at
+                // the key (`SinkWriter::tty_swallows_input`, one
+                // `tcgetattr`; the four corners are the `TtyEcho` doc): a
+                // press into canonical no-echo mode (`read -s`, `sudo`, an
+                // `ssh` passphrase) will never land on the screen, so there
+                // is no cell for its credit to pay for — no typed licence
+                // on either engine, no press credit, no insert or gesture
+                // licence, no ticket; nothing a program write on that row
+                // inside the ten-second patience could spend as a phantom.
+                // Read for printable presses and a bare Tab / ⌃V only (a
+                // release, a chord and a nav key never read the tty), and
+                // withholding on positive evidence alone: `None` banks as
+                // ever. The PTY write, the pet, the click and the cadence
+                // are unchanged.
                 let tty_swallows = input_now.is_some()
-                    && typed_forward == Some(true)
-                    && sink.tty_echo().is_some_and(|echo| echo.swallows_input());
+                    && (typed_forward == Some(true) || insert_tab || paste_chord_key)
+                    && sink.tty_swallows_input();
                 // A press the typed arm below WITHHELD for that reason. Its
                 // `swallowed_no_echo=` tally is taken after the PTY write,
                 // not at the key: the count is of presses the tty swallowed,
                 // and a press whose write fails never reached it.
                 let mut swallowed_press = false;
+                // Whether the press armed the composer-newline class (read
+                // under the term lock below); the delivery ticket mirrors it.
+                let mut composer_newline = false;
                 // The LICENSE is stamped only on a press-like event; a
                 // release can neither grant one nor spend one.
                 if let Some(input_now) = input_now {
@@ -4301,7 +4708,7 @@ impl App {
                         bed: self.config.trail_sound_bed_or_default(),
                         tone_melody: self.config.tone_melody_or_default(),
                     });
-                    // THE DELIVERED-INSERT ARM'S STYLE GATE (2026-09-12): a bare
+                    // THE DELIVERED-INSERT ARM'S STYLE GATE: a bare
                     // Tab / ⌃V arms the insert licence for Rainbow Kitty ONLY —
                     // the gate the paste's delivery edge already applies
                     // (`tick_cursor_fx`), so the host arms the class for that
@@ -4311,6 +4718,7 @@ impl App {
                     // (the same cached-presentation read the click makes), and
                     // only for the two keys that could arm it.
                     let insert_gesture_armed = (insert_tab || paste_chord_key)
+                        && !tty_swallows
                         && matches!(
                             self.glow_style(),
                             crate::cursor_glow::GlowStyle::RainbowKitty
@@ -4494,8 +4902,7 @@ impl App {
                             // nothing to supersede
                         } else if typed_press_supersede || typed_enter || tab_key || paste_chord_key
                         {
-                            ws.cursor_glow.supersede_typed_press(input_now);
-                            ws.cursor_trail.supersede_typed_press();
+                            ws.cursor_glow.supersede_typed_press();
                         } else {
                             ws.cursor_glow.clear_typed(input_now);
                             ws.cursor_trail.clear_typed();
@@ -4575,14 +4982,8 @@ impl App {
                             // glyphs; a zero-width cluster in it is a priced
                             // 0), or `None` — nothing remembered — for the
                             // engine's whole-press retire.
-                            let erased = ws.typed_glyph_widths.pop();
+                            let erased = ws.erase_prices.pop();
                             ws.cursor_glow.note_backspace_erasing(input_now, erased);
-                        } else if !inert_modifier {
-                            // Any other press closes the memory: a Backspace
-                            // after it erases something this dispatch did not
-                            // price (the typed arm below refills it for its
-                            // own graphemes).
-                            ws.typed_glyph_widths.clear();
                         }
                         // Feed only classifier/cadence state here. The
                         // LICENSE itself is stamped below, per class: plain
@@ -4590,10 +4991,32 @@ impl App {
                         // therefore stay dark, however fresh their classifier
                         // timestamps are.
                         let shift_enter_insert = enter_like && !typed_enter && is_alt;
+                        // A press the typed arm below prices into the memory,
+                        // grapheme by grapheme — a glyph, a committed IME run,
+                        // a composer newline — provided the tty will echo it.
+                        let prices_typed_glyphs = typed_forward == Some(true)
+                            && (!enter_like || shift_enter_insert)
+                            && !tty_swallows;
+                        if typed_forward != Some(false) && !inert_modifier && !prices_typed_glyphs {
+                            // Any other press closes the memory: a Backspace
+                            // after it erases something this dispatch did not
+                            // price — an arrow moved the erase point, a kill
+                            // or an Enter took the row, a swallowed glyph
+                            // banked nothing. A TYPED press KEEPS it and
+                            // appends its own widths: the memory is the row's
+                            // erasable tail in order, the paste's zeros
+                            // behind the run's glyphs behind the new key's,
+                            // so `abc`, paste `yz`, `d`, ⌫⌫⌫⌫ retires `d`,
+                            // nothing for `z`, nothing for `y`, then `c` (a
+                            // clear on every press had the second Backspace
+                            // take `c` for the pasted `z`).
+                            ws.erase_prices.clear();
+                        }
                         // Composer-newline remains a useful morphology hint for
                         // non-movement consumers, but it is never provenance.
                         if shift_enter_insert {
                             ws.cursor_glow.note_newline_break(input_now);
+                            composer_newline = true;
                         }
                         if typed_forward == Some(true) && (!enter_like || shift_enter_insert) {
                             // WIDTH-CREDIT PRICING (2026-08-15, "the rainbow
@@ -4645,19 +5068,30 @@ impl App {
                                 );
                                 // …and the widths BEHIND that one price, per
                                 // grapheme, for the Backspace that erases one
-                                // of them (`typed_glyph_widths`): an IME run
+                                // of them (`ErasePriceMemory`): an IME run
                                 // is banked as one press, and a Backspace
                                 // gives back one glyph of it, not the run.
                                 match ime {
-                                    Some(text) => committed_grapheme_cells_into(
-                                        text,
-                                        ambiguous_width_double,
-                                        &mut ws.typed_glyph_widths,
-                                    ),
-                                    None => ws.typed_glyph_widths.push(typed_cells),
+                                    Some(text) => ws
+                                        .erase_prices
+                                        .price_graphemes(text, ambiguous_width_double),
+                                    None => ws.erase_prices.push(typed_cells),
                                 }
+                                // The classic trail's stamp goes with the
+                                // glow's, IN LOCKSTEP: the trail's
+                                // `note_typed` is the glow's typed-stamp
+                                // twin (`CursorTrail::move_licensed`), so a
+                                // swallowed press arms neither — matching
+                                // the queued path, which never re-banks the
+                                // trail for one. Nothing asserts the
+                                // lockstep at runtime (the two engines
+                                // differ by design after a bare Backspace or
+                                // a moving kill); it is pinned per pty by
+                                // `a_press_the_tty_will_not_echo_banks_no_credit`
+                                // and, for the delivery path, by the
+                                // queued-delivery tests under `comet`.
+                                ws.cursor_trail.note_typed(input_now);
                             }
-                            ws.cursor_trail.note_typed(input_now);
                             // CLICK AT THE KEY, not at the echo (touch-to-glass
                             // audio): past ~20 ms a click stops feeling attached
                             // to the key, and echo time can lag by tens to
@@ -4832,40 +5266,35 @@ impl App {
                             ws.cursor_glow.note_return(input_now);
                             ws.cursor_trail.note_return(input_now);
                         }
-                        // Tab is a USER GESTURE (2026-08-30): a completion
-                        // sweep is the keyboard's own echo, and an unlicensed
-                        // one printed as the mid-band 8-cell hole. The gesture
-                        // hint is depth-1/consume-once too, and
-                        // `note_user_gesture` keeps the banked typed stamps
-                        // (the supersede shape) so mid-burst in-flight glyph
-                        // echoes stay licensed under their own class.
-                        // A TAB IS A DELIVERED INSERT TOO (2026-09-10): its
-                        // completion's width is unknowable from one `\t`
-                        // byte, so the engine takes the gesture cap as its
-                        // bound; its write is inline, so dispatch is
-                        // delivery. The gesture class stays armed beside it
-                        // for a cross-row completion and for the classic
-                        // trail's lockstep; a same-row completion is laid as
-                        // one sweep by the insert arm (where, under a hidden
-                        // caret, the gesture never reached the anchored lane
-                        // and the visible-caret one flew a wake + meteor).
-                        // A bare ⌃V — an app's own clipboard insert, Claude
-                        // Code's `[Image #1] ` — is the same gesture. Armed
-                        // under Rainbow Kitty only (`insert_gesture_armed`),
-                        // like the paste's delivery edge.
-                        // ONLY A BARE TAB IS AN INSERT (2026-09-11): ⇧Tab
-                        // and the modified Tabs keep the gesture class (a
-                        // reverse menu-complete is still a completion sweep
-                        // to the classic trail) but arm no insert — the
-                        // stamp is bound to the hand's row and spent once,
-                        // and a mode cycle has no echo for it to spend on.
-                        if tab_key || paste_chord_key {
+                        // A TAB / ⌃V IS A USER GESTURE — a completion sweep
+                        // or an app's own clipboard insert (Claude Code's
+                        // `[Image #1] `) is the keyboard's own echo, and an
+                        // unlicensed one printed as the mid-band 8-cell
+                        // hole: a one-shot move licence on both engines,
+                        // bank-preserving (`note_user_gesture` keeps the
+                        // typed stamps of glyphs still in flight). A BARE
+                        // one is also a delivered insert of unknown width
+                        // (one `\t` byte cannot say how wide its completion
+                        // is, so the engine takes the gesture cap as the
+                        // bound; the write is inline, so dispatch is
+                        // delivery, armed without the late-receipt claim
+                        // since a hop refused before the press is program
+                        // output), Rainbow Kitty only (`insert_gesture_armed`)
+                        // like the paste's delivery edge — a same-row
+                        // completion is laid as one sweep by the insert
+                        // arm, the gesture class beside it for a cross-row
+                        // completion and the classic trail. Both are
+                        // withheld when the tty swallows the press; a
+                        // modified Tab (⇧Tab, a mode cycle) keeps the
+                        // gesture and arms no insert, having no echo for
+                        // the stamp to spend on.
+                        if (tab_key || paste_chord_key) && !tty_swallows {
                             ws.cursor_glow.note_user_gesture(input_now);
                             ws.cursor_trail.note_user_gesture(input_now);
                         }
                         if insert_gesture_armed {
                             ws.cursor_glow
-                                .note_insert_delivered(input_now, InsertWidth::Unknown);
+                                .note_insert_armed(input_now, InsertWidth::Unknown);
                         }
                         // ...except NAVIGATION, which re-stamps its own class:
                         // a press whose whole purpose is to move the cursor is
@@ -5070,20 +5499,49 @@ impl App {
                 // common inline one — so the classified cosmetic feeds below can still
                 // read it after the dispatch (see their note on why they now run AFTER
                 // the write).
-                // THE DELIVERY TICKET (2026-09-10): if this key is queued
-                // behind a draining paste, its arrival-time licence is revoked
-                // below and the writer thread's completed write re-stamps it —
-                // a Tab / ⌃V as a delivered insert of unknown width, a plain
-                // glyph as a delivered typed stamp. Inline writes carry none.
-                // A press the tty will not echo (`tty_swallows`, above)
-                // carries no typed ticket either: the writer thread's
-                // completed write must not re-stamp what the key never
-                // banked.
-                let delivery_ticket = Some(DeliveryTicket {
-                    insert: (insert_tab || paste_chord_key).then_some(InsertWidth::Unknown),
-                    typed: typed_forward == Some(true) && !enter_like && !tty_swallows,
-                })
-                .filter(|ticket| !ticket.is_empty());
+                // THE DELIVERY TICKET: if this key is queued behind a
+                // draining paste, its arrival-time licence is revoked below
+                // and the writer thread's completed write re-stamps it — a
+                // Tab / ⌃V as a delivered insert of unknown width, every key
+                // as its one class. Inline writes carry none. A press the
+                // tty will not echo (`tty_swallows`, above) tickets neither
+                // the typed, the insert nor the gesture half: the completed
+                // write must not re-stamp what the key never banked. A key
+                // RELEASE (Kitty REPORT_EVENT_TYPES) carries no ticket at
+                // all — it banked nothing at dispatch, so a key-up queued
+                // behind a paste has nothing to re-stamp (one press, one
+                // stamp; one Tab, one insert licence).
+                let delivery_ticket = input_now.map(|dispatched| DeliveryTicket {
+                    insert: (insert_tab || paste_chord_key)
+                        .then_some(InsertWidth::Unknown)
+                        .filter(|_| !tty_swallows),
+                    window: Some(wid),
+                    key: if typed_forward == Some(true) && !enter_like && !tty_swallows {
+                        Some(DeliveredClass::Typed)
+                    } else if is_plain_enter(&ev) {
+                        Some(DeliveredClass::Return)
+                    } else if composer_newline {
+                        Some(DeliveredClass::Newline)
+                    } else if navigation_key {
+                        Some(DeliveredClass::Nav)
+                    } else if typed_forward == Some(false) {
+                        Some(DeliveredClass::Erase)
+                    } else if kill_key {
+                        Some(DeliveredClass::Kill {
+                            moves_cursor: kill_moves,
+                            word: kill_word,
+                        })
+                    } else if (tab_key || paste_chord_key) && !tty_swallows {
+                        // The gesture half follows the tty's verdict
+                        // like the typed and insert halves: a queued
+                        // Tab the kernel will not echo re-stamps no
+                        // class at delivery either.
+                        Some(DeliveredClass::Gesture)
+                    } else {
+                        None
+                    },
+                    dispatched_at: dispatched,
+                });
                 let (receipt, wrote_inline) = paste_order::ordered_or_inline(
                     &term,
                     &modes,
@@ -5118,25 +5576,19 @@ impl App {
                     ws.cursor_pet.note_console_input(now, kind);
                 }
                 // A queued key has not crossed the PTY boundary yet, and a
-                // failed inline write never will. Its arrival-time cursor
-                // licences must not be spendable by concurrent program output.
-                // This whole method is one event-loop turn, so effects cannot
-                // tick between the arm above and this timestamp-specific
-                // revoke; the safe cost is only missing cosmetics for the
-                // eventual queued echo. The PRESS CREDIT goes only with a
-                // FAILED write (2026-09-12): a queued key will reach the wire
-                // and echo, and its credit is what pays for that echo (its
-                // stamp is re-banked at delivery, `note_typed_stamp_delivered`).
+                // failed inline write never will: its arrival-time licences
+                // must not be spendable by concurrent program output. This
+                // whole method is one event-loop turn, so no effect tick
+                // observes the arm above before this timestamp-matched
+                // revoke; the licence comes back at delivery through the
+                // ticket's key class — every class the revoke clears — so
+                // the queued echo is lit exactly as the inline key's
+                // (`revoke_dispatch` says which engine keeps what).
                 if (!wrote_inline || outcome == InputOutcome::WriteFailed)
                     && let Some(armed_at) = input_now
                     && let Some(ws) = self.windows.get_mut(&wid)
                 {
-                    if outcome == InputOutcome::WriteFailed {
-                        ws.cursor_glow.revoke_failed_input_at(armed_at);
-                    } else {
-                        ws.cursor_glow.revoke_input_hints_at(armed_at);
-                    }
-                    ws.cursor_trail.revoke_input_hints_at(armed_at);
+                    revoke_dispatch(ws, armed_at, outcome == InputOutcome::WriteFailed);
                 }
                 // The PTY write has now RETURNED — close the key→write latency slice
                 // here (a press-path key only), so it isolates a blocking WriteFile
@@ -6212,6 +6664,25 @@ impl App {
         if movement_capable && let Some(ws) = self.windows.get_mut(&wid) {
             ws.cursor_glow.note_user_gesture(input_now);
             ws.cursor_trail.note_user_gesture(input_now);
+            // THE BACKSPACE PRICE MEMORY: the pasted glyphs sit between the
+            // last typed press and any Backspace that follows, so each such
+            // erase is the paste's and retires nothing of the press ring —
+            // a priced 0 per grapheme, appended (never a clear: an unpriced
+            // erase takes the whole newest press, the very glyphs the paste
+            // lies in front of). EVERY grapheme, a line break included: the
+            // line editors a paste lands in — ZLE, readline, Claude Code's
+            // composer — keep a pasted newline in the buffer as one
+            // erasable unit, so it is one Backspace's priced 0 exactly; and
+            // where a program collapses one, the extra 0 only delays the
+            // whole-press retire by one erase, the safer error (a missing 0
+            // charges a typed glyph's press for pasted text). Bounded as a
+            // whole, oldest first out (`ErasePriceMemory`).
+            if let InputEvent::Paste(text, _) = &ev {
+                let n = aterm_grapheme::split_graphemes(text)
+                    .take(ErasePriceMemory::CAP)
+                    .count();
+                ws.erase_prices.push_zeros(n);
+            }
             // THE UP-STRUM (RAINBOW-KITTY-V2.md §28, the even hand): a paste's
             // one sound, keyed off the event KIND here — a human's Cmd-V and
             // an agent's `paste` / `turn` remainder alike — and voiced by the
@@ -6224,12 +6695,12 @@ impl App {
                 w.request_redraw();
             }
         }
-        // THE DELIVERY TICKET (2026-09-10, "the image insert breaks the
-        // rainbow"): the insert's cell width, priced from the very text
-        // going on the wire (the formatter's sanitizer, then the grapheme
-        // width under the terminal's ambiguous-width mode), rides the FIFO
-        // job; the writer thread's completed write publishes it and the
-        // render prelude arms the engine's DELIVERED-INSERT licence with it.
+        // THE DELIVERY TICKET: the insert's cell width, priced from the very
+        // text going on the wire (the formatter's sanitizer, then the
+        // grapheme width under the terminal's ambiguous-width mode), rides
+        // the FIFO job; the writer thread's completed write publishes it and
+        // the render prelude arms the engine's DELIVERED-INSERT licence with
+        // it.
         // A body whose width the text cannot say (a TAB, a line break, a body
         // past the price probe) is an insert of UNKNOWN width, bounded at the
         // engine's gesture cap — a same-row echo no wider than that (Claude
@@ -6248,25 +6719,23 @@ impl App {
             }
             _ => None,
         };
-        // THE PASSWORD-MODE RULE, the paste half (2026-09-13): a paste into
-        // a tty in CANONICAL NO-ECHO mode (`read -s`, `sudo`, an `ssh`
-        // passphrase) will never be echoed, so there is no cell for an
-        // insert licence to pay for — the same verdict the press path reads
-        // off the master's termios (`tty_swallows`), read once per paste,
-        // and withholding only on POSITIVE evidence (`None` — a pipe sink,
-        // the `-1` sentinel, ConPTY — learns nothing and tickets as ever; a
-        // raw-mode program echoes for itself and keeps its ticket). Without
-        // this the paste armed a two-second same-row licence a program
-        // print on that row could spend as a phantom. The bytes, the
-        // gesture stamp, the up-strum and the pet note are unchanged.
-        let tty_swallows =
-            movement_capable && sink.tty_echo().is_some_and(|echo| echo.swallows_input());
+        // THE PASSWORD-MODE RULE, the paste half: a paste into a tty in
+        // canonical no-echo mode (`read -s`, `sudo`, an `ssh` passphrase)
+        // will never be echoed, so there is no cell for an insert licence to
+        // pay for — a two-second same-row licence a program print on that
+        // row could spend as a phantom. The same verdict the press path
+        // reads (`SinkWriter::tty_swallows_input`), read once per paste and
+        // withholding on positive evidence alone; the bytes, the gesture
+        // stamp, the up-strum and the pet note are unchanged.
+        let tty_swallows = movement_capable && sink.tty_swallows_input();
         let ticket = insert
             .filter(|width| *width != InsertWidth::Cells(0))
             .filter(|_| !tty_swallows)
             .map(|width| DeliveryTicket {
                 insert: Some(width),
-                typed: false,
+                window: None,
+                key: None,
+                dispatched_at: input_now,
             });
         // Enqueue the paste on the session's ordered FIFO: it writes OFF the UI
         // thread (a 16 MiB paste into a stalled child must never block the event
@@ -6274,7 +6743,7 @@ impl App {
         // the child sees the paste before that later input. Falls back to a
         // detached write only if the FIFO writer thread could not be spawned.
         match paste_order::enqueue(term, modes, sink, echo, ev, ticket) {
-            Ok(_queued_behind_existing) => {}
+            Ok(()) => {}
             Err(ev) => {
                 let term = term.clone();
                 let modes = modes.clone();
@@ -6284,15 +6753,15 @@ impl App {
                     // Detached paste fallback: expendable thread, block under
                     // SPILL_CAP. ONE contract with the FIFO: its completion
                     // publishes the same delivery ticket.
-                    let write = echo.begin_ticketed(OutputEchoInput::Echoable, ticket);
-                    let receipt = input::seam_egress_receipt(
+                    tracked_egress_ticketed(
                         &term,
                         &modes,
                         &sink,
+                        &echo,
                         &ev,
                         input::EgressMode::Backpressured,
+                        ticket,
                     );
-                    write.finish(receipt, &sink);
                 });
             }
         }
@@ -6304,11 +6773,10 @@ impl App {
         // stamped above, timestamp-matched so a newer key's licence (and
         // every banked typed stamp) is untouched. The DELIVERED-INSERT
         // licence is stamped by the render prelude from the write's own
-        // receipt when the bytes land (2026-09-10) — enqueue is still not
-        // delivery, and the gesture class still carries no paste.
+        // receipt when the bytes land — enqueue is not delivery, and the
+        // gesture class carries no paste.
         if movement_capable && let Some(ws) = self.windows.get_mut(&wid) {
-            ws.cursor_glow.revoke_input_hints_at(input_now);
-            ws.cursor_trail.revoke_input_hints_at(input_now);
+            revoke_dispatch(ws, input_now, false);
             // One accepted paste gesture cancels curiosity. It is not a
             // claim that the asynchronous write landed or changed the grid.
             ws.cursor_pet
@@ -7545,10 +8013,8 @@ impl App {
         let paste_chord = mods.is_some_and(|m| m.control_key() && !m.alt_key() && !m.super_key())
             && matches!(base_logical_key(&ev), Key::Character(ref c) if c.eq_ignore_ascii_case("v"));
         if plain_typed_glyph || paste_chord {
-            let at = std::time::Instant::now();
             if let Some(ws) = self.windows.get_mut(&wid) {
-                ws.cursor_glow.supersede_typed_press(at);
-                ws.cursor_trail.supersede_typed_press();
+                ws.cursor_glow.supersede_typed_press();
             }
         } else if !keymap::press_is_inert(&ev) {
             // A BARE MODIFIER IS NOT A SUPERSESSION (2026-09-13). macOS
@@ -10126,9 +10592,7 @@ impl App {
         let reaches_pty = !text.is_empty() && matches!(route, PreeditOwner::Grid);
         if reaches_pty {
             if let Some(ws) = self.windows.get_mut(&wid) {
-                ws.cursor_glow
-                    .supersede_typed_press(std::time::Instant::now());
-                ws.cursor_trail.supersede_typed_press();
+                ws.cursor_glow.supersede_typed_press();
             }
         } else {
             self.clear_move_license(wid);
@@ -14700,6 +15164,15 @@ mod press_path_lock_elision_tests {
     /// shipped 0.67.0 shape), this fails at the first assert with
     /// `spawns == 0`: the Enter both destroyed the bank and arrived
     /// licenseless, the measured deterministic +1 no-fresh-hint per Enter.
+    ///
+    /// The tail changed twice on 2026-09-13. The audit made a stamp a
+    /// licence only while its press is unpaid, and with the Return taken
+    /// class-blind by `g`'s `+1` (and `i` forgotten with it) read the second
+    /// echo as a refused program hop. The review then made the Return's
+    /// take class-aware: a same-row forward hop with a typed pair is a
+    /// glyph's echo, never the Return's move, so `g`'s and `i`'s echoes are
+    /// licensed by their own presses, the Return is kept for the row change
+    /// it licenses, and the flood after that is still refused.
     #[cfg(unix)]
     #[test]
     fn plain_enter_licenses_its_response_and_keeps_banked_stamps() {
@@ -14819,32 +15292,47 @@ mod press_path_lock_elision_tests {
         );
         let _ = drain(pipe);
         let ws = app.windows.get_mut(&wid).unwrap();
-        // The Enter's coalesced response move is licensed (`note_return` armed;
-        // spawn also pops the oldest banked stamp, class-blind)…
+        // The first observed move is `g`'s echo — a same-row `+1` with a
+        // typed pair — licensed by its own stamp and press and NOT the
+        // Return's (2026-09-13 review): the Return hint is kept for its own
+        // row change and `i`'s press stays in flight. (The audit's 2026-09-13
+        // rewrite had the Return taken class-blind here and `i` forgotten,
+        // which left `i`'s echo dark; before that the dangling stamp laid
+        // it by accident.)
         let e1 = Instant::now();
         ws.cursor_glow
             .tick(Some((0, 1)), e1, &glow_cfg, geom, &mut out);
         assert_eq!(
             ws.cursor_glow.spawns(),
             1,
-            "Enter's own response move must be licensed (was: deterministic no-fresh-hint +1 per Enter)"
+            "the first glyph's echo is licensed"
         );
-        // …and the surviving banked stamp still licenses the in-flight echo.
-        ws.cursor_glow.tick(
-            Some((2, 0)),
-            e1 + Duration::from_millis(16),
-            &glow_cfg,
-            geom,
-            &mut out,
+        assert_eq!(
+            ws.cursor_glow.in_flight_tally().credits,
+            1,
+            "`i` is still in flight after `g`'s echo — the Return forgot nothing"
         );
+        // …the bank survived it (the second glyph's stamp is still there —
+        // the pre-fix `clear_typed` would have emptied it)…
+        let e2 = e1 + Duration::from_millis(16);
+        assert!(
+            ws.cursor_glow.move_licensed(e2),
+            "banked typed stamps must survive a plain Enter"
+        );
+        // …and licenses `i`'s echo: the in-flight glyph echo that precedes
+        // a Return's own move is lit by its credit (§17.3).
+        ws.cursor_glow
+            .tick(Some((0, 2)), e2, &glow_cfg, geom, &mut out);
         assert_eq!(
             ws.cursor_glow.spawns(),
             2,
-            "banked typed stamps must survive a plain Enter"
+            "the in-flight glyph echo after a plain Enter is licensed"
         );
-        // Depth-1/consume-once: everything is spent — a program flood declines.
+        assert_eq!(ws.cursor_glow.in_flight_tally().credits, 0);
+        // The Return's own move — the row change — is licensed by
+        // `note_return` (was: deterministic no-fresh-hint +1 per Enter).
         ws.cursor_glow.tick(
-            Some((3, 0)),
+            Some((2, 0)),
             e1 + Duration::from_millis(32),
             &glow_cfg,
             geom,
@@ -14852,7 +15340,20 @@ mod press_path_lock_elision_tests {
         );
         assert_eq!(
             ws.cursor_glow.spawns(),
-            2,
+            3,
+            "Enter's own response move must be licensed"
+        );
+        // Depth-1/consume-once: everything is spent — a program flood declines.
+        ws.cursor_glow.tick(
+            Some((3, 0)),
+            e1 + Duration::from_millis(48),
+            &glow_cfg,
+            geom,
+            &mut out,
+        );
+        assert_eq!(
+            ws.cursor_glow.spawns(),
+            3,
             "the return license is consume-once — a program flood after it stays dark"
         );
     }
@@ -16842,7 +17343,7 @@ mod paste_cursor_gesture_tests {
             && let Some((at, ticket)) = batch.items[0]
             && let Some(width) = ticket.insert
         {
-            glow.note_insert_delivered(at, width);
+            glow.note_insert_delivered_from(at, at, width);
         }
         glow.tick(Some((2, 2 + hop)), now, &cfg, geom, &mut out);
         let licence = glow.admission_log().last().map_or("no-row", |r| r.licence);
@@ -16906,6 +17407,297 @@ mod paste_cursor_gesture_tests {
         let (spawns, _, width) = delivered_paste_then_hop("a\tb", cap + 1, true);
         assert_eq!(width, Some(InsertWidth::Unknown));
         assert_eq!(spawns, 0, "…and an echo past the cap is not");
+    }
+
+    /// A QUEUED KEY'S RECEIPT RE-STAMPS ONLY THE WINDOW THAT TYPED IT
+    /// (2026-09-13 audit, host-seam R2-5). Two windows on one session: the
+    /// dispatch banks the press credit and the v2 `Typed` on the
+    /// dispatching window's engine alone, but the receipt lives in the
+    /// session's tracker and the prelude applied its typed half on
+    /// whichever window read it — window B, which banked no press and no
+    /// credit, was handed a bare stamp (the dangling-stamp shape) for a
+    /// key typed in A while a paste drained, where the same key written
+    /// inline leaves B unlicensed. The typed half of the ticket now names
+    /// the dispatching window and is applied there only; the insert half
+    /// stays session-wide (a paste needs no per-window credit), so B still
+    /// arms a delivered paste's licence.
+    /// scope-waiver: "session-wide" here names the insert half's FAN-OUT (the
+    /// session's receipt is read by every window fronting it), not a safety
+    /// budget or a multiplying enforcer.
+    ///
+    /// RED before the fix: `queued=true: window B move_licensed=true
+    /// credits=0`.
+    ///
+    /// Run under `comet` as well (2026-09-14 audit of the audits, R2-2):
+    /// the classic trail's typed twin in the prelude had no witness — it
+    /// could be deleted with every gui test green — so under `comet` A's
+    /// trail is read beside its glow; B's trail was already read dark.
+    #[cfg(unix)]
+    #[test]
+    fn a_queued_keys_receipt_stamps_only_the_window_that_typed_it() {
+        use crate::app_render::CursorFxInputs;
+        use aterm_types::keyboard::{Key, KeyEventType, Modifiers};
+        for style in ["rainbow kitty", "comet"] {
+            for queued in [false, true] {
+                let mut pipe = [0; 2];
+                assert_eq!(unsafe { libc::pipe(pipe.as_mut_ptr()) }, 0);
+                let sink = Arc::new(SinkWriter::new(pipe[1]));
+                let master = sink.master();
+                let mut app = App::headless_for_test_with_sink(sink.clone());
+                app.recompute_sparkle();
+                app.config.motion = Some("full".into());
+                app.config.cursor_trail = Some(true);
+                app.config.cursor_trail_style = Some(style.to_string());
+                app.config.trail_sounds = Some(false);
+                let wid_a = WindowId(0);
+                app.windows.get_mut(&wid_a).unwrap().focused = true;
+                app.frontmost_window = Some(wid_a);
+                let wid_b = app
+                    .open_active_session_in_new_window_logical()
+                    .expect("a second window on the session");
+                app.windows.get_mut(&wid_b).unwrap().focused = true;
+                // Both windows baseline on the register.
+                for w in [wid_a, wid_b] {
+                    let mut seed = CursorFxInputs::sample_for_test(Instant::now());
+                    seed.cur = Some((2, 2));
+                    app.tick_cursor_fx(w, seed).expect("seed");
+                }
+                let pin = queued.then(|| super::paste_order::pin_ordering_for_test(&sink));
+                app.frontmost_window = Some(wid_a);
+                assert_eq!(
+                    app.input(
+                        wid_a,
+                        InputEvent::Key {
+                            key: Key::Character('a'),
+                            mods: Modifiers::empty(),
+                            base_layout: None,
+                            event_type: KeyEventType::Press,
+                        },
+                        Source::Human
+                    ),
+                    crate::input::InputOutcome::Ok
+                );
+                drop(pin);
+                for _ in 0..400 {
+                    if !super::paste_order::is_ordering(master) {
+                        break;
+                    }
+                    std::thread::sleep(Duration::from_millis(1));
+                }
+                assert!(!super::paste_order::is_ordering(master));
+                let now = Instant::now();
+                let mut live = CursorFxInputs::sample_for_test(now);
+                live.cur = Some((2, 2));
+                app.tick_cursor_fx(wid_b, live).expect("B's prelude");
+                let b = &app.windows[&wid_b];
+                assert!(
+                    !b.cursor_glow.move_licensed(now),
+                    "{style} queued={queued}: window B typed nothing and banked nothing, yet holds a typed licence"
+                );
+                assert!(
+                    !b.cursor_trail.move_licensed(now),
+                    "{style} queued={queued}: the classic trail too"
+                );
+                assert_eq!(b.cursor_glow.in_flight_tally().credits, 0);
+                // …while A, which typed it, is licensed either way.
+                let mut live = CursorFxInputs::sample_for_test(now);
+                live.cur = Some((2, 2));
+                app.tick_cursor_fx(wid_a, live).expect("A's prelude");
+                assert!(
+                    app.windows[&wid_a].cursor_glow.move_licensed(now),
+                    "{style} queued={queued}: window A holds the key's licence"
+                );
+                if style == "comet" {
+                    // The trail's typed twin, re-stamped at delivery on the
+                    // dispatching window (its tick is disabled under rainbow
+                    // kitty, where it clears its hints every frame).
+                    assert!(
+                        app.windows[&wid_a].cursor_trail.move_licensed(now),
+                        "{style} queued={queued}: window A's classic trail holds the key's typed twin"
+                    );
+                }
+                // The one-shot classes are the dispatching window's too: an
+                // Enter typed in A behind a paste re-licenses A, never B.
+                let pin = queued.then(|| super::paste_order::pin_ordering_for_test(&sink));
+                assert_eq!(
+                    app.input(
+                        wid_a,
+                        InputEvent::Key {
+                            key: Key::Named(aterm_types::keyboard::NamedKey::Enter),
+                            mods: Modifiers::empty(),
+                            base_layout: None,
+                            event_type: KeyEventType::Press,
+                        },
+                        Source::Human
+                    ),
+                    crate::input::InputOutcome::Ok
+                );
+                drop(pin);
+                for _ in 0..400 {
+                    if !super::paste_order::is_ordering(master) {
+                        break;
+                    }
+                    std::thread::sleep(Duration::from_millis(1));
+                }
+                let now = Instant::now();
+                let mut live = CursorFxInputs::sample_for_test(now);
+                live.cur = Some((2, 2));
+                app.tick_cursor_fx(wid_b, live).expect("B's prelude");
+                assert!(
+                    !app.windows[&wid_b].cursor_glow.move_licensed(now),
+                    "{style} queued={queued}: window B did not press Enter, yet holds its return licence"
+                );
+                let mut live = CursorFxInputs::sample_for_test(now);
+                live.cur = Some((2, 2));
+                app.tick_cursor_fx(wid_a, live).expect("A's prelude");
+                assert!(
+                    app.windows[&wid_a].cursor_glow.move_licensed(now),
+                    "{style} queued={queued}: window A holds the Enter's licence"
+                );
+                // The insert half stays session-wide: a paste delivered on the
+                // session arms B's insert licence — the delivered-insert class
+                // is Rainbow Kitty's alone, so under `comet` it arms nothing.
+                assert_eq!(
+                    app.input(
+                        wid_a,
+                        InputEvent::Paste(
+                            "foo bar ".to_string(),
+                            crate::input::PasteFraming::AtDrain
+                        ),
+                        Source::Human
+                    ),
+                    crate::input::InputOutcome::Ok
+                );
+                for _ in 0..400 {
+                    if !super::paste_order::is_ordering(master) {
+                        break;
+                    }
+                    std::thread::sleep(Duration::from_millis(1));
+                }
+                let now = Instant::now();
+                let mut live = CursorFxInputs::sample_for_test(now);
+                live.cur = Some((2, 2));
+                app.tick_cursor_fx(wid_b, live).expect("B's prelude");
+                assert_eq!(
+                    app.windows[&wid_b].cursor_glow.insert_tally().delivered,
+                    u64::from(style == "rainbow kitty"),
+                    "{style} queued={queued}: the delivered paste arms B too"
+                );
+                drop(app);
+                drop(sink);
+                unsafe {
+                    libc::close(pipe[0]);
+                    libc::close(pipe[1]);
+                }
+            }
+        }
+    }
+
+    /// A GLYPH TYPED BEFORE THE ENTER'S RESPONSE LANDS keeps its own echo
+    /// (2026-09-14 audit, dataflow-typed-press-R1-1 — the host twin of the
+    /// engine pins). `ab⏎` then `c` 100 ms later, before the prompt came
+    /// back (a slow prompt: SSH, a starship / p10k precmd): the host's
+    /// typed arm used to drop the Return one-shot at `c`, so the prompt's
+    /// one-row response was judged under `c`'s fresh stamp as a typed
+    /// re-anchor — it spent `c`'s credit and popped its stamp — and `c`'s
+    /// own +1 was refused `no-fresh-hint`, a dark cell at the new prompt
+    /// with a phantom left of it. RED before the fix: `response (2,5)->(3,2):
+    /// ("key","licensed") credits 1 -> 0` then `the glyph's +1:
+    /// ("none","no-fresh-hint")`.
+    #[cfg(unix)]
+    #[test]
+    fn a_glyph_typed_before_the_enters_response_lands_keeps_its_own_echo() {
+        use crate::app_render::CursorFxInputs;
+        use aterm_types::keyboard::{Key, KeyEventType, Modifiers, NamedKey};
+        // A private sink: the ordering FIFO is keyed by the PTY master.
+        let mut pipe = [0; 2];
+        assert_eq!(unsafe { libc::pipe(pipe.as_mut_ptr()) }, 0);
+        let sink = Arc::new(SinkWriter::new(pipe[1]));
+        let mut app = App::headless_for_test_with_sink(sink.clone());
+        app.recompute_sparkle();
+        let wid = WindowId(0);
+        app.config.motion = Some("full".into());
+        app.config.cursor_trail = Some(true);
+        app.config.cursor_trail_style = Some("rainbow kitty".to_string());
+        app.config.trail_sounds = Some(false);
+        app.windows.get_mut(&wid).unwrap().focused = true;
+        app.frontmost_window = Some(wid);
+        let key = |character: char| InputEvent::Key {
+            key: Key::Character(character),
+            mods: Modifiers::empty(),
+            base_layout: None,
+            event_type: KeyEventType::Press,
+        };
+        let tick = |app: &mut App, now: Instant, cur: (u16, u16)| {
+            let mut live = CursorFxInputs::sample_for_test(now);
+            live.cur = Some(cur);
+            app.tick_cursor_fx(wid, live).expect("tick");
+        };
+        // `ab`, echoed per key, from the prompt at (2, 3).
+        let t0 = Instant::now();
+        tick(&mut app, t0, (2, 3));
+        assert_eq!(
+            app.input(wid, key('a'), Source::Human),
+            crate::input::InputOutcome::Ok
+        );
+        tick(&mut app, t0 + Duration::from_millis(5), (2, 4));
+        assert_eq!(
+            app.input(wid, key('b'), Source::Human),
+            crate::input::InputOutcome::Ok
+        );
+        tick(&mut app, t0 + Duration::from_millis(10), (2, 5));
+        // Enter, then `c` 100 ms later, before the prompt came back.
+        assert_eq!(
+            app.input(
+                wid,
+                InputEvent::Key {
+                    key: Key::Named(NamedKey::Enter),
+                    mods: Modifiers::empty(),
+                    base_layout: None,
+                    event_type: KeyEventType::Press,
+                },
+                Source::Human
+            ),
+            crate::input::InputOutcome::Ok
+        );
+        std::thread::sleep(Duration::from_millis(100));
+        assert_eq!(
+            app.input(wid, key('c'), Source::Human),
+            crate::input::InputOutcome::Ok
+        );
+        std::thread::sleep(Duration::from_millis(30));
+        assert_eq!(app.windows[&wid].cursor_glow.in_flight_tally().credits, 1);
+        // The response: the prompt one row down, caret at column 2.
+        tick(&mut app, Instant::now(), (3, 2));
+        let glow = &app.windows[&wid].cursor_glow;
+        assert_eq!(
+            glow.in_flight_tally().credits,
+            1,
+            "the Enter's response spends nothing of `c`'s: {:?}",
+            glow.admission_log()
+                .last()
+                .map(|r| (r.reason, r.licence, r.origin, r.target))
+        );
+        std::thread::sleep(Duration::from_millis(20));
+        // `c`'s own echo.
+        tick(&mut app, Instant::now(), (3, 3));
+        let glow = &app.windows[&wid].cursor_glow;
+        let row = glow
+            .admission_log()
+            .last()
+            .map(|r| (r.reason, r.licence, r.origin, r.target));
+        assert_eq!(
+            row.map(|r| (r.0, r.2, r.3)),
+            Some(("licensed", (3, 2), (3, 3))),
+            "the glyph's own echo is licensed: {row:?}"
+        );
+        assert_eq!(glow.in_flight_tally().credits, 0, "…and spends its credit");
+        drop(app);
+        drop(sink);
+        unsafe {
+            libc::close(pipe[0]);
+            libc::close(pipe[1]);
+        }
     }
 
     /// Drive the PRODUCTION delivery edge — the render prelude inside
@@ -17547,6 +18339,7 @@ mod vi_dispatch_tests {
 #[cfg(test)]
 mod typed_kitty_summon_tests {
 
+    use super::DeliveredClass;
     use crate::input::{InputEvent, Source};
     use crate::{App, WindowId, term_lock};
     use aterm_spec::derive::cursor_cat_model;
@@ -18262,9 +19055,9 @@ mod typed_kitty_summon_tests {
         let ctx = &app.pool.get(session).unwrap().ctx;
         let batch = ctx.output_echo.deliveries_after(&ctx.sink, Some(0), now);
         let (at, ticket) = batch.items[0].expect("the queued key's delivery receipt");
-        assert!(ticket.typed && ticket.insert.is_none());
+        assert!(ticket.key == Some(DeliveredClass::Typed) && ticket.insert.is_none());
         let ws = app.windows.get_mut(&wid).unwrap();
-        ws.cursor_glow.note_typed_stamp_delivered(at);
+        ws.cursor_glow.note_delivered(at, DeliveredClass::Typed);
         ws.cursor_trail.note_typed(at);
         ws.cursor_glow
             .tick(Some((2, 5)), now, &glow_cfg, geom, &mut out);
@@ -18277,6 +19070,520 @@ mod typed_kitty_summon_tests {
             ws.cursor_glow.admission_log().last().map(|r| r.licence),
             Some("key")
         );
+        unsafe {
+            libc::close(pipe[0]);
+            libc::close(pipe[1]);
+        }
+    }
+
+    /// A ONE-SHOT KEY QUEUED BEHIND A DRAINING PASTE KEEPS ITS LICENCE
+    /// (2026-09-13 audit, host-seam R2-3; widened by the review). The
+    /// delivery ticket carried only the insert and typed classes; a plain
+    /// Enter, a navigation key and a Backspace had their one-shot licences
+    /// (return / nav / quench + poof) revoked at enqueue and nothing
+    /// re-armed them at delivery, so the response, the jump or the erase
+    /// after a paste was dark where the same key written inline is
+    /// licensed — the measured "one unlit notch per Enter" (2026-08-30)
+    /// re-opened for the paste + Enter shape (Cmd-V then Enter into a slow
+    /// child is the common queued shape). The ticket now carries the class
+    /// and the prelude re-stamps it — a PURE re-stamp: the v2 `Return` /
+    /// `Erase` / `Kill` and the credit retire / quench thermals were
+    /// banked at dispatch and never revoked. The review closed the three
+    /// classes the audit had left revoked: a composer newline (Shift+Enter
+    /// on the alternate screen), a kill chord (^W — its retreat is licensed
+    /// by the nav stamp `note_kill` arms) and a Tab's gesture (beside the
+    /// delivered insert the same ticket already re-armed).
+    ///
+    /// RED before the fix: `verdicts (inline, queued): [("Enter", [true,
+    /// false]), ("ArrowLeft", [true, false]), ("Backspace", [true,
+    /// false])]` with no receipt published at all for the queued key; and
+    /// before the review's widening `classes == [None]` for Shift+Enter,
+    /// ^W and Tab with `move_licensed` false after the prelude.
+    ///
+    /// The CLASSIC TRAIL'S twins (2026-09-14 audit of the audits, R2-2):
+    /// under the nine classic styles the engine that lights is
+    /// `cursor_trail`, and its half of the prelude — the Return, nav and
+    /// gesture re-stamps — had no witness: each could be deleted with
+    /// every gui test green, so a queued Enter / arrow / Tab under `comet`
+    /// would go dark again unseen. The same cases now run under `comet`
+    /// too and read the trail beside the glow (under `rainbow kitty` the
+    /// trail's tick is disabled and clears its hints every frame, so only
+    /// the glow is read there; Newline, Erase and Kill have no trail twin).
+    #[cfg(unix)]
+    #[test]
+    fn a_queued_one_shot_key_keeps_its_licence_at_delivery() {
+        use crate::app_render::CursorFxInputs;
+        let chord = |key: Key, mods: Modifiers| InputEvent::Key {
+            key,
+            mods,
+            base_layout: None,
+            event_type: KeyEventType::Press,
+        };
+        let cases: [(&str, InputEvent, DeliveredClass, bool); 6] = [
+            (
+                "Enter",
+                named(NamedKey::Enter),
+                DeliveredClass::Return,
+                false,
+            ),
+            (
+                "Shift+Enter",
+                chord(Key::Named(NamedKey::Enter), Modifiers::SHIFT),
+                DeliveredClass::Newline,
+                true,
+            ),
+            (
+                "ArrowLeft",
+                named(NamedKey::ArrowLeft),
+                DeliveredClass::Nav,
+                false,
+            ),
+            (
+                "Backspace",
+                named(NamedKey::Backspace),
+                DeliveredClass::Erase,
+                false,
+            ),
+            (
+                "Ctrl+W",
+                chord(Key::Character('w'), Modifiers::CTRL),
+                DeliveredClass::Kill {
+                    moves_cursor: true,
+                    word: true,
+                },
+                false,
+            ),
+            ("Tab", named(NamedKey::Tab), DeliveredClass::Gesture, false),
+        ];
+        for style in ["rainbow kitty", "comet"] {
+            for (label, ev, class, alt_screen) in cases.clone() {
+                for queued in [false, true] {
+                    let (mut app, sink, pipe) = app_with_private_pty();
+                    let wid = WindowId(0);
+                    let master = sink.master();
+                    app.config.motion = Some("full".into());
+                    app.config.cursor_trail = Some(true);
+                    app.config.cursor_trail_style = Some(style.to_string());
+                    app.config.trail_sounds = Some(false);
+                    app.windows.get_mut(&wid).unwrap().focused = true;
+                    app.frontmost_window = Some(wid);
+                    let session = app.front_terminal(wid).unwrap().session;
+                    if alt_screen {
+                        // The composer newline is armed on the alternate screen
+                        // only (Claude Code's composer); the main screen's
+                        // Shift+Enter arms nothing and carries no class.
+                        let term = app.front_terminal(wid).expect("terminal").term.clone();
+                        term_lock(&term).process(b"\x1b[?1049h");
+                    }
+                    let mut seed = CursorFxInputs::sample_for_test(Instant::now());
+                    seed.cur = Some((2, 2));
+                    app.tick_cursor_fx(wid, seed).expect("seed");
+                    let pin = queued.then(|| super::paste_order::pin_ordering_for_test(&sink));
+                    assert_eq!(
+                        app.input(wid, ev.clone(), Source::Human),
+                        crate::input::InputOutcome::Ok,
+                        "{label}"
+                    );
+                    drop(pin);
+                    for _ in 0..400 {
+                        if !super::paste_order::is_ordering(master) {
+                            break;
+                        }
+                        std::thread::sleep(Duration::from_millis(1));
+                    }
+                    assert!(!super::paste_order::is_ordering(master));
+                    if queued {
+                        let ctx = &app.pool.get(session).unwrap().ctx;
+                        let batch =
+                            ctx.output_echo
+                                .deliveries_after(&ctx.sink, Some(0), Instant::now());
+                        let classes: Vec<_> =
+                            batch.items.iter().flatten().map(|(_, t)| t.key).collect();
+                        assert_eq!(
+                            classes,
+                            vec![Some(class)],
+                            "{label}: the queued key's receipt carries its class"
+                        );
+                    }
+                    let now = Instant::now();
+                    let mut live = CursorFxInputs::sample_for_test(now);
+                    live.cur = Some((2, 2));
+                    app.tick_cursor_fx(wid, live).expect("the prelude");
+                    assert!(
+                        app.windows[&wid].cursor_glow.move_licensed(now),
+                        "{style} {label} queued={queued}: the key's one-shot licence stands after the prelude"
+                    );
+                    // The classic trail's twin is re-stamped beside it; under
+                    // the rainbow kitty presentation the trail's tick is
+                    // disabled and clears its hints every frame, so it is read
+                    // under `comet` only, and only for the classes it stamps.
+                    if style == "comet"
+                        && matches!(
+                            class,
+                            DeliveredClass::Return | DeliveredClass::Nav | DeliveredClass::Gesture
+                        )
+                    {
+                        assert!(
+                            app.windows[&wid].cursor_trail.move_licensed(now),
+                            "{style} {label} queued={queued}: the classic trail's twin stands after the prelude"
+                        );
+                    }
+                    drop(app);
+                    drop(sink);
+                    unsafe {
+                        libc::close(pipe[0]);
+                        libc::close(pipe[1]);
+                    }
+                }
+            }
+        }
+    }
+
+    /// A TAB'S DISPATCH ARM CLAIMS NO HOP REFUSED BEFORE THE KEY (2026-09-13
+    /// audit, host-seam R2-1). A bare Tab / ⌃V is armed as a delivered
+    /// insert at dispatch — its write is inline — and the engine's
+    /// late-receipt claim then laid a same-row forward hop the seam had
+    /// refused up to 0.25 s BEFORE the key: a prompt print, a spinner tick
+    /// on the hand's row, program output that cannot be the completion,
+    /// lit as `insert`; the licence and the gesture one-shot were spent on
+    /// it and the real completion that followed was refused
+    /// `no-fresh-hint`. That backward window exists for a spill-held
+    /// receipt resolved at the reader's clock; at a synchronous dispatch
+    /// nothing of the key is on the wire yet. The dispatch now arms the
+    /// licence without the retro claim (`note_insert_armed`); a delivery
+    /// receipt (`note_insert_delivered`) still claims as before.
+    ///
+    /// RED before the fix: `after Tab (no echo yet): spawns=1 lit=1
+    /// last=Some(("insert", (2, 2), (2, 4)))`, then the 8-cell completion
+    /// `("none", "no-fresh-hint", (2, 4), (2, 12))`.
+    #[cfg(unix)]
+    #[test]
+    fn a_tabs_dispatch_arm_claims_no_hop_refused_before_the_key() {
+        use crate::cursor_glow::Geom;
+        use aterm_types::keyboard::NamedKey;
+
+        let (mut app, sink, pipe) = app_with_private_pty();
+        let wid = WindowId(0);
+        app.config.cursor_trail = Some(true);
+        app.config.cursor_trail_style = Some("rainbow kitty".to_string());
+        let glow_cfg = app.glow_config();
+        let geom = Geom {
+            cw: 8,
+            ch: 16,
+            rows: 24,
+            cols: 80,
+            origin_x: 0,
+            origin_y: 0,
+            win_w: 640,
+            win_h: 384,
+            head: 0,
+        };
+        let mut out = Vec::new();
+        let t0 = Instant::now();
+        {
+            let glow = &mut app.windows.get_mut(&wid).unwrap().cursor_glow;
+            glow.tick(Some((2, 2)), t0, &glow_cfg, geom, &mut out);
+            // A program's own same-row +2 (a prompt print) — no key behind
+            // it: refused, and remembered as the pending hop.
+            glow.tick(
+                Some((2, 4)),
+                t0 + Duration::from_millis(20),
+                &glow_cfg,
+                geom,
+                &mut out,
+            );
+            assert_eq!(glow.spawns(), 0, "the keyless hop is refused");
+        }
+        // The Tab: nothing of it is on the wire yet when the host arms the
+        // insert, so nothing refused before this instant can be its echo.
+        assert_eq!(
+            app.input(wid, named(NamedKey::Tab), Source::Human),
+            crate::input::InputOutcome::Ok
+        );
+        {
+            let glow = &app.windows[&wid].cursor_glow;
+            assert_eq!(
+                glow.spawns(),
+                0,
+                "a Tab whose byte just went out has no echo to light yet: {:?}",
+                glow.admission_log()
+                    .last()
+                    .map(|r| (r.licence, r.origin, r.target))
+            );
+            assert_eq!(glow.insert_tally().lit, 0);
+            assert_eq!(glow.insert_tally().delivered, 1, "the licence is armed");
+        }
+        // The completion itself: an 8-cell completion on the hand's row.
+        let glow = &mut app.windows.get_mut(&wid).unwrap().cursor_glow;
+        glow.tick(
+            Some((2, 12)),
+            t0 + Duration::from_millis(60),
+            &glow_cfg,
+            geom,
+            &mut out,
+        );
+        assert_eq!(
+            glow.admission_log()
+                .last()
+                .map(|r| (r.licence, r.reason, r.origin, r.target)),
+            Some(("insert", "licensed", (2, 4), (2, 12))),
+            "the real completion is the insert's"
+        );
+        assert_eq!(glow.insert_tally().lit, 1);
+        drop(app);
+        drop(sink);
+        unsafe {
+            libc::close(pipe[0]);
+            libc::close(pipe[1]);
+        }
+    }
+
+    /// A KEY RELEASE QUEUED BEHIND A DRAINING PASTE CARRIES NO TICKET
+    /// (2026-09-13 audit, host-seam R2-2). The delivery ticket was built
+    /// from the key and modifiers alone, never the event type, and
+    /// `tty_swallows` is false for a release, so under Kitty flags 2|8
+    /// (REPORT_EVENT_TYPES + REPORT_ALL_KEYS_AS_ESC — crossterm / yazi /
+    /// helix-class TUIs) a bare glyph's RELEASE (`CSI n;1:3 u`) queued
+    /// behind a paste published a `typed` receipt and a Tab's an `insert`
+    /// one: the prelude re-stamped a key-up as a typed press — one press,
+    /// two stamps, one credit — and armed a second insert licence. A
+    /// release banked nothing at dispatch, so there is nothing for the
+    /// writer's completed write to re-stamp. Only releases go out here,
+    /// so no press banked anything; the wire bytes prove the encode is
+    /// untouched.
+    ///
+    /// RED before the fix: `[DeliveryTicket { insert: None, typed: true },
+    /// DeliveryTicket { insert: Some(Unknown), typed: false }]`.
+    #[cfg(unix)]
+    #[test]
+    fn a_queued_key_release_publishes_no_receipt() {
+        let (mut app, sink, pipe) = app_with_private_pty();
+        let wid = WindowId(0);
+        let master = sink.master();
+        app.config.cursor_trail = Some(true);
+        app.config.cursor_trail_style = Some("rainbow kitty".to_string());
+        let session = app.front_terminal(wid).unwrap().session;
+        let term = app.pool.get(session).unwrap().term.clone();
+        crate::term_lock(&term).process(b"\x1b[>10u");
+        let release = |key: Key| InputEvent::Key {
+            key,
+            mods: Modifiers::empty(),
+            base_layout: None,
+            event_type: KeyEventType::Release,
+        };
+        let pin = super::paste_order::pin_ordering_for_test(&sink);
+        assert!(super::paste_order::is_ordering(master));
+        assert_eq!(
+            app.input(wid, release(Key::Character('a')), Source::Human),
+            crate::input::InputOutcome::Ok
+        );
+        assert_eq!(
+            app.input(wid, release(Key::Named(NamedKey::Tab)), Source::Human),
+            crate::input::InputOutcome::Ok
+        );
+        drop(pin);
+        for _ in 0..400 {
+            if !super::paste_order::is_ordering(master) {
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        assert!(!super::paste_order::is_ordering(master));
+        let now = Instant::now();
+        let ctx = &app.pool.get(session).unwrap().ctx;
+        let batch = ctx.output_echo.deliveries_after(&ctx.sink, Some(0), now);
+        let tickets: Vec<_> = batch.items.iter().flatten().map(|(_, t)| *t).collect();
+        assert!(
+            tickets.is_empty(),
+            "a key-up is not typing and not an insert: {tickets:?}"
+        );
+        assert_eq!(batch.latest, 0, "no receipt at all");
+        // The wire is untouched: both releases were encoded and written.
+        let bytes = drain(pipe);
+        assert_eq!(bytes, b"\x1b[97;1:3u\x1b[9;1:3u");
+        assert!(
+            !app.windows[&wid].cursor_glow.move_licensed(now),
+            "a key-up arms no typed licence"
+        );
+        unsafe {
+            libc::close(pipe[0]);
+            libc::close(pipe[1]);
+        }
+    }
+
+    /// A QUEUED TICKET CARRIES ITS DISPATCH INSTANT (2026-09-13, the review
+    /// of the audit round). The insert's late-receipt claim reaches back
+    /// `INSERT_RETRO_FRESH` from the writer's completion, which for a Tab
+    /// queued behind a short-draining paste reaches past the Tab's own
+    /// press: a program hop refused before the key was dispatched was lit
+    /// as the completion. The ticket now names when its bytes were
+    /// dispatched — a key's and a paste's alike — and the prelude hands
+    /// that instant to the engine, whose claim stops there
+    /// (`a_late_receipt_claims_no_hop_refused_before_its_dispatch`).
+    #[cfg(unix)]
+    #[test]
+    fn a_queued_ticket_carries_its_dispatch_instant() {
+        use aterm_effects::cursor_glow::InsertWidth;
+
+        let (mut app, sink, pipe) = app_with_private_pty();
+        let wid = WindowId(0);
+        let master = sink.master();
+        app.config.cursor_trail = Some(true);
+        app.config.cursor_trail_style = Some("rainbow kitty".to_string());
+        let session = app.front_terminal(wid).unwrap().session;
+        let pin = super::paste_order::pin_ordering_for_test(&sink);
+        assert!(super::paste_order::is_ordering(master));
+        let before = Instant::now();
+        assert_eq!(
+            app.input(wid, named(NamedKey::Tab), Source::Human),
+            crate::input::InputOutcome::Ok
+        );
+        let tab_dispatched = Instant::now();
+        assert_eq!(
+            app.input(
+                wid,
+                InputEvent::Paste("yz".to_string(), crate::input::PasteFraming::AtDrain),
+                Source::Human
+            ),
+            crate::input::InputOutcome::Ok
+        );
+        let paste_dispatched = Instant::now();
+        drop(pin);
+        for _ in 0..400 {
+            if !super::paste_order::is_ordering(master) {
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        assert!(!super::paste_order::is_ordering(master));
+        let now = Instant::now();
+        let ctx = &app.pool.get(session).unwrap().ctx;
+        let batch = ctx.output_echo.deliveries_after(&ctx.sink, Some(0), now);
+        let receipts: Vec<_> = batch.items.iter().flatten().copied().collect();
+        assert_eq!(receipts.len(), 2, "the Tab's and the paste's: {receipts:?}");
+        let (tab_at, tab) = receipts[0];
+        let (paste_at, paste) = receipts[1];
+        assert_eq!(tab.insert, Some(InsertWidth::Unknown));
+        assert_eq!(paste.insert, Some(InsertWidth::Cells(2)));
+        let tab_dispatch = tab.dispatched_at;
+        let paste_dispatch = paste.dispatched_at;
+        assert!(
+            before <= tab_dispatch && tab_dispatch <= tab_dispatched,
+            "the Tab's dispatch instant is the press's"
+        );
+        assert!(
+            tab_dispatched <= paste_dispatch && paste_dispatch <= paste_dispatched,
+            "the paste's dispatch instant is its own"
+        );
+        assert!(
+            tab_dispatch <= tab_at && paste_dispatch <= paste_at,
+            "a receipt is never before its dispatch: tab {:?} paste {:?}",
+            tab_at.saturating_duration_since(tab_dispatch),
+            paste_at.saturating_duration_since(paste_dispatch)
+        );
+        let _ = drain(pipe);
+        unsafe {
+            libc::close(pipe[0]);
+            libc::close(pipe[1]);
+        }
+    }
+
+    /// THE PRELUDE HANDS THE QUEUED TAB'S DISPATCH INSTANT TO THE ENGINE
+    /// (2026-09-14 audit of the audits, R2-1). 287a2d0fd was pinned in two
+    /// halves that never met: the ticket carries `dispatched_at`
+    /// ([`a_queued_ticket_carries_its_dispatch_instant`]) and the engine
+    /// honours it (`a_late_receipt_claims_no_hop_refused_before_its_dispatch`)
+    /// — but the seam between them, `tick_cursor_fx`'s render prelude
+    /// choosing `note_insert_delivered_from` over `note_insert_delivered`,
+    /// had no witness: dropping the instant there left every gui test
+    /// green, and the defect it closes (program output before the key lit
+    /// as the completion) would have come back unseen. The real clock
+    /// orders the shapes: a keyless same-row +2 is refused and remembered
+    /// as the pending hop, a sleep, THEN the Tab is pressed behind the
+    /// ordering FIFO so its receipt reaches the prelude late. (A synthetic
+    /// hop stamp after the press lands after the ticket's real
+    /// `dispatched_at`, and the correct seam then legitimately claims it.)
+    /// `deliver_insert` clears the pending hop unconditionally, so what is
+    /// pinned is the claim — nothing spawned, nothing lit — not the hop's
+    /// survival.
+    ///
+    /// RED with the prelude calling `note_insert_delivered(*at, width)`:
+    /// `spawns == 1`, `lit == 1`, the last admission
+    /// `("insert", "licensed", (2, 2), (2, 4))`.
+    #[cfg(unix)]
+    #[test]
+    fn the_prelude_bounds_a_queued_tabs_late_claim_at_its_dispatch() {
+        use crate::app_render::CursorFxInputs;
+        use aterm_types::keyboard::NamedKey;
+
+        let (mut app, sink, pipe) = app_with_private_pty();
+        let wid = WindowId(0);
+        let master = sink.master();
+        app.config.motion = Some("full".into());
+        app.config.cursor_trail = Some(true);
+        app.config.cursor_trail_style = Some("rainbow kitty".to_string());
+        app.config.trail_sounds = Some(false);
+        app.windows.get_mut(&wid).unwrap().focused = true;
+        app.frontmost_window = Some(wid);
+        let t0 = Instant::now();
+        let mut seed = CursorFxInputs::sample_for_test(t0);
+        seed.cur = Some((2, 2));
+        app.tick_cursor_fx(wid, seed).expect("seed");
+        // A program's own same-row +2 (a prompt print): no key behind it,
+        // refused, remembered as the pending hop.
+        std::thread::sleep(Duration::from_millis(5));
+        let hop_at = Instant::now();
+        let mut hop = CursorFxInputs::sample_for_test(hop_at);
+        hop.cur = Some((2, 4));
+        app.tick_cursor_fx(wid, hop).expect("the keyless hop");
+        // REAL clock order: the hop is refused BEFORE the Tab is pressed.
+        std::thread::sleep(Duration::from_millis(30));
+        {
+            let glow = &app.windows[&wid].cursor_glow;
+            assert_eq!(glow.spawns(), 0, "the keyless hop is refused");
+            assert_eq!(glow.insert_tally().lit, 0);
+        }
+        // The Tab, queued behind the ordering FIFO so its receipt reaches
+        // the prelude late, carrying the dispatch instant.
+        let pin = super::paste_order::pin_ordering_for_test(&sink);
+        assert!(super::paste_order::is_ordering(master));
+        assert_eq!(
+            app.input(wid, named(NamedKey::Tab), Source::Human),
+            crate::input::InputOutcome::Ok
+        );
+        drop(pin);
+        for _ in 0..400 {
+            if !super::paste_order::is_ordering(master) {
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(1));
+        }
+        assert!(!super::paste_order::is_ordering(master));
+        // The prelude reads the receipt; the caret has not moved since the
+        // refused hop, so anything lit now is the pre-dispatch hop.
+        let now = Instant::now();
+        let mut live = CursorFxInputs::sample_for_test(now);
+        live.cur = Some((2, 4));
+        app.tick_cursor_fx(wid, live).expect("the prelude");
+        let glow = &app.windows[&wid].cursor_glow;
+        let last = glow
+            .admission_log()
+            .last()
+            .map(|r| (r.licence, r.reason, r.origin, r.target));
+        assert_eq!(
+            glow.insert_tally().delivered,
+            1,
+            "the queued Tab's receipt re-armed the licence: {last:?}"
+        );
+        assert_eq!(
+            glow.spawns(),
+            0,
+            "a hop refused before the Tab's dispatch is program output: {last:?}"
+        );
+        assert_eq!(glow.insert_tally().lit, 0, "{last:?}");
+        let _ = drain(pipe);
+        drop(app);
+        drop(sink);
         unsafe {
             libc::close(pipe[0]);
             libc::close(pipe[1]);
@@ -18383,6 +19690,15 @@ mod typed_kitty_summon_tests {
                 ws.cursor_glow.move_licensed(now),
                 banks,
                 "{label}: the typed licence"
+            );
+            // LOCKSTEP (2026-09-13 audit): the classic trail's stamp is
+            // withheld with the glow's — the trail's typed stamp is the
+            // glow's twin, and this assertion pins the withheld pair (no
+            // frame asserts it at runtime).
+            assert_eq!(
+                ws.cursor_trail.move_licensed(now),
+                banks,
+                "{label}: the classic trail's typed licence, in lockstep"
             );
             assert_eq!(
                 ws.cursor_glow.in_flight_tally().swallowed_no_echo,
@@ -18493,6 +19809,99 @@ mod typed_kitty_summon_tests {
             0,
             "unpriced: the whole newest press goes, as before"
         );
+        // A PASTE sits between the run and the Backspace (2026-09-13 audit,
+        // host-seam R2-7): the pasted glyphs banked no press, so the
+        // Backspace that erases one of them is the paste's and retires
+        // nothing of the run — a priced 0 per pasted grapheme. Before this
+        // the paste left the memory untouched and the Backspace popped the
+        // run's last glyph: credits 2 for an erase the hand never made on
+        // the run.
+        let paste = |app: &mut App, text: &str| {
+            assert_eq!(
+                app.input(
+                    wid,
+                    InputEvent::Paste(text.to_string(), crate::input::PasteFraming::AtDrain),
+                    Source::Human
+                ),
+                ok
+            );
+            for _ in 0..400 {
+                if !super::paste_order::is_ordering(master) {
+                    break;
+                }
+                std::thread::sleep(Duration::from_millis(1));
+            }
+            assert!(
+                !super::paste_order::is_ordering(master),
+                "the paste drained"
+            );
+        };
+        assert_eq!(
+            app.input(wid, InputEvent::Text("日本".to_string()), Source::Human),
+            ok
+        );
+        assert_eq!(credits(&mut app), 4);
+        paste(&mut app, "x");
+        assert_eq!(
+            app.input(wid, named(NamedKey::Backspace), Source::Human),
+            ok
+        );
+        assert_eq!(
+            credits(&mut app),
+            4,
+            "the Backspace erased the pasted glyph: the run's credits stand"
+        );
+        // …and a second Backspace, past the paste, is the run's again.
+        assert_eq!(
+            app.input(wid, named(NamedKey::Backspace), Source::Human),
+            ok
+        );
+        assert_eq!(credits(&mut app), 2);
+        // The plain-key analogue: `abc`, a paste, one Backspace — three
+        // presses still in flight.
+        assert_eq!(
+            app.input(wid, named(NamedKey::Backspace), Source::Human),
+            ok
+        );
+        assert_eq!(credits(&mut app), 0);
+        type_word(&mut app, wid, "abc");
+        assert_eq!(credits(&mut app), 3);
+        paste(&mut app, "yz");
+        assert_eq!(
+            app.input(wid, named(NamedKey::Backspace), Source::Human),
+            ok
+        );
+        assert_eq!(credits(&mut app), 3, "the paste's glyph, not `c`");
+        // THE BOUND (2026-09-13 review): the memory as a whole is held at
+        // the press bank's depth, oldest first out — two pastes with no key
+        // between them used to append a bound each.
+        let wide = "w".repeat(super::ErasePriceMemory::CAP + 2);
+        paste(&mut app, &wide);
+        paste(&mut app, &wide);
+        assert_eq!(
+            app.windows[&wid].erase_prices.widths().len(),
+            super::ErasePriceMemory::CAP,
+            "the memory is bounded as a whole"
+        );
+        // A LINE BREAK IS ONE ERASABLE UNIT: `x⏎y` pasted is three priced
+        // zeros — ZLE, readline and Claude Code's composer keep the newline
+        // in the buffer and one Backspace erases it — so three Backspaces
+        // retire nothing of `abc`, and the fourth is the run's again.
+        type_word(&mut app, wid, "de");
+        assert_eq!(credits(&mut app), 5);
+        paste(&mut app, "x\ny");
+        for _ in 0..3 {
+            assert_eq!(
+                app.input(wid, named(NamedKey::Backspace), Source::Human),
+                ok
+            );
+            assert_eq!(credits(&mut app), 5, "the paste's own, newline included");
+        }
+        assert_eq!(
+            app.input(wid, named(NamedKey::Backspace), Source::Human),
+            ok
+        );
+        assert_eq!(credits(&mut app), 4, "past the paste: `e`");
         drop(app);
         drop(sink);
         // SAFETY: both fds are ours and open; the borrowed-fd sink did not
@@ -18598,6 +20007,132 @@ mod typed_kitty_summon_tests {
         }
     }
 
+    /// A KEY TYPED AFTER A PASTE KEEPS THE PASTE'S PRICE ZEROS (2026-09-13,
+    /// the review of the audit round). The paste arm prices each pasted
+    /// grapheme as a zero so the Backspace that erases it retires nothing
+    /// of the press ring — but the next typed key cleared the memory
+    /// before pushing its own width, so under a stall `abc`, paste `yz`,
+    /// `d`, ⌫ (d, priced) ⌫ found the memory empty and retired the whole
+    /// newest unpaid press, `c`, for erasing the pasted `z`. A typed press
+    /// now keeps the memory and appends its own widths behind the zeros,
+    /// so the memory is the row's erasable tail in order: the presses
+    /// retired are `d` (its own), nothing for `z`, nothing for `y`, then
+    /// `c`. Every other class still empties it (an arrow moves the erase
+    /// point), and the whole is bounded at `TYPED_STAMP_DEPTH`.
+    ///
+    /// RED before the fix: the memory after `d` read `[1]` — the zeros
+    /// cleared — so the second Backspace retired `c`.
+    #[cfg(unix)]
+    #[test]
+    fn a_key_typed_after_a_paste_keeps_the_pastes_price_zeros() {
+        use aterm_session::sink::SinkWriter;
+        use std::sync::Arc;
+
+        let (master, slave) = pty_pair_with_lflag(|_| {});
+        let sink = Arc::new(SinkWriter::new(master));
+        let mut app = App::headless_for_test_with_sink(sink.clone());
+        app.recompute_sparkle();
+        let wid = WindowId(0);
+        app.config.cursor_trail = Some(true);
+        app.config.cursor_trail_style = Some("rainbow kitty".to_string());
+        let glow_cfg = app.glow_config();
+        let geom = crate::cursor_glow::Geom {
+            cw: 8,
+            ch: 16,
+            rows: 24,
+            cols: 80,
+            origin_x: 0,
+            origin_y: 0,
+            win_w: 640,
+            win_h: 384,
+            head: 0,
+        };
+        let mut out = Vec::new();
+        let mut credits = |app: &mut App| {
+            let ws = app.windows.get_mut(&wid).unwrap();
+            ws.cursor_glow
+                .tick(Some((0, 0)), Instant::now(), &glow_cfg, geom, &mut out);
+            ws.cursor_glow.in_flight_tally().credits
+        };
+        assert_eq!(credits(&mut app), 0, "seeded");
+        let ok = crate::input::InputOutcome::Ok;
+        let paste = |app: &mut App, text: &str| {
+            assert_eq!(
+                app.input(
+                    wid,
+                    InputEvent::Paste(text.to_string(), crate::input::PasteFraming::AtDrain),
+                    Source::Human
+                ),
+                ok
+            );
+            for _ in 0..400 {
+                if !super::paste_order::is_ordering(master) {
+                    break;
+                }
+                std::thread::sleep(Duration::from_millis(1));
+            }
+            assert!(
+                !super::paste_order::is_ordering(master),
+                "the paste drained"
+            );
+        };
+
+        type_word(&mut app, wid, "abc");
+        assert_eq!(credits(&mut app), 3);
+        paste(&mut app, "yz");
+        type_word(&mut app, wid, "d");
+        assert_eq!(
+            credits(&mut app),
+            4,
+            "four presses, two pasted glyphs between"
+        );
+        assert_eq!(
+            app.windows[&wid].erase_prices.widths(),
+            [1, 1, 1, 0, 0, 1],
+            "the row's erasable tail, in order"
+        );
+        for (want, why) in [
+            (3, "`d`: its own press"),
+            (3, "`z`: the paste's, nothing of the ring"),
+            (3, "`y`: the paste's, nothing of the ring"),
+            (2, "`c`: past the paste, the run's again"),
+        ] {
+            assert_eq!(
+                app.input(wid, named(NamedKey::Backspace), Source::Human),
+                ok
+            );
+            assert_eq!(credits(&mut app), want, "{why}");
+        }
+        // An IME commit after a paste keeps the zeros too, per grapheme
+        // behind them; and another class still empties the memory.
+        paste(&mut app, "q");
+        assert_eq!(
+            app.input(wid, InputEvent::Text("日本".to_string()), Source::Human),
+            ok
+        );
+        assert_eq!(
+            app.windows[&wid].erase_prices.widths(),
+            [1, 1, 0, 2, 2],
+            "the commit's graphemes behind the paste's zero"
+        );
+        assert_eq!(
+            app.input(wid, named(NamedKey::ArrowLeft), Source::Human),
+            ok
+        );
+        assert!(
+            app.windows[&wid].erase_prices.widths().is_empty(),
+            "an arrow moves the erase point: the memory is closed"
+        );
+        drop(app);
+        drop(sink);
+        // SAFETY: both fds are ours and open; the borrowed-fd sink did not
+        // close the master.
+        unsafe {
+            libc::close(slave);
+            libc::close(master);
+        }
+    }
+
     /// A SWALLOWED PRESS WHOSE WRITE FAILS IS NOT TALLIED (2026-09-13).
     /// `swallowed_no_echo=` counts presses the host typed into a tty that
     /// will never echo them — presses that REACHED the tty. The tally was
@@ -18661,7 +20196,10 @@ mod typed_kitty_summon_tests {
     /// three ptys, one paste into each: cooked and raw publish the priced
     /// insert as ever; canonical no-echo publishes NO insert receipt. The
     /// bytes reach the PTY in every case, and the gesture stamp, the
-    /// up-strum cue and the pet note are unchanged.
+    /// up-strum cue and the pet note are unchanged (the gesture stamp is
+    /// revoked at enqueue in the same turn whatever the tty — a paste's
+    /// one-shot never outlives its dispatch — which is why the bare Tab's
+    /// gesture half needs the tty's verdict and this path does not).
     ///
     /// RED before the paste gate: the middle pty published `Cells(8)`.
     #[cfg(unix)]
@@ -18732,10 +20270,149 @@ mod typed_kitty_summon_tests {
                 ticketed.then_some(InsertWidth::Cells(8)),
                 "{label}: the insert receipt"
             );
+            let ws = &app.windows[&wid];
+            assert!(
+                !ws.cursor_glow.move_licensed(now) && !ws.cursor_trail.move_licensed(now),
+                "{label}: a paste's gesture stamp is revoked at enqueue whatever the tty"
+            );
             assert_eq!(
                 batch.latest,
                 u64::from(ticketed),
                 "{label}: a withheld ticket publishes no receipt at all"
+            );
+            drop(app);
+            drop(sink);
+            // SAFETY: both fds are ours and open; the borrowed-fd sink did
+            // not close the master.
+            unsafe {
+                libc::close(slave);
+                libc::close(master);
+            }
+        }
+    }
+
+    /// A BARE TAB THE TTY WILL NOT ECHO ARMS NO INSERT — AND NO GESTURE
+    /// (2026-09-13 audit, host-seam R1-3 — the insert half of the
+    /// password-mode rule; the review of the audit round, the gesture
+    /// half). The glyph half withholds a press the kernel will not echo,
+    /// and the paste half publishes no insert receipt for one; a bare Tab
+    /// / ⌃V has `typed_forward == None`, so `tty_swallows` was false by
+    /// construction and the dispatch armed a 32-cell same-row licence live
+    /// for two seconds — into `read -s`, `sudo`, `passwd`, where the kernel
+    /// echoes nothing for it — and a queued Tab ticketed `Unknown` the
+    /// same way. A prompt re-render on that row inside two seconds could
+    /// spend it as a phantom sweep. The GESTURE class was then still
+    /// stamped regardless of the tty (`note_user_gesture`, glow and
+    /// classic trail, and the queued ticket's `DeliveredClass::Gesture`), so a
+    /// Tab into `read -s` armed a one-shot move licence a prompt re-render
+    /// could spend within a quarter second — a press the tty will not echo
+    /// is neither a licence nor a credit in the three classes that read
+    /// the tty: typed, insert, gesture (Return, Nav, Erase and Kill never
+    /// read it, and keep their own one-shot class — measured 2026-09-14:
+    /// an Enter, an arrow and a Backspace into a canonical no-echo pty each
+    /// still stamp theirs, the Enter's response at a password prompt being
+    /// real). Same three ptys,
+    /// a bare Tab into each, inline and queued behind a pinned FIFO: cooked
+    /// and raw arm, stamp and ticket as ever; canonical no-echo arms
+    /// nothing, stamps nothing on either engine, and publishes NO receipt
+    /// (a ticket with every half withheld is empty).
+    ///
+    /// RED before the fix: `inserts_delivered == 1` inline and a
+    /// `Some(Unknown)` receipt queued, on the canonical no-echo pty; then,
+    /// before the gesture half, `move_licensed` true on both engines and a
+    /// `[Some(Gesture)]` receipt on that pty.
+    #[cfg(unix)]
+    #[test]
+    fn a_bare_tab_the_tty_will_not_echo_arms_no_insert() {
+        use aterm_effects::cursor_glow::InsertWidth;
+        use aterm_session::sink::SinkWriter;
+        use aterm_types::keyboard::NamedKey;
+        use std::sync::Arc;
+
+        type Edit = fn(&mut libc::tcflag_t);
+        let cases: [(&str, Edit, bool); 3] = [
+            ("cooked (echo+icanon)", |_| {}, true),
+            ("canonical no-echo (read -s)", |l| *l &= !libc::ECHO, false),
+            (
+                "raw (a TUI echoes for itself)",
+                |l| *l &= !(libc::ECHO | libc::ICANON),
+                true,
+            ),
+        ];
+        for (label, edit, arms) in cases {
+            let (master, slave) = pty_pair_with_lflag(edit);
+            let sink = Arc::new(SinkWriter::new(master));
+            let echo = sink.tty_echo().expect("a pty master answers");
+            assert_eq!(echo.swallows_input(), !arms, "{label}: the sink's verdict");
+            let mut app = App::headless_for_test_with_sink(sink.clone());
+            app.recompute_sparkle();
+            let wid = WindowId(0);
+            app.config.cursor_trail = Some(true);
+            app.config.cursor_trail_style = Some("rainbow kitty".to_string());
+            // Inline: dispatch is delivery for a bare Tab.
+            assert_eq!(
+                app.input(wid, named(NamedKey::Tab), Source::Human),
+                crate::input::InputOutcome::Ok
+            );
+            {
+                let ws = app.windows.get(&wid).unwrap();
+                assert_eq!(
+                    ws.cursor_glow.insert_tally().delivered,
+                    u64::from(arms),
+                    "{label}: the inline Tab's insert arm"
+                );
+                assert_eq!(
+                    ws.cursor_glow.move_licensed(Instant::now()),
+                    arms,
+                    "{label}: the gesture class follows the tty's verdict"
+                );
+                assert_eq!(
+                    ws.cursor_trail.move_licensed(Instant::now()),
+                    arms,
+                    "{label}: …on the classic trail in lockstep"
+                );
+            }
+            // Queued behind a pinned FIFO: the writer's completed write is
+            // the delivery edge, and it must carry no insert for a Tab the
+            // tty swallows.
+            let pin = super::paste_order::pin_ordering_for_test(&sink);
+            assert!(super::paste_order::is_ordering(master));
+            assert_eq!(
+                app.input(wid, named(NamedKey::Tab), Source::Human),
+                crate::input::InputOutcome::Ok
+            );
+            drop(pin);
+            for _ in 0..400 {
+                if !super::paste_order::is_ordering(master) {
+                    break;
+                }
+                std::thread::sleep(Duration::from_millis(1));
+            }
+            assert!(!super::paste_order::is_ordering(master), "{label}: drained");
+            let now = Instant::now();
+            let session = app.front_terminal(wid).unwrap().session;
+            let ctx = &app.pool.get(session).unwrap().ctx;
+            let batch = ctx.output_echo.deliveries_after(&ctx.sink, Some(0), now);
+            let insert = batch.items.iter().flatten().find_map(|(_, t)| t.insert);
+            assert_eq!(
+                insert,
+                arms.then_some(InsertWidth::Unknown),
+                "{label}: the queued Tab's receipt"
+            );
+            let classes: Vec<_> = batch.items.iter().flatten().map(|(_, t)| t.key).collect();
+            assert_eq!(
+                classes,
+                if arms {
+                    vec![Some(DeliveredClass::Gesture)]
+                } else {
+                    vec![]
+                },
+                "{label}: the gesture class rides the receipt only where the tty echoes"
+            );
+            assert_eq!(
+                batch.latest,
+                u64::from(arms),
+                "{label}: one receipt, or none when every half is withheld"
             );
             drop(app);
             drop(sink);

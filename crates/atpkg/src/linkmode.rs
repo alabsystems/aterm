@@ -261,6 +261,24 @@ pub fn linked_checkout_checked(layout: &Layout, program: &str) -> std::io::Resul
 /// Re-assert a program's dev links (idempotent): re-run [`link`] from the recorded marker,
 /// picking up any newly-built/added bins. No build is invoked — building is producer scope,
 /// absent from the consumer (a documented divergence from aterm-pkg's `refresh`).
+/// The tool names a dev-linked `program` puts on PATH, from its link marker (the rel
+/// bins it was linked with, by file stem) — empty when it is not linked. For `which
+/// <program>` to name what the link exposes without re-walking the managed bin/.
+#[must_use]
+pub fn linked_bins(layout: &Layout, program: &str) -> Vec<String> {
+    if !safe_component(program) {
+        return Vec::new();
+    }
+    let Ok(marker) = read_marker_for_program(layout, program) else {
+        return Vec::new();
+    };
+    marker
+        .bins
+        .iter()
+        .filter_map(|rel| bin_tool_name(Path::new(rel)).map(str::to_string))
+        .collect()
+}
+
 pub fn refresh(layout: &Layout, program: &str) -> Result<LinkOutcome, LinkError> {
     if !safe_component(program) {
         return Err(LinkError::BadName(program.to_string()));

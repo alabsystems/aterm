@@ -994,6 +994,15 @@ pub enum GlyphImage {
 }
 
 impl GlyphImage {
+    /// Stored bitmap bytes, used for the cache's image-payload budget. This
+    /// excludes allocation overhead, spare vector capacity and map storage.
+    #[must_use]
+    pub fn byte_len(&self) -> usize {
+        match self {
+            GlyphImage::Mono { bytes, .. } | GlyphImage::Rgba { bytes, .. } => bytes.len(),
+        }
+    }
+
     pub fn width(&self) -> usize {
         match self {
             GlyphImage::Mono { width, .. } | GlyphImage::Rgba { width, .. } => *width,
@@ -1957,6 +1966,12 @@ pub struct Renderer {
     cursor_opacity: f32,
     /// The glyph cache, keyed by full rasterization identity.
     glyphs: FxHashMap<GlyphKey, GlyphImage>,
+    /// The bitmap payload bytes `glyphs` holds, maintained at its ONE insert site
+    /// ([`Renderer::glyph_image`]) and reset by [`Renderer::clear_glyph_images`].
+    /// The entry count alone cannot bound these bytes: image size scales with
+    /// the square of the pixel size, and the same 16 384 entries measured
+    /// 9.6 MB at 1x and 23.8 MB on a Retina cell.
+    glyph_bytes: usize,
     /// Per-char/presentation key resolve cache (primary-vs-fallback dispatch
     /// happens once per request, not once per blit). Explicit VS15 uses a
     /// distinct entry from Unicode default presentation so one cannot poison
@@ -7182,6 +7197,7 @@ impl Renderer {
             bg_opacity: 1.0,
             cursor_opacity: 1.0,
             glyphs: FxHashMap::default(),
+            glyph_bytes: 0,
             primary_gid_cache: FxHashMap::default(),
             keys: FxHashMap::default(),
             emoji_keys: FxHashMap::default(),
@@ -7253,7 +7269,7 @@ impl Renderer {
         }
         self.fit_cell_pad += widest.saturating_sub(self.cell_w);
         let calibrated = self.cell_w.max(widest);
-        self.glyphs.clear();
+        self.clear_glyph_images();
         self.keys.clear();
         self.styled_keys.clear();
         self.primary_gid_cache.clear();
@@ -7279,7 +7295,7 @@ impl Renderer {
         self.display_mix = mix;
         // Per-char routing + rasters were keyed to the OLD mix; re-resolve.
         self.keys.clear();
-        self.glyphs.clear();
+        self.clear_glyph_images();
         Ok(())
     }
 
@@ -7298,7 +7314,7 @@ impl Renderer {
         // — byte-identical across the swap — so a `keys`/`fallback_pick` reset alone
         // re-resolves a CJK char to the SAME key and `glyph_image` returns the OLD
         // face's bitmap (the new face never appears). Drop the bitmaps too.
-        self.glyphs.clear();
+        self.clear_glyph_images();
         self.clear_fallback_candidates();
         Ok(())
     }
@@ -7332,7 +7348,7 @@ impl Renderer {
         // the newly-installed symbol face unless we drop BOTH the per-char key memo and
         // its bitmap; clear both so the next miss re-probes the new face.
         self.keys.clear();
-        self.glyphs.clear();
+        self.clear_glyph_images();
         Ok(())
     }
 
@@ -7366,7 +7382,7 @@ impl Renderer {
         // is the worst offender: it memoizes the OLD font's shaped gid, so the new font
         // can yield a genuinely WRONG glyph (not merely a stale bitmap). Drop all three
         // so the injected face takes over on the next miss.
-        self.glyphs.clear();
+        self.clear_glyph_images();
         self.emoji_keys.clear();
         self.cluster_gids.clear();
         // `keys` too: select_face consulted colour coverage, so an emoji cp that
@@ -7402,7 +7418,7 @@ impl Renderer {
         // BoldPrimary `mono_gid` bitmaps in `self.glyphs` collide when the new bold
         // face maps the char to the same gid index — a `styled_keys` reset alone
         // re-resolves to the SAME key and returns the OLD face's bitmap. Drop them too.
-        self.glyphs.clear();
+        self.clear_glyph_images();
         // Styled ligature RUNS route through the run-face policy (W6), which now
         // prefers this face for BOLD runs: gids cached from the old face are wrong.
         self.shaped_runs.clear();
@@ -7458,7 +7474,7 @@ impl Renderer {
         // bitmaps, and styled-run gids all referenced the old face set — and the
         // address-keyed caches could alias a freed slot's address.
         self.styled_keys.clear();
-        self.glyphs.clear();
+        self.clear_glyph_images();
         self.shaped_runs.clear();
         self.clear_face_address_caches();
         Ok(())
@@ -7483,7 +7499,7 @@ impl Renderer {
             return false;
         }
         self.synthetic_styles = on;
-        self.glyphs.clear();
+        self.clear_glyph_images();
         true
     }
 
@@ -7523,7 +7539,7 @@ impl Renderer {
         // Per-char keys + bitmaps resolved against the OLD chain; drop both so a
         // char re-probes (same discipline as `set_fallback_bytes`).
         self.keys.clear();
-        self.glyphs.clear();
+        self.clear_glyph_images();
         true
     }
 
@@ -7541,7 +7557,7 @@ impl Renderer {
         self.symbol_fallback_paths = symbol_fallback_candidate_paths(&config);
         self.admitted_sources_sealed = false;
         self.keys.clear();
-        self.glyphs.clear();
+        self.clear_glyph_images();
         true
     }
 
@@ -7563,7 +7579,7 @@ impl Renderer {
         self.keys.clear();
         self.emoji_keys.clear();
         self.cluster_gids.clear();
-        self.glyphs.clear();
+        self.clear_glyph_images();
         true
     }
 
@@ -7703,7 +7719,7 @@ impl Renderer {
         self.admitted_sources_sealed = false;
         // Everything was rasterized / id-resolved against the OLD primary; drop it
         // all so the new face takes over (same discipline as `set_px`).
-        self.glyphs.clear();
+        self.clear_glyph_images();
         self.keys.clear();
         self.emoji_keys.clear();
         self.styled_keys.clear();
@@ -7983,7 +7999,7 @@ impl Renderer {
             // layer up. Latent today (every in-tree caller passes `false`),
             // which is precisely when it is cheap to close.
             self.keys.clear();
-            self.glyphs.clear();
+            self.clear_glyph_images();
             self.font_epoch += 1;
         }
     }
@@ -8524,7 +8540,7 @@ impl Renderer {
         // no key may retain a now-discarded runtime face decision.
         self.keys.clear();
         self.styled_keys.clear();
-        self.glyphs.clear();
+        self.clear_glyph_images();
         self.emoji_keys.clear();
         self.cluster_gids.clear();
         self.shaped_runs.clear();
@@ -8771,7 +8787,7 @@ impl Renderer {
             // Cached coverage is backend-specific (grid-fitted vs fontdue
             // bytes) — re-rasterize on the forced backend, same discipline as
             // the macOS arm below.
-            self.glyphs.clear();
+            self.clear_glyph_images();
             self.keys.clear();
             // Subpixel off with it: forced-fontdue means "the byte-stable
             // portable bytes", which per-channel fringes are not. (Linux-only:
@@ -8792,7 +8808,7 @@ impl Renderer {
             // specific (CoreText vs fontdue bytes), so they must be re-rasterized on
             // the new backend — same discipline as `set_px`. (styled_keys map
             // char→GlyphKey independent of the backend.)
-            self.glyphs.clear();
+            self.clear_glyph_images();
             // W8: runtime-fallback DISCOVERY is backend-faithful (the CT
             // drawability probe can accept faces fontdue cannot draw), so the
             // cached decisions — and the `keys` that route chars to them — are
@@ -9318,7 +9334,7 @@ impl Renderer {
         self.fallback_chain.remove(i);
         self.fallback_pick.clear();
         self.keys.clear();
-        self.glyphs.clear();
+        self.clear_glyph_images();
         self.clear_face_address_caches();
         self.font_epoch += 1;
         true
@@ -9364,7 +9380,7 @@ impl Renderer {
         self.styled_faces[slot] = None;
         self.styled_keys.clear();
         self.keys.clear();
-        self.glyphs.clear();
+        self.clear_glyph_images();
         self.shaped_runs.clear();
         self.clear_face_address_caches();
         self.font_epoch += 1;
@@ -9958,7 +9974,7 @@ impl Renderer {
         }
         // Every rasterized glyph / shaped run / CT font baked the OLD
         // instance — same clear discipline as `set_px`.
-        self.glyphs.clear();
+        self.clear_glyph_images();
         self.keys.clear();
         self.emoji_keys.clear();
         self.styled_keys.clear();
@@ -10096,7 +10112,7 @@ impl Renderer {
             self.cell_h = cell_h;
             self.baseline = baseline;
         }
-        self.glyphs.clear();
+        self.clear_glyph_images();
     }
 
     /// The current baseline adjustment (see [`Self::set_adjust_baseline`]).
@@ -10233,7 +10249,7 @@ impl Renderer {
         // padding and the weight dilation are both px-dependent).
         self.calibrate_fitted_cell();
         // Glyphs were rasterized at the old px; drop the caches so they re-rasterize.
-        self.glyphs.clear();
+        self.clear_glyph_images();
         self.keys.clear();
         self.emoji_keys.clear();
         self.styled_keys.clear();
@@ -10435,7 +10451,7 @@ impl Renderer {
         self.baseline = baseline;
         // Procedural glyphs fill the cell (sized to cell_h); drop them so they
         // re-rasterize to the new box. Cheap (procedural raster is synthetic).
-        self.glyphs.clear();
+        self.clear_glyph_images();
         // Deco masks are keyed by `(glyph, cell_w, cell_h)`; the new cell box makes
         // the old-size masks dead — drop them so they re-rasterize to the new box.
         self.deco_masks.borrow_mut().clear();
@@ -11226,7 +11242,7 @@ impl Renderer {
             self.keys.clear();
             self.styled_keys.clear();
             self.emoji_keys.clear();
-            self.glyphs.clear();
+            self.clear_glyph_images();
             self.deco_masks.borrow_mut().clear();
         }
         // PRIMARY-face (`font_id == 0`) user features — the only ones this shaper drives.
@@ -11286,7 +11302,7 @@ impl Renderer {
     pub fn set_font_thicken(&mut self, on: bool) {
         if self.font_thicken != on {
             self.font_thicken = on;
-            self.glyphs.clear();
+            self.clear_glyph_images();
         }
     }
 
@@ -11307,7 +11323,7 @@ impl Renderer {
         if (gamma - self.stem_gamma).abs() > f32::EPSILON {
             self.stem_gamma = gamma;
             self.stem_lut = build_stem_lut(gamma);
-            self.glyphs.clear();
+            self.clear_glyph_images();
             // The LUT bakes into the subpixel overlay's channel bytes too.
             #[cfg(all(unix, not(target_os = "macos")))]
             self.subpx_glyphs.clear();
@@ -11350,7 +11366,7 @@ impl Renderer {
             // Cached coverage is mode-specific; re-rasterize everything on the
             // new mode (the `debug_force_fontdue` discipline, plus the styled
             // keys — bold/italic coverage is grid-fitted too).
-            self.glyphs.clear();
+            self.clear_glyph_images();
             self.keys.clear();
             self.styled_keys.clear();
             // The subpixel raster follows the Off↔hinted boundary of this
@@ -11806,6 +11822,14 @@ impl Renderer {
         ligature_break_cols_into(input, r, &self.shaping, out);
     }
 
+    /// Discard raster images and their byte accounting together. Font, geometry,
+    /// seal and capacity invalidations all use this; their other cache families
+    /// retain each caller's existing invalidation policy.
+    fn clear_glyph_images(&mut self) {
+        self.glyphs.clear();
+        self.glyph_bytes = 0;
+    }
+
     /// The rasterized image for `key`, cached. External rasterizers (the GPU
     /// atlas) consume the exact bytes the CPU blit path uses, so their output
     /// can match pixel-for-pixel without duplicating the font logic/fallback.
@@ -11813,6 +11837,9 @@ impl Renderer {
         if !self.glyphs.contains_key(&key) {
             let mut img = self.rasterize(key);
             seat_ink_on_the_cell_floor(&mut img, self.baseline, self.cell_h);
+            // The one insert site, so the byte total is maintained here and
+            // nowhere else. The key was absent, so nothing is displaced.
+            self.glyph_bytes = self.glyph_bytes.saturating_add(img.byte_len());
             self.glyphs.insert(key, img);
         }
         &self.glyphs[&key]
@@ -12673,6 +12700,15 @@ impl Renderer {
     /// Mirrors the existing RuntimeFallback decision-cap.
     fn evict_glyph_caches_if_large(&mut self) {
         const GLYPH_CACHE_CAP: usize = 16_384;
+        // THE CACHE'S REAL RESOURCE IS BYTES (2026-09-14, the performance
+        // audit). An entry is `width × height` coverage bytes, so its size
+        // goes with the SQUARE of the pixel size: the same 16 384-entry cap
+        // measured 9.6 MB at 1x and 23.8 MB on a Retina cell, i.e. the ceiling
+        // moved with the display instead of staying where it was put. 12 MiB
+        // is above the 1x count cap's own footprint, so a 1x session evicts
+        // exactly when it did before and only a large-cell session is newly
+        // bounded.
+        const GLYPH_CACHE_BYTES: usize = 12 * 1024 * 1024;
         // The shaped-run cache grows with distinct (run, style) pairs; a feature/
         // ligature font catting unique content can grow it independently of the
         // glyph cache, so it is capped — and cleared — on its own.
@@ -12684,11 +12720,11 @@ impl Renderer {
         // non-color-glyph clusters accretes unbounded CPU RAM even though `glyphs` stays
         // small.
         const CLUSTER_CAP: usize = 16_384;
-        if self.glyphs.len() > GLYPH_CACHE_CAP {
+        if self.glyphs.len() > GLYPH_CACHE_CAP || self.glyph_bytes > GLYPH_CACHE_BYTES {
             // The key maps and deco masks grow in lockstep with distinct glyph
             // identities, so they ride the glyph cap: every one of these stays
             // bounded because `glyphs` (which they feed) is bounded.
-            self.glyphs.clear();
+            self.clear_glyph_images();
             self.keys.clear();
             self.emoji_keys.clear();
             self.styled_keys.clear();
@@ -30823,7 +30859,7 @@ mod tests {
         // the M-derived grid cell. This is exactly the geometry the qualifier
         // must make safe; the default form remains intentionally unqualified.
         r.cell_w = (raw.width() / 2).max(1);
-        r.glyphs.clear();
+        r.clear_glyph_images();
         let raw = r.glyph_image(default_key).clone();
         assert!(
             raw.xmin() < 0 || raw.xmin() + raw.width() as i32 > r.cell_w as i32,
@@ -33524,6 +33560,202 @@ mod subpixel_seat_tests {
             ink(0),
             ink(1)
         );
+    }
+}
+
+#[cfg(test)]
+mod glyph_cache_accounting_tests {
+    use super::*;
+
+    fn renderer() -> Renderer {
+        Renderer::from_bytes(embedded_font(), 16.0, Theme::default()).expect("embedded font")
+    }
+
+    fn accounting_model() -> aterm_spec::derive::Model {
+        aterm_spec::ty_model! {
+            GlyphImageClearAccounting {
+                const Buggy = 0;
+                var resident = 0;
+                var charged = 0;
+                action Warm when (resident == 0) {
+                    resident = 1;
+                    charged = 1;
+                }
+                action Hit when (resident == 1) {
+                    charged = charged;
+                }
+                action Clear {
+                    resident = 0;
+                    charged = if Buggy == 1 { charged } else { 0 };
+                }
+                invariant AccountingFollowsResidency: charged == resident;
+            }
+        }
+    }
+
+    // The model projects nonempty residency, while this assertion also checks
+    // the exact byte total, including a refill after an invalidation.
+    fn assert_accounted(r: &Renderer) {
+        assert_eq!(
+            r.glyph_bytes,
+            r.glyphs.values().map(GlyphImage::byte_len).sum::<usize>(),
+            "only currently resident bitmap bytes may be charged"
+        );
+    }
+
+    #[test]
+    fn glyph_byte_accounting_follows_real_settings_seal_and_size_clears() {
+        let model = accounting_model();
+        aterm_spec::verify::prove_and_catch_scalar(&model, model.name);
+        let mut state = model.init_state();
+        let mut r = renderer();
+        for step in [
+            "Warm", "Hit", "Settings", "Warm", "Seal", "Warm", "Size", "Warm",
+        ] {
+            let action = match step {
+                "Warm" | "Hit" => {
+                    let before = r.glyph_bytes;
+                    let key = r.glyph_key('A');
+                    let image = r.glyph_image(key);
+                    assert!(image.bytes().iter().any(|&byte| byte > 0));
+                    if step == "Hit" {
+                        assert_eq!(r.glyph_bytes, before, "hits cannot charge twice");
+                    }
+                    step
+                }
+                "Settings" => {
+                    r.set_font_thicken(!r.font_thicken());
+                    "Clear"
+                }
+                "Seal" => {
+                    r.seal_admitted_font_sources();
+                    "Clear"
+                }
+                "Size" => {
+                    r.set_px(24.0);
+                    "Clear"
+                }
+                _ => unreachable!(),
+            };
+            assert!(model.fire(action, &mut state));
+            assert_accounted(&r);
+            assert_eq!(state["resident"], i64::from(!r.glyphs.is_empty()), "{step}");
+            assert_eq!(state["charged"], i64::from(r.glyph_bytes > 0), "{step}");
+            assert!(model.check_invariant("AccountingFollowsResidency", &state));
+        }
+        // Replay the historical operation: a real warm cache loses its images,
+        // but keeps the prior charge. The derived negative must reject it.
+        let buggy = aterm_spec::interp::with_buggy(&model, 1);
+        assert!(buggy.fire("Clear", &mut state));
+        assert!(!buggy.check_invariant("AccountingFollowsResidency", &state));
+    }
+
+    #[test]
+    fn glyph_byte_cap_evicts_without_count_pressure_and_resets_for_refill() {
+        const BYTE_CAP: usize = 12 * 1024 * 1024;
+        let mut r = renderer();
+        let key = r.glyph_key('A');
+        let expected = r.glyph_image(key).clone();
+        assert!(!expected.bytes().is_empty());
+        r.deco_mask(DecoGlyph::Dot, 3, 5);
+
+        // Seed a valid large bitmap without a costly enormous font raster. Only
+        // the image payload is synthetic; the real eviction entry point below
+        // must distinguish the byte boundary from the independent entry cap.
+        r.glyphs.insert(
+            key,
+            GlyphImage::Mono {
+                width: BYTE_CAP,
+                height: 1,
+                xmin: 0,
+                ymin: 0,
+                advance: 1.0,
+                bytes: vec![0xFF; BYTE_CAP],
+            },
+        );
+        r.glyph_bytes = BYTE_CAP;
+        assert_accounted(&r);
+        r.evict_caches_if_large();
+        assert!(
+            r.glyphs.contains_key(&key),
+            "the exact byte cap is retained"
+        );
+        assert_eq!(r.glyph_bytes, BYTE_CAP);
+        assert!(!r.deco_masks.borrow().is_empty());
+
+        let GlyphImage::Mono { width, bytes, .. } = r.glyphs.get_mut(&key).unwrap() else {
+            unreachable!();
+        };
+        *width += 1;
+        bytes.push(0xFF);
+        r.glyph_bytes += 1;
+        assert_accounted(&r);
+        assert_eq!(
+            r.glyphs.len(),
+            1,
+            "count-only eviction would retain this cache"
+        );
+        r.evict_caches_if_large();
+        assert!(r.glyphs.is_empty(), "one byte beyond budget must evict");
+        assert_eq!(r.glyph_bytes, 0, "eviction retires the charge too");
+        assert!(r.keys.is_empty());
+        assert!(r.deco_masks.borrow().is_empty());
+
+        let key = r.glyph_key('A');
+        let refilled = r.glyph_image(key);
+        assert_eq!(
+            refilled.bytes(),
+            expected.bytes(),
+            "eviction preserves pixels"
+        );
+        assert_eq!(
+            (refilled.width(), refilled.height()),
+            (expected.width(), expected.height())
+        );
+        assert_accounted(&r);
+        r.evict_caches_if_large();
+        assert!(
+            r.glyphs.contains_key(&key),
+            "the small refill must stay warm"
+        );
+    }
+
+    /// **THE GLYPH CACHE'S BYTE TOTAL IS THE CACHE'S OWN** (2026-09-14, the
+    /// performance audit). The cache was bounded by ENTRY COUNT while an entry
+    /// is `width x height` coverage bytes — square in the pixel size, so the
+    /// same 16 384-entry cap measured 9.6 MB at 1x and 23.8 MB on a Retina
+    /// cell. It is bounded in bytes now, which only works if the running total
+    /// cannot drift from the map it describes: this walks the cache and
+    /// compares, after rasterizing enough distinct glyphs to exercise the one
+    /// insert site.
+    #[test]
+    fn the_glyph_cache_byte_total_matches_the_cache_it_describes() {
+        let mut r = renderer();
+        assert_eq!(r.glyph_bytes, 0, "a fresh cache holds nothing");
+        let key_for = |r: &mut Renderer, ch: char| {
+            let cell = RenderCell {
+                ch,
+                ..RenderCell::default()
+            };
+            r.resolve_cell_key(None, &cell)
+        };
+        for ch in "the quick brown fox JUMPS over 0123456789".chars() {
+            let key = key_for(&mut r, ch);
+            let _ = r.glyph_image(key);
+        }
+        assert!(!r.glyphs.is_empty(), "the cache took the glyphs");
+        let walked: usize = r.glyphs.values().map(GlyphImage::byte_len).sum();
+        assert_eq!(
+            r.glyph_bytes, walked,
+            "the running total is the sum of what the cache holds"
+        );
+        // Asking again for a key it already has must not charge twice.
+        let before = r.glyph_bytes;
+        for ch in "the quick".chars() {
+            let key = key_for(&mut r, ch);
+            let _ = r.glyph_image(key);
+        }
+        assert_eq!(r.glyph_bytes, before, "a cache HIT charges nothing");
     }
 }
 

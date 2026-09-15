@@ -13,8 +13,9 @@ use std::process::ExitCode;
 use std::time::Duration;
 
 use crate::supervise::{
-    self, EXIT_TIMEOUT, Mark, ReportOpts, Session, SuperviseOpts, classify_command_with,
-    exit_reason, render_phase_and_survey, worker_phase,
+    self, ClockAnchor, EXIT_TIMEOUT, LedgerFormat, LedgerHost, LedgerOpts, MailOpts, Mark,
+    ReportOpts, Session, SuperviseOpts, TaskOpts, View, classify_command_with, exit_reason,
+    render_phase_and_survey, worker_phase,
 };
 use crate::{ControlClient, CtlClient, DRIVE_HELP, RelayClient, SelfGovernor, Turn};
 
@@ -293,7 +294,36 @@ struct SubArgs {
     /// the worker's context left first reads at or below it, then `EVENT
     /// compacted` (`None` = [`DEFAULT_CONTEXT_WARN`]; `0` = neither).
     context_warn: Option<u8>,
-    /// Positional words (the command text for `classify`).
+    /// `watch` / `supervise --journal FILE`: the file the loop appends one
+    /// JSON object to per line it prints; `ledger --journal FILE`: the file
+    /// it reads back.
+    journal: Option<PathBuf>,
+    /// `report --final` / `--messages`: which of the report's rows print.
+    view: View,
+    /// `ledger --format`.
+    format: Option<LedgerFormat>,
+    /// `ledger --out PATH`: write the ledger there instead of to stdout.
+    out: Option<PathBuf>,
+    /// `ledger --since`: Unix ms, from a time word.
+    since_ms: Option<i64>,
+    /// `watch` / `supervise --mail`: park the mail lane on the manager's
+    /// inbox beside the loop.
+    mail: bool,
+    /// `--inbox @<sid>`: the manager's session (`watch`, `supervise`, `task`;
+    /// `@self` unless given).
+    inbox: Option<String>,
+    /// `--report-window S` / `--idle-grace S` (`watch`, `supervise`).
+    report_window_s: Option<u64>,
+    idle_grace_s: Option<u64>,
+    /// `task --deadline S`: the advisory deadline the post carries (and the
+    /// bound of `--wait`).
+    deadline_s: Option<u64>,
+    /// `task --wait`: park for the answer.
+    wait: bool,
+    /// `task --no-nudge`: the mail alone (a worker with the wake hook).
+    no_nudge: bool,
+    /// Positional words (the command text for `classify`, the task's text
+    /// for `task`).
     rest: Vec<String>,
 }
 
@@ -340,6 +370,16 @@ fn parse_sub(verb: &str, args: &[String]) -> Result<SubArgs, String> {
                 it.next(),
             )?),
             "--notes" => out.notes = Some(PathBuf::from(need("--notes", "a FILE", it.next())?)),
+            // `ledger`'s `--since` is a TIME (the journal's clock), every
+            // other verb's an archive mark.
+            "--since" if verb == "ledger" => {
+                let what = "a time: Unix milliseconds, or YYYY-MM-DD[THH:MM[:SS]][Z|±HH:MM]";
+                let v = need("--since", what, it.next())?;
+                out.since_ms = Some(
+                    supervise::parse_since(&v, tz_offset_s())
+                        .ok_or_else(|| format!("{verb}: --since needs {what}"))?,
+                );
+            }
             "--since" => {
                 let what = "ORIGIN:INDEX (a report's last=) or INDEX";
                 let v = need("--since", what, it.next())?;
@@ -357,6 +397,55 @@ fn parse_sub(verb: &str, args: &[String]) -> Result<SubArgs, String> {
                 );
             }
             "--report" => out.report = true,
+            // The loops write a journal; the ledger reads one.
+            "--journal" => {
+                if !matches!(verb, "watch" | "supervise" | "ledger") {
+                    return Err(format!(
+                        "{verb}: --journal is watch's and supervise's (they write it) and \
+                         ledger's (it reads it back)"
+                    ));
+                }
+                out.journal = Some(PathBuf::from(need("--journal", "a FILE", it.next())?));
+            }
+            // What a report prints: the rows are read the same way either way.
+            "--final" | "--messages" => {
+                if verb != "report" {
+                    return Err(format!(
+                        "{verb}: {a} is report's (it chooses which of the report's rows print)",
+                        a = a.as_str()
+                    ));
+                }
+                let want = if a == "--final" {
+                    View::Final
+                } else {
+                    View::Messages
+                };
+                if out.view != View::All && out.view != want {
+                    return Err(format!(
+                        "{verb}: --final and --messages are two views; pass one"
+                    ));
+                }
+                out.view = want;
+            }
+            "--format" => {
+                if verb != "ledger" {
+                    return Err(format!("{verb}: --format is ledger's"));
+                }
+                let what = "text, md or html";
+                let v = need("--format", what, it.next())?;
+                out.format = Some(
+                    LedgerFormat::parse(&v)
+                        .ok_or_else(|| format!("{verb}: --format needs {what}"))?,
+                );
+            }
+            "--out" => {
+                if verb != "ledger" {
+                    return Err(format!(
+                        "{verb}: --out is ledger's (every other verb prints to stdout)"
+                    ));
+                }
+                out.out = Some(PathBuf::from(need("--out", "a PATH", it.next())?));
+            }
             // Only the loops that see a survey appear press anything on it.
             "--dismiss-surveys" => {
                 if !matches!(verb, "watch" | "supervise") {
@@ -384,6 +473,65 @@ fn parse_sub(verb: &str, args: &[String]) -> Result<SubArgs, String> {
                         .filter(|&n| n <= 100)
                         .ok_or_else(|| format!("{verb}: --context-warn needs {what}"))?,
                 );
+            }
+            // Mail is the loops' channel; `task` sends by it.
+            "--mail" => {
+                if !matches!(verb, "watch" | "supervise") {
+                    return Err(format!(
+                        "{verb}: --mail is watch's and supervise's (the loops that park the \
+                         mail lane on your inbox beside the worker's screen)"
+                    ));
+                }
+                out.mail = true;
+            }
+            "--inbox" => {
+                if !matches!(verb, "watch" | "supervise" | "task") {
+                    return Err(format!(
+                        "{verb}: --inbox is watch's, supervise's and task's (the session whose \
+                         inbox is yours: @self unless given)"
+                    ));
+                }
+                let v = need("--inbox", "@<sid> (your own session)", it.next())?;
+                if !v.starts_with('@') {
+                    return Err(format!("{verb}: --inbox needs @<sid> (your own session)"));
+                }
+                out.inbox = Some(v);
+            }
+            "--report-window" | "--idle-grace" => {
+                if !matches!(verb, "watch" | "supervise") {
+                    return Err(format!(
+                        "{verb}: {a} is watch's and supervise's (how --mail folds the worker's \
+                         report into its idle point)",
+                        a = a.as_str()
+                    ));
+                }
+                let n = int(a, "a seconds integer", it.next())?;
+                if a == "--report-window" {
+                    out.report_window_s = Some(n);
+                } else {
+                    out.idle_grace_s = Some(n);
+                }
+            }
+            "--deadline" => {
+                if verb != "task" {
+                    return Err(format!(
+                        "{verb}: --deadline is task's (the advisory deadline the post carries)"
+                    ));
+                }
+                out.deadline_s = Some(int("--deadline", "a seconds integer", it.next())?);
+            }
+            "--wait" | "--no-nudge" => {
+                if verb != "task" {
+                    return Err(format!(
+                        "{verb}: {a} is task's (it sends the task by mail)",
+                        a = a.as_str()
+                    ));
+                }
+                if a == "--wait" {
+                    out.wait = true;
+                } else {
+                    out.no_nudge = true;
+                }
             }
             other if other.starts_with("--") => {
                 return Err(format!(
@@ -459,11 +607,43 @@ pub fn main_entry(argv: Vec<std::ffi::OsString>) -> ExitCode {
         Err(e) => {
             eprintln!("aterm-drive: {e}");
             if let Some(line) = watch_exit_line(&opts.cmd, &e) {
+                // The journal gets this EXIT too. `watch --journal FILE` says
+                // it appends one record for EVERY line it prints, and a replay
+                // reads that file alone — so a run that died BEFORE the loop
+                // (no host to reach, a flag it cannot parse) has to leave the
+                // reason there, not only on a stdout nobody kept. The loop's
+                // own `Journal::open` is never reached on this path, so the
+                // file is opened here, from the argv as typed.
+                let mut warn = std::io::stderr();
+                let mut journal = supervise::Journal::open(
+                    journal_arg(&opts.cmd).as_deref(),
+                    watch_sid_arg(&opts.cmd),
+                    &mut warn,
+                );
+                journal.record(&line, None, &mut warn);
                 println!("{line}");
             }
             ExitCode::FAILURE
         }
     }
+}
+
+/// The `--journal FILE` of a command line, read straight from the argv rather
+/// than from [`parse_sub`] — a failure BEFORE the loop may BE a sub-flag that
+/// would not parse, and the journal still has to record why the run ended.
+fn journal_arg(cmd: &[String]) -> Option<PathBuf> {
+    cmd.windows(2)
+        .find(|w| w[0] == "--journal")
+        .map(|w| PathBuf::from(&w[1]))
+}
+
+/// The `@sid` of a command line, the same way (`None` when the operator named
+/// none and the loop would have driven the focused session).
+fn watch_sid_arg(cmd: &[String]) -> Option<&str> {
+    cmd.iter()
+        .skip(1)
+        .map(String::as_str)
+        .find(|a| a.starts_with('@'))
 }
 
 /// The `EXIT <reason>` line `watch` ends on when it fails before its loop
@@ -495,16 +675,20 @@ fn run(opts: &Opts) -> Result<Reply, String> {
     if verb == "classify" {
         return classify_verb(&opts.cmd[1..]);
     }
-
     // `--dial <name>`: drive a REMOTE aterm over the local host's `dial` relay. A
     // persistent `RelayClient` speaks the SAME verbs as the local path, so the Turn
     // is byte-identical — predicates run on the authoritative remote host. Supports
     // the `prompt` drive loop (the remote use case); other verbs stay local.
+    //
+    // ITS REFUSAL RUNS BEFORE `ledger`. The ledger needs no preflight and so
+    // used to be dispatched above this guard — and `--dial box ledger @sid`
+    // then read the LOCAL host in silence and printed a report of the wrong
+    // machine under a remote name, at exit 0, while every other verb said so.
     if let Some(name) = &opts.dial {
         if verb != "prompt" {
             return Err(format!(
                 "--dial supports the `prompt` command (the drive loop); got `{verb}`. \
-                 Run local read/await/shot without --dial."
+                 Run local read/await/shot/ledger without --dial."
             ));
         }
         let text = opts.cmd[1..].join(" ");
@@ -522,6 +706,12 @@ fn run(opts: &Opts) -> Result<Reply, String> {
             )
         })?;
         return run_prompt_turn(opts, &mut client, &text).map(Reply::text);
+    }
+
+    // The ledger reads whatever answers and says what did not: a session that
+    // is gone still has a journal to replay, so it runs before the preflight.
+    if verb == "ledger" {
+        return ledger_verb(opts, &opts.cmd[1..]);
     }
 
     // A configured local endpoint already gives us everything the control CLI
@@ -598,10 +788,15 @@ fn run(opts: &Opts) -> Result<Reply, String> {
             let sub = parse_sub(verb, &opts.cmd[1..])?;
             no_positionals(verb, &sub)?;
             let sopts = supervise_opts(&sub);
+            mail_needs_sid(verb, &sub)?;
             let reconnect = sub.reconnect_s;
+            // `--mail`'s lane is a client of its own: it parks on YOUR inbox
+            // while the loop's client watches the worker.
+            let mut lane = CtlClient::new(ctl.clone(), opts.socket.clone());
             let mut session = Session::new(&mut client, sub.sid);
             set_reconnect(&mut session, reconnect);
-            let (text, code) = session.supervise(&sopts)?;
+            let (text, code) =
+                session.supervise_mail(&sopts, sopts.mail.is_some().then_some(&mut lane))?;
             Ok(Reply { text, code })
         }
         // The same loop, one flushed stdout line per decision, for a harness
@@ -611,10 +806,28 @@ fn run(opts: &Opts) -> Result<Reply, String> {
             let sub = parse_sub(verb, &opts.cmd[1..])?;
             no_positionals(verb, &sub)?;
             let sopts = supervise_opts(&sub);
+            mail_needs_sid(verb, &sub)?;
             let reconnect = sub.reconnect_s;
+            let mut lane = CtlClient::new(ctl.clone(), opts.socket.clone());
             let mut session = Session::new(&mut client, sub.sid);
             set_reconnect(&mut session, reconnect);
-            let code = session.watch(&sopts, &mut std::io::stdout().lock());
+            // stdout itself, not its lock: the mail lane's thread prints
+            // through the same sink.
+            let code = session.watch_mail(
+                &sopts,
+                sopts.mail.is_some().then_some(&mut lane),
+                &mut std::io::stdout(),
+            );
+            Ok(Reply {
+                text: String::new(),
+                code,
+            })
+        }
+        // The task goes by mail; the PTY gets at most the one-line nudge.
+        "task" => {
+            let sub = parse_sub(verb, &opts.cmd[1..])?;
+            let topts = task_opts(opts, &sub)?;
+            let code = supervise::task(&mut client, &topts, &mut std::io::stdout())?;
             Ok(Reply {
                 text: String::new(),
                 code,
@@ -628,7 +841,7 @@ fn run(opts: &Opts) -> Result<Reply, String> {
             let ropts = report_opts(&sub);
             let mut session = Session::new(&mut client, sub.sid);
             let report = session.report(&ropts)?;
-            Ok(Reply::text(report.render()))
+            Ok(Reply::text(report.render_view(ropts.view)))
         }
         "await" => {
             if opts.cmd.len() < 2 {
@@ -652,10 +865,148 @@ fn run(opts: &Opts) -> Result<Reply, String> {
         }
         other => Err(format!(
             "unknown command '{other}'. Valid: prompt | read | await | shot | classify | phase | \
-             await-turn | supervise | watch | report | help.\n  \
+             await-turn | supervise | watch | task | report | ledger | help.\n  \
              Run `aterm-drive --help` for the full guide."
         )),
     }
+}
+
+/// `aterm drive ledger`: read the worker's turn ledger, the watcher's journal,
+/// this session's mail with it and the archive's reply sizes, and print the
+/// one timeline (`--format text|md|html`, `--out PATH` to write it instead of
+/// printing). The worker is `@sid`, or — with none — the session the journal's
+/// own lines name.
+fn ledger_verb(opts: &Opts, args: &[String]) -> Result<Reply, String> {
+    let sub = parse_sub("ledger", args)?;
+    no_positionals("ledger", &sub)?;
+    let worker = match sub
+        .sid
+        .clone()
+        .or_else(|| journal_sid(sub.journal.as_deref()))
+    {
+        Some(sid) => sid,
+        None => {
+            return Err(
+                "ledger needs the worker: `aterm drive ledger @s-… ` (or a --journal \
+                        whose lines name one)"
+                    .to_string(),
+            );
+        }
+    };
+    let lopts = LedgerOpts {
+        worker,
+        journal: sub.journal.clone(),
+        since_ms: sub.since_ms,
+    };
+    let ctl = resolve_ctl();
+    let mut client = CtlClient::new(ctl, opts.socket.clone());
+    let mut anchor = clock_anchor;
+    let mut host = LedgerHost {
+        now_ms: supervise::journal::unix_ms(),
+        tz_offset_s: tz_offset_s(),
+        anchor: &mut anchor,
+    };
+    let ledger = supervise::gather(&mut client, &lopts, &mut host);
+    let text = supervise::render_ledger(&ledger, sub.format.unwrap_or_default());
+    match &sub.out {
+        None => Ok(Reply::text(text)),
+        Some(path) => {
+            write_private(path, &text)?;
+            Ok(Reply::text(format!("wrote {}\n", path.display())))
+        }
+    }
+}
+
+/// Write `text` to `path`, created 0600 (a ledger carries what the manager
+/// typed and what the worker said), truncating what was there.
+fn write_private(path: &std::path::Path, text: &str) -> Result<(), String> {
+    use std::io::Write as _;
+
+    let mut o = std::fs::OpenOptions::new();
+    o.create(true).write(true).truncate(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        o.mode(0o600);
+    }
+    let mut f = o
+        .open(path)
+        .map_err(|e| format!("cannot write {}: {e}", path.display()))?;
+    f.write_all(text.as_bytes())
+        .and_then(|()| f.flush())
+        .map_err(|e| format!("cannot write {}: {e}", path.display()))
+}
+
+/// The sid the journal's own lines name, when they all name one.
+fn journal_sid(path: Option<&std::path::Path>) -> Option<String> {
+    let (records, _) = supervise::read_journal(path?).ok()?;
+    let mut sids: Vec<&str> = records.iter().filter_map(|r| r.sid.as_deref()).collect();
+    sids.sort_unstable();
+    sids.dedup();
+    match sids.as_slice() {
+        [one] => Some((*one).to_string()),
+        _ => None,
+    }
+}
+
+/// The local time's offset from UTC in seconds, from `date +%z` (the one
+/// place a zone is read; UTC when it cannot be run).
+fn tz_offset_s() -> i64 {
+    let out = std::process::Command::new("date").arg("+%z").output().ok();
+    let text = out
+        .filter(|o| o.status.success())
+        .map(|o| String::from_utf8_lossy(&o.stdout).trim().to_string())
+        .unwrap_or_default();
+    parse_zone(&text).unwrap_or(0)
+}
+
+/// `+hhmm` / `-hh:mm` as seconds.
+fn parse_zone(text: &str) -> Option<i64> {
+    let (sign, rest) = text.split_at(text.find(['+', '-']).filter(|&i| i == 0)? + 1);
+    let digits: String = rest.chars().filter(char::is_ascii_digit).collect();
+    if digits.len() != 4 {
+        return None;
+    }
+    let h: i64 = digits[..2].parse().ok()?;
+    let m: i64 = digits[2..].parse().ok()?;
+    let v = h * 3600 + m * 60;
+    Some(if sign == "-" { -v } else { v })
+}
+
+/// Where the aterm process hosting `sid` started the clock its `history`,
+/// `inbox` and `timeline` stamps count from: the BIRTH TIME of its control
+/// socket, which it binds as it starts (measured on 2026-09-14: within 0.12 s
+/// of the fabric bus's own wall-clock stamps on the same three messages,
+/// where the process's start time — `ps -o lstart=` — was 5.3 s early,
+/// because the clock is pinned lazily, at the first thing that asks for it).
+fn clock_anchor(sid: &str) -> Result<ClockAnchor, String> {
+    let sessions = aterm_ctl::fleet_sessions().map_err(|e| format!("`ls` found nothing: {e}"))?;
+    let pid = sessions
+        .iter()
+        .find(|s| s.sid() == Some(sid))
+        .map(|s| s.pid)
+        .ok_or_else(|| format!("no live instance hosts @{sid}"))?;
+    let instances =
+        aterm_ctl::local_instances().map_err(|e| format!("`instances` found nothing: {e}"))?;
+    let sock = instances
+        .iter()
+        .find(|(p, _)| *p == pid)
+        .map(|(_, sock)| sock.clone())
+        .ok_or_else(|| format!("instance {pid} has no control socket to date"))?;
+    let meta = std::fs::metadata(&sock).map_err(|e| format!("{sock}: {e}"))?;
+    let when = meta
+        .created()
+        .or_else(|_| meta.modified())
+        .map_err(|e| format!("{sock}: no birth time: {e}"))?;
+    let epoch_ms = when
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_err(|e| format!("{sock}: a birth time before 1970: {e}"))?
+        .as_millis();
+    Ok(ClockAnchor {
+        pid,
+        epoch_ms: i64::try_from(epoch_ms).unwrap_or(i64::MAX),
+        how: "its control socket's birth time".to_string(),
+    })
 }
 
 /// `supervise`'s and `watch`'s default budget: the longest a worker is left
@@ -686,13 +1037,65 @@ fn supervise_opts(sub: &SubArgs) -> SuperviseOpts {
         report: sub.report,
         dismiss_surveys: sub.dismiss_surveys,
         context_warn: sub.context_warn.unwrap_or(DEFAULT_CONTEXT_WARN),
+        journal: sub.journal.clone(),
+        mail: sub.mail.then(|| MailOpts {
+            inbox: sub.inbox.clone(),
+            report_window: sub
+                .report_window_s
+                .map_or(supervise::DEFAULT_REPORT_WINDOW, Duration::from_secs),
+            idle_grace: sub
+                .idle_grace_s
+                .map_or(supervise::DEFAULT_IDLE_GRACE, Duration::from_secs),
+        }),
     }
+}
+
+/// `--mail` folds a report only when it is the watched worker's, so the
+/// worker must be named.
+fn mail_needs_sid(verb: &str, sub: &SubArgs) -> Result<(), String> {
+    if sub.mail && sub.sid.is_none() {
+        return Err(format!(
+            "{verb} --mail needs the worker's @sid (a report is folded into its turn only \
+             when it is that worker's)"
+        ));
+    }
+    Ok(())
+}
+
+/// `task @sid [--deadline S] [--wait] [--no-nudge] [--inbox @sid] <text>`.
+fn task_opts(opts: &Opts, sub: &SubArgs) -> Result<TaskOpts, String> {
+    let worker = sub
+        .sid
+        .clone()
+        .ok_or("task needs the worker: `aterm drive task @s-… 'run the suite and report'`")?;
+    let text = sub.rest.join(" ");
+    if text.trim().is_empty() {
+        return Err(
+            "task needs the text, e.g. `aterm drive task @s-… 'run the suite and report'`"
+                .to_string(),
+        );
+    }
+    let deadline = sub.deadline_s.map(Duration::from_secs);
+    Ok(TaskOpts {
+        worker,
+        inbox: sub
+            .inbox
+            .clone()
+            .unwrap_or_else(|| supervise::mail::SELF.to_string()),
+        text,
+        deadline,
+        nudge: !sub.no_nudge,
+        wait: sub
+            .wait
+            .then(|| deadline.unwrap_or(Duration::from_millis(opts.timeout_ms))),
+    })
 }
 
 fn report_opts(sub: &SubArgs) -> ReportOpts {
     ReportOpts {
         since: sub.since,
         max_rows: sub.max_rows.unwrap_or(supervise::DEFAULT_MAX_ROWS),
+        view: sub.view,
     }
 }
 
@@ -816,11 +1219,23 @@ mod tests {
                 reconnect_s: None,
                 allow_python: args(&["tools/*.py", "scripts/*report*.py"]),
                 notes: Some(PathBuf::from("/tmp/notes.txt")),
+                journal: None,
+                view: View::All,
+                format: None,
+                out: None,
+                since_ms: None,
                 since: None,
                 max_rows: None,
                 report: false,
                 dismiss_surveys: false,
                 context_warn: None,
+                mail: false,
+                inbox: None,
+                report_window_s: None,
+                idle_grace_s: None,
+                deadline_s: None,
+                wait: false,
+                no_nudge: false,
                 rest: vec![],
             }
         );
@@ -870,6 +1285,8 @@ mod tests {
                 report: false,
                 dismiss_surveys: false,
                 context_warn: 10,
+                journal: None,
+                mail: None,
             }
         );
         let sub = parse_sub("watch", &args(&["@s-1", "--report"])).expect("parses");
@@ -907,6 +1324,137 @@ mod tests {
             Some("EXIT cannot reach a target aterm over the control socket (refused).")
         );
         assert_eq!(watch_exit_line(&args(&["supervise"]), &err), None);
+    }
+
+    /// `--mail` and its knobs are watch's and supervise's, into the same
+    /// option (`None` unless given, so nothing changes without the flag);
+    /// the loop needs the worker's @sid to fold only its reports; `--inbox`
+    /// is theirs and task's, and must be a `@sid`.
+    #[test]
+    fn mail_flags_are_the_loops_and_need_the_worker() {
+        let sub = parse_sub(
+            "watch",
+            &args(&[
+                "@s-1",
+                "--mail",
+                "--inbox",
+                "@s-9",
+                "--report-window",
+                "60",
+                "--idle-grace",
+                "90",
+            ]),
+        )
+        .expect("parses");
+        assert!(no_positionals("watch", &sub).is_ok() && mail_needs_sid("watch", &sub).is_ok());
+        assert_eq!(
+            supervise_opts(&sub).mail,
+            Some(MailOpts {
+                inbox: Some("@s-9".to_string()),
+                report_window: Duration::from_secs(60),
+                idle_grace: Duration::from_secs(90),
+            })
+        );
+        let sub = parse_sub("supervise", &args(&["@s-1", "--mail"])).expect("parses");
+        assert_eq!(
+            supervise_opts(&sub).mail,
+            Some(MailOpts {
+                inbox: None,
+                report_window: supervise::DEFAULT_REPORT_WINDOW,
+                idle_grace: supervise::DEFAULT_IDLE_GRACE,
+            })
+        );
+        let sub = parse_sub("watch", &args(&["@s-1"])).expect("parses");
+        assert_eq!(supervise_opts(&sub).mail, None, "off unless given");
+        let sub = parse_sub("watch", &args(&["--mail"])).expect("parses");
+        let err = mail_needs_sid("watch", &sub).expect_err("no worker");
+        assert!(
+            err.starts_with("watch --mail needs the worker's @sid"),
+            "{err}"
+        );
+        for verb in ["phase", "await-turn", "report", "task"] {
+            let err = parse_sub(verb, &args(&["--mail"])).expect_err(verb);
+            assert!(
+                err.starts_with(&format!("{verb}: --mail is watch's and supervise's")),
+                "{err}"
+            );
+        }
+        let err = parse_sub("report", &args(&["--inbox", "@s-1"])).expect_err("report");
+        assert!(
+            err.starts_with("report: --inbox is watch's, supervise's and task's"),
+            "{err}"
+        );
+        let err = parse_sub("watch", &args(&["--inbox", "s-1"])).expect_err("no @");
+        assert!(err.contains("--inbox needs @<sid>"), "{err}");
+        let err = parse_sub("watch", &args(&["--idle-grace", "soon"])).expect_err("not an int");
+        assert!(
+            err.contains("--idle-grace needs a seconds integer"),
+            "{err}"
+        );
+        let err = parse_sub("phase", &args(&["--report-window", "5"])).expect_err("phase");
+        assert!(
+            err.starts_with("phase: --report-window is watch's and supervise's"),
+            "{err}"
+        );
+    }
+
+    /// `task @sid [--deadline S] [--wait] [--no-nudge] [--inbox @sid] <text>`:
+    /// the text is the positionals, the deadline rides on the post and
+    /// bounds `--wait` (else the global `--timeout` does), the nudge is on
+    /// unless refused; its flags are refused everywhere else.
+    #[test]
+    fn task_parses_the_worker_its_flags_and_the_text() {
+        let opts = parse(vec!["task".into()]).expect("parses");
+        let sub = parse_sub(
+            "task",
+            &args(&[
+                "@s-1",
+                "--deadline",
+                "600",
+                "--wait",
+                "--no-nudge",
+                "run it",
+                "now",
+            ]),
+        )
+        .expect("parses");
+        assert_eq!(
+            task_opts(&opts, &sub).expect("a task"),
+            TaskOpts {
+                worker: "@s-1".to_string(),
+                inbox: "@self".to_string(),
+                text: "run it now".to_string(),
+                deadline: Some(Duration::from_secs(600)),
+                nudge: false,
+                wait: Some(Duration::from_secs(600)),
+            }
+        );
+        let sub =
+            parse_sub("task", &args(&["@s-1", "--wait", "--inbox", "@s-9", "x"])).expect("parses");
+        let t = task_opts(&opts, &sub).expect("a task");
+        assert_eq!(
+            (t.inbox.as_str(), t.deadline, t.nudge, t.wait),
+            ("@s-9", None, true, Some(Duration::from_millis(180_000)))
+        );
+        let sub = parse_sub("task", &args(&["@s-1", "x"])).expect("parses");
+        assert_eq!(task_opts(&opts, &sub).expect("a task").wait, None);
+        let sub = parse_sub("task", &args(&["x"])).expect("parses");
+        let err = task_opts(&opts, &sub).expect_err("no worker");
+        assert!(err.starts_with("task needs the worker"), "{err}");
+        let sub = parse_sub("task", &args(&["@s-1"])).expect("parses");
+        let err = task_opts(&opts, &sub).expect_err("no text");
+        assert!(err.starts_with("task needs the text"), "{err}");
+        for (verb, flag) in [
+            ("watch", "--wait"),
+            ("supervise", "--no-nudge"),
+            ("report", "--deadline"),
+        ] {
+            let err = parse_sub(verb, &args(&[flag, "5"])).expect_err(verb);
+            assert!(
+                err.starts_with(&format!("{verb}: {flag} is task's")),
+                "{err}"
+            );
+        }
     }
 
     /// `await-turn` prints its turn exactly like `phase` — the `survey 0`
@@ -1096,6 +1644,7 @@ mod tests {
                     index: 1291
                 }),
                 max_rows: 500,
+                view: View::All,
             }
         );
         let sub = parse_sub("report", &args(&["--since", "42"])).expect("a bare index");
@@ -1403,5 +1952,270 @@ mod tests {
 
         std::fs::remove_file(token_path).expect("remove token");
         std::fs::remove_dir(dir).expect("remove endpoint directory");
+    }
+
+    /// The round-11 flags belong to their verbs: `--journal` to the loops
+    /// that write one and to the ledger that reads it back, `--final` and
+    /// `--messages` to `report`, `--format` and `--out` to `ledger`, whose
+    /// `--since` is a TIME where every other verb's is an archive mark.
+    #[test]
+    fn the_round_11_flags_belong_to_their_verbs() {
+        for verb in ["watch", "supervise"] {
+            let sub = parse_sub(verb, &args(&["@s-1", "--journal", "/tmp/j.jsonl"])).expect(verb);
+            assert!(no_positionals(verb, &sub).is_ok());
+            assert_eq!(sub.journal, Some(PathBuf::from("/tmp/j.jsonl")));
+            assert_eq!(
+                supervise_opts(&sub).journal,
+                Some(PathBuf::from("/tmp/j.jsonl")),
+                "{verb} hands it to the loop"
+            );
+            let sub = parse_sub(verb, &args(&["@s-1"])).expect(verb);
+            assert_eq!(supervise_opts(&sub).journal, None, "{verb}: off by default");
+        }
+        let sub = parse_sub(
+            "ledger",
+            &args(&[
+                "@s-1",
+                "--journal",
+                "j.jsonl",
+                "--format",
+                "md",
+                "--out",
+                "out.md",
+                "--since",
+                "1789344000000",
+            ]),
+        )
+        .expect("parses");
+        assert!(no_positionals("ledger", &sub).is_ok());
+        assert_eq!(
+            (
+                sub.sid.as_deref(),
+                sub.journal.as_deref(),
+                sub.format,
+                sub.out.as_deref(),
+                sub.since_ms
+            ),
+            (
+                Some("@s-1"),
+                Some(std::path::Path::new("j.jsonl")),
+                Some(LedgerFormat::Md),
+                Some(std::path::Path::new("out.md")),
+                Some(1_789_344_000_000)
+            )
+        );
+        // The formats, and what is not one.
+        for (word, want) in [
+            ("text", LedgerFormat::Text),
+            ("md", LedgerFormat::Md),
+            ("markdown", LedgerFormat::Md),
+            ("html", LedgerFormat::Html),
+        ] {
+            let sub = parse_sub("ledger", &args(&["--format", word])).expect(word);
+            assert_eq!(sub.format, Some(want), "{word}");
+        }
+        for bad in ["", "HTML", "pdf", "json"] {
+            let err = parse_sub("ledger", &args(&["--format", bad])).expect_err(bad);
+            assert_eq!(err, "ledger: --format needs text, md or html", "{bad}");
+        }
+        let err = parse_sub("ledger", &args(&["--format"])).expect_err("no value");
+        assert!(err.contains("--format needs"), "{err}");
+        // A time word, or Unix milliseconds; an archive mark is not one.
+        let sub = parse_sub("ledger", &args(&["--since", "2026-09-14T10:30:00Z"])).expect("a time");
+        assert_eq!(sub.since_ms, Some(1_789_381_800_000));
+        assert_eq!(sub.since, None, "ledger reads no archive mark");
+        for bad in ["7730:1291", "yesterday", "2026-13-01"] {
+            let err = parse_sub("ledger", &args(&["--since", bad])).expect_err(bad);
+            assert!(
+                err.starts_with("ledger: --since needs a time:"),
+                "{bad}: {err}"
+            );
+        }
+        // `report`'s `--since` is still the archive mark it always was.
+        let sub = parse_sub("report", &args(&["--since", "7730:1291"])).expect("a mark");
+        assert_eq!(sub.since.map(|m| m.index), Some(1291));
+        assert_eq!(sub.since_ms, None);
+        // The two report views: one of them, and only on `report`.
+        let sub = parse_sub("report", &args(&["@s-1", "--final"])).expect("parses");
+        assert!(no_positionals("report", &sub).is_ok());
+        assert_eq!(
+            (sub.view, report_opts(&sub).view),
+            (View::Final, View::Final)
+        );
+        let sub = parse_sub("report", &args(&["--messages"])).expect("parses");
+        assert_eq!(sub.view, View::Messages);
+        assert_eq!(
+            parse_sub("report", &args(&[])).expect("parses").view,
+            View::All,
+            "the whole report unless a view is asked for"
+        );
+        let err = parse_sub("report", &args(&["--final", "--messages"])).expect_err("two views");
+        assert_eq!(
+            err,
+            "report: --final and --messages are two views; pass one"
+        );
+        assert!(
+            parse_sub("report", &args(&["--final", "--final"])).is_ok(),
+            "the same view twice"
+        );
+        // Every flag refuses the verbs it is not for, by name.
+        for (verb, flag, says) in [
+            (
+                "report",
+                "--journal",
+                "--journal is watch's and supervise's",
+            ),
+            ("phase", "--journal", "--journal is watch's and supervise's"),
+            ("watch", "--final", "--final is report's"),
+            ("ledger", "--messages", "--messages is report's"),
+            ("report", "--format", "--format is ledger's"),
+            ("watch", "--out", "--out is ledger's"),
+        ] {
+            let err = parse_sub(verb, &args(&[flag, "x"])).expect_err(flag);
+            assert!(
+                err.starts_with(&format!("{verb}: {says}")),
+                "{verb} {flag}: {err}"
+            );
+        }
+    }
+
+    /// **`--dial` IS REFUSED FOR `ledger`, not silently ignored.**
+    ///
+    /// The ledger needs no control-socket preflight, so it was dispatched
+    /// ABOVE the `--dial` guard — and `aterm drive --dial nonexistent-box
+    /// ledger @sid` read the LOCAL host and printed a full report of the wrong
+    /// machine under a remote name, at exit 0, while `--dial ... report @sid`
+    /// on the same machine said "`--dial` supports the `prompt` command".
+    #[test]
+    fn dial_is_refused_for_ledger_like_every_other_non_prompt_verb() {
+        for verb in ["ledger", "report", "watch", "read"] {
+            let err = run(&Opts {
+                socket: None,
+                dial: Some("nonexistent-box".to_string()),
+                idle_ms: 1,
+                timeout_ms: 1,
+                ready: None,
+                cmd: vec![verb.to_string(), "@s-1".to_string()],
+            })
+            .expect_err("--dial drives only the prompt loop");
+            assert!(
+                err.starts_with(&format!(
+                    "--dial supports the `prompt` command (the drive loop); got `{verb}`."
+                )),
+                "{verb}: {err}"
+            );
+        }
+    }
+
+    /// **THE `EXIT` LINE OF A PRE-LOOP FAILURE REACHES THE JOURNAL.**
+    ///
+    /// `watch --journal FILE` promises one record for EVERY line it prints. A
+    /// run that dies before the loop — no host to reach, a flag it cannot
+    /// parse — prints `EXIT <reason>` from `main_entry`, but `Journal::open`
+    /// lived inside `watch_to`, so the file was never even created and a
+    /// replay saw no record that the watch had run or why it ended.
+    #[test]
+    fn a_watch_that_dies_before_its_loop_still_journals_its_exit() {
+        let dir = std::env::temp_dir().join(format!(
+            "aterm-drive-preloop-{}-{:?}",
+            std::process::id(),
+            std::thread::current().id()
+        ));
+        std::fs::create_dir_all(&dir).expect("tmp dir");
+        let path = dir.join("journal.jsonl");
+        let _ = std::fs::remove_file(&path);
+
+        // The argv as typed, read straight back — the sub-flags may be exactly
+        // what would not parse.
+        let cmd = vec![
+            "watch".to_string(),
+            "@s-1".to_string(),
+            "--journal".to_string(),
+            path.display().to_string(),
+        ];
+        assert_eq!(journal_arg(&cmd).as_deref(), Some(path.as_path()));
+        assert_eq!(watch_sid_arg(&cmd), Some("@s-1"));
+        assert_eq!(journal_arg(&cmd[..2]), None);
+        assert_eq!(watch_sid_arg(&["watch".to_string()]), None);
+
+        let mut warn = Vec::new();
+        let mut journal = crate::supervise::Journal::open(
+            journal_arg(&cmd).as_deref(),
+            watch_sid_arg(&cmd),
+            &mut warn,
+        );
+        let line = watch_exit_line(&cmd, "cannot reach a target aterm (refused).\n  • hint")
+            .expect("watch ends on EXIT");
+        journal.record(&line, None, &mut warn);
+
+        let (records, bad) =
+            crate::supervise::read_journal(&path).expect("the journal exists and reads");
+        assert_eq!(bad, 0);
+        assert_eq!(records.len(), 1, "one line printed, one record");
+        assert_eq!(records[0].kind, "exit");
+        assert_eq!(records[0].sid.as_deref(), Some("s-1"));
+        assert_eq!(records[0].line, line);
+        assert!(
+            records[0]
+                .line
+                .starts_with("EXIT cannot reach a target aterm"),
+            "{}",
+            records[0].line
+        );
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let mode = std::fs::metadata(&path).expect("stat").permissions().mode() & 0o777;
+            assert_eq!(mode, 0o600, "the journal is the loop's own");
+        }
+        let _ = std::fs::remove_file(&path);
+        let _ = std::fs::remove_dir(&dir);
+    }
+
+    /// The zone `date +%z` prints, in both spellings, as seconds; anything
+    /// else is no zone (and the ledger's times fall back to UTC).
+    #[test]
+    fn the_local_zone_is_read_from_date() {
+        assert_eq!(parse_zone("+0000"), Some(0));
+        assert_eq!(parse_zone("-0700"), Some(-7 * 3600));
+        assert_eq!(parse_zone("+0530"), Some(5 * 3600 + 1800));
+        assert_eq!(parse_zone("-07:00"), Some(-7 * 3600));
+        for bad in ["", "UTC", "0700", "+07", "+070000", "x+0700"] {
+            assert_eq!(parse_zone(bad), None, "{bad}");
+        }
+    }
+
+    /// The ledger needs a worker: the `@sid` given, or the one the journal's
+    /// own lines name (and nothing to go on is an actionable error).
+    #[test]
+    fn the_ledger_takes_its_worker_from_the_journal_when_none_is_named() {
+        let dir = std::env::temp_dir().join(format!("aterm-drive-ledger-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).expect("tmp dir");
+        let path = dir.join("journal.jsonl");
+        let line = |sid: &str| {
+            crate::supervise::JournalRecord::of_line(1, Some(sid), "TIMEOUT", None).to_json()
+        };
+        std::fs::write(&path, format!("{}\n{}\n", line("s-work"), line("@s-work"))).expect("write");
+        assert_eq!(journal_sid(Some(&path)).as_deref(), Some("s-work"));
+        // Two sessions in one file: the ledger cannot guess which.
+        std::fs::write(&path, format!("{}\n{}\n", line("s-work"), line("s-other"))).expect("write");
+        assert_eq!(journal_sid(Some(&path)), None);
+        assert_eq!(journal_sid(None), None);
+        assert_eq!(journal_sid(Some(&dir.join("nothing.jsonl"))), None);
+        let err = ledger_verb(
+            &Opts {
+                socket: None,
+                dial: None,
+                idle_ms: 1,
+                timeout_ms: 1,
+                ready: None,
+                cmd: vec!["ledger".to_string()],
+            },
+            &args(&["--journal", &path.to_string_lossy()]),
+        )
+        .expect_err("no worker");
+        assert!(err.starts_with("ledger needs the worker:"), "{err}");
+        let _ = std::fs::remove_file(&path);
+        let _ = std::fs::remove_dir(dir);
     }
 }

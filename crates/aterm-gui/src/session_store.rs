@@ -113,6 +113,15 @@ pub struct SessionRecord {
     pub role: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub attention: Option<String>,
+    /// CONTROL CARRY (additive, absent tolerated; round 10): `"<len>
+    /// <sha256hex>"` of this session's `seamless-<pid>-<nonce>.s<id>.ctl`
+    /// sidecar — the turn ledger and the tail of the alt-screen archive
+    /// (`crate::handoff_carry`). A plain string so an older reader skips it
+    /// like any unknown key. Best-effort by design: the sidecar is NOT in
+    /// either adoption-proof digest, a missing or mismatched one is ignored,
+    /// and nothing about it can refuse the adoption.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub control: Option<String>,
 }
 
 /// The screen half of the seamless handoff: the checkpoint's scalar projection
@@ -232,6 +241,15 @@ pub struct SessionHandoff {
     /// the old process. NEVER a token, NEVER a nonce (§1.4#3).
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub connections: Vec<ConnectionCarry>,
+    /// TURN-ID CARRY (additive, absent tolerated; round 10): the last `turn`
+    /// id the outgoing process minted. The incoming process continues the
+    /// count above it while still single-threaded (`seamless::take_incoming`),
+    /// so ids keep rising across the update and a `since-turn=`/`since=`
+    /// anchor taken before it still means "after that turn". A plain scalar an
+    /// older reader skips; carried apart from the ledgers so a ledger that
+    /// could not be carried cannot lower it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub next_turn_id: Option<u64>,
 }
 
 // ⚠ LOAD-BEARING WIRE FORMAT — DO NOT "CLEAN UP" THIS SERIALIZATION.
@@ -284,6 +302,8 @@ impl SessionHandoff {
             schema: Self::SCHEMA,
             window: None,
             connections,
+            // Stamped by the handoff worker, which writes the manifest.
+            next_turn_id: None,
             sessions: handles
                 .into_iter()
                 .map(|h| {
@@ -310,6 +330,8 @@ impl SessionHandoff {
                         icon: meta.icon.clone(),
                         role: meta.role.clone(),
                         attention: meta.attention.clone(),
+                        // Attached by the seamless writer with its sidecar.
+                        control: None,
                     }
                 })
                 .collect(),

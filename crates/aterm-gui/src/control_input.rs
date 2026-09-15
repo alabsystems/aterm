@@ -403,9 +403,12 @@ pub(crate) fn key_is_plain_typed_glyph(rest: &str) -> bool {
 /// pre-clearing for them wiped the banked stamps of keys whose echoes were
 /// still in flight AND destroyed the very license the dispatched key was about
 /// to arm — every control-driven `key enter` deterministically manufactured a
-/// no-fresh-hint decline. Anything malformed, modified (Ctrl/Alt/Super), other
-/// named keys (nav arms via a different host path with its own pre-clear
-/// semantics), or a release answers `false` and keeps the fence.
+/// no-fresh-hint decline. A bare Ctrl-V arms too — the delivered-insert class
+/// beside the gesture class, bank-preserving like Tab — and is the ONE modified
+/// chord that does. Anything malformed, any OTHER modified chord
+/// (Ctrl/Alt/Super), other named keys (nav arms via a different host path with
+/// its own pre-clear semantics), or a release answers `false` and keeps the
+/// fence.
 pub(crate) fn key_arms_own_license(rest: &str) -> bool {
     use aterm_types::keyboard::{Key, KeyEventType, Modifiers, NamedKey};
     if key_is_plain_typed_glyph(rest) {

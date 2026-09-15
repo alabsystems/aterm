@@ -242,20 +242,41 @@ const SCOPE_CLAIMS: &[ScopeClaim] = &[
             // `flash_limiter_window_model` and its "window-wide" prose moved
             // here when the model catalog was split out of derive.rs by family.
             "crates/aterm-spec/src/derive/models_effects.rs",
-            // `max_streaks`' doc names this limiter as the governor that binds
-            // long before a comet cap does ("the ≤2/s window-wide ignition
-            // limiter"). The sentence is TRUE and it is about THIS claim, not
-            // about the config field it sits on — which is precisely the case
-            // this list exists for. Arrived 2026-08-31 with PRISM WAKE
-            // (6dca65a30).
+            // `max_streaks`' doc names this limiter, and it is about THIS
+            // claim rather than about the config field it sits on — which is
+            // precisely the case this list exists for. Arrived 2026-08-31 with
+            // PRISM WAKE (6dca65a30).
+            //
+            // WHAT THE SENTENCE SAYS CHANGED (found 2026-09-01, landed
+            // 2026-09-14), and the entry survived the change on purpose. It
+            // used to assert that this window-wide limiter is one of the
+            // governors binding PRISM WAKE's comet rate. That was FALSE: the
+            // streak engine never reserves against `FlashLimiterWindow`, and
+            // no host call does it on the engine's behalf. The doc now names
+            // the limiter in order to DISCLAIM it — a true sentence about this
+            // claim's scope, kept where a reader of `max_streaks` would
+            // otherwise inherit the old error, and the reason this file must
+            // stay in the list rather than drop out of it.
             "crates/aterm-gui/src/app_config.rs",
-            // PRISM WAKE's own engine, for the same reason and in two places:
-            // its module header names "the ≤2/s WCAG rolling-ignition budget
-            // the word-nova" owns, and `OutputStreak`'s doc block says which
-            // budget is window-wide and that it is NOT this per-pane state
-            // machine's. Both sentences are about THIS claim. Naming another
-            // scope in order to DISCLAIM it is exactly the prose OB-17 should
-            // want written, and it must not be the thing that fails the build.
+            // PRISM WAKE's own engine. `OutputStreak`'s doc block names THIS
+            // claim's budget in order to DISCLAIM it — it says the ≤2/s
+            // rolling ignition allowance is window-wide, that it belongs to
+            // `FlashLimiterWindow`, and that PRISM WAKE never reserves against
+            // it (there is no FlashLimiter call in that file and the host makes
+            // none on its behalf), so "one per window" would be the wrong shape
+            // for a per-pane state machine. Naming another scope in order to
+            // disclaim it is exactly the prose OB-17 should want written, and it
+            // must not be the thing that fails the build.
+            //
+            // NOT STALE, and verified rather than assumed: removing this line
+            // makes the real-tree census RED with
+            // "[OB-17] ... `window-wide` in the doc block at
+            // crates/aterm-effects/src/output_streak.rs". Arrived 2026-08-31
+            // with PRISM WAKE (6dca65a30); re-checked when that file's WCAG
+            // prose was corrected (found 2026-09-01, landed 2026-09-14), which
+            // deleted the module header's claim that the streak's spawn floor
+            // sat "inside" this budget — a sentence that invoked a budget the
+            // engine does not spend from.
             "crates/aterm-effects/src/output_streak.rs",
         ],
         rationale: "WCAG 2.3.1 charges 2 flash pairs per ignition against a \

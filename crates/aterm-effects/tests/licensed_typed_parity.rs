@@ -799,7 +799,57 @@ fn a_licensed_typed_move_is_byte_identical_across_the_license_commit() {
         // RE-CAPTURED 2026-09-13 (the comet's review round): the rail's reach
         // capped at RAIL_REACH_MAX_CH, the wipe on typed cells only, the last
         // row flat. Entry 2 alone; the other EIGHT came back byte-identical.
-        7_629_358_332_570_765_847,
+        // RE-CAPTURED 2026-09-14 — THE OWNER'S NOTCH AND SLIVERS
+        // (`docs/measured/cursor-notch-2026-09-14.md`): the band continues
+        // one cell under the caret so the block stands on it, a boundary's
+        // light is the older side's with the younger side entering at the
+        // tail ease (two abutting runs share their seam vertex), and the hot
+        // edge exists on a cold hand. This script's typing runs under a
+        // caret on every frame, so entry 2 alone moves
+        // (`7_629_358_332_570_765_847` → `9_091_786_048_869_394_637`); the
+        // other EIGHT came back byte-identical — the attach and the boundary
+        // law are the ribbon's own, which is this re-capture's control. The
+        // flat spelling's pin moved with it (below): none of the three is a
+        // comet branch.
+        // RE-CAPTURED 2026-09-14 — the rail's own ceiling (RAIL_LUMA_CEIL 0.54,
+        // L5 amended to the glyph rows; the owner's visible yellow). Entry 2
+        // alone; the other EIGHT came back byte-identical.
+        // RE-BAKED AT THE MERGE, 2026-09-14: the landing-palette round landed on a main
+        // already carrying the rail ceiling, the scrub and the new-line fade; the kitty
+        // entry read off the merged tree's own run (was 5_061_215_610_766_713_242).
+        // RE-CAPTURED 2026-09-13 — THE PHRASE REST (Rainbow Path v3 §2.6,
+        // step 5). The ribbon's grace after the last key is the melody's
+        // rest (0.90 s at the floor, tempo-scaled) where it was a 0.75 s
+        // literal; an erase holds the open phrase; a row the caret is not on
+        // retracts into its own nearest end. This script's swoosh tail and
+        // its erase move with it.
+        // RE-CAPTURED 2026-09-14 — RAINBOW PATH v3 MERGED ONTO THE SCRUB:
+        // the phrase rest, the erase/kill phrase hold, the per-row retract
+        // target and the overlay wake on the flight clock, on top of the
+        // comet body, the vivid rail and its ceiling, with `Ribbon::scrub`
+        // reading every keyed same-row move first. This script's typing, its
+        // erase and its fold cross all of them, so entry 2 alone moves;
+        // captured with `ATERM_CAPTURE_TYPED_PARITY=1`, the other EIGHT came
+        // back byte-identical — the laws are v2's own and no other style's
+        // frame can reach them, which is this re-capture's control.
+        // RE-CAPTURED AT THE 0.86 RC MERGE, 2026-09-14 — THE NOTCH ROUND
+        // MEETS RAINBOW PATH v3. Neither side's number can describe this
+        // tree: v3 had `17_850_034_006_297_281_646` without main's notch
+        // round, main had `5_416_272_849_145_983_171` without v3's phrase
+        // rest and overlay. What main brings that this script crosses is the
+        // ATTACH under the caret cell — the band continues one cell under
+        // the block — together with the boundary law (a seam's light is the
+        // older side's, the younger entering at the tail ease), the hot edge
+        // on a cold hand, and the floor under a leaving caret cell. This
+        // script types under a caret on every frame, so the attach alone
+        // reaches every typed frame of it. Main's soft-end fix
+        // (`Cohort::landing_col`) cannot reach this fold — the script only
+        // types rightward and never jumps — so it is a no-regression check
+        // on the typed path there, not a control. Read off the merged
+        // tree's own run with `ATERM_CAPTURE_TYPED_PARITY=1`: entry 2 is
+        // `6_195_508_255_605_043_548` here, and the other EIGHT came back
+        // byte-identical, which is this re-capture's control.
+        6_195_508_255_605_043_548,
         12_359_376_227_302_100_357,
         17_288_162_128_308_037_669,
         13_741_658_660_564_044_123,
@@ -828,16 +878,44 @@ fn a_licensed_typed_move_is_byte_identical_across_the_license_commit() {
     );
 }
 
-/// THE FLAT SPELLING IS THE PRE-COMET FOLD (2026-09-13,
+/// THE FLAT SPELLING COLLAPSES EVERY COMET BRANCH (2026-09-13,
 /// `RAINBOW-KITTY-V2.md` §30). With `GlowConfig::ribbon_flat` set — the
-/// `rainbow kitty flat` spelling, the owner's A/B control — the same script
-/// folds to the number entry 2 of `GOLDEN` held BEFORE the comet body, the
-/// vivid rail and the from-the-hand attack landed (captured on 8582a67f9,
-/// the gap fixes). Every comet branch in `ribbon.rs` collapses to the old
-/// expression under the flag, and this is the measurement of that claim.
+/// `rainbow kitty flat` spelling, the owner's A/B control — every comet
+/// branch in `ribbon.rs` collapses to the pre-comet expression, and this is
+/// the byte-exact measurement of that claim.
+///
+/// RE-PINNED 2026-09-14 (Rainbow Path v3 merged). Until now this number WAS
+/// entry 2 of `GOLDEN` as it stood before the comet landed (8582a67f9), and
+/// it can no longer be: the merge moves laws the flag does not gate — the
+/// phrase rest, the erase/kill phrase hold, the per-row retract target and
+/// the overlay wake on its flight clock. The flag's own claim is unchanged
+/// and still measured: flat folds HERE, the default body folds elsewhere.
+///
+/// RE-CAPTURED AT THE 0.86 RC MERGE, 2026-09-14. Main's notch round is not
+/// a comet branch either — the attach under the caret cell, the boundary
+/// law, the hot edge's floor and the floor under a leaving caret cell stand
+/// under the flat body exactly as they stand under the comet — so the flat
+/// fold moves with them too. That is the same reason the number stopped
+/// being a time capsule and became a pin on the COLLAPSE: what is measured
+/// here is that the flag folds every comet branch off, and the `assert_ne!`
+/// control below is what keeps it a measurement rather than a claim.
 #[test]
 fn the_flat_spelling_keeps_the_pre_comet_typed_fold() {
-    const PRE_COMET: u64 = 7_634_783_364_044_148_639;
+    // RE-BAKED AT THE MERGE, 2026-09-14 (was 7_634_783_364_044_148_639): the flat
+    // spelling's typed fold on the merged tree — the rail ceiling, the landing palette,
+    // the scrub and the new-line fade together.
+    // RE-CAPTURED AT THE 0.86 MERGE: the flat spelling still collapses every comet
+    // branch byte for byte, but the fold it collapses TO is not the pre-comet tree's —
+    // the phrase rest, the erase hold and the per-row retract are not gated by the flag,
+    // so they move this number too. It pins the COLLAPSE, not a snapshot of history.
+    // RE-CAPTURED AGAIN AT THE 0.86 RC MERGE, 2026-09-14: neither side's number can
+    // describe this tree — v3 had `6_809_270_375_967_585_791` without the notch round,
+    // main had `14_265_225_952_539_666_539` without the phrase rest, the erase hold and
+    // the per-row retract. The notch round's attach, boundary law and floors are not
+    // comet branches, so they move the flat fold alongside v3's ungated laws; read off
+    // the merged tree's own run as `18_065_821_225_995_789_763`. The `assert_ne!`
+    // control below held: the default body still folds this script elsewhere.
+    const PRE_COMET: u64 = 18_065_821_225_995_789_763;
     let mut flat = cfg(GlowStyle::RainbowKitty);
     flat.ribbon_flat = true;
     let a = typed_script_with(&flat, true);
@@ -845,7 +923,7 @@ fn the_flat_spelling_keeps_the_pre_comet_typed_fold() {
     assert_eq!(a, b, "the flat typed script is nondeterministic");
     assert_eq!(
         a.fingerprint, PRE_COMET,
-        "the flat spelling stopped being byte-identical to the pre-comet ribbon"
+        "the flat spelling stopped collapsing every comet branch"
     );
     // …and the control: the default body is the comet, so the same script
     // WITHOUT the flag folds to something else (entry 2 of `GOLDEN`).

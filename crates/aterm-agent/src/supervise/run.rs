@@ -15,12 +15,26 @@
 //! `@sid`, or the server turned the connection away — does not end the loop:
 //! the outage is ridden out ([`Session::ride_out`]) and the loop looks again
 //! from a fresh read.
+//!
+//! With `--mail` ([`SuperviseOpts::mail`]) a second [`Ctl`] — the mail lane,
+//! [`super::mail::Lane`] — parks `await inbox` on the MANAGER's own session
+//! from a thread of its own, prints `MAIL …` per delivery through the loop's
+//! one sink, and hands the watched worker's `report`s to the loop, which
+//! folds each into the idle point of the same turn
+//! (`Session::hold_for_report`): one `EVENT turn` line per worker turn. The
+//! worker's socket sees not one request more than without the flag, and
+//! without it every line is byte-identical.
 
 use std::io::Write;
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::mpsc::{self, Receiver, RecvTimeoutError, TryRecvError};
+use std::sync::{Mutex, PoisonError};
 use std::time::{Duration, Instant};
 
 use super::classify::{DEFAULT_PYTHON_ALLOW, Verdict, classify_command_with};
+use super::journal::Journal;
+use super::mail::{self, Delivery, MailOpts};
 use super::phase::{
     Phase, busy_signal, composer_draft, composer_text, context_left, has_composer_frame,
     is_placeholder, last_said_index, last_said_row, status_row, survey_open, worker_phase,
@@ -152,11 +166,27 @@ const TURNED_AWAY: &[&str] = &["ERR control server busy", "ERR auth"];
 pub trait Ctl {
     /// `args` is the request after any `@sid` selector, e.g. `["text", "--json"]`.
     fn call(&mut self, args: &[&str]) -> Result<CtlReply, String>;
+
+    /// A handle that cuts the request in flight short — and every one after
+    /// it — from another thread: what ends the mail lane's parked `await
+    /// inbox` (20 s a step) the moment the loop has its result, so
+    /// `supervise --mail` hands its point back at once and `watch --mail`'s
+    /// process ends with its last line ([`Session::run_loop`]). `None` for a
+    /// client that cannot: the loop then ends within one step.
+    fn interrupter(&self) -> Option<Interrupter> {
+        None
+    }
 }
+
+/// [`Ctl::interrupter`]'s handle.
+pub type Interrupter = Box<dyn Fn() + Send + Sync>;
 
 impl Ctl for crate::CtlClient {
     fn call(&mut self, args: &[&str]) -> Result<CtlReply, String> {
         self.run_raw(args)
+    }
+    fn interrupter(&self) -> Option<Interrupter> {
+        self.cutter()
     }
 }
 
@@ -208,6 +238,22 @@ pub struct SuperviseOpts {
     /// armed at its start: a compaction between two `supervise` runs is not
     /// seen.
     pub context_warn: u8,
+    /// `--journal`: a file to append one JSON object to for every line the
+    /// loop prints — and, for `supervise`, for every line `watch` would have
+    /// printed for what it decides silently ([`super::journal`]).
+    pub journal: Option<PathBuf>,
+    /// `--mail`: park the mail lane ([`super::mail::Lane`]) on the manager's
+    /// inbox beside the loop. Every delivery prints `MAIL id=<n> off=<o>
+    /// from=<sid> kind=<k> len=<n> [re=<o>]` as it lands; an idle point is
+    /// held (`Session::hold_for_report`) for the worker's `report` of the
+    /// same turn — `idle_grace` at most, the screen read once a step under
+    /// it — and printed as ONE line, `EVENT turn seq=<n> report=<id>
+    /// rows=<n> <summary>` (the report's row id and its body's row count)
+    /// when one that is the turn's came ([`MailIn::is_this_turns`]:
+    /// `report_window` bounds only a report from before the turn was seen to
+    /// begin), else `EVENT idle-no-report seq=<n> <summary>`. `None` — no
+    /// flag — leaves every line as it was.
+    pub mail: Option<MailOpts>,
 }
 
 impl SuperviseOpts {
@@ -350,10 +396,114 @@ struct Outage {
 
 /// How the shared loop ended.
 enum End {
-    /// The review stopped the loop at this point (`supervise`).
-    Stopped(Turn),
+    /// The review stopped the loop at this point (`supervise`), with how
+    /// `--mail` settled it when it was an idle one.
+    Stopped(Turn, Option<Fold>),
     /// The budget ran out; the last screen read.
     Timeout(Turn),
+}
+
+/// How `--mail` settled an idle point (`Session::hold_for_report`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Fold {
+    /// The worker's `report` of this turn came within the window: the point
+    /// prints as `EVENT turn seq=<n> report=<id> rows=<n> <summary>`.
+    Report { id: u64, rows: usize },
+    /// None came within the grace: `EVENT idle-no-report seq=<n> <summary>`.
+    NoReport,
+}
+
+/// The loop's side of the mail lane ([`SuperviseOpts::mail`]).
+struct MailIn {
+    /// The worker's `report`s, as the lane hands them over.
+    rx: Receiver<Delivery>,
+    /// Reports that came before an idle point, kept until the point.
+    pending: Vec<Delivery>,
+    window: Duration,
+    grace: Duration,
+    /// The lane ended (its `MAIL lane off` line said why): no report can
+    /// come, so an idle point prints as without `--mail`.
+    gone: bool,
+    /// Where the turn in progress begins, at the latest: the moment the last
+    /// point a turn ended on (idle, a question, a limit notice) was handed
+    /// over — the loop's start before any. A report from before it is that
+    /// turn's, or an older one's, never this turn's.
+    floor: Instant,
+    /// The first read that saw the worker busy after `floor`: the turn had
+    /// begun by then, so a report from after it is this turn's however long
+    /// ago it came (a report posted mid-turn by a re-fired Stop, the worker
+    /// working on past the window). `None` until such a read.
+    busy_at: Option<Instant>,
+    /// Whether `floor` is a handed-over point's, not the loop's start.
+    handed: bool,
+}
+
+impl MailIn {
+    /// Whether a delivery is the turn's that ends at the point being held
+    /// (`now`): after the turn was seen to begin (`busy_at`) it is, whatever
+    /// its age; between a handed-over point and that read it is the ended
+    /// turn's late report (the Stop hook fires a moment after the screen
+    /// settles) and is not; before the turn was seen to begin — the loop's
+    /// first turn, or one too short to be read busy — it is when it came
+    /// within the window, the only thing then known about it.
+    fn is_this_turns(&self, d: &Delivery, now: Instant) -> bool {
+        if d.at < self.floor {
+            return false;
+        }
+        match self.busy_at {
+            Some(busy) if d.at >= busy => true,
+            Some(_) if self.handed => false,
+            _ => now.duration_since(d.at) <= self.window,
+        }
+    }
+}
+
+/// How `Session::hold_for_report` settled an idle point: the fold, and the
+/// screen it read past the point when the point was superseded under the
+/// hold (a prompt, the worker busy again) — the next look's turn.
+struct Held {
+    fold: Option<Fold>,
+    carried: Option<Screen>,
+}
+
+/// A client for the loops that run without a mail lane: never called.
+pub struct NoLane;
+
+impl Ctl for NoLane {
+    fn call(&mut self, _args: &[&str]) -> Result<CtlReply, String> {
+        Err("no mail lane".to_string())
+    }
+}
+
+/// Where every line of a loop goes — `watch`'s stdout, `supervise`'s stderr —
+/// each recorded in the journal first. ONE per loop, shared with the mail
+/// lane's thread under a lock, so a `MAIL` line and an `EVENT` line never
+/// interleave mid-line and the journal's order is the printed order. The
+/// lock is taken in the open at every site (`sink.lock()`, poisoned or not:
+/// a line is worth printing after a panic elsewhere), held for one line, and
+/// nothing else is locked under it.
+struct Sink<'w> {
+    out: &'w mut (dyn Write + Send + 'w),
+    journal: Journal,
+    /// Where the journal's one warning goes (`watch`: stderr); `None` sends
+    /// it to `out` (`supervise`, whose lines are stderr already).
+    warn: Option<&'w mut (dyn Write + Send + 'w)>,
+}
+
+impl Sink<'_> {
+    /// Record `line` in the journal (its warning to `warn`, else to `out`).
+    fn record(&mut self, line: &str, turn: Option<u64>) {
+        match self.warn.as_deref_mut() {
+            Some(w) => self.journal.record(line, turn, w),
+            None => self.journal.record(line, turn, self.out),
+        }
+    }
+
+    /// Record `line`, then print and flush it.
+    fn line(&mut self, line: &str, turn: Option<u64>) -> Result<(), String> {
+        self.record(line, turn);
+        emit(self.out, line)
+    }
 }
 
 /// What the shared loop ([`Session::drive`]) carries from one look to the
@@ -372,6 +522,10 @@ struct Looking {
     moved: bool,
     /// Where the session survey stood at the last look ([`Session::survey`]).
     survey: Survey,
+    /// A screen the last look read past its point (the hold's safety net,
+    /// [`Session::hold_for_report`]): the next look's turn, if it still shows
+    /// a point.
+    carried: Option<Screen>,
 }
 
 /// The session survey, as the loop left it at a look ([`Session::survey`]).
@@ -417,54 +571,118 @@ trait Review {
     /// A read-only prompt was approved; the press landed at `seq`.
     fn approved(&mut self, seq: u64, command: &str) -> Result<(), String>;
     /// A new review point, with its report counted when `--report` asked for
-    /// one. `false` stops the loop with it (`supervise`); `true` means it was
-    /// reported and the loop keeps watching (`watch`).
-    fn review(&mut self, turn: &Turn, report: Option<ReportBrief>) -> Result<bool, String>;
+    /// one, and how `--mail` settled it when it was an idle one. `false`
+    /// stops the loop with it (`supervise`); `true` means it was reported and
+    /// the loop keeps watching (`watch`).
+    fn review(
+        &mut self,
+        turn: &Turn,
+        report: Option<ReportBrief>,
+        fold: Option<Fold>,
+    ) -> Result<bool, String>;
     /// An informational line (`RECONNECT …`, `RECONNECTED …`), said as it
     /// happens.
     fn say(&mut self, line: &str) -> Result<(), String>;
 }
 
 /// `supervise`: the first review point ends the loop, and is its result; an
-/// informational line goes to `log` (stderr), never into the result.
-struct StopAtReview<'l> {
-    log: &'l mut dyn Write,
+/// informational line goes to the sink (stderr), never into the result. The
+/// journal gets every line said, and the line `watch` would print for an
+/// approval and for the review point.
+struct StopAtReview<'l, 'w> {
+    sink: &'l Mutex<Sink<'w>>,
+    allow: &'l [String],
 }
 
-impl Review for StopAtReview<'_> {
-    fn approved(&mut self, _seq: u64, _command: &str) -> Result<(), String> {
+impl Review for StopAtReview<'_, '_> {
+    fn approved(&mut self, seq: u64, command: &str) -> Result<(), String> {
+        self.sink
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .record(&approved_line(seq, command), None);
         Ok(())
     }
-    fn review(&mut self, _turn: &Turn, _report: Option<ReportBrief>) -> Result<bool, String> {
+    fn review(
+        &mut self,
+        turn: &Turn,
+        _report: Option<ReportBrief>,
+        fold: Option<Fold>,
+    ) -> Result<bool, String> {
+        self.sink
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .record(&folded_event_line(turn, self.allow, None, fold), None);
         Ok(false)
     }
     fn say(&mut self, line: &str) -> Result<(), String> {
-        log_line(self.log, line);
+        let mut sink = self.sink.lock().unwrap_or_else(PoisonError::into_inner);
+        sink.record(line, None);
+        log_line(sink.out, line);
         Ok(())
     }
 }
 
-/// `watch`: one flushed line per approval and per review point.
-struct Lines<'w> {
-    out: &'w mut dyn Write,
+/// `watch`: one flushed line per approval and per review point, each
+/// journaled before it is printed.
+struct Lines<'w, 's> {
+    sink: &'w Mutex<Sink<'s>>,
     allow: &'w [String],
 }
 
-impl Review for Lines<'_> {
+impl Review for Lines<'_, '_> {
     fn approved(&mut self, seq: u64, command: &str) -> Result<(), String> {
-        emit(self.out, &format!("APPROVED seq={seq} {}", clip(command)))
+        self.sink
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .line(&approved_line(seq, command), None)
     }
-    fn review(&mut self, turn: &Turn, report: Option<ReportBrief>) -> Result<bool, String> {
-        let line = match report {
-            Some(brief) => reported_event_line(turn, self.allow, brief),
-            None => event_line(turn, self.allow),
-        };
-        emit(self.out, &line)?;
+    fn review(
+        &mut self,
+        turn: &Turn,
+        report: Option<ReportBrief>,
+        fold: Option<Fold>,
+    ) -> Result<bool, String> {
+        let line = folded_event_line(turn, self.allow, report, fold);
+        self.sink
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .line(&line, report.and_then(|b| b.turn))?;
         Ok(true)
     }
     fn say(&mut self, line: &str) -> Result<(), String> {
-        emit(self.out, line)
+        self.sink
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .line(line, None)
     }
+}
+
+/// The EVENT line of a review point, as `--report` and `--mail` shape it:
+/// [`reported_event_line`]'s with a brief, [`event_line`]'s without; an idle
+/// point `--mail` folded a report into is `EVENT turn seq=<n> report=<id>
+/// rows=<n> <summary>` (the brief, had one been read, would count the same
+/// words twice: none is), and one no report came for is `EVENT idle-no-report
+/// …` with the brief where there is one.
+fn folded_event_line(
+    turn: &Turn,
+    allow: &[String],
+    report: Option<ReportBrief>,
+    fold: Option<Fold>,
+) -> String {
+    match fold {
+        Some(Fold::Report { id, rows }) => format!(
+            "EVENT turn seq={} report={id} rows={rows} {}",
+            turn.screen.seq,
+            event_summary(turn, allow)
+        ),
+        Some(Fold::NoReport) => event_line_as("idle-no-report", turn, allow, report),
+        None => event_line_as(turn.phase.name(), turn, allow, report),
+    }
+}
+
+/// The line `watch` prints for an approval: `APPROVED seq=<n> <command>`.
+fn approved_line(seq: u64, command: &str) -> String {
+    format!("APPROVED seq={seq} {}", clip(command))
 }
 
 /// What one guarded press did. `seq` is the content baseline the server
@@ -548,6 +766,12 @@ pub struct Session<'a, C: Ctl> {
     context_warn: u8,
     /// Where the watch on the context indicator stands.
     context: Context,
+    /// `--mail`'s side of the lane while a loop runs with one.
+    mail: Option<MailIn>,
+    /// How long the lane parks one `await inbox` before re-arming it.
+    mail_step: Duration,
+    /// How long a held idle point waits between looks at the screen.
+    hold_step: Duration,
 }
 
 impl<'a, C: Ctl> Session<'a, C> {
@@ -566,6 +790,9 @@ impl<'a, C: Ctl> Session<'a, C> {
             survey_gone: false,
             context_warn: 0,
             context: Context::Armed,
+            mail: None,
+            mail_step: WAIT_STEP,
+            hold_step: WAIT_STEP,
         }
     }
 
@@ -573,6 +800,21 @@ impl<'a, C: Ctl> Session<'a, C> {
     /// (`--reconnect-s`; 180 s unless set; zero: not at all).
     pub fn set_reconnect(&mut self, window: Duration) {
         self.reconnect = window;
+    }
+
+    /// How long the mail lane parks one `await inbox` before it re-arms (the
+    /// loop's 20 s step unless set; a test shrinks it). The loop's process
+    /// ends within one such step after its last line where the lane's client
+    /// has no [`Ctl::interrupter`]; with one, the parked wait is cut short.
+    pub fn set_mail_step(&mut self, step: Duration) {
+        self.mail_step = step;
+    }
+
+    /// How long a held idle point (`--mail`) waits for the worker's report
+    /// between looks at the screen (the loop's 20 s step unless set; a test
+    /// shrinks it) — the safety net under the hold.
+    pub fn set_hold_step(&mut self, step: Duration) {
+        self.hold_step = step;
     }
 
     /// The features the server turned out to have (for diagnostics).
@@ -837,6 +1079,12 @@ impl<'a, C: Ctl> Session<'a, C> {
             }
             if !(writing && gone) {
                 *saw_busy = true;
+                // `--mail`: the turn has begun by now (`MailIn::busy_at`).
+                if let Some(m) = &mut self.mail
+                    && m.busy_at.is_none()
+                {
+                    m.busy_at = Some(Instant::now());
+                }
             }
             if Instant::now() >= deadline {
                 return Ok(Turn {
@@ -922,11 +1170,41 @@ impl<'a, C: Ctl> Session<'a, C> {
         self.supervise_to(opts, &mut std::io::stderr())
     }
 
-    /// [`Self::supervise`], its `RECONNECT …` lines said to `log`.
+    /// [`Self::supervise`] with `--mail`'s lane (`lane`: the second client
+    /// the lane parks on the manager's inbox; `None` runs without one, as
+    /// [`Self::supervise`] does). Every `MAIL` line goes to stderr with the
+    /// `RECONNECT` lines; an idle review point is held for the worker's
+    /// report (`Session::hold_for_report`) and the result's phase lines end
+    /// with `report <id> rows=<n>`, or `report -` when none came in the
+    /// grace ([`render_result_mail`]); the journal gets the `EVENT turn` or
+    /// `EVENT idle-no-report` line `watch --mail` would print.
+    pub fn supervise_mail<L: Ctl + Send>(
+        &mut self,
+        opts: &SuperviseOpts,
+        lane: Option<&mut L>,
+    ) -> Result<(String, u8), String> {
+        self.supervise_with(opts, lane, &mut std::io::stderr())
+    }
+
+    /// [`Self::supervise`], its `RECONNECT …` lines said to `log`. With
+    /// `--journal`, the file gets every line said on `log`, an `APPROVED`
+    /// line per approval and the `EVENT` line `watch` would print for the
+    /// review point, then `TIMEOUT`, or `EXIT <reason>` for the error the
+    /// loop ends on; a journal that fails is said once on `log`.
     fn supervise_to(
         &mut self,
         opts: &SuperviseOpts,
-        log: &mut dyn Write,
+        log: &mut (dyn Write + Send),
+    ) -> Result<(String, u8), String> {
+        self.supervise_with(opts, None::<&mut NoLane>, log)
+    }
+
+    /// [`Self::supervise_to`] with the mail lane.
+    fn supervise_with<L: Ctl + Send>(
+        &mut self,
+        opts: &SuperviseOpts,
+        lane: Option<&mut L>,
+        log: &mut (dyn Write + Send),
     ) -> Result<(String, u8), String> {
         let allow = opts.allow();
         // `report` counts into `watch`'s one line; `supervise` prints the rows
@@ -935,13 +1213,103 @@ impl<'a, C: Ctl> Session<'a, C> {
             report: false,
             ..opts.clone()
         };
-        Ok(match self.drive(opts, &mut StopAtReview { log })? {
-            End::Stopped(turn) => (render_result(&turn, &allow), 0),
-            End::Timeout(turn) => (
-                format!("TIMEOUT\n{}", render_result(&turn, &allow)),
-                EXIT_TIMEOUT,
-            ),
-        })
+        let journal = Journal::open(opts.journal.as_deref(), self.sid.as_deref(), log);
+        let sink = Mutex::new(Sink {
+            out: log,
+            journal,
+            warn: None,
+        });
+        let end = self.run_loop(
+            opts,
+            &sink,
+            lane,
+            &mut StopAtReview {
+                sink: &sink,
+                allow: &allow,
+            },
+        );
+        match end {
+            Ok(End::Stopped(turn, fold)) => Ok((render_result_mail(&turn, &allow, fold), 0)),
+            Ok(End::Timeout(turn)) => {
+                sink.lock()
+                    .unwrap_or_else(PoisonError::into_inner)
+                    .record("TIMEOUT", None);
+                Ok((
+                    format!("TIMEOUT\n{}", render_result(&turn, &allow)),
+                    EXIT_TIMEOUT,
+                ))
+            }
+            Err(e) => {
+                sink.lock()
+                    .unwrap_or_else(PoisonError::into_inner)
+                    .record(&format!("EXIT {}", exit_reason(&e)), None);
+                Err(e)
+            }
+        }
+    }
+
+    /// [`Self::drive`], with the mail lane running beside it when `opts.mail`
+    /// asks for one and `lane` is a client for it: the lane's thread parks
+    /// `await inbox` on the manager's session ([`mail::Lane::run`]), prints
+    /// through `sink`, and hands the watched worker's reports to
+    /// `Session::hold_for_report`. The lane is told to stop when the loop
+    /// ends, its parked wait cut short where its client can be interrupted
+    /// ([`Ctl::interrupter`]: `aterm-ctl` is signalled), and joined — at
+    /// once, or within one parked wait (`mail_step`) where it cannot.
+    fn run_loop<L: Ctl + Send>(
+        &mut self,
+        opts: &SuperviseOpts,
+        sink: &Mutex<Sink<'_>>,
+        lane: Option<&mut L>,
+        review: &mut dyn Review,
+    ) -> Result<End, String> {
+        let Some((mopts, lane)) = opts.mail.as_ref().zip(lane) else {
+            self.mail = None;
+            return self.drive(opts, review);
+        };
+        let (tx, rx) = mpsc::channel();
+        self.mail = Some(MailIn {
+            rx,
+            pending: Vec::new(),
+            window: mopts.report_window,
+            grace: mopts.idle_grace,
+            gone: false,
+            floor: Instant::now(),
+            busy_at: None,
+            handed: false,
+        });
+        let worker = self.sid.clone();
+        // Taken before the lane's thread owns the client: what cuts its
+        // parked wait short once the loop has ended.
+        let cut = lane.interrupter();
+        let lane = mail::Lane {
+            ctl: lane,
+            inbox: mopts
+                .inbox
+                .clone()
+                .unwrap_or_else(|| mail::SELF.to_string()),
+            step: self.mail_step,
+            reconnect: self.reconnect,
+            pause: self.pause,
+            pause_max: self.pause_max,
+        };
+        let stop = AtomicBool::new(false);
+        let say = |line: &str| {
+            sink.lock()
+                .unwrap_or_else(PoisonError::into_inner)
+                .line(line, None)
+        };
+        let end = std::thread::scope(|s| {
+            s.spawn(|| lane.run(worker.as_deref(), &say, tx, &stop));
+            let end = self.drive(opts, review);
+            stop.store(true, Ordering::Relaxed);
+            if let Some(cut) = &cut {
+                cut();
+            }
+            end
+        });
+        self.mail = None;
+        end
     }
 
     /// `supervise`'s loop for a harness that wakes its agent once per stdout
@@ -976,23 +1344,77 @@ impl<'a, C: Ctl> Session<'a, C> {
     /// first reads at or below the threshold, once a descent, then `EVENT
     /// compacted seq=<n>` once it has gone (or jumped back up) — the worker
     /// compacted, and the watch is armed again.
-    pub fn watch(&mut self, opts: &SuperviseOpts, out: &mut dyn Write) -> u8 {
+    pub fn watch(&mut self, opts: &SuperviseOpts, out: &mut (dyn Write + Send)) -> u8 {
+        self.watch_to(opts, out, &mut std::io::stderr())
+    }
+
+    /// [`Self::watch`] with `--mail`'s lane (`lane`: the second client the
+    /// lane parks on the manager's inbox; `None` runs without one, as
+    /// [`Self::watch`] does). The lane prints `MAIL id=<n> off=<o> from=<sid>
+    /// kind=<k> len=<n> [re=<o>]` per delivery as it lands, on stdout with
+    /// every other line; an idle point is held for the worker's report
+    /// (`Session::hold_for_report`) and printed as `EVENT turn seq=<n>
+    /// report=<id> rows=<n> <summary>` — one line per worker turn, the body
+    /// a `inbox get <id>` away — or `EVENT idle-no-report seq=<n> <summary>`
+    /// once the grace is spent. A lane that cannot go on says `MAIL lane
+    /// off: <why> (the loop goes on without mail)` once, and from then on the
+    /// lines are as without the flag.
+    pub fn watch_mail<L: Ctl + Send>(
+        &mut self,
+        opts: &SuperviseOpts,
+        lane: Option<&mut L>,
+        out: &mut (dyn Write + Send),
+    ) -> u8 {
+        self.watch_with(opts, lane, out, &mut std::io::stderr())
+    }
+
+    /// [`Self::watch`], a journal's one warning said to `warn`. With
+    /// `--journal`, every line — the last one too — is appended to the file
+    /// before it is printed.
+    fn watch_to(
+        &mut self,
+        opts: &SuperviseOpts,
+        out: &mut (dyn Write + Send),
+        warn: &mut (dyn Write + Send),
+    ) -> u8 {
+        self.watch_with(opts, None::<&mut NoLane>, out, warn)
+    }
+
+    /// [`Self::watch_to`] with the mail lane.
+    fn watch_with<L: Ctl + Send>(
+        &mut self,
+        opts: &SuperviseOpts,
+        lane: Option<&mut L>,
+        out: &mut (dyn Write + Send),
+        warn: &mut (dyn Write + Send),
+    ) -> u8 {
         let allow = opts.allow();
-        let end = self.drive(
+        let journal = Journal::open(opts.journal.as_deref(), self.sid.as_deref(), warn);
+        let sink = Mutex::new(Sink {
+            out,
+            journal,
+            warn: Some(warn),
+        });
+        let end = self.run_loop(
             opts,
+            &sink,
+            lane,
             &mut Lines {
-                out: &mut *out,
+                sink: &sink,
                 allow: &allow,
             },
         );
         let (line, code) = match end {
             Ok(End::Timeout(_)) => ("TIMEOUT".to_string(), EXIT_TIMEOUT),
             // `Lines` never stops at a review point; kept for the match.
-            Ok(End::Stopped(_)) => ("EXIT stopped at a review point".to_string(), 1),
+            Ok(End::Stopped(..)) => ("EXIT stopped at a review point".to_string(), 1),
             Err(e) => (format!("EXIT {}", exit_reason(&e)), 1),
         };
         // Nothing is left to report a failed write to.
-        let _ = emit(out, &line);
+        let _ = sink
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .line(&line, None);
         code
     }
 
@@ -1017,6 +1439,7 @@ impl<'a, C: Ctl> Session<'a, C> {
             handed: None,
             moved: false,
             survey: Survey::Closed,
+            carried: None,
         };
         loop {
             match self.look(opts, &allow, &mut state, deadline, review) {
@@ -1067,7 +1490,22 @@ impl<'a, C: Ctl> Session<'a, C> {
         let remaining = deadline.saturating_duration_since(Instant::now());
         // The context watch speaks as the reads come, mid-turn included.
         let mut say = |line: &str| review.say(line);
-        let turn = self.await_turn_from(remaining, state.gone_first, &mut state.moved, &mut say)?;
+        // A screen the hold read past its point still showing a point is
+        // this look's turn; one busy again is awaited as any turn is.
+        let carried = state
+            .carried
+            .take()
+            .filter(|s| worker_phase(&s.rows) != Phase::Busy && has_composer_frame(&s.rows));
+        let turn = match carried {
+            Some(screen) => Turn {
+                phase: worker_phase(&screen.rows),
+                screen,
+                timed_out: false,
+            },
+            None => {
+                self.await_turn_from(remaining, state.gone_first, &mut state.moved, &mut say)?
+            }
+        };
         if std::mem::take(&mut state.moved) {
             state.handed = None;
         }
@@ -1121,17 +1559,45 @@ impl<'a, C: Ctl> Session<'a, C> {
             if Instant::now() >= deadline {
                 return Ok(Some(End::Timeout(point)));
             }
-            let report = if opts.report && reported(&point.phase) {
+            // `--mail`: an idle point waits for the worker's report of this
+            // turn first; a folded one reads no report from the screen (the
+            // mail IS what was said).
+            let Held { fold, carried } = if point.phase == Phase::Idle {
+                self.hold_for_report(&point, allow, deadline)?
+            } else {
+                Held {
+                    fold: None,
+                    carried: None,
+                }
+            };
+            let report = if opts.report
+                && reported(&point.phase)
+                && !matches!(fold, Some(Fold::Report { .. }))
+            {
                 Some(self.brief_report(opts)?)
             } else {
                 None
             };
-            if !review.review(&point, report)? {
-                return Ok(Some(End::Stopped(point)));
+            if !review.review(&point, report, fold)? {
+                return Ok(Some(End::Stopped(point, fold)));
             }
             // The manager has the worker now, as after a fresh `supervise`.
             state.approved.clear();
             state.handed = Some(review_key(&point, allow));
+            // `--mail`: a turn ended here; the next begins after it.
+            if let Some(m) = &mut self.mail
+                && reported(&point.phase)
+            {
+                m.floor = Instant::now();
+                m.busy_at = None;
+                m.handed = true;
+            }
+            if carried.is_some() {
+                // The screen has moved past the point already, and was read.
+                state.carried = carried;
+                state.gone_first = false;
+                return Ok(None);
+            }
             point
         };
         if !self.wait_past(seen.screen.seq, deadline)? {
@@ -1334,6 +1800,7 @@ impl<'a, C: Ctl> Session<'a, C> {
             Ok(r) => Ok(ReportBrief {
                 complete: r.complete(),
                 rows: r.rows.len(),
+                turn: r.turn,
             }),
             Err(Fail::Lost(why)) => Err(Fail::Lost(why)),
             Err(Fail::Hard(why)) => {
@@ -1344,7 +1811,127 @@ impl<'a, C: Ctl> Session<'a, C> {
                 Ok(ReportBrief {
                     complete: false,
                     rows: 0,
+                    turn: None,
                 })
+            }
+        }
+    }
+
+    /// `--mail` at an idle point: how it is settled ([`Fold`]), or no fold
+    /// when there is no lane (no `--mail`, or the lane ended). The worker's
+    /// `report`s come from the lane as they land ([`Delivery`]); the newest
+    /// pending one that is this turn's ([`MailIn::is_this_turns`]) folds at
+    /// once — the rest are forgotten, an earlier turn's — and none pending,
+    /// the point is HELD until one lands (a fold) or the grace runs out
+    /// ([`Fold::NoReport`]), the budget bounding the hold as it bounds every
+    /// wait. Claude Code's Stop hook posts the report as the turn ends, a
+    /// moment before or after the screen settles, so the hold is short where
+    /// there is a hook and the grace where there is none.
+    ///
+    /// THE SCREEN IS THE SAFETY NET UNDER THE HOLD: once a `hold_step` (20 s)
+    /// of it has passed with no report, the screen is read once — a footer
+    /// that ticked is the same point ([`review_key`]) and the hold goes on;
+    /// a prompt, a question or the worker busy again has superseded the
+    /// point, which is said as `idle-no-report` (the turn did end, and no
+    /// report came before the worker moved on) with the screen read carried
+    /// to the next look ([`Held::carried`]). Without it a prompt right after
+    /// an idle — a queued message, a wake — waited the whole grace unseen.
+    fn hold_for_report(
+        &mut self,
+        point: &Turn,
+        allow: &[String],
+        deadline: Instant,
+    ) -> Result<Held, Fail> {
+        let none = Held {
+            fold: None,
+            carried: None,
+        };
+        let Some(m) = self.mail.as_mut() else {
+            return Ok(none);
+        };
+        loop {
+            match m.rx.try_recv() {
+                Ok(d) => m.pending.push(d),
+                Err(TryRecvError::Empty) => break,
+                Err(TryRecvError::Disconnected) => {
+                    m.gone = true;
+                    break;
+                }
+            }
+        }
+        let now = Instant::now();
+        let recent = m
+            .pending
+            .iter()
+            .filter(|d| m.is_this_turns(d, now))
+            .max_by_key(|d| d.id)
+            .map(|d| Fold::Report {
+                id: d.id,
+                rows: d.rows,
+            });
+        m.pending.clear();
+        if let Some(fold) = recent {
+            return Ok(Held {
+                fold: Some(fold),
+                carried: None,
+            });
+        }
+        if m.gone {
+            return Ok(none);
+        }
+        let until = now
+            .checked_add(m.grace)
+            .map_or(deadline, |t| t.min(deadline));
+        let key = review_key(point, allow);
+        loop {
+            let left = until.saturating_duration_since(Instant::now());
+            if left.is_zero() {
+                return Ok(Held {
+                    fold: Some(Fold::NoReport),
+                    carried: None,
+                });
+            }
+            let slice = left.min(self.hold_step);
+            let got = match self.mail.as_mut() {
+                Some(m) => m.rx.recv_timeout(slice),
+                None => return Ok(none),
+            };
+            match got {
+                Ok(d) => {
+                    return Ok(Held {
+                        fold: Some(Fold::Report {
+                            id: d.id,
+                            rows: d.rows,
+                        }),
+                        carried: None,
+                    });
+                }
+                Err(RecvTimeoutError::Disconnected) => {
+                    if let Some(m) = self.mail.as_mut() {
+                        m.gone = true;
+                    }
+                    return Ok(none);
+                }
+                Err(RecvTimeoutError::Timeout) => {
+                    if slice == left {
+                        // The grace ran out with this slice: nothing to look
+                        // at that the next look will not read anyway.
+                        continue;
+                    }
+                    let screen = self.screen()?;
+                    let now_turn = Turn {
+                        phase: worker_phase(&screen.rows),
+                        screen,
+                        timed_out: false,
+                    };
+                    if review_key(&now_turn, allow) == key {
+                        continue;
+                    }
+                    return Ok(Held {
+                        fold: Some(Fold::NoReport),
+                        carried: Some(now_turn.screen),
+                    });
+                }
             }
         }
     }
@@ -1856,20 +2443,43 @@ pub fn render_phase(turn: &Turn, python_allow: &[String]) -> String {
 /// notice, `message=<text> reset=<text|->`; otherwise the last row the worker
 /// said. Each field is cut at 160 characters.
 pub fn event_line(turn: &Turn, python_allow: &[String]) -> String {
-    format!(
-        "EVENT {} seq={} {}",
-        turn.phase.name(),
-        turn.screen.seq,
-        event_summary(turn, python_allow)
-    )
+    event_line_as(turn.phase.name(), turn, python_allow, None)
+}
+
+/// `EVENT <word> seq=<n> [complete=<0|1> rows=<n>] <summary>`: the line of
+/// a review point under the phase word given (`idle-no-report` for an idle
+/// point `--mail` waited on in vain), with the brief `--report` read, if any.
+fn event_line_as(
+    word: &str,
+    turn: &Turn,
+    python_allow: &[String],
+    report: Option<ReportBrief>,
+) -> String {
+    match report {
+        Some(brief) => format!(
+            "EVENT {word} seq={} complete={} rows={} {}",
+            turn.screen.seq,
+            u8::from(brief.complete),
+            brief.rows,
+            event_summary(turn, python_allow)
+        ),
+        None => format!(
+            "EVENT {word} seq={} {}",
+            turn.screen.seq,
+            event_summary(turn, python_allow)
+        ),
+    }
 }
 
 /// What `watch --report` adds to an EVENT line: whether `report` found
-/// nothing lost since the manager's turn, and how many rows it holds.
+/// nothing lost since the manager's turn, and how many rows it holds — and,
+/// for the journal, the ledger turn it counted from (`None` when it started
+/// at no turn, or failed).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct ReportBrief {
     pub complete: bool,
     pub rows: usize,
+    pub turn: Option<u64>,
 }
 
 /// The review points `watch --report` counts a report for: the turn ended on
@@ -1881,14 +2491,7 @@ fn reported(phase: &Phase) -> bool {
 /// [`event_line`] with `complete=<0|1> rows=<n>` between the seq and the
 /// summary (`watch --report`); the summary stays the free-text tail.
 pub fn reported_event_line(turn: &Turn, python_allow: &[String], report: ReportBrief) -> String {
-    format!(
-        "EVENT {} seq={} complete={} rows={} {}",
-        turn.phase.name(),
-        turn.screen.seq,
-        u8::from(report.complete),
-        report.rows,
-        event_summary(turn, python_allow)
-    )
+    event_line_as(turn.phase.name(), turn, python_allow, Some(report))
 }
 
 fn event_summary(turn: &Turn, python_allow: &[String]) -> String {
@@ -2046,11 +2649,33 @@ fn render_prompt(p: &Prompt, python_allow: &[String]) -> String {
     out
 }
 
+/// [`render_result`] as `supervise --mail` prints it: after the phase lines,
+/// `report <id> rows=<n>` for an idle point the worker's report was folded
+/// into, `report -` for one no report came for; without a fold, the result
+/// as it always was.
+pub fn render_result_mail(turn: &Turn, python_allow: &[String], fold: Option<Fold>) -> String {
+    let mail = match fold {
+        Some(Fold::Report { id, rows }) => format!("report {id} rows={rows}\n"),
+        Some(Fold::NoReport) => "report -\n".to_string(),
+        None => String::new(),
+    };
+    let mut out = render_phase(turn, python_allow);
+    out.push_str(&mail);
+    out.push_str(&render_result_rows(turn));
+    out
+}
+
 /// The compact result `supervise` prints: the phase lines, then the prompt box
 /// verbatim, or the last 28 non-blank rows.
 pub fn render_result(turn: &Turn, python_allow: &[String]) -> String {
     let mut out = render_phase(turn, python_allow);
-    out.push_str("--\n");
+    out.push_str(&render_result_rows(turn));
+    out
+}
+
+/// The `--` line and the rows under it ([`render_result`]).
+fn render_result_rows(turn: &Turn) -> String {
+    let mut out = String::from("--\n");
     let rows = &turn.screen.rows;
     let span = (turn.phase == Phase::Prompt)
         .then(|| prompt_box_span(rows))
@@ -2188,6 +2813,12 @@ mod tests {
         history: Option<CtlReply>,
         /// `offscreen` replies, in order (none left: a host without the verb).
         offscreen: VecDeque<CtlReply>,
+        /// The mail lane's `await inbox` answers this mock RELEASES as it
+        /// serves chosen requests (by arrival index), so a test decides
+        /// whether the worker's report lands before or after the idle point
+        /// the screen shows ([`MailMock`]).
+        release: Option<std::sync::mpsc::Sender<CtlReply>>,
+        release_at: BTreeMap<usize, Vec<CtlReply>>,
     }
 
     fn ok(stdout: &str) -> CtlReply {
@@ -2259,6 +2890,8 @@ mod tests {
                 delay: BTreeMap::new(),
                 history: None,
                 offscreen: VecDeque::new(),
+                release: None,
+                release_at: BTreeMap::new(),
             }
         }
         fn last_served(&self) -> &[String] {
@@ -2380,6 +3013,13 @@ mod tests {
             if let Some(pause) = self.delay.remove(&at) {
                 std::thread::sleep(pause);
             }
+            if let Some(replies) = self.release_at.remove(&at)
+                && let Some(tx) = &self.release
+            {
+                for r in replies {
+                    let _ = tx.send(r);
+                }
+            }
             if let Some((i, seq)) = self.restart
                 && i == at
             {
@@ -2459,6 +3099,8 @@ mod tests {
             dismiss_surveys: false,
             // The CLI's default: with no indicator on a screen, nothing moves.
             context_warn: 10,
+            journal: None,
+            mail: None,
         }
     }
 
@@ -3048,7 +3690,7 @@ mod tests {
     /// Claude Code parks under the done row (the saved wait_bg7 screen).
     #[test]
     fn an_event_summary_is_what_the_worker_said_not_the_survey() {
-        let mut rows: Vec<String> = include_str!("fixtures/wait_bg7.out")
+        let mut rows: Vec<String> = super::super::prompt::fixtures::WAIT_BG7
             .lines()
             .map(str::to_string)
             .collect();
@@ -5617,5 +6259,964 @@ mod tests {
         assert_eq!(utc_stamp(0), "1970-01-01T00:00:00Z");
         assert_eq!(utc_stamp(951_782_400), "2000-02-29T00:00:00Z");
         assert_eq!(utc_stamp(1_757_527_218), "2025-09-10T18:00:18Z");
+    }
+
+    // ---- the journal (`--journal FILE`) -----------------------------------
+
+    /// A journal file in a temp dir of this test's own.
+    fn journal_file(tag: &str) -> (PathBuf, PathBuf) {
+        let dir = std::env::temp_dir().join(format!("aterm-journal-{tag}-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).expect("tmp dir");
+        let path = dir.join("journal.jsonl");
+        let _ = std::fs::remove_file(&path);
+        (dir, path)
+    }
+
+    /// The records a journal file holds, and the file's mode.
+    fn journal_records(path: &Path) -> (Vec<super::super::journal::JournalRecord>, u32) {
+        let (records, bad) = super::super::journal::read_journal(path).expect("read the journal");
+        assert_eq!(bad, 0, "every line is a record");
+        #[cfg(unix)]
+        let mode = {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::metadata(path).expect("stat").permissions().mode() & 0o777
+        };
+        #[cfg(not(unix))]
+        let mode = 0o600;
+        (records, mode)
+    }
+
+    /// `watch --journal`: every line it prints is appended as one JSON object
+    /// — the same scripted run as
+    /// [`watch_prints_one_line_per_decision_and_keeps_watching`], so the
+    /// journal's `line` fields ARE the printed lines — with the kind, phase,
+    /// seq, `complete=`/`rows=` and free-text tail read from the line itself.
+    /// The file is created 0600, appended to (a line already in it survives),
+    /// and every record carries the `@sid` the loop was given and a Unix time
+    /// that does not go backwards.
+    #[test]
+    fn watch_journals_every_line_it_prints() {
+        let (dir, path) = journal_file("watch");
+        std::fs::write(
+            &path,
+            "{\"t\":1,\"kind\":\"other\",\"line\":\"an older run\"}\n",
+        )
+        .expect("an older run's line");
+        let was = journal_records(&path).1;
+        let mut m = Mock::new(
+            true,
+            vec![
+                busy_screen(),
+                bash_one_row(),
+                busy_screen(),
+                question_screen(),
+                busy_screen(),
+                idle_screen(),
+            ],
+        );
+        m.vanish_after = Some(3);
+        let opts = SuperviseOpts {
+            journal: Some(path.clone()),
+            ..auto(30, None)
+        };
+        let mut out: Vec<u8> = Vec::new();
+        let mut warn: Vec<u8> = Vec::new();
+        let code =
+            Session::new(&mut m, Some("@s-1".to_string())).watch_to(&opts, &mut out, &mut warn);
+        assert_eq!(code, 1);
+        assert!(
+            warn.is_empty(),
+            "no warning: {}",
+            String::from_utf8_lossy(&warn)
+        );
+        let printed: Vec<String> = String::from_utf8(out)
+            .expect("utf-8")
+            .lines()
+            .map(str::to_string)
+            .collect();
+        let (records, mode) = journal_records(&path);
+        assert_eq!(mode, was, "a file that was already there keeps its mode");
+        assert_eq!(
+            records[0].line, "an older run",
+            "the file is appended to, never truncated"
+        );
+        let mine = &records[1..];
+        assert_eq!(
+            mine.iter().map(|r| r.line.clone()).collect::<Vec<_>>(),
+            printed,
+            "one record per line printed, in order"
+        );
+        assert_eq!(
+            mine.iter().map(|r| r.kind.as_str()).collect::<Vec<_>>(),
+            ["approved", "event", "event", "exit"]
+        );
+        assert_eq!(
+            mine.iter().map(|r| r.phase.as_str()).collect::<Vec<_>>(),
+            ["prompt", "question", "idle", "-"]
+        );
+        assert_eq!(
+            mine.iter().map(|r| r.seq).collect::<Vec<_>>(),
+            [Some(102), Some(104), Some(106), None]
+        );
+        assert_eq!(mine[0].summary, "git log --oneline -5");
+        assert_eq!(mine[2].summary, "⏺ Done.");
+        assert!(
+            mine[3].summary.starts_with("session gone ("),
+            "{:?}",
+            mine[3].summary
+        );
+        assert!(mine.iter().all(|r| r.sid.as_deref() == Some("s-1")));
+        assert!(mine.iter().all(|r| r.t > 1_700_000_000_000));
+        assert!(mine.windows(2).all(|w| w[0].t <= w[1].t));
+        assert!(
+            mine.iter()
+                .all(|r| r.complete.is_none() && r.rows.is_none())
+        );
+        let _ = std::fs::remove_file(&path);
+        let _ = std::fs::remove_dir(dir);
+    }
+
+    /// `watch --report --journal`: the point's line carries `complete=` and
+    /// `rows=`, and the record carries them as fields — with the ledger turn
+    /// the report counted from, so the ledger can attribute the reply to the
+    /// turn that asked for it.
+    #[test]
+    fn a_reported_point_journals_its_report_and_its_turn() {
+        let (dir, path) = journal_file("report");
+        let mut m = Mock::new(true, vec![idle_screen()]);
+        m.vanish_after = Some(1);
+        m.history = Some(ok(
+            "turn 7 submitted=1 status=settled started_ms=1 dur_ms=2 seq=3 \
+             hash=0000000000000000 arch=5:40 text=Pick%20one\n",
+        ));
+        m.offscreen
+            .push_back(offscreen_reply(41, &["❯ Pick one"], &idle_screen()));
+        let opts = SuperviseOpts {
+            report: true,
+            journal: Some(path.clone()),
+            ..auto(30, None)
+        };
+        let mut out: Vec<u8> = Vec::new();
+        let mut warn: Vec<u8> = Vec::new();
+        Session::new(&mut m, None).watch_to(&opts, &mut out, &mut warn);
+        let (records, _) = journal_records(&path);
+        let point = &records[0];
+        assert_eq!(point.kind, "event");
+        assert_eq!(
+            (point.complete, point.rows, point.turn),
+            (Some(true), Some(4), Some(7))
+        );
+        assert_eq!(point.summary, "⏺ Done.");
+        assert!(point.sid.is_none(), "no @sid was given");
+        assert_eq!(records[1].kind, "exit");
+        let _ = std::fs::remove_file(&path);
+        let _ = std::fs::remove_dir(dir);
+    }
+
+    /// `supervise --journal`: the lines it says on stderr are journaled, and
+    /// so are the ones `watch` would have printed for what it decides
+    /// silently — the review point's EVENT line, an approval, and the
+    /// TIMEOUT or `EXIT <reason>` it ends on.
+    #[test]
+    fn supervise_journals_what_watch_would_have_printed() {
+        let (dir, path) = journal_file("supervise");
+        let opts = SuperviseOpts {
+            journal: Some(path.clone()),
+            ..auto(30, None)
+        };
+        let mut m = Mock::new(
+            true,
+            vec![with_context(busy_screen(), 9), busy_screen(), idle_screen()],
+        );
+        let mut log: Vec<u8> = Vec::new();
+        let (out, code) = Session::new(&mut m, Some("@s-1".to_string()))
+            .supervise_to(&opts, &mut log)
+            .expect("supervise");
+        assert_eq!(code, 0);
+        assert!(out.starts_with("idle\n"), "{out}");
+        let (records, mode) = journal_records(&path);
+        assert_eq!(mode, 0o600);
+        assert_eq!(
+            records.iter().map(|r| r.line.clone()).collect::<Vec<_>>(),
+            [
+                "EVENT context seq=101 9% until auto-compact",
+                "EVENT compacted seq=102",
+                "EVENT idle seq=103 ⏺ Done.",
+            ],
+            "the two lines said on stderr, then the review point"
+        );
+        assert_eq!(
+            records.iter().map(|r| r.phase.as_str()).collect::<Vec<_>>(),
+            ["context", "compacted", "idle"]
+        );
+        // A budget that is already spent: the TIMEOUT is the last record.
+        let mut m = Mock::new(true, vec![busy_screen()]);
+        let mut log: Vec<u8> = Vec::new();
+        let (_, code) = Session::new(&mut m, None)
+            .supervise_to(
+                &SuperviseOpts {
+                    max: Duration::ZERO,
+                    journal: Some(path.clone()),
+                    ..SuperviseOpts::default()
+                },
+                &mut log,
+            )
+            .expect("supervise");
+        assert_eq!(code, EXIT_TIMEOUT);
+        let (records, _) = journal_records(&path);
+        assert_eq!(records.last().map(|r| r.kind.as_str()), Some("timeout"));
+        assert_eq!(records.last().map(|r| r.line.as_str()), Some("TIMEOUT"));
+        // A loop that fails: the `EXIT <reason>` line `watch` would print.
+        let mut m = Mock::new(true, vec![idle_screen()]);
+        m.down = Some((0, err("exited")));
+        let mut log: Vec<u8> = Vec::new();
+        let err = Session::new(&mut m, None)
+            .supervise_to(
+                &SuperviseOpts {
+                    journal: Some(path.clone()),
+                    ..auto(30, None)
+                },
+                &mut log,
+            )
+            .expect_err("the session is gone");
+        let (records, _) = journal_records(&path);
+        let last = records.last().expect("a record");
+        assert_eq!(last.kind, "exit");
+        assert_eq!(last.line, format!("EXIT {}", exit_reason(&err)));
+        assert!(
+            last.line.starts_with("EXIT session gone ("),
+            "{}",
+            last.line
+        );
+        let _ = std::fs::remove_file(&path);
+        let _ = std::fs::remove_dir(dir);
+    }
+
+    /// A journal that cannot be written is said ONCE and stops nothing: the
+    /// loop prints every line and ends as it would have. (Opening it and
+    /// appending to it fail through the same one-warning path.)
+    #[test]
+    fn a_journal_that_fails_is_said_once_and_stops_nothing() {
+        let (dir, path) = journal_file("bad");
+        // A path under a file, not a directory: the open cannot succeed.
+        std::fs::write(&path, "").expect("a file where a directory would have to be");
+        let opts = SuperviseOpts {
+            journal: Some(path.join("under-a-file.jsonl")),
+            ..auto(30, None)
+        };
+        let mut m = Mock::new(true, vec![busy_screen(), question_screen()]);
+        m.vanish_after = Some(1);
+        let mut out: Vec<u8> = Vec::new();
+        let mut warn: Vec<u8> = Vec::new();
+        let code = Session::new(&mut m, None).watch_to(&opts, &mut out, &mut warn);
+        assert_eq!(code, 1);
+        let lines: Vec<String> = String::from_utf8(out)
+            .expect("utf-8")
+            .lines()
+            .map(str::to_string)
+            .collect();
+        assert_eq!(
+            decisions(&lines)[0],
+            "EVENT question ⏺ Keep the harness or rewrite it?"
+        );
+        assert!(
+            lines.last().is_some_and(|l| l.starts_with("EXIT ")),
+            "{lines:?}"
+        );
+        let warn = String::from_utf8(warn).expect("utf-8");
+        assert_eq!(
+            warn.lines().count(),
+            1,
+            "one warning for the whole run: {warn:?}"
+        );
+        assert!(
+            warn.starts_with("aterm-drive: journal ")
+                && warn.contains("the loop goes on without it"),
+            "{warn}"
+        );
+        let _ = std::fs::remove_file(&path);
+        let _ = std::fs::remove_dir(dir);
+    }
+
+    /// The mail lane's scripted client ([`Session::watch_mail`]'s second
+    /// [`Ctl`]). `await inbox` answers come through a channel the screen mock
+    /// releases into ([`Mock::release_at`]) and time out after `step` with
+    /// none, as the server's parked wait does; every other request pops the
+    /// next scripted reply (an empty inbox listing with none left).
+    struct MailMock {
+        requests: Vec<String>,
+        awaits: std::sync::mpsc::Receiver<CtlReply>,
+        /// The interrupter's way in: a timeout sent here ends a parked wait.
+        release: std::sync::mpsc::Sender<CtlReply>,
+        replies: VecDeque<CtlReply>,
+        step: Duration,
+    }
+
+    /// A short parked wait: the loop's process ends within one.
+    const MAIL_STEP: Duration = Duration::from_millis(10);
+
+    impl MailMock {
+        /// The lane's mock and the sender the screen mock releases through.
+        fn new(replies: Vec<CtlReply>) -> (Self, std::sync::mpsc::Sender<CtlReply>) {
+            let (tx, rx) = std::sync::mpsc::channel();
+            (
+                Self {
+                    requests: Vec::new(),
+                    awaits: rx,
+                    release: tx.clone(),
+                    replies: replies.into(),
+                    step: MAIL_STEP,
+                },
+                tx,
+            )
+        }
+        /// The requests with the parked waits' `timeout <ms>` and their
+        /// repeats cut: what the lane asked, in order, each once.
+        fn asked(&self) -> Vec<String> {
+            let mut out: Vec<String> = Vec::new();
+            for r in &self.requests {
+                let r = match r.find(" timeout ") {
+                    Some(i) => r[..i].to_string(),
+                    None => r.clone(),
+                };
+                if out.last() != Some(&r) {
+                    out.push(r);
+                }
+            }
+            out
+        }
+    }
+
+    impl Ctl for MailMock {
+        fn call(&mut self, args: &[&str]) -> Result<CtlReply, String> {
+            self.requests.push(args.join(" "));
+            let verb_at = usize::from(args.first().is_some_and(|a| a.starts_with('@')));
+            if args.get(verb_at) == Some(&"await") {
+                return Ok(self
+                    .awaits
+                    .recv_timeout(self.step)
+                    .unwrap_or_else(|_| timeout()));
+            }
+            Ok(self.replies.pop_front().unwrap_or_else(|| {
+                ok("OK 0 hold=0 holder=- seen=0 bus_head=0 dropped=0 pending=0\n")
+            }))
+        }
+        /// As the real client's: the parked wait answers at once (here with
+        /// a timeout; `aterm-ctl` signalled answers with no `OK`).
+        fn interrupter(&self) -> Option<Interrupter> {
+            let release = self.release.clone();
+            Some(Box::new(move || {
+                let _ = release.send(timeout());
+            }))
+        }
+    }
+
+    /// The manager's inbox as the lane first reads it: one row, id 4.
+    const INBOX_AT_START: &str = "OK 1 hold=0 holder=- seen=3 bus_head=80 dropped=0 pending=0\n\
+                                  msg 4 off=80 t=1000 from=h-owner kind=note trust=human len=3\n";
+    /// What lands during the run: the owner's ask, then the worker's report.
+    const INBOX_LANDED: &str = "OK 2 hold=0 holder=- seen=3 bus_head=91 dropped=0 pending=0\n\
+                                msg 5 off=90 t=2000 from=h-owner kind=ask trust=human re=70 len=7\n\
+                                msg 6 off=91 t=2100 from=s-1@n-1 kind=report trust=agent len=40\n";
+    const REPORT_BODY: &str = "Suite green.\n987 passed, 0 failed.\nNothing left.\n";
+    const KINDS: &str = "kinds=ask,answer,task,report,note,control,ack,expired,undeliverable";
+
+    fn mail_opts(window: Duration, grace: Duration) -> SuperviseOpts {
+        SuperviseOpts {
+            mail: Some(super::super::mail::MailOpts {
+                inbox: None,
+                report_window: window,
+                idle_grace: grace,
+            }),
+            ..auto(30, None)
+        }
+    }
+    fn watch_mail_lines(
+        m: &mut Mock,
+        lane: &mut MailMock,
+        opts: &SuperviseOpts,
+    ) -> (Vec<String>, u8) {
+        let mut out: Vec<u8> = Vec::new();
+        let mut s = Session::new(m, Some("@s-1".to_string()));
+        s.set_mail_step(MAIL_STEP);
+        let code = s.watch_mail(opts, Some(lane), &mut out);
+        let text = String::from_utf8(out).expect("utf-8");
+        (text.lines().map(str::to_string).collect(), code)
+    }
+
+    /// `watch --mail`: the lane parks on the manager's inbox and prints one
+    /// `MAIL` line per delivery as it lands; the worker's `report` that
+    /// follows the idle point is folded into it — ONE `EVENT turn` line for
+    /// the turn, naming the report's row id and its body's row count, and
+    /// no `report` is read from the screen — while the worker's socket sees
+    /// exactly the requests it sees without the flag. The journal records
+    /// the MAIL lines (kind `mail`) and the fold (`report`, `rows`).
+    #[test]
+    fn watch_mail_folds_the_workers_report_into_its_turn() {
+        let (dir, path) = journal_file("mail");
+        let (mut lane, release) =
+            MailMock::new(vec![ok(INBOX_AT_START), ok(INBOX_LANDED), ok(REPORT_BODY)]);
+        let mut m = Mock::new(true, vec![busy_screen(), idle_screen()]);
+        m.vanish_after = Some(1);
+        m.release = Some(release);
+        // Released as the idle screen is read (request 4): the report comes
+        // AFTER the point.
+        m.release_at.insert(4, vec![ok("OK inbox 6\n")]);
+        let opts = SuperviseOpts {
+            report: true,
+            journal: Some(path.clone()),
+            ..mail_opts(Duration::from_secs(120), Duration::from_secs(180))
+        };
+        let (lines, code) = watch_mail_lines(&mut m, &mut lane, &opts);
+        assert_eq!(
+            lines,
+            [
+                "MAIL id=5 off=90 from=h-owner kind=ask len=7 re=70",
+                "MAIL id=6 off=91 from=s-1@n-1 kind=report len=40",
+                "EVENT turn seq=102 report=6 rows=3 ⏺ Done.",
+                "EXIT session gone (await seq 102 failed: aterm-ctl: ERR exited)",
+            ]
+        );
+        assert_eq!(code, 1);
+        // The worker's socket: not one request more than without --mail
+        // (the same sequence `watch_prints_one_line_per_decision_and_keeps_watching`
+        // asserts for a point the screen never moves past), and no `report`
+        // read for the folded point.
+        assert_eq!(
+            m.requests,
+            [
+                "@s-1 await gone esc.to.interrupt timeout 20000",
+                "@s-1 text --json tail=40",
+                "@s-1 await seq 101 timeout 20000",
+                "@s-1 await idle 2000 timeout 20000",
+                "@s-1 text --json tail=40",
+                "@s-1 await seq 102 timeout 20000",
+                "@s-1 text --json tail=40",
+                "@s-1 await seq 102 timeout 20000",
+            ]
+        );
+        assert_eq!(
+            lane.asked(),
+            [
+                "@self inbox 1 --peek --meta".to_string(),
+                format!("@self await inbox since=4 {KINDS}"),
+                "@self inbox since=4 --peek --meta".to_string(),
+                "@self inbox get 6".to_string(),
+                format!("@self await inbox since=6 {KINDS}"),
+            ]
+        );
+        let (records, _) = journal_records(&path);
+        assert_eq!(
+            records.iter().map(|r| r.kind.as_str()).collect::<Vec<_>>(),
+            ["mail", "mail", "event", "exit"]
+        );
+        assert_eq!(
+            records[1].summary,
+            "id=6 off=91 from=s-1@n-1 kind=report len=40"
+        );
+        assert_eq!(
+            (
+                records[2].phase.as_str(),
+                records[2].seq,
+                records[2].report,
+                records[2].rows,
+                records[2].complete
+            ),
+            ("turn", Some(102), Some(6), Some(3), None)
+        );
+        let _ = std::fs::remove_file(&path);
+        let _ = std::fs::remove_dir(dir);
+    }
+
+    /// A report that lands BEFORE the screen settles (the Stop hook fires
+    /// as the turn ends) folds into the idle point that follows within the
+    /// window; outside the window it is another turn's, and the idle waits
+    /// its grace and is said with no report.
+    #[test]
+    fn a_report_that_came_first_folds_into_the_idle_that_follows() {
+        let landed = "OK 1 hold=0 holder=- seen=3 bus_head=91 dropped=0 pending=0\n\
+                      msg 6 off=91 t=2100 from=s-1@n-1 kind=report trust=agent len=40\n";
+        let (mut lane, release) =
+            MailMock::new(vec![ok(INBOX_AT_START), ok(landed), ok(REPORT_BODY)]);
+        let mut m = Mock::new(true, vec![busy_screen(), idle_screen()]);
+        m.vanish_after = Some(1);
+        m.release = Some(release);
+        // Released at the loop's first request: the report is in before the
+        // worker's screen was even read.
+        m.release_at.insert(0, vec![ok("OK inbox 6\n")]);
+        let opts = mail_opts(Duration::from_secs(120), Duration::from_secs(180));
+        let (lines, _) = watch_mail_lines(&mut m, &mut lane, &opts);
+        assert_eq!(
+            lines,
+            [
+                "MAIL id=6 off=91 from=s-1@n-1 kind=report len=40",
+                "EVENT turn seq=102 report=6 rows=3 ⏺ Done.",
+                "EXIT session gone (await seq 102 failed: aterm-ctl: ERR exited)",
+            ]
+        );
+        // The window is all the loop knows when it never saw the turn begin:
+        // a worker found idle at the loop's start, a report that came before
+        // its screen was read. Within the window it is this turn's …
+        let found_idle = |window: Duration| {
+            let (mut lane, release) =
+                MailMock::new(vec![ok(INBOX_AT_START), ok(landed), ok(REPORT_BODY)]);
+            let mut m = Mock::new(true, vec![idle_screen()]);
+            m.vanish_after = Some(1);
+            m.release = Some(release);
+            m.release_at.insert(0, vec![ok("OK inbox 6\n")]);
+            // The report is in before the screen is read (request 1).
+            m.delay.insert(1, Duration::from_millis(40));
+            let opts = mail_opts(window, Duration::from_millis(50));
+            watch_mail_lines(&mut m, &mut lane, &opts).0
+        };
+        assert_eq!(
+            found_idle(Duration::from_secs(120)),
+            [
+                "MAIL id=6 off=91 from=s-1@n-1 kind=report len=40",
+                "EVENT turn seq=101 report=6 rows=3 ⏺ Done.",
+                "EXIT session gone (await seq 101 failed: aterm-ctl: ERR exited)",
+            ]
+        );
+        // … and past it (a zero window) another turn's.
+        assert_eq!(
+            found_idle(Duration::ZERO),
+            [
+                "MAIL id=6 off=91 from=s-1@n-1 kind=report len=40",
+                "EVENT idle-no-report seq=101 ⏺ Done.",
+                "EXIT session gone (await seq 101 failed: aterm-ctl: ERR exited)",
+            ]
+        );
+    }
+
+    const LANDED_6: &str = "OK 1 hold=0 holder=- seen=3 bus_head=91 dropped=0 pending=0\n\
+                            msg 6 off=91 t=2100 from=s-1@n-1 kind=report trust=agent len=40\n";
+    const LANDED_7: &str = "OK 1 hold=0 holder=- seen=3 bus_head=92 dropped=0 pending=0\n\
+                            msg 7 off=92 t=2200 from=s-1@n-1 kind=report trust=agent len=18\n";
+
+    /// A worker ends a turn with a QUESTION; its Stop hook posts that turn's
+    /// report (the question's text). A question point is not held, so the
+    /// report is not folded and stays pending. The manager answers, the
+    /// worker works and goes idle with no report of its own: the NEXT idle
+    /// must not name the question turn's report as this turn's — a report
+    /// from before the last point handed over is never the next turn's.
+    #[test]
+    fn a_question_turns_report_is_not_the_next_turns() {
+        let (mut lane, release) =
+            MailMock::new(vec![ok(INBOX_AT_START), ok(LANDED_6), ok(REPORT_BODY)]);
+        let mut m = Mock::new(
+            true,
+            vec![
+                busy_screen(),
+                question_screen(),
+                busy_screen(),
+                idle_screen(),
+            ],
+        );
+        m.vanish_after = Some(1);
+        m.release = Some(release);
+        // The hook's report lands as the question settles (request 3 is the
+        // settle wait); the question is read 100 ms later (request 4), the
+        // MAIL line printed by then.
+        m.release_at.insert(3, vec![ok("OK inbox 6\n")]);
+        m.delay.insert(4, Duration::from_millis(100));
+        let opts = mail_opts(Duration::from_secs(120), Duration::from_millis(200));
+        let (lines, _) = watch_mail_lines(&mut m, &mut lane, &opts);
+        assert_eq!(
+            lines,
+            [
+                "MAIL id=6 off=91 from=s-1@n-1 kind=report len=40",
+                "EVENT question seq=102 ⏺ Keep the harness or rewrite it?",
+                "EVENT idle-no-report seq=104 ⏺ Done.",
+                "EXIT session gone (await seq 104 failed: aterm-ctl: ERR exited)",
+            ]
+        );
+    }
+
+    /// Two reports in one turn — the hook's, then the worker's own. The
+    /// first folds into the idle; the second lands while the worker is STILL
+    /// idle in that turn, after the point was handed over and before the
+    /// worker was read busy again. It is that turn's late report, not the
+    /// next turn's.
+    #[test]
+    fn a_second_report_of_a_turn_is_not_the_next_turns() {
+        let (mut lane, release) = MailMock::new(vec![
+            ok(INBOX_AT_START),
+            ok(LANDED_6),
+            ok(REPORT_BODY),
+            ok(LANDED_7),
+            ok("Also: lint clean.\n"),
+        ]);
+        let mut m = Mock::new(
+            true,
+            vec![busy_screen(), idle_screen(), busy_screen(), idle_screen()],
+        );
+        m.vanish_after = Some(1);
+        m.release = Some(release);
+        // The hook's report as the idle is read (request 4): folds into it.
+        m.release_at.insert(4, vec![ok("OK inbox 6\n")]);
+        // The worker's own report after the fold, the worker still idle
+        // (request 5 is the wait past the point); the next turn's reads come
+        // 100 ms later, the MAIL line printed by then.
+        m.release_at.insert(5, vec![ok("OK inbox 7\n")]);
+        m.delay.insert(6, Duration::from_millis(100));
+        let opts = mail_opts(Duration::from_secs(120), Duration::from_millis(200));
+        let (lines, _) = watch_mail_lines(&mut m, &mut lane, &opts);
+        assert_eq!(
+            lines,
+            [
+                "MAIL id=6 off=91 from=s-1@n-1 kind=report len=40",
+                "EVENT turn seq=102 report=6 rows=3 ⏺ Done.",
+                "MAIL id=7 off=92 from=s-1@n-1 kind=report len=18",
+                "EVENT idle-no-report seq=104 ⏺ Done.",
+                "EXIT session gone (await seq 104 failed: aterm-ctl: ERR exited)",
+            ]
+        );
+    }
+
+    /// A report posted mid-turn (a re-fired Stop's, a tool call's), the
+    /// worker then working on past the window (100 ms here, 120 s in
+    /// production): the turn DID report — the report came after the worker
+    /// was read busy for it — and the line must not say it did not.
+    #[test]
+    fn a_mid_turn_report_older_than_the_window_is_still_its_turns() {
+        let (mut lane, release) =
+            MailMock::new(vec![ok(INBOX_AT_START), ok(LANDED_6), ok(REPORT_BODY)]);
+        let mut m = Mock::new(true, vec![busy_screen(), idle_screen()]);
+        m.vanish_after = Some(1);
+        m.release = Some(release);
+        // Posted while busy (request 2 waits on the busy screen's seq) …
+        m.release_at.insert(2, vec![ok("OK inbox 6\n")]);
+        // … and the worker works on for 300 ms past the window.
+        m.delay.insert(3, Duration::from_millis(300));
+        let opts = mail_opts(Duration::from_millis(100), Duration::from_millis(100));
+        let (lines, _) = watch_mail_lines(&mut m, &mut lane, &opts);
+        assert_eq!(
+            lines,
+            [
+                "MAIL id=6 off=91 from=s-1@n-1 kind=report len=40",
+                "EVENT turn seq=102 report=6 rows=3 ⏺ Done.",
+                "EXIT session gone (await seq 102 failed: aterm-ctl: ERR exited)",
+            ]
+        );
+    }
+
+    /// A writer that stamps each line with when it was printed.
+    struct Stamped {
+        started: Instant,
+        buf: Vec<u8>,
+        lines: Vec<(Duration, String)>,
+    }
+    impl Write for Stamped {
+        fn write(&mut self, b: &[u8]) -> std::io::Result<usize> {
+            self.buf.extend_from_slice(b);
+            while let Some(i) = self.buf.iter().position(|&c| c == b'\n') {
+                let line = String::from_utf8_lossy(&self.buf[..i]).into_owned();
+                self.lines.push((self.started.elapsed(), line));
+                self.buf.drain(..=i);
+            }
+            Ok(b.len())
+        }
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    /// The screen is the safety net under the hold. A permission prompt that
+    /// follows an idle (a queued message, a wake) is seen within one hold
+    /// step, not once the grace (180 s in production) is spent: the idle is
+    /// said as `idle-no-report` — the turn ended, and no report came before
+    /// the worker moved on — and the prompt right after it, from the screen
+    /// the hold read. A footer tick under the hold is not a move.
+    #[test]
+    fn a_prompt_after_an_idle_is_seen_within_a_hold_step() {
+        let (mut lane, _release) = MailMock::new(vec![ok(INBOX_AT_START)]);
+        let mut m = Mock::new(true, vec![busy_screen(), idle_screen(), write_prompt()]);
+        m.vanish_after = Some(1);
+        let opts = mail_opts(Duration::from_secs(120), Duration::from_millis(400));
+        let mut out = Stamped {
+            started: Instant::now(),
+            buf: Vec::new(),
+            lines: Vec::new(),
+        };
+        let mut s = Session::new(&mut m, Some("@s-1".to_string()));
+        s.set_mail_step(MAIL_STEP);
+        s.set_hold_step(Duration::from_millis(20));
+        let _ = s.watch_mail(&opts, Some(&mut lane), &mut out);
+        let lines: Vec<&str> = out.lines.iter().map(|(_, l)| l.as_str()).collect();
+        assert_eq!(
+            lines,
+            [
+                "EVENT idle-no-report seq=102 ⏺ Done.",
+                "EVENT prompt seq=103 kind=bash classify=not-read-only:rm command=rm -rf target",
+                "EXIT session gone (await seq 103 failed: aterm-ctl: ERR exited)",
+            ]
+        );
+        let prompt = out
+            .lines
+            .iter()
+            .find(|(_, l)| l.starts_with("EVENT prompt"))
+            .unwrap();
+        assert!(
+            prompt.0 < Duration::from_millis(400),
+            "the prompt waited the idle's grace: {:?}",
+            out.lines
+        );
+        // A ticking footer (the composer's hint cycling): the same point,
+        // held on.
+        let (mut lane, _release) = MailMock::new(vec![ok(INBOX_AT_START)]);
+        let mut ticked = rows(&["⏺ Done.", "", "✻ Cogitated for 4s · done 2:41 PM", ""]);
+        ticked.extend(composer("  /help for help"));
+        let mut m = Mock::new(true, vec![busy_screen(), idle_screen(), ticked]);
+        m.vanish_after = Some(1);
+        let opts = mail_opts(Duration::from_secs(120), Duration::from_millis(60));
+        let mut out: Vec<u8> = Vec::new();
+        let started = Instant::now();
+        let mut s = Session::new(&mut m, Some("@s-1".to_string()));
+        s.set_mail_step(MAIL_STEP);
+        s.set_hold_step(Duration::from_millis(20));
+        let _ = s.watch_mail(&opts, Some(&mut lane), &mut out);
+        assert!(started.elapsed() >= Duration::from_millis(60));
+        let text = String::from_utf8(out).expect("utf-8");
+        assert_eq!(
+            text.lines().next(),
+            Some("EVENT idle-no-report seq=102 ⏺ Done."),
+            "{text}"
+        );
+        assert_eq!(
+            text.lines().filter(|l| l.starts_with("EVENT")).count(),
+            1,
+            "{text}"
+        );
+    }
+
+    /// `supervise --mail`: the result IS the wake, and it is handed back the
+    /// moment the review point is reached — the lane's parked `await inbox`
+    /// (20 s in production, 2 s here) is cut short, not waited out.
+    #[test]
+    fn supervise_mails_result_does_not_wait_for_the_lanes_parked_step() {
+        let (mut lane, _release) = MailMock::new(vec![ok(INBOX_AT_START)]);
+        lane.step = Duration::from_secs(2);
+        let mut m = Mock::new(true, vec![idle_screen()]);
+        let opts = mail_opts(Duration::from_secs(120), Duration::ZERO);
+        let mut log: Vec<u8> = Vec::new();
+        let mut s = Session::new(&mut m, Some("@s-1".to_string()));
+        s.set_mail_step(Duration::from_secs(2));
+        let started = Instant::now();
+        let (out, code) = s
+            .supervise_with(&opts, Some(&mut lane), &mut log)
+            .expect("supervise");
+        assert_eq!(code, 0);
+        assert!(out.starts_with("idle\nreport -\n"), "{out}");
+        assert!(
+            started.elapsed() < Duration::from_millis(500),
+            "the review point was reached at once; the result came back after {:?}",
+            started.elapsed()
+        );
+        // The cut wait is not the lane's to judge: no `MAIL lane off` line.
+        assert!(log.is_empty(), "{}", String::from_utf8_lossy(&log));
+    }
+
+    /// An idle point no report comes for is held for the grace, then said
+    /// as `EVENT idle-no-report` — with `--report`'s brief, since the screen
+    /// is all there is to read — and the lane's parked wait re-arms on every
+    /// timeout without a line. A question is not held: it prints as it
+    /// always did, between the MAIL lines.
+    #[test]
+    fn an_idle_with_no_report_is_said_once_the_grace_is_spent() {
+        let (mut lane, _release) = MailMock::new(vec![ok(INBOX_AT_START)]);
+        let mut m = Mock::new(
+            true,
+            vec![
+                busy_screen(),
+                question_screen(),
+                busy_screen(),
+                idle_screen(),
+            ],
+        );
+        m.vanish_after = Some(1);
+        m.history = Some(ok(
+            "turn 7 submitted=1 status=settled started_ms=1 dur_ms=2 seq=3 \
+             hash=0000000000000000 arch=5:40 text=Pick%20one\n",
+        ));
+        m.offscreen.push_back(offscreen_reply(
+            41,
+            &["❯ Pick one", "⏺ Looking at both."],
+            &question_screen(),
+        ));
+        m.offscreen
+            .push_back(offscreen_reply(41, &[], &idle_screen()));
+        let opts = SuperviseOpts {
+            report: true,
+            ..mail_opts(Duration::from_secs(120), Duration::from_millis(60))
+        };
+        let started = Instant::now();
+        let (lines, _) = watch_mail_lines(&mut m, &mut lane, &opts);
+        assert_eq!(
+            lines,
+            [
+                "EVENT question seq=102 complete=1 rows=3 ⏺ Keep the harness or rewrite it?",
+                "EVENT idle-no-report seq=104 complete=0 rows=3 ⏺ Done.",
+                "EXIT session gone (await seq 104 failed: aterm-ctl: ERR exited)",
+            ]
+        );
+        assert!(
+            started.elapsed() >= Duration::from_millis(60),
+            "the idle waited its grace: {:?}",
+            started.elapsed()
+        );
+        let awaits = lane
+            .requests
+            .iter()
+            .filter(|r| r.contains("await inbox since=4"))
+            .count();
+        assert!(awaits >= 2, "the wait re-arms: {:?}", lane.requests);
+        assert!(!lane.requests.iter().any(|r| r.contains("inbox get")));
+    }
+
+    /// Without `--mail` — the flag not given, or given with no lane to run —
+    /// every line is byte-identical to `watch`'s, and the worker's socket
+    /// sees the same requests.
+    #[test]
+    fn without_mail_every_line_is_as_before() {
+        let screens = || {
+            vec![
+                busy_screen(),
+                bash_one_row(),
+                busy_screen(),
+                question_screen(),
+                busy_screen(),
+                idle_screen(),
+            ]
+        };
+        let mut m = Mock::new(true, screens());
+        m.vanish_after = Some(1);
+        let (plain, code) = watch_lines(&mut m, &auto(30, None));
+        let asked = m.requests.clone();
+        assert_eq!(code, 1);
+        assert_eq!(plain[2], "EVENT idle seq=106 ⏺ Done.");
+        // The flag, no lane.
+        let mut m = Mock::new(true, screens());
+        m.vanish_after = Some(1);
+        let mut out: Vec<u8> = Vec::new();
+        let opts = mail_opts(Duration::from_secs(120), Duration::from_secs(180));
+        let code = Session::new(&mut m, None).watch_mail(&opts, None::<&mut NoLane>, &mut out);
+        let text = String::from_utf8(out).expect("utf-8");
+        assert_eq!(text.lines().collect::<Vec<_>>(), plain);
+        assert_eq!((code, &m.requests), (1, &asked));
+        // A lane, no flag.
+        let (mut lane, _release) = MailMock::new(vec![ok(INBOX_AT_START)]);
+        let mut m = Mock::new(true, screens());
+        m.vanish_after = Some(1);
+        let mut out: Vec<u8> = Vec::new();
+        let code = Session::new(&mut m, Some("@s-1".to_string())).watch_mail(
+            &auto(30, None),
+            Some(&mut lane),
+            &mut out,
+        );
+        let text = String::from_utf8(out).expect("utf-8");
+        assert_eq!(text.lines().collect::<Vec<_>>(), plain);
+        assert_eq!(code, 1);
+        assert!(lane.requests.is_empty(), "no flag: the lane never runs");
+        let unselected: Vec<&str> = m
+            .requests
+            .iter()
+            .map(|r| r.strip_prefix("@s-1 ").unwrap_or(r))
+            .collect();
+        assert_eq!(unselected, asked);
+    }
+
+    /// A lane that cannot start (a host without the fabric verbs, no
+    /// `$ATERM_PARENT_SESSION_ID` for `@self`) says so ONCE and the loop goes
+    /// on: an idle point is not held, and prints as without the flag.
+    #[test]
+    fn a_lane_that_cannot_start_says_so_once_and_the_loop_goes_on() {
+        let (mut lane, _release) = MailMock::new(vec![err("unknown verb (try: help)")]);
+        let mut m = Mock::new(true, vec![busy_screen(), idle_screen()]);
+        m.vanish_after = Some(1);
+        let opts = mail_opts(Duration::from_secs(120), Duration::from_secs(180));
+        let started = Instant::now();
+        let (lines, code) = watch_mail_lines(&mut m, &mut lane, &opts);
+        assert_eq!(
+            lines,
+            [
+                "MAIL lane off: inbox: ERR unknown verb (try: help) (the loop goes on without mail)",
+                "EVENT idle seq=102 ⏺ Done.",
+                "EXIT session gone (await seq 102 failed: aterm-ctl: ERR exited)",
+            ]
+        );
+        assert_eq!(code, 1);
+        assert!(
+            started.elapsed() < Duration::from_secs(60),
+            "no grace was waited with no lane"
+        );
+        assert_eq!(lane.requests, ["@self inbox 1 --peek --meta"]);
+    }
+
+    /// `supervise --mail`: the MAIL lines go to stderr with the RECONNECT
+    /// lines, the idle review point is held for the report, the result's
+    /// phase lines name it (`report <id> rows=<n>`) ahead of the rows, and
+    /// the journal gets the `EVENT turn` line `watch --mail` would print;
+    /// with no report in the grace the result says `report -`.
+    #[test]
+    fn supervise_mail_holds_the_idle_and_names_the_report() {
+        let (dir, path) = journal_file("supervise-mail");
+        let (mut lane, release) =
+            MailMock::new(vec![ok(INBOX_AT_START), ok(INBOX_LANDED), ok(REPORT_BODY)]);
+        let mut m = Mock::new(true, vec![busy_screen(), idle_screen()]);
+        m.release = Some(release);
+        m.release_at.insert(4, vec![ok("OK inbox 6\n")]);
+        let opts = SuperviseOpts {
+            journal: Some(path.clone()),
+            ..mail_opts(Duration::from_secs(120), Duration::from_secs(180))
+        };
+        let mut log: Vec<u8> = Vec::new();
+        let mut s = Session::new(&mut m, Some("@s-1".to_string()));
+        s.set_mail_step(MAIL_STEP);
+        let (out, code) = s
+            .supervise_with(&opts, Some(&mut lane), &mut log)
+            .expect("supervise");
+        assert_eq!(code, 0);
+        assert!(out.starts_with("idle\nreport 6 rows=3\n--\n"), "{out}");
+        assert!(out.ends_with("? for shortcuts\n"), "{out}");
+        let log = String::from_utf8(log).expect("utf-8");
+        assert_eq!(
+            log.lines().collect::<Vec<_>>(),
+            [
+                "MAIL id=5 off=90 from=h-owner kind=ask len=7 re=70",
+                "MAIL id=6 off=91 from=s-1@n-1 kind=report len=40",
+            ]
+        );
+        let (records, _) = journal_records(&path);
+        assert_eq!(
+            records.iter().map(|r| r.line.clone()).collect::<Vec<_>>(),
+            [
+                "MAIL id=5 off=90 from=h-owner kind=ask len=7 re=70",
+                "MAIL id=6 off=91 from=s-1@n-1 kind=report len=40",
+                "EVENT turn seq=102 report=6 rows=3 ⏺ Done.",
+            ]
+        );
+        // No report in the grace: `report -`, and the journal's line says
+        // idle-no-report.
+        let (mut lane, _release) = MailMock::new(vec![ok(INBOX_AT_START)]);
+        let mut m = Mock::new(true, vec![idle_screen()]);
+        let opts = SuperviseOpts {
+            journal: Some(path.clone()),
+            ..mail_opts(Duration::from_secs(120), Duration::from_millis(30))
+        };
+        let mut log: Vec<u8> = Vec::new();
+        let mut s = Session::new(&mut m, Some("@s-1".to_string()));
+        s.set_mail_step(MAIL_STEP);
+        let (out, code) = s
+            .supervise_with(&opts, Some(&mut lane), &mut log)
+            .expect("supervise");
+        assert_eq!(code, 0);
+        assert!(out.starts_with("idle\nreport -\n--\n"), "{out}");
+        let (records, _) = journal_records(&path);
+        assert_eq!(
+            records.last().map(|r| r.line.as_str()),
+            Some("EVENT idle-no-report seq=101 ⏺ Done.")
+        );
+        let _ = std::fs::remove_file(&path);
+        let _ = std::fs::remove_dir(dir);
     }
 }

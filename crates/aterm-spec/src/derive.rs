@@ -860,9 +860,12 @@ impl Model {
 // (pure code motion). The `pub use` re-exports keep every existing
 // `crate::derive::*_model` path — and the xref registry — compiling unchanged.
 mod models_console_life;
+mod models_control_bind_retry;
+mod models_control_preparation;
 mod models_core;
 mod models_cursor_input;
 mod models_effects;
+mod models_fabric_enable;
 mod models_fx;
 mod models_glyphs;
 mod models_gui;
@@ -872,15 +875,24 @@ mod models_operator;
 mod models_pet_observation_admission;
 mod models_release;
 mod models_render;
+mod models_ribbon_release_restoration;
 mod models_ribbon_row_hold;
 mod models_session;
 mod models_title_summary;
 mod models_update;
+mod models_update_activation_observation;
+mod models_update_check_coordination;
+mod models_update_environment_repair;
+mod models_update_retired_intent;
+mod models_update_web_cache;
 
 pub use models_console_life::*;
+pub use models_control_bind_retry::native_update_handoff_bind_retry_model;
+pub use models_control_preparation::native_update_control_preparation_model;
 pub use models_core::*;
 pub use models_cursor_input::*;
 pub use models_effects::*;
+pub use models_fabric_enable::*;
 pub use models_fx::*;
 pub use models_glyphs::*;
 pub use models_gui::*;
@@ -890,10 +902,21 @@ pub use models_operator::*;
 pub use models_pet_observation_admission::*;
 pub use models_release::*;
 pub use models_render::*;
+pub use models_ribbon_release_restoration::*;
 pub use models_ribbon_row_hold::*;
 pub use models_session::*;
 pub use models_title_summary::*;
 pub use models_update::*;
+pub use models_update_activation_observation::native_update_activation_observation_model;
+pub use models_update_check_coordination::{
+    native_update_boot_health_lock_model, native_update_check_join_model,
+    native_update_check_receipt_model, native_update_check_wait_model,
+};
+pub use models_update_environment_repair::native_update_environment_repair_model;
+pub use models_update_retired_intent::{
+    native_update_failure_target_model, native_update_retired_intent_model,
+};
+pub use models_update_web_cache::native_update_web_cache_model;
 
 /// Property-combinator generators: each returns a fully-formed, `Buggy`-gated
 /// [`Model`] (prove@Buggy=0, counterexample@Buggy=1) for a recurring property

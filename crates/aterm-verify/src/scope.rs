@@ -199,6 +199,14 @@ impl Scope {
     pub fn includes_regex_lane(&self) -> bool {
         self.includes_crate("aterm-search")
     }
+
+    /// Whether the sealed fabric lane has anything to run: it tests
+    /// `aterm-link` under `--features sealed`, so a scope without that crate
+    /// has nothing for it.
+    #[must_use]
+    pub fn includes_sealed_lane(&self) -> bool {
+        self.includes_crate("aterm-link")
+    }
 }
 
 #[cfg(test)]

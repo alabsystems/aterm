@@ -20,14 +20,9 @@ aterm-gui = { path = "../aterm-gui" }     # the WINDOW (winit/wgpu) + headless e
 aterm-ctl = { path = "../aterm-ctl" }     # `aterm ctl`  — control-socket client
 atpkg = { path = "../atpkg" }             # `aterm pkg`  — toolchain package manager
 aterm-agent = { path = "../aterm-agent" } # `aterm fleet` / `aterm drive`
-# `aterm link` — the fabric bridge. A LIBRARY like every other verb, so the one
-# Mach-O carries it: before 2026-09-10 this crate lived outside the workspace
-# and path-depended on a sibling astream checkout, so no release ever shipped
-# the bridge and turning the fabric on meant building two repositories by hand.
-# Its astream crates are vendored under vendor/astream (see that README); the
-# sealed cross-host transport is behind its off-by-default `sealed` feature, so
-# this adds no cipher tree to the shipped binary.
-aterm-link = { path = "../aterm-link" }
+# `aterm link` — the fabric bridge — is a UNIX-ONLY dependency; see the
+# `[target.'cfg(unix)'.dependencies]` table below and the `Link` arms in
+# src/main.rs.
 # The headless update lane: `aterm update status|check` and the session-mode
 # background check/stage loop (round-11 — a terminal-only Mac used to run NONE
 # of the updater, while install.sh promised automatic updates).
@@ -46,6 +41,33 @@ aterm-log = { path = "../aterm-log" }    # stderr logger for the headless update
 # upstream stable and is not gated. The library is empty; nothing links in.
 trust-gate = { path = "../trust-gate" }
 
+# `aterm link` — the fabric bridge. A LIBRARY like every other verb, so the one
+# Mach-O carries it: before 2026-09-10 this crate lived outside the workspace
+# and path-depended on a sibling astream checkout, so no release ever shipped
+# the bridge and turning the fabric on meant building two repositories by hand.
+# Its astream crates are vendored under vendor/astream (see that README); the
+# sealed cross-host transport is behind its off-by-default `sealed` feature, so
+# this adds no cipher tree to the shipped binary.
+#
+# UNIX ONLY, on purpose (2026-09-14): the bridge is Unix-domain sockets and
+# descriptors inherited at fixed numbers (`aterm_uds::spawnfd`: `dup2` between
+# fork and exec) end to end — `std::os::unix` and `std::os::fd` at module
+# level across ctl.rs, mirror.rs and transport.rs — and its Unix-domain
+# sharding in the vendored astream broker (`astream_broker::sharded`) is
+# `cfg(unix)` too (the broker itself serves TCP on Windows); on macOS the
+# broker is kept alive by launchd. Unconditional, it made the shipped Windows
+# binary unbuildable from the commit that made it a workspace member
+# (2026-09-12, shipped as v0.82.0), and no gate RAN that said so: `xtask gate
+# cells --cell win` type-checks `-p aterm` for x86_64-pc-windows-msvc and
+# would have failed on the `std::os::unix` imports, but it lives behind
+# `tools/verify.sh --full` and nothing ran it between v0.82.0 and 2026-09-14;
+# the x86_64-pc-windows-gnu cfg-validation lane has been dead since the libc
+# swap (crates/aterm-libc has no windows-gnu cell). On non-unix targets the
+# `link` verb stays on the roster and refuses by name (src/main.rs
+# `link_unavailable`) instead of failing to exist.
+[target.'cfg(unix)'.dependencies]
+aterm-link = { path = "../aterm-link" }
+
 [dev-dependencies]
 # The front-door verb-routing test drives the binary under a REAL pty: the
 # regression it pins (`aterm ship` reaching the session parser) is invisible
@@ -55,13 +77,16 @@ libc = { workspace = true }
 [build-dependencies]
 # Windows only: compile + link the icon, the side-by-side manifest and
 # VS_VERSION_INFO into THE shipped exe (build.rs → OUT_DIR/aterm.rc). It has to
-# live HERE and not in aterm-gui: `embed_resource::compile` emits
-# `cargo:rustc-link-arg-bins`, which reaches only its own package's bins, so
-# aterm-gui's copy only ever decorated `aterm-gui.exe` — never the binary
-# install.ps1 actually ships. Same version aterm-gui already pins, so it adds
-# nothing to the dependency tree. The crate is a documented no-op when the
-# target is not Windows, and build.rs returns before calling it anyway.
-embed-resource = "3"
+# live HERE and not in aterm-gui: the step emits `cargo:rustc-link-arg-bins`,
+# which reaches only its own package's bins, so aterm-gui's copy only ever
+# decorated `aterm-gui.exe` — never the binary install.ps1 actually ships.
+# First-party (crates/aterm-winres) since 2026-09-14: the `embed-resource` it
+# replaces pulled `vswhom` into the msvc graph, which reaches `libc::wchar_t`
+# and `libc::wcslen` — items crates/aterm-libc deliberately does not declare on
+# Windows — so the native msvc build failed closed. The step is a documented
+# no-op when the target is not Windows, and build.rs returns before calling it
+# anyway.
+aterm-winres = { workspace = true }
 
 [lints]
 workspace = true

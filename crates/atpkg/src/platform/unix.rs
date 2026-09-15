@@ -58,6 +58,52 @@ pub fn our_uid() -> u32 {
     unsafe { libc::getuid() }
 }
 
+/// This ACCOUNT's home directory, as the OS knows it — `getpwuid(getuid())->pw_dir` —
+/// which is NOT `$HOME`.
+///
+/// The difference is load-bearing for the `[machine]` settings. `defaults` (cfprefsd)
+/// resolves the per-host preference domain from the account, and IGNORES `$HOME`:
+/// measured 2026-09-14, `HOME=/tmp/x defaults -currentHost write com.aterm.probe …`
+/// landed in the REAL `~/Library/Preferences/ByHost/`. So a process pointed at a
+/// synthetic home — every integration test in this crate, a `sudo -H`, a CI job — would
+/// still write the real account's Universal Control keys, and did, before the guard that
+/// calls this existed. Read through `/etc/passwd` this would be wrong on macOS, where
+/// local accounts live in Open Directory and are absent from that file; `getpwuid` asks
+/// the directory service.
+///
+/// `None` when the account cannot be resolved; the caller treats that as "cannot prove
+/// this is the real home" and does not write.
+#[must_use]
+pub fn account_home() -> Option<PathBuf> {
+    // The reentrant form, which every ABI cell this crate ships declares (Darwin and
+    // Linux alike), with a buffer sized for any real passwd record.
+    let mut pw: libc::passwd = unsafe { std::mem::zeroed() };
+    let mut buf = [0u8; 4096];
+    let mut out: *mut libc::passwd = std::ptr::null_mut();
+    // SAFETY: `pw` is a valid, writable passwd out-param; `buf` is a valid writable
+    // buffer of the stated length that outlives the call and that `pw`'s string fields
+    // point INTO on success; `out` is a valid out-pointer. getpwuid_r writes nothing past
+    // buflen. `pw_dir` is read only when `out` is non-null (success) and is then a
+    // NUL-terminated C string inside `buf`, copied out before `buf` goes out of scope.
+    unsafe {
+        let rc = libc::getpwuid_r(
+            libc::getuid(),
+            &mut pw,
+            buf.as_mut_ptr().cast::<libc::c_char>(),
+            buf.len(),
+            &mut out,
+        );
+        if rc != 0 || out.is_null() || pw.pw_dir.is_null() {
+            return None;
+        }
+        let bytes = std::ffi::CStr::from_ptr(pw.pw_dir).to_bytes();
+        if bytes.is_empty() {
+            return None;
+        }
+        Some(PathBuf::from(OsStr::from_bytes(bytes)))
+    }
+}
+
 /// Mark `dir` as excluded from Time Machine and every backup tool that honours the
 /// convention, by setting the `com.apple.metadata:com_apple_backup_excludeItem`
 /// extended attribute.

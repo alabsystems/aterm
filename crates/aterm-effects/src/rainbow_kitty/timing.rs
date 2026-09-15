@@ -204,50 +204,94 @@ pub const MINI_FAN_MIN_CELLS: u16 = 2;
 /// (§6.12: no flight, no train, 1 m2 + 2 m3, gone by 245 ms).
 pub const MINI_FAN_MAX_CELLS: u16 = JUMP_MIN_CELLS - 1;
 
-/// **THE ECHO PATIENCE**, seconds — how long a typed press stays on the
-/// engine's echo ledger (`super::EchoLedger`) waiting for the caret advance
-/// that is its echo, before it is forgotten as swallowed.
-///
-/// The host's licence window is `0.25 s` (`CursorGlow::TYPE_HINT_FRESH`), and
-/// an echo judged later than that is refused at the seam — correctly, for
-/// program output, and at the cost of the glyph cell when the echo was merely
-/// LATE: a TUI whose render loop stalled. Measured on the owner's machine
-/// (2026-09-10): a scripted typist on an idle Claude Code prompt saw echoes of
-/// 2-31 ms, but the instance's own echo ledger held a `1373 ms` worst case from
-/// real use, and `input_p99 = 268 ms`. Two seconds covered that.
-///
-/// **It is the host's IN-FLIGHT PATIENCE, by alias (2026-09-12).** Two
-/// seconds bounded the ECHO LATENCY; what a press really waits on is the
-/// ROW, and a row goes silent for longer than any debounce when the app's
-/// event loop stalls. Measured with real Claude Code 2.1.268 under three
-/// Rust compiles: the owner's screenshot came from a 2.7 s stall, and the
-/// matrix's worst real stall was 7.7 s — presses this ledger had expired as
-/// swallowed while the app was merely busy. One patience for one press,
-/// whichever layer is asked: `CursorGlow::IN_FLIGHT_PATIENCE_S` (10 s —
-/// see its doc for the number's reasons) is the one number, and this is an
-/// alias so the two cannot drift.
-pub const ECHO_PATIENCE_S: f32 = crate::cursor_glow::IN_FLIGHT_PATIENCE_S;
+// ---------------------------------------------------------------------------
+// 1b. THE PHRASE REST — one rest for the melody and the ribbon
+//     (Rainbow Path v3 §2.6, law S5, D-6; 2026-09-13)
+// ---------------------------------------------------------------------------
 
-/// The most cells one observed move may lay from the echo ledger — the host's
-/// own coalesced-sweep cap (`CursorGlow::RAINBOW_TYPED_SWEEP_MAX`, which is
-/// `TYPED_STAMP_DEPTH`: 128 since 2026-09-12, 32 from the host's own ledger
-/// fix of 2026-09-09): more presses than that cannot be paired with any one
-/// move, so the ledger never holds more either.
-pub const ECHO_LEDGER_DEPTH: usize = crate::cursor_glow::TYPED_STAMP_DEPTH;
+/// A typing gap this long is a REST, and a rest RESOLVES the line (the
+/// melody's §3.1) and ENDS the phrase the ribbon is holding (the ribbon's
+/// grace). ONE number for both halves — this constant was the synth's
+/// `PHRASE_PAUSE_MS` and the ribbon's `LIFT_GRACE_S` 0.75 read from two
+/// places until 2026-09-13; the melody re-exports it and the ribbon's grace
+/// is derived from it, so the light and the song let go of a phrase on the
+/// same instant (S5).
+///
+/// **900, not v1's 600.** v1's 600 ms was tuned against a governor decay the
+/// melody's §16 row 11 sets to exactly 1.0; at 600 ms every ordinary
+/// think-pause resolves, and a line that resolves every few words has no
+/// line left. 900 ms is longer than a word-finding pause and shorter than a
+/// real stop.
+pub const PHRASE_PAUSE_MS: u32 = 900;
 
-/// **THE RIBBON'S BIRTH FLOOR** (seconds, 2026-09-12): a host sweep is dated
-/// at its licensing KEY's clock — for a stalled batch, the OLDEST unpaid
-/// press, seconds before the echo — because that clock is what the echo
-/// ledger partitions by. The RIBBON must not be born there: a cell born
-/// three seconds ago into a cohort whose last key was three seconds ago is
-/// retired on the very tick that laid it, and the batch the seam just
-/// licensed shows dark (the matrix's `held_lit_late`). So the engine floors
-/// the sweep's birth at one stamp window before the echo — the host's own
-/// `TYPE_HINT_FRESH`, the floor its insert lane already uses — so the
-/// echoing frame shows the run lit and the cohort it joins is refreshed. A
-/// per-key sweep's key is inside the window by definition: `max` is a no-op
-/// and that path is byte-identical.
-pub const SWEEP_BIRTH_FLOOR_S: f32 = crate::cursor_glow::CursorGlow::TYPE_HINT_FRESH;
+/// The tempo multiple of the phrase rest (D-6, the owner's default 2.5;
+/// A/B 2.0 / 3.0): `phrase_rest_ms(ioi) = max(PHRASE_PAUSE_MS, 2.5 · ioi)`.
+/// At ≥ 2.8 cps (`ioi ≤ 360 ms`) the rest is the 900 ms floor and the
+/// melody is byte-identical to its pre-v3 self; a slower hand gets a
+/// proportionally longer rest in both halves, so the after-glow of a
+/// 2 cps hunt-and-peck line does not start its exit swoosh between two of
+/// its own keys.
+pub const PHRASE_REST_IOI_MUL: f32 = 2.5;
+
+/// A gap longer than this is not typing at all: the IOI estimator RESTARTS
+/// at [`IOI_DEFAULT_MS`] rather than dragging a stale 600 ms average into
+/// the next burst.
+pub const IOI_RESET_MS: u32 = 2_000;
+/// IOI clamp floor / ceiling (ms), the melody's §9.6. The ceiling bounds the
+/// phrase rest too: `phrase_rest_ms` tops out at `2.5 · 600 = 1500 ms`.
+pub const IOI_MIN_MS: f32 = 30.0;
+/// See [`IOI_MIN_MS`].
+pub const IOI_MAX_MS: f32 = 600.0;
+/// The IOI a fresh session assumes — 4 cps, which the melody's §9.6 table
+/// uses as the 0 dB reference for the whole loudness arc.
+pub const IOI_DEFAULT_MS: f32 = 250.0;
+/// EMA weight on the newest gap (§9.6). 0.5 is two-gap memory: fast enough
+/// that a burst is heard as a burst, slow enough that one stumbled key does
+/// not brighten the note after it.
+pub const IOI_EMA_ALPHA: f32 = 0.5;
+
+/// **THE PHRASE REST**, ms, for a hand at `ioi_ms`: the longer of
+/// [`PHRASE_PAUSE_MS`] and [`PHRASE_REST_IOI_MUL`] tempos. Non-finite input
+/// reads as the default tempo. Read by the melody's rest
+/// (`MelodyV2::on_typed`) and by the ribbon's grace (`Ribbon::place`) — the
+/// one function S5 names.
+#[inline]
+#[must_use]
+pub fn phrase_rest_ms(ioi_ms: f32) -> f32 {
+    let ioi = if ioi_ms.is_finite() {
+        ioi_ms.clamp(IOI_MIN_MS, IOI_MAX_MS)
+    } else {
+        IOI_DEFAULT_MS
+    };
+    (PHRASE_REST_IOI_MUL * ioi).max(PHRASE_PAUSE_MS as f32)
+}
+
+/// Whether a raw gap of `gap_ms` since the last key is a REST at tempo
+/// `ioi_ms` — the melody's `gap >= PHRASE_PAUSE_MS`, tempo-scaled.
+#[inline]
+#[must_use]
+pub fn phrase_rest_reached(gap_ms: u32, ioi_ms: f32) -> bool {
+    gap_ms as f32 >= phrase_rest_ms(ioi_ms)
+}
+
+/// **THE TEMPO'S ONE UPDATE** — the inter-onset EMA the melody has run
+/// since v2 (§9.6), lifted here so the ribbon runs the identical law on the
+/// identical keys: the first key of a session, or a gap of
+/// [`IOI_RESET_MS`] or more, restarts at [`IOI_DEFAULT_MS`]; a REST holds
+/// the tempo (the owner's ruling: the same text at two speeds plays the same
+/// degrees after every pause); otherwise the EMA on the clamped gap.
+#[inline]
+#[must_use]
+pub fn ioi_next(ioi_ms: f32, gap_ms: u32, first: bool, rest: bool) -> f32 {
+    if first || gap_ms >= IOI_RESET_MS {
+        IOI_DEFAULT_MS
+    } else if rest {
+        ioi_ms
+    } else {
+        (1.0 - IOI_EMA_ALPHA) * ioi_ms
+            + IOI_EMA_ALPHA * (gap_ms as f32).clamp(IOI_MIN_MS, IOI_MAX_MS)
+    }
+}
 
 // ---------------------------------------------------------------------------
 // 2. THE SHARED COUNTS (§8.1, "plus two shared counts")
@@ -314,6 +358,44 @@ pub fn rain_spacing_ms(flight_ms: f32) -> f32 {
         return RAIN_SPACING_MIN_MS;
     }
     (flight_ms / FAN_HERO_N as f32).clamp(RAIN_SPACING_MIN_MS, RAIN_SPACING_MAX_MS)
+}
+
+// ---------------------------------------------------------------------------
+// 2b. THE KILL'S RETRACT SCHEDULE (§8.2, §27)
+// ---------------------------------------------------------------------------
+
+/// **`12·n + 240` ms** — the kill's retract span (§8.2): a kill of `n` cells
+/// drains its suffix farthest-first over this long, and a Backspace (`n = 0`)
+/// over the base alone. Shared because three producers must agree on it: the
+/// ribbon retracts the cells on it, the insert's rewrite (§27) reuses it
+/// verbatim, and the sky finishes the retracted cells' field stars on it
+/// (§5.6: "its field stars die with their cells") — the ribbon owns the cell,
+/// stardust owns the star, and the two meet on the event edge because the
+/// star cannot read the cell per frame.
+pub const KILL_RETRACT_BASE_MS: f32 = 240.0;
+
+/// Per-cell term of [`KILL_RETRACT_BASE_MS`]'s schedule.
+pub const KILL_RETRACT_PER_CELL_MS: f32 = 12.0;
+
+/// The base in seconds — the ribbon's clock.
+const KILL_RETRACT_BASE_S: f32 = KILL_RETRACT_BASE_MS / 1000.0;
+
+/// The per-cell term in seconds — the ribbon's clock.
+const KILL_RETRACT_PER_CELL_S: f32 = KILL_RETRACT_PER_CELL_MS / 1000.0;
+
+/// The kill's retract span in ms, `240 + 12·cells` — the sky's clock.
+#[inline]
+#[must_use]
+pub fn kill_span_ms(cells: u16) -> f32 {
+    KILL_RETRACT_BASE_MS + KILL_RETRACT_PER_CELL_MS * f32::from(cells)
+}
+
+/// The kill's retract span in seconds, `0.012·cells + 0.240` — the ribbon's
+/// clock, in the operation order its retract was baked with.
+#[inline]
+#[must_use]
+pub fn kill_span_s(cells: u16) -> f32 {
+    KILL_RETRACT_PER_CELL_S * f32::from(cells) + KILL_RETRACT_BASE_S
 }
 
 // ---------------------------------------------------------------------------
@@ -583,6 +665,21 @@ const _: () = assert!(TRANSIENT_STAR_COV_CEIL * 1.5 > JUMP_COV_CEIL);
 const _: () = assert!(TRANSIENT_STAR_COV_CEIL < JUMP_COV_CEIL);
 // §2.5: the one sanctioned attack has a positive span.
 const _: () = assert!(EDGE_IN_S > 0.0);
+// §2.6 / S5: `phrase_rest_ms`'s `max` is genuinely two regimes, not a dead
+// branch. The floor binds up to an IOI of 360 ms (`2.5 × 360 = 900`, exactly
+// `PHRASE_PAUSE_MS`); above that crossover the tempo term binds, and it stays
+// at or above the floor all the way to the top of the clamp
+// (`2.5 × 600 = 1500 ms`). Both arms are reachable, so the rest a slow hand
+// gets is longer than the floor rather than pinned to it.
+const _: () = assert!(PHRASE_REST_IOI_MUL * IOI_MAX_MS >= PHRASE_PAUSE_MS as f32);
+const _: () = assert!(PHRASE_REST_IOI_MUL * 360.0 <= PHRASE_PAUSE_MS as f32);
+// The seconds form is the literal the ribbon's retract was baked with: a
+// correctly-rounded division of exact operands, bit-equal to `0.012` and
+// `0.240`, so the kill, the rewrite and the field-star finish share one clock.
+const _: () = assert!(
+    KILL_RETRACT_PER_CELL_S == 0.012 && KILL_RETRACT_BASE_S == 0.240,
+    "the seconds form is the literal the ribbon's retract was baked with"
+);
 
 // ---------------------------------------------------------------------------
 // Small shared shapes
@@ -612,6 +709,40 @@ mod tests {
     /// two clamps, and monotonicity across the whole open range. This is the
     /// number the synth resolves through the SAME function, so an off-by-one
     /// here desynchronises the bell from the pin.
+    /// **S5's function** (Rainbow Path v3 §2.6): the floor at every tempo of
+    /// 2.8 cps or faster — where the melody is byte-identical to its pre-v3
+    /// self — and `2.5 · ioi` beyond it, capped by the IOI ceiling; the
+    /// tempo update is the melody's own law to the bit.
+    #[test]
+    fn the_phrase_rest_is_the_floor_at_speed_and_the_tempo_multiple_below_it() {
+        for ioi in [30.0, 100.0, 250.0, 360.0] {
+            assert_eq!(phrase_rest_ms(ioi), 900.0, "ioi {ioi}: the floor");
+        }
+        assert_eq!(phrase_rest_ms(400.0), 1000.0);
+        assert_eq!(phrase_rest_ms(500.0), 1250.0);
+        assert_eq!(phrase_rest_ms(600.0), 1500.0);
+        assert_eq!(
+            phrase_rest_ms(5000.0),
+            1500.0,
+            "the IOI ceiling caps the rest"
+        );
+        assert_eq!(phrase_rest_ms(f32::NAN), phrase_rest_ms(IOI_DEFAULT_MS));
+        assert!(phrase_rest_reached(900, 100.0));
+        assert!(!phrase_rest_reached(899, 100.0));
+        assert!(!phrase_rest_reached(1000, 500.0));
+        assert!(phrase_rest_reached(1250, 500.0));
+        // The tempo law: first / reset → default, a rest holds, else the EMA.
+        assert_eq!(ioi_next(123.0, 100, true, false), IOI_DEFAULT_MS);
+        assert_eq!(ioi_next(123.0, 2000, false, false), IOI_DEFAULT_MS);
+        assert_eq!(ioi_next(123.0, 1000, false, true), 123.0);
+        assert_eq!(ioi_next(200.0, 100, false, false), 150.0);
+        assert_eq!(
+            ioi_next(200.0, 10, false, false),
+            115.0,
+            "the gap is clamped at 30"
+        );
+    }
+
     /// `impact` is the ONE magnitude every distance-graded landing law reads,
     /// so its shape is pinned here once: floor exactly 1 at the 8-cell meteor
     /// floor (the floor landing must not change), non-decreasing over the whole

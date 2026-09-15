@@ -688,11 +688,16 @@ pub(crate) struct Adopted {
     /// SCREEN CARRY: the outgoing engine's checkpoint, when the handoff carried
     /// one. Hydrated into the fresh engine before the reader starts, so the
     /// post-update window shows the exact pre-update visible screen (prompt included)
-    /// instead of booting blank over a live shell. Preexisting off-screen scrollback
-    /// is intentionally outside this bounded handoff projection. `None` is retained
-    /// only for non-handoff construction; authenticated modern/legacy adoption
-    /// requires a checkpoint.
+    /// instead of booting blank over a live shell. It carries a bounded tail of
+    /// the scrollback as well (`seamless::max_handoff_history_lines`, fewer or none
+    /// under deadline or budget pressure); older scrollback stays behind. `None` is
+    /// retained only for non-handoff construction; authenticated adoption requires
+    /// a checkpoint.
     pub checkpoint: Option<aterm_core::terminal::TerminalCheckpoint>,
+    /// CONTROL CARRY (`crate::handoff_carry`): the outgoing session's turn ledger
+    /// and the tail of its alt-screen archive, when the handoff carried them and
+    /// they checked out. Best-effort: `None` adopts exactly as before.
+    pub control: Option<crate::handoff_carry::ControlCarry>,
 }
 
 #[allow(
@@ -834,7 +839,7 @@ pub(crate) fn spawn_session(
     // outgoing process cleared CLOEXEC so it survived the exec — the SAME shell keeps
     // running); otherwise FORK a fresh shell (every normal caller).
     let adopted = adopt.is_some();
-    let (master, pid, adopt_checkpoint) = match adopt {
+    let (master, pid, adopt_checkpoint, mut adopt_control) = match adopt {
         Some(a) => {
             // FD HYGIENE: the outgoing process cleared CLOEXEC so this master
             // survived the handoff — re-arm it NOW (mirroring what forkpty does
@@ -843,7 +848,7 @@ pub(crate) fn spawn_session(
             // handoff child before its own deliberate clear.
             #[cfg(unix)]
             let _ = aterm_pty::set_cloexec(a.master, true);
-            (a.master, a.pid, a.checkpoint)
+            (a.master, a.pid, a.checkpoint, a.control)
         }
         None => {
             // Pick the child rlimit posture by containment mode: the daily-driver modes
@@ -886,7 +891,7 @@ pub(crate) fn spawn_session(
                 cell_px,
             );
             match spawned {
-                Ok(aterm_pty::SpawnedShell { master, pid }) => (master, pid, None),
+                Ok(aterm_pty::SpawnedShell { master, pid }) => (master, pid, None, None),
                 Err(e) => {
                     // The child-recursion provisioning above (the `PROXIES` entry + the
                     // 0600 edge-token file) is registered BEFORE this fallible spawn, and
@@ -963,9 +968,15 @@ pub(crate) fn spawn_session(
         cast: cast.clone(),
         temporal: temporal.clone(),
         byte_fanout: byte_fanout.clone(),
-        turns: Arc::new(std::sync::Mutex::new(
-            crate::turn_ledger::TurnLedger::default(),
-        )),
+        // An adopted session goes on with the ledger the handoff carried (its
+        // records print `carried=1`) — or, when it could not be carried, an
+        // empty one that says which turn ids it no longer vouches for. Every
+        // other session starts empty.
+        turns: Arc::new(std::sync::Mutex::new(if adopted {
+            crate::handoff_carry::adopted_ledger(adopt_control.as_mut())
+        } else {
+            crate::turn_ledger::TurnLedger::default()
+        })),
         meta: std::sync::Mutex::new(crate::session_timeline::SessionMeta::default()),
         app_kitty: std::sync::Mutex::new(crate::app_kitty::AppKittySlot::default()),
         timeline: Arc::new(std::sync::Mutex::new(
@@ -986,8 +997,18 @@ pub(crate) fn spawn_session(
     // pre-update screen — prompt included — instead of booting blank over a
     // live shell that then LOOKS dead. The engine may restore at the OLD grid
     // size; the window's first resize converges engine + PTY to the new frame.
+    //
+    // Then the CONTROL CARRY's archive, into the engine that has just restored
+    // the screen it was captured with: the archive goes on under its old origin
+    // and indices, diffing the app's next frame exactly as the old process
+    // would have. It never panics on what it is given, and without it the
+    // restored screen is the new baseline, as before.
     if let Some(cp) = &adopt_checkpoint {
-        term_lock(&term).restore_checkpoint(cp);
+        let mut engine = term_lock(&term);
+        engine.restore_checkpoint(cp);
+        if let Some(control) = adopt_control.take() {
+            let _ = control.install(&mut engine);
+        }
     }
 
     // One-time AI-discoverability hint: OPT-IN (`$ATERM_AI_HINT`), OFF by default so a
@@ -1178,7 +1199,7 @@ impl DeferredReaderGate {
         self.inner.ready.notify_all();
     }
 
-    fn wait_until_released(&self, stop: &AtomicBool) -> bool {
+    pub(crate) fn wait_until_released(&self, stop: &AtomicBool) -> bool {
         let mut guard = self.inner.lock.lock().unwrap_or_else(|p| p.into_inner());
         while !self.inner.open.load(Ordering::Acquire) {
             if stop.load(Ordering::Acquire) {
@@ -1760,15 +1781,15 @@ pub(crate) fn new_live_terminal(
     // backend (no disk-tier config is exposed), so no scratch path is needed here.
     // `with_defaults()` seeds a 100k-line / 100 MB STORE. The user-facing limit is now
     // one total across that store and the ring, so the no-config path below explicitly
-    // applies the advertised 100k total (leaving a 90k store share). `apply_config`
+    // applies the advertised 100k total (subtracting this ring's capacity from the
+    // store share). `apply_config`
     // performs the same split for configured totals, including `scrollback_lines = 0`
-    // ⇒ unlimited, bounded only by the budget. The ring stays at the pre-store 10k, so
-    // history ≤10k is byte-identical to the old path and the store purely extends
-    // retention past it.
+    // ⇒ unlimited, bounded only by the budget. The initial ring capacity comes from
+    // the estimated byte target below; older history moves into the store.
     let mut t = Terminal::with_scrollback(
         rows,
         cols,
-        LIVE_SCROLLBACK_RING_LINES,
+        live_scrollback_ring_lines(cols),
         aterm_core::scrollback::Scrollback::with_defaults(),
     );
     if let Some(tc) = cfg {
@@ -1794,9 +1815,11 @@ pub(crate) fn new_live_terminal(
     // apply_config never touches alternate_scroll, so ordering is irrelevant; set it
     // last to make the default-on unmistakable.
     t.modes_mut().alternate_scroll = true;
-    // The alt-screen archive's ORIGIN: its indices mean something only inside this
-    // process, so a mark a driver holds from a previous process (a self-update
-    // handoff, a restart) must never be read as an index into this one.
+    // The alt-screen archive's ORIGIN: its indices mean something only inside the
+    // archive that minted them, so a mark a driver holds from a previous process
+    // (a restart) must never be read as an index into this one. An adopted
+    // session whose handoff carried its archive takes the carried origin back
+    // (`AltArchive::import`), and its marks go on meaning what they meant.
     t.set_alt_archive_origin(alt_archive_origin());
     t
 }
@@ -1807,10 +1830,13 @@ pub(crate) fn new_live_terminal(
 /// first call and never 0.
 ///
 /// WHY a process identity and not a per-session counter: archive indices restart
-/// at 1 in every process, so after a self-update handoff a driver's `since=1203`
-/// would silently read a NEW archive's unrelated row 1204. `offscreen
+/// at 1 in every new archive, so after a restart a driver's `since=1203` would
+/// silently read a NEW archive's unrelated row 1204. `offscreen
 /// since=<origin>:<i>` names the origin the index was minted under, and one that
-/// is not this process's reads from the start instead, with `origin=` saying why.
+/// is not the archive's reads from the start instead, with `origin=` saying why.
+/// A self-update handoff that carries the archive (`crate::handoff_carry`)
+/// keeps its origin, so the session's archive can carry an EARLIER process's
+/// origin rather than this one; one that could not carry it starts here.
 /// The pid alone repeats across reboots and the clock alone repeats across two
 /// processes launched in one tick; together they do not in practice.
 pub(crate) fn alt_archive_origin() -> u64 {
@@ -1824,12 +1850,63 @@ pub(crate) fn alt_archive_origin() -> u64 {
     })
 }
 
-/// The fast in-memory grid ring for a live session, in lines — held at the pre-SCROLL-1
-/// `Grid::new` value so recent scrollback (≤ this many lines) stays uncompressed and
-/// byte-identical to the old path; older lines tier into the attached store (warm-LZ4 /
-/// cold-zstd) rather than being dropped. History depth is governed by the store's line
-/// limit + memory budget, not this ring.
-const LIVE_SCROLLBACK_RING_LINES: usize = 10_000;
+/// Estimated byte target for a newly created live session's in-memory grid ring.
+///
+/// The ring holds recent scrollback uncompressed so it reads back without a
+/// decompress; older lines tier into the attached store (warm-LZ4 / cold-zstd)
+/// rather than being dropped, and history DEPTH is governed by the store's line
+/// limit, not by this.
+///
+/// The target accounts for width because a ring row is allocated at the full
+/// grid width and recycled in place, so a scrolled-off line costs
+/// `cols × size_of::<Cell>()` plus ~45 B of
+/// Row/ring bookkeeping WHATEVER IT HOLDS — measured byte-identical for lines
+/// of 0, 40 and 200 characters, and linear in the window's width: 704 B/line at
+/// 80 columns, 1,700 at 200, 3,339 at 400. Held at a flat 10,000 LINES (the
+/// pre-store `Grid::new` value, inherited rather than measured) that is 17.0 MB
+/// of real resident memory per tab at 200 columns and 33 MB at 400 — measured
+/// +20.2 MB RSS for a 20,000-line session — for history nobody is looking at,
+/// and it is 83% of a session's footprint for 10% of its history: the tiered
+/// store beside it holds the other 90% at 38 B/line, 43x cheaper.
+///
+/// This is a startup sizing estimate, not a hard allocation or RSS limit. The
+/// 45-byte overhead is approximate, allocator/page slack is not modeled, and
+/// the 512-line floor can exceed the target at very wide widths. Resizing keeps
+/// the chosen line capacity rather than recomputing it. Checkpoint adoption
+/// replaces the grid through `restore_checkpoint`, whose existing restore
+/// policy uses a 1000-line main-grid ring and preserves carried history in its
+/// store (the alternate grid has no ring).
+///
+/// THE TRADE, and why it is affordable now: a smaller ring pushes more lines
+/// through row-to-Line + LZ4. That conversion was made 16-18% cheaper in the
+/// same audit (`scroll_convert.rs`'s plain-run walk). With a live compression
+/// worker, `compress_offload_active` stages scrolled rows for that worker's
+/// batches. If the worker cannot spawn, the existing inline drain remains the
+/// fallback; a smaller ring can therefore increase work on that reader path.
+const LIVE_SCROLLBACK_RING_BYTES: usize = 4 * 1024 * 1024;
+
+/// Never more than the pre-audit ring, so no window can get a DEEPER ring than
+/// the value this replaced.
+const LIVE_SCROLLBACK_RING_LINES_MAX: usize = 10_000;
+
+/// A floor so a very wide window still keeps an instant-scrollback ring worth
+/// having (512 lines is ~10 screens at 50 rows).
+const LIVE_SCROLLBACK_RING_LINES_MIN: usize = 512;
+
+/// The initial ring's line cap for a window `cols` wide, estimated from
+/// [`LIVE_SCROLLBACK_RING_BYTES`].
+fn live_scrollback_ring_lines(cols: u16) -> usize {
+    // `size_of::<Cell>()` is 8; the ~45 B of Row/ring slack is the measured
+    // intercept of the per-line fit (8·cols + 45).
+    let per_line = usize::from(cols)
+        .saturating_mul(std::mem::size_of::<aterm_core::grid::Cell>())
+        .saturating_add(45)
+        .max(1);
+    (LIVE_SCROLLBACK_RING_BYTES / per_line).clamp(
+        LIVE_SCROLLBACK_RING_LINES_MIN,
+        LIVE_SCROLLBACK_RING_LINES_MAX,
+    )
+}
 
 /// One OSC 52 write, already ROUTED to its platform destinations by
 /// [`route_osc52_write`]: the text bound for the system CLIPBOARD and/or the text
@@ -3797,9 +3874,21 @@ pub(crate) fn reroute_path_env(
 /// `~/.local/bin` and `/opt/homebrew/bin` when the shell will not answer.
 pub(crate) fn atpkg_child_path() -> String {
     login_shell_path().unwrap_or_else(|| {
+        // The managed dirs the shell hook would have put on PATH — `agents/` first,
+        // `bin/` last — so a fallback PATH cannot make `reconcile_shadowed` record a
+        // false SHADOWED row for a `claude` the managed twin in fact out-ranks
+        // (audit 2026-09-14).
+        let layout = atpkg::store::resolve_configured();
+        let managed = layout.as_ref().and_then(|l| {
+            Some((
+                l.agents_dir().to_str()?.to_owned(),
+                l.bin_dir().to_str()?.to_owned(),
+            ))
+        });
         fallback_child_path(
             std::env::var("PATH").ok().as_deref(),
             aterm_types::dirs::home_dir().as_deref(),
+            managed.as_ref().map(|(a, b)| (a.as_str(), b.as_str())),
         )
     })
 }
@@ -3957,6 +4046,7 @@ pub(crate) fn pick_login_path(output: &str) -> Option<String> {
 pub(crate) fn fallback_child_path(
     process_path: Option<&str>,
     home: Option<&std::path::Path>,
+    managed: Option<(&str, &str)>,
 ) -> String {
     let sep = if cfg!(windows) { ';' } else { ':' };
     let mut entries: Vec<String> = process_path
@@ -3972,6 +4062,15 @@ pub(crate) fn fallback_child_path(
     for dir in extra {
         if !entries.contains(&dir) {
             entries.push(dir);
+        }
+    }
+    // The shell hook's two placements (`atpkg::hooks`): `agents/` MOVED TO THE FRONT,
+    // `bin/` appended once — the order a login shell would have answered with.
+    if let Some((agents, bin)) = managed {
+        entries.retain(|e| e != agents);
+        entries.insert(0, agents.to_string());
+        if !entries.iter().any(|e| e == bin) {
+            entries.push(bin.to_string());
         }
     }
     entries.join(&sep.to_string())
@@ -4047,7 +4146,7 @@ mod reroute_path_env_tests {
         assert_eq!(pick_login_path(""), None);
         let home = Path::new("/Users//u");
         assert_eq!(
-            fallback_child_path(Some("/usr/bin:/bin:/usr/sbin:/sbin"), Some(home)),
+            fallback_child_path(Some("/usr/bin:/bin:/usr/sbin:/sbin"), Some(home), None),
             path(&[
                 "/usr/bin",
                 "/bin",
@@ -4060,13 +4159,35 @@ mod reroute_path_env_tests {
             "launchd's four, then the foreign homes"
         );
         assert_eq!(
-            fallback_child_path(Some("/opt/homebrew/bin:/usr/bin"), None),
+            fallback_child_path(Some("/opt/homebrew/bin:/usr/bin"), None, None),
             path(&["/opt/homebrew/bin", "/usr/bin", "/usr/local/bin"]),
             "already-present dirs are not repeated; no home, no ~/.local/bin"
         );
         assert_eq!(
-            fallback_child_path(None, Some(home)),
+            fallback_child_path(None, Some(home), None),
             path(&["/Users//u/.local/bin", "/opt/homebrew/bin", "/usr/local/bin"])
+        );
+        // The managed dirs ride like the shell hook places them: agents/ first (moved,
+        // never duplicated), bin/ last once — so the fallback cannot report the
+        // managed `claude` as SHADOWED by ~/.local/bin/claude (audit 2026-09-14).
+        let agents = "/Users//u/Library/Application Support/aterm/pkg/agents";
+        let bin = "/Users//u/Library/Application Support/aterm/pkg/bin";
+        assert_eq!(
+            fallback_child_path(
+                Some(&format!("/usr/bin:{agents}:/bin")),
+                Some(home),
+                Some((agents, bin))
+            ),
+            path(&[
+                agents,
+                "/usr/bin",
+                "/bin",
+                "/Users//u/.local/bin",
+                "/opt/homebrew/bin",
+                "/usr/local/bin",
+                bin
+            ]),
+            "agents/ moved to the front, bin/ appended"
         );
     }
 
@@ -4986,5 +5107,62 @@ mod kitty_transfer_tests {
 
         let _ = std::fs::remove_dir_all(&dir);
         assert!(!placed, "an over-cap file must be rejected (fail closed)");
+    }
+}
+
+#[cfg(test)]
+mod ring_budget_tests {
+    use super::{
+        LIVE_SCROLLBACK_RING_BYTES, LIVE_SCROLLBACK_RING_LINES_MAX, LIVE_SCROLLBACK_RING_LINES_MIN,
+        live_scrollback_ring_lines,
+    };
+
+    /// The sizing formula's estimate, not a measurement of allocated memory.
+    fn estimated_bytes_at(cols: u16) -> usize {
+        live_scrollback_ring_lines(cols)
+            * (usize::from(cols) * std::mem::size_of::<aterm_core::grid::Cell>() + 45)
+    }
+
+    /// The initial capacity scales with width under the sizing estimate, with
+    /// explicit min/max line clamps. This checks that policy's arithmetic;
+    /// it does not assert an allocation bound across resizes or restoration.
+    #[test]
+    fn the_scrollback_ring_targets_estimated_bytes_at_initial_width() {
+        for cols in [80u16, 120, 200, 400, 1000] {
+            let lines = live_scrollback_ring_lines(cols);
+            assert!(
+                (LIVE_SCROLLBACK_RING_LINES_MIN..=LIVE_SCROLLBACK_RING_LINES_MAX).contains(&lines),
+                "{cols} cols: {lines} lines is outside the ring's own bounds"
+            );
+            // Wherever the floor is not what bound it, the estimate fits.
+            if lines > LIVE_SCROLLBACK_RING_LINES_MIN {
+                assert!(
+                    estimated_bytes_at(cols) <= LIVE_SCROLLBACK_RING_BYTES,
+                    "{cols} cols: estimated {} B over the {LIVE_SCROLLBACK_RING_BYTES} B target",
+                    estimated_bytes_at(cols)
+                );
+            }
+        }
+        assert_eq!(
+            live_scrollback_ring_lines(4096),
+            LIVE_SCROLLBACK_RING_LINES_MIN
+        );
+        assert!(
+            estimated_bytes_at(4096) > LIVE_SCROLLBACK_RING_BYTES,
+            "the intentional floor must not be misreported as a hard byte limit"
+        );
+        // A wider window gets a SHALLOWER ring. That is the whole point.
+        assert!(
+            live_scrollback_ring_lines(80) > live_scrollback_ring_lines(400),
+            "a narrow window keeps the deeper ring"
+        );
+        // And what it replaced — a flat 10,000 lines at 200 columns — was 16.5 MB
+        // against this ring's 4.0 MiB, a factor of 3.9.
+        let flat_10k = 10_000 * (200 * std::mem::size_of::<aterm_core::grid::Cell>() + 45);
+        assert!(
+            flat_10k > 3 * estimated_bytes_at(200),
+            "the 200-column ring should be a fraction of the flat 10k it replaced: {flat_10k} B vs {} B",
+            estimated_bytes_at(200)
+        );
     }
 }

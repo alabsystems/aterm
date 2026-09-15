@@ -36,6 +36,12 @@ fn waiting_line() -> String {
     format!("atpkg: {}", atpkg::cli::LOCK_WAITING_MARKER)
 }
 
+/// The sentence that answers it once the announced wait ends in the lock
+/// (`atpkg::cli::LOCK_ACQUIRED_MARKER`, 2026-09-14).
+fn acquired_line() -> String {
+    format!("atpkg: {}", atpkg::cli::LOCK_ACQUIRED_MARKER)
+}
+
 /// The sentence a declined machine's `seed` prints instead of provisioning.
 const DECLINED_SENTENCE: &str = "removed on this machine";
 
@@ -267,6 +273,25 @@ fn a_waiting_seed_proceeds_once_the_holder_releases() {
         ran_at > waiting_at,
         "the verb runs AFTER the wait: {stdout:?}"
     );
+    // THE WAIT IS ANSWERED (2026-09-14): once, between the announcement and the
+    // verb's own output — the GUI retires its waiting row on it, since a quiet
+    // verb under the lock would otherwise leave "waiting for another install"
+    // standing until this child exits.
+    let acquired: Vec<usize> = stdout
+        .iter()
+        .enumerate()
+        .filter(|(_, l)| l.starts_with(&acquired_line()))
+        .map(|(i, _)| i)
+        .collect();
+    assert_eq!(
+        acquired.len(),
+        1,
+        "exactly one `lock-acquired:` line answers the wait: {stdout:?}"
+    );
+    assert!(
+        waiting_at < acquired[0] && acquired[0] < ran_at,
+        "announced, then acquired, then the verb: {stdout:?}"
+    );
     assert!(
         !stderr.contains("holds the store lock"),
         "no refusal on stderr: {stderr}"
@@ -326,6 +351,10 @@ fn a_waiting_seed_times_out_with_exit_75() {
         !stdout.iter().any(|l| l.contains(DECLINED_SENTENCE)),
         "never ran the verb: {stdout:?}"
     );
+    assert!(
+        !stdout.iter().any(|l| l.starts_with(&acquired_line())),
+        "a wait that ran out never claims the lock: {stdout:?}"
+    );
     let lock = lock_path_of(&fx.prefix);
     assert!(
         stderr.contains("another atpkg process holds the store lock at") && stderr.contains(&lock),
@@ -352,6 +381,8 @@ fn a_typed_seed_stays_fail_fast_with_exit_75() {
         "fail-fast, not a wait: {elapsed:?}"
     );
     assert!(stdout.is_empty(), "no marker for a typed verb: {stdout:?}");
+    // The refusal names the door the host settings still have (they take no lock).
+    assert!(stderr.contains("aterm pkg machine apply"), "{stderr}");
     assert!(
         stderr.contains("another atpkg process holds the store lock at"),
         "{stderr}"
@@ -374,6 +405,7 @@ fn an_unwritable_prefix_never_waits_and_keeps_exit_1() {
     );
     assert!(stdout.is_empty(), "{stdout:?}");
     assert!(stderr.contains("cannot take the store lock"), "{stderr}");
+    assert!(stderr.contains("aterm pkg machine apply"), "{stderr}");
 }
 
 /// Whether `pid` is alive, asked the way atpkg's own progress reader asks
@@ -572,6 +604,36 @@ fn a_waiter_whose_parent_is_init_from_the_start_is_not_an_orphan() {
     );
 }
 
+/// A holder that lets go INSIDE the announcement grace is waited out silently:
+/// no `lock-waiting:` line, and so no `lock-acquired:` answer either — a wait
+/// nobody was told about has nothing to retire (2026-09-14).
+#[test]
+fn a_wait_that_ends_inside_the_grace_is_never_announced_nor_answered() {
+    let fx = Fixture::new("grace");
+    let guard = fx.hold();
+    let child = stream(fx.spawn(&["seed", "--wait-lock", "60"]));
+    std::thread::sleep(Duration::from_millis(500));
+    drop(guard);
+    let (status, elapsed, stdout, stderr) = child.finish(Duration::from_secs(20));
+    assert!(status.success(), "{status}; stderr: {stderr}");
+    assert!(
+        elapsed < atpkg::lock::WAIT_ANNOUNCE_GRACE + Duration::from_secs(5),
+        "proceeded soon after the release: {elapsed:?}"
+    );
+    assert!(
+        !stdout.iter().any(|l| l.starts_with(&waiting_line())),
+        "inside the grace: no announcement: {stdout:?}"
+    );
+    assert!(
+        !stdout.iter().any(|l| l.starts_with(&acquired_line())),
+        "…and nothing to answer: {stdout:?}"
+    );
+    assert!(
+        stdout.iter().any(|l| l.contains(DECLINED_SENTENCE)),
+        "the verb ran: {stdout:?}"
+    );
+}
+
 /// No contention, no marker: the flag changes nothing about an uncontended pass.
 #[test]
 fn a_declined_seed_without_contention_is_unchanged() {
@@ -584,6 +646,10 @@ fn a_declined_seed_without_contention_is_unchanged() {
     assert!(
         !stdout.iter().any(|l| l.starts_with(&waiting_line())),
         "the marker prints only on contention: {stdout:?}"
+    );
+    assert!(
+        !stdout.iter().any(|l| l.starts_with(&acquired_line())),
+        "…and a wait that was never announced is never answered: {stdout:?}"
     );
     assert!(
         stdout.iter().any(|l| l.contains(DECLINED_SENTENCE)),

@@ -4,7 +4,7 @@ description = "astream servable broker: durable exactly-once pub/sub, Filter-rou
 version = "0.1.0"
 edition = "2021"
 license = "Apache-2.0"
-authors = ["Andrew Yates"]
+authors = ["Andrew Yates <andrewyates.name@gmail.com>"]
 rust-version = "1.89"
 
 # Zero third-party dependencies — std only (threads, sync, UnixListener) plus the
@@ -16,12 +16,15 @@ cap = ["dep:astream-cap"]
 # Off by default, and NOTHING IN A DEFAULT ATERM BUILD TURNS IT ON: the sealed
 # TCP transport (serve_tcp_sealed / Client::connect_tcp_sealed). aterm-link
 # re-exports it as its own off-by-default `sealed` feature, which its cross-host
-# test enables. `handshake`, `identity`, `at-rest` and `anti-rollback` are NOT
-# vendored — each adds a curve and nothing on aterm's side reaches them.
+# test enables.
 aead = ["dep:astream-aead"]
-# Declared because the SOURCE references them in `cfg(feature = ...)`; nothing in
-# aterm enables any of them, and each would add a curve. Kept verbatim from
-# upstream so a re-sync is a copy, not a reconciliation.
+# The four below are DECLARED AND FUNCTIONAL — their source is vendored and
+# pinned in UPSTREAM.toml — but no aterm feature maps to any of them, so no aterm
+# build can reach them. Kept verbatim from upstream so a re-sync is a copy, not
+# a reconciliation. Their costs differ, measured 2026-09-12 with `targo tree`:
+# `handshake` and `identity` each pull a curve (x25519-dalek; then ed25519-dalek),
+# while `at-rest` and `anti-rollback` pull NOTHING beyond the `aead` tree — they
+# are off only because nothing on aterm's side encrypts the durable log.
 handshake = ["aead", "astream-aead/handshake"]
 identity = ["handshake", "astream-aead/identity"]
 at-rest = ["aead"]

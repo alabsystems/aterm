@@ -6,7 +6,7 @@
 // WHY THIS FILE EXISTS AT ALL, and why the obvious "it's already done" is wrong:
 // `crates/aterm-gui/build.rs` has embedded `assets/aterm.rc` (`1 ICON`) since the
 // Windows port started, and `docs/NATIVE_WINDOWS_DESIGN.md` recorded it as done.
-// But `embed_resource::compile` emits `cargo:rustc-link-arg-bins`, and a build
+// But the resource step emits `cargo:rustc-link-arg-bins`, and a build
 // script's link args reach only the bin targets of ITS OWN package — i.e.
 // `aterm-gui.exe`, which nobody ships. The binary that ships is this crate's
 // `[[bin]] name = "aterm"` (install.ps1 hardlinks all seven CLI names onto that
@@ -31,21 +31,24 @@
 //
 // FAILURE POSTURE: warn loudly, never break the build. A machine with a Rust
 // toolchain but no resource compiler must still be able to build aterm — that is
-// why `embed-resource` is used with `manifest_optional()` semantics. But the
+// why a missing resource compiler is a warning, never an error. But the
 // SILENT half of that posture is exactly how the missing icon shipped for
-// months, so every non-Ok outcome (including `NotAttempted`, which
-// `manifest_optional()` maps to `Ok(())` and says nothing about) prints a
-// multi-line banner naming the user-visible consequence, and
+// months, so every outcome that is not `Linked` prints a multi-line banner
+// naming the user-visible consequence (`aterm_winres::Outcome` has no silent
+// variant — the step is first-party since 2026-09-14, and that crate's root
+// says why `embed-resource` left: its msvc-only `vswhom` chain reached
+// `libc::wchar_t`/`wcslen`, which the first-party libc does not declare on
+// Windows, so the native msvc build failed closed), and
 // `ATERM_REQUIRE_WIN_RESOURCES=1` turns the whole thing into a hard error for
 // release cutters and CI.
 //
 // Off Windows this file returns on its first statement: no .rc is generated, no
 // resource compiler is invoked, and NO link arg is emitted — so a macOS or Linux
 // build produces a byte-identical binary to one built without this file. (The
-// `embed-resource` build-dependency itself is still compiled, as any host build
-// dependency is; it is the same version aterm-gui already pins, so it is already
-// in the tree and adds nothing. Its `compile()` would also return `NotWindows`
-// on its own — the early return above just means we never ask.)
+// `aterm-winres` build-dependency itself is still compiled, as any host build
+// dependency is — a few hundred lines of std-only Rust, no third-party graph
+// behind it. Its `compile()` would also return `NotWindows` on its own — the
+// early return above just means we never ask.)
 
 /// Ordinal shared by the icon and the manifest.
 ///
@@ -124,10 +127,10 @@ fn main() {
         return;
     }
 
-    // `compile()` (not `compile_for*`) targets every bin of this package, which
-    // is exactly one: `[[bin]] name = "aterm"`.
-    let outcome = embed_resource::compile(&rc_path, embed_resource::NONE);
-    if outcome == embed_resource::CompilationResult::Ok {
+    // The link arg the step emits targets every bin of this package, which is
+    // exactly one: `[[bin]] name = "aterm"`.
+    let outcome = aterm_winres::compile(&rc_path);
+    if outcome.is_linked() {
         return;
     }
     report(&outcome.to_string());
@@ -152,7 +155,7 @@ fn report(why: &str) {
         "    grey 3D dialog buttons instead of Common-Controls v6.".to_string(),
         "  fix: install a resource compiler — the Windows SDK's rc.exe (it is".to_string(),
         "    on PATH inside a VS Developer prompt / vcvars64) or LLVM's".to_string(),
-        "    llvm-rc — then rebuild.".to_string(),
+        "    llvm-rc — or point ATERM_RC at one — then rebuild.".to_string(),
         "  set ATERM_REQUIRE_WIN_RESOURCES=1 to make this a hard build error".to_string(),
         "    instead of a warning (release cuts and CI should).".to_string(),
         "-----------------------------------------------------------------".to_string(),

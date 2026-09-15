@@ -276,7 +276,8 @@
 //!   row ([`Ribbon::advance_swoosh`]): the caret on its own row, its own end
 //!   nearest the caret otherwise; the target is the caret block's LEFT
 //!   edge ([`Ribbon::retract_x`]).
-//! * **The editing hand holds the row** ([`Ribbon::hold_row`]), and an
+//! * **The editing hand holds the row** ([`Ribbon::hold_phrase`] — the
+//!   phrase WITHIN the row since Rainbow Path v3 §2.3), and an
 //!   erase whose echo lands a tick late still retracts from the retreat's
 //!   landing (`pending_erase`).
 //! * **A composer's re-anchor relays the moved word** ([`Relocate`]): Ink
@@ -293,6 +294,46 @@
 //!
 //! What the doc above still says about the fold's hold ("earlier rows stay
 //! lit while the hand is on the last one") is superseded by this section.
+//!
+//! ## 2026-09-14 — the scrub (`RAINBOW-KITTY-V2.md` §31)
+//!
+//! The owner, on the shipped v0.85.0: *"the painting system for scrubbing
+//! back and forth with back word and forward word doesn't work correctly
+//! and leaves gaps."* Measured at the host seam and on glass
+//! (`docs/measured/scrub-gaps-2026-09-14.md`, `tests/scrub_gaps.rs`): a
+//! word hop left the band's clock alone, so the swoosh ran on the last
+//! KEY's clock under the scrubbing hand and the band was mid-retract by the
+//! seventh hop; a hop of eight cells or more abandoned it outright.
+//!
+//! * **A scrub holds the band** ([`Ribbon::scrub`]). A same-row keyed move
+//!   whose corridor is lit end to end by a band that is not leaving is the
+//!   hand moving over its own text: it abandons nothing, takes nothing
+//!   over, lays nothing, and renews the crossed cohorts' clock as an erase
+//!   does. The band leaves one swoosh after the hand's last act on it.
+//!   Discarded for that move: "a real jump on the same row abandons the
+//!   band into its swoosh" and "a hop must not touch the word's clock"
+//!   (d23b4f935, 4ca68c467). A jump that LEAVES the run — past the band's
+//!   oldest cell, off its end onto dark ground, to another row — keeps
+//!   both, and a band already inside its retract keeps the leaving-band
+//!   clause. Two guards from the fix-up review: a cell already inside its
+//!   expiry melt (a hop's cold stub half a second on) is a cell already
+//!   going out, so the move over it is the hop it is and nothing snaps
+//!   back to full; and the hold reaches exactly the cohorts that OWN the
+//!   corridor's columns, never one shadowed under them (an abandoned
+//!   band's drained cells under the fresh ones a jump's wake laid in its
+//!   holes).
+//! * **The scrub predicate IS the boundary with Rainbow Path v3's overlay
+//!   wake** (merged 2026-09-14). v3 §2.7 rules that a jump lays its corridor
+//!   on an OVERLAY layer along the meteor's flight and abandons the band
+//!   beneath it; the scrub rules that the same keystroke lays nothing and
+//!   holds the band. They answer different events, and [`Ribbon::scrub`]
+//!   says which: inside the hand's own lit run is a scrub, leaving it — past
+//!   its oldest cell, off its end onto dark ground, over light already
+//!   melting, or to another row — is a jump and takes the overlay. The two
+//!   can never disagree about one move, because a move inside the run has no
+//!   dark ground for a corridor to light and no band the hand has left to
+//!   abandon; and v3's own reason for the overlay, "a leaving band is never
+//!   taken over" (R9), does not reach a band the hand never left.
 //!
 //! ## 2026-09-13 — the comet, the vivid rail and the from-the-hand attack
 //! (`RAINBOW-KITTY-V2.md` §30)
@@ -348,19 +389,19 @@ use std::mem;
 
 use aterm_time::Instant;
 
-use aterm_render::{BeamVertex, GlowBlend, RibbonVertex, comet_beam, ribbon_beam};
-
-use crate::cursor_glow::{
-    InkRole, RAINBOW_CARET_LIGHT_FLOOR, RAINBOW_SPARKLE_LIGHT_SHARE, band_pos, band_row,
+use aterm_render::{
+    BeamVertex, GlowBlend, RibbonVertex, comet_beam, over_premul, premul_rgb, ribbon_beam,
 };
+
+use crate::cursor_glow::{InkRole, band_pos, band_row};
 use crate::effect_util::lerp_rgb;
 use crate::spectrum::{spectrum, spectrum_with_min_saturation};
 
 use super::meteor::tri;
 use super::spine::{DISP_RELEASE_TAU, PHASE_RATE};
 use super::timing::{
-    EDGE_IN_S, JUMP_MIN_CELLS, REDUCED_MOTION_FADE_MS, clamp01, edge_in, smoothstep01, spend,
-    suck_in,
+    EDGE_IN_S, FLIGHT_MIN_MS, IOI_DEFAULT_MS, JUMP_MIN_CELLS, REDUCED_MOTION_FADE_MS, clamp01,
+    edge_in, flight_ms, ioi_next, kill_span_s, phrase_rest_ms, smoothstep01, spend, suck_in,
 };
 use super::{Cadence, Config, Ctx, Event, Frame, Licence, TypedClass, level_step_spend};
 
@@ -443,6 +484,21 @@ pub const HOT_EDGE_DISP_MIN: f32 = 0.15;
 /// Width of the smoothstep that fades the hot edge in over
 /// [`HOT_EDGE_DISP_MIN`] — `smoothstep((disp − 0.15)/0.30)`.
 pub const HOT_EDGE_DISP_SPAN: f32 = 0.30;
+
+/// **THE HOT EDGE'S GAIN FLOOR** (2026-09-14, the owner's notch): the share
+/// of the hairline a COLD hand gets — the first key of a word, momentum
+/// zero. Below it the hairline did not exist at all (`hot_edge_gain` was
+/// exactly zero under [`HOT_EDGE_DISP_MIN`]), so the one mark that attaches
+/// the band's top edge to the caret was absent on precisely the key the eye
+/// is on: a word's first letter had a lowered, edgeless head under a full
+/// block. The edge's EXISTENCE no longer depends on momentum; only the rest
+/// of its gain still ramps with the hand over [`HOT_EDGE_DISP_SPAN`]. Half:
+/// at the transient cap's `118 × 0.70` on the owner's intensity that is 41
+/// levels of hot ink on the top row against 83 at full momentum — present,
+/// and still visibly a speed mark when the hand is hot. A TYPED key's
+/// alone: an arrow's wake is no key, and its head keeps the momentum-only
+/// gain it always had (`hot_edge_gain`'s `typed`).
+pub const HOT_EDGE_GAIN_FLOOR: f32 = 0.5;
 
 /// How far, in `ch`, the hot edge's hairline may sit from the caret's own cell
 /// band before it stops being "the mark at the hand" and becomes a highlighter
@@ -664,26 +720,27 @@ pub const COMET_TAPER_CELLS: f32 = 12.0;
 /// `(135, 135, 255)`; at 0.20 it is `(100, 100, 255)`-ish and still blue.
 pub const RAIL_LUMA_FLOOR: f32 = 0.20;
 
-/// **THE RAIL'S CEILING — L5, THE CARET IS THE BRIGHTEST PERSISTENT THING ON
-/// GLASS.** The family gives every light that is not the caret ONE ceiling:
-/// the caret takes a luminance FLOOR ([`RAINBOW_CARET_LIGHT_FLOOR`], 80 of
-/// 255 — "it is a cursor; being findable is its job") and the sparkle field
-/// takes [`RAINBOW_SPARKLE_LIGHT_SHARE`] of it (72). The rail is a wide bed
-/// the eye rests on, lit for as long as the body is, so it sits under the
-/// same ceiling, in the same coordinate, derived from the same two numbers
-/// — a stop whose full-value colour is brighter than this is scaled DOWN
-/// through its own hue ([`rail_ink`] via [`onto_luma`], hue exact). On the
-/// default theme that is yellow at `(149, 149, 0)` — composited
-/// `(140, 140, 3)` at the bed's cap against the bed's own `(80, 80, 3)` —
-/// green at `(0, 168, 0)`, orange at `(227, 113, 0)`; red `Y 0.213` and
-/// every cold stop are inside the band already. A brighter warm rail is therefore a
-/// ruling on the caret's floor, not on this recipe (raising the floor to
-/// 120 "pales 39–68 % of the arc and turns the caret's red into a salmon",
-/// its own doc says), exactly as a brighter bed is a ruling on the bar.
-/// Pinned by `the_brightest_pixel_in_the_frame_is_under_the_cursor`
-/// (`cursor_glow`) and `the_rail_ink_table`. The band `[0.20, 0.282]` is a
-/// 1.4× spread, so the rail reads as ONE weight — the "black gaps" lesson.
-pub const RAIL_LUMA_CEIL: f32 = RAINBOW_CARET_LIGHT_FLOOR * RAINBOW_SPARKLE_LIGHT_SHARE / 255.0;
+/// **THE RAIL'S CEILING — ITS OWN, BELOW THE BASELINE** (re-ruled 2026-09-14).
+/// Until then the rail sat under L5's one non-caret ceiling — the caret's
+/// light floor ([`crate::cursor_glow::RAINBOW_CARET_LIGHT_FLOOR`] 80) times the sparkle field's
+/// share (`Y 0.282`): yellow at `(149, 149, 0)`, composited `(140, 140, 3)`,
+/// a mustard. The owner asked to SEE yellow and ruled "you can raise the
+/// light floor". Raising the FLOOR itself (150) did what its doc warned:
+/// the caret block paled to a salmon across most of the arc and the star
+/// laws that derive their ceiling from the same number went vacuous —
+/// seven pins red. So L5 is amended instead of the floor: **the caret is
+/// the brightest persistent thing IN THE GLYPH ROWS**; the rail lives below
+/// the row bottom, never under a letter, and takes its own ceiling. At
+/// `Y 0.54` yellow's ink is `(200, 200, 0)`, composited `≈ (190, 190, 3)` at
+/// the bed's cap — a yellow that reads as yellow — and every stop brighter
+/// than the ceiling (yellow, green, cyan-ish crossing, orange) is scaled
+/// DOWN through its own hue ([`rail_ink`] via [`onto_luma`], hue exact),
+/// so the rail reads as ONE weight, the "black gaps" lesson. Pinned by
+/// `the_rail_is_yellow_below_the_row_bottom_and_the_glyph_box_stays_at_the_bar`
+/// and `the_rail_ink_table`; the caret's own pin
+/// (`the_brightest_pixel_in_the_frame_is_under_the_cursor`) now reads the
+/// glyph rows, where the caret still wins.
+pub const RAIL_LUMA_CEIL: f32 = 0.54;
 
 const _: () = assert!(
     RAIL_LUMA_FLOOR < RAIL_LUMA_CEIL,
@@ -742,6 +799,29 @@ pub const UNDER_COV_CAP: f32 = 236.0;
 /// about half coverage up, and a claim made under that would be a claim the
 /// pixels cannot honour.
 pub const STATUS_LIT_COV: u8 = (UNDER_COV_CAP / 2.0) as u8;
+
+/// **THE PAINT SCANNER'S COLOUR FLOOR**, the pair the glass census reads a
+/// pixel as band ink by: brightest channel at or over [`SCAN_INK_MAX`] AND a
+/// channel spread at or over [`SCAN_INK_SPREAD`]. [`STATUS_LIT_COV`] is this
+/// floor solved ONCE for the arc's dimmest stop and then applied to every
+/// stop; [`reads_as_ink`] applies it to each stop's own composite, which is
+/// the difference between a bound and a fact.
+pub const SCAN_INK_MAX: u32 = 60;
+
+/// …and the spread half of it — see [`SCAN_INK_MAX`].
+pub const SCAN_INK_SPREAD: u32 = 40;
+
+/// Whether a COMPOSITED `0x00RRGGBB` pixel reads as band ink to the glass
+/// census ([`SCAN_INK_MAX`] / [`SCAN_INK_SPREAD`]) — the predicate
+/// [`Ribbon::ink_segments`] answers "is this boundary on the glass" with,
+/// per stop, instead of against the whole arc's worst case.
+#[must_use]
+pub fn reads_as_ink(rgb: u32) -> bool {
+    let (r, g, b) = ((rgb >> 16) & 0xff, (rgb >> 8) & 0xff, rgb & 0xff);
+    let mx = r.max(g).max(b);
+    let mn = r.min(g).min(b);
+    mx >= SCAN_INK_MAX && mx - mn >= SCAN_INK_SPREAD
+}
 
 /// The LEDGER'S FRAME TOP (§3.4): the level a `glow_under` pixel may reach
 /// once every stream on it has been priced. The bed's own request stops at
@@ -944,19 +1024,30 @@ pub const WAKE_MAX_CELLS: u16 = 32;
 /// Long enough to read as an after-effect and short enough that a Ctrl-A /
 /// Ctrl-E ping-pong cannot accumulate. FIXED, not [`Ribbon::cell_life`] — a
 /// jump must not inherit the four-letter chain law, nor its 1.70 s swoosh
-/// floor ([`SWOOSH_LIFE_S`]). The wake's cohort is never held by a later
-/// jump (each jump abandons what came before it), so the pool holds at most
-/// `WAKE_LIFE_S / jump period` wakes, and the pinned ping-pong empties
-/// within one wake life of its last key.
+/// floor ([`SWOOSH_LIFE_S`]). A later JUMP never holds the wake's cohort
+/// (each jump abandons what came before it), so the pool holds at most
+/// `WAKE_LIFE_S / jump period` wakes. A later keyed move that is a SCRUB
+/// over the wake ([`Ribbon::scrub`], 2026-09-14) — its corridor lit end to
+/// end by the wake's own live cells, none yet inside its expiry melt — does
+/// hold it, as it holds any cohort that owns the ground the hand crosses:
+/// one cohort, no new cells, renewed for as long as the hand scrubs it.
+/// A stub past its melt opening is never held, so the pinned ping-pong over
+/// dark ground still empties within one wake life of its last key.
 pub const WAKE_LIFE_S: f32 = 1.10;
 
-/// A NEW wake cell is born this far past the landing, so it fades up UNDER a
-/// train that is still bright: the eye sees ONE gesture leaving light
-/// behind, not two marks racing. Until it is born the cell is DARK
-/// ([`Ribbon::env_of`]'s first line) — the attack starts at `born`, never
-/// before it. A cell taken over from the live band keeps its own birth: a
-/// hand-off has no attack, and no dip.
-pub const WAKE_BORN_LAG_S: f32 = 0.10;
+// **THE WAKE IS BORN ALONG THE FLIGHT** (2026-09-13, Rainbow Path v3 §2.7,
+// law K3). Corridor cell `j` of `n`, counted from the ORIGIN, is born at
+// `t0 + T · j / n` with `T = flight_ms(cells)` — the arrival edge that
+// already times the meteor head, the bell, the kitty's `land_at` and the
+// pin — so the corridor is dark ahead of the meteor and lit behind it, and
+// its far end is lit by `T ≤ 120 ms` (R10, < 200 ms). Until it is born a
+// cell is DARK ([`Ribbon::env_of`]'s first line) — the attack starts at
+// `born`, never before it. A hop (under [`JUMP_MIN_CELLS`]) takes
+// [`FLIGHT_MIN_MS`]. This replaces `WAKE_BORN_LAG_S` 0.10, one lag for
+// every cell of the corridor whatever its length: on glass the cells beside
+// the landing came up a whole frame after the landing's own starburst (the
+// refresh's "birth gap", cols 38–41 dark at +103 ms). There is no constant:
+// the clock is [`flight_ms`]'s.
 
 /// A same-row hop under [`JUMP_MIN_CELLS`] — an arrow key — lays its wake at
 /// this share of [`WAKE_LIFE_S`]: holding an arrow paints rainbow behind the
@@ -971,9 +1062,19 @@ pub const WAKE_HOP_LIFE_SHARE: f32 = 0.5;
 /// Cells the four-letter guarantee reaches for.
 pub const FOUR_LETTER_CELLS: u16 = 4;
 
-/// FINGER-LIFT ARC: no typing key for this long and the ribbon begins its exit
-/// swoosh — finish reaching four letters, then retract into the caret.
-pub const LIFT_GRACE_S: f32 = 0.75;
+/// **THE PHRASE REST'S FLOOR**, seconds — the least grace a cohort keeps
+/// after the last key of its phrase before the exit swoosh begins (finish
+/// reaching four letters, then retract into the caret). Derived from the
+/// melody's own rest ([`super::timing::PHRASE_PAUSE_MS`], 900 ms) since
+/// 2026-09-13 (Rainbow Path v3 §2.6, S5): the song and the light let go of
+/// a phrase on the same instant. A cohort's ACTUAL grace is
+/// [`Cohort::grace_s`] — [`super::timing::phrase_rest_ms`] of the hand's
+/// tempo at its last key, `max(0.90, 2.5 · ioi)` — so a slow hand's line
+/// does not start leaving between two of its own keys; this floor is what
+/// the derived totals below are stated at. (Was `LIFT_GRACE_S` 0.75, a
+/// literal of its own: the audit measured the after-glow 931–1201 ms after
+/// the last key against a law that promised more.)
+pub const PHRASE_REST_MIN_S: f32 = super::timing::PHRASE_PAUSE_MS as f32 / 1000.0;
 
 /// One extension cell lights per this step while the swoosh finishes REACHING
 /// four letters.
@@ -997,51 +1098,227 @@ pub const RETRACT_DUR_S: f32 = 0.40;
 /// ending in a cliff.
 pub const RETRACT_FADE_S: f32 = 0.24;
 
-/// The KILL's retract span (§8.2): a kill of `cells` drains its suffix
-/// farthest-first over `12·n + 240` ms. The insert's rewrite (§27) reuses it
-/// verbatim — one law, so a change to the kill's stagger cannot desynchronise
-/// the rewrite. `stardust` names the same schedule for its field
-/// (`FIELD_RETRACT_BASE_MS` / `FIELD_RETRACT_PER_CELL_MS`).
-#[must_use]
-pub fn kill_span_s(cells: u16) -> f32 {
-    0.012 * f32::from(cells) + 0.240
-}
+// MERGE, 0.86: the KILL's retract span used to be a literal `0.012·n + 0.240`
+// here. Upstream gave the schedule ONE home in `timing.rs` — where the base
+// and the per-cell term are named constants the sky reads too — and this
+// module now imports [`kill_span_s`] from there. Upstream's home wins: its
+// doc states everything this copy did (§8.2, the insert's rewrite reusing it
+// verbatim, stardust's field sharing it) and it keeps the same operation
+// order, `per_cell · cells + base`, so the retract is bit-identical.
 
-/// The whole exit swoosh: `0.75 grace + 3 × 0.05 reach + 0.40 retract +
-/// 0.24 fade` = 1.54 s (§4, verbatim).
-pub const SWOOSH_TOTAL_S: f32 =
-    LIFT_GRACE_S + REACH_STEP_S * REACH_BEATS as f32 + RETRACT_DUR_S + RETRACT_FADE_S;
+/// The exit swoosh past the grace: `3 × 0.05 reach + 0.40 retract + 0.24
+/// fade` = 0.79 s. The whole swoosh is `grace + 0.79 s` — [`swoosh_total_s`]
+/// of the cohort's own grace.
+pub const SWOOSH_AFTER_GRACE_S: f32 =
+    REACH_STEP_S * REACH_BEATS as f32 + RETRACT_DUR_S + RETRACT_FADE_S;
 
-/// Floor on a cell's life so the exit swoosh always terminates the ribbon
-/// before the natural melt can — **the swoosh IS the ending, never a passive
-/// dim-out.**
-pub const SWOOSH_LIFE_S: f32 = 1.70;
+/// The whole exit swoosh AT THE FLOOR GRACE: `0.90 grace + 0.79` = 1.69 s.
+/// The least after-glow a phrase leaves; a cohort's own is
+/// [`Cohort::swoosh_total`]. (Was two literals, 1.54 and a 1.70 life floor;
+/// both are DERIVED now, §2.6.)
+///
+/// MERGE, 0.86: this DERIVATION supersedes main's `LIFT_GRACE_S + …` = 1.54 s
+/// literal, and the merge does not let the literal back. The grace is the
+/// melody's phrase rest (Rainbow Path v3 §2.6 step 5): `PHRASE_REST_MIN_S`
+/// 0.90 s at the floor and tempo-scaled above it, so a slower hand gets a
+/// longer after-glow instead of one 0.75 s number for every tempo. At the
+/// floor that is +150 ms of after-glow against main's form — the difference
+/// of the two constants and nothing softer, `0.90 + 0.79` against
+/// `0.75 + 0.79`. `LIFT_GRACE_S` no longer exists to be added, so main's
+/// form would not even compile here.
+pub const SWOOSH_TOTAL_S: f32 = PHRASE_REST_MIN_S + SWOOSH_AFTER_GRACE_S;
 
-/// The swoosh's own offset of its RETRACT: grace plus the three reach beats,
-/// the idle at which a cohort starts moving into the caret. A real jump
-/// ABANDONS the band by rewinding its cohorts' `alive_at` to exactly this far
-/// back, so the mark goes out through the retract + fade it would have taken
+/// The margin a cell's life keeps past its swoosh, so the swoosh always
+/// terminates the ribbon before the natural melt can — **the swoosh IS the
+/// ending, never a passive dim-out.** A cell's life floor is
+/// [`swoosh_life_s`] of the rest its phrase was priced at when it was laid,
+/// and every key that holds the phrase re-floors the phrase's cells
+/// ([`Ribbon::place`]), so a rest that lengthens under a slowing hand can
+/// never outlive the cells it is holding.
+pub const SWOOSH_LIFE_MARGIN_S: f32 = 0.01;
+
+/// The life floor at the floor grace, 1.70 s — the number the chain law and
+/// the frame-cost gate were measured against.
+pub const SWOOSH_LIFE_S: f32 = SWOOSH_TOTAL_S + SWOOSH_LIFE_MARGIN_S;
+
+/// The swoosh's own offset of its RETRACT at the floor grace: grace plus the
+/// three reach beats, the idle at which a cohort starts moving into the
+/// caret; a cohort's own is [`Cohort::retract_start`]. A real jump ABANDONS
+/// the band by rewinding its cohorts' `alive_at` to exactly this far back,
+/// so the mark goes out through the retract + fade it would have taken
 /// anyway (`0.40 + 0.24 s`), starting from the light it has NOW — never a
 /// step (v1's own note: clamping `life` steps too, because the melt rides
 /// `age / life`).
-pub const RETRACT_START_S: f32 = LIFT_GRACE_S + REACH_STEP_S * REACH_BEATS as f32;
+pub const RETRACT_START_S: f32 = retract_start_s(PHRASE_REST_MIN_S);
+
+/// The idle at which a cohort of grace `grace_s` starts its retract.
+#[inline]
+#[must_use]
+pub const fn retract_start_s(grace_s: f32) -> f32 {
+    grace_s + REACH_STEP_S * REACH_BEATS as f32
+}
+
+/// The whole swoosh of a cohort of grace `grace_s`.
+#[inline]
+#[must_use]
+pub const fn swoosh_total_s(grace_s: f32) -> f32 {
+    grace_s + SWOOSH_AFTER_GRACE_S
+}
+
+/// The life floor of a cell whose phrase rests `grace_s`.
+#[inline]
+#[must_use]
+pub const fn swoosh_life_s(grace_s: f32) -> f32 {
+    swoosh_total_s(grace_s) + SWOOSH_LIFE_MARGIN_S
+}
 
 /// Focus loss embers the ribbon out over this long on `spend` (§8.2). Nothing
 /// sounds, and nothing is retracted — the mark simply stops being lit.
 pub const FOCUS_EMBER_S: f32 = 0.30;
 
+/// **A STOP IS STILL ON THE GLASS** while its composited pixel is still a
+/// COLOUR the eye can pick out of the ground: [`SEEN_CONTRAST`] of contrast
+/// against the theme's own background in the channel that carries it, and at
+/// least this much channel SPREAD, so what is left is a hue and not a grey
+/// wash.
+///
+/// The SPREAD is a property of the PIXEL alone — a chroma, in bytes — so it
+/// already says the same thing over any ground, and it is the paint census's
+/// own `max - min >= 40` unchanged. The LEVEL is the half that has to be
+/// said against the ground, and it is said in [`SEEN_CONTRAST`].
+pub const SEEN_SPREAD: f32 = 40.0;
+
+/// **THE LEVEL HALF OF [`SEEN_SPREAD`], AS A RATIO AND NOT A BYTE COUNT** —
+/// the WCAG contrast the composite must stand from the ground in its
+/// furthest channel (`channel_contrast`) to be a mark at all.
+///
+/// **It replaces an absolute 24-byte lift, refuted on glass the same day it
+/// shipped (2026-09-14).** A byte lift is not one statement: 24 bytes off
+/// Nord's `#2E3440` is a composite peaking at 71..90, comfortably over the
+/// paint census's own colour floor (`ribscan` calls a pixel painted at
+/// `max(r, g, b) >= 60 && max - min >= 40`), while 24 bytes off the SHIPPED
+/// default `#111318` is a composite peaking at 50..59 — UNDER it, for all
+/// 24 stops of the arc. The same constant that took Nord to zero dark runs
+/// therefore took the default theme's ember to 8 frames of 30 carrying a
+/// run of up to 33 dark cells: the band exited at a level that STRADDLES
+/// the instrument's line, and which cells fell on which side of it was left
+/// to the blur. It is the same defect on five of the eight dark themes that
+/// ship (default, Solarized Dark, Tokyo Night, Catppuccin Mocha, One Dark);
+/// Nord is one of the three it happens to miss.
+///
+/// **A RATIO is one statement.** On `#111318` the census's own 60 is 1.71:1
+/// in the red channel (1.68 green, 1.61 blue); `1.90` is that line plus the
+/// margin a byte of rounding, the ink table's 1/128th sampling and the
+/// emitter's own quantisation need. It puts every stop of every shipped
+/// theme out at a composite the census still calls paint — peaking at 69..75
+/// on the default ground and 86..109 on Nord — with no theme in between
+/// where the exit can straddle the line. On a light theme it is the same
+/// sentence read in the paper's polarity: the mark stands that far BELOW
+/// the ground instead of above it.
+///
+/// It cannot lift a stop the bed's own bar already leaves under the census
+/// (Solarized Dark's foreground puts 13 of the 24 stops under it at FULL
+/// coverage, before any ember): there the floor lands over the cell's whole
+/// coverage and the stop simply HOLDS until the pool clears, which is the
+/// most a fade can do for a stop that has no room to fade.
+pub const SEEN_CONTRAST: f32 = 1.90;
+
+/// **THE EMBER'S PER-STOP FLOOR, in that stop's own extinction units** — the
+/// coverage the focus ember leaves a stop at, [`BedInkLut::seen_floor_at`]
+/// times this, just far enough over the colour floor that no rounding of the
+/// alpha byte and no error in the table's own sampling can take one stop
+/// under it while its neighbours are still lit.
+///
+/// It is deliberately SMALL. The band's disappearance is the ember's end —
+/// `Ribbon::retire`'s one clear of the pool, the single global decision in
+/// the whole seam — and the band should reach that instant as dim as the
+/// census's colour floor allows, so what the eye sees is a band that has
+/// dimmed to almost nothing and then stops, rather than a band cut off while
+/// it still has light. A LOWER floor cannot buy more: below it a stop is not
+/// on the glass at all, and taking the stops under it one at a time is the
+/// dark run this whole mechanism exists to forbid.
+pub const EMBER_FLOOR_MARGIN: f32 = 1.05;
+
+/// **THE CURTAIN** (2026-09-13, Rainbow Path v3 §2.8, law A2; D-2, D-3):
+/// at a coordinate-space seam the host cannot carry the cells across — the
+/// alternate screen, a tab or terminal switch, a resize with no reflow map,
+/// a content invalidation — every cohort is drawn into the hand it last
+/// stood under over this long on `suck-in` and spent on `spend`,
+/// FARTHEST-FIRST ([`CURTAIN_STAGGER_S`]), and nothing is laid until it is
+/// over. The retract's own fade
+/// ([`RETRACT_FADE_S`]), so the eye reads the one exit it knows. Where the
+/// old law was `reset()` — 15–18 lit cells → 0 in one 17 ms frame (audit
+/// s8, the refresh's s19, s7) — this is at least three captured frames at
+/// 30 fps and never a frame where the count drops from > 4 to 0.
+pub const CURTAIN_S: f32 = RETRACT_FADE_S;
+
+/// **THE CURTAIN IS STAGGERED, FARTHEST-FIRST** (2026-09-14): the window of
+/// `CURTAIN_S` over which the cells START spending, in [`Cohort::drain_rank`]
+/// order — the end farthest from the hand at `0`, the cell under the hand at
+/// `CURTAIN_STAGGER_S`. The retract this curtain imitates is staggered
+/// (`RETRACT_DUR_S` of starts, then [`RETRACT_FADE_S`] of spend each), and a
+/// curtain that put every cell on ONE clock did not gather the band in — it
+/// dropped the whole band at once: measured on glass at every band age swept
+/// (last key +40 ms through +1040 ms), `ribbon_segments` fell 19 → 0 in a
+/// SINGLE frame, which is the cliff `CURTAIN_S`'s own doc comment forbids.
+/// The natural retract never steps more than 6.
+///
+/// **THE RETRACT'S OWN RATIO**, on the curtain's own budget: the retract
+/// spends `RETRACT_DUR_S` of starts and then `RETRACT_FADE_S` per cell, so
+/// `RETRACT_DUR_S / (RETRACT_DUR_S + RETRACT_FADE_S)` of its span is
+/// stagger. The curtain takes that fraction of `CURTAIN_S`, which keeps the
+/// whole fall inside 0.24 s — the number the design, the doc comments and
+/// the CHANGELOG all state — while giving the count the retract's shape.
+///
+/// A band of `n` boundaries then loses about `n · frame / CURTAIN_STAGGER_S`
+/// per frame — 22 % of it at 30 fps, 11 % at 60 — instead of all of it at
+/// once. See [`CURTAIN_MAX_STEP_FRAC`].
+pub const CURTAIN_STAGGER_S: f32 = CURTAIN_S * (RETRACT_DUR_S / (RETRACT_DUR_S + RETRACT_FADE_S));
+
+/// What each cell of a falling curtain spends over, once its
+/// [`CURTAIN_STAGGER_S`] turn has come — the remainder, so the LAST cell to
+/// start (the one under the hand) reaches exactly zero at `CURTAIN_S`.
+pub const CURTAIN_SPEND_S: f32 = CURTAIN_S - CURTAIN_STAGGER_S;
+
+/// **THE CLIFF BOUND** the curtain's law is stated against: the most of the
+/// band ONE 33 ms frame may take while a curtain runs, as a fraction of what
+/// was lit when the curtain fell — measured in the quantity `trail status`
+/// and the glass census actually read (`ribbon_segments`, and
+/// [`Ribbon::ink_segments`]'s per-stop count beside it), never in a
+/// geometric predicate that scores alpha 1 and alpha 236 alike.
+///
+/// Stated as a FRACTION because the quantity is scale-dependent:
+/// `slabs_per_cell` is 3, 2 or 1 as the budget and the momentum move, so the
+/// same band is 58 boundaries in the twin's fixture and 19 on the owner's
+/// glass. The arithmetic above gives 22 % at 30 fps; the headroom is for the
+/// bunching a discrete count shows. A curtain on ONE clock takes 100 % in a
+/// single frame, which is what this refutes.
+pub const CURTAIN_MAX_STEP_FRAC: f32 = 0.34;
+
+/// …and the other half of the same law: a curtain must be seen to FALL.
+/// At 30 fps at least this many frames carry band ink between the seam and
+/// darkness — `reset()`'s one frame, and a one-clock curtain's two, are
+/// both under it.
+pub const CURTAIN_MIN_FRAMES: usize = 5;
+
 /// **THE CONTENT RETIREMENT'S MELT** (2026-09-12, the abandoned band): a
-/// cell the host has SEEN lose its glyph — overwritten by a re-laid input
-/// box, blanked by an erase that put nothing back, left on a row the caret
-/// was observed to leave with no licence behind the move — goes out over
-/// this long on the retract's own `spend` law ([`Ribbon::retire_cells`]).
-/// Short, because the light has no glyph under it any more and the module's
-/// yardstick is "no light with no keystroke behind it": the eye must read
-/// it as the mark following the text away, not as a mark lingering where
-/// text used to be. Well under the 150 ms the owner's "stray rainbows"
-/// ruling allows, and half the retract's own fade, so a witness that fires
-/// on the frame a box relocates has the old band dark before the hand's
-/// next key echoes.
+/// cell the host has SEEN its glyph REPLACED under — overwritten by a
+/// re-laid input box, or blanked while the same text stands on another
+/// row, the box re-laid elsewhere — goes out over this long on the
+/// retract's own `spend` law ([`Ribbon::retire_cells`]). Short, because
+/// the light is sitting under the wrong letters, or beside the text it was
+/// laid under, and the module's yardstick is "no light with no keystroke
+/// behind it": the eye must read it as the mark following the text away,
+/// not as a mark lingering where text used to be. Well under the 150 ms
+/// the owner's "stray rainbows" ruling allows, and half the retract's own
+/// fade, so a witness that fires on the frame a box relocates has the old
+/// band dark before the hand's next key echoes.
+///
+/// NOT the clock for a glyph that merely WENT (2026-09-14, the new line's
+/// fade): a band whose text was erased and not replaced — a submit, a
+/// Ctrl-U — has nothing to be wrong over, and this cut read as "the
+/// contrail disappeared". It is released to the swoosh's retract instead
+/// ([`Ribbon::release_cells`]).
 pub const RETIRE_MELT_S: f32 = 0.12;
 
 /// The share of a cell's life over which the expiry melt runs (v1's
@@ -1058,6 +1335,19 @@ pub const EXPIRY_MELT_GAMMA: f32 = 1.6;
 /// full across the tail cell (v1's `RAINBOW_RUN_TAIL_EASE`): the band's oldest
 /// edge reads as a full slab easing out through a feather, never as a chopped
 /// stub.
+///
+/// **WHERE IT APPLIES (2026-09-14, the owner's slivers).** At EVERY boundary
+/// the younger side's light enters at this share and the boundary takes the
+/// brighter of the two sides — `max(older side, younger side × ease)`, the
+/// older side being the tail side of the run's stream ([`Run::stream_dir`]:
+/// the left for a typed run). Where the older side is a live cell at full
+/// light the boundary is that light and the ease never shows; where it is
+/// absent the boundary is the feather; where it is a cell that is LEAVING
+/// the feather grows in exactly as fast as that cell's light goes. Before
+/// this the ease was a flat tenth at the first boundary of every RUN — and a
+/// run is one cohort, so a wake laid beside a word, or a word whose earlier
+/// cells a composer's re-anchor had drained, printed a dark column and a
+/// step INSIDE a continuous band on the very frame its neighbour retired.
 pub const RUN_TAIL_EASE: f32 = 0.10;
 
 // ===========================================================================
@@ -1080,6 +1370,25 @@ pub fn live_since(cohorts: &[Cohort], cell: &Cell) -> Instant {
         .iter()
         .find(|c| c.id == cell.cohort)
         .map_or(cell.born, |c| cell.born.max(c.alive_at))
+}
+
+/// **WHICH LAYER A CELL IS ON** (Rainbow Path v3 §2.3, law K1). Typed and
+/// insert lays write `Base`; a wake — a jump's corridor, a hop's short trail
+/// — writes ONLY `Over` and never touches a `Base` cohort's cells or clocks:
+/// "a leaving band is never taken over" is literal, the wake does not
+/// address the band at all. Composition is per position: a born `Over`
+/// cell is what the geometry draws where one exists ([`Ribbon::build`]),
+/// the `Base` cell beneath it otherwise — and because the wake shares the
+/// band's walk origin (R9, [`Ribbon::wake_origin`]) the two carry the same
+/// colour at the same column, so an overlay over a draining band reads as
+/// one continuous corridor and never a hole.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum Layer {
+    /// A typed key's, an insert's, or the swoosh's reach's cell.
+    #[default]
+    Base,
+    /// A wake's cell — a jump's corridor or a hop's trail.
+    Over,
 }
 
 /// One LAID RIBBON CELL — the atom of the field (v1's `spark`, ported).
@@ -1134,12 +1443,14 @@ pub struct Cell {
     /// simply living. The exit swoosh drives the whole COHORT instead, because
     /// it retracts the mark as one object.
     pub retract_at: Option<Instant>,
-    /// Set when the cell has been RETIRED by content ([`Ribbon::retire_cells`],
-    /// [`Ribbon::retire_row`]): the glyph it was laid under has changed, gone,
-    /// or been left behind by an unlicensed caret relocation. The cell spends
-    /// to exactly zero over [`RETIRE_MELT_S`] from this stamp and leaves the
-    /// pool; its attack is frozen at the stamp so it can never brighten after
-    /// it. `None` while the cell is simply living. Distinct from
+    /// Set when the cell has been RETIRED by content ([`Ribbon::retire_cells`]):
+    /// the glyph it was laid under has been REPLACED by another, so the light
+    /// sits under the wrong letters. The cell spends to exactly zero over
+    /// [`RETIRE_MELT_S`] from this stamp and leaves the pool; its attack is
+    /// frozen at the stamp so it can never brighten after it. `None` while
+    /// the cell is simply living — and `None` for a cell whose glyph merely
+    /// WENT ([`Ribbon::release_cells`]): that cell leaves with its cohort
+    /// through the swoosh's retract, unstamped. Distinct from
     /// [`Cell::retract_at`] so the Backspace goldens stay byte-identical.
     pub retire_at: Option<Instant>,
     /// The `Spine::birth_disp` this cell was priced at — the number behind
@@ -1154,6 +1465,20 @@ pub struct Cell {
     /// re-read from the live spine (the same law as [`Cell::cov0`]: shape may
     /// follow the spine, light and reach may not).
     pub edge_cells: f32,
+    /// Which layer this cell is on — see [`Layer`].
+    pub layer: Layer,
+    /// **RE-ARMED FROM A LEVEL** (Rainbow Path v3 §2.6, law M1 — monotone
+    /// re-wetting): `(when, level)`. Set when a cell's light continues
+    /// another's — a wake cell born over a live band cell at the band's own
+    /// level, or a corridor cell RE-OWNED by a later jump from the level it
+    /// had — and read by [`Ribbon::env_of`] in place of the birth attack:
+    /// the envelope starts at exactly `level` at `when` and rises to full
+    /// through the one sanctioned attack, `edge-in`. It rises, never steps,
+    /// and is never held at a partial level for longer than `EDGE_IN_S` —
+    /// which is what the old takeover broke when it baked a half-melted
+    /// cell's level into `cov0` (R6's frozen ramp). `None` for a cell born
+    /// from dark on the ordinary attack.
+    pub rearm: Option<(Instant, f32)>,
 }
 
 impl Cell {
@@ -1220,10 +1545,13 @@ pub struct Cohort {
     /// is being laid, not wait for the next finger-lift.
     pub abandoned: bool,
     /// Minted by a wake ([`Ribbon::wake`]) and never typed into. A HOP's
-    /// new cells join only such a cohort, or mint one — so an arrow beside a
-    /// live word touches neither the word's clock nor its bounds (its cells
-    /// it leaves exactly as they are) — and a typed key laid into a wake
-    /// cohort clears the flag: the hand is on it now.
+    /// new cells join only such a cohort, or mint one — so an arrow beside
+    /// a live word over blank ground touches neither the word's clock nor
+    /// its bounds (its cells it leaves exactly as they are) — and a typed
+    /// key laid into a wake cohort clears the flag: the hand is on it now.
+    /// An arrow OVER the word — every crossed cell lit — is a scrub
+    /// ([`Ribbon::scrub`], 2026-09-14): it lays no wake at all and holds
+    /// the word's clock, the hand being on it.
     pub wake: bool,
     /// The caret column the retract pulls this cohort toward, captured the
     /// frame it entered its retract ([`Ribbon::advance_swoosh`]) and held
@@ -1233,6 +1561,13 @@ pub struct Cohort {
     /// frame a Ctrl-A landed while it was half-way into its old spot (13
     /// cells at 1.25 s idle), which is the step "smooth transitions" forbids.
     pub retract_col: Option<u16>,
+    /// **WHICH END DRAINS FIRST** once the retract owns the mark, frozen
+    /// beside [`Cohort::retract_col`] (§2.6, per-row drain order): `false`
+    /// — the left end first, farthest from a head at the right — for the
+    /// caret's own row and a row ABOVE it; `true` — the right end first —
+    /// for a row BELOW the caret, whose logical-farthest cell is its right
+    /// end. The band always drains away from the hand.
+    pub drain_right_first: bool,
     /// Where the cohort is in the exit choreography.
     pub phase: Phase,
     /// An abandon the HAND did not make — a program's caret round trip, or
@@ -1240,9 +1575,71 @@ pub struct Cohort {
     /// this cohort takes back ([`Ribbon::join_cohort`], 2026-09-13). A jump
     /// the hand made (Nav, Return) is not rejoinable: it meant to leave.
     pub rejoinable: bool,
+    /// **THE PHRASE THIS COHORT BELONGS TO** (Rainbow Path v3 §2.3, S6):
+    /// the Score's unit — opened by the first typed key after a rest or
+    /// after a Return / a line kill, closed by the next. Every cohort minted
+    /// or joined by a typed lay while phrase `P` is open belongs to `P`; a
+    /// wrap fold's new-row cohort belongs to `P`; a typing lay into a cohort
+    /// of a CLOSED phrase (the hand paused past the rest and resumed on the
+    /// same line) re-assigns it to the open phrase. `0` for a cohort no
+    /// phrase holds — a wake's. ONE FINGER holds ONE PHRASE
+    /// ([`Ribbon::place`]): a key refreshes the cohorts of the open phrase
+    /// that are ON THE HAND'S ROW, and no other (the merged row clause,
+    /// 2026-09-14 — see [`Ribbon::place`]).
+    pub phrase: u32,
+    /// **THE GRACE THIS COHORT'S SWOOSH KEEPS**, seconds — the phrase rest
+    /// ([`super::timing::phrase_rest_ms`]) at the hand's tempo when the
+    /// cohort was last held; [`PHRASE_REST_MIN_S`] at the floor. The idle
+    /// after `alive_at` at which the reach begins; the retract begins at
+    /// [`Cohort::retract_start`] and the swoosh is over at
+    /// [`Cohort::swoosh_total`].
+    pub grace_s: f32,
+    /// A content-only release may be undone when the same complete cell
+    /// identities and glyphs return. A later abandon/retirement revokes it.
+    release_clock: Option<ReleaseClock>,
+}
+
+#[derive(Clone, Copy, Debug)]
+struct ReleaseClock {
+    alive_at: Instant,
+    retract_col: Option<u16>,
+    phase: Phase,
+    rejoinable: bool,
+    cells: usize,
 }
 
 impl Cohort {
+    /// The idle at which this cohort's retract begins: its grace plus the
+    /// three reach beats.
+    #[inline]
+    #[must_use]
+    pub fn retract_start(&self) -> f32 {
+        retract_start_s(self.grace_s)
+    }
+
+    /// The idle at which this cohort's swoosh is over.
+    #[inline]
+    #[must_use]
+    pub fn swoosh_total(&self) -> f32 {
+        swoosh_total_s(self.grace_s)
+    }
+
+    /// **THE DRAIN RANK OF A COLUMN**, `0..=1` — how early in the retract
+    /// the cell at `col` starts spending: `1` first (the end farthest from
+    /// the hand in logical order), `0` last (the end nearest it). Read by
+    /// the envelope and the cadence from the frozen
+    /// [`Cohort::drain_right_first`], so the order cannot flip mid-drain.
+    #[inline]
+    #[must_use]
+    pub fn drain_rank(&self, col: u16) -> f32 {
+        let span = f32::from(self.col1.saturating_sub(self.col0)).max(1.0);
+        if self.drain_right_first {
+            f32::from(col.saturating_sub(self.col0)) / span
+        } else {
+            f32::from(self.col1.saturating_sub(1).saturating_sub(col)) / span
+        }
+    }
+
     /// **THE FIELD AT A COLUMN OF THIS COHORT** (C2): the classic walk read
     /// from the immutable origin, so it is the same number however the cell
     /// came to be laid — typed, retyped after a backspace, or reached by the
@@ -1272,24 +1669,30 @@ pub enum Phase {
 }
 
 impl Phase {
-    /// The phase a cohort is in `idle` seconds after its last live cell.
-    /// `None` once the swoosh has finished and the cohort is over.
+    /// The phase a cohort of grace `grace_s` ([`Cohort::grace_s`]) is in
+    /// `idle_s` seconds after its last live key. `None` once the swoosh has
+    /// finished and the cohort is over.
     #[must_use]
-    pub fn at(idle_s: f32) -> Option<Self> {
-        const REACH_END: f32 = LIFT_GRACE_S + REACH_STEP_S * REACH_BEATS as f32;
-        const RETRACT_END: f32 = REACH_END + RETRACT_DUR_S;
+    pub fn at(idle_s: f32, grace_s: f32) -> Option<Self> {
+        let grace = if grace_s.is_finite() {
+            grace_s.max(PHRASE_REST_MIN_S)
+        } else {
+            PHRASE_REST_MIN_S
+        };
+        let reach_end = retract_start_s(grace);
+        let retract_end = reach_end + RETRACT_DUR_S;
         if idle_s.is_nan() || idle_s <= 0.0 {
             // NaN-refusing spelling: a non-finite idle takes the laying arm,
             // which draws the mark rather than dropping it.
             return Some(Self::Laying);
         }
-        if idle_s < LIFT_GRACE_S {
+        if idle_s < grace {
             Some(Self::Grace)
-        } else if idle_s < REACH_END {
+        } else if idle_s < reach_end {
             Some(Self::Reaching)
-        } else if idle_s < RETRACT_END {
+        } else if idle_s < retract_end {
             Some(Self::Retracting)
-        } else if idle_s < SWOOSH_TOTAL_S {
+        } else if idle_s < swoosh_total_s(grace) {
             Some(Self::Fading)
         } else {
             None
@@ -1735,6 +2138,80 @@ pub fn bed_ink(rgb: u32, budget: f32) -> u32 {
     onto_luma(spectrum_with_min_saturation(rgb, BED_SAT_FLOOR), budget)
 }
 
+/// **THE WCAG CONTRAST OF ONE CHANNEL**, both bytes read as a monochrome
+/// light — the per-channel form of the ratio [`relative_luminance`] states
+/// the body's own [`BODY_CONTRAST_BAR`] in, and the coordinate
+/// [`SEEN_CONTRAST`] is stated in.
+///
+/// Per CHANNEL and not over the whole colour, because the bed equalises the
+/// arc's LUMINANCE ([`bed_ink`]) and a whole-colour luminance test therefore
+/// cannot tell two stops of the bed apart at all: at one luminance a violet
+/// stop is `#0019FD` and a warm one `#585000`, and a luminance floor that
+/// leaves the warm one readable puts the violet one out at a blue channel of
+/// 186 — the band cut off while it is still bright. The channel that carries
+/// the hue is what the eye picks out of the ground, and what the census
+/// measures, so it is what is measured here.
+fn channel_contrast(a: f32, b: f32) -> f32 {
+    let (a, b) = (srgb_to_linear(a / 255.0), srgb_to_linear(b / 255.0));
+    let (hi, lo) = if a >= b { (a, b) } else { (b, a) };
+    (hi + 0.05) / (lo + 0.05)
+}
+
+/// **IS THIS COMPOSITED PIXEL STILL A STOP?** — [`SEEN_CONTRAST`] of
+/// contrast against the ground in the channel that stands furthest from it
+/// ([`channel_contrast`]) and [`SEEN_SPREAD`] bytes of channel spread. Both
+/// halves are needed: the contrast alone passes a grey smudge, the spread
+/// alone passes the ground itself on a strongly tinted theme.
+///
+/// GROUND-INDEPENDENT by construction: the level half is a ratio against
+/// this theme's own ground and the chroma half is a property of the pixel,
+/// so neither half carries a byte count that is only true of one background.
+#[must_use]
+fn seen(rgb: u32, bg: u32) -> bool {
+    let ch = |c: u32, sh: u32| f32::from(((c >> sh) & 0xff) as u8);
+    let (r, g, b) = (ch(rgb, 16), ch(rgb, 8), ch(rgb, 0));
+    let stand = channel_contrast(r, ch(bg, 16))
+        .max(channel_contrast(g, ch(bg, 8)))
+        .max(channel_contrast(b, ch(bg, 0)));
+    let spread = r.max(g).max(b) - r.min(g).min(b);
+    stand >= SEEN_CONTRAST && spread >= SEEN_SPREAD
+}
+
+/// **THE COVERAGE AT WHICH A STOP GOES OUT** — the smallest alpha BYTE at
+/// which `ink` composited over `bg` still passes [`seen`]; `255` for an ink
+/// no coverage can make read.
+///
+/// This is the whole arithmetic behind the ember's per-stop floor. The bed
+/// puts every stop on ONE composited LUMINANCE ([`bed_ink`], the legibility
+/// bar) — it does not put them on one DISTANCE FROM THE GROUND, and it
+/// cannot: at the bar the warm third's ink is a dark olive whose brightest
+/// channel is around 91, where blue's is 255. Fading every stop's alpha by
+/// the same factor therefore does NOT take them out together — each loses
+/// the same FRACTION of a very different distance — and the warm stops
+/// cross this floor while their neighbours are still bright, which is a
+/// dark run opening inside a band that is still lit. Measured on the
+/// default theme by `the_warm_stops_go_out_at_several_times_the_coverage_…`:
+/// chartreuse goes out at 188 of the bed's 236 and orange at 137, where blue
+/// and violet go out at 52 — a spread of 3.6x.
+///
+/// Solved by a scan over the 256 alphas the renderer can actually ask for,
+/// with the renderer's own compositor, once per theme into
+/// [`BedInkLut::seen`]. The scan runs DOWN from full and answers "one over
+/// the highest alpha that fails", not "the first alpha that passes": the
+/// floor has to be a level the stop reads at and at every coverage ABOVE it,
+/// and only the downward form says that without an argument about the shape
+/// of [`seen`] in the alpha. `256` — over any coverage the bed can spend —
+/// for an ink no coverage can make read, which [`Ribbon::ember_floor_of`]
+/// turns into "hold at full until the pool clears".
+#[must_use]
+fn seen_floor(ink: u32, bg: u32) -> f32 {
+    (1..=255u16)
+        .rev()
+        .map(|a| u8::try_from(a).unwrap_or(255))
+        .find(|&a| !seen(over_premul(bg, premul_rgb(ink, a), a), bg))
+        .map_or(1.0, |a| f32::from(a) + 1.0)
+}
+
 /// **THE CRISP EDGE'S REACH, PRICED AT BIRTH** — how many cells back the
 /// hairline of a cell laid on this tick may run ([`Cell::edge_cells`]).
 ///
@@ -1836,6 +2313,19 @@ pub(crate) fn light_role(cfg: &Config) -> InkRole {
     }
 }
 
+/// The body's published alpha ceiling for this theme — [`UNDER_COV_CAP`] on
+/// a dark one, the compositing role's on a light one (§3.4). One spelling,
+/// because [`Ribbon::cov_of`] and [`Ribbon::ember_floor`] must price the
+/// same cell against the same ceiling.
+#[must_use]
+fn cov_cap(cfg: &Config) -> f32 {
+    if cfg.dark_theme {
+        UNDER_COV_CAP
+    } else {
+        light_role(cfg).alpha_cap()
+    }
+}
+
 /// The bed's ink table for ONE theme — resident, rebuilt only when the theme
 /// or the spelling changes.
 ///
@@ -1855,6 +2345,12 @@ pub struct BedInkLut {
     hot: Vec<u32>,
     /// The vivid rail's table ([`rail_ink`]), same positions (2026-09-13).
     rail: Vec<u32>,
+    /// **THE COLOUR FLOOR'S TABLE** ([`seen_floor`] of the BED's ink over
+    /// this theme's ground, in alpha BYTES), same positions (2026-09-14).
+    /// The focus ember reads it so that every stop leaves on its own
+    /// extinction rather than on one shared fraction of very different
+    /// distances from the ground.
+    seen: Vec<f32>,
 }
 
 impl BedInkLut {
@@ -1872,16 +2368,20 @@ impl BedInkLut {
         self.hot.reserve(BED_INK_LUT_LEN);
         self.rail.clear();
         self.rail.reserve(BED_INK_LUT_LEN);
+        self.seen.clear();
+        self.seen.reserve(BED_INK_LUT_LEN);
         for i in 0..BED_INK_LUT_LEN {
             let x = i as f32 / (BED_INK_LUT_LEN - 1) as f32;
             let arc = spectrum(x);
-            self.lut.push(if cfg.dark_theme {
+            let bed = if cfg.dark_theme {
                 bed_ink(arc, budget)
             } else {
                 role.ink(arc)
-            });
+            };
+            self.lut.push(bed);
             self.hot.push(hot_edge_ink(arc));
             self.rail.push(rail_ink(arc));
+            self.seen.push(seen_floor(bed, cfg.theme_bg));
         }
         self.key = Some(key);
     }
@@ -1907,6 +2407,31 @@ impl BedInkLut {
     #[must_use]
     pub fn rail_at(&self, t: f32) -> u32 {
         Self::sample(&self.rail, t)
+    }
+
+    /// **THE COLOUR FLOOR AT WALK POSITION `t`** — the alpha byte under
+    /// which this stop's bed stops reading as a stop over the live theme's
+    /// ground ([`seen_floor`]), the same fold as the ink tables. `0` on an
+    /// unsynced table, which is "no floor" — exactly the curve this module
+    /// had before the table existed.
+    ///
+    /// The BRACKETING entries' MAX, not a lerp: the ink at `t` is itself a
+    /// lerp of the two entries, and `seen_floor` is not linear in the ink, so
+    /// a lerped floor can land a byte or two UNDER the true extinction of the
+    /// colour actually drawn — and a floor under the true one is the one
+    /// error that matters here, because it is a stop going dark under its
+    /// neighbours. The table's step is 1/128th of the arc and the floor moves
+    /// about two bytes across it, so the max costs at most that and is never
+    /// short.
+    #[must_use]
+    pub fn seen_floor_at(&self, t: f32) -> f32 {
+        if self.seen.is_empty() {
+            return 0.0;
+        }
+        let x = clamp01(tri(t)) * (BED_INK_LUT_LEN - 1) as f32;
+        let i = (x as usize).min(BED_INK_LUT_LEN - 1);
+        let j = (i + 1).min(BED_INK_LUT_LEN - 1);
+        self.seen[i].max(self.seen[j])
     }
 
     /// One lerp on `table` at the folded position of `t`; `0` on an unsynced
@@ -1954,6 +2479,38 @@ pub fn expiry_melt(u: f32) -> f32 {
     } else {
         taper.powf(EXPIRY_MELT_GAMMA)
     }
+}
+
+/// **THE FOCUS EMBER'S LEVEL, PER STOP** (2026-09-14) — the band's common
+/// fade `f` (the `spend` curve, or the theme's one linear fade under
+/// reduced motion) read INTO the stop's own range: it runs from exactly
+/// `1.0` at the blur to exactly `floor` when the fade is spent, where
+/// `floor` is the coverage at which THIS stop stops being seen
+/// ([`seen_floor`], as a share of the cell's own full coverage).
+///
+/// **THE LAW IT KEEPS: THE BAND LEAVES AS ONE OBJECT.** A common multiplier
+/// does not: the bed puts every stop on one composited luminance, not on one
+/// distance from the ground, so at half coverage the warm third is already
+/// under the colour floor while blue is four times above it — the band
+/// splits into two lit pieces with a dark run between them, which is the
+/// owner's "black gaps" arriving by a new route. Here every stop keeps the
+/// whole of the fade it HAS: no stop can cross its own floor while the ember
+/// still has level, because the fade's bottom IS that floor, and the ember's
+/// end ([`Ribbon::retire`]) then takes every cell in the same frame, each
+/// from its own just-visible level. One interval on every frame, and out
+/// together.
+///
+/// Exactly `1.0` at the blur, so that frame is byte for byte what it was;
+/// exactly `floor` when the fade is spent; non-increasing in `f`, so the
+/// ember still never brightens. A cell whose floor is ABOVE its own coverage
+/// (a stop the bar leaves barely readable even at the cap) simply holds what
+/// it has and leaves with the rest — the clamp is on the LEVEL, never on the
+/// floor, because a clamped floor would put that cell back on a schedule of
+/// its own.
+#[must_use]
+pub fn ember_level(floor: f32, f: f32) -> f32 {
+    let floor = floor.max(0.0);
+    clamp01(floor + (1.0 - floor) * clamp01(f))
 }
 
 /// The ONE linear fade of the theme (§2.5, §6.11): under reduced motion a
@@ -2046,6 +2603,39 @@ struct Run {
     stream_dir: i8,
 }
 
+/// **THE ATTACH'S LEVEL** this frame — set by [`Ribbon::plan_run`] at the
+/// head boundary of the run under the caret and read wherever the caret
+/// cell's light is planned: the head boundary's own coverage (`base`), the
+/// head cell's uniform attack (`uniform`, [`BIRTH_EDGE_FLOOR`] to 1 over
+/// the 18 ms edge-in) and the probe the from-the-hand wipe runs on
+/// ([`Ribbon::wipe_of`] — the head cell with its attack on its BIRTH
+/// clock). [`AttachFloor::level`] at `dist` across the caret cell (`0` at
+/// the head's edge, `1` at the block's far edge) is the light the attach
+/// puts there: the caret cell's own segments when nothing is laid under the
+/// caret, and the FLOOR under a LEAVING cell's light when one is — its own
+/// run's erased cell draining after a Backspace, or a neighbour cohort's
+/// cell retiring by content — so the block stands on the band while the
+/// cell spends, and the frame that retires it changes no byte (review of
+/// the attach, 2026-09-14: the erased cell's spend took the caret cell to
+/// zero under the block, then the retirement switched the attach on at
+/// full in one frame).
+#[derive(Clone, Copy, Debug)]
+struct AttachFloor {
+    row: u16,
+    /// The caret cell.
+    col: u16,
+    base: f32,
+    uniform: f32,
+    probe: Cell,
+}
+
+impl AttachFloor {
+    /// The attach's light at `dist` across the caret cell.
+    fn level(&self, rib: &Ribbon, ctx: &Ctx<'_>, dist: f32) -> f32 {
+        self.base * self.uniform * rib.wipe_of(ctx, &self.probe, dist)
+    }
+}
+
 /// THE RIBBON producer: the laid cells, their cohorts, this frame's plan, and
 /// the field index every other producer reads.
 ///
@@ -2085,13 +2675,30 @@ pub struct Ribbon {
     verts: Vec<RibbonVertex>,
     /// The bed's ink table for the live theme.
     ink: BedInkLut,
+    /// The theme GROUND the last planned frame composited over, stamped
+    /// beside [`Ribbon::ink`]'s sync so [`Ribbon::ink_segments`] can answer
+    /// what a boundary actually reads as without a `Ctx`.
+    ground: u32,
+    /// **WHAT THE LAST FRAME PUT ON THE GLASS**: how many of the quads that
+    /// emit appended to `under` composite to something the glass census
+    /// counts as band ink ([`reads_as_ink`]). Measured on the frame's own
+    /// pixels rather than modelled from the plan — the bed is not the only
+    /// stream on a ribbon row (the baseline strip's accent and the vivid
+    /// rail ride with it), so a number derived from [`Segment::cov`] alone
+    /// under-reports the end of a fall. `trail status` reports it as
+    /// `ribbon_drawn=`.
+    ink_quads: usize,
     /// Set while the window is unfocused: the ribbon embers out over
-    /// [`FOCUS_EMBER_S`] on `spend` and nothing sounds (§8.2).
+    /// [`FOCUS_EMBER_S`] on `spend` and nothing sounds (§8.2). Cleared by
+    /// [`Ribbon::retire`] with the pool once the ember has burnt out, and by
+    /// [`Ribbon::regain_focus`] (into a rearm if still burning).
     ember_at: Option<Instant>,
-    /// Focus REGAINED while the ember was still burning: `(when, level)`, the
-    /// spend level the ribbon had at that instant. The light comes back up
-    /// from that level through the one sanctioned attack, `edge-in`, rather
-    /// than snapping to full — v1's `rearm`.
+    /// Focus REGAINED while the ember was still burning: `(when, fade)`, the
+    /// ember's own common fade at that instant, which [`ember_level`] reads
+    /// into each stop's own range. The light comes back up from the level it
+    /// had through the one sanctioned attack, `edge-in`, rather than snapping
+    /// to full — v1's `rearm`. The FADE is stamped rather than one level,
+    /// because the level is per stop (2026-09-14).
     rearm: Option<(Instant, f32)>,
     /// The reduced-motion posture of the last frame planned, cached for the
     /// cadence law (seam point 9 is asked with a clock and nothing else).
@@ -2100,20 +2707,39 @@ pub struct Ribbon {
     /// wraps a fold at — or `None` for the whole grid. Handed down by the
     /// engine every tick ([`super::Engine::set_pane`]).
     pane: Option<(u16, u16)>,
+    /// **THE ATTACH** of the last frame planned — the `(row, col)` of the
+    /// caret cell the band was continued under ([`Ribbon::plan_run`]), or
+    /// `None`. Read by [`Ribbon::lay_cell`]: a typed cell laid where the
+    /// attach stood INHERITS its light — its attack is already spent — so
+    /// the key that turns the caret cell into the head cell moves no byte
+    /// down; the from-the-hand wipe then belongs to the NEXT attach, one
+    /// cell on under the block. Read again by [`Ribbon::build`]: a LEAVING
+    /// cell the attach floored last frame that the caret has since left —
+    /// a held Backspace moving the block off the cell it erased — restarts
+    /// its retract at that frame, so what the block leaves behind drains
+    /// from the level it showed under the block instead of dropping to
+    /// wherever its own clock had got to.
+    attach: Option<(u16, u16)>,
+    /// The attach's level this frame ([`AttachFloor`]), or `None` while no
+    /// run stands under the caret. Set at the head boundary as the runs are
+    /// planned, read by the caret cell's slabs in the same run or the
+    /// neighbour run to its right — which is planned after it (`sorted` is
+    /// row-major) — and by the attach's own segments.
+    attach_floor: Option<AttachFloor>,
     /// The cell height of the last frame planned, px.
     cell_h: f32,
     /// The WEDGE's full travel in px — `(dn_ch − DN_FLOOR_CH)·ch` of the
     /// last frame's profile — the distance the mark's lower edge closes as
     /// the spine releases ([`Ribbon::settle_step_s`]).
     wedge_px: f32,
-    /// Erases the hand has made whose RETREAT the ribbon has not yet seen
-    /// (2026-09-13). An `Erase` is replayed against the tick's caret; when
-    /// its echo lands on a LATER tick that caret still stands past the
-    /// erased glyph and `retract_suffix` finds nothing to retract — the
-    /// erased cell stayed lit under the blank (measured: a held Backspace
-    /// retracted in pairs on alternate keys). The count is spent by the
-    /// next typed-licensed same-row retreat, which retracts from ITS
-    /// landing; a typed lay clears it.
+    /// Erases the hand has made whose RETREAT the ribbon has not yet seen.
+    /// An `Erase` is replayed against the tick's caret; when its echo lands
+    /// on a LATER tick that caret still stands past the erased glyph and
+    /// `retract_suffix` finds nothing to retract, so the erased cell would
+    /// stay lit under the blank (measured: a held Backspace retracting in
+    /// pairs on alternate keys). The count is spent by the next
+    /// typed-licensed same-row retreat, which retracts from ITS landing; a
+    /// typed lay clears it.
     pending_erase: u16,
     /// The cell of the last typed Space, `(row, col)` — what tells a
     /// re-anchor how long the word an app moved to the next row was.
@@ -2126,6 +2752,32 @@ pub struct Ribbon {
     /// re-anchoring at red — `Cohort::t0`'s documented continuation, which
     /// had nothing to read once `retire` dropped the cohort with its cells.
     last_walk: Option<LastWalk>,
+    /// **THE HAND'S TEMPO**, ms — the inter-onset EMA the melody runs
+    /// ([`super::timing::ioi_next`]), run here on the same typed keys so
+    /// the ribbon's grace is [`super::timing::phrase_rest_ms`] of the same
+    /// number the song rests on (S5). `0.0` before the first key reads as
+    /// the default tempo ([`Ribbon::rest_s`]).
+    ioi_ms: f32,
+    /// The clock of the last key that HELD a phrase — a typed key, an erase
+    /// or a kill: the rest is measured from it, exactly as the melody's
+    /// `last_key_ms` is any touch.
+    last_key_at: Option<Instant>,
+    /// **THE OPEN PHRASE** (§2.3), or `None` between phrases — after a rest
+    /// has passed since [`Ribbon::last_key_at`], a Return or a line kill.
+    /// The next typed lay opens the next one.
+    phrase_open: Option<u32>,
+    /// The next phrase id to mint; `0` is never minted (it is "no phrase",
+    /// a wake cohort's).
+    next_phrase: u32,
+    /// **THE CURTAIN IN PROGRESS**: when it fell. `None` when none is
+    /// falling.
+    ///
+    /// The column each cohort is drawn toward is NOT here: it is frozen on
+    /// the cohort itself ([`Cohort::retract_col`], with
+    /// [`Cohort::drain_right_first`] beside it), by exactly the rule a
+    /// natural retract freezes them with, and from the BAND'S OWN HAND
+    /// rather than from [`Ribbon::caret`] — see [`Ribbon::curtain`].
+    curtain: Option<Instant>,
 }
 
 /// **A RE-ANCHOR'S MOVED WORD** (2026-09-13, the owner: "the rainbow cursor
@@ -2282,13 +2934,22 @@ impl Ribbon {
     /// over a glyph that has shifted; [`Event::Kill`] drains the same suffix,
     /// at least `cells` wide, farthest-first at `12·n + 240` ms (the Word /
     /// Line scope is the synth's, §8.2 — the drain is one law);
-    /// [`Event::Move`] moves [`Ribbon::caret`] and, on a REAL jump under a
-    /// non-typed licence (a row change, or [`JUMP_MIN_CELLS`] or more on the
-    /// row), lays the WAKE of a same-row navigation or synthetic jump
-    /// ([`Ribbon::wake`], R5 — the corridor it crossed, newest at the
-    /// landing, taking over what the live band already lit) and then
-    /// ABANDONS every other cohort straight into its retract (see
-    /// [`RETRACT_START_S`]); a same-row hop under the jump floor with a
+    /// [`Event::Move`] moves [`Ribbon::caret`] and then asks ONE question of
+    /// a keyed same-row move — [`Ribbon::scrub`], the boundary between the
+    /// two laws that answer it. A move that stays INSIDE the hand's own lit
+    /// run is a SCRUB: it lays nothing, takes nothing over, abandons
+    /// nothing, and HOLDS the cohorts it crossed (the owner's back-word /
+    /// forward-word gesture on v0.85.0). A move that LEAVES the run — past
+    /// its oldest cell, off its end onto dark ground, over light already
+    /// melting, or to another row — is a REAL jump under a non-typed licence
+    /// (a row change, or [`JUMP_MIN_CELLS`] or more on the row): it lays the
+    /// WAKE of a same-row navigation or synthetic jump ([`Ribbon::wake`],
+    /// R5 — the corridor it crossed, on the [`Layer::Over`] overlay, each
+    /// cell born on the meteor's own flight clock, over a [`Layer::Base`]
+    /// band whose cells it never touches) and then ABANDONS every other
+    /// cohort straight into its retract beneath it (see
+    /// [`Cohort::retract_start`]), draining from the origin end so the drain
+    /// follows the meteor; a same-row hop under the jump floor with a
     /// navigation witness (an arrow) lays a shorter wake in a cohort of its
     /// own and abandons nothing — a click inside the word is an edit, and
     /// the swoosh's own grace handles it; a band already leaving is left on
@@ -2303,8 +2964,53 @@ impl Ribbon {
     /// one tick must coalesce them into one `Typed { cells: 2 }`, because the
     /// caret each of them landed at is not carried on the event.
     pub fn on_event(&mut self, ev: &super::Event, at: Instant, ctx: &Ctx<'_>) {
+        // UNDER A CURTAIN NOTHING IS LAID (§2.8): the cells on glass belong
+        // to a coordinate space that has ended and are being drawn out; a
+        // key, an echo, a jump in the new space waits for the curtain to
+        // finish (0.24 s) — the caret mirror alone is kept.
+        if self.curtain.is_some() {
+            if let Event::Move { to, .. } = *ev {
+                self.caret = Some(to);
+            }
+            return;
+        }
+        // Once the hand explicitly edits or leaves a released mark, a later
+        // matching redraw cannot undo that decision. This changes no cell or
+        // lifetime; it only revokes the content-release restoration token.
+        let revoke = match *ev {
+            Event::Erase | Event::Kill { .. } | Event::Return => Some(ctx.caret.0),
+            Event::Rewrite { row, .. } => Some(row),
+            Event::Move {
+                from,
+                licence: Licence::Nav | Licence::Return | Licence::Synthetic,
+                ..
+            } => Some(from.0),
+            _ => None,
+        };
+        if let Some(row) = revoke {
+            for cohort in &mut self.cohorts {
+                if cohort.row == row {
+                    cohort.release_clock = None;
+                }
+            }
+        }
         match *ev {
             Event::Typed { cells, class, .. } => {
+                // THE HAND IS ON IT (2026-09-13, the focus seam): a key
+                // typed while the focus ember burns — a control-socket
+                // agent typing into an unfocused window, the host's own
+                // "live typed wake" — clears the ember and comes back up
+                // from the level the light had reached, through `edge-in`,
+                // exactly as a focus regain does. Without this arm every
+                // cell laid under a burning ember was born at `spend(1) =
+                // 0` and the unfocused window went dark for good.
+                if self.ember_at.is_some() {
+                    self.regain_focus(at);
+                }
+                // THE SCORE'S KEY (Rainbow Path v3 §2.1/§2.3): the tempo and
+                // the phrase move before anything is laid, so the lay reads
+                // the grace this key priced.
+                self.note_key(at);
                 self.pending_erase = 0;
                 if class == TypedClass::Space {
                     let (row, col_end) = ctx.caret;
@@ -2312,23 +3018,40 @@ impl Ribbon {
                 }
                 self.lay(cells, at, ctx);
             }
-            Event::Erase => {
-                self.retract_suffix(ctx.caret.0, ctx.caret.1, 1, at, RETRACT_FADE_S);
-                self.pending_erase = self.pending_erase.saturating_add(1);
-                self.hold_row(ctx.caret.0, at);
-            }
-            Event::Kill { cells, .. } => {
-                let span_s = kill_span_s(cells);
-                self.retract_suffix(ctx.caret.0, ctx.caret.1, cells, at, span_s);
-                self.pending_erase = self.pending_erase.saturating_add(cells.max(1));
-                self.hold_row(ctx.caret.0, at);
+            // AN ERASE OR A KILL HOLDS THE PHRASE (§2.3, S6): the hand is
+            // on it. Before this a Backspace run started the swoosh from
+            // the band's left end while the erase was still going (audit
+            // s10) because only a lay refreshed a cohort. The hold is the
+            // open phrase's cohorts ON THE CARET'S ROW — the row clause is
+            // the shipped `hold_row`'s (`OnlyOwnerRenews`, the derived
+            // `ribbon_row_hold_model`), the phrase clause is v3's.
+            //
+            // MERGE, 0.86: upstream gave both arms ONE call shape,
+            // [`Ribbon::erase`], and this takes it — the retract, the owed
+            // retreat and the hold are one law with two spans. What the
+            // candidate keeps is WHAT IT HOLDS WITH: `erase` holds the
+            // phrase, not the bare row (`hold_phrase` supersedes `hold_row`
+            // — see its doc, and the v0.85.0 snap it was measured against).
+            // The two bodies are otherwise the same law: upstream's
+            // `cells.max(1)` reaches `retract_suffix` as `min_cells`, where
+            // 0 and 1 both give `last = far.unwrap_or(col).max(col)`, so a
+            // Backspace-shaped kill retracts exactly what it did here; and
+            // `pending_erase` took `cells.max(1)` on both sides already.
+            Event::Erase => self.erase(ctx.caret, 1, RETRACT_FADE_S, at),
+            Event::Kill { cells, scope } => {
+                self.erase(ctx.caret, cells.max(1), kill_span_s(cells), at);
+                // A line kill ends the phrase, as a Return does: what is
+                // typed next is a new line.
+                if scope == super::KillScope::Line {
+                    self.phrase_open = None;
+                }
             }
             Event::Move {
                 from, to, licence, ..
             } => {
                 self.caret = Some(to);
                 let same_row = to.0 == from.0;
-                if matches!(licence, Licence::Typed | Licence::Insert) {
+                if licence.is_echo() {
                     // A typed echo's own FORWARD motion is inert here: the
                     // key laid its cell, and the caret mirror is all that
                     // moves. A delivered insert's is inert the same way: its
@@ -2353,15 +3076,29 @@ impl Ribbon {
                         self.settle_relocate(to.0, from.1, at, ctx);
                     }
                 } else {
+                    // THE SCRUB (2026-09-14, the owner: "the painting
+                    // system for scrubbing back and forth with back word
+                    // and forward word doesn't work correctly and leaves
+                    // gaps"): a keyed same-row move whose every crossed
+                    // cell is lit by a band that is not leaving is the hand
+                    // moving over its own text — at any distance, either
+                    // way. It abandons nothing, takes nothing over, lays
+                    // nothing, and HOLDS the band it crossed
+                    // ([`Ribbon::scrub`]). Everything below is for a move
+                    // that leaves the run.
+                    let scrub = same_row
+                        && licence.is_keyed_nav()
+                        && self.scrub(to.0, from.1, to.1, at, ctx);
                     let jump = !same_row || to.1.abs_diff(from.1) >= JUMP_MIN_CELLS;
-                    if jump {
+                    if scrub {
+                        // Held; nothing else to do.
+                    } else if jump {
                         // THE WAKE, then the abandon that spares it. A row
                         // change has no corridor on one row (an Up-arrow
                         // recall must not paint the line it lands on), and a
                         // PTY cascade or a Return earns no credit — they keep
                         // the old law: abandon, lay nothing.
-                        let wakes =
-                            same_row && matches!(licence, Licence::Nav | Licence::Synthetic);
+                        let wakes = same_row && licence.is_keyed_nav();
                         let keep = if wakes {
                             self.wake(to.0, from.1, to.1, at, ctx, WAKE_LIFE_S, true)
                         } else {
@@ -2372,9 +3109,19 @@ impl Ribbon {
                         // and parking the cursor back): the band goes back
                         // into the HAND's last column, never toward wherever
                         // the program parked the cursor, and the hand's next
-                        // key may take the band back (`join_cohort`).
+                        // key may take the band back (`join_cohort`). A
+                        // SAME-ROW jump the hand made takes the landing as
+                        // its frozen target with a drain that FOLLOWS THE
+                        // METEOR — origin end first — so no band cell starts
+                        // spending before the corridor cell above it is born
+                        // (Rainbow Path v3 §2.6/§2.7).
                         let program = licence == Licence::Pty;
-                        self.abandon(at, keep, program.then_some(from.1), program);
+                        let toward = if program {
+                            Some((from.1, false))
+                        } else {
+                            same_row.then_some((to.1, to.1 < from.1))
+                        };
+                        self.abandon(at, keep, toward, program);
                     } else if same_row && licence == Licence::Nav && from.1 != to.1 {
                         // AN ARROW'S HOP: a short wake behind the caret, no
                         // abandon — the band under the hand keeps its light.
@@ -2407,7 +3154,10 @@ impl Ribbon {
                 self.retract_suffix(row, col, cells.max(1), at, span_s);
                 self.caret = Some((row, col));
             }
-            Event::Return | Event::ReducedMotion(_) => {}
+            // A Return closes the phrase: the next typed key opens a new
+            // one, and the line the hand left goes out at its own rest.
+            Event::Return => self.phrase_open = None,
+            Event::ReducedMotion(_) => {}
         }
     }
 
@@ -2416,38 +3166,353 @@ impl Ribbon {
         self.pane = pane;
     }
 
+    /// **DROP THE CURTAIN** ([`CURTAIN_S`]): every cohort on glass is drawn
+    /// into the hand it last stood under — its own frozen
+    /// [`Cohort::retract_col`], by the retract's per-row rule against the
+    /// BAND'S OWN HEAD ([`Ribbon::curtain_hand`]) — and spent to exactly
+    /// zero over 0.24 s, FARTHEST-FIRST on [`CURTAIN_STAGGER_S`], with
+    /// nothing laid until it is over. A ribbon with nothing laid has nothing
+    /// to curtain and stays ready; a curtain already falling keeps its
+    /// clock. The phrase ends with the space.
+    pub fn curtain(&mut self, at: Instant) {
+        self.phrase_open = None;
+        if self.cells.is_empty() || self.curtain.is_some() {
+            return;
+        }
+        // **THE HAND IS THE BAND'S OWN HEAD** (2026-09-14), not
+        // [`Ribbon::caret`]. On the commonest path to this seam — type a
+        // command, press Return, let `less`/`vim`/`top` take the screen —
+        // the Return that launched the program has ALREADY moved the caret
+        // to column 0 of the next line by the time the host notices the
+        // space changed, so the caret at seam time is tens of columns from
+        // the cells. Reading its bare COLUMN dragged the whole band leftward
+        // while it faded — measured on glass at the alt seam, span
+        // `[37,56] → [33,45] → [28,31] → [25,25]`, ending 31 columns and
+        // 465 px from its own head: a slide across the row, not a gather
+        // into the hand. (The resize seam looked right only because the
+        // caret had not moved there.) The band's own head IS where the hand
+        // let go of it — the caret sits one past the last laid glyph — so
+        // the target is the head cohort's `col1`, which is that cell's right
+        // edge.
+        let hand = self.curtain_hand();
+        for i in 0..self.cohorts.len() {
+            // A cohort already retracting froze its target when the hand let
+            // go of it; that is the same fact, measured earlier, and it stays.
+            if self.cohorts[i].retract_col.is_some() {
+                continue;
+            }
+            let coh = self.cohorts[i];
+            let (target, right_first) = Self::target_toward(&coh, hand);
+            self.cohorts[i].retract_col = target;
+            self.cohorts[i].drain_right_first = right_first;
+        }
+        self.curtain = Some(at);
+    }
+
+    /// **WHERE THE HAND WAS** when a curtain falls — `(row, column one past
+    /// the band's head)`, read from the cohorts themselves so it cannot be
+    /// moved by whatever the host did to the caret at the seam.
+    ///
+    /// The newest cohort the hand actually typed into (`!wake`, newest
+    /// [`Cohort::alive_at`]); a ribbon made only of wake corridors falls back
+    /// to its newest cohort. `col1` is exclusive, so it is exactly the column
+    /// the caret stood in when that cohort's last cell was laid.
+    fn curtain_hand(&self) -> Option<(u16, u16)> {
+        let newest = |wake_ok: bool| {
+            self.cohorts
+                .iter()
+                .filter(|c| wake_ok || !c.wake)
+                .max_by_key(|c| c.alive_at)
+                .map(|c| (c.row, c.col1))
+        };
+        newest(false).or_else(|| newest(true))
+    }
+
+    /// Whether a curtain is falling — the host's "nothing is laid" gate
+    /// and the twins' witness.
+    #[must_use]
+    pub fn curtained(&self) -> bool {
+        self.curtain.is_some()
+    }
+
+    /// **THE PHRASE REST IN FORCE**, seconds — [`phrase_rest_ms`] of the
+    /// hand's tempo; the floor before any key.
+    #[must_use]
+    pub fn rest_s(&self) -> f32 {
+        let ioi = if self.ioi_ms > 0.0 {
+            self.ioi_ms
+        } else {
+            IOI_DEFAULT_MS
+        };
+        phrase_rest_ms(ioi) / 1000.0
+    }
+
+    /// The open phrase's id — read-only, for the twins.
+    #[must_use]
+    pub fn phrase_open(&self) -> Option<u32> {
+        self.phrase_open
+    }
+
+    /// **A TYPED KEY ON THE SCORE** (§2.1, §2.3): measure the gap since the
+    /// last key, resolve a REST (a gap of the rest in force or more — the
+    /// melody's own test, [`super::timing::phrase_rest_reached`], on the
+    /// tempo as of the previous key), advance the tempo by the melody's own
+    /// law, and open a new phrase if the last one is closed. Run once per
+    /// `Typed` event, never per cell.
+    fn note_key(&mut self, at: Instant) {
+        let gap_ms = self
+            .last_key_at
+            .map(|t| (at.saturating_duration_since(t).as_secs_f32() * 1000.0).round());
+        let first = gap_ms.is_none();
+        let rest = gap_ms.is_none_or(|g| g >= self.rest_s() * 1000.0);
+        if rest || self.phrase_open.is_none() {
+            self.open_phrase();
+        }
+        let gap = gap_ms.map_or(0, |g| g.clamp(0.0, f32::from(u16::MAX) * 64.0) as u32);
+        let ioi = if self.ioi_ms > 0.0 {
+            self.ioi_ms
+        } else {
+            IOI_DEFAULT_MS
+        };
+        self.ioi_ms = ioi_next(ioi, gap, first, rest);
+        self.last_key_at = Some(at);
+    }
+
+    /// Mint the next phrase and open it.
+    fn open_phrase(&mut self) {
+        let id = self.next_phrase.max(1);
+        self.next_phrase = id.wrapping_add(1).max(1);
+        self.phrase_open = Some(id);
+    }
+
+    /// The phrase a typed lay belongs to — the open one, opened here if a
+    /// typed echo arrives with none open (a ledger-bridged sweep after a
+    /// Return, say): a typed cell always has a phrase.
+    fn phrase_for_lay(&mut self) -> u32 {
+        if self.phrase_open.is_none() {
+            self.open_phrase();
+        }
+        self.phrase_open.unwrap_or(1)
+    }
+
+    /// **THE HAND IS ON THE PHRASE UNDER IT** — an erase or a kill: every
+    /// un-abandoned cohort of the open phrase on the caret's ROW keeps its
+    /// laying clock, its grace is re-priced at the rest in force, and the
+    /// rest is measured from this key.
+    ///
+    /// This REPLACES `hold_row` (2026-09-13): an erase or a kill used to
+    /// refresh every un-abandoned cohort on the caret row unconditionally,
+    /// which is what stopped the exit swoosh running on the last TYPED key's
+    /// clock straight through a Backspace run (the surviving letters drained
+    /// away ~1 s into the edit and snapped back to full, with no attack, on
+    /// the fix key). The row scope is kept verbatim — `row` here IS that
+    /// row, `ribbon_row_hold_model`'s `OnlyOwnerRenews` — and the phrase is
+    /// added on top: an edit inside the phrase holds it.
+    ///
+    /// **AN ERASE AFTER THE REST OPENS A NEW ONE AND TAKES THE ROW BACK**
+    /// (2026-09-14). The first spelling of this law closed the phrase instead
+    /// and held nothing, on the reading that "an edit after the rest is an
+    /// edit to a line the hand had let go of" — and it deleted the shipped
+    /// gesture that `hold_row` was added for: on v0.85.0 a Backspace run
+    /// begun after the after-glow had started SNAPPED the band back (13 lit
+    /// cells to 19, at full) and the band then lived 1175.8 ms past the last
+    /// erase; on the closed phrase there was no snap and the tail was 0.0 ms,
+    /// because closing it made every LATER erase of the run a no-op too. A
+    /// hand that comes back to a line is a hand on that line. So the erase
+    /// MINTS a phrase and ADOPTS the caret row's un-abandoned cohorts into
+    /// it, which renews exactly the row the gesture is on and nothing else:
+    /// the phrase narrows the hold within a row, it never widens it across
+    /// rows.
+    fn hold_phrase(&mut self, at: Instant, row: u16) {
+        let rested = self
+            .last_key_at
+            .is_some_and(|t| at.saturating_duration_since(t).as_secs_f32() >= self.rest_s());
+        let open = match self.phrase_open {
+            Some(open) if !rested => open,
+            _ => {
+                self.open_phrase();
+                let id = self.phrase_open.unwrap_or(1);
+                for coh in &mut self.cohorts {
+                    if !coh.abandoned && coh.row == row {
+                        coh.phrase = id;
+                    }
+                }
+                id
+            }
+        };
+        self.last_key_at = Some(at);
+        self.hold(open, row, None, at);
+    }
+
+    /// Refresh every un-abandoned cohort of phrase `open` at `at`: the
+    /// laying clock, the phase, the frozen retract target, the grace — and
+    /// the life floor of its cells, so a rest that lengthened under a
+    /// slowing hand never outlives the cells it holds.
+    fn hold(&mut self, open: u32, hand_row: u16, laid_into: Option<usize>, at: Instant) {
+        let grace = self.rest_s();
+        let floor = swoosh_life_s(grace);
+        let held_by = |i: usize, c: &Cohort| {
+            !c.abandoned && c.phrase == open && (c.row == hand_row || laid_into == Some(i))
+        };
+        for (i, coh) in self.cohorts.iter_mut().enumerate() {
+            if held_by(i, coh) {
+                coh.alive_at = coh.alive_at.max(at);
+                coh.phase = Phase::Laying;
+                coh.retract_col = None;
+                coh.grace_s = grace;
+            }
+        }
+        let cohorts = &self.cohorts;
+        for cell in &mut self.cells {
+            if cell.life_s < floor
+                && cohorts
+                    .iter()
+                    .enumerate()
+                    .any(|(i, c)| c.id == cell.cohort && held_by(i, c))
+            {
+                cell.life_s = floor;
+            }
+        }
+    }
+
+    /// **THE RETRACT TARGET OF A COHORT** (§2.6, per-row): the caret's
+    /// column when the caret is on its row; otherwise the cohort's own end
+    /// nearest the caret in LOGICAL order — its right end (the fold) for a
+    /// row above the caret, its left end for a row below. The suck-in never
+    /// slides a row toward a column that belongs to another row (audit
+    /// hi/s9 frames 0041–0044; the refresh's s17: the row-4 remnant drained
+    /// toward the pre-jump caret column). Returned with the drain order the
+    /// same reading fixes ([`Cohort::drain_right_first`]).
+    fn retract_target(&self, coh: &Cohort) -> (Option<u16>, bool) {
+        Self::target_toward(coh, self.caret)
+    }
+
+    /// [`Ribbon::retract_target`]'s rule against an ARBITRARY hand, so a
+    /// curtain can freeze the same targets against the band's own head
+    /// ([`Ribbon::curtain_hand`]) instead of against a caret the seam has
+    /// already moved.
+    fn target_toward(coh: &Cohort, hand: Option<(u16, u16)>) -> (Option<u16>, bool) {
+        match hand {
+            None => (None, false),
+            Some((hrow, hcol)) if coh.row == hrow => (Some(hcol), false),
+            Some((hrow, _)) if coh.row < hrow => {
+                (Some(coh.col1.saturating_sub(1).max(coh.col0)), false)
+            }
+            Some(_) => (Some(coh.col0), true),
+        }
+    }
+
+    /// **AN ERASE** — a Backspace or a kill of `cells` at `caret`: retract
+    /// the row's suffix from the caret farthest-first over `span_s`
+    /// ([`Ribbon::retract_suffix`]), owe the retreat its echo has not yet
+    /// made (`pending_erase`), and hold the row's light. The Backspace's
+    /// `2 × 0.24 s` and the kill's `12·n + 240 ms` are this one law with
+    /// two spans.
+    ///
+    /// MERGE, 0.86: upstream's one fn, holding with the candidate's
+    /// [`Ribbon::hold_phrase`] rather than with `hold_row`, which no longer
+    /// exists — v3 superseded it (same row scope, narrowed by the open
+    /// phrase, and it re-prices the grace at the rest in force, which the
+    /// bare row hold could not). "Hold the row's light" above is still
+    /// exactly what happens; the phrase only says WHICH cohorts of that row.
+    fn erase(&mut self, caret: (u16, u16), cells: u16, span_s: f32, at: Instant) {
+        self.retract_suffix(caret.0, caret.1, cells, at, span_s);
+        self.pending_erase = self.pending_erase.saturating_add(cells);
+        self.hold_phrase(at, caret.0);
+    }
+
+    /// Whether `cell` is still LIVE at `at`: not leaving, and inside its
+    /// life measured from the later of its birth and its cohort's revival
+    /// ([`live_since`]).
+    fn alive_at(&self, cell: &Cell, at: Instant) -> bool {
+        !cell.leaving()
+            && at
+                .saturating_duration_since(live_since(&self.cohorts, cell))
+                .as_secs_f32()
+                < cell.life_s
+    }
+
+    /// Whether a live cell owns `(row, col)` at `at` — the cell a sweep or
+    /// a relay leaves exactly as it is.
+    fn owned(&self, row: u16, col: u16, at: Instant) -> bool {
+        self.cells
+            .iter()
+            .any(|c| c.row == row && c.col == col && self.alive_at(c, at))
+    }
+
+    /// **A KEY WHOSE ECHO HAS NOT LANDED IS HELD, NOT LAID.** `Event::Typed`
+    /// is replayed at the engine's mirror and [`Ribbon::lay`] lays
+    /// `caret.col − n`, which is the key's own cell only when its echo moved
+    /// the mirror in the same frame; a frame before the echo that is the
+    /// PREVIOUS cell — the prompt's trailing space for the first key of a
+    /// fresh line, or the previous row's last pane cell through the fold for
+    /// a key typed at column 0 (after Enter, after backspacing to col 0,
+    /// `cat` / `read` / an empty PS1) — a phantom over a blank the content
+    /// witness never arms, alive with the row's cohort. The engine calls
+    /// this instead of [`Ribbon::on_event`] for a `Typed` with no move after
+    /// it in the frame's buffer: the `Typed` arm minus the lay — the erase
+    /// count is closed, a Space's cell remembered, and the caret row HELD
+    /// (the edit clock an erase refreshes, so a stall still keeps the row's
+    /// light). The key's cell comes with its echo, from the seam's sweep;
+    /// nothing typed goes dark.
+    ///
+    /// `cell` is the cell the held key WILL lay — the mirror, advanced past
+    /// the keys held before it in the frame — or `None` for a key typed at
+    /// a caret the engine never learned. A held Space is remembered at that
+    /// cell, not at the mirror's left neighbour: `lay`'s `caret − 1` is the
+    /// Space's cell only once its echo has moved the mirror past it, and
+    /// the composer's word move measures the word from the Space's own cell.
+    /// The echo's sweep cannot correct it later ([`super::Engine`]'s
+    /// `swept_space_cell` reads the frame's own keys).
+    pub(super) fn hold_typed(
+        &mut self,
+        ev: &super::Event,
+        at: Instant,
+        ctx: &Ctx<'_>,
+        cell: Option<(u16, u16)>,
+    ) {
+        if let Event::Typed { class, .. } = *ev {
+            self.pending_erase = 0;
+            if class == TypedClass::Space
+                && let Some(cell) = cell
+            {
+                self.last_space = Some(cell);
+            }
+            // `hold_row` was v3's `hold_phrase` before the merge: the same row
+            // scope, narrowed by the open phrase. A key whose echo has not landed
+            // is still the hand on that row, so it holds exactly as a laid one does.
+            self.hold_phrase(at, ctx.caret.0);
+        }
+    }
+
     /// **A TYPED ECHO'S GLYPH CELLS** ([`Event::Sweep`]): lay every cell in
-    /// `col0..col1` on `row` that no LIVE cell owns, as typing, born at the
-    /// echo. A key lays at the caret the tick replays with, so a key whose
+    /// `col0..col1` on `row` that no LIVE cell owns ([`Ribbon::owned`]), as
+    /// typing, born at the echo. A key lays at the caret the tick replays with, so a key whose
     /// echo shares its tick already owns its glyph cell and is left exactly
     /// as it was — per-key typing is byte-identical (the deletion goldens
     /// pin it). What the sweep lights is what the keys could not: the cells
     /// of a batched echo behind the landing's own, and the glyph of a key
-    /// whose echo landed a frame late (the key laid the PREVIOUS glyph's
-    /// cell, the caret's neighbour at key time).
+    /// whose echo landed a frame late (the key was HELD, not laid, on the
+    /// frame it was typed — [`Ribbon::hold_typed`] — so its cell comes
+    /// from this sweep alone).
     fn sweep(&mut self, row: u16, col0: u16, col1: u16, at: Instant, ctx: &Ctx<'_>) {
         let cols = u16::try_from(ctx.geom.cols).unwrap_or(u16::MAX);
         for col in col0..col1.min(cols) {
-            let owned = self.cells.iter().any(|c| {
-                c.row == row
-                    && c.col == col
-                    && !c.leaving()
-                    && at
-                        .saturating_duration_since(live_since(&self.cohorts, c))
-                        .as_secs_f32()
-                        < c.life_s
-            });
-            if !owned {
+            if !self.owned(row, col, at) {
                 self.lay_cell(row, col, at, ctx, true);
             }
         }
     }
 
-    /// Focus came back. If the ember was still burning, carry the level it
+    /// Focus came back. If the ember was still burning, carry the FADE it
     /// had reached into an `edge-in` rearm so the ribbon comes back UP through
     /// the one sanctioned attack instead of snapping to full in one frame
     /// (v1's `rearm`). A focus loss that already burned out has nothing to
     /// rearm — the pool was cleared by [`Ribbon::retire`].
+    ///
+    /// The stamp is the ember's common FADE, not a level: [`ember_level`]
+    /// turns it into each cell's own level, which is the only way every cell
+    /// resumes from exactly where the ember left it.
     fn regain_focus(&mut self, at: Instant) {
         if let Some(ember) = self.ember_at.take() {
             let r = at.saturating_duration_since(ember).as_secs_f32() / FOCUS_EMBER_S;
@@ -2539,7 +3604,7 @@ impl Ribbon {
         };
         // The exit swoosh must get to finish before the natural melt steals the
         // ending — even for a lone keystroke, which earns a full mini-swoosh.
-        life.max(SWOOSH_LIFE_S)
+        life.max(swoosh_life_s(self.rest_s()))
     }
 
     /// **THE HAND LEFT THE ROW** (2026-09-13, the owner: "the rainbow cursor
@@ -2672,16 +3737,7 @@ impl Ribbon {
     /// row's cohort on the walk it has (C2).
     fn relay_word(&mut self, row: u16, col0: u16, col1: u16, at: Instant) {
         for col in col0..col1 {
-            let owned = self.cells.iter().any(|c| {
-                c.row == row
-                    && c.col == col
-                    && !c.leaving()
-                    && at
-                        .saturating_duration_since(live_since(&self.cohorts, c))
-                        .as_secs_f32()
-                        < c.life_s
-            });
-            if owned {
+            if self.owned(row, col, at) {
                 continue;
             }
             let idx = self.join_cohort(row, col, at);
@@ -2708,37 +3764,210 @@ impl Ribbon {
                 retire_at: None,
                 birth_disp: like.map_or(0.0, |c| c.birth_disp),
                 edge_cells: like.map_or(HOT_EDGE_CELLS, |c| c.edge_cells),
+                layer: Layer::Base,
+                rearm: None,
             };
             self.place(idx, cell, at, row);
         }
     }
 
-    /// **THE EDITING HAND HOLDS THE ROW** (2026-09-13): an erase or a kill
-    /// refreshes the caret row's cohorts exactly as a typed lay does. Until
-    /// this the exit swoosh ran on the last TYPED key's clock straight
-    /// through a Backspace run — the surviving letters drained away ~1 s into
-    /// the edit and snapped back to full, with no attack, on the fix key.
-    fn hold_row(&mut self, row: u16, at: Instant) {
-        for coh in &mut self.cohorts {
-            if coh.row == row && !coh.abandoned {
+    /// **THE SCRUB, AND THE LINE BETWEEN IT AND THE JUMP** (2026-09-14;
+    /// the Rainbow Path v3 merge, 2026-09-14) — a same-row keyed move
+    /// (`Nav`, `Synthetic`) from column `from` to `to` on `row` is a scrub
+    /// when the corridor it crossed, `[min, max)`, is lit end to end by
+    /// cells that are not leaving: every column owned by a live cell with
+    /// light on the glass whose cohort is neither abandoned nor inside its
+    /// retract. That is the hand moving over its own text. Then nothing is
+    /// laid, taken over or abandoned, and the cohorts the corridor crosses
+    /// are HELD — clock renewed to the hop, phase back to laying, the
+    /// retract target released — exactly as [`Ribbon::hold_phrase`] holds
+    /// the caret row's phrase for an editing hand: the band leaves through
+    /// its swoosh ([`Cohort::swoosh_total_s`]) after the hand's LAST act on
+    /// it, a hop included. Returns whether the move was a scrub; a move that
+    /// is not one takes the jump or hop arm.
+    ///
+    /// **THIS PREDICATE IS THE BOUNDARY** between the two laws that
+    /// answer a same-row keyed move, and it is the whole of it. Rainbow
+    /// Path v3 §2.7 rules that a jump lays an OVERLAY corridor
+    /// ([`Layer::Over`]) along the meteor's flight and abandons the
+    /// [`Layer::Base`] band beneath it; the scrub rules that the same event
+    /// lays nothing and holds the band. Both are right, about different
+    /// events, and `scrub` decides which event this is:
+    ///
+    /// * **INSIDE the hand's own lit run → a scrub.** Every column the move
+    ///   crossed is owned by live, not-leaving, not-melting light of a
+    ///   cohort that is not abandoned and not retracting. Alt-B/Alt-F over
+    ///   the words of the line you just typed; Ctrl-A and Ctrl-E between the
+    ///   ends of a band that reaches both. Held: see the measurement below,
+    ///   and `a_scrub_inside_the_band_keeps_every_cell_s_light_and_holds_the_row`,
+    ///   `a_home_and_an_end_inside_the_band_abandon_nothing_and_take_nothing_over`.
+    /// * **LEAVING the run → a jump, and v3's overlay wake.** Past the
+    ///   band's OLDEST cell (a Ctrl-A to column 0 from a band that starts at
+    ///   column 10 — the real prompt's case, the prompt's own columns are
+    ///   dark), off its END onto dark ground (an Alt-F or an End past the
+    ///   last letter), over a cell already melting or already leaving, or to
+    ///   ANOTHER ROW (`same_row` is false before this is ever called). Then
+    ///   [`Ribbon::wake`] lays its corridor on `Over` born on the flight
+    ///   clock and [`Ribbon::abandon`] sends the `Base` band into its
+    ///   retract beneath it — v3 §2.7 verbatim, K1–K4, and
+    ///   `a_jump_lays_its_wake_over_the_live_band_and_leaves_the_band_s_cells_untouched`,
+    ///   `a_jump_past_the_band_s_oldest_cell_or_off_its_row_still_abandons_it`.
+    ///
+    /// The two laws never disagree about one event because the corridor
+    /// cannot be both lit end to end and not: a move INSIDE the run has no
+    /// dark ground for a corridor to light and no band the hand has left to
+    /// abandon, and a move that LEAVES the run has both. The v3 design's own
+    /// prose says the same thing from the other side — the overlay exists so
+    /// that "a leaving band is never taken over" (R9) can be literal — and a
+    /// band under a hand that never left it is not leaving.
+    ///
+    /// The owner, on v0.85.0: *"the painting system for scrubbing back and
+    /// forth with back word and forward word doesn't work correctly and
+    /// leaves gaps."* Measured (`docs/measured/scrub-gaps-2026-09-14.md`):
+    /// under the 2026-09-09 laws a word hop left the band's clock alone
+    /// ("a hop must not touch the word's clock", 4ca68c467), so the swoosh
+    /// ran on the last KEY's clock under the scrubbing hand — by the
+    /// seventh hop of the owner's scrub the band was mid-retract, its tail
+    /// drained and its boundaries pulled toward the column the retract
+    /// began under, while the hops through it laid cold half-life stubs
+    /// only where the drain had already emptied a cell; and a word hop of
+    /// [`JUMP_MIN_CELLS`] or more ABANDONED the band ("a real jump on the
+    /// same row abandons the band into its swoosh", d23b4f935 → 4ca68c467),
+    /// handing the corridor to a 1.1 s wake and draining the rest, which the
+    /// next hop back found mid-retract and, by the leaving-band clause,
+    /// could not take over. Both are one defect: a band under a hand that
+    /// never left it was treated as a band the hand had left. That law is
+    /// discarded HERE, for the move that stays inside the run; a jump that
+    /// leaves the run — past its oldest cell, off its end onto dark ground,
+    /// to another row — keeps it ([`Ribbon::abandon`], the hop's cold wake).
+    ///
+    /// RENEW, not freeze: the band's clock is the hop's, so a scrub that
+    /// lasts longer than a swoosh keeps the band whole for as long as it
+    /// lasts, and the cells' life ([`Cell::life_s`], spent from the cohort's
+    /// clock through [`live_since`]) is renewed with it — the same choice
+    /// [`Ribbon::hold_phrase`] made for the erase. A band already inside its
+    /// retract when the hop comes is a band already leaving: the 4ca68c467
+    /// clause stands, and the move is judged as the hop or jump it is.
+    ///
+    /// The hold is the clock only — `alive_at`, `phase`, `retract_col`. It
+    /// does NOT re-price `Cohort::grace_s` and does NOT raise
+    /// [`Cell::life_s`] the way [`Ribbon::hold`] does for a typed key: a
+    /// navigation mints no note, so the rest in force has not moved, and a
+    /// wake cohort caught in a corridor keeps the floor grace
+    /// [`PHRASE_REST_MIN_S`] it was minted with ([`Ribbon::mint_cohort`]).
+    /// The hand does not adopt what it crossed into the open phrase either —
+    /// it does not have to: a key that lands in or beside the band takes it
+    /// back through [`Ribbon::join_cohort`] and [`Ribbon::place`] re-assigns
+    /// it there, and an erase takes the whole row back through
+    /// [`Ribbon::hold_phrase`].
+    ///
+    /// Two guards, from the fix-up review (2026-09-14), each the anti-stray
+    /// law's own — "no light with no keystroke behind it", "never brighter
+    /// than the cell was":
+    ///
+    /// * **A cell past its melt opening is a cell already going out.** The
+    ///   expiry melt opens at `1 − EXPIRY_MELT_SHARE` of a cell's life
+    ///   (the reduced-motion fade [`REDUCED_MOTION_FADE_MS`] before its
+    ///   end), and a hop's cold stub ([`WAKE_HOP_LIFE_SHARE`]) or a jump's
+    ///   wake reaches it while its cohort is still in grace. Renewing that
+    ///   cohort's clock restarted `spent` at zero and snapped a stub at
+    ///   0.09 of body to 1.0 in one frame — a ×7.5 step with no attack. So
+    ///   the corridor is lit end to end only by cells not yet melting; over
+    ///   a melting stub the move is the hop it is, lays nothing over the
+    ///   live stub, and the stub finishes melting under the hand. The
+    ///   typed band is never caught by this guard: its life is at least
+    ///   [`swoosh_life_s`] of its phrase's grace, so its melt opens past
+    ///   the retract the phase guard already refuses.
+    /// * **The hold reaches exactly the cohorts that OWN the corridor's
+    ///   columns** — the newest un-leaving cell of each, the one the guard
+    ///   above read. A cohort shadowed under them is left on its clock: an
+    ///   abandoned band's drained cells stay resident (not `leaving()`)
+    ///   under the fresh cells a jump's wake laid in its holes until its
+    ///   swoosh ends, and a hold that renewed "every cohort with a cell in
+    ///   the corridor" brought that band back from `0 … 0, 111` to full
+    ///   in one frame, Fading → Laying, 0.64 s after it was abandoned. As
+    ///   [`Ribbon::hold_phrase`] and the one-finger hold in
+    ///   [`Ribbon::place`] skip `abandoned`, a scrub skips what it did not
+    ///   read. Under v3's layers the reading is narrower still: the owner
+    ///   the guard reads is the corridor column's newest un-leaving cell on
+    ///   EITHER layer, so a live `Over` corridor from an earlier jump counts
+    ///   as light on the glass — which is what it is.
+    fn scrub(&mut self, row: u16, from: u16, to: u16, at: Instant, ctx: &Ctx<'_>) -> bool {
+        let (lo, hi) = (from.min(to), from.max(to));
+        if lo == hi {
+            return false;
+        }
+        // The owner of a column: its newest cell that is not leaving (the
+        // pool is append-ordered; `build` and `wake` read the same one).
+        let owner = |cells: &[Cell], col: u16| {
+            cells
+                .iter()
+                .rposition(|c| c.row == row && c.col == col && !c.leaving())
+        };
+        let reduced = ctx.cfg.reduced_motion;
+        for col in lo..hi {
+            let Some(i) = owner(&self.cells, col) else {
+                return false;
+            };
+            let cell = self.cells[i];
+            if self.env_of(ctx, &cell) <= 0.0 {
+                return false;
+            }
+            let Some(coh) = self.cohorts.iter().find(|k| k.id == cell.cohort) else {
+                return false;
+            };
+            let idle = at.saturating_duration_since(coh.alive_at).as_secs_f32();
+            if coh.abandoned || Phase::at(idle, coh.grace_s).is_none_or(Phase::is_retracting) {
+                return false;
+            }
+            // THE MELT GUARD: `spent` on the clock `env_of` reads
+            // (`live_since`), against the instant the cell's own melt opens.
+            let spent = at
+                .saturating_duration_since(cell.born.max(coh.alive_at))
+                .as_secs_f32();
+            let melt_opens = if reduced {
+                (cell.life_s - REDUCED_MOTION_FADE_MS / 1000.0).max(0.0)
+            } else {
+                cell.life_s * (1.0 - EXPIRY_MELT_SHARE)
+            };
+            if spent > melt_opens {
+                return false;
+            }
+        }
+        // THE HOLD: the owner of each corridor column, and only it. Holding
+        // a cohort twice is the same hold.
+        for col in lo..hi {
+            let Some(i) = owner(&self.cells, col) else {
+                continue;
+            };
+            let id = self.cells[i].cohort;
+            if let Some(coh) = self.cohorts.iter_mut().find(|k| k.id == id) {
                 coh.alive_at = coh.alive_at.max(at);
                 coh.phase = Phase::Laying;
                 coh.retract_col = None;
             }
         }
+        true
     }
 
     /// Abandon the cohorts of ONE row — see [`Ribbon::abandon`] — into the
     /// column the hand left the row at, taking them back if it returns.
     fn abandon_row(&mut self, row: u16, at: Instant, toward: Option<u16>) {
-        let Some(rewound) = at.checked_sub(std::time::Duration::from_secs_f32(RETRACT_START_S))
-        else {
-            return;
-        };
         for coh in &mut self.cohorts {
-            if coh.row != row || coh.abandoned {
+            if coh.row != row {
                 continue;
             }
+            coh.release_clock = None;
+            if coh.abandoned {
+                continue;
+            }
+            // ITS OWN retract start (Rainbow Path v3 §2.6): a cohort whose
+            // phrase rested longer is sent the same `0.40 + 0.24 s` out.
+            let Some(rewound) =
+                at.checked_sub(std::time::Duration::from_secs_f32(coh.retract_start()))
+            else {
+                continue;
+            };
             if coh.retract_col.is_none() {
                 coh.retract_col = toward;
             }
@@ -2762,13 +3991,28 @@ impl Ribbon {
         // Chaining from "the highest t in the pool" instead would hand a cell
         // retyped after a backspace the stop of the erased cell to its right
         // plus one, and leave a colour seam when the erased cells fade.
+        // A TYPED CELL LAID WHERE THE ATTACH STOOD inherits its light
+        // (2026-09-14): the caret cell already carried the head's light at
+        // full under the block, so the cell the key lays there starts with
+        // its attack spent — edge-in and wipe alike — instead of dropping to
+        // the birth floor and pouring back in; the pour is the NEXT attach's
+        // (`plan_run`). A cell laid anywhere else attacks as before.
+        let inherited = typing && self.attach == Some((row, col));
+        let attack_at = if inherited {
+            at.checked_sub(std::time::Duration::from_secs_f32(
+                EDGE_IN_S + ATTACK_WIPE_S,
+            ))
+            .unwrap_or(at)
+        } else {
+            at
+        };
         let cell = Cell {
             row,
             col,
             cohort: cohort.id,
             t: cohort.t_at(col),
             born: at,
-            attack_at: at,
+            attack_at,
             life_s,
             cov0,
             typing,
@@ -2776,6 +4020,8 @@ impl Ribbon {
             retire_at: None,
             birth_disp,
             edge_cells: edge_cells(ctx.surge, ctx.flow.heat),
+            layer: Layer::Base,
+            rearm: None,
         };
         self.place(idx, cell, at, ctx.caret.0);
     }
@@ -2805,11 +4051,7 @@ impl Ribbon {
             // at a press seconds ago, that the floored sweep then re-lays)
             // takes a fresh attack. Identity is ALWAYS the fresh birth: the
             // content witness must not read the new key as the old glyph.
-            let alive = !old.leaving()
-                && at
-                    .saturating_duration_since(live_since(&self.cohorts, &old))
-                    .as_secs_f32()
-                    < old.life_s;
+            let alive = self.alive_at(&old, at);
             if alive && old.typing == typing {
                 cell.attack_at = old.attack_at.min(cell.attack_at);
                 cell.cov0 = cell.cov0.max(old.cov0);
@@ -2823,23 +4065,33 @@ impl Ribbon {
         if typing {
             // The hand is on this cohort now, whatever minted it.
             coh.wake = false;
-            // ONE FINGER, ONE ROW (re-ruled 2026-09-13): a live key holds
-            // every un-abandoned cohort ON THE HAND'S ROW in its laying
-            // phase. It used to hold every row — "a hot paragraph typed
-            // across three wraps is one mark" — which is what kept the row
-            // a composer had re-wrapped away from lit for as long as the
-            // hand typed below it (the owner's "persistent on the screen").
-            // The streak follows the hand: a row it has left leaves on its
-            // own clock (`leave_row`). The cohort the cell was laid INTO is
+            // ONE FINGER, ONE PHRASE, ON THE HAND'S ROW (merged 2026-09-14
+            // from 2026-09-12's row ruling and Rainbow Path v3 §2.3/S6).
+            //
+            // The shipped law is ONE FINGER, ONE ROW: a live key holds every
+            // un-abandoned cohort ON THE HAND'S ROW in its laying phase. It
+            // used to hold every row — "a hot paragraph typed across three
+            // wraps is one mark" — which is what kept the row a composer had
+            // re-wrapped away from lit for as long as the hand typed below
+            // it (the owner's "persistent on the screen"). The streak
+            // follows the hand: a row it has left leaves on its own clock
+            // (`leave_row`). That ruling is model-checked — `aterm-spec`'s
+            // `ribbon_row_hold_model`, invariant `OnlyOwnerRenews`, with a
+            // global hold as its named falsifier — so v3's phrase does not
+            // widen it back across rows; the phrase NARROWS it instead.
+            //
+            // v3's clause: the cohort a typed key lays into belongs to the
+            // OPEN PHRASE — minted into it, or re-assigned to it when the
+            // hand resumes a line whose phrase had closed — and the hold
+            // renews only cohorts of THAT phrase. A cohort of a CLOSED
+            // phrase on the same row (the hand paused past the rest and
+            // started again beside it) is left on its own clock, where the
+            // row law renewed it. The cohort the cell was laid INTO is
             // always refreshed — a fold's own sweep, dated at the key, lands
             // on the row the hand is leaving and is that row's last key.
-            for (i, held) in self.cohorts.iter_mut().enumerate() {
-                if !held.abandoned && (i == idx || held.row == hand_row) {
-                    held.alive_at = held.alive_at.max(at);
-                    held.phase = Phase::Laying;
-                    held.retract_col = None;
-                }
-            }
+            let open = self.phrase_for_lay();
+            self.cohorts[idx].phrase = open;
+            self.hold(open, hand_row, Some(idx), at);
         } else {
             // A WAKE CELL holds only its OWN cohort — and that is always a
             // wake cohort ([`Cohort::wake`]: a jump mints one, a hop joins
@@ -2858,8 +4110,9 @@ impl Ribbon {
     /// The landing cell is included, so the caret block's fill, the train's
     /// phase-lock (`field_at(landing)`, §6.4) and the bed under the caret read
     /// ONE walk; the origin cell is the far end. New cells are born
-    /// [`WAKE_BORN_LAG_S`] past the move and live `life_s`; at most
-    /// [`WAKE_MAX_CELLS`] of them, counted back from the landing.
+    /// along the flight ([`flight_ms`] of the span: cell `j` from the origin
+    /// at `T · j / n`) and live `life_s`; at most [`WAKE_MAX_CELLS`] of them,
+    /// counted back from the landing.
     ///
     /// The wake's cohort takes THE BAND'S OWN WALK ORIGIN
     /// ([`Ribbon::wake_origin`]: the row's freshest cohort's `anchor_col`
@@ -2870,31 +4123,42 @@ impl Ribbon {
     /// Ctrl-A to its origin and repainted stops past the kink on a Ctrl-E
     /// across it.
     ///
-    /// `takeover` is the JUMP's arm: the corridor is minted as a cohort of
-    /// its own and every cell the live band already lights is HANDED OVER,
-    /// not re-lit: same stop, the old cell's own birth (no second attack),
-    /// priced at exactly the light it has now, and the old cell leaves the
-    /// pool. The abandon that follows then finds nothing under the corridor
-    /// to retract, and the eye sees no step — the band simply outlives the
-    /// jump on the wake's clock. Lit cells beyond the cap are taken over too:
-    /// the cap bounds NEW light, never light already on the glass.
+    /// **THE WAKE IS AN OVERLAY** (2026-09-13, Rainbow Path v3 §2.3/§2.7,
+    /// laws K1–K4). Every wake cell is [`Layer::Over`] and the band's own
+    /// cells — [`Layer::Base`] — are never touched: not taken over, not
+    /// re-priced, not moved. `takeover` is the JUMP's arm: the corridor is
+    /// minted as a cohort of its own and laid over every column it crosses
+    /// (within [`WAKE_MAX_CELLS`] of the landing, or beyond it wherever the
+    /// band still carries light — the cap bounds NEW light, never the
+    /// corridor over light already on the glass). Over a live band cell the
+    /// wake cell is born on the flight clock AT THE BAND'S OWN LEVEL
+    /// ([`Cell::rearm`]) and at least its price, so the hand-off has no
+    /// attack and no dip; the abandon that follows drains the band beneath
+    /// on a schedule that follows the meteor ([`Ribbon::abandon`]), so no
+    /// band cell starts spending before the corridor above it is born. A
+    /// band ALREADY LEAVING is covered the same way, from whatever level it
+    /// has: the old "lay nothing under a leaving cell" clause — R6's guard
+    /// against a half-drained cell FROZEN at its level by a takeover — is
+    /// unnecessary once nothing is taken over and a covered level is only
+    /// ever a starting point for `edge-in` (M1), and it was the tear the
+    /// refresh measured: the cells a reversal could not re-strike left
+    /// before the rest. A cell an EARLIER WAKE laid is RE-OWNED by this one
+    /// in place (K4): same birth, same price, re-armed from its current
+    /// level, on this cohort's clock — so a Ctrl-A/Ctrl-E ping-pong at any
+    /// cadence holds one corridor, one interval of light, one wake cohort
+    /// on the row.
     ///
-    /// A band ALREADY LEAVING is not an owner to take over: a cell whose
-    /// cohort is retracting or abandoned stays on that clock, and while it is
-    /// still lit nothing is laid under it — the wake lights only the cells
-    /// the drain has emptied (and, past the drain's end, all of them). Taking
-    /// a half-drained cell over froze it at its instantaneous level for a
-    /// whole wake life beside cells re-lit at full: the frozen partial ramp
-    /// the reviewer reproduced at 1.0 / 1.25 / 1.4 s idle. So a Ctrl-A a
-    /// second after the last key shows the band finishing its exit and a
-    /// fresh wake rising under the cells it has already left, the two never
-    /// sharing a cell; the wake's width grows with the idle from nothing at
-    /// 1.0 s to the full cap once the band is gone.
-    ///
-    /// Without `takeover` (a hop) a cell a live cell owns is left as it is,
-    /// and the new cells join the row's adjacent WAKE cohort or mint one on
-    /// the same origin ([`Ribbon::join_wake_cohort`]) — never a typed
-    /// word's, whose clock and bounds a hop must not touch.
+    /// Without `takeover` (a hop) a column any LIVE light owns is left
+    /// exactly as it is — the band's cell on `Base`, and (merged 2026-09-14
+    /// from the scrub round) an earlier hop's own cold stub on `Over`: a hop
+    /// re-owns nothing, because a cell already inside its expiry melt that a
+    /// hop renewed came back to full in one frame, which is the same
+    /// counter-example [`Ribbon::scrub`]'s melt guard refuses. Re-owning is
+    /// the jump's law (K4 names a jump), and a jump needs it because its
+    /// corridor must be one interval. The hop's new cells join the row's
+    /// adjacent WAKE cohort or mint one on the same origin
+    /// ([`Ribbon::join_wake_cohort`]) — never a typed word's, whose clock and
+    /// bounds a hop must not touch.
     ///
     /// Every wake cell is `typing: false` — load-bearing: the one-finger hold
     /// in [`Ribbon::place`] and the momentum spine read that flag, and
@@ -2921,56 +4185,137 @@ impl Ribbon {
         let leftward = to < from;
         let far = from.min(cols - 1);
         let span = far.abs_diff(to);
-        let born_new = at
-            .checked_add(std::time::Duration::from_secs_f32(WAKE_BORN_LAG_S))
-            .unwrap_or(at);
+        // THE FLIGHT CLOCK (K3): a jump's `T = flight_ms(cells)`, the one
+        // number the meteor head, the bell and the pin already fly on; a
+        // hop takes the flight floor. Cell `j` from the origin is born at
+        // `t0 + T · j / n`.
+        let flight_s = if takeover {
+            flight_ms(f32::from(span))
+        } else {
+            FLIGHT_MIN_MS
+        } / 1000.0;
+        let n = f32::from(span).max(1.0);
         let birth_disp = clamp01(ctx.birth_disp);
         let cov0_new = BODY_COLD_SHARE + (1.0 - BODY_COLD_SHARE) * birth_disp;
         let (anchor_col, t0) = self.wake_origin(row, to, at);
-        let minted = takeover.then(|| self.mint_cohort(row, to, anchor_col, t0, at, true));
+        let minted = takeover.then(|| self.own_wake_cohort(row, to, from, anchor_col, t0, at));
         // Far end first, landing LAST — the pool is append-ordered and the
         // index's last-writer-wins rule reads it so. Birth order does NOT
-        // make the landing the head: every new cell here shares one
-        // `born_new`, and a newest-born head would resolve to the far end
-        // of a leftward corridor. The landing is the head by `head_col`'s
-        // WAKE clause (the caret standing on a wake run's first cell), which
-        // is what puts the hot edge by the caret after a Ctrl-A.
+        // make the landing the head. RESTATED AT THE 0.86 RC MERGE: main's
+        // reason here reads "every new cell here shares one `born_new`",
+        // and on this tree they do not — v3's flight clock gives cell `j`
+        // its own `t0 + T · j / n` just below, so birth order IS the
+        // corridor's own order. The conclusion is unchanged and now holds
+        // for two reasons at once: a newest-born head would resolve to the
+        // far end of a leftward corridor, to the landing of a rightward
+        // one, and to the far end again of a re-owned one — none of which
+        // is a rule. The landing is the head by `head_col`'s WAKE clause
+        // (the caret standing on a wake run's first cell), which is what
+        // puts the hot edge by the caret after a Ctrl-A.
+        // (`Cohort::landing_col` and the `landing_idx` that stamped it are
+        // gone with main's second review round, a5d400c38: the boundary is
+        // one expression on every run again.)
         for k in (0..=span).rev() {
             let col = if leftward { to + k } else { to - k };
-            // The cell that owns this column now: its newest un-retracting
-            // cell (the pool is append-ordered; `build` reads the same one).
-            let owner = self
+            let j = span - k;
+            let born_new = at
+                .checked_add(std::time::Duration::from_secs_f32(
+                    flight_s * f32::from(j) / n,
+                ))
+                .unwrap_or(at);
+            // THE OVER LAYER'S OWNER at this column — an older wake's cell,
+            // whatever its clock — and the BASE cell beneath, if it is live
+            // light: the pool is append-ordered; `build` reads the same
+            // ones.
+            let over = self
                 .cells
                 .iter()
-                .rposition(|c| c.row == row && c.col == col && !c.leaving());
-            let (born, attack_at, cov0) = match owner {
+                .rposition(|c| c.row == row && c.col == col && c.layer == Layer::Over);
+            let base = self
+                .cells
+                .iter()
+                .rposition(|c| c.row == row && c.col == col && c.layer == Layer::Base)
+                .map(|i| {
+                    let c = self.cells[i];
+                    (
+                        c.cov0,
+                        if c.leaving() {
+                            0.0
+                        } else {
+                            self.env_of(ctx, &c)
+                        },
+                    )
+                });
+            let base_cov = base.map_or(0.0, |(cov0, env)| cov0 * env);
+            // The `Over` owner while it is still LIGHT ON THE GLASS — read
+            // for the hop's guard alone. A jump re-owns whatever it finds
+            // there, live or burnt out, because its corridor must be one
+            // interval and a re-owned cell's clock restarts with its new
+            // cohort's (`live_since`).
+            let over_live = over.filter(|&i| {
+                let c = self.cells[i];
+                !c.leaving() && self.env_of(ctx, &c) > 0.0
+            });
+            // **A HOP LEAVES LIVE LIGHT EXACTLY AS IT IS** — the scrub
+            // round's law (2026-09-14), read here over BOTH layers at the
+            // merge. An arrow beside the word you just typed lays nothing
+            // over the band (`Base`), and an arrow that turns back over its
+            // own cold stub lets the stub finish melting instead of re-owning
+            // it (`Over`): renewing a cell already inside its expiry melt is
+            // "light no key bought" — a stub at 0.09 of body came back to
+            // full, ×7.5 in one frame, which is the counter-example
+            // `Ribbon::scrub`'s melt guard was added for. The two are ONE law
+            // read at two seams: the scrub refuses to hold a melting cell, and
+            // the hop that the refusal hands the move to refuses to re-own it.
+            // Re-owning is the JUMP's law (v3 §2.7 K4, which says "a jump
+            // whose corridor overlaps an `Over` cohort"): a corridor must be
+            // one interval, so it re-owns what it covers.
+            if !takeover && (base_cov > 0.0 || over_live.is_some()) {
+                continue;
+            }
+            let (born, attack_at, cov0, rearm) = match over {
                 Some(i) => {
-                    let cell = self.cells[i];
-                    let env = self.env_of(ctx, &cell);
-                    let leaving = self
-                        .cohorts
-                        .iter()
-                        .find(|c| c.id == cell.cohort)
-                        .is_none_or(|c| c.abandoned || c.phase.is_retracting());
-                    if env <= 0.0 {
-                        // Melted to nothing since the last plan, or drained
-                        // by its cohort's retract: a hole, not an owner.
-                        if k >= WAKE_MAX_CELLS {
-                            continue;
-                        }
-                        (born_new, born_new, cov0_new)
-                    } else if leaving || !takeover {
-                        // On its own clock (a band already leaving), or
-                        // under a hop (a live cell is left as it is): lay
-                        // nothing here.
+                    // THE REVERSAL RE-OWNS (K4, M1): the overlapped cell of
+                    // an earlier wake — a Ctrl-A/Ctrl-E ping-pong's last
+                    // corridor, a held arrow's own trail — is taken into
+                    // this wake in place: same birth, same price, its
+                    // envelope re-armed from the level it has NOW so it
+                    // rises through `edge-in` and never steps, on this
+                    // cohort's clock from here. The old cohort keeps only
+                    // the cells this corridor does not cover, on its own
+                    // clock; emptied, it retires. Before this the old
+                    // wake's cells were "leaving" and nothing was laid under
+                    // them — the drain tear the refresh measured 852–889 ms
+                    // after the last reversal (cols 37–41 dark for ~40 ms).
+                    let old = self.cells[i];
+                    let level = clamp01(self.env_of(ctx, &old));
+                    self.cells.remove(i);
+                    (old.born, old.attack_at, old.cov0, Some((at, level)))
+                }
+                None => {
+                    if base_cov <= 0.0 && k >= WAKE_MAX_CELLS {
+                        // Beyond the cap NEW light is not laid; light the band
+                        // already carries there is covered, so the corridor
+                        // stays whole however long the band was.
                         continue;
+                    }
+                    if base_cov > 0.0 {
+                        // OVER A LIVE BAND CELL: born on the flight clock at
+                        // the band's OWN level — its coverage share now — so
+                        // the hand-off has no attack and no dip (M1), and at
+                        // least the band's price, so the corridor is never
+                        // dimmer than the band it covers.
+                        let cov0 = cov0_new.max(base_cov);
+                        (
+                            born_new,
+                            born_new,
+                            cov0,
+                            Some((born_new, clamp01(base_cov / cov0))),
+                        )
                     } else {
-                        let old = self.cells.remove(i);
-                        (old.born, old.attack_at, old.cov0 * env)
+                        (born_new, born_new, cov0_new, None)
                     }
                 }
-                None if k >= WAKE_MAX_CELLS => continue,
-                None => (born_new, born_new, cov0_new),
             };
             let idx = match minted {
                 Some(idx) => idx,
@@ -2993,10 +4338,57 @@ impl Ribbon {
                 // A wake cell is the swoosh's reach, not a key: no key, no
                 // surge, and the crisp edge is the head's property anyway.
                 edge_cells: HOT_EDGE_CELLS,
+                layer: Layer::Over,
+                rearm,
             };
             self.place(idx, cell, at, row);
         }
         minted.map(|idx| self.cohorts[idx].id)
+    }
+
+    /// **ONE LIVE WAKE COHORT PER ROW** (Rainbow Path v3 §2.7, law K4;
+    /// 2026-09-14, measured). A jump whose corridor overlaps a wake cohort
+    /// still inside [`WAKE_LIFE_S`] of its own arrival RE-OWNS it — the
+    /// cohort takes `alive_at := now` and the corridor's cells join it —
+    /// instead of minting a second cohort beside it. Otherwise a fresh one.
+    ///
+    /// WHY, on glass. [`WAKE_MAX_CELLS`] binds at the far end of a corridor,
+    /// so a reversal across more than 32 cells re-lays only the 32 nearest
+    /// its landing; the cells past that stayed on the PREVIOUS cohort's
+    /// clock while the re-laid ones rode the new one, and the two clocks
+    /// came due 120–300 ms apart. The row tore exactly there: measured on
+    /// a 44-cell run at 120 / 200 / 300 ms reversals, a 4–7 cell hole at
+    /// columns 37–42 from +902 ms to +983 ms after the last Ctrl-E, on
+    /// every cadence and on both the merged tree and main. With one cohort
+    /// the whole corridor — re-laid and covered alike — rides one clock and
+    /// leaves together, which is what K2 ("one interval ... until the
+    /// wake's own drain") asks for.
+    fn own_wake_cohort(
+        &mut self,
+        row: u16,
+        to: u16,
+        from: u16,
+        anchor_col: u16,
+        t0: f32,
+        at: Instant,
+    ) -> usize {
+        let (lo, hi) = (to.min(from), to.max(from));
+        let live = self.cohorts.iter().enumerate().find(|(_, c)| {
+            c.row == row
+                && c.wake
+                && !c.abandoned
+                && at.saturating_duration_since(c.alive_at).as_secs_f32() <= WAKE_LIFE_S
+                && c.col0 <= hi
+                && lo < c.col1
+        });
+        if let Some((i, _)) = live {
+            let coh = &mut self.cohorts[i];
+            coh.alive_at = at;
+            coh.phase = Phase::Laying;
+            coh.retract_col = None;
+            return i;
+        }
+        self.mint_cohort(row, to, anchor_col, t0, at, true)
     }
 
     /// The walk origin a wake takes on `row`, as `(anchor_col, t0)`: the
@@ -3067,6 +4459,13 @@ impl Ribbon {
     ) -> usize {
         let id = self.next_cohort;
         self.next_cohort = self.next_cohort.wrapping_add(1);
+        // A wake keeps the floor grace: it is no phrase's, and its cells
+        // expire on `WAKE_LIFE_S` before any longer rest could matter.
+        let grace_s = if wake {
+            PHRASE_REST_MIN_S
+        } else {
+            self.rest_s()
+        };
         self.cohorts.push(Cohort {
             id,
             row,
@@ -3079,8 +4478,12 @@ impl Ribbon {
             abandoned: false,
             wake,
             retract_col: None,
+            drain_right_first: false,
             phase: Phase::Laying,
             rejoinable: false,
+            phrase: 0,
+            grace_s,
+            release_clock: None,
         });
         self.cohorts.len() - 1
     }
@@ -3169,9 +4572,15 @@ impl Ribbon {
         }
     }
 
-    /// A real jump ABANDONS the band: every cohort still in its grace or
-    /// reach — except the jump's own wake, `keep` — is sent straight into
-    /// its retract by rewinding `alive_at` to [`RETRACT_START_S`] ago. The
+    /// A real jump that LEAVES THE RUN abandons the band (since
+    /// 2026-09-14 a same-row jump whose corridor is lit end to end is a
+    /// scrub and never reaches here — [`Ribbon::scrub`]; the 2026-09-09
+    /// ruling "a real jump on the same row abandons the band into its
+    /// swoosh" is kept only for a jump past the band's oldest cell, off its
+    /// end onto dark ground, or to another row): every cohort still in its
+    /// grace or reach — except the jump's own wake, `keep` — is sent
+    /// straight into its retract by rewinding `alive_at` to
+    /// [`RETRACT_START_S`] ago. The
     /// light leaves CONTINUOUSLY from the level it has (the retract's `spend`
     /// starts at exactly `1.0`), where v1's life clamp stepped the melt on
     /// the jump frame; and a cohort already retracting is left on its own
@@ -3180,31 +4589,53 @@ impl Ribbon {
     /// jump left behind beyond it — and a band that was already leaving
     /// when the jump came, which the wake did not touch.
     ///
-    /// `toward` pre-sets the retract's target — a PROGRAM's jump takes the
-    /// band back into the hand's last column rather than wherever the
-    /// program parked the cursor (a repaint parking at column 0 for one
-    /// frame used to pull the whole band left across the line while the
-    /// hand kept typing at its end: a lit island between two dark
-    /// stretches) — and `rejoinable` lets the hand's next key take the
-    /// band back ([`Ribbon::join_cohort`]).
-    fn abandon(&mut self, at: Instant, keep: Option<u32>, toward: Option<u16>, rejoinable: bool) {
-        let Some(rewound) = at.checked_sub(std::time::Duration::from_secs_f32(RETRACT_START_S))
-        else {
-            return;
-        };
+    /// `toward` pre-sets the retract's target and its drain order. A
+    /// PROGRAM's jump takes the band back into the hand's last column
+    /// rather than wherever the program parked the cursor (a repaint
+    /// parking at column 0 for one frame used to pull the whole band left
+    /// across the line while the hand kept typing at its end: a lit island
+    /// between two dark stretches), and `rejoinable` lets the hand's next
+    /// key take the band back ([`Ribbon::join_cohort`]). A SAME-ROW jump
+    /// the hand made passes `(landing, leftward)`: the abandoned cohorts
+    /// take the landing as their frozen target (R1, the caret they let go
+    /// under) and a drain order that FOLLOWS THE METEOR — origin end
+    /// first, landing end last — so under the overlay corridor being born
+    /// along the flight ([`Ribbon::wake`]) no band cell starts spending
+    /// before the corridor cell above it is born: cell `j` from the origin
+    /// is born at `T · j / n ≤ 0.12 · j / n` and starts spending at
+    /// `0.40 · j / n`. A row change passes `None` and the per-row target
+    /// law decides at the retract's first frame.
+    fn abandon(
+        &mut self,
+        at: Instant,
+        keep: Option<u32>,
+        toward: Option<(u16, bool)>,
+        rejoinable: bool,
+    ) {
         for coh in &mut self.cohorts {
             if keep == Some(coh.id) {
                 continue;
             }
+            coh.release_clock = None;
             if !coh.abandoned {
-                if coh.retract_col.is_none() {
-                    coh.retract_col = toward;
-                }
                 coh.rejoinable = rejoinable;
             }
+            // Rewound to ITS OWN retract start: a cohort whose phrase
+            // rested longer is sent the same `0.40 + 0.24 s` out.
+            let Some(rewound) =
+                at.checked_sub(std::time::Duration::from_secs_f32(coh.retract_start()))
+            else {
+                continue;
+            };
             coh.abandoned = true;
             if coh.alive_at > rewound {
                 coh.alive_at = rewound;
+            }
+            if let Some((col, leftward)) = toward
+                && coh.retract_col.is_none()
+            {
+                coh.retract_col = Some(col);
+                coh.drain_right_first = leftward;
             }
         }
     }
@@ -3217,11 +4648,15 @@ impl Ribbon {
     /// ([`super::timing::spend`]), its attack frozen at the stamp so it never
     /// brightens after it ([`Ribbon::env_of`]), and leaves the pool on the
     /// first plan past the melt ([`Ribbon::retire`]). The host's CONTENT
-    /// WITNESS calls this for a cell whose glyph it has seen change or go
-    /// (`Engine::witness_rows`); a cell laid over ink that is still there
-    /// is never touched, which is D2's "a prompt redraw must not wipe the
-    /// ribbon" kept: an erase that puts the same text back before the host
-    /// samples changes nothing here.
+    /// WITNESS calls this for a cell whose glyph it has seen REPLACED
+    /// (`Engine::witness_rows`) — under a live cell, or under a cell it
+    /// released earlier whose cohort is still retracting: the melt then
+    /// multiplies into the retract's envelope ([`Ribbon::env_of`]), so the
+    /// cell is out in `RETIRE_MELT_S` and never brighter than it was. A
+    /// cell laid over ink that is still there is never touched, which is
+    /// D2's "a prompt redraw must not wipe the ribbon" kept: an erase that
+    /// puts the same text back before the host samples changes nothing
+    /// here.
     ///
     /// BY IDENTITY, because a position can hold more than one live cell:
     /// one owner per cell holds per COHORT ([`Ribbon::place`]) and a key
@@ -3247,26 +4682,113 @@ impl Ribbon {
                 continue;
             }
             cell.retire_at = Some(at);
+            if let Some(coh) = self.cohorts.iter_mut().find(|c| c.id == cell.cohort) {
+                coh.release_clock = None;
+            }
             n += 1;
         }
         n
     }
 
-    /// [`Ribbon::retire_cells`] for EVERY live cell on `row` — the
-    /// relocation arm: the caret was observed on another row through a move
-    /// the licence gate declined (a hidden warp the ConPTY bridge would not
-    /// bridge), so the band attached to the old caret row is retired as one
-    /// unit. Returns how many cells were newly stamped.
-    pub fn retire_row(&mut self, row: u16, at: Instant) -> usize {
+    /// **RELEASE SPECIFIC LIVE CELLS TO THE SWOOSH** (2026-09-14, the new
+    /// line's fade — the owner, on the 0.85 build: *"when I went to a new
+    /// line the contrail disappeared versus nicely fading"*). The content
+    /// witness's OTHER verdict: the glyph under each of `cells` (by
+    /// identity, as [`Ribbon::retire_cells`]) has GONE, and nothing replaced
+    /// it — Claude Code's Enter clearing the composer, a Ctrl-U, a cleared
+    /// line. The light has nothing to be wrong over, so it does not take
+    /// the [`RETIRE_MELT_S`] cut that stale light over REPLACED text takes;
+    /// it leaves the way a row the hand left leaves everywhere else: every
+    /// named cell's cohort is ABANDONED into its retract
+    /// ([`Ribbon::abandon_row`]'s law — `alive_at` rewound to
+    /// [`RETRACT_START_S`] ago, so the retract's `spend` starts at exactly
+    /// the light it has and the mark is drawn into the hand farthest-first
+    /// over `RETRACT_DUR_S + RETRACT_FADE_S`, the head the last light to
+    /// go), the target left for `advance_swoosh` to resolve on the retract
+    /// frame (the caret on its own row, the row's own end otherwise). NOT
+    /// rejoinable: the text is gone, so a key landing back on the row lays
+    /// its own light and never takes this back. A cohort already abandoned
+    /// keeps the clock it has (its retract is under way) and only loses its
+    /// rejoin.
+    ///
+    /// Returns how many named cells were resident and not already leaving
+    /// — the cells whose text went, as `retire_cells` counts — so
+    /// `ribbon_retired=` says a band went out because its text went
+    /// whichever clock it left on. Nothing is stamped on the cells
+    /// themselves: they stay owners of their columns for the retract's
+    /// span, exactly as an abandoned row's do, and so they can still be
+    /// named again — by the witness, for a glyph landing under them, onto
+    /// `retire_cells` — which is why the witness keeps their records and
+    /// reports such re-verdicts, and `Engine::witness_rows` counts each
+    /// cell once. Off the frame path's steady state: a release is an event.
+    pub fn release_cells(&mut self, cells: &[(u16, u16, Instant)], at: Instant) -> usize {
+        let Some(rewound) = at.checked_sub(std::time::Duration::from_secs_f32(RETRACT_START_S))
+        else {
+            return 0;
+        };
         let mut n = 0;
-        for cell in &mut self.cells {
-            if cell.row != row || cell.leaving() {
+        for i in 0..self.cells.len() {
+            let cell = self.cells[i];
+            if cell.leaving() || !cells.contains(&(cell.row, cell.col, cell.born)) {
                 continue;
             }
-            cell.retire_at = Some(at);
             n += 1;
+            let Some(coh) = self.cohorts.iter_mut().find(|c| c.id == cell.cohort) else {
+                continue;
+            };
+            if !coh.abandoned {
+                coh.release_clock = Some(ReleaseClock {
+                    alive_at: coh.alive_at,
+                    retract_col: coh.retract_col,
+                    phase: coh.phase,
+                    rejoinable: coh.rejoinable,
+                    cells: self.cells.iter().filter(|c| c.cohort == coh.id).count(),
+                });
+            }
+            coh.rejoinable = false;
+            if coh.abandoned {
+                continue;
+            }
+            coh.abandoned = true;
+            if coh.alive_at > rewound {
+                coh.alive_at = rewound;
+            }
         }
         n
+    }
+
+    /// Whether a release still owns the cohort's clock. The witness checks
+    /// the original glyph identities separately; an explicit abandon or
+    /// retirement never permits restoration through this seam.
+    pub(super) fn restore_releases(
+        &mut self,
+        candidates: &[(u32, usize)],
+        accepted: &mut Vec<u32>,
+    ) {
+        accepted.clear();
+        if candidates.is_empty() {
+            return;
+        }
+        for coh in &mut self.cohorts {
+            let Some(saved) = coh.release_clock else {
+                continue;
+            };
+            let Ok(i) = candidates.binary_search_by_key(&coh.id, |&(id, _)| id) else {
+                continue;
+            };
+            if candidates[i].1 != saved.cells {
+                continue;
+            }
+            // Recover the exact saved clock; no new life or birth is earned.
+            coh.release_clock = None;
+            coh.alive_at = saved.alive_at;
+            coh.retract_col = saved.retract_col;
+            coh.phase = saved.phase;
+            coh.rejoinable = saved.rejoinable;
+            coh.abandoned = false;
+            accepted.push(coh.id);
+        }
+        accepted.sort_unstable();
     }
 
     /// **NO TWO TYPED COHORTS ABUT ON A ROW** (2026-09-13 — the owner's
@@ -3342,6 +4864,7 @@ impl Ribbon {
     /// ONCE and fill the index and the geometry from that same pass (§18).
     pub fn plan(&mut self, ctx: &Ctx<'_>) {
         self.ink.sync(ctx.cfg);
+        self.ground = ctx.cfg.theme_bg;
         self.caret = Some(ctx.caret);
         self.reduced = ctx.cfg.reduced_motion;
         self.cell_h = ctx.geom.ch as f32;
@@ -3365,41 +4888,40 @@ impl Ribbon {
         for i in 0..self.cohorts.len() {
             let coh = self.cohorts[i];
             let idle = now.saturating_duration_since(coh.alive_at).as_secs_f32();
-            let Some(phase) = Phase::at(idle) else {
+            let Some(phase) = Phase::at(idle, coh.grace_s) else {
                 self.cohorts[i].phase = Phase::Fading;
                 continue;
             };
             self.cohorts[i].phase = phase;
-            // THE RETRACT'S TARGET is the caret's column the frame the
-            // retract begins, and it stays: the mark is drawn back into the
-            // hand that let go of it, not toward wherever the caret goes
-            // next (see `Cohort::retract_col`).
+            // THE RETRACT'S TARGET is fixed the frame the retract begins,
+            // and it stays: the mark is drawn back into the hand that let go
+            // of it — or, on a row the caret is not on, into its own end
+            // nearest the hand in logical order ([`Ribbon::retract_target`])
+            // — not toward wherever the caret goes next (see
+            // `Cohort::retract_col`). The drain order is frozen with it.
             if phase.is_retracting() && self.cohorts[i].retract_col.is_none() {
-                // PER ROW (2026-09-13): a cohort on the caret's row is drawn
-                // back into the caret; one on a row ABOVE it into its own
-                // right end (the point the hand left the row at), one BELOW
-                // into its left end. The live caret's column on another row
-                // used to pull an abandoned row's light sideways toward a
-                // column that belongs to a different line.
+                // PER ROW (2026-09-13, restated by Rainbow Path v3 §2.6):
+                // a cohort on the caret's row is drawn back into the caret;
+                // one on a row ABOVE it into its own right end (the fold,
+                // the point the hand left the row at), one BELOW into its
+                // left end, and the drain order is frozen with it. The live
+                // caret's column on another row used to pull an abandoned
+                // row's light sideways toward a column that belongs to a
+                // different line.
                 let coh = self.cohorts[i];
-                self.cohorts[i].retract_col = self.caret.map(|(crow, ccol)| {
-                    if crow == coh.row {
-                        ccol
-                    } else if crow > coh.row {
-                        coh.col1
-                    } else {
-                        coh.col0
-                    }
-                });
+                let (target, right_first) = self.retract_target(&coh);
+                self.cohorts[i].retract_col = target;
+                self.cohorts[i].drain_right_first = right_first;
             }
-            // Under reduced motion the mark is STATIC (§6.11): no reach.
-            if phase != Phase::Reaching || ctx.cfg.reduced_motion {
+            // Under reduced motion the mark is STATIC (§6.11): no reach; and
+            // under a curtain nothing is laid, the reach included.
+            if phase != Phase::Reaching || ctx.cfg.reduced_motion || self.curtain.is_some() {
                 continue;
             }
             // ONE EXTENSION CELL PER BEAT while the mark is still short of the
             // four-letter span. They may overlap letters the burst never typed
             // — accepted by design; the ribbon is source-over and capped.
-            let beats = (((idle - LIFT_GRACE_S) / REACH_STEP_S).floor() as i32 + 1)
+            let beats = (((idle - coh.grace_s) / REACH_STEP_S).floor() as i32 + 1)
                 .clamp(0, i32::from(REACH_BEATS)) as u16;
             let span = coh.col1.saturating_sub(coh.col0);
             let want = FOUR_LETTER_CELLS.saturating_sub(span).min(beats);
@@ -3456,6 +4978,8 @@ impl Ribbon {
             retire_at: tail.retire_at,
             birth_disp: tail.birth_disp,
             edge_cells: tail.edge_cells,
+            layer: tail.layer,
+            rearm: tail.rearm,
         });
         if let Some(coh) = self.cohorts.iter_mut().find(|c| c.id == cohort) {
             coh.col0 = coh.col0.min(col);
@@ -3470,9 +4994,20 @@ impl Ribbon {
         let ember_done = self
             .ember_at
             .is_some_and(|at| now.saturating_duration_since(at).as_secs_f32() >= FOCUS_EMBER_S);
-        if ember_done {
+        let curtain_done = self
+            .curtain
+            .is_some_and(|at| now.saturating_duration_since(at).as_secs_f32() >= CURTAIN_S);
+        if ember_done || curtain_done {
+            // The ember clock goes with the pool it burnt: left standing it
+            // re-offered `ember_at + FOCUS_EMBER_S` — a past instant, floored
+            // to the tail — on every deadline read, a wake with nothing on
+            // glass until the next focus gain (the 2026-09-14 audit). The
+            // curtain's clock goes for the same reason, and the next key lays
+            // afresh in the new space.
             self.cells.clear();
             self.cohorts.clear();
+            self.ember_at = None;
+            self.curtain = None;
             return;
         }
         let cohorts = &self.cohorts;
@@ -3496,7 +5031,11 @@ impl Ribbon {
             }
             cohorts.iter().any(|c| {
                 c.id == cell.cohort
-                    && Phase::at(now.saturating_duration_since(c.alive_at).as_secs_f32()).is_some()
+                    && Phase::at(
+                        now.saturating_duration_since(c.alive_at).as_secs_f32(),
+                        c.grace_s,
+                    )
+                    .is_some()
             })
         });
         let cells = &self.cells;
@@ -3524,6 +5063,37 @@ impl Ribbon {
         let cols = u16::try_from(ctx.geom.cols).unwrap_or(u16::MAX);
         self.plan.clear();
         self.runs.clear();
+        // WHAT THE BLOCK LEAVES BEHIND DRAINS FROM THE LEVEL IT SHOWED
+        // (2026-09-14): a leaving cell the attach floored last frame
+        // (`attach`) that is no longer under the caret — a held Backspace
+        // moves the block one cell left per key, off the cell it erased a
+        // key ago — has been spending on its own clock under the floor,
+        // so uncovering it would drop the rail under it by a quarter in
+        // one frame at 30/s (`spend(33 ms / 240 ms)`). Its retract restarts
+        // here, at the uncovering: it drains from full over the fade it
+        // always had, one cell behind the block. A retract not yet begun (a
+        // kill's farthest-first schedule) keeps its date; a content
+        // retirement keeps its own clock (its law is "never brighter than
+        // the cell was"); a cell a fresh lay shadows is left alone.
+        if let Some((row, col)) = self.attach
+            && ctx.caret != (row, col)
+            && !self
+                .cells
+                .iter()
+                .any(|c| c.row == row && c.col == col && !c.leaving())
+        {
+            for c in &mut self.cells {
+                if c.row == row
+                    && c.col == col
+                    && let Some(at) = c.retract_at
+                    && at < ctx.now
+                {
+                    c.retract_at = Some(ctx.now);
+                }
+            }
+        }
+        self.attach = None;
+        self.attach_floor = None;
         self.index.begin(cols);
         if self.cells.is_empty() {
             return;
@@ -3543,7 +5113,29 @@ impl Ribbon {
         for (i, c) in self.cells.iter().enumerate() {
             sorted.push((c.row, c.col, u32::try_from(i).unwrap_or(u32::MAX)));
         }
-        sorted.sort_unstable_by(|a, b| a.0.cmp(&b.0).then(a.1.cmp(&b.1)).then(b.2.cmp(&a.2)));
+        // THE LAYERS (K1): where a BORN `Over` cell shares a position with a
+        // `Base` cell, the `Over` cell is the position's owner — the
+        // corridor draws over the band it covers, whatever the band's
+        // clock — and an `Over` cell not yet born (the flight clock) leaves
+        // the band beneath it on glass until it is: the corridor is dark
+        // ahead of the meteor only where nothing was lit.
+        let now = ctx.now;
+        let cells = &self.cells;
+        // The position's owner, by rank: a BORN `Over` cell first, then the
+        // newest `Base` cell, and an UNBORN `Over` cell last of all — it is
+        // dark, and the band under it is what is on glass until it is born.
+        let rank = |i: u32| -> u8 {
+            match cells.get(i as usize) {
+                Some(c) if c.layer == Layer::Over => u8::from(now < c.born) * 2,
+                _ => 1,
+            }
+        };
+        sorted.sort_unstable_by(|a, b| {
+            a.0.cmp(&b.0)
+                .then(a.1.cmp(&b.1))
+                .then(rank(a.2).cmp(&rank(b.2)))
+                .then(b.2.cmp(&a.2))
+        });
         for &(row, col, idx) in &sorted {
             let Some(cell) = self.cells.get(idx as usize) else {
                 continue;
@@ -3589,6 +5181,9 @@ impl Ribbon {
             0.0
         };
         let rows = body + rail;
+        // THE ATTACH (2026-09-14): the run at the hand continues one cell
+        // under the caret (`plan_run`), one more cell of slabs to price.
+        let cells = cells + 1;
         let per_slab = (cells as f32 * rows).max(1.0);
         let fit = (RIBBON_QUAD_BUDGET as f32 / per_slab).floor();
         (fit.max(1.0) as usize).clamp(1, SLABS_PER_CELL)
@@ -3610,7 +5205,32 @@ impl Ribbon {
             {
                 e += 1;
             }
-            self.plan_run(ctx, &sorted[s..=e]);
+            // THE RUN'S NEIGHBOURS (2026-09-14): where another run abuts
+            // this one on its row — another cohort's cells, a wake's, a
+            // draining cell's — the two runs SHARE their seam vertex: the
+            // run to the left was planned first (`sorted` is row-major),
+            // so its last vertex is handed to this run as its first, and
+            // this run's first cell hands its light to the run on the
+            // left's last boundary. The seam column then carries the older
+            // side's light at the older side's shape, not a fresh feather
+            // (`plan_run`).
+            let row = sorted[s].0;
+            let nb = |i: Option<usize>, col: Option<u16>| -> Option<Cell> {
+                let (i, col) = (i?, col?);
+                let e = sorted.get(i)?;
+                (e.0 == row && e.1 == col).then(|| self.cells.get(e.2 as usize).copied())?
+            };
+            let abuts_left = nb(s.checked_sub(1), sorted[s].1.checked_sub(1)).is_some();
+            let seam = if abuts_left {
+                self.runs
+                    .last()
+                    .filter(|r| r.row == row && r.col1.checked_add(1) == Some(sorted[s].1))
+                    .and_then(|r| self.plan.get(r.hi.checked_sub(1)?).copied())
+            } else {
+                None
+            };
+            let right = nb(Some(e + 1), sorted[e].1.checked_add(1));
+            self.plan_run(ctx, &sorted[s..=e], seam, right);
             s = e + 1;
         }
     }
@@ -3737,7 +5357,17 @@ impl Ribbon {
         // it (§6.11) — the natural life, the retract stamp, the ember and the
         // swoosh all resolve through `reduced_fade`; the 18 ms `edge-in`
         // stays, because it is the one sanctioned attack and not a motion.
-        let mut env = (BIRTH_EDGE_FLOOR + (1.0 - BIRTH_EDGE_FLOOR) * edge_in(age))
+        // THE ATTACK: from dark through `edge-in` at birth — or, for a cell
+        // RE-ARMED from a level (`Cell::rearm`, M1), from exactly that level
+        // at the re-arm's instant up to full through the same `edge-in`.
+        let attack = match cell.rearm {
+            Some((re_at, level)) => {
+                let r = attack_now.saturating_duration_since(re_at).as_secs_f32();
+                level + (1.0 - level) * edge_in(r)
+            }
+            None => BIRTH_EDGE_FLOOR + (1.0 - BIRTH_EDGE_FLOOR) * edge_in(age),
+        };
+        let mut env = attack
             * if reduced {
                 reduced_fade(cell.life_s - spent)
             } else {
@@ -3762,39 +5392,78 @@ impl Ribbon {
                 spend(clamp01(r / RETIRE_MELT_S))
             };
         }
-        if let Some(at) = self.ember_at {
+        if let Some(at) = self.curtain {
+            // THE CURTAIN: the retract's own `spend`, and the retract's own
+            // FARTHEST-FIRST order — the cell furthest from the hand in
+            // logical order ([`Cohort::drain_rank`], the same frozen
+            // [`Cohort::drain_right_first`] the natural drain reads) starts
+            // spending at the curtain's instant, the cell under the hand at
+            // [`CURTAIN_STAGGER_S`], and each takes [`CURTAIN_SPEND_S`] to
+            // reach exactly zero — so the last of them is exactly zero at
+            // `CURTAIN_S` and the band gathers INTO the hand instead of
+            // dropping whole. A curtain on ONE clock is what made the count
+            // fall 19 → 0 in a single frame on glass; see
+            // [`CURTAIN_STAGGER_S`].
             let r = now.saturating_duration_since(at).as_secs_f32();
             env *= if reduced {
-                reduced_fade(FOCUS_EMBER_S - r)
+                reduced_fade(CURTAIN_S - r)
             } else {
-                spend(clamp01(r / FOCUS_EMBER_S))
+                let rank = coh.map_or(1.0, |c| c.drain_rank(cell.col));
+                let t0 = CURTAIN_STAGGER_S * (1.0 - rank);
+                spend(clamp01((r - t0) / CURTAIN_SPEND_S))
             };
-        }
-        if let Some((at, level)) = self.rearm {
-            // Focus regained mid-ember: back up from the level it had, on the
-            // one sanctioned attack, so the return is continuous.
-            let r = attack_now.saturating_duration_since(at).as_secs_f32();
-            env *= level + (1.0 - level) * edge_in(r);
         }
         if let Some(coh) = coh
             && coh.phase.is_retracting()
         {
             let idle = now.saturating_duration_since(coh.alive_at).as_secs_f32();
             if reduced {
-                env *= reduced_fade(SWOOSH_TOTAL_S - idle);
+                env *= reduced_fade(coh.swoosh_total() - idle);
             } else {
-                let span = f32::from(coh.col1.saturating_sub(coh.col0)).max(1.0);
                 // FARTHEST-FIRST, on the retract's own schedule: the cell
-                // FURTHEST FROM THE HEAD starts spending first and each takes
-                // `RETRACT_FADE_S` to reach exactly zero, so the mark is drawn
-                // back INTO the hand. Draining head-first would be the same
-                // arithmetic reading the mark backwards, and it looks like the
-                // ribbon abandoning the caret.
-                let from_head =
-                    f32::from(coh.col1.saturating_sub(1).saturating_sub(cell.col)) / span;
-                let t0 = RETRACT_START_S + RETRACT_DUR_S * (1.0 - from_head);
+                // FURTHEST FROM THE HAND in logical order starts spending
+                // first ([`Cohort::drain_rank`] — the left end on the
+                // caret's row and on a row above it, the right end on a row
+                // below) and each takes `RETRACT_FADE_S` to reach exactly
+                // zero, so the mark is drawn back INTO the hand. Draining
+                // head-first would be the same arithmetic reading the mark
+                // backwards, and it looks like the ribbon abandoning the
+                // caret.
+                let t0 = coh.retract_start() + RETRACT_DUR_S * (1.0 - coh.drain_rank(cell.col));
                 env *= spend(clamp01((idle - t0) / RETRACT_FADE_S));
             }
+        }
+        // THE FOCUS EMBER AND ITS REARM RUN LAST (2026-09-14), because the
+        // ember's floor is priced against the light the cell ACTUALLY has —
+        // everything above, the melt and the retract and the swoosh's own
+        // drain included. Priced against the birth ceiling instead, a cell
+        // that had already melted a little would reach its colour floor
+        // before its neighbours, which is the very thing the floor exists to
+        // forbid.
+        if let Some(at) = self.ember_at {
+            // THE EMBER, PER STOP: the fall is read into this cell's OWN
+            // range by [`ember_level`] and the go-out is one common
+            // multiplier over every stop at its own floor, so no stop can
+            // cross the colour floor before its neighbours. The band leaves
+            // as one object.
+            let r = now.saturating_duration_since(at).as_secs_f32();
+            let f = if reduced {
+                reduced_fade(FOCUS_EMBER_S - r)
+            } else {
+                spend(clamp01(r / FOCUS_EMBER_S))
+            };
+            env *= ember_level(self.ember_floor(ctx, cell, env), f);
+        }
+        if let Some((at, fade)) = self.rearm {
+            // Focus regained mid-ember: back up from the level it had, on the
+            // one sanctioned attack, so the return is continuous. The stamp
+            // carries the ember's own FADE at the regain, not one level: the
+            // ember's level is per stop, so each cell rearms from exactly
+            // where it was (a single shared number would step every cell but
+            // one, up or down, on the regain frame).
+            let level = ember_level(self.ember_floor(ctx, cell, env), fade);
+            let r = attack_now.saturating_duration_since(at).as_secs_f32();
+            env *= level + (1.0 - level) * edge_in(r);
         }
         env
     }
@@ -3806,12 +5475,36 @@ impl Ribbon {
     /// is the bed's own published ceiling, and the only one this producer
     /// applies).
     fn cov_of(&self, ctx: &Ctx<'_>, cell: &Cell) -> f32 {
-        let cap = if ctx.cfg.dark_theme {
-            UNDER_COV_CAP
-        } else {
-            light_role(ctx.cfg).alpha_cap()
-        };
+        let cap = cov_cap(ctx.cfg);
         (cap * cell.cov0 * self.env_of(ctx, cell) * clamp01(ctx.cfg.intensity)).clamp(0.0, cap)
+    }
+
+    /// **THE EMBER'S FLOOR FOR THIS CELL**, as a share of the ember's own
+    /// factor: the alpha byte at which its stop stops being seen over the
+    /// live theme's ground ([`BedInkLut::seen_floor_at`], with
+    /// [`EMBER_FLOOR_MARGIN`]) divided by the coverage the cell has with
+    /// every OTHER envelope factor already spent (`carried`). `0` — no floor,
+    /// today's curve — for a cell with no coverage to spend, and for an
+    /// unsynced ink table.
+    fn ember_floor(&self, ctx: &Ctx<'_>, cell: &Cell, carried: f32) -> f32 {
+        self.ember_floor_of(
+            cov_cap(ctx.cfg) * cell.cov0 * clamp01(ctx.cfg.intensity) * carried,
+            cell.t,
+        )
+    }
+
+    /// [`Ribbon::ember_floor`] against a coverage already priced — the form
+    /// the cadence fold reads, which has a peak and a walk position and no
+    /// [`Config`].
+    fn ember_floor_of(&self, full_cov: f32, t: f32) -> f32 {
+        if !full_cov.is_finite() || full_cov <= 0.0 {
+            return 0.0;
+        }
+        // NOT clamped to 1: a floor over the cell's own full coverage means
+        // "hold full through the dim", and [`ember_level`]'s clamp says so —
+        // clamping the floor instead would take that cell out of the common
+        // go-out's units and it would leave on its own.
+        (self.ink.seen_floor_at(t) * EMBER_FLOOR_MARGIN / full_cov).max(0.0)
     }
 
     /// **THE FROM-THE-HAND ATTACK** (2026-09-13, `RAINBOW-KITTY-V2.md` §30)
@@ -3880,6 +5573,30 @@ impl Ribbon {
         if ctx.cfg.reduced_motion {
             return x;
         }
+        // THE CURTAIN draws every boundary into the column its own cohort
+        // was frozen toward when the curtain fell ([`Ribbon::curtain`] —
+        // per COHORT, exactly as a natural retract, and derived from the
+        // band's own head rather than from a caret the seam has moved), on
+        // the same `suck-in` the retract uses and toward the same edge of
+        // the same block, whatever the cohort's phase: the eye reads the one
+        // exit it already knows. Reading [`Ribbon::caret`] here is wrong
+        // twice over — the engine's caret mirror is forgotten with the space
+        // that ended, `plan` re-stamps it from the NEW space every frame,
+        // and at the alt-screen seam the Return that launched the program
+        // has already taken it to column 0 of the next line.
+        if let Some(at) = self.curtain {
+            let u = clamp01(ctx.now.saturating_duration_since(at).as_secs_f32() / CURTAIN_S);
+            let target = self
+                .cohorts
+                .iter()
+                .find(|c| c.id == cohort)
+                .and_then(|c| c.retract_col);
+            let Some(col) = target else {
+                return x;
+            };
+            let caret_x = f32::from(ctx.geom.origin_x) + f32::from(col) * ctx.geom.cw as f32;
+            return caret_x + (x - caret_x) * (1.0 - suck_in(u));
+        }
         let Some(coh) = self
             .cohorts
             .iter()
@@ -3891,7 +5608,7 @@ impl Ribbon {
             .now
             .saturating_duration_since(coh.alive_at)
             .as_secs_f32();
-        let u = clamp01((idle - RETRACT_START_S) / (RETRACT_DUR_S + RETRACT_FADE_S));
+        let u = clamp01((idle - coh.retract_start()) / (RETRACT_DUR_S + RETRACT_FADE_S));
         let target = coh.retract_col.or_else(|| self.caret.map(|(_, col)| col));
         // The target is the caret cell's LEFT EDGE (2026-09-13), not its
         // centre: the mark shortens into the hand and stops at the block,
@@ -3982,7 +5699,53 @@ impl Ribbon {
 
     /// Plan ONE contiguous run into [`Ribbon::plan`], boundary by boundary,
     /// with [`Ribbon::slabs_per_cell`] vertices per cell.
-    fn plan_run(&mut self, ctx: &Ctx<'_>, run: &[(u16, u16, u32)]) {
+    ///
+    /// `seam` is the last vertex of the run abutting this one on its left,
+    /// if any, and `right_nb` the owner cell abutting it on its right (another
+    /// cohort's — see [`Ribbon::build_runs`]): the run's first boundary IS the
+    /// seam vertex (shape and colour bit for bit, its light the older side's
+    /// under the tail-ease law below), and its last boundary prices the
+    /// right neighbour's light into the same law, so two abutting runs meet
+    /// at one vertex instead of a feather.
+    ///
+    /// **THE ATTACH (2026-09-14, the owner's notch).** A typed run whose head
+    /// stands under a live caret — the caret one column right of the head
+    /// cell, the head the run's last cell, nothing laid under the caret —
+    /// continues ONE CELL past its head boundary with the head boundary's own
+    /// sample, so the body, the strip and the rail run on under the caret
+    /// cell and the block stands ON the band: the leading under the block
+    /// and the crown above it carry the head's light instead of the ground.
+    /// Before this the band ended at the block's left edge — its rail 22
+    /// device rows deep at the owner's cell, its crown one row above the
+    /// cell top — and the ground showed as a black foot under the block and
+    /// a black step beside it: "a right angle of black from the cursor to
+    /// the underline". The extension is the head's light and nothing else
+    /// (no key, no clock of its own): it is priced from the head boundary,
+    /// pulled by the head's retract, and it is gone with the head.
+    ///
+    /// **…AND IT SURVIVES AN ERASE** (review of the attach, 2026-09-14).
+    /// The attach's law is "the caret cell carries no LIVE light": a cell
+    /// under the caret that is LEAVING — the erased cell a Backspace left
+    /// the caret over, draining on `retract_at`; a cell the content witness
+    /// retired under the caret — does not own the caret cell either. Its
+    /// slabs are planned as before (its own shape, its own colour, its own
+    /// spend), FLOORED at the attach's level ([`AttachFloor`]): the block
+    /// stands on the band while the cell spends, and the frame the cell
+    /// retires and the attach's own segments take its place changes no
+    /// byte. With the first cut's predicate (`head == col1 && right_nb is
+    /// none`) the erased cell's spend took the caret cell from 215 to 0
+    /// under the block over 224 ms, then its retirement switched the attach
+    /// on at full in ONE frame — a 107-level rise at the peak, 214 at the
+    /// darkest column — on every Backspace. The floor is applied inside the
+    /// boundary loop, never as extra segments: two polylines co-owning the
+    /// caret cell's x would composite the source-over bed twice.
+    fn plan_run(
+        &mut self,
+        ctx: &Ctx<'_>,
+        run: &[(u16, u16, u32)],
+        seam: Option<Segment>,
+        right_nb: Option<Cell>,
+    ) {
         let row = run[0].0;
         let (col0, col1) = (run[0].1, run[run.len() - 1].1);
         let Some(cohort) = self.cells.get(run[0].2 as usize).map(|c| c.cohort) else {
@@ -4007,8 +5770,55 @@ impl Ribbon {
             (e.1 == col).then(|| self.cells.get(e.2 as usize))?
         };
         let cw = ctx.geom.cw as f32;
+        // THE ATTACH's condition (see the doc above): a typed run, wet at
+        // the hand, the caret one column right of the head and inside the
+        // pane, and no LIVE light under the caret — nothing laid there, or
+        // a cell that is leaving (its own run's, or the neighbour's).
+        let pane_end = self.pane.map_or(
+            u16::try_from(ctx.geom.cols).unwrap_or(u16::MAX),
+            |(c0, w)| c0.saturating_add(w),
+        );
+        let caret_cell = head_col.wrapping_add(1);
+        let under_caret_leaving = match cell_at(caret_cell) {
+            Some(c) => c.leaving(),
+            None => right_nb.as_ref().is_some_and(Cell::leaving),
+        };
+        let caret_free = cell_at(caret_cell).is_none() && right_nb.is_none() || under_caret_leaving;
+        let attach = stream_dir < 0
+            && wet
+            && at_caret
+            && ctx.caret.1 == caret_cell
+            && ctx.caret.1 < pane_end
+            && caret_free;
+        // THE ATTACH'S OWN ATTACK: the birth floor and the 18 ms edge-in
+        // (T2, T3 — the level's own ramp), and the from-the-hand wipe
+        // over `ATTACK_WIPE_S` from the head's edge outward, all on the
+        // head cell's BIRTH clock (the key that put the caret here) —
+        // whatever attack the head cell itself inherited. `wipe_of` is
+        // a RATIO to the uniform attack, so the uniform attack is put
+        // back here: the head's light is already at full.
+        let attack = attach
+            .then(|| cell_at(head_col).copied())
+            .flatten()
+            .map(|head| {
+                let probe = Cell {
+                    attack_at: head.born,
+                    ..head
+                };
+                let age = ctx.now.saturating_duration_since(head.born).as_secs_f32();
+                (
+                    BIRTH_EDGE_FLOOR + (1.0 - BIRTH_EDGE_FLOOR) * edge_in(age),
+                    probe,
+                )
+            });
+        if attack.is_some() {
+            self.attach = Some((row, caret_cell));
+        }
         let lo = self.plan.len();
         let mut prev: Option<(f32, Sample)> = None;
+        // The boundary (index from `col0`) a hard edge doubled, if any —
+        // see THE BLOCK'S RIGHT EDGE below; the head index accounts for it.
+        let mut doubled: Option<usize> = None;
         for boundary in u32::from(col0)..=u32::from(col1) + 1 {
             let left = boundary
                 .checked_sub(1)
@@ -4033,11 +5843,6 @@ impl Ribbon {
             let wa = self.wipe_of(ctx, a, if caret_side_right { 0.0 } else { 1.0 });
             let wb = self.wipe_of(ctx, b, if caret_side_right { 1.0 } else { 0.0 });
             let mid = |u: f32, v: f32| (u + v) * 0.5;
-            // THE TAIL EASE: the mark's oldest outer boundary — the LEFT end,
-            // always (see `Run::head`) — keeps a tenth of its coverage and the
-            // first cell's slabs ramp it back to full, so the band ends
-            // through a one-cell feather instead of a cliff.
-            let ease = if left.is_none() { RUN_TAIL_EASE } else { 1.0 };
             // THE BRIGHTER SIDE OWNS THE BOUNDARY (2026-09-13). Shape and
             // colour are the midpoint of the two cells; COVERAGE is the
             // brighter cell's, and the dimmer cell's own level is reached
@@ -4047,13 +5852,110 @@ impl Ribbon {
             // retired (+74..+100 levels in one tick, ~240 ms after the last
             // Backspace), and dimmed the previous glyph's cell by a third for
             // one frame on every key while the new cell's edge-in ran.
-            let here = (
+            //
+            // …AND THE YOUNGER SIDE ENTERS AT THE TAIL EASE (2026-09-14).
+            // The LEFT side is the older light on every run — the tail of a
+            // typed run, and, for want of anything the caret cannot move,
+            // of a wake too (see the note below the seam branches) — and the
+            // right side feathers in at [`RUN_TAIL_EASE`], the boundary
+            // taking the brighter of the two. An absent side gives no light, so the
+            // run's outer tail boundary is the one-cell feather it always
+            // was; a live neighbour at full light — another run's cell —
+            // owns the seam and no feather shows; a neighbour that is
+            // LEAVING hands the feather over exactly as fast as its light
+            // goes, so the frame that retires it changes no byte. The flat
+            // tenth at `left.is_none()` printed a dark column and a step
+            // inside a continuous band wherever two live runs met, and a
+            // pop the frame a drained neighbour retired.
+            //
+            // At a SEAM with the run on the left, this run's first vertex
+            // is that run's last — the same spine, reach and stop, so the
+            // two polylines meet at one point whatever their own heads and
+            // waves say — and its light is what that vertex already carries
+            // (which priced this run's first cell in, below). At a seam with
+            // a run on the right, the neighbour's light enters this run's
+            // last boundary the same way.
+            let mut la = left.map_or(0.0, |_| sa.3 * wa);
+            let mut lb = right.map_or(0.0, |_| sb.3 * wb);
+            let mut shape = (
                 mid(sa.0, sb.0),
                 mid(sa.1, sb.1),
                 mid(sa.2, sb.2),
                 mid(a.t, b.t),
-                (sa.3 * wa).max(sb.3 * wb) * ease,
             );
+            if left.is_none()
+                && let Some(seam) = seam
+            {
+                la = f32::from(seam.cov);
+                shape = (seam.spine, seam.up, seam.dn, seam.t);
+            }
+            if right.is_none()
+                && let Some(nb) = right_nb.as_ref()
+            {
+                // THE NEIGHBOUR'S OWN EDGE (2026-09-14, review): this
+                // boundary is `nb`'s LEFT edge by construction, whatever
+                // way THIS run's light streams — `wipe_of`'s `dist` runs
+                // from a cell's caret side, and the neighbour's is its own
+                // run's business. A by-construction correction: the term
+                // only enters through the ease, and `wipe_of` is 1.0 for
+                // any cell that is not `typing` or is older than
+                // `ATTACK_WIPE_S`, so it is reachable only where a leftward
+                // run abuts a neighbour's freshly typed cell inside 40 ms.
+                // `caret_side_right` below still picks the wipe's edge for
+                // this run's OWN cells, so the boundary's light is not yet
+                // free of the caret — only its choice of soft end is.
+                lb = self.cov_of(ctx, nb) * self.wipe_of(ctx, nb, 1.0);
+            }
+            // …AND IT IS THE SAME EXPRESSION ON EVERY RUN (2026-09-14, at
+            // the merge with the scrub round). The left side owns the
+            // boundary and the right enters at the ease, whichever way this
+            // run's light streams: `la` is the neighbour's at a run's first
+            // boundary (the seam, or nothing — which is the one-cell
+            // feather the oldest end has always opened with) and the run's
+            // OWN at its last (where the head, the attach and the block
+            // stand, whole). Mirroring the expression for a leftward wake
+            // put the choice in `head_col`, which resolves the head — and
+            // so the stream — from the CARET, every frame: a caret
+            // scrubbing rightward into a leftward corridor's own cells (a
+            // Ctrl-A's holes, then two Rights) took the own-cell head
+            // instead of the wake's landing, the stream flipped, and the
+            // corridor's far boundary went 23 → 233 in ONE frame — a
+            // 210-level rise inside a settled band, over a drained cell
+            // with no key behind it. Which end of a mark is soft is not
+            // something the hand may change by moving.
+            let natural = la.max(lb * RUN_TAIL_EASE);
+            // THE BLOCK'S RIGHT EDGE IS A HARD EDGE. At a leaving caret
+            // cell's far edge the vertex is floored (`AttachFloor`), and
+            // when the band goes on past it — the next erased cell of a
+            // held Backspace, a neighbour run — the SAME x carries a second
+            // vertex at the boundary's natural light, so the cell to the
+            // right lerps from its own seam and not from the floor:
+            // `ribbon_beam` prices a slab once at its centre, so a slab
+            // running from the floored vertex to a nearly-spent neighbour
+            // read half the floor (97 levels in the 10 px right of the
+            // block) and vanished in one frame when that neighbour retired.
+            // The zero-length segment between the two draws nothing (the
+            // beam skips a span under 1e-3), and the attach's own segments
+            // end at the block's right edge the same way.
+            let floored = left
+                .and_then(|l| self.attach_floor_at(ctx, row, l, 1.0))
+                .map(|floor| natural.max(floor));
+            let cov = floored.unwrap_or(natural);
+            let here = (shape.0, shape.1, shape.2, shape.3, cov);
+            // THE ATTACH'S LEVEL is the head boundary's: from here on the
+            // caret cell's slabs — this run's or the neighbour run's — and
+            // the attach's own segments read it.
+            if let Some((uniform, probe)) = attack
+                && boundary == u32::from(caret_cell)
+            {
+                self.attach_floor = Some(AttachFloor {
+                    row,
+                    col: caret_cell,
+                    base: cov,
+                    uniform,
+                    probe,
+                });
+            }
             let x = f32::from(ctx.geom.origin_x) + boundary as f32 * cw;
             if let Some((px, p)) = prev {
                 // The cell between `prev` and `here` is `a`: its interior
@@ -4066,6 +5968,13 @@ impl Ribbon {
                     let l = |u: f32, v: f32| u + (v - u) * f;
                     let own =
                         sa.3 * self.wipe_of(ctx, a, if caret_side_right { 1.0 - f } else { f });
+                    let mut cov = l(p.4, here.4).min(own);
+                    // THE FLOOR inside a leaving caret cell (`AttachFloor`):
+                    // `f` runs from the head's edge, the attach's own wipe
+                    // coordinate.
+                    if let Some(floor) = self.attach_floor_at(ctx, row, a, f) {
+                        cov = cov.max(floor);
+                    }
                     self.plan.push(Segment {
                         // ROUNDED TO THE PIXEL LATTICE: `ribbon_beam` tiles
                         // half-open at `ceil`, and a fractional interior vertex
@@ -4076,7 +5985,7 @@ impl Ribbon {
                         up: l(p.1, here.1),
                         dn: l(p.2, here.2),
                         t: l(p.3, here.3),
-                        cov: l(p.4, here.4).min(own).clamp(0.0, 255.0) as u8,
+                        cov: cov.clamp(0.0, 255.0) as u8,
                     });
                 }
             }
@@ -4088,7 +5997,47 @@ impl Ribbon {
                 t: here.3,
                 cov: here.4.clamp(0.0, 255.0) as u8,
             });
-            prev = Some((x, here));
+            let continues =
+                right.is_some() || (boundary == u32::from(col1) + 1 && right_nb.is_some());
+            let onward = if floored.is_some() && continues {
+                doubled = Some((boundary - u32::from(col0)) as usize);
+                let seam = (shape.0, shape.1, shape.2, shape.3, natural);
+                self.plan.push(Segment {
+                    x: self.retract_x(ctx, cohort, x).round(),
+                    spine: seam.0,
+                    up: seam.1,
+                    dn: seam.2,
+                    t: seam.3,
+                    cov: seam.4.clamp(0.0, 255.0) as u8,
+                });
+                seam
+            } else {
+                here
+            };
+            prev = Some((x, onward));
+        }
+        // THE ATTACH'S OWN SEGMENTS: one cell on under a live caret, the
+        // head boundary's own sample at every slab (see the doc above) —
+        // only where NOTHING is laid under the caret. A leaving cell there
+        // keeps its own slabs, floored above.
+        if attach
+            && !under_caret_leaving
+            && let Some((px, p)) = prev
+            && let Some(af) = self.attach_floor
+        {
+            let x = px + cw;
+            for j in 1..=slabs {
+                let f = j as f32 / slabs as f32;
+                let cov = af.level(self, ctx, f);
+                self.plan.push(Segment {
+                    x: self.retract_x(ctx, cohort, px + (x - px) * f).round(),
+                    spine: p.0,
+                    up: p.1,
+                    dn: p.2,
+                    t: p.3,
+                    cov: cov.clamp(0.0, 255.0) as u8,
+                });
+            }
         }
         let hi = self.plan.len();
         if hi > lo {
@@ -4097,10 +6046,14 @@ impl Ribbon {
             // head is the landing's LEFT edge — the run's first boundary —
             // and its stream runs the other way (`Run::stream_dir`).
             let head_boundary = usize::from(head_col - col0) + 1;
+            // A hard edge doubled before the head shifts every later
+            // vertex by one (the head itself is live light, never the
+            // doubled boundary).
+            let shift = usize::from(doubled.is_some_and(|d| d < head_boundary));
             let head = if stream_dir > 0 {
                 lo
             } else {
-                (lo + head_boundary * slabs).min(hi - 1)
+                (lo + head_boundary * slabs + shift).min(hi - 1)
             };
             self.runs.push(Run {
                 row,
@@ -4116,6 +6069,16 @@ impl Ribbon {
                 stream_dir,
             });
         }
+    }
+
+    /// The attach's floor under `cell` at `dist` across it (`0` at the
+    /// head's edge), or `None`: the floor applies to a LEAVING cell at the
+    /// caret cell of this frame's attach ([`AttachFloor`]) and to nothing
+    /// else — a live cell owns its light, and a leaving cell anywhere else
+    /// drains as it always did.
+    fn attach_floor_at(&self, ctx: &Ctx<'_>, row: u16, cell: &Cell, dist: f32) -> Option<f32> {
+        let af = self.attach_floor?;
+        (af.row == row && af.col == cell.col && cell.leaving()).then(|| af.level(self, ctx, dist))
     }
 
     // -- emit --------------------------------------------------------------
@@ -4146,9 +6109,11 @@ impl Ribbon {
     /// budget as the body, after the body of its run — a saturated frame
     /// sheds the oldest run's rail before that run's body.
     pub fn emit(&mut self, ctx: &Ctx<'_>, frame: &mut Frame<'_>) {
+        self.ink_quads = 0;
         if self.plan.is_empty() || self.runs.is_empty() {
             return;
         }
+        let ink_from = frame.under.len();
         let shoulder = Self::body_profile(ctx.cfg).shoulder;
         let rail = Self::rail_lit(ctx.cfg);
         let chf = ctx.geom.ch as f32;
@@ -4271,6 +6236,21 @@ impl Ribbon {
         self.runs = runs;
         self.verts = verts;
         self.emit_hot_edge(ctx, frame);
+        // WHAT THIS FRAME PUT ON THE GLASS, off the frame's own pixels (see
+        // [`Ribbon::ink_quads`]). One saturating compare per emitted quad,
+        // no allocation.
+        let bg = ctx.cfg.theme_bg;
+        self.ink_quads = frame.under[ink_from..]
+            .iter()
+            .filter(|q| reads_as_ink(over_premul(bg, q.color, q.alpha)))
+            .count();
+    }
+
+    /// How many of the last frame's ribbon quads read as band ink on the
+    /// glass — `trail status`'s `ribbon_drawn=`. See [`Ribbon::ink_quads`].
+    #[must_use]
+    pub fn ink_quad_count(&self) -> usize {
+        self.ink_quads
     }
 
     /// The gain of §4.1's hot edge, `0..1`, from the spine the head cell was
@@ -4285,12 +6265,23 @@ impl Ribbon {
     /// keystroke behind it. This is the PRICE only; [`Ribbon::emit_hot_edge`]
     /// multiplies in the head cell's envelope ([`Ribbon::env_of`]) so the
     /// hairline goes out with its body.
+    ///
+    /// `typed` is whether the head cell is a KEY's ([`Cell::typing`]): the
+    /// floor is a typed key's alone, so a cold arrow's wake — no key, no
+    /// momentum — carries exactly the hairline it always had, none.
     #[must_use]
-    pub fn hot_edge_gain(cfg: &Config, disp: f32) -> f32 {
+    pub fn hot_edge_gain(cfg: &Config, disp: f32, typed: bool) -> f32 {
         if !cfg.dark_theme || cfg.reduced_motion {
             return 0.0;
         }
-        smoothstep01((clamp01(disp) - HOT_EDGE_DISP_MIN) / HOT_EDGE_DISP_SPAN)
+        // THE FLOOR (2026-09-14): the edge EXISTS on a cold hand — the first
+        // key of a word attaches the band's top to the caret like any other
+        // key — and the rest of it ramps with the hand as before. A wake's
+        // head is no key (review, 2026-09-14): a cold hop landed under a
+        // half-gain hairline it never had.
+        let floor = if typed { HOT_EDGE_GAIN_FLOOR } else { 0.0 };
+        floor
+            + (1.0 - floor) * smoothstep01((clamp01(disp) - HOT_EDGE_DISP_MIN) / HOT_EDGE_DISP_SPAN)
     }
 
     /// **REFINEMENT A** (§4.1) — a 1-px additive hairline IN THE SPECTRUM
@@ -4343,7 +6334,8 @@ impl Ribbon {
         // the hand — the ember, the expiry melt, the swoosh's drain — and a
         // hairline that ignored it rode the retract at full coverage over a
         // body that had spent to zero, then snapped off with the cells.
-        let gain = Self::hot_edge_gain(ctx.cfg, head_cell.birth_disp) * self.env_of(ctx, head_cell);
+        let gain = Self::hot_edge_gain(ctx.cfg, head_cell.birth_disp, head_cell.typing)
+            * self.env_of(ctx, head_cell);
         if gain <= 0.0 {
             return;
         }
@@ -4402,6 +6394,28 @@ impl Ribbon {
     #[must_use]
     pub fn field_at(&self, row: u16, col: u16) -> Option<f32> {
         self.index.at(row, col)
+    }
+
+    /// **THE WALK ORIGIN AT A CELL** (2026-09-14) — `(anchor_col, t0)` of
+    /// the cohort that owns the cell at `(row, col)`, or `None` where nothing
+    /// is laid. The pair [`Cohort::t_at`] reads, so `t0 + walk_t(col −
+    /// anchor_col)` is exactly [`Ribbon::field_at`]'s number at this cell
+    /// and CONTINUES past it at the band's own pace — `d/16` on the run's
+    /// first sixteen cells, `d/36` after — which is what a mark that must
+    /// wear the band's colour at a column the band does not reach (the
+    /// landing starburst's jets, `meteor::LandingWalk`) needs and the field
+    /// alone cannot give. The owner is the same cell the index takes: the
+    /// newest in pool order at the position ([`Ribbon::build`]'s
+    /// newest-first sort). Read after [`Ribbon::plan`], like `field_at`.
+    #[must_use]
+    pub fn walk_origin_at(&self, row: u16, col: u16) -> Option<(u16, f32)> {
+        let owner = self
+            .cells
+            .iter()
+            .rev()
+            .find(|c| c.row == row && c.col == col)?;
+        let cohort = self.cohorts.iter().find(|c| c.id == owner.cohort)?;
+        Some((cohort.anchor_col, cohort.t0))
     }
 
     /// **THE CARET'S POSITION IN THE FIELD** (v1's `rainbow_field`, seam point
@@ -4499,6 +6513,49 @@ impl Ribbon {
         self.plan.iter().filter(|s| s.cov >= STATUS_LIT_COV)
     }
 
+    /// **WHAT IS ACTUALLY ON THE GLASS** — every planned boundary whose own
+    /// composite over the theme ground reads as band ink to the census
+    /// ([`reads_as_ink`]), not only those over the CLAIM floor
+    /// [`Ribbon::lit_segments`] keeps.
+    ///
+    /// [`STATUS_LIT_COV`] is a bound on what the status verb may CLAIM: it
+    /// is solved for the bed's DIMMEST stop, so a claim made under it could
+    /// not be honoured by the pixels of that stop. It is not a fact about
+    /// the band. Reporting it as one is how `trail status` came to answer
+    /// `ribbon_segments=0 ribbon_active=false` from +99 ms to +231 ms of
+    /// EVERY curtain, while 1065 quads at alpha 102 down to 9 were still
+    /// being composited — the shipped instrument saying the band was gone
+    /// for the last half of every fall. `trail status` reports this number
+    /// beside the claim (`ribbon_drawn=`), and `ribbon_active` reads it
+    /// while a curtain is falling.
+    pub fn ink_segments(&self) -> impl Iterator<Item = &Segment> {
+        let bg = self.ground;
+        let ink = &self.ink;
+        self.plan.iter().filter(move |s| {
+            if s.cov == 0 {
+                return false;
+            }
+            // THE LEVEL THE SPINE ACTUALLY COMPOSITES, which is what the
+            // census sees: the body's `cov` PLUS the baseline strip's accent
+            // above it ([`STRIP_LIFT_GAIN`]), priced against the same
+            // [`BODY_FRAME_TOP`] the emitter prices it against. Reading
+            // `cov` alone here under-reports the last frames of a fall — the
+            // emitter puts `cov · 1.35` down and the glass counts it.
+            let a = (f32::from(s.cov) * (1.0 + STRIP_LIFT_GAIN)).min(BODY_FRAME_TOP) as u8;
+            reads_as_ink(over_premul(bg, premul_rgb(ink.at(s.t), a), a))
+        })
+    }
+
+    /// Milliseconds left in a falling curtain, or `None` when none is
+    /// falling — `trail status`'s `ribbon_curtain_ms=`, so the verb says
+    /// WHY a band on the glass is under the claim floor.
+    #[must_use]
+    pub fn curtain_left_ms(&self, now: Instant) -> Option<u32> {
+        let at = self.curtain?;
+        let r = now.saturating_duration_since(at).as_secs_f32();
+        Some(((CURTAIN_S - r).max(0.0) * 1000.0).round() as u32)
+    }
+
     /// True when nothing is laid and no transient is finishing — one of the
     /// three pools `Engine::next_change_deadline` folds (§18).
     ///
@@ -4521,12 +6578,16 @@ impl Ribbon {
     #[must_use]
     pub fn brisk(&self, now: Instant) -> bool {
         let ramping = |at: Instant| now.saturating_duration_since(at).as_secs_f32() < EDGE_IN_S;
-        self.cells.iter().any(|c| ramping(c.attack_at))
+        // A falling curtain is the retract's own motion, on every cell.
+        (!self.reduced && self.curtain.is_some() && !self.cells.is_empty())
+            || self.cells.iter().any(|c| ramping(c.attack_at))
             || self.rearm.is_some_and(|(at, _)| ramping(at))
             || (!self.reduced
                 && self.cohorts.iter().any(|c| {
-                    Phase::at(now.saturating_duration_since(c.alive_at).as_secs_f32())
-                        == Some(Phase::Retracting)
+                    Phase::at(
+                        now.saturating_duration_since(c.alive_at).as_secs_f32(),
+                        c.grace_s,
+                    ) == Some(Phase::Retracting)
                 }))
     }
 
@@ -4593,7 +6654,7 @@ impl Ribbon {
                     cell.retract_at.map(|at| RETRACT_FADE_S - since(at)),
                     cell.retire_at.map(|at| RETIRE_MELT_S - since(at)),
                     self.ember_at.map(|at| FOCUS_EMBER_S - since(at)),
-                    coh.map(|c| SWOOSH_TOTAL_S - since(c.alive_at)),
+                    coh.map(|c| c.swoosh_total() - since(c.alive_at)),
                 ];
                 for left in ends.into_iter().flatten() {
                     cad.tail((left - reduced_fade_s).max(0.0));
@@ -4609,21 +6670,23 @@ impl Ribbon {
             let ember_u = self.ember_at.map(|at| clamp01(since(at) / FOCUS_EMBER_S));
             let swoosh_u = coh.and_then(|c| {
                 let idle = since(c.alive_at);
-                if Phase::at(idle) != Some(Phase::Fading) {
+                if Phase::at(idle, c.grace_s) != Some(Phase::Fading) {
                     return None;
                 }
-                let span = f32::from(c.col1.saturating_sub(c.col0)).max(1.0);
-                let from_head = f32::from(c.col1.saturating_sub(1).saturating_sub(cell.col)) / span;
-                let t0 = RETRACT_START_S + RETRACT_DUR_S * (1.0 - from_head);
+                let t0 = c.retract_start() + RETRACT_DUR_S * (1.0 - c.drain_rank(cell.col));
                 Some(clamp01((idle - t0) / RETRACT_FADE_S))
             });
             // The content retirement's melt is one more `spend` factor on
             // the same product, and one more ending.
             let retire_u = cell.retire_at.map(|at| clamp01(since(at) / RETIRE_MELT_S));
             let f_r = retract_u.map_or(1.0, spend);
-            let f_e = ember_u.map_or(1.0, spend);
             let f_s = swoosh_u.map_or(1.0, spend);
             let f_m = retire_u.map_or(1.0, spend);
+            // The ember is priced against the light already spent, exactly as
+            // `env_of` prices it.
+            let carried = base * melt * f_r * f_s * f_m;
+            let ember_floor = self.ember_floor_of(carried, cell.t);
+            let f_e = ember_u.map_or(1.0, |u| ember_level(ember_floor, spend(u)));
             if let Some(step) = level_step_melt(base * f_r * f_e * f_s * f_m, u, life) {
                 cad.tail(step);
             }
@@ -4634,8 +6697,14 @@ impl Ribbon {
                 cad.tail(step);
             }
             if let Some(ue) = ember_u
-                && let Some(step) =
-                    level_step_spend(base * melt * f_r * f_s * f_m, ue, FOCUS_EMBER_S)
+                && let Some(step) = level_step_spend(
+                    // Only `1 - floor` of the carried peak moves with the
+                    // ember now: `ember_level` is affine in the common fade,
+                    // so this is that fade's own step, exactly.
+                    carried * (1.0 - ember_floor).max(0.0),
+                    ue,
+                    FOCUS_EMBER_S,
+                )
             {
                 cad.tail(step);
             }
@@ -4665,19 +6734,23 @@ impl Ribbon {
             // retract's first frame, and the swoosh's end (the cohort
             // retires — the idle instant). The retract's end is a tail: the
             // retract is brisk until then, and what follows is a fade.
+            let grace = coh.grace_s.max(PHRASE_REST_MIN_S);
             for beat in [
-                LIFT_GRACE_S,
-                LIFT_GRACE_S + REACH_STEP_S,
-                LIFT_GRACE_S + 2.0 * REACH_STEP_S,
-                RETRACT_START_S,
-                SWOOSH_TOTAL_S,
+                grace,
+                grace + REACH_STEP_S,
+                grace + 2.0 * REACH_STEP_S,
+                coh.retract_start(),
+                coh.swoosh_total(),
             ] {
                 cad.edge(coh.alive_at + dur(beat));
             }
-            cad.tail_at(coh.alive_at + dur(RETRACT_START_S + RETRACT_DUR_S));
+            cad.tail_at(coh.alive_at + dur(coh.retract_start() + RETRACT_DUR_S));
         }
         if let Some(at) = self.ember_at {
             cad.tail_at(at + dur(FOCUS_EMBER_S));
+        }
+        if let Some(at) = self.curtain {
+            cad.tail_at(at + dur(CURTAIN_S));
         }
         cad.take()
     }
@@ -4835,6 +6908,10 @@ impl Ribbon {
         self.last_space = None;
         self.relocate = None;
         self.last_walk = None;
+        // The phrase went with its cells; the hand's tempo and its last key
+        // are the hand's, not the coordinate space's, and stay.
+        self.phrase_open = None;
+        self.curtain = None;
     }
 }
 
@@ -4856,6 +6933,15 @@ mod tests {
     /// was made on and re-measured against.
     const NORD_BG: u32 = 0x002E_3440;
     const NORD_FG: u32 = 0x00D8_DEE9;
+
+    /// **THE THEME THE PRODUCT ACTUALLY OPENS WITH** — `ColorScheme::default`,
+    /// what a config with no `theme` line gets, and the DARKEST ground aterm
+    /// ships. `DEFAULT_BG` above is Tokyo Night's `#1A1B26` and is not this
+    /// one: the ember's first twin ran on Tokyo Night and Nord, the theme
+    /// every user sees on first launch was in neither arm, and that is where
+    /// the ember fragmented.
+    const SHIPPED_BG: u32 = 0x0011_1318;
+    const SHIPPED_FG: u32 = 0x00D0_D0D0;
 
     /// The 1× fixture: `cw 9`, `ch 18`, 120 × 40 cells.
     fn geom() -> Geom {
@@ -4918,6 +7004,7 @@ mod tests {
             phase: 0.0,
             caret,
             caret_t: 0.0,
+            caret_walk: None,
             mend: None,
             surge: 0.0,
             flow: Default::default(),
@@ -5047,6 +7134,56 @@ mod tests {
         })
     }
 
+    /// **THE DEVICE-COLUMN CENSUS** — one entry per device column of
+    /// `xs`, in window-absolute px: the topmost device row carrying at least
+    /// `floor` levels of light inside the device rows `ys`, the bottommost,
+    /// and the greatest level in the column. `None` where no quad reaches
+    /// the floor. A source-over quad's
+    /// level is its opacity byte; an ADDITIVE quad's (`alpha == 0`, the hot
+    /// edge in `out`) is its brightest premultiplied channel — the light it
+    /// adds. It is the unit the head's attach and the seam pins are stated
+    /// in: a per-CELL census cannot see a step inside a cell, and the
+    /// owner's notch is inside the head cell.
+    fn column_census(
+        quads: &[GlowQuad],
+        xs: std::ops::Range<i32>,
+        ys: std::ops::Range<i32>,
+        floor: u8,
+    ) -> Vec<Option<(i32, i32, u8)>> {
+        let level = |q: &GlowQuad| -> u8 {
+            if q.alpha > 0 {
+                q.alpha
+            } else {
+                let c = q.color;
+                ((c >> 16) & 0xff).max((c >> 8) & 0xff).max(c & 0xff) as u8
+            }
+        };
+        xs.map(|x| {
+            let mut top = i32::MAX;
+            let mut bot = i32::MIN;
+            let mut peak = 0u8;
+            for q in quads {
+                let lv = level(q);
+                if lv < floor || q.w == 0 {
+                    continue;
+                }
+                let qx0 = i32::from(q.x);
+                if x < qx0 || x >= qx0 + i32::from(q.w) {
+                    continue;
+                }
+                let y = i32::from(q.y);
+                if !ys.contains(&y) {
+                    continue;
+                }
+                top = top.min(y);
+                bot = bot.max(y + i32::from(q.h) - 1);
+                peak = peak.max(lv);
+            }
+            (top != i32::MAX).then_some((top, bot, peak))
+        })
+        .collect()
+    }
+
     fn contrast(a: u32, b: u32) -> f32 {
         let (la, lb) = (relative_luminance(a), relative_luminance(b));
         let (hi, lo) = if la >= lb { (la, lb) } else { (lb, la) };
@@ -5071,6 +7208,19 @@ mod tests {
 
     fn plan_sum(rib: &Ribbon) -> u32 {
         rib.plan_segments().iter().map(|s| u32::from(s.cov)).sum()
+    }
+
+    /// The planned light up to and including the boundary at column `col`
+    /// on the 1× fixture — the BAND's own, without the attach under the
+    /// caret cell beyond it (2026-09-14), which is the caret's light and
+    /// leaves with the caret.
+    fn band_sum(rib: &Ribbon, col: u16) -> u32 {
+        let x = f32::from(col) * geom().cw as f32;
+        rib.plan_segments()
+            .iter()
+            .filter(|s| s.x <= x + 0.5)
+            .map(|s| u32::from(s.cov))
+            .sum()
     }
 
     // -- §2.2 L3, §3.2: the bed's one ceiling ------------------------------
@@ -5950,7 +8100,8 @@ mod tests {
             disp: 0.8,
         };
         type_keys(&mut rib, at(t0, 1000), keys, &c);
-        let now = at(t0, 1060 + 850);
+        // Two reach beats in: the rest (0.90 s at the floor) plus 0.10 s.
+        let now = at(t0, 1060 + (PHRASE_REST_MIN_S * 1000.0) as u64 + 100);
         let cx = ctx(now, &c, (2, 42), 0.0);
         rib.plan(&cx);
         assert!(
@@ -6217,14 +8368,40 @@ mod tests {
         );
     }
 
+    /// A cold hand carries the hot edge at its FLOOR and a hot one the whole
+    /// of it (2026-09-14: the edge's existence no longer waits for momentum —
+    /// see [`HOT_EDGE_GAIN_FLOOR`]); a light ground carries none at all.
     #[test]
-    fn a_cold_hand_and_a_light_ground_carry_no_hot_edge() {
+    fn a_cold_hand_carries_the_edge_s_floor_and_a_light_ground_carries_no_hot_edge() {
         let dark = cfg(true, true);
         let light = cfg(false, true);
-        assert!(Ribbon::hot_edge_gain(&dark, HOT_EDGE_DISP_MIN - 0.01) <= 0.0);
-        assert!(Ribbon::hot_edge_gain(&dark, 0.9) > 0.0);
+        let cold = Ribbon::hot_edge_gain(&dark, 0.0, true);
         assert!(
-            Ribbon::hot_edge_gain(&light, 1.0) <= 0.0,
+            (cold - HOT_EDGE_GAIN_FLOOR).abs() < 1e-6,
+            "the first key of a word gets the attach: {cold} against the floor {HOT_EDGE_GAIN_FLOOR}"
+        );
+        // The floor's VALUE, not only its arithmetic: with the floor at
+        // 0.0 every line above still holds (review, 2026-09-14).
+        assert!(
+            HOT_EDGE_GAIN_FLOOR > 0.0 && cold > 0.0,
+            "the edge EXISTS on a cold hand: floor {HOT_EDGE_GAIN_FLOOR}, cold gain {cold}"
+        );
+        assert!(
+            (Ribbon::hot_edge_gain(&dark, HOT_EDGE_DISP_MIN - 0.01, true) - HOT_EDGE_GAIN_FLOOR)
+                .abs()
+                < 1e-6,
+            "under the disp floor the gain is the floor and nothing more"
+        );
+        assert!(Ribbon::hot_edge_gain(&dark, 0.9, true) > HOT_EDGE_GAIN_FLOOR + 0.4);
+        assert!((Ribbon::hot_edge_gain(&dark, 1.0, true) - 1.0).abs() < 1e-6);
+        // A WAKE's head is no key: no floor, the ramp it always had.
+        assert!(
+            Ribbon::hot_edge_gain(&dark, 0.0, false) <= 0.0,
+            "a cold arrow's wake carries no hairline"
+        );
+        assert!((Ribbon::hot_edge_gain(&dark, 1.0, false) - 1.0).abs() < 1e-6);
+        assert!(
+            Ribbon::hot_edge_gain(&light, 1.0, true) <= 0.0,
             "additive white on a paper ground is exactly what L6 forbids"
         );
     }
@@ -6378,8 +8555,9 @@ mod tests {
         let mut left_prev = f32::NEG_INFINITY;
         let mut edge_prev = u32::MAX;
         let mut edge_first: Option<u32> = None;
-        let retract_start = (LIFT_GRACE_S + REACH_STEP_S * f32::from(REACH_BEATS)) * 1000.0;
-        for ms in ((retract_start as u64)..1560).step_by(10) {
+        let retract_start = RETRACT_START_S * 1000.0;
+        let total = (SWOOSH_TOTAL_S * 1000.0).round() as u64;
+        for ms in ((retract_start as u64)..total + 20).step_by(10) {
             let now = at(last, ms);
             let cx = ctx(now, &c, caret, 0.0);
             rib.plan(&cx);
@@ -6399,14 +8577,14 @@ mod tests {
                 "the hot edge brightened inside the swoosh at +{ms} ms ({edge_prev} → {edge})"
             );
             edge_prev = edge;
-            if ms == 1450 {
+            if ms == total - 90 {
                 let first = edge_first.unwrap_or(0);
                 assert!(
                     !sink.under.is_empty() && edge * 4 < first,
                     "mid-fade the hot edge must be well under way with its body ({first} → {edge})"
                 );
             }
-            if ms == 1530 {
+            if ms == total - 10 {
                 assert!(
                     !rib.cells().is_empty(),
                     "the cells must still be in the pool for the pin to mean anything"
@@ -6452,7 +8630,7 @@ mod tests {
         let mut rib = Ribbon::new();
         type_run(&mut rib, t0, 10, 8, &c, 0.8);
         let last = at(t0, 7 * 60);
-        let start = LIFT_GRACE_S + REACH_STEP_S * f32::from(REACH_BEATS);
+        let start = RETRACT_START_S;
         let now = at(last, ((start + RETRACT_DUR_S * 0.5) * 1000.0) as u64);
         let cx = ctx(now, &c, (2, 18), 0.0);
         rib.plan(&cx);
@@ -6509,8 +8687,10 @@ mod tests {
         );
         let b_left = b.iter().map(|s| s.x).fold(f32::INFINITY, f32::min);
         let b_right = b.iter().map(|s| s.x).fold(f32::NEG_INFINITY, f32::max);
+        // The six typed cells end at 46 cw; the ATTACH (2026-09-14) carries
+        // the head's light one cell on under the caret at 46, to 47 cw.
         assert!(
-            (b_left - 40.0 * cw).abs() < 0.5 && (b_right - 46.0 * cw).abs() < 0.5,
+            (b_left - 40.0 * cw).abs() < 0.5 && (b_right - 47.0 * cw).abs() < 0.5,
             "the cohort under the hand was squashed with its row-mate: [{b_left}, {b_right}]"
         );
     }
@@ -6584,7 +8764,8 @@ mod tests {
         let mut sink = Sink::default();
         let mut frames = 0u32;
         let mut peak_prev = u8::MAX;
-        for ms in (900..1560u64).step_by(10) {
+        let total = (SWOOSH_TOTAL_S * 1000.0).round() as u64;
+        for ms in ((PHRASE_REST_MIN_S * 1000.0) as u64..total + 20).step_by(10) {
             let now = at(last, ms);
             let cx = ctx(now, &c, (2, 18), 0.0);
             rib.plan(&cx);
@@ -6604,8 +8785,10 @@ mod tests {
                 .iter()
                 .map(|q| f32::from(q.x) + f32::from(q.w))
                 .fold(f32::NEG_INFINITY, f32::max);
+            // Eight typed cells, 10..18 cw, plus the ATTACH under the caret
+            // at 18 (2026-09-14) — static on every frame like the rest.
             assert!(
-                (left - 10.0 * cw).abs() < 0.5 && (right - 18.0 * cw).abs() < 0.5,
+                (left - 10.0 * cw).abs() < 0.5 && (right - 19.0 * cw).abs() < 0.5,
                 "a static mark moved at +{ms} ms: [{left}, {right}]"
             );
             let peak = sink.under.iter().map(|q| q.alpha).max().unwrap_or(0);
@@ -6633,7 +8816,7 @@ mod tests {
         let last = at(t0, 39 * 60);
         let cx = ctx(at(last, 8), &c, (2, 42), 0.9);
         rib.plan(&cx);
-        let before = plan_sum(&rib);
+        let before = band_sum(&rib, 42);
         let segs = rib.plan_segments().len() as u32;
         assert!(
             plan_peak(&rib) > 200,
@@ -6645,7 +8828,7 @@ mod tests {
         // wake is pinned on its own below).
         rib.on_event(&pty((2, 42), (2, 80)), now, &cx);
         rib.plan(&cx);
-        let after = plan_sum(&rib);
+        let after = band_sum(&rib, 42);
         assert!(
             after + 2 * segs >= before,
             "the jump stepped the band down ({before} → {after} over {segs} boundaries) instead of retracting it from where it was"
@@ -6687,7 +8870,8 @@ mod tests {
         let t0 = Instant::now();
         let mut rib = Ribbon::new();
         // A cold Ctrl-A across 108 columns: WAKE_MAX_CELLS beside the caret,
-        // the landing included, every one born WAKE_BORN_LAG_S later, with
+        // the landing included, each born on the flight clock — cell `j`
+        // from the origin at `T · j / n`, `T = flight_ms(108)` = 120 ms — with
         // the fixed life — never the four-letter chain law's.
         let cx = ctx(t0, &c, (2, 2), 0.0);
         rib.on_event(&nav((2, 110), (2, 2)), t0, &cx);
@@ -6698,15 +8882,29 @@ mod tests {
             (2..2 + WAKE_MAX_CELLS).collect::<Vec<_>>(),
             "a leftward jump's wake runs from the landing rightward, capped"
         );
-        let lag = t0 + Duration::from_secs_f32(WAKE_BORN_LAG_S);
+        let flight = flight_ms(108.0) / 1000.0;
+        assert!((flight - 0.12).abs() < 1e-6, "the clamp: 120 ms");
         for &(col, typing, life, born) in &cells {
             assert!(!typing, "col {col}: a wake cell is never typing");
             assert!(
                 (life - WAKE_LIFE_S).abs() < 1e-6,
                 "col {col}: fixed life, got {life}"
             );
-            assert_eq!(born, lag, "col {col}: born one lag past the landing");
+            let j = f32::from(110 - col);
+            let want = t0 + Duration::from_secs_f32(flight * j / 108.0);
+            let off = born
+                .saturating_duration_since(want)
+                .max(want.saturating_duration_since(born));
+            assert!(
+                off <= Duration::from_millis(1),
+                "col {col}: born on the flight clock at T·{j}/108 (off by {off:?})"
+            );
         }
+        let (first, last) = (cells[cells.len() - 1].3, cells[0].3);
+        assert!(
+            first < last,
+            "the cell nearest the origin is born first, the landing last"
+        );
         assert_eq!(rib.cohorts().len(), 1, "one cohort, the wake's own");
         // A cold Ctrl-E the other way, once the first wake is long gone: the
         // wake runs from the landing LEFTWARD, and the origin cell at col 2
@@ -6855,9 +9053,14 @@ mod tests {
         let mut rib = Ribbon::new();
         let cx = ctx(t0, &c, (2, 2), 0.0);
         rib.on_event(&nav((2, 60), (2, 2)), t0, &cx);
-        let lag_ms = (WAKE_BORN_LAG_S * 1000.0) as u64;
+        // THE FLIGHT CLOCK (K3): 58 cells fly `T = flight_ms(58)` = 108 ms.
+        // The corridor is capped at 32 cells back from the landing, so the
+        // first cell laid is col 33 — `j = 27` from the origin — born at
+        // `T · 27/58` = 50 ms; the landing (col 2, `j = 58`) is born at `T`.
+        let flight_ms_ = flight_ms(58.0) as u64;
+        let first_ms = (flight_ms(58.0) * 27.0 / 58.0) as u64;
         let edge_ms = (EDGE_IN_S * 1000.0) as u64;
-        for ms in [0u64, lag_ms / 2, lag_ms - 1] {
+        for ms in [0u64, first_ms / 2, first_ms - 1] {
             let cx = ctx(at(t0, ms), &c, (2, 2), 0.0);
             rib.plan(&cx);
             assert_eq!(
@@ -6870,16 +9073,38 @@ mod tests {
                 "+{ms} ms: …but it is laid, so the host keeps ticking"
             );
         }
-        let cx = ctx(at(t0, lag_ms + edge_ms + 2), &c, (2, 2), 0.0);
+        // Half-way through the flight the corridor is lit behind the head
+        // and dark ahead of it: the landing's own cell is still unborn.
+        let cx = ctx(at(t0, flight_ms_ / 2 + 10), &c, (2, 2), 0.0);
+        rib.plan(&cx);
+        assert!(plan_peak(&rib) > 0, "the corridor is lit behind the head");
+        let landing = rib
+            .cells()
+            .iter()
+            .find(|l| l.row == 2 && l.col == 2)
+            .expect("the landing cell is laid");
+        assert_eq!(
+            rib.env_of(&cx, landing),
+            0.0,
+            "…and dark ahead of it: the landing is unborn until T"
+        );
+        let cx = ctx(at(t0, flight_ms_ + edge_ms + 2), &c, (2, 2), 0.0);
         rib.plan(&cx);
         assert!(
             plan_peak(&rib) >= (UNDER_COV_CAP * BODY_COLD_SHARE) as u8 - 2,
-            "one attack past its birth the wake is at its cold ceiling ({})",
+            "one attack past the landing's birth the wake is at its cold ceiling ({})",
             plan_peak(&rib)
         );
-        // …and it is out one life after that birth, through its own melt.
+        assert!(
+            rib.env_of(
+                &cx,
+                rib.cells().iter().find(|l| l.col == 2).expect("landing")
+            ) > 0.99,
+            "the landing cell is at full one edge-in past T"
+        );
+        // …and it is out one life after the last birth, through its own melt.
         let cx = ctx(
-            at(t0, lag_ms + (WAKE_LIFE_S * 1000.0) as u64 + 20),
+            at(t0, flight_ms_ + (WAKE_LIFE_S * 1000.0) as u64 + 20),
             &c,
             (2, 2),
             0.0,
@@ -6887,38 +9112,93 @@ mod tests {
         rib.plan(&cx);
         assert!(
             rib.at_rest(),
-            "the wake is gone one WAKE_LIFE_S after its birth"
+            "the wake is gone one WAKE_LIFE_S after its last birth"
         );
     }
 
     #[test]
-    fn a_jump_hands_the_live_band_to_its_wake_with_the_stops_it_had_and_no_step() {
+    fn a_jump_lays_its_wake_over_the_live_band_and_leaves_the_band_s_cells_untouched() {
+        // 2026-09-13 (K1, M1): this pin was `a_jump_hands_the_live_band_to_
+        // its_wake_with_the_stops_it_had_and_no_step` — the takeover. Under
+        // the overlay the band's cells are BYTE-IDENTICAL after the jump,
+        // the corridor lies over them on `Over` at the band's own level with
+        // the same stops, and the eye still sees no step.
+        //
+        // RESTATED 2026-09-14 at the scrub merge, because its PREMISE moved
+        // and not its law. v3 drove this over a band at cols 2..42 with a
+        // Ctrl-A from 42 — a corridor lit end to end by the hand's own text,
+        // which `Ribbon::scrub` now answers instead: held, nothing laid,
+        // nothing abandoned (`a_home_and_an_end_inside_the_band_abandon_
+        // nothing_and_take_nothing_over`, which is that exact script). So
+        // the band starts at column 12 and the jump crosses ten dark cells
+        // before it reaches the band: the move LEAVES the run, which is the
+        // event v3 §2.7's overlay is about, and every assertion below is
+        // v3's own, now read over a corridor with a dark half and a lit one.
         let c = cfg(true, true);
         let t0 = Instant::now();
         let mut rib = Ribbon::new();
-        // Forty cells over 2.4 s, then a Ctrl-A: the band under the hand IS
-        // the corridor. It keeps every stop it had (C2), loses no light on
-        // the jump frame, has ONE owner per cell, and then outlives the jump
-        // on the wake's clock instead of the abandon's 0.64 s retract. (A
-        // jump AWAY from the band — Alt-F past its end — leaves the band
-        // behind its origin, outside the corridor: that light still goes out
-        // through the abandon, pinned above under the PTY licence.)
-        type_run(&mut rib, t0, 2, 40, &c, 0.9);
+        // Forty cells at cols 12..52 over 2.4 s, then a Ctrl-A to column 2:
+        // the corridor crosses ten dark cells before the band, so the jump
+        // LEAVES the run (a Ctrl-A onto the band's own first cell is a scrub
+        // since 2026-09-14 — `a_home_and_an_end_inside_the_band_abandon_nothing_and_take_nothing_over`)
+        // and the band under the corridor is handed to the wake. It keeps
+        // every stop it had (C2), loses no light on the jump frame, has ONE
+        // owner per cell, and then outlives the jump on the wake's clock
+        // instead of the abandon's 0.64 s retract. (A jump AWAY from the
+        // band — Alt-F past its end — leaves the band behind its origin,
+        // outside the corridor: that light still goes out through the
+        // abandon, pinned above under the PTY licence.)
+        type_keys(
+            &mut rib,
+            t0,
+            Keys {
+                g: geom(),
+                row: 2,
+                col0: 12,
+                n: 40,
+                period_ms: 60,
+                disp: 0.9,
+            },
+            &c,
+        );
         let last = at(t0, 39 * 60);
-        let cx = ctx(at(last, 8), &c, (2, 42), 0.9);
+        let cx = ctx(at(last, 8), &c, (2, 52), 0.9);
         rib.plan(&cx);
-        let before = plan_sum(&rib);
+        // THE BAND'S OWN LIGHT, NOT THE CARET'S — main's law at the 0.86 RC
+        // merge, taken at this script's own columns. The notch round makes
+        // the band continue one cell under the caret block, so at the
+        // `before` frame (caret on col 52) the plan carries an attach at col
+        // 52 that is the CARET's light and leaves with it on the jump; main
+        // answered that by reading `band_sum` instead of `plan_sum` here.
+        // Main's column, 42, was the one its own abandon test uses and is
+        // ten cells inside this script's band (cols 12..52), which would
+        // have thrown away a quarter of what the three assertions below
+        // compare, so the boundary is read at the band's own right edge, 51.
+        // The same measure is taken on every later frame, so `before`,
+        // `after`, `landed` and `held` are one quantity read four times —
+        // main's test compared a `band_sum` against three `plan_sum`s. The
+        // corridor's DARK HALF beyond this window (cols 2..12) is asserted
+        // on its own below.
+        let band_light = |rib: &Ribbon| band_sum(rib, 51);
+        let before = band_light(&rib);
+        let before_cells: Vec<Cell> = rib.cells().to_vec();
         let segs = rib.plan_segments().len() as u32;
-        let stops: Vec<Option<f32>> = (2..42u16).map(|col| rib.field_at(2, col)).collect();
+        let stops: Vec<Option<f32>> = (12..52u16).map(|col| rib.field_at(2, col)).collect();
         assert!(
             stops.iter().all(Option::is_some),
-            "the band is laid under cols 2..42"
+            "the band is laid under cols 12..52"
         );
         let now = at(last, 16);
         let cx = ctx(now, &c, (2, 2), 0.9);
-        rib.on_event(&nav((2, 42), (2, 2)), now, &cx);
+        // The band's envelope AT THE JUMP INSTANT — what the corridor's
+        // cells are born from.
+        let envs_before: Vec<(u16, f32)> = before_cells
+            .iter()
+            .map(|l| (l.col, rib.env_of(&cx, l)))
+            .collect();
+        rib.on_event(&nav((2, 52), (2, 2)), now, &cx);
         rib.plan(&cx);
-        for (col, want) in (2..42u16).zip(&stops) {
+        for (col, want) in (12..52u16).zip(&stops) {
             let got = rib.field_at(2, col);
             assert!(
                 matches!((got, want), (Some(g), Some(w)) if (g - w).abs() < 1e-5),
@@ -6931,39 +9211,129 @@ mod tests {
             .map(|c| c.id)
             .max()
             .expect("the wake cohort");
-        for col in 2..42u16 {
-            let owners: Vec<&Cell> = rib
+        let band = rib.cohorts()[0];
+        assert_ne!(band.id, wake);
+        assert!(band.abandoned, "the band is abandoned beneath the corridor");
+        assert_eq!(
+            (band.retract_col, band.drain_right_first),
+            (Some(2), true),
+            "…toward the landing, draining from the origin end first (the drain follows the meteor)"
+        );
+        // THE CORRIDOR'S DARK HALF: the ten cells before the band, which are
+        // what makes this move a jump and not a scrub. They carry the
+        // corridor and nothing else — no band cell was ever laid there.
+        let flight = flight_ms(50.0) / 1000.0;
+        for col in 2..12u16 {
+            assert!(
+                !rib.cells()
+                    .iter()
+                    .any(|c| c.row == 2 && c.col == col && c.layer == Layer::Base),
+                "col {col}: dark ground carries no band cell"
+            );
+            let over: Vec<&Cell> = rib
                 .cells()
                 .iter()
-                .filter(|c| c.row == 2 && c.col == col)
+                .filter(|c| c.row == 2 && c.col == col && c.layer == Layer::Over)
                 .collect();
-            assert_eq!(owners.len(), 1, "col {col}: one owner, the wake's cell");
-            assert_eq!(owners[0].cohort, wake, "col {col}: …in the wake cohort");
+            assert_eq!(over.len(), 1, "col {col}: the corridor lit the dark ground");
+            assert!(over[0].rearm.is_none(), "col {col}: nothing to re-arm from");
+            let j = f32::from(52 - col);
+            let want = now + Duration::from_secs_f32(flight * j / 50.0);
             assert!(
-                !owners[0].typing,
-                "col {col}: a taken-over cell is a wake cell"
+                over[0].born.saturating_duration_since(want) <= Duration::from_millis(1)
+                    && want.saturating_duration_since(over[0].born) <= Duration::from_millis(1),
+                "col {col}: born on the flight clock"
             );
         }
-        // The origin cell (42) is unlit and beyond the cap counted back from
-        // the landing, so it stays dark: the cap bounds NEW light only, and
-        // the band's 40 cells were all taken over — nothing else was laid.
-        assert!(rib.field_at(2, 42).is_none());
-        assert_eq!(rib.cells().len(), 40, "the band's cells, and no more");
-        let after = plan_sum(&rib);
+        for col in 12..52u16 {
+            let base: Vec<&Cell> = rib
+                .cells()
+                .iter()
+                .filter(|c| c.row == 2 && c.col == col && c.layer == Layer::Base)
+                .collect();
+            let over: Vec<&Cell> = rib
+                .cells()
+                .iter()
+                .filter(|c| c.row == 2 && c.col == col && c.layer == Layer::Over)
+                .collect();
+            assert_eq!(
+                base.len(),
+                1,
+                "col {col}: the band's own cell is still there"
+            );
+            assert_eq!(over.len(), 1, "col {col}: one wake cell over it");
+            let (b, o) = (base[0], over[0]);
+            let was = before_cells
+                .iter()
+                .find(|c| c.col == col)
+                .expect("was laid");
+            assert!(
+                b.cohort == was.cohort
+                    && b.born == was.born
+                    && b.cov0 == was.cov0
+                    && b.life_s == was.life_s,
+                "col {col}: the wake touched the band's cell (K1)"
+            );
+            assert_eq!(o.cohort, wake, "col {col}: …in the wake cohort");
+            assert!(!o.typing, "col {col}: a wake cell is never typing");
+            assert!(
+                o.cov0 >= b.cov0 - 1e-6,
+                "col {col}: the corridor is never dimmer than the band it covers"
+            );
+            let (re_at, level) = o.rearm.expect("born at the band's level");
+            assert_eq!(re_at, o.born);
+            // The band's coverage share AT THE JUMP: `cov0 · env` — the
+            // newest typed cell is still inside its 18 ms attack at +16 ms.
+            let env_before = envs_before
+                .iter()
+                .find(|&&(c, _)| c == col)
+                .map_or(0.0, |&(_, e)| e);
+            assert!(
+                env_before > 0.9 && (level * o.cov0 - b.cov0 * env_before).abs() < 1e-5,
+                "col {col}: the level is the band's own coverage share (level {level}, env {env_before})"
+            );
+            let j = f32::from(52 - col);
+            let want = now + Duration::from_secs_f32(flight * j / 50.0);
+            assert!(
+                o.born.saturating_duration_since(want) <= Duration::from_millis(1)
+                    && want.saturating_duration_since(o.born) <= Duration::from_millis(1),
+                "col {col}: born on the flight clock"
+            );
+        }
+        // The origin cell (52) is unlit and beyond the cap counted back from
+        // the landing, so it stays dark: the cap bounds NEW light only — the
+        // ten dark cells before the band are inside it and are laid, and the
+        // band's forty are covered however far back they run.
+        assert!(rib.field_at(2, 52).is_none());
+        assert_eq!(
+            rib.cells().len(),
+            90,
+            "the band's 40 cells and the corridor's 50 over them"
+        );
+        // NO STEP on the jump frame (the corridor is unborn, the band is
+        // whole) and none once the corridor has landed.
+        let after = band_light(&rib);
         assert!(
             after + 2 * segs >= before,
-            "the hand-off stepped the band down ({before} → {after} over {segs} boundaries)"
+            "the jump frame stepped the band down ({before} → {after} over {segs} boundaries)"
+        );
+        let cx = ctx(at(now, (flight * 1000.0) as u64 + 20), &c, (2, 2), 0.9);
+        rib.plan(&cx);
+        let landed = band_light(&rib);
+        assert!(
+            landed + 2 * segs >= before,
+            "the landed corridor is dimmer than the band it covers ({before} → {landed})"
         );
         // Where the abandon's retract would have drained it to nothing, the
-        // wake still holds the band (the design's ~1.1 s after-effect)…
+        // wake still holds the corridor (the design's ~1.1 s after-effect)…
         let cx = ctx(at(last, 16 + 660), &c, (2, 80), 0.9);
         rib.plan(&cx);
-        let held = plan_sum(&rib);
+        let held = band_light(&rib);
         assert!(
             held * 2 > before,
-            "0.66 s after the jump the wake must still hold the band ({before} → {held})"
+            "0.66 s after the jump the wake must still hold the corridor ({before} → {held})"
         );
-        // …and it is out one wake life (plus the new cells' lag) later.
+        // …and it is out one wake life past the last birth.
         let cx = ctx(at(last, 16 + 1250), &c, (2, 80), 0.9);
         rib.plan(&cx);
         assert!(rib.at_rest(), "the wake is out by +1.25 s");
@@ -7026,6 +9396,13 @@ mod tests {
         let mut caret = (2u16, 2u16);
         let mut peak_by_cycle = Vec::new();
         let mut peak = 0usize;
+        // K2 / K4 (2026-09-13): from the second corridor's landing on, the
+        // lit cells on the row are ONE interval holding both endpoints on
+        // EVERY frame, and the row holds exactly one live wake cohort after
+        // every jump — a reversal re-owns the corridor it overlaps instead of
+        // abandoning it and laying a second one beside its drain.
+        let landed = 200 + flight_ms(58.0) as u64 + (EDGE_IN_S * 1000.0) as u64 + 8;
+        let mut interval_frames = 0u32;
         for ms in (0..=3000u64).step_by(8) {
             let now = at(t0, ms);
             if ms % 200 == 0 {
@@ -7041,7 +9418,43 @@ mod tests {
             let cx = ctx(now, &c, caret, 0.0);
             rib.plan(&cx);
             peak = peak.max(rib.cells().len());
+            if ms % 200 == 0 {
+                let wakes = rib
+                    .cohorts()
+                    .iter()
+                    .filter(|k| k.wake && rib.cells().iter().any(|l| l.cohort == k.id))
+                    .count();
+                assert_eq!(wakes, 1, "+{ms} ms: one live wake cohort on the row (K4)");
+            }
+            if ms >= landed {
+                // A column is lit when any cell at it composites at or over
+                // the status floor — the position's owner is the brightest
+                // born cell (`build`'s rank), so "any" is what the glass shows.
+                let lit: Vec<u16> = (2..=60u16)
+                    .filter(|&col| {
+                        rib.cells().iter().any(|l| {
+                            l.row == 2
+                                && l.col == col
+                                && UNDER_COV_CAP * l.cov0 * rib.env_of(&cx, l)
+                                    >= f32::from(STATUS_LIT_COV)
+                        })
+                    })
+                    .collect();
+                assert!(
+                    lit.first() == Some(&2) && lit.last() == Some(&60),
+                    "+{ms} ms: the lit set holds both endpoints ({lit:?})"
+                );
+                assert!(
+                    lit.windows(2).all(|w| w[1] - w[0] <= 1),
+                    "+{ms} ms: the lit set is one interval, no hole (K2): {lit:?}"
+                );
+                interval_frames += 1;
+            }
         }
+        assert!(
+            interval_frames > 300,
+            "the interval law was checked on {interval_frames} frames"
+        );
         let bound = usize::from(WAKE_MAX_CELLS + 1) * (WAKE_LIFE_S / 0.2).ceil() as usize
             + 59 * (RETRACT_START_S / 0.2).ceil() as usize;
         let worst = *peak_by_cycle.iter().max().expect("cycles");
@@ -7059,6 +9472,108 @@ mod tests {
         assert!(
             rib.at_rest(),
             "everything is out one wake life after the last jump"
+        );
+    }
+
+    /// **A PARTIAL REVERSAL RE-OWNS THE CORRIDOR INSTEAD OF ABANDONING IT**
+    /// (K4's "mints no second wake cohort on that row"; 2026-09-14). A jump
+    /// back that stops SHORT of the corridor it is reversing leaves the far
+    /// part of the old corridor uncovered. NOTE WHICH GESTURES REACH HERE: a
+    /// hop back over text that is still lit is a SCRUB ([`Ribbon::scrub`]) and
+    /// never lays a corridor at all, so the gestures this law answers are the
+    /// ones that JUMP — a reversal landing inside a corridor laid over ground
+    /// the hand's own light has already left. Until
+    /// [`Ribbon::own_wake_cohort`] that part belonged to a cohort the jump's
+    /// own `abandon` then sent straight into its retract, so the row carried
+    /// two clocks: the covered half on the new jump's, the uncovered half
+    /// draining at once. The lit set stopped being one interval well before
+    /// the wake's own drain, which is exactly what K2 forbids.
+    #[test]
+    fn a_partial_reversal_keeps_the_whole_corridor_on_one_clock() {
+        let c = cfg(true, true);
+        let t0 = Instant::now();
+        let mut rib = Ribbon::new();
+        // A 43-cell run left to go out entirely, so the corridor is laid over
+        // NOTHING: over a live band cell a corridor is laid without bound
+        // (§2.10) and neither the cap nor the ownership shows.
+        type_run(&mut rib, t0, 2, 43, &c, 0.9);
+        let cold = at(t0, 6000);
+        rib.plan(&ctx(cold, &c, (2, 43), 0.0));
+        assert!(
+            rib.at_rest(),
+            "the typed band is gone before the first jump"
+        );
+        // Ctrl-A: 43 → 0, the whole row.
+        let a = at(cold, 100);
+        rib.on_event(&nav((2, 43), (2, 0)), a, &ctx(a, &c, (2, 0), 0.0));
+        rib.plan(&ctx(at(a, 130), &c, (2, 0), 0.0));
+        let first = rib
+            .cohorts()
+            .iter()
+            .find(|k| k.wake)
+            .map(|k| k.id)
+            .expect("the first corridor");
+        // …then a PARTIAL reversal: 0 → 20, half of it.
+        let b = at(a, 300);
+        rib.on_event(&nav((2, 0), (2, 20)), b, &ctx(b, &c, (2, 20), 0.0));
+        rib.plan(&ctx(at(b, 130), &c, (2, 20), 0.0));
+        let live: Vec<(u32, bool)> = rib
+            .cohorts()
+            .iter()
+            .filter(|k| k.wake && rib.cells().iter().any(|l| l.cohort == k.id))
+            .map(|k| (k.id, k.abandoned))
+            .collect();
+        assert_eq!(
+            live,
+            vec![(first, false)],
+            "the reversal re-owns the corridor it overlaps: one live wake cohort, \
+             not abandoned ({live:?})"
+        );
+        // ONE CLOCK over the whole corridor — the covered half and the far
+        // half the reversal never reached.
+        let cx = ctx(at(b, 130), &c, (2, 20), 0.0);
+        let clocks: Vec<Instant> = rib
+            .cells()
+            .iter()
+            .filter(|l| l.layer == Layer::Over)
+            .map(|l| rib.live_since(l))
+            .collect();
+        assert!(clocks.len() > 30, "the corridor is laid ({})", clocks.len());
+        assert_eq!(
+            clocks.iter().min(),
+            clocks.iter().max(),
+            "every corridor cell reads one clock, covered or not"
+        );
+        // …and it stays one interval for the rest of the wake's life.
+        let mut frames = 0u32;
+        for ms in (0..1000u64).step_by(8) {
+            let now = at(b, 130 + ms);
+            let cx = ctx(now, &c, (2, 20), 0.0);
+            rib.plan(&cx);
+            let live: Vec<u16> = rib
+                .cells()
+                .iter()
+                .filter(|l| l.layer == Layer::Over && rib.env_of(&cx, l) > 0.0)
+                .map(|l| l.col)
+                .collect();
+            if live.is_empty() {
+                break;
+            }
+            let (lo, hi) = (
+                *live.iter().min().expect("min"),
+                *live.iter().max().expect("max"),
+            );
+            assert_eq!(
+                (lo..=hi).filter(|col| live.contains(col)).count(),
+                usize::from(hi - lo + 1),
+                "+{ms} ms: the corridor is one interval ({lo}..={hi})"
+            );
+            frames += 1;
+        }
+        let _ = cx;
+        assert!(
+            frames > 60,
+            "the interval law was checked on {frames} frames"
         );
     }
 
@@ -7102,23 +9617,27 @@ mod tests {
         let c = cfg(true, true);
         let t0 = Instant::now();
         let mut rib = Ribbon::new();
-        // A word at cols 10..17; Left from 18 to 17 crosses its own live
-        // cell (left alone) and the caret's empty cell 18 (laid, in a WAKE
-        // cohort of its own on the word's walk — never in the word's cohort,
-        // whose clock, phase and bounds the arrow must not touch: an arrow
-        // beside the word you just typed does not restart its grace).
+        // A word at cols 10..17, the caret at 18; Right from 18 to 19
+        // crosses the caret's empty cell 18 — blank ground beside the word,
+        // so it is a hop and not a scrub — and lays 18 and 19 in a WAKE
+        // cohort of its own on the word's walk, never in the word's cohort,
+        // whose clock, phase and bounds an arrow over blank ground must not
+        // touch: an arrow BESIDE the word you just typed does not restart
+        // its grace. (An arrow ONTO the word — Left from 18 to 17 — is a
+        // scrub since 2026-09-14: it lays nothing and holds the word;
+        // `a_scrub_inside_the_band_keeps_every_cell_s_light_and_holds_the_row`.)
         type_run(&mut rib, t0, 10, 8, &c, 0.8);
         let word = rib.cohorts()[0];
         assert!(!word.wake);
         let now = at(t0, 600);
-        let cx = ctx(now, &c, (2, 17), 0.8);
+        let cx = ctx(now, &c, (2, 19), 0.8);
         let t17 = rib.field_at(2, 17);
-        rib.on_event(&nav((2, 18), (2, 17)), now, &cx);
+        rib.on_event(&nav((2, 18), (2, 19)), now, &cx);
         rib.plan(&cx);
         assert_eq!(
             rib.field_at(2, 17),
             t17,
-            "the live cell under the hop is untouched"
+            "the live cell beside the hop is untouched"
         );
         let laid: Vec<&Cell> = rib
             .cells()
@@ -7171,7 +9690,7 @@ mod tests {
         let cx = ctx(
             at(t0, 420 + (SWOOSH_TOTAL_S * 1000.0) as u64 + 20),
             &c,
-            (2, 17),
+            (2, 19),
             0.0,
         );
         rib.plan(&cx);
@@ -7203,39 +9722,43 @@ mod tests {
         );
     }
 
+    /// **A JUMP INTO A BAND ALREADY LEAVING** (2026-09-13, K1 / M1). The
+    /// reviewer's reproduction of 2026-09-09 — forty cells, a Ctrl-A inside
+    /// the swoosh window and past it — re-pinned under the overlay. This was
+    /// `…_lays_nothing_under_it_and_lights_only_what_has_gone_out`, the
+    /// clause that refused to lay a wake cell under a leaving cell because a
+    /// TAKEOVER froze a half-drained cell at its level (R6's ramp). Nothing is
+    /// taken over now: the band's cells and clock are byte-identical after
+    /// the jump, the corridor is laid OVER every column — from the level the
+    /// band has there, rising through `edge-in`, never a step — and the
+    /// corridor's width no longer depends on how far the band has drained:
+    /// that dependence was the refresh's drain tear.
     #[test]
-    fn a_jump_into_a_band_already_leaving_lays_nothing_under_it_and_lights_only_what_has_gone_out()
-    {
-        // The reviewer's reproduction (2026-09-09): forty cells, a plan at
-        // `now` — the host plans every tick, so the cohort's phase is current
-        // when the Move arrives — then a Ctrl-A at 1.0 / 1.25 / 1.4 s idle,
-        // inside the swoosh window (retract from 0.90 s, over at 1.54 s), and
-        // at 1.6 s as the cold endpoint. Before this clause the takeover
-        // handed every half-drained cell to a fresh Laying cohort at its
-        // instantaneous level and re-lit the emptied ones at full: a ramp
-        // frozen between two bright runs for a whole wake life — R6's gaps.
+    fn a_jump_into_a_band_already_leaving_lays_its_wake_over_it_from_the_level_it_has() {
         let c = cfg(true, true);
         let t0 = Instant::now();
-        let cw = geom().cw as f32;
         let cov0_new = BODY_COLD_SHARE + (1.0 - BODY_COLD_SHARE) * 0.9;
-        let vis = |rib: &Ribbon| -> String {
-            let mut cells: Vec<(i32, u8)> = Vec::new();
-            for s in rib.plan_segments() {
-                let col = (s.x / cw).floor() as i32;
-                match cells.iter_mut().find(|e| e.0 == col) {
-                    Some(e) => e.1 = e.1.max(s.cov),
-                    None => cells.push((col, s.cov)),
-                }
-            }
-            cells.sort_unstable();
-            cells
+        let cw = geom().cw as f32;
+        // MAIN'S CLAUSE, KEPT AT THE 0.86 MERGE (2026-09-14): the band's own
+        // boundaries end at the head cell's right edge (42 cw), and the
+        // ATTACH under the caret cell is the CARET's light — it leaves with
+        // the caret on the jump frame, so the no-lurch comparison below must
+        // not read it. Without this filter the attach at col 42 vanishes when
+        // the caret lands on col 2 and the band reads as having moved, which
+        // is the opposite of what the assertion is for. v3 hoisted this
+        // closure out of the loop; the clause rides with it.
+        let lit_xs = |rib: &Ribbon| -> Vec<(i32, u8)> {
+            rib.plan_segments()
                 .iter()
-                .map(|(c0, v)| format!("{c0}:{v}"))
-                .collect::<Vec<_>>()
-                .join(" ")
+                .filter(|s| s.cov > 0 && s.x <= 42.0 * cw + 0.5)
+                .map(|s| ((s.x * 16.0).round() as i32, s.cov))
+                .collect()
         };
+        let rs = (RETRACT_START_S * 1000.0).round() as u64;
+        let total = (SWOOSH_TOTAL_S * 1000.0).round() as u64;
+        let flight = flight_ms(40.0) / 1000.0;
         let mut laid = Vec::new();
-        for idle_ms in [1000u64, 1250, 1400, 1600] {
+        for idle_ms in [rs + 100, rs + 350, rs + 500, total + 60] {
             let mut rib = Ribbon::new();
             type_run(&mut rib, t0, 2, 40, &c, 0.9);
             let last = at(t0, 39 * 60);
@@ -7244,57 +9767,44 @@ mod tests {
             rib.plan(&cx);
             let band = rib.cohorts().first().copied();
             let before: Vec<Cell> = rib.cells().to_vec();
-            let lit: Vec<u16> = before
-                .iter()
-                .filter(|l| rib.env_of(&cx, l) > 0.0)
-                .map(|l| l.col)
-                .collect();
-            let mut empty: Vec<u16> = (2..42u16).filter(|col| !lit.contains(col)).collect();
-            empty.sort_unstable();
-            println!("idle {idle_ms} before  {}", vis(&rib));
-            let lit_xs = |rib: &Ribbon| -> Vec<(i32, u8)> {
-                rib.plan_segments()
-                    .iter()
-                    .filter(|s| s.cov > 0)
-                    .map(|s| ((s.x * 16.0).round() as i32, s.cov))
-                    .collect()
-            };
+            // v3's own reading: the LEVEL of every band cell at the jump
+            // instant, not merely which columns are lit. The overlay is born
+            // from that level (`rearm`), so the corridor's assertions below
+            // need the number, and `> 0.0` on it is still main's lit/empty
+            // split — the two are one list now.
+            let level_before: Vec<(u16, f32)> =
+                before.iter().map(|l| (l.col, rib.env_of(&cx, l))).collect();
             let xs_before = lit_xs(&rib);
             let cx = ctx(now, &c, (2, 2), 0.9);
             rib.on_event(&nav((2, 42), (2, 2)), now, &cx);
             rib.plan(&cx);
-            println!("idle {idle_ms} +0 ms   {}", vis(&rib));
             // NO LURCH: every boundary the leaving band had is exactly where
-            // it was on the jump frame — its retract keeps pulling toward
-            // the caret it began under, not toward the landing.
-            let xs_after = lit_xs(&rib);
+            // it was on the jump frame — the corridor is unborn, and the
+            // band's retract keeps pulling toward the caret it began under.
             assert_eq!(
-                xs_before, xs_after,
+                xs_before,
+                lit_xs(&rib),
                 "idle {idle_ms}: the leaving band moved on the jump frame"
             );
             let band_id = band.map(|b| b.id);
-            // Every cell the band still lights is still the band's: same
-            // cohort, same birth, same price, ONE owner — nothing was taken
-            // over and nothing was laid under it.
-            for col in &lit {
-                let owners: Vec<&Cell> = rib
+            // K1: every band cell is byte-identical, and its clock untouched.
+            for was in &before {
+                let now_cell = rib
                     .cells()
                     .iter()
-                    .filter(|l| l.row == 2 && l.col == *col)
-                    .collect();
-                assert_eq!(owners.len(), 1, "idle {idle_ms}: col {col} keeps one owner");
-                let b = before
-                    .iter()
-                    .find(|l| l.col == *col)
-                    .expect("was in the pool");
-                let o = owners[0];
+                    .find(|l| l.layer == Layer::Base && l.col == was.col)
+                    .unwrap_or_else(|| {
+                        panic!("idle {idle_ms}: the band's cell at {} is gone", was.col)
+                    });
                 assert!(
-                    Some(o.cohort) == band_id && o.born == b.born && o.cov0 == b.cov0,
-                    "idle {idle_ms}: the lit band cell at col {col} was taken over"
+                    now_cell.cohort == was.cohort
+                        && now_cell.born == was.born
+                        && now_cell.cov0 == was.cov0
+                        && now_cell.retract_at == was.retract_at,
+                    "idle {idle_ms}: the wake touched the band's cell at col {}",
+                    was.col
                 );
             }
-            // …the leaving band's clock is not touched (it is already past
-            // the abandon's rewind point)…
             if let Some(b) = band {
                 let b_now = rib
                     .cohorts()
@@ -7303,47 +9813,97 @@ mod tests {
                     .expect("the band stays in the pool");
                 assert_eq!(
                     b_now.alive_at, b.alive_at,
-                    "idle {idle_ms}: the leaving band keeps its clock"
+                    "idle {idle_ms}: the band keeps its clock"
                 );
-                assert!(b_now.phase.is_retracting() || idle_ms < 900);
+                assert!(b_now.phase.is_retracting() || idle_ms < rs);
             }
-            // …and the wake's NEW cells sit exactly where the drain had
-            // already emptied a cell (within the cap counted back from the
-            // landing: cols 2..34), one cohort, born a lag late, cold-priced.
-            let wake: Vec<&Cell> = rib
+            // THE CORRIDOR: one wake cohort on `Over`, over every column
+            // within the cap and over every lit column beyond it; from the
+            // band's level where the band is lit, from dark where it is not.
+            let wake: Vec<Cell> = rib
                 .cells()
                 .iter()
-                .filter(|l| Some(l.cohort) != band_id)
+                .filter(|l| l.layer == Layer::Over)
+                .copied()
                 .collect();
+            let wake_id = wake.first().map(|l| l.cohort);
+            assert!(wake_id.is_some() && wake_id != band_id);
             let mut wake_cols: Vec<u16> = wake.iter().map(|l| l.col).collect();
             wake_cols.sort_unstable();
-            let want: Vec<u16> = empty
-                .iter()
-                .copied()
-                .filter(|col| col - 2 < WAKE_MAX_CELLS)
+            let want: Vec<u16> = (2..42u16)
+                .filter(|col| {
+                    col - 2 < WAKE_MAX_CELLS
+                        || level_before.iter().any(|&(c, e)| c == *col && e > 0.0)
+                })
                 .collect();
             assert_eq!(
                 wake_cols, want,
-                "idle {idle_ms}: the wake lights the emptied cells and only them"
+                "idle {idle_ms}: the corridor covers the cap and every lit cell beyond it"
             );
-            let wake_id = wake.first().map(|l| l.cohort);
             for w in &wake {
                 assert!(Some(w.cohort) == wake_id, "idle {idle_ms}: one wake cohort");
-                let lag_ok = w.born >= at(now, 99) && w.born <= at(now, 101);
+                assert!(!w.typing);
+                let j = f32::from(42 - w.col);
+                let want = now + Duration::from_secs_f32(flight * j / 40.0);
                 assert!(
-                    !w.typing && (w.cov0 - cov0_new).abs() < 1e-6 && lag_ok,
-                    "idle {idle_ms}: col {} is a new wake cell (cold-priced, born WAKE_BORN_LAG_S late)",
+                    w.born.saturating_duration_since(want) <= Duration::from_millis(1)
+                        && want.saturating_duration_since(w.born) <= Duration::from_millis(1),
+                    "idle {idle_ms}: col {} is born on the flight clock",
                     w.col
                 );
+                let under = before.iter().find(|l| l.col == w.col);
+                let env = level_before
+                    .iter()
+                    .find(|&&(c, _)| c == w.col)
+                    .map_or(0.0, |&(_, e)| e);
+                match (under, env > 0.0) {
+                    (Some(u), true) => {
+                        let (re_at, level) = w.rearm.unwrap_or_else(|| {
+                            panic!("idle {idle_ms}: col {} over lit light is re-armed", w.col)
+                        });
+                        assert_eq!(re_at, w.born);
+                        let start = u.cov0 * env;
+                        assert!(
+                            (w.cov0 * level - start).abs() < 1e-5 && w.cov0 >= cov0_new - 1e-6,
+                            "idle {idle_ms}: col {} starts at the band's coverage {start} (cov0 {} level {level})",
+                            w.col,
+                            w.cov0
+                        );
+                    }
+                    _ => {
+                        assert!(
+                            w.rearm.is_none() && (w.cov0 - cov0_new).abs() < 1e-6,
+                            "idle {idle_ms}: col {} over nothing is a cold-priced cell from dark",
+                            w.col
+                        );
+                    }
+                }
             }
             laid.push(wake.len());
+            // M1 at one covered column: the light the eye sees there does not
+            // step when the corridor cell is born over the draining band —
+            // sampled one frame either side of its birth.
+            if let Some(w) = wake.iter().find(|l| l.col == 20)
+                && level_before.iter().any(|&(c, e)| c == 20 && e > 0.3)
+            {
+                let cov_at = |rib: &mut Ribbon, t: Instant| -> u8 {
+                    let cx = ctx(t, &c, (2, 2), 0.9);
+                    rib.plan(&cx);
+                    cell_cov(rib, geom(), 20)
+                };
+                let pre = cov_at(&mut rib, w.born - Duration::from_millis(1));
+                let post = cov_at(&mut rib, w.born + Duration::from_millis(1));
+                assert!(
+                    post + 4 >= pre,
+                    "idle {idle_ms}: col 20 stepped down at the corridor's birth ({pre} → {post})"
+                );
+            }
             // Through the wake's life the pool holds only the two kinds — the
             // band's cells draining on their own clock and the wake's — and
-            // no band cell remains once its swoosh is over (1.54 s idle).
+            // no band cell remains once its swoosh is over.
             for dt in [50u64, 150, 400, 800] {
                 let cx = ctx(at(now, dt), &c, (2, 2), 0.9);
                 rib.plan(&cx);
-                println!("idle {idle_ms} +{dt:>3} ms {}", vis(&rib));
                 for l in rib.cells() {
                     assert!(
                         Some(l.cohort) == band_id || Some(l.cohort) == wake_id,
@@ -7351,7 +9911,7 @@ mod tests {
                         l.col
                     );
                 }
-                if idle_ms + dt > (SWOOSH_TOTAL_S * 1000.0) as u64 {
+                if idle_ms + dt > total {
                     assert!(
                         rib.cells().iter().all(|l| Some(l.cohort) != band_id),
                         "idle {idle_ms} +{dt}: the band must be out {SWOOSH_TOTAL_S} s after its last key"
@@ -7365,21 +9925,846 @@ mod tests {
                 "idle {idle_ms}: everything is out 1.3 s after the jump"
             );
         }
-        // The wake's width grows with the idle, continuously from nothing
-        // while the band is still whole to the full cap once it is gone.
-        assert_eq!(
-            laid[0], 0,
-            "at 1.0 s idle every band cell is still lit: no wake"
-        );
+        // The corridor's width does not depend on how far the band has
+        // drained: the cap plus whatever the band still lights beyond it —
+        // 40 while any of cols 34..42 are lit, the bare cap once it is gone.
+        assert_eq!(laid[0], 40, "inside the retract the whole band is covered");
         assert!(
-            laid.windows(2).all(|w| w[0] < w[1]),
-            "monotone in idle: {laid:?}"
+            laid.windows(2).all(|w| w[0] >= w[1]),
+            "non-increasing in idle: {laid:?}"
         );
         assert_eq!(
             laid[3],
             usize::from(WAKE_MAX_CELLS),
             "past the swoosh the cold Ctrl-A lays the cap"
         );
+    }
+
+    // -- 2026-09-14: scrubbing never damages the band -----------------------
+    //
+    // The owner, on the shipped v0.85.0: "the painting system for scrubbing
+    // back and forth with back word and forward word doesn't work correctly
+    // and leaves gaps."
+
+    /// One column of a [`census`]: `(col, owner, planned coverage)`, the
+    /// owner as `(cohort, born, typing, cov0 bits)` or `None` where no live
+    /// cell owns the column.
+    type CensusColumn = (u16, Option<(u32, Instant, bool, u32)>, u8);
+
+    /// The per-cell CENSUS of `row`'s cells `col0..col1` on this frame — the
+    /// identity of the cell that owns each column (`cohort`, `born`,
+    /// `typing`, `cov0`), and the coverage the plan puts inside that column
+    /// (the max `cov` of every boundary and slab whose `x` falls in the
+    /// column; a retract that pulls a boundary out of its column moves its
+    /// light with it, which is the gap the eye sees). Byte for byte, so
+    /// "the scrub damaged nothing" is an equality and not a tolerance.
+    fn census(rib: &Ribbon, row: u16, col0: u16, col1: u16) -> Vec<CensusColumn> {
+        let cw = geom().cw as f32;
+        (col0..col1)
+            .map(|col| {
+                let owner = rib
+                    .cells()
+                    .iter()
+                    .rposition(|c| c.row == row && c.col == col && !c.leaving())
+                    .map(|i| {
+                        let c = rib.cells()[i];
+                        (c.cohort, c.born, c.typing, c.cov0.to_bits())
+                    });
+                let cov = rib
+                    .plan_segments()
+                    .iter()
+                    .filter(|s| (s.x / cw).floor() as i64 == i64::from(col))
+                    .map(|s| s.cov)
+                    .max()
+                    .unwrap_or(0);
+                (col, owner, cov)
+            })
+            .collect()
+    }
+
+    /// The columns of `census` whose light is gone or is another cell's —
+    /// the gaps, as `(col, cov)`.
+    fn gaps(before: &[CensusColumn], now: &[CensusColumn]) -> Vec<(u16, u8)> {
+        before
+            .iter()
+            .zip(now)
+            .filter(|(b, n)| b != n)
+            .map(|(_, n)| (n.0, n.2))
+            .collect()
+    }
+
+    /// The owner's line, "the quick brown fox jumps over the lazy dogs", typed
+    /// at 12 cps on row 2 from column 0 (44 cells, the caret at 44), planned
+    /// after every key. Returns the last key's clock.
+    fn type_the_owner_s_line(rib: &mut Ribbon, t0: Instant, c: &Config) -> Instant {
+        let keys = Keys {
+            g: geom(),
+            row: 2,
+            col0: 0,
+            n: 44,
+            period_ms: 83,
+            disp: 0.8,
+        };
+        type_keys(rib, t0, keys, c);
+        at(t0, 43 * 83)
+    }
+
+    /// **SCRUBBING NEVER DAMAGES THE BAND** (2026-09-14). Option+Left ×4,
+    /// Option+Right ×4, Option+Left ×2 over the words of the line the hand
+    /// just typed, 150 ms apart, starting 150 ms after the last key — the
+    /// owner's scrub. Every hop stays inside the run the hand typed, so it
+    /// is a SCRUB: it abandons nothing, takes nothing over, lays nothing
+    /// and dims nothing — the census of the band's 44 cells is byte-identical
+    /// after every hop to the census before the first — and it HOLDS THE ROW
+    /// exactly as an erase does (`hold_row`): the band's clock is renewed by
+    /// the hop, so it leaves through its swoosh `SWOOSH_TOTAL_S` after the
+    /// hand's LAST hop, not after its last key.
+    ///
+    /// RED before (the 2026-09-09 law "a hop must not touch the word's
+    /// clock"): the swoosh ran on the last KEY's clock under the scrubbing
+    /// hand — at the seventh hop (+1050 ms) the band was mid-retract, its
+    /// tail drained and its boundaries pulled toward the column the retract
+    /// began under, and the hops through it laid cold half-life stubs only
+    /// where the drain had already emptied a cell: the gaps the owner saw.
+    #[test]
+    fn a_scrub_inside_the_band_keeps_every_cell_s_light_and_holds_the_row() {
+        let c = cfg(true, true);
+        let t0 = Instant::now();
+        let mut rib = Ribbon::new();
+        let last = type_the_owner_s_line(&mut rib, t0, &c);
+        let band = rib.cohorts()[0];
+        // The census just before the first hop.
+        let cx = ctx(at(last, 150), &c, (2, 44), 0.8);
+        rib.plan(&cx);
+        let before = census(&rib, 2, 0, 44);
+        assert!(
+            before
+                .iter()
+                .all(|(_, owner, cov)| owner.is_some() && *cov > 100),
+            "the band is whole and hot under the line before the scrub"
+        );
+        // The words' starts: 40 (dogs), 35 (lazy), 31 (the), 26 (over) — and
+        // back to the end.
+        let stops = [40u16, 35, 31, 26, 31, 35, 40, 44, 40, 35];
+        let mut caret = (2u16, 44u16);
+        let mut last_hop = last;
+        for (k, &col) in stops.iter().enumerate() {
+            let now = at(last, 150 * (k as u64 + 1));
+            let to = (2, col);
+            let cx = ctx(now, &c, to, 0.8);
+            rib.on_event(&nav(caret, to), now, &cx);
+            rib.plan(&cx);
+            caret = to;
+            last_hop = now;
+            let now_census = census(&rib, 2, 0, 44);
+            let g = gaps(&before, &now_census);
+            assert!(
+                g.is_empty(),
+                "hop {} ({}→{}, +{} ms): the scrub damaged the band at {} of 44 cells: {:?}",
+                k + 1,
+                if k == 0 { 44 } else { stops[k - 1] },
+                col,
+                150 * (k + 1),
+                g.len(),
+                g
+            );
+            assert!(
+                rib.cohorts().iter().all(|k| !k.abandoned),
+                "hop {}: a scrub abandons nothing",
+                k + 1
+            );
+            assert!(
+                rib.cells().iter().all(|c| !c.leaving()),
+                "hop {}: a scrub sends no cell on its way out",
+                k + 1
+            );
+        }
+        // The scrubbing hand HELD the row: the band's clock is the last hop's.
+        let held = rib
+            .cohorts()
+            .iter()
+            .find(|k| k.id == band.id)
+            .expect("the typed band is still the band");
+        assert_eq!(
+            held.alive_at, last_hop,
+            "the scrubbing hand holds the row — the band's clock is the hop's"
+        );
+        assert_eq!(held.phase, Phase::Laying);
+        // The band is whole at +0.7 s after the last hop (its grace)…
+        let cx = ctx(at(last_hop, 700), &c, caret, 0.8);
+        rib.plan(&cx);
+        assert!(
+            gaps(&before, &census(&rib, 2, 0, 44)).is_empty(),
+            "0.7 s after the last hop the band is still whole: the hops renewed its clock"
+        );
+        // …well into its retract SWOOSH_TOTAL_S − 0.2 s after it, on the
+        // hop's clock and not the key's (which would have had it out long
+        // ago)…
+        let cx = ctx(at(last_hop, 1400), &c, caret, 0.8);
+        rib.plan(&cx);
+        assert!(
+            !rib.at_rest() && plan_sum(&rib) > 0,
+            "1.4 s after the last hop the band is leaving on the hop's clock"
+        );
+        // …and out one swoosh after the hand's last act on the row.
+        let cx = ctx(
+            at(last_hop, (SWOOSH_TOTAL_S * 1000.0) as u64 + 20),
+            &c,
+            caret,
+            0.8,
+        );
+        rib.plan(&cx);
+        assert!(
+            rib.at_rest(),
+            "the band leaves through its swoosh {SWOOSH_TOTAL_S} s after the last hop"
+        );
+    }
+
+    /// **A HOME AND AN END INSIDE THE BAND ARE SCRUBS TOO** (2026-09-14) —
+    /// the jump arm. Forty cells at cols 2..42, then Ctrl-A (42 → 2, forty
+    /// cells: the meteor flies), Ctrl-E (2 → 42) and Ctrl-A again, 150 ms
+    /// apart. The corridor is the band, so the jump abandons nothing and
+    /// hands nothing over: every cell keeps its own cohort, birth, price and
+    /// `typing`, one owner per cell, the census byte-identical, the row
+    /// held — and the band leaves one swoosh after the last jump.
+    ///
+    /// Discards, for a jump INSIDE the run, the 2026-09-09 law "a real jump
+    /// on the same row abandons the band into its swoosh" (`Ribbon::abandon`,
+    /// d23b4f935 → 4ca68c467) and its takeover: they moved the band under
+    /// the hand onto the wake's 1.1 s clock and drained everything the
+    /// corridor did not cover, and the Option+Right back through the
+    /// draining part found cells mid-retract that the wake may not take
+    /// over — gaps. A jump that LEAVES the run keeps that law (pinned below).
+    #[test]
+    fn a_home_and_an_end_inside_the_band_abandon_nothing_and_take_nothing_over() {
+        let c = cfg(true, true);
+        let t0 = Instant::now();
+        let mut rib = Ribbon::new();
+        type_run(&mut rib, t0, 2, 40, &c, 0.9);
+        let last = at(t0, 39 * 60);
+        let band = rib.cohorts()[0];
+        let cx = ctx(at(last, 150), &c, (2, 42), 0.9);
+        rib.plan(&cx);
+        let before = census(&rib, 2, 2, 42);
+        let mut caret = (2u16, 42u16);
+        let mut last_jump = last;
+        for (k, &col) in [2u16, 42, 2].iter().enumerate() {
+            let now = at(last, 150 * (k as u64 + 1));
+            let to = (2, col);
+            let cx = ctx(now, &c, to, 0.9);
+            rib.on_event(&nav(caret, to), now, &cx);
+            rib.plan(&cx);
+            caret = to;
+            last_jump = now;
+            let g = gaps(&before, &census(&rib, 2, 2, 42));
+            assert!(
+                g.is_empty(),
+                "jump {} (→{col}): the jump damaged the band at {} of 40 cells: {:?}",
+                k + 1,
+                g.len(),
+                g
+            );
+            assert_eq!(rib.cohorts().len(), 1, "jump {}: no wake was minted", k + 1);
+            assert_eq!(rib.cells().len(), 40, "jump {}: nothing was laid", k + 1);
+            for cell in rib.cells() {
+                assert!(
+                    cell.cohort == band.id && cell.typing && !cell.leaving(),
+                    "jump {}: col {} was taken over or sent away",
+                    k + 1,
+                    cell.col
+                );
+            }
+            let held = rib.cohorts()[0];
+            assert!(!held.abandoned, "jump {}: the band is not abandoned", k + 1);
+            assert_eq!(held.alive_at, now, "jump {}: the hand holds the row", k + 1);
+        }
+        let cx = ctx(at(last_jump, 660), &c, caret, 0.9);
+        rib.plan(&cx);
+        assert!(
+            gaps(&before, &census(&rib, 2, 2, 42)).is_empty(),
+            "0.66 s after the last jump — where the abandon's retract would have drained it — the band is whole"
+        );
+        let cx = ctx(
+            at(last_jump, (SWOOSH_TOTAL_S * 1000.0) as u64 + 20),
+            &c,
+            caret,
+            0.9,
+        );
+        rib.plan(&cx);
+        assert!(rib.at_rest(), "…and out one swoosh after the last jump");
+    }
+
+    /// **A JUMP THAT LEAVES THE RUN KEEPS THE ABANDON LAW** (2026-09-14, the
+    /// control for the scrub). (a) Past the band's OLDEST cell: forty cells
+    /// at cols 10..50 and a Ctrl-A to column 0 — the corridor crosses ten
+    /// dark cells before it reaches the band, so it is a jump: the wake lays
+    /// its corridor and the band goes into its retract beneath it, as
+    /// d23b4f935 ruled. (b) Off the row: an Up-arrow abandons the band into
+    /// its retract and lays nothing. (c) Past the band's end: a Right ×6
+    /// from the caret's cell over blank ground is a hop that leaves the
+    /// band's clock alone — the band leaves one swoosh after ITS last key,
+    /// and the hop's cold wake sits behind the caret.
+    ///
+    /// RESTATED 2026-09-14 at the Rainbow Path v3 merge, for (a) only and
+    /// for the MECHANISM only, not the law. d23b4f935's abandon said the
+    /// corridor TOOK the band's cells over onto the wake's clock; v3 §2.7
+    /// (K1) says the corridor is an OVERLAY that never touches them — the
+    /// band's cells stay on `Base`, byte-identical, and drain under the
+    /// corridor on their own abandon. The law under test is unchanged and is
+    /// the whole point of this pin: a jump that leaves the run ABANDONS the
+    /// band, where a scrub inside the run holds it.
+    #[test]
+    fn a_jump_past_the_band_s_oldest_cell_or_off_its_row_still_abandons_it() {
+        let c = cfg(true, true);
+        let t0 = Instant::now();
+        // (a)
+        let mut rib = Ribbon::new();
+        type_keys(
+            &mut rib,
+            t0,
+            Keys {
+                g: geom(),
+                row: 2,
+                col0: 10,
+                n: 40,
+                period_ms: 60,
+                disp: 0.9,
+            },
+            &c,
+        );
+        let last = at(t0, 39 * 60);
+        let band = rib.cohorts()[0];
+        let now = at(last, 150);
+        let cx = ctx(now, &c, (2, 0), 0.9);
+        rib.on_event(&nav((2, 50), (2, 0)), now, &cx);
+        rib.plan(&cx);
+        let wake = rib
+            .cohorts()
+            .iter()
+            .find(|k| k.wake)
+            .expect("(a): the jump past the band's oldest cell lays its wake");
+        assert!(
+            (10..50u16).all(|col| rib
+                .cells()
+                .iter()
+                .any(|c| c.col == col && c.cohort == wake.id && c.layer == Layer::Over)),
+            "(a): the corridor lies over every cell of the band"
+        );
+        assert_eq!(
+            rib.cells()
+                .iter()
+                .filter(|c| c.cohort == band.id && c.layer == Layer::Base)
+                .count(),
+            40,
+            "(a): …and the band's own forty cells are still under it (K1)"
+        );
+        let leaving = rib
+            .cohorts()
+            .iter()
+            .find(|k| k.id == band.id)
+            .expect("(a): the band is still in the pool");
+        assert!(
+            leaving.abandoned,
+            "(a): a jump PAST the band's oldest cell abandons it — this is the law"
+        );
+        assert!(
+            (0..10u16).all(|col| rib
+                .cells()
+                .iter()
+                .any(|c| c.col == col && c.cohort == wake.id)),
+            "(a): the dark cells before the band are laid"
+        );
+        // …and it is gone one abandon later, where a scrub would have held
+        // it one swoosh past the hand's last act.
+        let cx = ctx(at(now, 660), &c, (2, 0), 0.9);
+        rib.plan(&cx);
+        assert!(
+            rib.cells().iter().all(|c| c.cohort != band.id),
+            "(a): the abandoned band is out 0.66 s later"
+        );
+        // (b)
+        let mut rib = Ribbon::new();
+        type_run(&mut rib, t0, 2, 40, &c, 0.9);
+        let band = rib.cohorts()[0];
+        let cx = ctx(now, &c, (1, 42), 0.9);
+        rib.on_event(&nav((2, 42), (1, 42)), now, &cx);
+        rib.plan(&cx);
+        let gone = rib
+            .cohorts()
+            .iter()
+            .find(|k| k.id == band.id)
+            .expect("(b): the band is still in the pool");
+        assert!(gone.abandoned, "(b): a row change abandons the band");
+        assert_eq!(rib.cohorts().len(), 1, "(b): …and lays no wake");
+        let cx = ctx(at(now, 660), &c, (1, 42), 0.9);
+        rib.plan(&cx);
+        assert!(rib.at_rest(), "(b): the abandoned band is out 0.64 s later");
+        // (c)
+        let mut rib = Ribbon::new();
+        let last = type_the_owner_s_line(&mut rib, t0, &c);
+        let band = rib.cohorts()[0];
+        let now = at(last, 150);
+        let cx = ctx(now, &c, (2, 50), 0.8);
+        rib.on_event(&nav((2, 44), (2, 50)), now, &cx);
+        rib.plan(&cx);
+        let held = rib
+            .cohorts()
+            .iter()
+            .find(|k| k.id == band.id)
+            .expect("(c): the band");
+        assert_eq!(
+            held.alive_at, last,
+            "(c): a hop off the band's end does not hold the row"
+        );
+        assert!(
+            rib.cohorts().iter().any(|k| k.wake && k.id != band.id),
+            "(c): the hop lays its cold wake behind the caret"
+        );
+        let cx = ctx(
+            at(last, (SWOOSH_TOTAL_S * 1000.0) as u64 + 20),
+            &c,
+            (2, 50),
+            0.8,
+        );
+        rib.plan(&cx);
+        assert!(
+            rib.cells().iter().all(|c| c.cohort != band.id),
+            "(c): the band leaves one swoosh after ITS last key"
+        );
+    }
+
+    /// **A SCRUB HOLDS ONLY THE COHORTS THAT OWN ITS CORRIDOR** (2026-09-14,
+    /// the fix-up's first guard) — the reviewer's counter-example. Type
+    /// `hello world` (eleven cells at cols 0..11); +200 ms a Ctrl-E-shaped
+    /// jump 11 → 31 (the wake W1 lays the dark corridor, the band A is
+    /// abandoned into its retract); +350 ms a Ctrl-A 31 → 0 (A's drain has
+    /// emptied its far cells, so the jump's wake W2 takes W1 over and fills
+    /// A's holes with fresh cells — A's drained cells stay RESIDENT under
+    /// them, not `leaving()`, until its swoosh ends); +200 ms a Right ×2
+    /// 0 → 2 over W2's live cells: a scrub.
+    ///
+    /// The scrub holds W2 — and NOTHING ELSE. A, shadowed under the
+    /// corridor, keeps its clock, its phase, its abandon and every cell's
+    /// coverage exactly as a twin that never saw the scrub has them, and is
+    /// pruned when its swoosh ends. RED before: the hold loop renewed every
+    /// cohort with any non-leaving cell in the corridor, so A went Fading →
+    /// Laying with the hop's clock and its drained cells came back from
+    /// `0,0,0,0,0,0,0,111` to `153…158` in one frame — light no key bought,
+    /// the anti-stray law's own complaint, and the inverse of what
+    /// `hold_row` and `place`'s one-finger hold do (both skip `abandoned`).
+    #[test]
+    fn a_scrub_over_holes_a_hop_filled_leaves_an_abandoned_cohort_exactly_as_it_was() {
+        let c = cfg(true, true);
+        let t0 = Instant::now();
+        // The scrubbed ribbon and its twin: identical up to the scrub, which
+        // only `rib` receives; both planned at the same instant with the
+        // same caret.
+        let mut rib = Ribbon::new();
+        let mut twin = Ribbon::new();
+        for r in [&mut rib, &mut twin] {
+            type_run(r, t0, 0, 11, &c, 0.9);
+        }
+        let last = at(t0, 10 * 60);
+        let band = rib.cohorts()[0];
+        for (from, to, ms) in [((2u16, 11u16), (2, 31), 200u64), ((2, 31), (2, 0), 550)] {
+            let now = at(last, ms);
+            for r in [&mut rib, &mut twin] {
+                let cx = ctx(now, &c, to, 0.9);
+                r.on_event(&nav(from, to), now, &cx);
+                r.plan(&cx);
+            }
+        }
+        let a_before = *rib
+            .cohorts()
+            .iter()
+            .find(|k| k.id == band.id)
+            .expect("A is resident until its swoosh ends");
+        assert!(
+            a_before.abandoned && a_before.phase.is_retracting(),
+            "the setup: A is abandoned and inside its swoosh ({:?})",
+            a_before.phase
+        );
+        let w2 = *rib
+            .cohorts()
+            .iter()
+            .filter(|k| k.wake && !k.abandoned)
+            .max_by_key(|k| k.alive_at)
+            .expect("W2 owns the corridor");
+        assert!(
+            rib.cells()
+                .iter()
+                .any(|l| l.cohort == band.id && (0..2).contains(&l.col) && !l.leaving()),
+            "the setup: A's drained cells at cols 0..2 are still resident under W2's"
+        );
+        // The frame before the scrub, on both.
+        let scrub_at = at(last, 750);
+        let pre = at(scrub_at, 0)
+            .checked_sub(Duration::from_millis(16))
+            .expect("clock");
+        let cx = ctx(pre, &c, (2, 0), 0.9);
+        rib.plan(&cx);
+        let cov_pre = census(&rib, 2, 0, 32);
+        // The scrub: Right ×2 over W2's live cells.
+        let cx = ctx(scrub_at, &c, (2, 2), 0.9);
+        rib.on_event(&nav((2, 0), (2, 2)), scrub_at, &cx);
+        rib.plan(&cx);
+        twin.plan(&cx);
+        let held = rib
+            .cohorts()
+            .iter()
+            .find(|k| k.id == w2.id)
+            .expect("W2 is still in the pool");
+        assert_eq!(
+            held.alive_at, scrub_at,
+            "the scrub holds W2, the cohort that owns the corridor"
+        );
+        let a_after = *rib
+            .cohorts()
+            .iter()
+            .find(|k| k.id == band.id)
+            .expect("A is still resident on the scrub frame");
+        assert!(
+            a_after.abandoned
+                && a_after.alive_at == a_before.alive_at
+                && a_after.retract_col == a_before.retract_col
+                && a_after.phase.is_retracting(),
+            "the scrub left A's clock, abandon and retract target exactly as they were, still leaving: {a_before:?} → {a_after:?}"
+        );
+        // A's phase moves only with the clock: it is the twin's, planned at
+        // the same instant (Retracting → Fading between the jump and the
+        // scrub, on A's own clock).
+        let a_twin = twin
+            .cohorts()
+            .iter()
+            .find(|k| k.id == band.id)
+            .expect("the twin's A");
+        assert!(
+            a_twin.alive_at == a_after.alive_at
+                && a_twin.phase == a_after.phase
+                && a_twin.retract_col == a_after.retract_col,
+            "A on the scrubbed ribbon is A on the twin: {a_twin:?} vs {a_after:?}"
+        );
+        // A's own columns (its cells are the newest owners at cols 2..11 —
+        // W2 filled only the holes at 0..2): byte-identical to the twin's,
+        // and no column brighter than the frame before.
+        let cov_now = census(&rib, 2, 0, 32);
+        let cov_twin = census(&twin, 2, 0, 32);
+        let a_cols: Vec<u16> = rib
+            .cells()
+            .iter()
+            .filter(|l| l.cohort == band.id && !l.leaving())
+            .map(|l| l.col)
+            .collect();
+        assert!(!a_cols.is_empty(), "A still has resident cells");
+        for &col in &a_cols {
+            let i = usize::from(col);
+            assert_eq!(
+                cov_now[i], cov_twin[i],
+                "col {col}: A's light after the scrub is the twin's"
+            );
+            assert!(
+                cov_now[i].2 <= cov_pre[i].2,
+                "col {col}: A's light did not come back ({} → {})",
+                cov_pre[i].2,
+                cov_now[i].2
+            );
+        }
+        // A is pruned when ITS swoosh ends, not one swoosh after the hop.
+        let cx = ctx(at(last, 950), &c, (2, 2), 0.9);
+        rib.plan(&cx);
+        assert!(
+            rib.cohorts().iter().all(|k| k.id != band.id),
+            "A is gone when its own swoosh ends — the scrub did not renew it"
+        );
+    }
+
+    /// **A SCRUB INTO A CORRIDOR DOES NOT MOVE ITS SOFT END**
+    /// (2026-09-14, at the merge of the notch round with the scrub round).
+    /// The tail-ease law puts a run's one-cell feather at the end away from
+    /// its head, and [`Ribbon::head_col`] resolves the head from the CARET:
+    /// type `hello world`, Ctrl-E to col 31 (a rightward hop, its wake over
+    /// blank ground), Ctrl-A back to col 0 (a leftward corridor whose
+    /// landing is col 0 and whose own cells fill the holes the band's drain
+    /// left at cols 0..2), then Right Right — a scrub over the corridor's
+    /// own live cells. The caret at col 0 took the corridor's WAKE head
+    /// (`stream_dir` +1, the feather at its far end); the caret at col 2
+    /// took the own-cell head at `caret − 1` (`stream_dir` −1, the feather
+    /// at its near end), so the feather crossed the run in ONE frame.
+    ///
+    /// The boundary is ONE expression on every run now — the left side owns
+    /// it, the right enters at the ease — so a run's soft end is its left
+    /// one whichever way its light streams, and no caret move can exchange
+    /// the two. (Keying it instead to a `Cohort::landing_col` stamped where
+    /// the jump put the hand was tried and REJECTED in a second review
+    /// round: a run pouring rightward feathers the end the hand types at,
+    /// and typing after any leftward jump put the block on 20 of 214
+    /// levels, with the swoosh's own reach re-arming the predicate 0.75 s
+    /// after the hand lifted. The trade this one makes instead is stated
+    /// in `docs/measured/cursor-notch-2026-09-14.md`.) RED before: the corridor's far edge
+    /// went 23 → 233 in one frame, a 210-level rise inside a settled band,
+    /// and its near end went dark by the same step. It is the same class of
+    /// pop the boundary law itself was written to remove, and
+    /// `scrub_gaps.rs`'s
+    /// `a_scrub_over_holes_a_hop_filled_leaves_an_abandoned_band_alone_at_the_host_seam`
+    /// caught it at the host seam.
+    ///
+    /// RESTATED AT THE 0.86 RC MERGE (2026-09-14) — THE LAW IS MAIN'S, THE
+    /// COLUMNS ARE v3's. Main wrote this over a FOUR-COLUMN window (0..4)
+    /// because on main the Ctrl-A's wake laid new light only where the
+    /// band's drain had already emptied a cell, so the corridor's own run
+    /// was cols 0..2 and its right-edge vertex was col 3. Rainbow Path v3
+    /// §2.7 makes the wake an OVERLAY: the corridor is laid on `Layer::Over`
+    /// over every column it crosses, lit or not, out to [`WAKE_MAX_CELLS`] —
+    /// so here it is one run at cols 0..=31 with its vertex at col 32, and
+    /// cols 0..4 are all interior to it. On a window that short, "whole to
+    /// its right edge" is read three cells in from the left and says nothing
+    /// about the right edge at all; that is how this pin would go quietly
+    /// vacuous. The window is read off the corridor's OWN run now — its
+    /// left cell through the vertex one past its last — and the whole-ness
+    /// clause is read over every column of it rather than two. MEASURED on
+    /// the merged tree: col 0 at 163 (the left feather, the trade the second
+    /// review round chose and stated), cols 1..=32 flat at 233 through the
+    /// right-edge vertex, identical before and after the scrub, while
+    /// `stream_dir` still flips +1 → −1 across it — the flip the soft end
+    /// must not follow. REFUTED to prove it can still fail: swap the
+    /// boundary to `lb.max(la * RUN_TAIL_EASE)` — the right side owning it —
+    /// and col 0 rises to 233 while the vertex at col 32 drops to 23.
+    #[test]
+    fn a_scrub_into_a_leftward_corridor_does_not_move_its_soft_end() {
+        let c = cfg(true, true);
+        let t0 = Instant::now();
+        let mut rib = Ribbon::new();
+        type_run(&mut rib, t0, 0, 11, &c, 0.9);
+        let last = at(t0, 10 * 60);
+        for (from, to, ms) in [((2u16, 11u16), (2, 31), 200u64), ((2, 31), (2, 0), 550)] {
+            let now = at(last, ms);
+            let cx = ctx(now, &c, to, 0.9);
+            rib.on_event(&nav(from, to), now, &cx);
+            rib.plan(&cx);
+        }
+        let cx = ctx(at(last, 734), &c, (2, 0), 0.9);
+        rib.plan(&cx);
+        // THE CORRIDOR'S OWN EXTENT, read off its run rather than assumed:
+        // the overlay reaches as far as the jump did, capped at
+        // `WAKE_MAX_CELLS`. The census window is its landing through the
+        // vertex one past its far cell.
+        let corridor = |r: &Ribbon| {
+            r.runs
+                .iter()
+                .find(|u| u.row == 2 && u.col0 == 0)
+                .map(|u| (u.col0, u.col1, u.stream_dir))
+                .expect("the corridor's own run")
+        };
+        let (c0, c1, dir_before) = corridor(&rib);
+        assert!(
+            c1 >= c0 + 4,
+            "the setup: the corridor must be long enough to have a far end away from its landing (cols {c0}..={c1})"
+        );
+        let before = census(&rib, 2, c0, c1 + 2);
+        let cohorts_before = rib.cohorts().len();
+        let scrub_at = at(last, 750);
+        let cx = ctx(scrub_at, &c, (2, 2), 0.9);
+        rib.on_event(&nav((2, 0), (2, 2)), scrub_at, &cx);
+        rib.plan(&cx);
+        let after = census(&rib, 2, c0, c1 + 2);
+        let (a0, a1, dir_after) = corridor(&rib);
+        let show = |cen: &[CensusColumn]| cen.iter().map(|k| (k.0, k.2)).collect::<Vec<_>>();
+        // THE PRECONDITION: the two Rights are a scrub (nothing is minted)
+        // and the head DOES still flip across them — the run's light streams
+        // one way with the caret on the landing and the other with it two
+        // cells in. Without this the pin could go quietly vacuous.
+        assert_eq!(
+            cohorts_before,
+            rib.cohorts().len(),
+            "the setup: the two Rights are a scrub over lit cells and mint nothing"
+        );
+        assert_eq!(
+            (a0, a1),
+            (c0, c1),
+            "the scrub moved the corridor's own bounds, so the two censuses read different columns"
+        );
+        assert_ne!(
+            dir_before, dir_after,
+            "the setup: the caret move still flips the corridor run's stream, which is what the soft end must no longer follow"
+        );
+        // The soft end is the corridor's LEFT one, where the band opens,
+        // and it is whole from there through to its right-edge vertex. On
+        // both frames: the caret move does not exchange the two. Read over
+        // EVERY column of the run and not a three-column peek, so a census
+        // that went dark past the window cannot pass the equalities.
+        for (name, cen) in [("before the scrub", &before), ("after it", &after)] {
+            let whole = cen[1].2;
+            assert!(
+                cen[0].2 < whole && whole > 100 && cen[1..].iter().all(|k| k.2 == whole),
+                "{name}: the corridor opens soft at its left and is whole to its right edge: {:?}",
+                show(cen)
+            );
+        }
+        for (b, a) in before.iter().zip(after.iter()) {
+            assert!(
+                i32::from(a.2) - i32::from(b.2) <= 2,
+                "col {}: the scrub raised the corridor's light {} -> {} in one frame ({:?} -> {:?})",
+                b.0,
+                b.2,
+                a.2,
+                show(&before),
+                show(&after)
+            );
+        }
+    }
+
+    /// **A SCRUB NEVER RAISES A CELL'S LIGHT** (2026-09-14, the fix-up's
+    /// second guard) — the reviewer's counter-example. Type `the quick`
+    /// (nine cells at cols 0..9); +150 ms a Right ×6 9 → 15 over blank
+    /// ground (a hop: its cold half-life wake at cols 9..15, 0.55 s); +600 ms
+    /// a Left ×5 15 → 10 back over the stub. The stub is 0.5 s into its
+    /// 0.55 s life — deep inside its expiry melt (which opens at 0.70 of
+    /// life) at ~0.09 of body — while its cohort is still in its grace.
+    ///
+    /// A cell past its melt opening is a cell already going out: the move is
+    /// NOT a scrub, it takes the hop arm, lays nothing over the stub (a live
+    /// cell is left as it is) and the stub finishes melting to zero as it
+    /// did on main — no column is brighter on the landing frame than on the
+    /// frame before. RED before: the scrub held the stub's cohort, `spent`
+    /// restarted at zero and the stub snapped from 21 to 157 levels in one
+    /// frame, a ×7.5 step with no attack. The typed band is never caught
+    /// by this guard: its melt opens at 0.70 × 1.70 = 1.19 s, past the
+    /// 0.90 s retract the phase guard already refuses.
+    ///
+    /// The control: the same Left ×5 at +200 ms, the stub at 0.1 s of life
+    /// (un-melted), IS a scrub — it holds the stub's cohort and no column
+    /// moves a level.
+    #[test]
+    fn a_scrub_over_a_melting_wake_stub_raises_no_cell_s_coverage() {
+        let c = cfg(true, true);
+        let t0 = Instant::now();
+        let hop_at = |last: Instant| at(last, 150);
+        // (a) The melting stub.
+        let mut rib = Ribbon::new();
+        type_run(&mut rib, t0, 0, 9, &c, 0.9);
+        let last = at(t0, 8 * 60);
+        let band = rib.cohorts()[0];
+        let cx = ctx(hop_at(last), &c, (2, 15), 0.9);
+        rib.on_event(&nav((2, 9), (2, 15)), hop_at(last), &cx);
+        rib.plan(&cx);
+        let stub = *rib
+            .cohorts()
+            .iter()
+            .find(|k| k.wake)
+            .expect("the hop lays its cold wake");
+        // 2026-09-14, the v3 merge: the corridor is born ON THE FLIGHT CLOCK
+        // now (cell `j` of `n` at `T·j/n`, `T` = `FLIGHT_MIN_MS` 60 ms for a
+        // hop) where it used to be born one flat `WAKE_BORN_LAG_S` 100 ms
+        // after the key, so every stub cell is ~0.1 s older at a given
+        // instant and the whole stub is OUT by +600 ms. The probe moves with
+        // the births, not the law: at +500 ms every cell of cols 10..15 is
+        // past its melt opening (0.70 × 0.55 s = 0.385 s of life; the
+        // youngest, col 15, is 0.44 s old) and every one is still lit (the
+        // oldest, col 10, is 0.49 s of 0.55 s) — which is the setup the two
+        // asserts below read.
+        let back_at = at(hop_at(last), 500);
+        let pre = back_at
+            .checked_sub(Duration::from_millis(16))
+            .expect("clock");
+        let cx = ctx(pre, &c, (2, 15), 0.9);
+        rib.plan(&cx);
+        let cov_pre = census(&rib, 2, 0, 16);
+        // THE SETUP, read off the engine and not off a coverage threshold:
+        // every cell of the corridor the move is about to cross is still LIT
+        // and is already PAST ITS MELT OPENING. (Before the flight clock every
+        // stub cell shared one birth, so one census bound said this; now they
+        // are staggered 10 ms apart across the hop's 60 ms flight and sit at
+        // 0.77–0.86 of their life — 62…182 of the body's 233 at this
+        // instant — all of them melting, which is what the guard reads.)
+        let melting: Vec<(u16, f32, f32)> = (10..16u16)
+            .filter_map(|col| {
+                rib.cells().iter().find(|l| l.col == col).map(|l| {
+                    (
+                        col,
+                        rib.env_of(&cx, l),
+                        pre.saturating_duration_since(live_since(rib.cohorts(), l))
+                            .as_secs_f32()
+                            - l.life_s * (1.0 - EXPIRY_MELT_SHARE),
+                    )
+                })
+            })
+            .collect();
+        assert!(
+            melting.len() == 6
+                && melting
+                    .iter()
+                    .all(|&(_, env, past)| env > 0.0 && past > 0.0),
+            "the setup: every cell of cols 10..16 is lit and past its melt opening              (col, env, seconds past the opening) {melting:?}, coverage {:?}",
+            cov_pre.iter().map(|k| k.2).collect::<Vec<_>>()
+        );
+        let cx = ctx(back_at, &c, (2, 10), 0.9);
+        rib.on_event(&nav((2, 15), (2, 10)), back_at, &cx);
+        rib.plan(&cx);
+        let cov_now = census(&rib, 2, 0, 16);
+        for col in 0..16usize {
+            assert!(
+                cov_now[col].2 <= cov_pre[col].2,
+                "col {col}: the move over a melting stub raised its light ({} → {})",
+                cov_pre[col].2,
+                cov_now[col].2
+            );
+        }
+        let stub_now = rib
+            .cohorts()
+            .iter()
+            .find(|k| k.id == stub.id)
+            .expect("the stub's cohort is still resident");
+        assert_eq!(
+            stub_now.alive_at, stub.alive_at,
+            "a melting stub's clock is not renewed"
+        );
+        assert_eq!(
+            rib.cohorts()
+                .iter()
+                .find(|k| k.id == band.id)
+                .map(|k| k.alive_at),
+            Some(last),
+            "the typed band beside the corridor is left on its own clock"
+        );
+        // …and the stub is out within the 0.11 s its youngest cell had left
+        // (col 9 holds the band's own right boundary, sampled at 9·cw).
+        let cx = ctx(at(back_at, 130), &c, (2, 10), 0.9);
+        rib.plan(&cx);
+        let cov_out = census(&rib, 2, 0, 16);
+        assert!(
+            (10..16).all(|col| cov_out[col].2 == 0),
+            "the stub finished melting under the hand: {:?}",
+            cov_out.iter().map(|k| k.2).collect::<Vec<_>>()
+        );
+        // (b) The control: over an un-melted stub the same move is a scrub.
+        let mut rib = Ribbon::new();
+        type_run(&mut rib, t0, 0, 9, &c, 0.9);
+        let cx = ctx(hop_at(last), &c, (2, 15), 0.9);
+        rib.on_event(&nav((2, 9), (2, 15)), hop_at(last), &cx);
+        rib.plan(&cx);
+        let stub = *rib.cohorts().iter().find(|k| k.wake).expect("the stub");
+        let back_at = at(hop_at(last), 200);
+        let cx = ctx(back_at, &c, (2, 15), 0.9);
+        rib.plan(&cx);
+        let cov_pre = census(&rib, 2, 0, 16);
+        let cx = ctx(back_at, &c, (2, 10), 0.9);
+        rib.on_event(&nav((2, 15), (2, 10)), back_at, &cx);
+        rib.plan(&cx);
+        let cov_now = census(&rib, 2, 0, 16);
+        assert_eq!(
+            cov_now.iter().map(|k| k.2).collect::<Vec<_>>(),
+            cov_pre.iter().map(|k| k.2).collect::<Vec<_>>(),
+            "(b): a scrub over a live stub moves no column a level"
+        );
+        assert_eq!(
+            rib.cohorts()
+                .iter()
+                .find(|k| k.id == stub.id)
+                .map(|k| k.alive_at),
+            Some(back_at),
+            "(b): …and holds the stub's cohort, which owns the corridor"
+        );
+        assert_eq!(rib.cells().len(), 9 + 7, "(b): nothing was laid");
     }
 
     #[test]
@@ -7397,8 +10782,10 @@ mod tests {
         let t0 = Instant::now();
         let last = at(t0, 39 * 60);
         let now = at(last, 16);
-        // (a) Into the band's middle, 42 → 20: cells 20..42 are taken over on
-        // the stops they had; cells 2..20 stay the band's, on theirs.
+        // (a) Into the band's middle from beyond its end, 60 → 20 (a jump
+        // that leaves the run: cells 42..60 are dark — from 42 it would be
+        // a scrub, 2026-09-14): cells 20..42 are taken over on the stops
+        // they had; cells 2..20 stay the band's, on theirs.
         let mut rib = Ribbon::new();
         type_run(&mut rib, t0, 2, 40, &c, 0.9);
         let cx = ctx(at(last, 8), &c, (2, 42), 0.9);
@@ -7407,7 +10794,7 @@ mod tests {
             .map(|col| rib.field_at(2, col).expect("laid"))
             .collect();
         let cx = ctx(now, &c, (2, 20), 0.9);
-        rib.on_event(&nav((2, 42), (2, 20)), now, &cx);
+        rib.on_event(&nav((2, 60), (2, 20)), now, &cx);
         rib.plan(&cx);
         for (col, want) in (2..42u16).zip(&stops) {
             let got = rib.field_at(2, col).expect("still lit at +0");
@@ -7440,18 +10827,26 @@ mod tests {
     }
 
     #[test]
-    fn a_wrapped_paragraph_s_earlier_row_keeps_the_life_it_had_when_the_caret_left_it() {
-        // 2026-09-12, the abandoned band: the one-finger hold is ROW-SCOPED
-        // (`Ribbon::place`). Row 2's cohort stops being renewed the moment
+    fn a_wrapped_paragraph_is_one_phrase_and_each_row_keeps_its_own_clock() {
+        // MERGED 2026-09-14 — the row ruling and the phrase, each doing its
+        // own work.
+        //
+        // 2026-09-12's ruling (the abandoned band) is ROW-SCOPED renewal
+        // (`Ribbon::place`), model-checked by `aterm-spec`'s
+        // `ribbon_row_hold_model` (`OnlyOwnerRenews`, whose named falsifier
+        // is a global hold): row 2's cohort stops being renewed the moment
         // the hand is on row 3, keeps exactly the clock it had, and leaves
-        // through its own swoosh SWOOSH_TOTAL_S after ITS last key — while
-        // row 3 is still being typed. This re-pins what
-        // `a_wrapped_paragraph_keeps_its_earlier_rows_until_the_finger_lifts`
-        // pinned the other way: under that law every key on row 3 renewed
-        // row 2, which is how the owner's 0.83.0 screenshot came to hold a
-        // flat full band on a wrapped line's first row while the caret typed
-        // on its second. RED on main at the first assertion (row 2's clock
-        // read the row-3 key), GREEN here.
+        // through its own swoosh after ITS last key — which is how the
+        // owner's 0.83.0 screenshot stopped holding a flat full band on a
+        // wrapped line's first row while the caret typed on its second.
+        //
+        // Rainbow Path v3 §2.3 (S6) adds the PHRASE on top of it, and the
+        // phrase is what the merge keeps: a wrap fold's new-row cohort is
+        // minted while the phrase is open, so both rows carry ONE phrase id
+        // and one grace (the hand's rest), and a cohort of a CLOSED phrase
+        // on the hand's own row is no longer renewed by it — the row law
+        // renewed that one. The phrase narrows the hold; it does not widen
+        // it back across rows.
         let c = cfg(true, true);
         let t0 = Instant::now();
         let mut rib = Ribbon::new();
@@ -7464,48 +10859,509 @@ mod tests {
             disp: 0.9,
         };
         // Twenty keys on row 2 (the last at +1900 ms), then the hand is on
-        // row 3 from +2000 ms.
+        // row 3 from +2000 ms — 100 ms later, inside the phrase's rest.
         type_keys(&mut rib, t0, row(2, 0, 20), &c);
         let left_row_2 = at(t0, 1900);
         type_keys(&mut rib, at(t0, 2000), row(3, 0, 5), &c);
+        let open = rib
+            .phrase_open()
+            .expect("the phrase is open under the hand");
         let row2 = rib
             .cohorts()
             .iter()
             .find(|c| c.row == 2)
             .expect("row 2 is still resident inside its own grace at +2.4 s");
-        assert_eq!(
-            row2.alive_at, left_row_2,
-            "a key on row 3 must not renew row 2's clock"
-        );
-        assert!(
-            rib.cells().iter().any(|l| l.row == 2),
-            "row 2 keeps the life it had: lit through its own grace"
-        );
         let row3 = rib
             .cohorts()
             .iter()
             .find(|c| c.row == 3)
             .expect("row 3 cohort");
+        // THE PHRASE: one breath, one id, one grace.
+        assert_eq!(row2.phrase, open, "the fold's first row is the phrase's");
+        assert_eq!(row3.phrase, open, "…and so is the row the fold opened");
+        assert_eq!(
+            (row2.grace_s, row3.grace_s),
+            (rib.rest_s(), rib.rest_s()),
+            "both rows keep the rest the hand is playing"
+        );
+        // THE ROW: each keeps its own clock.
+        assert_eq!(
+            row2.alive_at, left_row_2,
+            "a key on row 3 must not renew row 2's clock"
+        );
         assert_eq!(
             row3.alive_at,
             at(t0, 2400),
             "…and the key holds its own row"
         );
+        assert!(
+            rib.cells().iter().any(|l| l.row == 2),
+            "row 2 keeps the life it had: lit through its own grace"
+        );
         // Fifteen more keys on row 3, +2500 … +3900 ms.
         type_keys(&mut rib, at(t0, 2500), row(3, 5, 15), &c);
         assert!(
             !rib.cells().iter().any(|l| l.row == 2),
-            "row 2 left {SWOOSH_TOTAL_S} s after ITS last key, under a hand still typing on row 3"
+            "row 2 left one swoosh after ITS last key, under a hand still typing on row 3"
         );
         assert!(
             rib.cells().iter().any(|l| l.row == 3),
             "…while row 3 is still lit under the hand"
         );
-        let cx = ctx(at(t0, 3900 + 1600), &c, (3, 20), 0.0);
+        // …and row 3 leaves one swoosh after its own last key — measured
+        // against the PHRASE's own total, not the old 1.54 s literal.
+        let total = (SWOOSH_TOTAL_S * 1000.0).round() as u64;
+        let cx = ctx(at(t0, 3900 + total - 40), &c, (3, 20), 0.0);
+        rib.plan(&cx);
+        assert!(
+            rib.cells().iter().any(|l| l.row == 3),
+            "row 3 is on glass 40 ms before its swoosh ends"
+        );
+        let cx = ctx(at(t0, 3900 + total + 40), &c, (3, 20), 0.0);
         rib.plan(&cx);
         assert!(
             rib.at_rest(),
-            "…and row 3 leaves {SWOOSH_TOTAL_S} s after its own last key"
+            "…and leaves {SWOOSH_TOTAL_S} s after its own last key"
+        );
+    }
+
+    /// **S6, the other half: a phrase holds only its own.** A cohort of a
+    /// CLOSED phrase on the same row — typed, then a rest — is not renewed by
+    /// a new phrase's keys elsewhere on the row and goes out on its own
+    /// clock; a lay ADJACENT to it (the hand resuming the line) re-assigns it
+    /// to the open phrase, and it is held again.
+    #[test]
+    fn a_new_phrase_holds_none_of_a_closed_one_s_cohorts_until_the_hand_resumes_it() {
+        let c = cfg(true, true);
+        let t0 = Instant::now();
+        let mut rib = Ribbon::new();
+        let keys = |col0: u16, n: u16| Keys {
+            g: geom(),
+            row: 2,
+            col0,
+            n,
+            period_ms: 100,
+            disp: 0.9,
+        };
+        // "abc" at cols 2..5, the last key at +200 ms; a 1.2 s rest closes
+        // the phrase (the floor is 0.90 s).
+        type_keys(&mut rib, t0, keys(2, 3), &c);
+        let first = rib.phrase_open().expect("open");
+        let abc = rib.cohorts()[0];
+        assert_eq!(abc.phrase, first);
+        // A new phrase at cols 20.., not adjacent: the old cohort is left
+        // with the clock it had.
+        type_keys(&mut rib, at(t0, 1400), keys(20, 3), &c);
+        let second = rib.phrase_open().expect("open");
+        assert_ne!(second, first, "a rest closed the first phrase");
+        let abc_now = rib
+            .cohorts()
+            .iter()
+            .find(|k| k.id == abc.id)
+            .expect("abc is still resident inside its swoosh");
+        assert_eq!(
+            abc_now.phrase, first,
+            "the closed phrase's cohort is not re-assigned"
+        );
+        assert_eq!(
+            abc_now.alive_at,
+            at(t0, 200),
+            "…and not renewed by the new phrase's keys"
+        );
+        assert_ne!(abc_now.phase, Phase::Laying, "it is on its way out");
+        // The hand resumes the old line at col 5, adjacent to "abc", at
+        // +1700 ms: still inside the chain window, so the lay joins the old
+        // cohort — which re-joins the open phrase and is held from here.
+        let now = at(t0, 1700);
+        let cx = ctx(now, &c, (2, 6), 0.9);
+        rib.on_event(&typed(), now, &cx);
+        rib.plan(&cx);
+        let abc_now = rib
+            .cohorts()
+            .iter()
+            .find(|k| k.id == abc.id)
+            .expect("the resumed cohort");
+        assert_eq!(
+            abc_now.phrase, second,
+            "resuming a line re-joins the open phrase"
+        );
+        assert_eq!(abc_now.alive_at, now);
+        assert_eq!(abc_now.phase, Phase::Laying);
+    }
+
+    /// **The after-glow's other complaint (audit #9, s10): a Backspace run
+    /// started the swoosh.** An erase holds the open phrase — the hand is on
+    /// it — so through a run of eight Backspaces at 120 ms the band's LEFT
+    /// end stays lit and its clock follows the erases; the swoosh begins one
+    /// rest after the LAST erase. An erase after the rest has passed holds
+    /// nothing: the phrase is closed and the band is already leaving.
+    #[test]
+    fn a_backspace_run_holds_the_phrase_so_the_left_end_stays_lit_through_it() {
+        let c = cfg(true, true);
+        let t0 = Instant::now();
+        let mut rib = Ribbon::new();
+        type_run(&mut rib, t0, 2, 20, &c, 0.9);
+        let last = at(t0, 19 * 60);
+        let coh = rib.cohorts()[0];
+        // Eight Backspaces from +100 ms, 120 ms apart: caret 22 → 14.
+        let mut caret = 22u16;
+        for i in 0..8u64 {
+            caret -= 1;
+            let now = at(last, 100 + i * 120);
+            erase_at(&mut rib, now, (2, caret), &c);
+            let k = rib
+                .cohorts()
+                .iter()
+                .find(|k| k.id == coh.id)
+                .expect("the band is held");
+            assert_eq!(
+                k.alive_at, now,
+                "erase {i}: the phrase's clock follows the hand"
+            );
+            assert_eq!(k.phase, Phase::Laying);
+            let cx = ctx(now, &c, (2, caret), 0.9);
+            let left = rib
+                .cells()
+                .iter()
+                .find(|l| l.row == 2 && l.col == 2)
+                .expect("the left end is in the pool");
+            assert!(
+                rib.env_of(&cx, left) > 0.99,
+                "erase {i} (+{} ms after the last key): the left end is at full ({})",
+                100 + i * 120,
+                rib.env_of(&cx, left)
+            );
+        }
+        let last_erase = at(last, 100 + 7 * 120);
+        // Under the old law the swoosh had started at +0.75 s after the last
+        // KEY, and the left end was retreating by +541 ms on glass. Here
+        // the grace runs from the last ERASE: still laying at +0.80 s after
+        // it, reaching at +0.95 s.
+        let cx = ctx(at(last_erase, 800), &c, (2, 14), 0.0);
+        rib.plan(&cx);
+        let k = rib.cohorts().iter().find(|k| k.id == coh.id).expect("held");
+        assert_eq!(k.phase, Phase::Grace);
+        let cx = ctx(at(last_erase, 950), &c, (2, 14), 0.0);
+        rib.plan(&cx);
+        let k = rib.cohorts().iter().find(|k| k.id == coh.id).expect("held");
+        assert_eq!(
+            k.phase,
+            Phase::Reaching,
+            "the rest is measured from the last erase"
+        );
+        // …and an erase past the rest MINTS a phrase and takes the row back
+        // (2026-09-14; the arm this replaces asserted the opposite and had
+        // deleted the shipped revival — see `hold_phrase`).
+        let before = rib.phrase_open().expect("open under the run");
+        let late = at(last_erase, 1200);
+        erase_at(&mut rib, late, (2, 13), &c);
+        let k = rib
+            .cohorts()
+            .iter()
+            .find(|k| k.id == coh.id)
+            .expect("resident");
+        assert_eq!(
+            k.alive_at, late,
+            "an erase after the rest takes the row's band back"
+        );
+        assert_eq!(k.phase, Phase::Laying);
+        let now = rib.phrase_open().expect("a fresh phrase is open");
+        assert_ne!(now, before, "it is a NEW phrase, not the one that rested");
+        assert_eq!(
+            rib.cohorts()
+                .iter()
+                .find(|k| k.id == coh.id)
+                .expect("resident")
+                .phrase,
+            now,
+            "…and the row's cohort was adopted into it"
+        );
+    }
+
+    /// **THE HAND COMES BACK: a Backspace run begun AFTER the rest revives
+    /// the band** (2026-09-14). The gesture `hold_row` was added for, and
+    /// the one the first phrase spelling deleted: on v0.85.0 erasing into a
+    /// band that had started its after-glow snapped it back to full and the
+    /// band then outlived the last erase by a whole swoosh; on the branch as
+    /// merged there was no snap at all and the tail was zero, because the
+    /// first erase CLOSED the phrase and every later erase of the run then
+    /// held nothing.
+    ///
+    /// The revival is a NEW phrase over the caret row's cohorts — the row
+    /// scope is untouched (`ribbon_row_hold_model`, `OnlyOwnerRenews`), so
+    /// this is not the global hold coming back.
+    #[test]
+    fn a_backspace_run_begun_after_the_rest_snaps_the_band_back_and_runs_the_tail_from_it() {
+        let c = cfg(true, true);
+        let t0 = Instant::now();
+        let mut rib = Ribbon::new();
+        // Twenty keys at 10 cps on row 2, cols 2..22; last key at +1900 ms.
+        type_keys(
+            &mut rib,
+            t0,
+            Keys {
+                g: geom(),
+                row: 2,
+                col0: 2,
+                n: 20,
+                period_ms: 100,
+                disp: 0.9,
+            },
+            &c,
+        );
+        let id = rib.cohorts()[0].id;
+        // A SECOND ROW under the SAME hand, one key later and never touched
+        // again: the control that says the revival renews the caret's row
+        // and nothing else (`OnlyOwnerRenews`).
+        type_keys(
+            &mut rib,
+            at(t0, 2000),
+            Keys {
+                g: geom(),
+                row: 5,
+                col0: 2,
+                n: 1,
+                period_ms: 100,
+                disp: 0.9,
+            },
+            &c,
+        );
+        let last = at(t0, 2000);
+        let other = rib
+            .cohorts()
+            .iter()
+            .find(|k| k.row == 5)
+            .expect("row 5")
+            .alive_at;
+        // +1.40 s past the hand's last key: the rest (0.90 s) is spent, row
+        // 2's after-glow is under way, and both rows are still resident.
+        let glow = at(last, 1400);
+        let cx = ctx(glow, &c, (2, 22), 0.0);
+        rib.plan(&cx);
+        let leaving = rib
+            .cohorts()
+            .iter()
+            .find(|k| k.id == id)
+            .expect("row 2 is still resident");
+        assert!(
+            leaving.phase != Phase::Laying && leaving.phase != Phase::Grace,
+            "the fixture must erase into a band that is already leaving ({:?})",
+            leaving.phase
+        );
+        let dim = lit_row(&rib, &cx, 2, 1.0).len();
+        let full_env = rib
+            .cells()
+            .iter()
+            .filter(|l| l.row == 2 && rib.env_of(&cx, l) > 0.99)
+            .count();
+        // THE SNAP: one Backspace, and the row is laying again at full.
+        let bs0 = at(glow, 0);
+        erase_at(&mut rib, bs0, (2, 21), &c);
+        // Read at the erase's OWN instant — the same frame `dim` was read
+        // on, so the two numbers are a before and an after of one gesture.
+        let cx = ctx(bs0, &c, (2, 21), 0.0);
+        let k = rib
+            .cohorts()
+            .iter()
+            .find(|k| k.id == id)
+            .expect("the band is taken back");
+        assert_eq!(k.alive_at, bs0, "the clock follows the hand that came back");
+        assert_eq!(k.phase, Phase::Laying);
+        let back = lit_row(&rib, &cx, 2, 1.0).len();
+        let back_env = rib
+            .cells()
+            .iter()
+            .filter(|l| l.row == 2 && rib.env_of(&cx, l) > 0.99)
+            .count();
+        println!("revival: lit {dim} -> {back} cells, at full {full_env} -> {back_env}");
+        assert!(
+            back > dim && back_env > full_env,
+            "the erase must SNAP the band back ({dim} -> {back} lit, {full_env} -> {back_env} at full)"
+        );
+        let left = rib
+            .cells()
+            .iter()
+            .find(|l| l.row == 2 && l.col == 2)
+            .expect("the left end is in the pool");
+        assert!(
+            rib.env_of(&cx, left) > 0.99,
+            "…and the left end is back at full ({})",
+            rib.env_of(&cx, left)
+        );
+        // THE ROW CONTROL: row 5 kept exactly the clock it had.
+        assert_eq!(
+            rib.cohorts()
+                .iter()
+                .find(|k| k.row == 5)
+                .expect("row 5 is resident")
+                .alive_at,
+            other,
+            "an erase on row 2 must not renew row 5"
+        );
+        // THE REST OF THE RUN, 120 ms apart, then the tail from the LAST one.
+        let mut caret = 21u16;
+        for i in 1..8u64 {
+            caret -= 1;
+            erase_at(&mut rib, at(glow, i * 120), (2, caret), &c);
+        }
+        let last_erase = at(glow, 7 * 120);
+        let mut tail_ms = 0u64;
+        for ms in (0..=2400).step_by(20) {
+            let cx = ctx(at(last_erase, ms), &c, (2, caret), 0.0);
+            rib.plan(&cx);
+            if rib.cells().iter().any(|l| l.row == 2) {
+                tail_ms = ms;
+            } else {
+                break;
+            }
+        }
+        println!("revival: tail after the last erase {tail_ms} ms");
+        assert!(
+            tail_ms >= 1176,
+            "the band must outlive the last erase by at least the 1175.8 ms v0.85.0 measured ({tail_ms} ms)"
+        );
+        let total = (SWOOSH_TOTAL_S * 1000.0).round() as u64;
+        assert!(
+            tail_ms <= total + 60,
+            "…and by no more than its own swoosh ({tail_ms} ms against {total} ms)"
+        );
+    }
+
+    /// **S5: the grace is the melody's rest, tempo-scaled** (D-6, k = 2.5).
+    /// At 10 cps the rest is the 0.90 s floor; at 2 cps (ioi 500 ms) it is
+    /// 1.25 s, so a slow hand's line is still in its grace at 1.0 s idle —
+    /// where the floor would have had it reaching — and leaves 0.79 s after
+    /// its own rest.
+    #[test]
+    fn a_slow_hand_s_grace_is_the_tempo_multiple_and_a_fast_hand_s_is_the_floor() {
+        let c = cfg(true, true);
+        let t0 = Instant::now();
+        let fast = {
+            let mut rib = Ribbon::new();
+            type_run(&mut rib, t0, 2, 12, &c, 0.9);
+            rib.cohorts()[0].grace_s
+        };
+        assert!(
+            (fast - PHRASE_REST_MIN_S).abs() < 1e-6,
+            "10 cps: the floor ({fast})"
+        );
+        let mut rib = Ribbon::new();
+        let keys = Keys {
+            g: geom(),
+            row: 2,
+            col0: 2,
+            n: 12,
+            period_ms: 500,
+            disp: 0.6,
+        };
+        type_keys(&mut rib, t0, keys, &c);
+        let last = at(t0, 11 * 500);
+        let slow = rib.cohorts()[0].grace_s;
+        assert!(
+            (1.20..=1.25).contains(&slow),
+            "2 cps: the EMA has the tempo near 500 ms, the rest near 1.25 s ({slow})"
+        );
+        let cx = ctx(at(last, 1000), &c, (2, 14), 0.0);
+        rib.plan(&cx);
+        assert_eq!(
+            rib.cohorts()[0].phase,
+            Phase::Grace,
+            "at 1.0 s idle a 2 cps line is still in its grace"
+        );
+        let total = (swoosh_total_s(slow) * 1000.0) as u64;
+        let cx = ctx(at(last, total - 40), &c, (2, 14), 0.0);
+        rib.plan(&cx);
+        assert!(!rib.at_rest(), "on glass 40 ms before its own swoosh ends");
+        let cx = ctx(at(last, total + 40), &c, (2, 14), 0.0);
+        rib.plan(&cx);
+        assert!(rib.at_rest(), "…and gone 40 ms after");
+    }
+
+    /// **§2.6, the retract target and drain order per row.** A band on a
+    /// row BELOW the caret (an Up-arrow recall left it) retracts toward its
+    /// own LEFT end and drains right-first; one on a row ABOVE (the hand
+    /// went down a line) retracts toward its right end — the fold — and
+    /// drains left-first. Neither slides toward a column that belongs to
+    /// another row (audit hi/s9; the refresh's s17).
+    #[test]
+    fn a_row_the_caret_is_not_on_retracts_into_its_own_nearest_end_in_logical_order() {
+        let c = cfg(true, true);
+        let t0 = Instant::now();
+        let below = |to: (u16, u16)| {
+            let mut rib = Ribbon::new();
+            type_run(&mut rib, t0, 4, 20, &c, 0.9);
+            let last = at(t0, 19 * 60);
+            let now = at(last, 100);
+            let cx = ctx(now, &c, to, 0.9);
+            rib.on_event(&nav((2, 24), to), now, &cx);
+            rib.plan(&cx);
+            let k = rib.cohorts()[0];
+            let env = |col: u16, ms: u64| {
+                let cx = ctx(at(now, ms), &c, to, 0.0);
+                let cell = rib
+                    .cells()
+                    .iter()
+                    .find(|l| l.row == 2 && l.col == col)
+                    .expect("cell");
+                rib.env_of(&cx, cell)
+            };
+            (k, env(4, 200), env(23, 200))
+        };
+        // Up: the caret to row 1, col 24 — the band is now BELOW the hand.
+        let (k, left, right) = below((1, 24));
+        assert!(k.abandoned && k.phase.is_retracting());
+        assert_eq!(
+            k.retract_col,
+            Some(4),
+            "a row below the caret pulls into its left end"
+        );
+        assert!(k.drain_right_first, "…and drains from its right end");
+        assert!(
+            right < left,
+            "200 ms into the retract the right end has spent more than the left ({right} vs {left})"
+        );
+        // Down: the caret to row 3, col 0 — the band is ABOVE the hand.
+        let (k, left, right) = below((3, 0));
+        assert_eq!(
+            k.retract_col,
+            Some(23),
+            "a row above the caret pulls into its right end — the fold — not toward col 0 on another row"
+        );
+        assert!(!k.drain_right_first);
+        assert!(
+            left < right,
+            "…and drains from its left end ({left} vs {right})"
+        );
+    }
+
+    /// **A3: the after-glow of a fast line ends at the floor rest plus the
+    /// swoosh** — 1.69 s after the last key, where the audit measured
+    /// 931–1201 ms against a law that promised 1.54 and a grace of 0.75.
+    #[test]
+    fn the_after_glow_of_a_fast_line_ends_at_the_rest_plus_the_swoosh() {
+        let c = cfg(true, true);
+        let t0 = Instant::now();
+        let mut rib = Ribbon::new();
+        type_run(&mut rib, t0, 2, 20, &c, 0.9);
+        let last = at(t0, 19 * 60);
+        let total = (SWOOSH_TOTAL_S * 1000.0).round() as u64;
+        assert_eq!(total, 1690, "0.90 s rest + 0.79 s swoosh");
+        let mut sink = Sink::default();
+        let cx = ctx(at(last, total - 30), &c, (2, 22), 0.0);
+        rib.plan(&cx);
+        let mut f = sink.frame();
+        rib.emit(&cx, &mut f);
+        assert!(
+            !sink.under.is_empty(),
+            "light on glass 30 ms before the swoosh ends"
+        );
+        let cx = ctx(at(last, total + 30), &c, (2, 22), 0.0);
+        rib.plan(&cx);
+        let mut f = sink.frame();
+        rib.emit(&cx, &mut f);
+        assert!(
+            sink.under.is_empty() && rib.at_rest(),
+            "…and none 30 ms after"
         );
     }
 
@@ -7627,8 +11483,17 @@ mod tests {
         );
     }
 
+    /// **A RELEASED RUN LEAVES THROUGH THE SWOOSH'S RETRACT, UNSTAMPED**
+    /// (2026-09-14, the new line's fade). Six typed cells, the last one
+    /// backspaced (retracting on its own 0.24 s clock); the witness names
+    /// all six as blanked. The five live cells are counted and not one of
+    /// them is stamped: their cohort is abandoned into its retract — not
+    /// rejoinable, the text is gone — and the retracting cell keeps the
+    /// clock it has. The retract's own span later the row is out of the
+    /// pool: its light was drawn into the hand over `RETRACT_DUR_S +
+    /// RETRACT_FADE_S`, never cut on `RETIRE_MELT_S`.
     #[test]
-    fn a_retired_row_goes_as_one_unit_and_a_cell_already_leaving_keeps_its_clock() {
+    fn a_released_run_is_abandoned_into_its_retract_and_a_cell_already_leaving_keeps_its_clock() {
         let c = cfg(true, true);
         let t0 = Instant::now();
         let mut rib = Ribbon::new();
@@ -7636,25 +11501,88 @@ mod tests {
         let last = at(t0, 5 * 60);
         // Backspace: cell 15 retracts on its own 0.24 s clock.
         erase_at(&mut rib, at(last, 50), (2, 15), &c);
-        let stamped = rib.retire_row(2, at(last, 60));
+        let stamp_15 = rib
+            .cells()
+            .iter()
+            .find(|l| l.row == 2 && l.col == 15)
+            .and_then(|l| l.retract_at);
+        assert!(stamp_15.is_some(), "the erased cell is retracting");
+        let named: Vec<(u16, u16, Instant)> = rib
+            .cells()
+            .iter()
+            .filter(|l| l.row == 2)
+            .map(|l| (l.row, l.col, l.born))
+            .collect();
+        let released = rib.release_cells(&named, at(last, 60));
         assert_eq!(
-            stamped, 5,
+            released, 5,
             "the five live cells; the retracting one keeps its clock"
         );
         assert!(
             rib.cells()
                 .iter()
-                .all(|l| l.row != 2 || l.retire_at.is_some() || l.retract_at.is_some()),
-            "every cell on the row is leaving"
+                .all(|l| l.row != 2 || l.retire_at.is_none()),
+            "not one cell is stamped on the melt"
         );
-        assert_eq!(rib.retire_row(2, at(last, 70)), 0, "nothing left to stamp");
-        let cx = ctx(at(last, 60 + 130), &c, (2, 15), 0.9);
+        assert_eq!(
+            rib.cells()
+                .iter()
+                .find(|l| l.row == 2 && l.col == 15)
+                .and_then(|l| l.retract_at),
+            stamp_15,
+            "the retracting cell keeps its own clock"
+        );
+        let coh = rib
+            .cohorts()
+            .iter()
+            .find(|k| k.row == 2)
+            .copied()
+            .expect("the row's cohort");
+        assert!(coh.abandoned, "the cohort is abandoned");
+        assert!(!coh.rejoinable, "…and not rejoinable: the text is gone");
+        let cx = ctx(at(last, 76), &c, (2, 15), 0.9);
         rib.plan(&cx);
         assert!(
-            !rib.cells()
+            rib.cohorts()
                 .iter()
-                .any(|l| l.row == 2 && l.retire_at.is_some()),
-            "the retired five are out of the pool {RETIRE_MELT_S} s later"
+                .find(|k| k.row == 2)
+                .is_some_and(|k| k.phase.is_retracting()),
+            "on the next plan the cohort is in its retract"
+        );
+        assert!(
+            rib.cells().iter().filter(|l| l.row == 2).count() >= 5,
+            "…and the five cells are still resident, drawn in, not cut"
+        );
+        // A second release of the same cells restarts nothing: the clock
+        // the cohort has is the clock it keeps.
+        let alive_at = rib
+            .cohorts()
+            .iter()
+            .find(|k| k.row == 2)
+            .map(|k| k.alive_at);
+        rib.release_cells(&named, at(last, 90));
+        assert_eq!(
+            rib.cohorts()
+                .iter()
+                .find(|k| k.row == 2)
+                .map(|k| k.alive_at),
+            alive_at,
+            "a repeat release does not rewind the clock again"
+        );
+        let cx = ctx(
+            at(
+                last,
+                60 + ((RETRACT_DUR_S + RETRACT_FADE_S) * 1000.0) as u64 + 20,
+            ),
+            &c,
+            (2, 15),
+            0.9,
+        );
+        rib.plan(&cx);
+        assert!(
+            !rib.cells().iter().any(|l| l.row == 2),
+            "the released run is out of the pool the retract's own span later, \
+             not {RETIRE_MELT_S} s later"
         );
     }
 
@@ -7677,6 +11605,7 @@ mod tests {
         let neighbor = born(&rib, 11);
         let mut witness = Witness::new();
         let mut retired = Vec::new();
+        let mut released = Vec::new();
         let original: Vec<char> = "          ab".chars().collect();
         witness.walk(
             rib.cells(),
@@ -7685,6 +11614,7 @@ mod tests {
                 cols: &original,
             }],
             &mut retired,
+            &mut released,
         );
         assert!(retired.is_empty());
         let fired = at(t0, 100);
@@ -7705,6 +11635,7 @@ mod tests {
                 cols: &replacement,
             }],
             &mut retired,
+            &mut released,
         );
         assert!(retired.is_empty(), "the fresh key arms its own record");
         let changed: Vec<char> = "          Yb".chars().collect();
@@ -7715,6 +11646,7 @@ mod tests {
                 cols: &changed,
             }],
             &mut retired,
+            &mut released,
         );
         assert_eq!(
             retired,
@@ -7780,6 +11712,7 @@ mod tests {
         type_run(&mut rib, t0, 10, 1, &c, 0.9);
         let mut witness = Witness::new();
         let mut retired = Vec::new();
+        let mut released = Vec::new();
         let original: Vec<char> = "          a".chars().collect();
         witness.walk(
             rib.cells(),
@@ -7788,6 +11721,7 @@ mod tests {
                 cols: &original,
             }],
             &mut retired,
+            &mut released,
         );
         assert!(retired.is_empty());
         let before_ctx = ctx(at(t0, 99), &c, (2, 11), 0.9);
@@ -7817,6 +11751,7 @@ mod tests {
                 cols: &replacement,
             }],
             &mut retired,
+            &mut released,
         );
         assert!(
             retired.is_empty(),
@@ -7834,13 +11769,53 @@ mod tests {
         let cx = ctx(at(last, 100), &c, (2, 16), 0.8);
         rib.plan(&cx);
         let full = plan_peak(&rib);
+        let full_sum = plan_sum(&rib);
         rib.on_event(&Event::Focus(false), at(last, 100), &cx);
         let cx = ctx(at(last, 250), &c, (2, 16), 0.8);
         rib.plan(&cx);
         let dimmed = plan_peak(&rib);
+        let dim_sum = plan_sum(&rib);
+        // RESTATED 2026-09-14 (the per-stop ember floor, and again the same
+        // day when the floor became a CONTRAST). The ember dims each stop
+        // into its OWN range, and that range is a fact about the theme, not
+        // about the ember: the bed's bar and the colour floor are 236 and
+        // 193 apart for a chartreuse stop on the default ground, so a band
+        // of warm stops can only lose a sixth of its light before one of
+        // them is off the glass. "Well under way" therefore has to be said
+        // in units of the RANGE THE BAND HAS, which is measured here and not
+        // assumed: a second ribbon laid by the same fixture, embered to its
+        // last frame, is what this band's light is on its way to.
+        let mut twin = Ribbon::new();
+        type_run(&mut twin, t0, 10, 6, &c, 0.8);
+        let blur_cx = ctx(at(last, 100), &c, (2, 16), 0.8);
+        twin.on_event(&Event::Focus(false), at(last, 100), &blur_cx);
+        let end_cx = ctx(at(last, 399), &c, (2, 16), 0.8);
+        twin.plan(&end_cx);
+        let floor_sum = plan_sum(&twin);
+        let range = full_sum.saturating_sub(floor_sum);
+        let burned = full_sum.saturating_sub(dim_sum);
+        println!(
+            "ember/regain: {full_sum} → {dim_sum} → {floor_sum} of light \
+             (range {range}, burned {burned} = {:.0}% at u=0.5, spend says {:.0}%)",
+            100.0 * burned as f32 / range.max(1) as f32,
+            100.0 * (1.0 - spend(0.5))
+        );
         assert!(
-            dimmed < full / 2,
-            "the ember must be well under way ({full} → {dimmed})"
+            dimmed < full,
+            "the ember must be burning ({full} → {dimmed})"
+        );
+        assert!(
+            range > 0 && floor_sum > 0,
+            "the fixture must leave the band SOME range to spend and some light at the floor \
+             ({full_sum} → {floor_sum})"
+        );
+        // `spend` is `(1 − u)²`, so at the halfway instant exactly three
+        // quarters of whatever range the band has is already gone. Within a
+        // twentieth, which is the rounding of a coverage byte per cell.
+        assert!(
+            burned as f32 >= range as f32 * (1.0 - spend(0.5) - 0.05),
+            "the ember must be well under way: {burned} of {range} spendable \
+             ({full_sum} → {dim_sum}, floor {floor_sum})"
         );
         rib.on_event(&Event::Focus(true), at(last, 250), &cx);
         let cx = ctx(at(last, 251), &c, (2, 16), 0.8);
@@ -7857,6 +11832,389 @@ mod tests {
             rearmed + 3 >= full,
             "after the edge-in the ribbon must be back at its level ({full} vs {rearmed})"
         );
+    }
+
+    // -- THE FOCUS EMBER LEAVES AS ONE OBJECT (2026-09-14) -----------------
+
+    /// **THE PAINT CENSUS'S OWN RULE, NOT THIS MODULE'S** — `ribscan`, the
+    /// rig that measured this defect on glass, calls a pixel PAINT when
+    /// `max(r, g, b) >= 60 && max - min >= 40`, and a cell LIT when a fifth
+    /// of its bed pixels are paint. On a light theme the mark is a dark
+    /// saturated pixel on bright paper, so the level half is read in the
+    /// paper's polarity (`min <= 255 - 60`) and the chroma half — a property
+    /// of the pixel alone — is unchanged.
+    ///
+    /// Stated in ABSOLUTE BYTES, and deliberately NOT in terms of [`seen`].
+    /// The first spelling of this twin judged lit-ness with `seen` — the
+    /// very predicate [`seen_floor`] inverts — so its pass was guaranteed by
+    /// construction: it went on passing while the shipped binary opened
+    /// 33-cell dark runs on the default theme. A pin must not be written in
+    /// the thing it is pinning.
+    fn census_paint(px: u32, light: bool) -> bool {
+        let c = |sh: u32| f32::from(((px >> sh) & 0xff) as u8);
+        let (r, g, b) = (c(16), c(8), c(0));
+        let (mx, mn) = (r.max(g).max(b), r.min(g).min(b));
+        let level = if light {
+            mn <= 255.0 - 60.0
+        } else {
+            mx >= 60.0
+        };
+        level && mx - mn >= 40.0
+    }
+
+    /// Columns of `row` whose BED composites as PAINT over the theme's own
+    /// ground ([`census_paint`], the rig's instrument read inside the module
+    /// against the same bytes the renderer will send) at `scale` times the
+    /// coverage the ribbon reports on this frame.
+    fn lit_row(rib: &Ribbon, cx: &Ctx<'_>, row: u16, scale: f32) -> Vec<u16> {
+        let bg = cx.cfg.theme_bg;
+        let light = !cx.cfg.dark_theme;
+        let mut out: Vec<u16> = Vec::new();
+        for cell in rib.cells().iter().filter(|c| c.row == row) {
+            let a = (rib.cov_of(cx, cell) * scale).round().clamp(0.0, 255.0) as u8;
+            if a > 0 && census_paint(over_premul(bg, premul_rgb(rib.ink.at(cell.t), a), a), light) {
+                out.push(cell.col);
+            }
+        }
+        out.sort_unstable();
+        out.dedup();
+        out
+    }
+
+    /// The longest DARK run strictly inside `lit`'s own span — the rig's
+    /// `ribscan` verdict, in cells.
+    fn dark_run(lit: &[u16]) -> u16 {
+        let (mut worst, mut run) = (0u16, 0u16);
+        let (Some(&first), Some(&last)) = (lit.first(), lit.last()) else {
+            return 0;
+        };
+        for col in first..=last {
+            if lit.contains(&col) {
+                run = 0;
+            } else {
+                run += 1;
+                worst = worst.max(run);
+            }
+        }
+        worst
+    }
+
+    /// **THE BAND LEAVES AS ONE OBJECT.** Through every frame of the focus
+    /// ember the PAINTED cells of a band are ONE interval — no dark run
+    /// inside it — and the whole band goes out in the frame the ember ends.
+    ///
+    /// The defect this pins (measured on glass 2026-09-14: 3 of 21 frames of
+    /// the blur window held a dark run of 5 to 8 cells on Nord, and 8 of 30
+    /// frames a run of up to 33 on the default theme, against 0 of 30 on
+    /// v0.85.0, which has no ember at all) is NOT a tear and not a missing
+    /// cell: it is the bed's own arithmetic. [`bed_ink`] puts every stop on
+    /// one composited LUMINANCE — the legibility bar — and therefore NOT on
+    /// one distance from the ground, so one shared fade takes the warm third
+    /// off the glass while its neighbours are still bright and the band
+    /// reads as two pieces with a hole.
+    ///
+    /// **Judged by [`census_paint`] and NOT by [`seen`]**, which is the whole
+    /// difference between this spelling and the one it replaces. The first
+    /// spelling asked `seen` whether a cell was lit — the predicate
+    /// [`seen_floor`] inverts — so the ember's exit level was compared with
+    /// the definition of the exit level, and the answer was yes by
+    /// construction on any theme, including the one where the shipped binary
+    /// was opening 33-cell holes. Here the fixture's own arm, and the rig on
+    /// glass, use the same instrument and neither of them is this module's.
+    ///
+    /// Two falsifiers, so a fixture that cannot fail cannot pass: the shipped
+    /// PRE-EMBER fade (a bare `spend` over the whole band) reconstructed on
+    /// the same frames, which splits the band by 21 cells over 26 frames; and
+    /// — when the floor is reverted to the 24-byte lift this replaced — this
+    /// arm itself, which goes red on the default ground at 33 cells, the same
+    /// number the glass census reported.
+    #[test]
+    fn the_focus_ember_never_opens_a_dark_run_inside_the_band() {
+        for (theme, fg, bg) in [
+            ("default #111318", SHIPPED_FG, SHIPPED_BG),
+            ("Nord", NORD_FG, NORD_BG),
+        ] {
+            let mut c = cfg(true, true);
+            c.theme_fg = fg;
+            c.theme_bg = bg;
+            let t0 = Instant::now();
+            let mut rib = Ribbon::new();
+            // SIXTY cells, so the walk folds twice and the warm third lands
+            // in the MIDDLE of the band as well as at its ends: a hole the
+            // scanner can see has to have lit cells on both sides of it.
+            type_keys(
+                &mut rib,
+                t0,
+                Keys {
+                    g: geom(),
+                    row: 2,
+                    col0: 2,
+                    n: 60,
+                    period_ms: 40,
+                    disp: 0.9,
+                },
+                &c,
+            );
+            let last = at(t0, 59 * 40);
+            let caret = (2u16, 62u16);
+            let cx = ctx(at(last, 60), &c, caret, 0.9);
+            rib.plan(&cx);
+            let full = lit_row(&rib, &cx, 2, 1.0);
+            assert!(
+                full.len() >= 40,
+                "{theme}: the fixture's band is lit before the blur ({} cells)",
+                full.len()
+            );
+            assert_eq!(dark_run(&full), 0, "{theme}: the fixture starts whole");
+            let blur = at(last, 60);
+            rib.on_event(&Event::Focus(false), blur, &cx);
+            let (mut worst_new, mut worst_old, mut old_split_frames) = (0u16, 0u16, 0u32);
+            let mut shrunk_while_lit = Vec::new();
+            for ms in (0..=300).step_by(4) {
+                let now = at(blur, ms);
+                let cx = ctx(now, &c, caret, 0.0);
+                rib.plan(&cx);
+                let burned = ms as f32 / 1000.0 / FOCUS_EMBER_S;
+                let now_lit = lit_row(&rib, &cx, 2, 1.0);
+                // THE PRE-FIX EMBER, EXACTLY: the same frame with the ember
+                // lifted off the envelope, scaled by the bare `spend` that
+                // was this module's whole ember law before the per-stop
+                // floor. Reconstruction, not a model.
+                let burning = rib.ember_at.take();
+                let old_lit = lit_row(&rib, &cx, 2, spend(clamp01(burned)));
+                rib.ember_at = burning;
+                worst_new = worst_new.max(dark_run(&now_lit));
+                let od = dark_run(&old_lit);
+                worst_old = worst_old.max(od);
+                if od >= 2 {
+                    old_split_frames += 1;
+                }
+                if !now_lit.is_empty() && now_lit != full {
+                    shrunk_while_lit.push((ms, now_lit.len()));
+                }
+            }
+            assert_eq!(
+                worst_new, 0,
+                "{theme}: the ember opened a dark run of {worst_new} cells inside the band"
+            );
+            assert!(
+                shrunk_while_lit.is_empty(),
+                "{theme}: cells left the band before the end of the ember: {shrunk_while_lit:?}"
+            );
+            let gone = ctx(at(blur, 301), &c, (2, 62), 0.0);
+            rib.plan(&gone);
+            assert!(
+                lit_row(&rib, &gone, 2, 1.0).is_empty(),
+                "{theme}: the ember's end takes every cell"
+            );
+            // THE FALSIFIER: the pre-fix ember splits this same band.
+            assert!(
+                worst_old >= 2 && old_split_frames >= 2,
+                "{theme}: the fixture cannot show the defect it pins \
+                 (worst pre-fix dark run {worst_old} cells over {old_split_frames} frames)"
+            );
+            println!(
+                "ember/{theme}: shipped worst dark run {worst_new}; \
+                 pre-fix {worst_old} cells over {old_split_frames} frames"
+            );
+        }
+    }
+
+    /// Every ground aterm SHIPS, read out of the product's own theme table:
+    /// `ColorScheme::default` — the theme a config with no `theme` line gets
+    /// — plus every built-in, dark and light, each with the `dark_theme`
+    /// flag the GUI would give it (`aterm_render::theme_is_dark`). Read, not
+    /// listed, so a theme added to the product cannot be a theme nobody ran.
+    fn shipped_grounds() -> Vec<(String, u32, u32, bool)> {
+        let rgb =
+            |c: aterm_types::Rgb| (u32::from(c.r) << 16) | (u32::from(c.g) << 8) | u32::from(c.b);
+        let d = aterm_types::scheme::ColorScheme::default();
+        let mut out = vec![("Default".to_string(), rgb(d.foreground), rgb(d.background))];
+        out.extend(
+            aterm_types::scheme::builtin_names()
+                .into_iter()
+                .filter_map(|n| {
+                    aterm_types::scheme::builtin(n)
+                        .map(|s| (n.to_string(), rgb(s.foreground), rgb(s.background)))
+                }),
+        );
+        // `builtin_names` carries "Default" too; one ground, one row.
+        let mut seen_bg: Vec<u32> = Vec::new();
+        out.into_iter()
+            .filter(|(_, _, bg)| {
+                let first = !seen_bg.contains(bg);
+                seen_bg.push(*bg);
+                first
+            })
+            .map(|(n, fg, bg)| (n, fg, bg, aterm_render::theme_is_dark(bg)))
+            .collect()
+    }
+
+    /// **THE FLOOR MEANS ONE THING ON EVERY THEME THAT SHIPS.** For every
+    /// ground in the product's own table, every stop the bed's bar leaves as
+    /// PAINT at full coverage ([`census_paint`], the rig's instrument — NOT
+    /// [`seen`]) is still paint at the coverage the ember leaves it at. The
+    /// ember may dim a stop; it may not be what takes it off the glass.
+    ///
+    /// This is the twin the 24-byte lift did not have. That constant was
+    /// measured on Nord, proved on Nord, and shipped — and it is the STRICTER
+    /// of its two halves on Nord (24 bytes off `#2E3440` leaves the band at a
+    /// peak of 71..90, over the census's 60) and the LOOSER on the default
+    /// `#111318` (50..59, under it). The second arm here reconstructs
+    /// it and requires it to FAIL, so the sweep has a red arm and a green one
+    /// on the same fixture.
+    #[test]
+    fn the_ember_never_takes_a_stop_under_the_census_on_any_shipped_ground() {
+        /// The 24-byte lift this module shipped for one day, reconstructed.
+        fn abs_lift_floor(ink: u32, bg: u32) -> f32 {
+            let ch = |c: u32, sh: u32| f32::from(((c >> sh) & 0xff) as u8);
+            let old_seen = |px: u32| {
+                let (r, g, b) = (ch(px, 16), ch(px, 8), ch(px, 0));
+                let lift = (r - ch(bg, 16))
+                    .abs()
+                    .max((g - ch(bg, 8)).abs())
+                    .max((b - ch(bg, 0)).abs());
+                lift >= 24.0 && r.max(g).max(b) - r.min(g).min(b) >= 40.0
+            };
+            (1..=255u16)
+                .rev()
+                .map(|a| u8::try_from(a).unwrap_or(255))
+                .find(|&a| !old_seen(over_premul(bg, premul_rgb(ink, a), a)))
+                .map_or(1.0, |a| f32::from(a) + 1.0)
+        }
+        let mut old_broke = Vec::new();
+        let mut grounds = 0u32;
+        for (name, fg, bg, dark) in shipped_grounds() {
+            let mut c = cfg(dark, true);
+            c.theme_fg = fg;
+            c.theme_bg = bg;
+            let mut lut = BedInkLut::default();
+            lut.sync(&c);
+            let cap = cov_cap(&c);
+            let light = !dark;
+            let exit = |ink: u32, floor: f32| {
+                // `EMBER_FLOOR_MARGIN` over the floor, clipped to the bed's
+                // own ceiling: a floor over the ceiling is "hold at full".
+                let a = (floor * EMBER_FLOOR_MARGIN).clamp(0.0, cap) as u8;
+                over_premul(bg, premul_rgb(ink, a), a)
+            };
+            let level = |px: u32| {
+                let c = |sh: u32| f32::from(((px >> sh) & 0xff) as u8);
+                if light {
+                    c(16).min(c(8)).min(c(0))
+                } else {
+                    c(16).max(c(8)).max(c(0))
+                }
+            };
+            let (mut lit_at_bar, mut lost_new, mut lost_old) = (0u32, Vec::new(), Vec::new());
+            let (mut lo, mut hi) = (f32::INFINITY, 0.0f32);
+            for i in 0..BED_INK_LUT_LEN {
+                let t = i as f32 / (BED_INK_LUT_LEN - 1) as f32;
+                let ink = lut.at(t);
+                let cov = cap as u8;
+                if !census_paint(over_premul(bg, premul_rgb(ink, cov), cov), light) {
+                    // The BAR already leaves this stop under the instrument
+                    // at full coverage (Solarized Dark's foreground does it
+                    // to half the arc). Not the ember's to fix, and the
+                    // floor lands over the whole coverage there, so the stop
+                    // holds until the pool clears.
+                    continue;
+                }
+                lit_at_bar += 1;
+                let px = exit(ink, lut.seen_floor_at(t));
+                lo = lo.min(level(px));
+                hi = hi.max(level(px));
+                if !census_paint(px, light) {
+                    lost_new.push((t, px));
+                }
+                if !census_paint(exit(ink, abs_lift_floor(ink, bg)), light) {
+                    lost_old.push(t);
+                }
+            }
+            grounds += 1;
+            println!(
+                "ground/{name} bg=#{bg:06X} {} — {lit_at_bar} of {BED_INK_LUT_LEN} stops lit at the bar, \
+                 exit level {lo:.0}..{hi:.0}, lost by the floor {} (by the 24-byte lift {})",
+                if dark { "dark" } else { "light" },
+                lost_new.len(),
+                lost_old.len()
+            );
+            assert!(
+                lost_new.is_empty(),
+                "{name}: the ember took {} stops the bar left lit under the paint census — \
+                 {:?}",
+                lost_new.len(),
+                lost_new
+                    .iter()
+                    .map(|(t, px)| format!("t={t:.2} #{px:06X}"))
+                    .take(6)
+                    .collect::<Vec<_>>()
+            );
+            if !lost_old.is_empty() {
+                old_broke.push((name, lost_old.len(), lit_at_bar));
+            }
+        }
+        assert!(
+            grounds >= 12,
+            "the product's theme table went missing ({grounds} grounds)"
+        );
+        // THE RED ARM: the constant this replaced is not a statement about
+        // visibility at all — it loses most of the arc on the theme the
+        // product opens with, and the whole point is that no fixture stated
+        // in `seen` could ever have said so.
+        println!(
+            "the 24-byte lift loses stops on {} of {grounds} shipped grounds: {old_broke:?}",
+            old_broke.len()
+        );
+        let default_lost = old_broke
+            .iter()
+            .find(|(n, _, _)| n == "Default")
+            .map_or(0, |(_, lost, _)| *lost);
+        assert!(
+            default_lost >= 100,
+            "the 24-byte lift must be REFUTED on the default ground for this sweep to have a red \
+             arm; it lost {default_lost} stops"
+        );
+    }
+
+    /// **THE ARITHMETIC BEHIND THE FLOOR, PRINTED.** The bed's bar equalises
+    /// the arc's LUMINANCE, not its distance from the ground, so the alpha at
+    /// which a stop stops being [`seen`] differs across the arc by a factor
+    /// of four or more — which is exactly how much of the fade a shared
+    /// multiplier gets wrong.
+    #[test]
+    fn the_warm_stops_go_out_at_several_times_the_coverage_the_cool_ones_do() {
+        for (theme, fg, bg) in [
+            ("default #111318", SHIPPED_FG, SHIPPED_BG),
+            ("Nord", NORD_FG, NORD_BG),
+        ] {
+            let mut c = cfg(true, true);
+            c.theme_fg = fg;
+            c.theme_bg = bg;
+            let mut lut = BedInkLut::default();
+            lut.sync(&c);
+            let mut rows = Vec::new();
+            for i in 0..12u32 {
+                let t = i as f32 / 12.0;
+                rows.push((t, lut.at(t), lut.seen_floor_at(t)));
+            }
+            let lo = rows.iter().map(|r| r.2).fold(f32::INFINITY, f32::min);
+            let hi = rows.iter().map(|r| r.2).fold(0.0f32, f32::max);
+            for (t, ink, floor) in &rows {
+                println!(
+                    "seen_floor/{theme} t={t:.2} ink=#{ink:06X} peak={} floor={floor:.0}/236",
+                    ((ink >> 16) & 0xff).max((ink >> 8) & 0xff).max(ink & 0xff)
+                );
+            }
+            assert!(
+                hi >= 3.0 * lo,
+                "{theme}: the arc's colour floors must spread — {lo:.0} to {hi:.0}"
+            );
+            assert!(
+                hi < UNDER_COV_CAP,
+                "{theme}: every stop must be visible at the bed's own ceiling ({hi:.0})"
+            );
+        }
     }
 
     #[test]
@@ -7897,14 +12255,513 @@ mod tests {
             "the body must still be on glass for the pin to mean anything"
         );
         let low = peak_channel(&sink.out);
+        // RESTATED 2026-09-14: the hairline's share of its own start is the
+        // HEAD CELL'S ENVELOPE, exactly — which is the law, where the old
+        // `low * 4 < full` was a number that happened to hold while every
+        // stop spent one shared curve. Under the per-stop ember floor the
+        // head's stop keeps the range its ink has, and the hairline keeps
+        // exactly that: measured, not assumed.
+        let cx = ctx(at(lost, 250), &c, (2, 18), 0.9);
+        let head = rib
+            .cells()
+            .iter()
+            .max_by_key(|l| l.col)
+            .copied()
+            .expect("the head is in the pool");
+        let env = rib.env_of(&cx, &head);
+        let share = low as f32 / full as f32;
         assert!(
-            low * 4 < full && low <= mid,
-            "+250 ms into the ember the hot edge is at {low} against {full} at the loss; it must go out with its body, not hold until the pool clears"
+            (share - env).abs() < 0.06,
+            "+250 ms into the ember the hot edge is at {low} of {full} (share {share:.3}); \
+             it must ride the head cell's own envelope ({env:.3}), not a clock of its own"
+        );
+        // RESTATED again 2026-09-14 (the floor as a contrast): "going out
+        // with its body" is a claim about the CLOCK, and `env < 0.7` was a
+        // claim about the head stop's RANGE — which belongs to the theme.
+        // `spend` is `(1 − u)²`, so at +250 ms of 300 the ember has spent
+        // 97% of whatever range the head has: the envelope here must already
+        // be within a few parts in a hundred of the one it ends the ember
+        // at, and the hairline must be falling with it.
+        let end_cx = ctx(at(lost, 299), &c, (2, 18), 0.9);
+        let env_end = rib.env_of(&end_cx, &head);
+        let law = env_end + (1.0 - env_end) * spend(250.0 / 300.0);
+        assert!(
+            low <= mid && (env - law).abs() < 0.03 && env_end < 1.0,
+            "…and it must be going out with its body on the ember's own clock, not holding \
+             until the pool clears ({full} → {mid} → {low}, envelope {env:.3}, the ember's \
+             law at this instant {law:.3}, its floor {env_end:.3})"
         );
         frame(&mut rib, &mut sink, at(lost, 300));
         assert!(
-            sink.out.is_empty() && rib.at_rest(),
-            "…and at the ember's end there is nothing, hairline included"
+            sink.out.is_empty()
+                && rib.at_rest()
+                && rib.next_change_deadline(at(lost, 300)).is_none(),
+            "…and at the ember's end there is nothing, hairline included, and no wake asked for"
+        );
+    }
+
+    /// **THE FOCUS SEAM'S WAKE CLAUSE** (2026-09-13, Rainbow Path v3 step 1).
+    /// The host now forwards RAW focus (`CursorGlow::note_focus`), and the
+    /// host's own law for an unfocused window that is being typed into — a
+    /// control-socket agent's window — is that its light keeps drawing (the
+    /// "live typed wake" fold). So a typed key laid while the ember burns
+    /// CLEARS the ember and re-lights from the level the light had, through
+    /// `edge-in`, and the pool is not swept at the ember's end. Before this
+    /// arm every cell laid under a burning ember was born at `spend(1) = 0`.
+    #[test]
+    fn a_typed_key_under_a_burning_ember_clears_it_and_relights_from_the_level() {
+        let c = cfg(true, true);
+        let t0 = Instant::now();
+        let mut rib = Ribbon::new();
+        type_run(&mut rib, t0, 10, 8, &c, 0.9);
+        let lost = at(t0, 7 * 60 + 100);
+        rib.plan(&ctx(lost, &c, (2, 18), 0.9));
+        let pre = plan_peak(&rib);
+        rib.on_event(&Event::Focus(false), lost, &ctx(lost, &c, (2, 18), 0.9));
+        let cx = ctx(at(lost, 150), &c, (2, 18), 0.9);
+        rib.plan(&cx);
+        let mid = plan_peak(&rib);
+        let full = (UNDER_COV_CAP * BODY_COLD_SHARE) as u8;
+        // RESTATED 2026-09-14 (the per-stop floor as a contrast): halfway
+        // through, the body is below the level it had at the blur. It is NOT
+        // below the cold-body ceiling any more, and that was never the
+        // claim: the peak belongs to whichever stop in the run has the least
+        // range between the bed's bar and the colour floor, and on a dark
+        // ground a warm stop's range is a fifth of its light.
+        assert!(
+            mid > 0 && mid < pre,
+            "halfway through the ember the body is spending ({pre} → {mid}, cold ceiling {full})"
+        );
+        // A key at +150 ms: the hand is on the window, focused or not.
+        let key = at(lost, 150);
+        let cx = ctx(key, &c, (2, 19), 0.9);
+        rib.on_event(&typed(), key, &cx);
+        rib.plan(&cx);
+        assert!(
+            plan_peak(&rib) >= mid,
+            "the key re-arms the run from the ember's level, never below it ({} < {mid})",
+            plan_peak(&rib)
+        );
+        let cx = ctx(at(key, 30), &c, (2, 19), 0.9);
+        rib.plan(&cx);
+        assert!(
+            plan_peak(&rib) >= full - 2,
+            "one edge-in after the key the run is back at its ceiling ({})",
+            plan_peak(&rib)
+        );
+        let cx = ctx(at(lost, 320), &c, (2, 19), 0.9);
+        rib.plan(&cx);
+        assert!(
+            !rib.at_rest() && plan_peak(&rib) >= full - 2,
+            "past the ember's end the ribbon is still on the glass: the key cleared the ember"
+        );
+    }
+
+    /// **THE CURTAIN** (Rainbow Path v3 §2.8, A2; 2026-09-13, restated
+    /// 2026-09-14). At a coordinate-space seam the band is drawn into the
+    /// hand it last stood under over `CURTAIN_S` and spent to exactly zero —
+    /// FARTHEST-FIRST, so the count falls in steps and never off a cliff —
+    /// and nothing is laid until it is over: a key and a jump during the
+    /// curtain leave the pool as it is, a key after it lays afresh. The host
+    /// asks for frames throughout (the suck-in is motion).
+    ///
+    /// **STATED IN THE QUANTITY THE INSTRUMENTS READ.** The law's own metric
+    /// is [`Ribbon::lit_segments`] — `trail status`'s `ribbon_segments=`, and
+    /// with [`Ribbon::ink_segments`] the number the glass census counts. An
+    /// earlier spelling of this pin asserted a geometric `cell_lit`, which
+    /// scores a quad at alpha 1 exactly as it scores one at alpha 236 and so
+    /// cannot see a brightness cliff at all; and it stopped sampling at
+    /// +198 ms, one frame before the fall it was pinning. Both halves are
+    /// fixed here: the sweep runs PAST `CURTAIN_S` to +330 ms, and every
+    /// frame's step is measured on the segment counts.
+    ///
+    /// The bounds are [`CURTAIN_MAX_STEP_FRAC`] and [`CURTAIN_MIN_FRAMES`]:
+    /// the natural retract this curtain imitates never steps more than 6 of
+    /// ~20 cells, because it is staggered farthest-first. A curtain on ONE
+    /// clock stepped the whole band — `ribbon_segments` 19 → 0 in a single
+    /// frame on glass, at every band age swept.
+    #[test]
+    fn a_curtain_gathers_the_band_into_its_hand_over_a_quarter_second_with_no_cliff_and_lays_nothing()
+     {
+        let c = cfg(true, true);
+        let g = geom();
+        let cw = g.cw as f32;
+        let t0 = Instant::now();
+        let mut rib = Ribbon::new();
+        type_run(&mut rib, t0, 10, 20, &c, 0.9);
+        let last = at(t0, 19 * 60);
+        // THE CARET HAS ALREADY MOVED when the host notices the space ended:
+        // this is the alt-screen path — a Return launched the program, so the
+        // caret is at column 0 of the NEXT row while the band still lies at
+        // columns 10..29 of row 2. The curtain must gather into the BAND'S
+        // head, not slide 30 columns to the caret.
+        let caret = (3u16, 0u16);
+        let mut sink = Sink::default();
+        #[derive(Clone, Copy)]
+        struct Sample {
+            peak: u8,
+            sum: u32,
+            left: f32,
+            cells: usize,
+            segs: usize,
+            ink: usize,
+        }
+        let frame = |rib: &mut Ribbon, sink: &mut Sink, now: Instant| -> Sample {
+            let cx = ctx(now, &c, caret, 0.9);
+            rib.plan(&cx);
+            let segs = rib.lit_segments().count();
+            let ink = rib.ink_segments().count();
+            let mut f = sink.frame();
+            rib.emit(&cx, &mut f);
+            Sample {
+                peak: sink.under.iter().map(|q| q.alpha).max().unwrap_or(0),
+                sum: sink.under.iter().map(|q| u32::from(q.alpha)).sum(),
+                left: sink
+                    .under
+                    .iter()
+                    .map(|q| f32::from(q.x))
+                    .fold(f32::INFINITY, f32::min),
+                cells: (0..40u16)
+                    .filter(|&col| cell_lit(&sink.under, g, 2, col))
+                    .count(),
+                segs,
+                ink,
+            }
+        };
+        let before = frame(&mut rib, &mut sink, at(last, 8));
+        assert!(
+            before.peak > 200 && before.cells == 20 && before.segs >= 20,
+            "the band is whole before the seam (peak {}, {} cells, {} segments)",
+            before.peak,
+            before.cells,
+            before.segs
+        );
+        let fell = at(last, 16);
+        rib.curtain(fell);
+        assert!(rib.curtained());
+        assert!(rib.brisk(fell), "a falling curtain asks for every frame");
+        assert!(
+            rib.next_change_deadline(fell)
+                .is_some_and(|d| d <= fell + Duration::from_secs_f32(CURTAIN_S)),
+            "…and books its end"
+        );
+        // Nothing is laid under the curtain: a key, an echo, a jump.
+        let cells = rib.cells().len();
+        let cx = ctx(at(fell, 40), &c, (3, 1), 0.9);
+        rib.on_event(&typed(), at(fell, 40), &cx);
+        rib.on_event(
+            &Event::Sweep {
+                row: 3,
+                col0: 0,
+                col1: 1,
+            },
+            at(fell, 40),
+            &cx,
+        );
+        rib.on_event(&nav((3, 1), (3, 40)), at(fell, 40), &cx);
+        assert_eq!(rib.cells().len(), cells, "a curtain lays nothing");
+        // Eleven frames at 30 fps, PAST the end of the fall: the band's total
+        // light falls every frame, the left end is drawn toward the band's
+        // own head, and neither segment count ever steps more than
+        // `CURTAIN_MAX_STEP_FRAC` of what it fell on.
+        let mut prev = before;
+        let mut worst_step = 0usize;
+        let mut worst_ink_step = 0usize;
+        let mut ink_frames = 0usize;
+        let mut dark_at = None;
+        for ms in [33u64, 66, 99, 132, 165, 198, 231, 264, 297, 330] {
+            let now = frame(&mut rib, &mut sink, at(fell, ms));
+            assert!(
+                now.peak <= prev.peak,
+                "+{ms} ms: the curtain never brightens ({} → {})",
+                prev.peak,
+                now.peak
+            );
+            // NEVER BRIGHTENS. The tolerance is geometric, not temporal: the
+            // suck-in moves every boundary, so the slab lattice under a
+            // shortening run re-samples and the summed alpha can wobble by a
+            // few parts in ten thousand between two frames of a fall that is
+            // monotone in every cell's envelope.
+            assert!(
+                now.sum <= prev.sum + prev.sum / 500,
+                "+{ms} ms: the band's total light rose ({} → {})",
+                prev.sum,
+                now.sum
+            );
+            if now.sum > 0 {
+                assert!(
+                    now.left >= prev.left - 0.5,
+                    "+{ms} ms: the band is drawn toward its head, never away ({} → {})",
+                    prev.left,
+                    now.left
+                );
+            }
+            let step = prev.segs.saturating_sub(now.segs);
+            let ink_step = prev.ink.saturating_sub(now.ink);
+            worst_step = worst_step.max(step);
+            worst_ink_step = worst_ink_step.max(ink_step);
+            let bar = CURTAIN_MAX_STEP_FRAC * before.segs.max(before.ink) as f32;
+            assert!(
+                step as f32 <= bar && ink_step as f32 <= bar,
+                "+{ms} ms: the curtain stepped {step} claimed / {ink_step} inked segments in one \
+                 frame ({} → {} / {} → {}); the bound is {bar:.1} \
+                 ({CURTAIN_MAX_STEP_FRAC} of the {} it fell on)",
+                prev.segs,
+                now.segs,
+                prev.ink,
+                now.ink,
+                before.segs.max(before.ink)
+            );
+            if now.ink > 0 {
+                ink_frames += 1;
+            }
+            println!(
+                "curtain +{ms} ms: peak {} sum {} left {:.1} cells {} segs {} ink {}",
+                now.peak, now.sum, now.left, now.cells, now.segs, now.ink
+            );
+            if now.ink == 0 && dark_at.is_none() {
+                dark_at = Some(ms);
+            }
+            prev = now;
+        }
+        println!("curtain worst step: {worst_step} claimed, {worst_ink_step} inked");
+        // NOT VACUOUS: the fall must actually have been a fall — the counts
+        // reached zero inside the sweep, and they did it in steps.
+        assert!(
+            dark_at.is_some_and(|ms| ms >= 132),
+            "the band went dark at {dark_at:?} ms — a curtain lasts CURTAIN_S"
+        );
+        assert!(
+            worst_ink_step > 0,
+            "the sweep never saw the band leave: it was already dark"
+        );
+        assert!(
+            prev.sum * 8 < before.sum,
+            "the fall spent nothing: {} → {} over the whole sweep",
+            before.sum,
+            prev.sum
+        );
+        assert!(
+            ink_frames >= CURTAIN_MIN_FRAMES,
+            "the curtain drew ink on {ink_frames} of the swept frames; the law is \
+             {CURTAIN_MIN_FRAMES} (a cut draws one, a one-clock curtain two)"
+        );
+        // Exactly zero at the end, the pool empty, the next key lays afresh.
+        let end = frame(&mut rib, &mut sink, at(fell, 250));
+        assert_eq!((end.peak, end.segs, end.ink), (0, 0, 0));
+        assert!(rib.at_rest() && !rib.curtained());
+        let after = at(fell, 300);
+        let cx = ctx(after, &c, (4, 6), 0.9);
+        rib.on_event(&typed(), after, &cx);
+        rib.plan(&cx);
+        assert_eq!(
+            rib.cells().len(),
+            1,
+            "after the curtain a key lays its cell"
+        );
+        // **THE GATHER IS INTO THE BAND'S OWN HEAD** (2026-09-14). The band
+        // lies at columns 10..29 of row 2; its head is column 29, whose right
+        // edge is column 30's left edge, and that is where every boundary
+        // must converge. The seam's caret is NOT that place, and the shipped
+        // curtain froze `Ribbon::caret`'s bare COLUMN: at the alt-screen seam
+        // the Return that launched the program had already taken the caret to
+        // column 0, so the whole band was dragged 30 columns — 270 px — to
+        // column 0 while it faded. A slide across the row, not a gather into
+        // the hand.
+        //
+        // Both of the shapes that caret takes are swept, because they fail
+        // differently: (3, 0) — the next row — is the alt-screen path, and
+        // (2, 0) — column 0 of the BAND'S OWN row, a carriage-return redraw
+        // or a resize landing — is the one a per-row read of the caret still
+        // gets wrong.
+        for seam_caret in [(3u16, 0u16), (2, 0)] {
+            let mut rib2 = Ribbon::new();
+            type_run(&mut rib2, t0, 10, 20, &c, 0.9);
+            // The host's last observed caret before the space ended.
+            let cx = ctx(at(last, 8), &c, seam_caret, 0.9);
+            rib2.plan(&cx);
+            rib2.curtain(fell);
+            let near_end = at(fell, 216);
+            let cx = ctx(near_end, &c, seam_caret, 0.9);
+            rib2.plan(&cx);
+            {
+                let mut f2 = sink.frame();
+                rib2.emit(&cx, &mut f2);
+            }
+            let left_x = sink
+                .under
+                .iter()
+                .map(|q| f32::from(q.x))
+                .fold(f32::INFINITY, f32::min);
+            let head_x = f32::from(g.origin_x) + 30.0 * cw;
+            assert!(
+                !sink.under.is_empty(),
+                "seam caret {seam_caret:?}: the band was gone before the gather could be read"
+            );
+            assert!(
+                (left_x - head_x).abs() <= 3.0 * cw,
+                "seam caret {seam_caret:?}: the band gathered to x {left_x:.1}, not to its own \
+                 head at {head_x:.1} (column 0 is x {:.1}, {:.0} cells away)",
+                f32::from(g.origin_x),
+                (head_x - f32::from(g.origin_x)) / cw
+            );
+        }
+    }
+
+    /// **THE CURTAIN IS DRAWN UNDER LETTERS THAT STAY LEGIBLE** (Rainbow Path
+    /// v3 §2.8, law B1 over step 7's frames). The 0.24 s the band spends
+    /// leaving is drawn UNDER the incoming app's first frames — `less` painting
+    /// its page, `vim` its buffer — and the design's claim is that this is safe
+    /// "by construction", because the bed is source-over at the bar. That is an
+    /// argument, not a measurement: `letters_stay_legible_under_the_ribbon…`
+    /// sweeps `bed_ink`'s own range, but it never runs a curtain, and the
+    /// curtain is the one state that spends every cohort's light on one
+    /// envelope and drags every boundary across the row while it does. So this
+    /// pin sweeps the real emitted frames: every device row a letter of the
+    /// typed row (and of the reach into the row above) can touch, at every
+    /// column the band crosses, on every 8 ms of the fall — the text
+    /// composites at `BODY_CONTRAST_BAR` throughout.
+    ///
+    /// **AND IT IS SENSITIVE TO THE CURTAIN** (2026-09-14). An earlier
+    /// spelling passed with the ENTIRE mechanism deleted — the `spend`
+    /// multiply, the boundary suck-in and the lay-gate all removed — because
+    /// all it pinned was "a lit ribbon is legible", which
+    /// `letters_stay_legible_under_the_ribbon…` already pins, and a pin that
+    /// cannot refute anything is worse than none. The frames it sweeps are now
+    /// required to BE a curtain's: the light spends away (red on its own if
+    /// the `spend` multiply goes), the ink retreats toward the hand, and a key
+    /// struck under it lays nothing (red on its own if the gate goes).
+    ///
+    /// The rail is deliberately outside the sweep, exactly as in
+    /// `the_rail_is_yellow_below_the_row_bottom_and_the_glyph_box_stays_at_the_bar`:
+    /// its top is pinned at the row bottom and no glyph of the row reaches it.
+    #[test]
+    fn the_curtain_is_legible_under_the_app_s_first_frames_on_every_frame_it_falls() {
+        let c = cfg(true, true);
+        let g = geom();
+        let (cw, ch) = (g.cw as f32, g.ch as f32);
+        let t0 = Instant::now();
+        let mut rib = Ribbon::new();
+        type_run(&mut rib, t0, 10, 20, &c, 0.9);
+        let last = at(t0, 19 * 60);
+        let caret = (2u16, 30u16);
+        let fell = at(last, 16);
+        // THE CELLS THE CURTAIN FALLS ON, so the lay-gate below has something
+        // to refuse.
+        let laid = rib.cells().len();
+        rib.curtain(fell);
+        assert!(rib.curtained(), "precondition: a curtain is falling");
+        // THE LAY-GATE, checked on the frames the sweep is about to walk: a
+        // key struck under the curtain lays nothing, so what the letters
+        // composite against is the LEAVING band and not a fresh one. Red on
+        // its own if the gate goes.
+        // The key lands well clear of the band's own columns, so a lay that
+        // got through is a NEW cell and not a re-wet of one already there.
+        let cx = ctx(at(fell, 8), &c, (2, 41), 0.9);
+        rib.on_event(&typed(), at(fell, 8), &cx);
+        assert_eq!(
+            rib.cells().len(),
+            laid,
+            "the sweep is not under a lay-gate: a key laid a cell during the curtain"
+        );
+        let row_top = f32::from(g.origin_y) + 2.0 * ch;
+        let row_bottom = row_top + ch;
+        let mut sink = Sink::default();
+        let mut worst = f32::INFINITY;
+        let mut worst_at = (0.0_f32, 0.0_f32, 0_u64);
+        let mut lit_frames = 0;
+        let mut peak_seen = 0_u8;
+        let mut first: Option<(u32, f32)> = None;
+        let mut last_lit: Option<(u64, u32, f32)> = None;
+        for ms in (0..=248).step_by(8) {
+            let cx = ctx(at(fell, ms), &c, caret, 0.9);
+            rib.plan(&cx);
+            {
+                let mut f = sink.frame();
+                rib.emit(&cx, &mut f);
+            }
+            let peak = sink.under.iter().map(|q| q.alpha).max().unwrap_or(0);
+            if peak > 0 {
+                lit_frames += 1;
+                peak_seen = peak_seen.max(peak);
+            }
+            // THE THREE MOVING PARTS, sampled on the same frames the letters
+            // are (see the paragraph above): the spend's envelope, the
+            // suck-in's leftmost boundary, and the total light.
+            let sum: u32 = sink.under.iter().map(|q| u32::from(q.alpha)).sum();
+            let left = sink
+                .under
+                .iter()
+                .map(|q| f32::from(q.x))
+                .fold(f32::INFINITY, f32::min);
+            if ms == 0 {
+                first = Some((sum, left));
+            }
+            if sum > 0 {
+                last_lit = Some((ms, sum, left));
+            }
+            // The whole span the run could occupy, plus a cell either side —
+            // the suck-in moves the boundaries, so a fixed window would stop
+            // sampling the band rather than proving anything about it.
+            let mut x = f32::from(g.origin_x) + 9.0 * cw;
+            while x < f32::from(g.origin_x) + 32.0 * cw {
+                let mut y = row_top - 0.2 * ch;
+                while y < row_bottom {
+                    let k = contrast(DEFAULT_FG, composite_at(&sink.under, x, y));
+                    if k < worst {
+                        worst = k;
+                        worst_at = (x, y - row_bottom, ms);
+                    }
+                    y += 1.0;
+                }
+                x += 1.0;
+            }
+        }
+        assert!(
+            lit_frames >= 3 && peak_seen > 0,
+            "precondition: the curtain actually drew ({lit_frames} lit frames, peak {peak_seen})"
+        );
+        // **SENSITIVE TO THE CURTAIN, NOT TO A LIT RIBBON** (2026-09-14). An
+        // earlier spelling of this pin passed with the ENTIRE mechanism
+        // deleted — the `spend` multiply, the boundary suck-in and the
+        // lay-gate all removed — because all it pinned was "a lit ribbon is
+        // legible", which `letters_stay_legible_under_the_ribbon…` already
+        // pins. A pin that cannot refute anything is worse than none, so the
+        // frames swept are now required to BE a curtain's: its light spends
+        // away, its boundaries are drawn into the hand, and nothing is laid
+        // under it. Each clause is red on its own if its mechanism goes.
+        let (sum0, left0) = first.expect("the sweep starts at +0 ms");
+        let (end_ms, end_sum, end_left) = last_lit.expect("the curtain drew");
+        assert!(
+            end_sum * 8 < sum0,
+            "the sweep was not a falling curtain: the band's light went {sum0} → {end_sum} \
+             by +{end_ms} ms"
+        );
+        assert!(
+            end_left > left0 + 3.0 * cw,
+            "the sweep was not a gathering curtain: the band's ink retreated from {left0:.1} \
+             only to {end_left:.1} px, under three cells — it is supposed to end up under the \
+             hand at {:.1}",
+            f32::from(g.origin_x) + 30.0 * cw
+        );
+
+        // NOT VACUOUS: a sweep that missed the band would answer the bare
+        // ground's own contrast, which is the one number this pin can produce
+        // while proving nothing.
+        let ground = contrast(DEFAULT_FG, DEFAULT_BG);
+        println!(
+            "curtain legibility: {lit_frames} lit frames, peak cov {peak_seen}, worst {worst:.3}:1 vs the bare ground's {ground:.3}:1"
+        );
+        assert!(
+            worst < ground - 0.5,
+            "the sweep never crossed the band: worst {worst:.3}:1 is the bare ground's {ground:.3}:1"
+        );
+        assert!(
+            worst >= BODY_CONTRAST_BAR,
+            "a letter under the falling curtain composites at {worst:.3}:1 (x {}, {:.0} px above the row bottom, +{} ms into the fall); the bar is {BODY_CONTRAST_BAR}:1",
+            worst_at.0,
+            -worst_at.1,
+            worst_at.2
         );
     }
 
@@ -8167,20 +13024,17 @@ mod tests {
                 .collect::<Vec<_>>()
         );
         let (r, gr, b) = ((lit >> 16) & 0xff, (lit >> 8) & 0xff, lit & 0xff);
-        // 1.75× THE BED'S OLIVE, under the caret's light (L5). The bed
-        // composites yellow at ≈ 80; the rail is held to the sparkle field's
-        // ceiling beside the caret (`RAIL_LUMA_CEIL`, 72 of 255 light —
-        // `(140, 140, 3)` at the cap), so the pin is ≥ 130 and r ≈ g with
-        // little blue — a yellow, not an olive. A blazing yellow (≥ 200) is
-        // a ruling on `RAINBOW_CARET_LIGHT_FLOOR`, not on this recipe.
+        // 2.4× THE BED'S OLIVE (re-ruled 2026-09-14): the rail's own ceiling
+        // (`RAIL_LUMA_CEIL` 0.54 — `(200, 200, 0)` ink, `≈ (190, 190, 3)` at
+        // the cap) puts a yellow that reads as yellow under the baseline,
+        // r ≈ g with little blue. It is brighter than the caret's floor on
+        // purpose: the rail is never under a letter, and L5 is the caret's
+        // law in the glyph rows.
+        // r within a sixteenth of g: the sampled slab lerps a step past the
+        // anchor toward green (`#B6C000` measured), which is still yellow.
         assert!(
-            max_channel(lit) >= 130 && r.abs_diff(gr) <= 8 && b < 40,
-            "0.15 ch below the row bottom at yellow's anchor the rail composites #{lit:06X}; the owner asked to SEE yellow (peak ≥ 130, r ≈ g, little blue)"
-        );
-        assert!(
-            relative_luminance(lit) * 255.0 < RAINBOW_CARET_LIGHT_FLOOR - 6.0,
-            "…and it stays under the caret's light floor with the field's margin (L5): #{lit:06X} is {:.0} of 255",
-            relative_luminance(lit) * 255.0
+            max_channel(lit) >= 185 && r.abs_diff(gr) <= 16 && b < 40,
+            "0.15 ch below the row bottom at yellow's anchor the rail composites #{lit:06X}; the owner asked to SEE yellow (peak ≥ 185, r ≈ g, little blue)"
         );
         // …and the rail is the FULL arc: every stop the run lays composites
         // at a max channel over 130 down there, warm and cold alike.
@@ -8246,7 +13100,9 @@ mod tests {
         let cov = UNDER_COV_CAP as u8;
         println!();
         println!(
-            "band [{RAIL_LUMA_FLOOR:.3}, {RAIL_LUMA_CEIL:.3}] — the caret's floor {RAINBOW_CARET_LIGHT_FLOOR} × the field's share {RAINBOW_SPARKLE_LIGHT_SHARE}"
+            "band [{RAIL_LUMA_FLOOR:.3}, {RAIL_LUMA_CEIL:.3}] — the rail's own ceiling below the baseline (the caret's floor {} × the field's share {} rules the glyph rows)",
+            crate::cursor_glow::RAINBOW_CARET_LIGHT_FLOOR,
+            crate::cursor_glow::RAINBOW_SPARKLE_LIGHT_SHARE
         );
         println!("stop     arc      rail     Y rail  composited@236 (max, light)   bed@236");
         for (name, &arc) in names.iter().zip(SPECTRUM_ANCHORS.iter()) {
@@ -8302,9 +13158,8 @@ mod tests {
                 max_channel(lit)
             );
             assert!(
-                relative_luminance(lit) * 255.0
-                    <= RAINBOW_CARET_LIGHT_FLOOR * RAINBOW_SPARKLE_LIGHT_SHARE + 0.5,
-                "{name}: the rail composites over the field's ceiling (L5)"
+                relative_luminance(lit) * 255.0 <= RAIL_LUMA_CEIL * 255.0 + 0.5,
+                "{name}: the rail composites over its own ceiling"
             );
         }
     }
@@ -8387,16 +13242,20 @@ mod tests {
         }
     }
 
-    /// **THE FROM-THE-HAND ATTACK** (§30): a new cell's light enters from
-    /// the caret side. On the echo frame the whole cell is at the birth
-    /// floor (T2); on the next the caret-side slab leads the far slab; by
-    /// `ATTACK_WIPE_S` the cell is uniform. The flat spelling fades in in
-    /// place: every slab equal on every frame.
+    /// **THE FROM-THE-HAND ATTACK** (§30): new light enters from the hand.
+    /// Since 2026-09-14 the new light is the ATTACH under the caret cell —
+    /// the cell the key lays where the last attach stood inherits its
+    /// level — and the attach pours in from the head's edge outward. On the
+    /// echo frame the whole attach is at the birth floor (T2); from the
+    /// second frame on the slab nearest the head's edge leads the far
+    /// slab; by `ATTACK_WIPE_S` it is uniform. The flat spelling fades in in place: every slab equal
+    /// on every frame.
     #[test]
     fn a_new_cell_s_light_enters_from_the_caret_side() {
         let g = geom();
         let cw = g.cw as f32;
-        let x0 = f32::from(g.origin_x) + 17.0 * cw;
+        // The attach: the caret cell, 18, from the head's right edge on.
+        let x0 = f32::from(g.origin_x) + 18.0 * cw;
         let x1 = x0 + cw;
         for c in [cfg(true, true), flat(true, true)] {
             let t0 = Instant::now();
@@ -8405,7 +13264,7 @@ mod tests {
             let born = at(t0, 7 * 60);
             let mut frames = Vec::new();
             println!(
-                "flat {}: the head cell's slabs (cov), left boundary first; the caret is at the RIGHT edge",
+                "flat {}: the attach's slabs (cov), the head's edge first; the caret cell's right edge last",
                 c.ribbon_flat
             );
             for ms in [0u64, 8, 16, 24, 32, 48] {
@@ -8421,8 +13280,8 @@ mod tests {
                 assert!(slabs.len() >= 3, "three slabs per cell at this fixture");
                 frames.push(slabs);
             }
-            // The left boundary is the previous cell's (the brighter side
-            // owns it); the cell's OWN slabs are the rest.
+            // The first vertex is the head's own right edge (the brighter
+            // side owns it); the attach's OWN slabs are the rest.
             let own = |f: &Vec<u8>| f[1..].to_vec();
             let floor = (BIRTH_EDGE_FLOOR * UNDER_COV_CAP * 0.8) as u8;
             for &s in &own(&frames[0]) {
@@ -8435,23 +13294,24 @@ mod tests {
                     "the echo frame is AT the floor, not above it: {s}"
                 );
             }
-            let f8 = own(&frames[1]);
             let f16 = own(&frames[2]);
+            let f24 = own(&frames[3]);
             let last = own(&frames[5]);
             if c.ribbon_flat {
-                for f in [&f8, &f16, &last] {
+                for f in [&f16, &f24, &last] {
                     let (lo, hi) = (f.iter().min().unwrap(), f.iter().max().unwrap());
                     assert!(hi - lo <= 2, "the flat body fades in IN PLACE: {f:?}");
                 }
                 continue;
             }
-            // +8 ms and +16 ms: the caret side (the last slab) leads the far
-            // side (the first own slab) by a visible margin.
-            for (ms, f) in [(8, &f8), (16, &f16)] {
-                let (far, near) = (f[0], f[f.len() - 1]);
+            // +16 ms and +24 ms: the head's side (the first own slab, a
+            // third of the cell from the head's edge) leads the far side
+            // (the last slab) by a visible margin.
+            for (ms, f) in [(16, &f16), (24, &f24)] {
+                let (near, far) = (f[0], f[f.len() - 1]);
                 assert!(
                     near >= far + 30,
-                    "+{ms} ms: the caret-side slab ({near}) must lead the far slab ({far}); the light enters from the hand"
+                    "+{ms} ms: the slab at the head's edge ({near}) must lead the far slab ({far}); the light enters from the hand"
                 );
             }
             // …and by the wipe's end the cell is uniform.
@@ -8466,7 +13326,7 @@ mod tests {
     /// **THE GATE** (§30): the flat spelling draws no rail and the shape it
     /// had — nothing below the flat body's own reach, nothing vivid anywhere
     /// in `under`. (The byte-for-byte pin is the deletion golden in
-    /// `cursor_glow`, `the_flat_spelling_restores_the_pre_comet_body_byte_for_byte`.)
+    /// `cursor_glow`, `the_flat_spelling_collapses_every_comet_branch_byte_for_byte`.)
     #[test]
     fn the_flat_spelling_draws_no_rail() {
         let c = flat(true, true);
@@ -9345,9 +14205,13 @@ mod tests {
         assert_eq!(rib.cohorts().iter().filter(|k| k.row == 2).count(), 1);
     }
 
-    /// A key replayed one tick BEFORE its echo lays the previous glyph's
-    /// cell again: it keeps that cell's attack age instead of
-    /// restarting the 18 ms edge-in on a settled cell.
+    /// A key replayed against a caret whose cell is already lit lays that
+    /// cell again and keeps its attack age instead of restarting the 18 ms
+    /// edge-in on a settled cell. (Since 2026-09-14 the engine holds a key
+    /// whose echo has not landed rather than replaying it a tick early; the
+    /// shape that still reaches this re-lay is a glyph typed before a
+    /// one-shot's move, replayed at the caret before that move — its run's
+    /// own last cell.)
     #[test]
     fn a_key_replayed_before_its_echo_keeps_the_previous_cell_s_attack() {
         let c = cfg(true, true);
@@ -9384,9 +14248,13 @@ mod tests {
     }
 
     /// THE BRIGHTER SIDE OWNS A BOUNDARY: a new cell's attack lives inside
-    /// the new cell — the settled cell beside it keeps every one of its
+    /// the new light — the settled cell beside it keeps every one of its
     /// slabs — and an erased neighbour's spend never sags the surviving
-    /// head cell, so nothing pops when the erased cell retires.
+    /// head cell, so nothing pops when the erased cell retires. Since
+    /// 2026-09-14 the new light is the ATTACH under the caret cell: the
+    /// cell the key lays where the attach stood inherits the level the
+    /// attach already had (no byte moves down on the key), and the attack
+    /// is the next attach's, one cell on.
     #[test]
     fn a_boundary_takes_the_brighter_cell_s_coverage() {
         let c = cfg(true, true);
@@ -9411,10 +14279,15 @@ mod tests {
             boundary_cov(&rib, 6).expect("the shared boundary") >= edge - 1,
             "the shared boundary sagged toward the attacking cell"
         );
-        let young: Vec<u8> = interior_covs(&rib, 6);
+        let laid: Vec<u8> = interior_covs(&rib, 6);
         assert!(
-            young.iter().all(|&v| v < edge),
-            "the attack lives inside the new cell: {young:?} under {edge}"
+            laid.iter().all(|&v| v + 1 >= edge),
+            "the cell laid where the attach stood keeps the attach's level: {laid:?} under {edge}"
+        );
+        let young: Vec<u8> = interior_covs(&rib, 7);
+        assert!(
+            !young.is_empty() && young.iter().all(|&v| v < edge),
+            "the attack lives in the attach under the caret cell: {young:?} under {edge}"
         );
         // Settle, then erase the head: the survivor's slabs hold while the
         // erased neighbour spends, and hold when it retires.
@@ -9749,7 +14622,10 @@ mod tests {
     }
 
     /// The swoosh shortens the mark INTO the hand and stops at the caret
-    /// block's left edge: no fresh column lights inside the caret cell.
+    /// block: no column lights past the block's right edge, and the ATTACH
+    /// under the caret cell (2026-09-14) — lit since the key, the head's own
+    /// light — only ever SHRINKS toward the block's left edge with the rest
+    /// of the mark: no fresh column lights inside the caret cell.
     #[test]
     fn the_swoosh_stops_at_the_caret_block_s_left_edge() {
         let c = cfg(true, true);
@@ -9758,16 +14634,979 @@ mod tests {
         type_run(&mut rib, t0, 2, 8, &c, 0.9);
         let last = at(t0, 7 * 60);
         let caret_x = 10.0 * geom().cw as f32;
+        let block_right = caret_x + geom().cw as f32;
+        let mut reach_prev = f32::INFINITY;
         for ms in [1000u64, 1100, 1200, 1300, 1400] {
             let cx = ctx(at(last, ms), &c, (2, 10), 0.0);
             rib.plan(&cx);
+            let reach = rib
+                .plan_segments()
+                .iter()
+                .map(|s| s.x)
+                .fold(f32::NEG_INFINITY, f32::max);
+            assert!(
+                reach <= block_right + 0.5,
+                "+{ms} ms: a slab at x {reach} is past the caret block (right edge {block_right})"
+            );
+            assert!(
+                reach <= reach_prev + 0.5,
+                "+{ms} ms: the mark's reach grew from {reach_prev} to {reach} under a lifted hand"
+            );
+            reach_prev = reach;
             for s in rib.plan_segments() {
                 assert!(
-                    s.x <= caret_x + 0.5,
-                    "+{ms} ms: a slab at x {} is inside the caret cell (left edge {caret_x})",
+                    s.x <= block_right + 0.5,
+                    "+{ms} ms: a slab at x {} is past the caret block (right edge {block_right})",
                     s.x
                 );
             }
         }
+    }
+
+    // -- 2026-09-14: the owner's notch and slivers ---------------------------
+    //
+    // THE OWNER, on the shipped v0.85.0, Claude Code's composer, `and I also
+    // seee an ugly gap` typed at 12 cps, the caret a filled block right of
+    // "gap": "there is a right angle of black from the cursor to the
+    // underline. also there are some painting errors" — "isn't painting
+    // nicely from the cursor". Measured on glass before the fix (headless,
+    // his cell, `docs/measured/cursor-notch-2026-09-14.md`): the band ended
+    // at the block's left edge, its rail 24 device rows deep, so the ground
+    // showed as a 31 × 24 px black foot under the block; and every run's
+    // first boundary was feathered whatever stood to its left. The pins
+    // below are stated on a per-device-column census of the emitted quads
+    // at his geometry (`geom_owner`, 30 × 56 device px), at the densities
+    // his glass affords (three slabs per cell for the composer line alone,
+    // one for a screenful of lit rows).
+
+    /// The owner's glass: 144 × 60 cells of 15 × 28 pt at scale 2 — 30 × 56
+    /// device px.
+    fn geom_owner() -> Geom {
+        Geom {
+            cw: 30,
+            ch: 56,
+            rows: 60,
+            cols: 144,
+            origin_x: 0,
+            origin_y: 0,
+            win_w: 4320,
+            win_h: 3360,
+            head: 0,
+        }
+    }
+
+    /// The owner's config on his glass: the default dark theme at his
+    /// `intensity 0.70`.
+    fn cfg_owner() -> Config {
+        let mut c = cfg(true, true);
+        c.intensity = 0.70;
+        c
+    }
+
+    /// The owner's row on his glass: the composer line, row 56 of 60.
+    const OWNER_ROW: u16 = 56;
+
+    /// Type the owner's line on [`OWNER_ROW`] from column 2 at
+    /// `period_ms` a key with a `pause_ms` thinking pause after `also ` (the
+    /// first key of `seee` is a word's first key), planning after every key
+    /// as the engine does. Returns the last key's offset from `t0` and the
+    /// caret column after it.
+    fn type_owner_line(
+        rib: &mut Ribbon,
+        t0: Instant,
+        c: &Config,
+        disp: f32,
+        period_ms: u64,
+        pause_ms: u64,
+    ) -> (u64, u16) {
+        let g = geom_owner();
+        let mut ms = 0u64;
+        let mut col = 2u16;
+        let mut last = 0u64;
+        for (i, _) in "and I also seee an ugly gap".chars().enumerate() {
+            let now = at(t0, ms);
+            let cx = ctx_in(now, c, (OWNER_ROW, col + 1), disp, g);
+            rib.on_event(&typed(), now, &cx);
+            rib.plan(&cx);
+            col += 1;
+            last = ms;
+            ms += period_ms;
+            if i == 10 {
+                ms += pause_ms;
+            }
+        }
+        (last, col)
+    }
+
+    /// One frame on the owner's glass: plan and emit at `now` with the caret
+    /// at `caret`, into `sink`.
+    fn owner_frame(
+        rib: &mut Ribbon,
+        sink: &mut Sink,
+        c: &Config,
+        now: Instant,
+        caret: u16,
+        disp: f32,
+    ) {
+        let cx = ctx_in(now, c, (OWNER_ROW, caret), disp, geom_owner());
+        rib.plan(&cx);
+        let mut f = sink.frame();
+        rib.emit(&cx, &mut f);
+    }
+
+    /// The device rows the owner's row's band can occupy: half a cell above
+    /// its top (the crown and the sky's stars are above that) to a cell
+    /// below its bottom (the rail).
+    fn owner_rows() -> std::ops::Range<i32> {
+        let g = geom_owner();
+        let top = i32::from(OWNER_ROW) * g.ch as i32;
+        top - g.ch as i32 / 2..top + 2 * g.ch as i32
+    }
+
+    /// **THE ATTACH** — the notch, pinned. Under a live caret the band's top
+    /// edge holds its plateau height through the head cell up to the block's
+    /// left edge, and the body — the rail's foot and the crown, not only the
+    /// strip — continues under the caret cell, so the block stands ON the
+    /// band: no device column from the head cell's left edge to the block's
+    /// right edge is ground-dark, none has a top lit row under the plateau
+    /// by more than one row, none a rail shallower than the head's by more
+    /// than one row, and none a peak more than a dither step under the
+    /// head's. On a COLD hand (the first key of a word, momentum 0) as on a
+    /// hot one — and the hot edge's hairline stands over the head cell on
+    /// both, because its existence no longer waits for momentum
+    /// ([`HOT_EDGE_GAIN_FLOOR`]).
+    ///
+    /// RED on main on both hands: the caret cell's thirty columns read DARK
+    /// (the band ended at the block's left edge — a 30 × 22 px foot of
+    /// ground under the block on this geometry), and the cold hand's `out`
+    /// stream was empty (`hot_edge_gain` was exactly zero under
+    /// `HOT_EDGE_DISP_MIN`).
+    #[test]
+    fn the_caret_block_stands_on_the_band_under_a_cold_hand_and_a_hot_one() {
+        for (disp, hand) in [(0.0f32, "cold"), (0.7, "hot")] {
+            let c = cfg_owner();
+            let g = geom_owner();
+            let cw = g.cw as i32;
+            let t0 = Instant::now();
+            let mut rib = Ribbon::new();
+            let (last, caret) = type_owner_line(&mut rib, t0, &c, disp, 83, 700);
+            let mut sink = Sink::default();
+            owner_frame(&mut rib, &mut sink, &c, at(t0, last + 100), caret, disp);
+            assert_eq!(
+                rib.slabs_per_cell(),
+                3,
+                "{hand}: the composer line alone plans at three slabs"
+            );
+            let head_x0 = i32::from(caret - 1) * cw;
+            let block_x1 = i32::from(caret + 1) * cw;
+            let x0 = head_x0 - 3 * cw;
+            let cens = column_census(&sink.under, x0..block_x1, owner_rows(), 8);
+            // The plateau: the highest top over the three cells before the head.
+            let plateau = cens[..3 * cw as usize]
+                .iter()
+                .filter_map(|e| e.map(|(t, _, _)| t))
+                .min()
+                .expect("the cells before the head are lit");
+            let head = &cens[3 * cw as usize..4 * cw as usize];
+            let head_bot = head
+                .iter()
+                .filter_map(|e| e.map(|(_, b, _)| b))
+                .max()
+                .unwrap_or(0);
+            let head_peak = head
+                .iter()
+                .filter_map(|e| e.map(|(_, _, p)| p))
+                .max()
+                .unwrap_or(0);
+            let mut dark = Vec::new();
+            for (k, e) in cens.iter().enumerate().skip(3 * cw as usize) {
+                let x = x0 + k as i32;
+                let Some((top, bot, peak)) = *e else {
+                    dark.push(x);
+                    continue;
+                };
+                assert!(
+                    top <= plateau + 1,
+                    "{hand}: column {x} tops out at {top}, under the plateau's {plateau}"
+                );
+                if x >= head_x0 + cw {
+                    assert!(
+                        bot >= head_bot - 1,
+                        "{hand}: the foot under the block at column {x} ends at {bot}, the head's rail at {head_bot}"
+                    );
+                    assert!(
+                        peak + 2 >= head_peak,
+                        "{hand}: the band under the block at column {x} peaks at {peak}, the head at {head_peak}"
+                    );
+                }
+            }
+            assert!(
+                dark.is_empty(),
+                "{hand}: ground-dark columns between the head cell and the block's right edge: {} of them, from x {}",
+                dark.len(),
+                dark[0]
+            );
+            // THE HAIRLINE stands over the head cell, cold hand included.
+            let hot = column_census(&sink.out, head_x0..head_x0 + cw, owner_rows(), 1);
+            let unlit = hot.iter().filter(|e| e.is_none()).count();
+            assert_eq!(
+                unlit, 0,
+                "{hand}: {unlit} of the head cell's columns carry no hot edge"
+            );
+        }
+    }
+
+    /// One frame's census on the owner's row: `(ms, caret, column_census
+    /// over the leg's columns at floor 8)`.
+    type FrameCensus = (u64, u16, Vec<Option<(i32, i32, u8)>>);
+
+    /// One frame of `column_census` per 16 ms on the owner's row over `ms`:
+    /// before each frame `step` applies whatever the leg has due at that
+    /// instant and names the caret column the frame is planned at.
+    fn owner_frames(
+        rib: &mut Ribbon,
+        t0: Instant,
+        c: &Config,
+        disp: f32,
+        ms: std::ops::RangeInclusive<u64>,
+        xs: std::ops::Range<i32>,
+        mut step: impl FnMut(&mut Ribbon, u64) -> u16,
+    ) -> Vec<FrameCensus> {
+        let mut sink = Sink::default();
+        let mut frames = Vec::new();
+        let (mut ms, to_ms) = (*ms.start(), *ms.end());
+        while ms <= to_ms {
+            let caret = step(rib, ms);
+            owner_frame(rib, &mut sink, c, at(t0, ms), caret, disp);
+            frames.push((
+                ms,
+                caret,
+                column_census(&sink.under, xs.clone(), owner_rows(), 8),
+            ));
+            ms += 16;
+        }
+        frames
+    }
+
+    /// The fade's own steepest per-frame slope, in levels: `spend` falls at
+    /// most `2 / RETRACT_FADE_S` a second from a 215-level body, 29 levels a
+    /// 16 ms frame, plus the wave's own anti-aliasing at the plateau.
+    const FADE_STEP_MAX: i32 = 36;
+
+    /// **THE BLOCK STANDS ON WHOLE LIGHT AFTER A JUMP, AND ON THE KEYS THAT
+    /// FOLLOW IT** (2026-09-14, the second review round). The round's
+    /// headline is that the caret block stands ON the band; the pins for it
+    /// all put the block at a typed run's head, so a rule that feathered the
+    /// end the hand types at whenever the run still carried a corridor
+    /// shipped green. Ten keys, Home (cols 0..1 are dark, so the move lays a
+    /// corridor), End (back over the corridor's own live cells — a scrub),
+    /// then three more keys: the head cell and the block's own cell must
+    /// read the band's own level across every device column of the owner's
+    /// 30 × 56 cell.
+    ///
+    /// RED under the rejected `Cohort::landing_col` rule: the head cell read
+    /// 182 / 117 / 53 across its three slab thirds and the block's own cell
+    /// 20 flat — 9% of the band, standing, for the corridor's whole life.
+    #[test]
+    fn the_block_stands_on_whole_light_after_a_jump_and_the_keys_that_follow_it() {
+        let g = geom_owner();
+        let cw = g.cw as i32;
+        let row = OWNER_ROW;
+        for (disp, hand) in [(0.0f32, "cold"), (0.7, "hot")] {
+            let c = cfg_owner();
+            let t0 = Instant::now();
+            let mut rib = Ribbon::new();
+            let keys = Keys {
+                g,
+                row,
+                col0: 2,
+                n: 10,
+                period_ms: 83,
+                disp,
+            };
+            type_keys(&mut rib, t0, keys, &c);
+            let mut ms = 9 * 83 + 120;
+            for (from, to) in [((row, 12u16), (row, 0u16)), ((row, 0), (row, 12))] {
+                let now = at(t0, ms);
+                let cx = ctx_in(now, &c, to, disp, g);
+                rib.on_event(&nav(from, to), now, &cx);
+                rib.plan(&cx);
+                ms += 120;
+            }
+            let mut caret = 12u16;
+            for _ in 0..3 {
+                ms += 83;
+                caret += 1;
+                let now = at(t0, ms);
+                let cx = ctx_in(now, &c, (row, caret), disp, g);
+                rib.on_event(&typed(), now, &cx);
+                rib.plan(&cx);
+            }
+            ms += 300;
+            let mut sink = Sink::default();
+            owner_frame(&mut rib, &mut sink, &c, at(t0, ms), caret, disp);
+            // The plateau is read off the four settled cells before the head;
+            // the head cell and the block's own cell must match it.
+            let x0 = i32::from(caret - 5) * cw;
+            let x1 = i32::from(caret + 1) * cw;
+            let cens = column_census(&sink.under, x0..x1, owner_rows(), 8);
+            let plateau = cens[..4 * cw as usize]
+                .iter()
+                .filter_map(|e| e.map(|(_, _, p)| p))
+                .max()
+                .expect("the band before the head is lit");
+            let show = |lo: usize| {
+                (0..3)
+                    .map(|j| cens[lo + j * (cw as usize / 3)].map_or(0, |(_, _, p)| i32::from(p)))
+                    .collect::<Vec<_>>()
+            };
+            for (k, e) in cens.iter().enumerate().skip(4 * cw as usize) {
+                let x = x0 + k as i32;
+                let peak = e.map_or(0, |(_, _, p)| p);
+                assert!(
+                    i32::from(plateau) - i32::from(peak) <= 2,
+                    "{hand}: device column {x} reads {peak} against the band's {plateau} — the head cell is {:?} and the block's own {:?}",
+                    show(4 * cw as usize),
+                    show(5 * cw as usize)
+                );
+            }
+        }
+    }
+
+    /// **THE BLOCK STANDS ON THE BAND THROUGH A LEAVING CARET CELL** — read
+    /// off `frames` (`owner_frames` over device columns from `x0`, `cw` px
+    /// a cell): on every frame every column of the caret cell is lit; no
+    /// column of the span rises by more than a dither step (2 levels) in
+    /// one frame — in particular not the frame the leaving cell retires and
+    /// the attach takes its place; and no column from the caret cell's left
+    /// edge to `hold_x1` — the cells the block has stood on — falls faster
+    /// than the fade's own slope: what the block leaves behind drains from
+    /// the level it showed.
+    fn assert_block_on_band(frames: &[FrameCensus], x0: i32, cw: i32, hold_x1: i32, leg: &str) {
+        for (i, (ms, caret, cens)) in frames.iter().enumerate() {
+            let cx0 = i32::from(*caret) * cw;
+            let dark: Vec<i32> = (cx0..cx0 + cw)
+                .filter(|x| cens[(x - x0) as usize].is_none())
+                .collect();
+            assert!(
+                dark.is_empty(),
+                "{leg}, +{ms} ms, caret {caret}: {} ground-dark columns under the block, from x {}",
+                dark.len(),
+                dark[0]
+            );
+            if i == 0 {
+                continue;
+            }
+            let prev = &frames[i - 1].2;
+            let level = |e: &Option<(i32, i32, u8)>| e.map_or(0, |(_, _, p)| i32::from(p));
+            for (k, (now, was)) in cens.iter().zip(prev.iter()).enumerate() {
+                let x = x0 + k as i32;
+                let (now, was) = (level(now), level(was));
+                assert!(
+                    now - was <= 2,
+                    "{leg}, +{ms} ms: column {x} rose {was} -> {now} in one frame"
+                );
+                if (cx0..hold_x1).contains(&x) {
+                    assert!(
+                        was - now <= FADE_STEP_MAX,
+                        "{leg}, +{ms} ms: column {x} fell {was} -> {now} in one frame, faster than the fade"
+                    );
+                }
+            }
+        }
+    }
+
+    /// **THE ATTACH SURVIVES AN ERASE** (review of the attach, 2026-09-14).
+    /// A Backspace leaves the caret over the cell it erased, which drains
+    /// under the block (`Cell::retract_at`) and retires 240 ms on; a
+    /// content retirement (`Ribbon::retire_cells`) puts a melting cell
+    /// under the caret the same way. The attach's law is "the caret cell
+    /// carries no LIVE light", so a leaving cell under the caret is floored
+    /// at the attach's level ([`Ribbon::plan_run`]): the block stands on
+    /// the band while the cell spends, the frame that retires it changes no
+    /// byte, and a cell the block leaves behind — a held Backspace at 30/s
+    /// — drains from the level it showed, its retract restarted the frame
+    /// the block leaves it ([`Ribbon::build`]). Four legs, each on a cold
+    /// and a hot hand, per frame at 16 ms through the retirement, on the
+    /// owner's geometry: one Backspace; four at 30/s; the caret's own run's
+    /// cells retired by content under the caret (an insert shifted the
+    /// glyphs); and a neighbour cohort's cell — an arrow's wake — retiring
+    /// under the caret.
+    ///
+    /// RED on b4510ab2 (the attach's first cut, whose predicate was `head ==
+    /// col1 && right_nb.is_none()`): the caret cell's peak went 215 → 107
+    /// over 224 ms with its darkest column reaching 0 — the notch back under
+    /// the block — then at +240 ms the erased cell retired, the attach
+    /// switched on and the cell jumped to 214 in ONE frame: a 107-level
+    /// rise at the peak, 214 at the darkest column.
+    #[test]
+    fn the_block_stays_on_the_band_while_the_cell_under_it_leaves_and_when_it_is_gone() {
+        let g = geom_owner();
+        let cw = g.cw as i32;
+        let row = OWNER_ROW;
+        let fade_ms = (RETRACT_FADE_S * 1000.0) as u64;
+        let melt_ms = (RETIRE_MELT_S * 1000.0) as u64;
+        for (disp, hand) in [(0.0f32, "cold"), (0.7, "hot")] {
+            // LEGS 1 AND 2: `erases` Backspaces `period` ms apart after an
+            // eight-key word (cells 2..=9, the caret at 10).
+            for (period, erases, leg) in [
+                (0u64, 1u16, "one Backspace"),
+                (33, 4, "Backspace held at 30/s"),
+            ] {
+                let leg = format!("{hand} hand, {leg}");
+                let c = cfg_owner();
+                let t0 = Instant::now();
+                let mut rib = Ribbon::new();
+                let keys = Keys {
+                    g,
+                    row,
+                    col0: 2,
+                    n: 8,
+                    period_ms: 83,
+                    disp,
+                };
+                type_keys(&mut rib, t0, keys, &c);
+                let ms0 = 7 * 83 + 300;
+                let last_erase = ms0 + u64::from(erases - 1) * period;
+                let mut done = 0u16;
+                let mut caret = 10u16;
+                let x0 = i32::from(10 - erases) * cw;
+                let frames = owner_frames(
+                    &mut rib,
+                    t0,
+                    &c,
+                    disp,
+                    ms0 - 16..=last_erase + fade_ms + 200,
+                    x0..11 * cw,
+                    |rib, ms| {
+                        while done < erases && ms >= ms0 + u64::from(done) * period {
+                            caret -= 1;
+                            let now = at(t0, ms);
+                            let cx = ctx_in(now, &c, (row, caret), disp, g);
+                            rib.on_event(&Event::Erase, now, &cx);
+                            done += 1;
+                        }
+                        caret
+                    },
+                );
+                assert_block_on_band(&frames, x0, cw, 10 * cw, &leg);
+                assert!(
+                    !rib.cells().iter().any(|l| l.row == row && l.col >= caret),
+                    "{leg}: the erased cells retired inside the window"
+                );
+                assert_eq!(caret, 10 - erases, "{leg}: every erase landed");
+            }
+            // LEG 3: the caret's own run's cells retired by CONTENT under the
+            // caret — three arrows left into the word, a key typed there,
+            // and the witness retiring the cells whose glyphs the insert
+            // shifted (the caret cell first among them).
+            {
+                let leg = format!("{hand} hand, own cells retired under the caret");
+                let c = cfg_owner();
+                let t0 = Instant::now();
+                let mut rib = Ribbon::new();
+                let keys = Keys {
+                    g,
+                    row,
+                    col0: 2,
+                    n: 8,
+                    period_ms: 83,
+                    disp,
+                };
+                type_keys(&mut rib, t0, keys, &c);
+                let mut ms = 7 * 83 + 300;
+                let cx = ctx_in(at(t0, ms), &c, (row, 7), disp, g);
+                rib.on_event(&nav((row, 10), (row, 7)), at(t0, ms), &cx);
+                rib.plan(&cx);
+                ms += 300;
+                let cx = ctx_in(at(t0, ms), &c, (row, 8), disp, g);
+                rib.on_event(&typed(), at(t0, ms), &cx);
+                rib.plan(&cx);
+                let ms0 = ms + 60;
+                let ids: Vec<(u16, u16, Instant)> = rib
+                    .cells()
+                    .iter()
+                    .filter(|l| l.row == row && l.col >= 8)
+                    .map(|l| (l.row, l.col, l.born))
+                    .collect();
+                let mut retired = false;
+                let x0 = 7 * cw;
+                let frames = owner_frames(
+                    &mut rib,
+                    t0,
+                    &c,
+                    disp,
+                    ms0 - 16..=ms0 + melt_ms + 200,
+                    x0..11 * cw,
+                    |rib, ms| {
+                        if !retired && ms >= ms0 {
+                            // TWO, not three (at the merge with the scrub
+                            // round): the three arrows left over the word's
+                            // own lit cells are a SCRUB now, which lays no
+                            // wake at all, and the key at col 8 re-lays the
+                            // cell at col 7 in place rather than minting one
+                            // — so the cells at and right of the caret are
+                            // the typed word's own two, and the witness call
+                            // alone retires them.
+                            assert_eq!(
+                                rib.retire_cells(&ids, at(t0, ms)),
+                                2,
+                                "{leg}: the shifted cells retire"
+                            );
+                            retired = true;
+                        }
+                        8
+                    },
+                );
+                assert_block_on_band(&frames, x0, cw, 9 * cw, &leg);
+                assert!(
+                    !rib.cells().iter().any(|l| l.row == row && l.col >= 8),
+                    "{leg}: the retired cells left the pool inside the window"
+                );
+            }
+            // LEG 4: a NEIGHBOUR cohort's cell under the caret — a three-key
+            // word, an arrow hop right over empty cells (a wake of its own
+            // cohort, 5..=9), the hop back onto the word's end, and the wake
+            // retired by content under the caret.
+            {
+                let leg = format!("{hand} hand, a wake's cell retired under the caret");
+                let c = cfg_owner();
+                let t0 = Instant::now();
+                let mut rib = Ribbon::new();
+                let keys = Keys {
+                    g,
+                    row,
+                    col0: 2,
+                    n: 3,
+                    period_ms: 83,
+                    disp,
+                };
+                type_keys(&mut rib, t0, keys, &c);
+                // The hop's wake lives `WAKE_LIFE_S · WAKE_HOP_LIFE_SHARE`
+                // from the hop and is born 100 ms after it: back and
+                // retired inside that.
+                let mut ms = 2 * 83 + 200;
+                let cx = ctx_in(at(t0, ms), &c, (row, 9), disp, g);
+                rib.on_event(&nav((row, 5), (row, 9)), at(t0, ms), &cx);
+                rib.plan(&cx);
+                ms += 120;
+                let cx = ctx_in(at(t0, ms), &c, (row, 5), disp, g);
+                rib.on_event(&nav((row, 9), (row, 5)), at(t0, ms), &cx);
+                rib.plan(&cx);
+                let typed_cohort = rib
+                    .cells()
+                    .iter()
+                    .find(|l| l.row == row && l.col == 4)
+                    .expect("the word's last cell")
+                    .cohort;
+                let ids: Vec<(u16, u16, Instant)> = rib
+                    .cells()
+                    .iter()
+                    .filter(|l| l.row == row && l.col >= 5)
+                    .map(|l| (l.row, l.col, l.born))
+                    .collect();
+                assert!(
+                    rib.cells()
+                        .iter()
+                        .any(|l| l.row == row && l.col == 5 && l.cohort != typed_cohort),
+                    "{leg}: the wake is a cohort of its own"
+                );
+                let ms0 = ms + 80;
+                let mut retired = false;
+                // The span is the head, the caret cell and the wake's next
+                // cell: the wake's FAR end is its own matter — the frame
+                // its landing cell starts leaving, `head_col` resolves the
+                // run's newest cell instead and its stream flips, so the
+                // tail feather moves from one end of the wake to the other
+                // (a ~30-level rise at the far end, on main too).
+                let x0 = 4 * cw;
+                let frames = owner_frames(
+                    &mut rib,
+                    t0,
+                    &c,
+                    disp,
+                    ms0 - 16..=ms0 + melt_ms + 200,
+                    x0..7 * cw,
+                    |rib, ms| {
+                        if !retired && ms >= ms0 {
+                            assert!(
+                                rib.retire_cells(&ids, at(t0, ms)) >= 5,
+                                "{leg}: the wake retires"
+                            );
+                            retired = true;
+                        }
+                        5
+                    },
+                );
+                assert_block_on_band(&frames, x0, cw, 6 * cw, &leg);
+                assert!(
+                    !rib.cells().iter().any(|l| l.row == row && l.col >= 5),
+                    "{leg}: the retired wake left the pool inside the window"
+                );
+            }
+        }
+    }
+
+    /// **THE FLOOR IS A TYPED KEY'S** (review, 2026-09-14): the hot edge's
+    /// gain floor exists so the first key of a word attaches the band's top
+    /// to the caret; a cold arrow hop's wake is no key, and its head carries
+    /// no hairline on a cold hand — exactly as before the floor — while a
+    /// hot hand's wake keeps the hairline it always had.
+    ///
+    /// RED on b4510ab2: a cold `nav((56,2),(56,8))` emitted 131 `out` quads
+    /// (peak 35 at intensity 0.70) where main emitted none.
+    #[test]
+    fn a_cold_arrow_s_wake_carries_no_hairline_and_a_hot_one_keeps_its_own() {
+        let g = geom_owner();
+        let row = OWNER_ROW;
+        for (disp, hand, lit) in [(0.0f32, "cold", false), (0.7, "hot", true)] {
+            let c = cfg_owner();
+            let t0 = Instant::now();
+            let mut rib = Ribbon::new();
+            let cx = ctx_in(t0, &c, (row, 8), disp, g);
+            rib.on_event(&nav((row, 2), (row, 8)), t0, &cx);
+            rib.plan(&cx);
+            let mut sink = Sink::default();
+            owner_frame(&mut rib, &mut sink, &c, at(t0, 200), 8, disp);
+            assert!(
+                !sink.under.is_empty(),
+                "{hand}: the hop's wake is laid and lit"
+            );
+            assert_eq!(
+                !sink.out.is_empty(),
+                lit,
+                "{hand} hand: the wake's hairline ({} out quads) — a floor is a typed key's",
+                sink.out.len()
+            );
+        }
+    }
+
+    /// The peak level per device column over `xs` inside the owner's row
+    /// window, `0` where nothing is lit.
+    fn column_peaks(under: &[GlowQuad], xs: std::ops::Range<i32>) -> Vec<i32> {
+        column_census(under, xs, owner_rows(), 1)
+            .iter()
+            .map(|e| e.map_or(0, |(_, _, p)| i32::from(p)))
+            .collect()
+    }
+
+    /// Columns of `peaks` (offsets into it) darker than BOTH sides by more
+    /// than `tol` levels — the brightest column within a cell to the left
+    /// and within a cell to the right — past the first `skip` columns (the
+    /// run's oldest cell, whose feather is designed).
+    fn sliver_columns(peaks: &[i32], cw: usize, skip: usize, tol: i32) -> Vec<usize> {
+        (skip..peaks.len())
+            .filter(|&i| {
+                let left = peaks[i.saturating_sub(cw)..i]
+                    .iter()
+                    .copied()
+                    .max()
+                    .unwrap_or(0);
+                let right = peaks[i + 1..(i + 1 + cw).min(peaks.len())]
+                    .iter()
+                    .copied()
+                    .max()
+                    .unwrap_or(0);
+                peaks[i] + tol < left && peaks[i] + tol < right
+            })
+            .collect()
+    }
+
+    /// **NO SLIVERS** — a boundary two live runs share carries the older
+    /// side's light. A word typed on the owner's glass and an arrow hop
+    /// beside it (the hop's wake is a cohort of its own, laid abutting the
+    /// word — `heal_seams` folds typed cohorts only) print ONE continuous
+    /// band: no device column inside it is darker than both its sides by
+    /// more than a dither step, and the top edge steps no more than one
+    /// device row between adjacent columns, except at the run's oldest cell.
+    ///
+    /// RED on main: the wake run's first boundary took the flat tenth
+    /// (`left.is_none()`), a column at a quarter of the body's level and a
+    /// three-slab ramp back up — "a dark cell plus a step" between the word
+    /// and its wake.
+    #[test]
+    fn a_boundary_two_live_runs_share_carries_the_older_side_s_light() {
+        let c = cfg_owner();
+        let g = geom_owner();
+        let cw = g.cw as i32;
+        let t0 = Instant::now();
+        let mut rib = Ribbon::new();
+        type_keys(
+            &mut rib,
+            t0,
+            Keys {
+                g,
+                row: OWNER_ROW,
+                col0: 2,
+                n: 6,
+                period_ms: 83,
+                disp: 0.7,
+            },
+            &c,
+        );
+        // The hop: → three times, coalesced — a wake on 8, 9, 10 of its own.
+        let hop = at(t0, 5 * 83 + 120);
+        let cx = ctx_in(hop, &c, (OWNER_ROW, 11), 0.7, g);
+        rib.on_event(&nav((OWNER_ROW, 8), (OWNER_ROW, 11)), hop, &cx);
+        rib.plan(&cx);
+        let mut sink = Sink::default();
+        owner_frame(&mut rib, &mut sink, &c, at(hop, 300), 11, 0.7);
+        assert_eq!(
+            rib.cohorts().iter().filter(|k| k.row == OWNER_ROW).count(),
+            2,
+            "the word and its wake are two cohorts: {:?}",
+            rib.cohorts()
+        );
+        assert_eq!(rib.runs.len(), 2, "…and two runs abutting at column 8");
+        let x0 = 2 * cw;
+        let x1 = 12 * cw;
+        let peaks = column_peaks(&sink.under, x0..x1);
+        let dark: Vec<i32> = peaks
+            .iter()
+            .enumerate()
+            .filter(|(_, p)| **p == 0)
+            .map(|(i, _)| x0 + i as i32)
+            .collect();
+        assert!(dark.is_empty(), "dark columns inside the band: {dark:?}");
+        let slivers: Vec<i32> = sliver_columns(&peaks, cw as usize, cw as usize, 2)
+            .into_iter()
+            .map(|i| x0 + i as i32)
+            .collect();
+        assert!(
+            slivers.is_empty(),
+            "columns darker than both sides by more than a dither step: {slivers:?} (peaks {:?})",
+            &peaks[5 * cw as usize..7 * cw as usize]
+        );
+        let tops = column_census(&sink.under, x0 + cw..x1, owner_rows(), 8);
+        for w in tops.windows(2) {
+            let (Some(a), Some(b)) = (w[0], w[1]) else {
+                continue;
+            };
+            assert!(
+                (a.0 - b.0).abs() <= 1,
+                "the top edge steps {} rows between adjacent columns ({} → {})",
+                (a.0 - b.0).abs(),
+                a.0,
+                b.0
+            );
+        }
+    }
+
+    /// **THE FEATHER GROWS IN AS ITS NEIGHBOUR GOES** — the Claude Code
+    /// re-anchor. `and I also ` typed, then the composer's licensed park
+    /// (`(56,13) → (56,2)`, `licence=key`: `re_anchor` drains the row's cells
+    /// toward the landing over the retract's 0.4 s) and its return on the
+    /// same tick, then `seee an ugly gap` typed on at 12 cps while the old
+    /// cells fade and retire one by one under the new word. Read at 16 ms
+    /// from the park through the hand's grace: no device column's peak
+    /// FALLS by more than the fade's own steepest frame between two frames
+    /// (36 levels — the retract's `spend` is `(1 − u)²` over 0.24 s, so its
+    /// first 16 ms take `2 × 251 × 16/240 ≈ 34` levels off the strip's
+    /// peak), and on every settled frame (past the newest cell's 40 ms
+    /// wipe) no column
+    /// inside the live band is darker than both its sides by more than a
+    /// dither step.
+    ///
+    /// RED on main: the frame an old cell RETIRED moved the run's first
+    /// boundary onto the next cell, whose left edge fell from the body's
+    /// level to a tenth of it in one tick — a dark column appearing at a
+    /// word boundary under a hand still typing, the owner's sliver at
+    /// `seee|an`.
+    #[test]
+    fn the_feather_grows_in_as_a_drained_neighbour_goes_never_in_one_frame() {
+        let c = cfg_owner();
+        let g = geom_owner();
+        let cw = g.cw as i32;
+        let t0 = Instant::now();
+        let mut rib = Ribbon::new();
+        let first = "and I also ";
+        let mut ms = 0u64;
+        let mut col = 2u16;
+        for _ in first.chars() {
+            let now = at(t0, ms);
+            let cx = ctx_in(now, &c, (OWNER_ROW, col + 1), 0.7, g);
+            rib.on_event(&typed(), now, &cx);
+            rib.plan(&cx);
+            col += 1;
+            ms += 83;
+        }
+        // The park and its return, one tick.
+        let park = at(t0, ms + 20);
+        let cx = ctx_in(park, &c, (OWNER_ROW, col), 0.7, g);
+        rib.on_event(&typed_move((OWNER_ROW, col), (OWNER_ROW, 2)), park, &cx);
+        rib.on_event(&typed_move((OWNER_ROW, 2), (OWNER_ROW, col)), park, &cx);
+        rib.plan(&cx);
+        let mut keys: Vec<(u64, u16)> = Vec::new();
+        let mut k = ms + 70;
+        for _ in "seee an ugly gap".chars() {
+            keys.push((k, col + 1));
+            col += 1;
+            k += 83;
+        }
+        let last_key = keys.last().map_or(k, |e| e.0);
+        let mut sink = Sink::default();
+        let x0 = 2 * cw;
+        let x1 = 30 * cw;
+        let mut prev: Option<Vec<i32>> = None;
+        let mut next_key = 0usize;
+        let mut caret = col - 16;
+        let mut worst_drop = (0i32, 0i32, 0u64);
+        let mut slivers_seen = Vec::new();
+        let mut t = ms + 20;
+        let mut last_key_at = 0u64;
+        // Through the hand's grace and no further: past it the swoosh's
+        // retract pulls the mark's edge into the caret, and a column the
+        // edge passes goes dark in a frame by design (`retract_x`).
+        // RESTATED AT THE 0.86 RC MERGE (2026-09-14): main wrote this bound
+        // as `LIFT_GRACE_S` (0.75 s), the literal Rainbow Path v3 §2.6 S5
+        // replaced with the melody's own phrase rest. The grace in force is
+        // `Cohort::rest_s` — `phrase_rest_ms(ioi) = max(900 ms, 2.5 · ioi)`
+        // — and this script types at a steady 83 ms, so `2.5 · 83 = 208 ms`
+        // is under the floor and the rest IS `PHRASE_REST_MIN_S`. The law
+        // read here is unchanged and the window is 150 ms WIDER than main
+        // measured it, so the feather is now watched over the whole of the
+        // grace the merged tree actually gives this hand.
+        let until = last_key + (PHRASE_REST_MIN_S * 1000.0) as u64;
+        while t <= until {
+            while next_key < keys.len() && keys[next_key].0 <= t {
+                let (kt, kc) = keys[next_key];
+                let now = at(t0, kt);
+                let cx = ctx_in(now, &c, (OWNER_ROW, kc), 0.7, g);
+                rib.on_event(&typed(), now, &cx);
+                caret = kc;
+                last_key_at = kt;
+                next_key += 1;
+            }
+            owner_frame(&mut rib, &mut sink, &c, at(t0, t), caret, 0.7);
+            let peaks = column_peaks(&sink.under, x0..x1);
+            if let Some(p) = &prev {
+                for (i, (&a, &b)) in p.iter().zip(&peaks).enumerate() {
+                    if a - b > worst_drop.0 {
+                        worst_drop = (a - b, x0 + i as i32, t);
+                    }
+                }
+            }
+            let settled = t.saturating_sub(last_key_at) >= 60;
+            if settled {
+                // The LIVE band: the cells that are not leaving, to the
+                // block. The drained cells to its left go out farthest from
+                // the park first — a valley opening between the old word
+                // and the new is the re-anchor's own drain, not a seam —
+                // and the live band's first cell, whose left edge the
+                // feather grows into as its neighbour goes, may feather.
+                let live_col = rib
+                    .cells()
+                    .iter()
+                    .filter(|l| !l.leaving())
+                    .map(|l| l.col)
+                    .min()
+                    .unwrap_or(2);
+                let first = (usize::from(live_col) - 2) * cw as usize;
+                let live = &peaks[first.min(peaks.len())..];
+                for i in sliver_columns(live, cw as usize, cw as usize, 2) {
+                    slivers_seen.push((t, x0 + (first + i) as i32, live[i]));
+                }
+            }
+            prev = Some(peaks);
+            t += 16;
+        }
+        assert!(
+            rib.cells().iter().all(|l| l.col >= 13),
+            "by the end of the grace the drained cells have retired"
+        );
+        assert!(
+            worst_drop.0 <= 36,
+            "a column's light fell {} levels in one 16 ms frame (x {}, +{} ms): the feather popped in",
+            worst_drop.0,
+            worst_drop.1,
+            worst_drop.2
+        );
+        assert!(
+            slivers_seen.is_empty(),
+            "columns darker than both sides inside the live band: {:?}",
+            &slivers_seen[..slivers_seen.len().min(8)]
+        );
+    }
+
+    /// **ONE SLAB PER CELL** — a screenful of lit rows on the owner's glass
+    /// (three hundred cells on three rows above the composer line) drives
+    /// `slabs_per_cell` to one and the frame to the budget's edge, and the
+    /// attach and the seam law hold there too: the block stands on the
+    /// band, no column inside the composer line's band is a sliver, and the
+    /// top edge steps no more than the comet taper's own per-cell lerp
+    /// (three device rows, from 0.30 ch over twelve cells resolved once per
+    /// cell — see `docs/measured/cursor-notch-2026-09-14.md` for the price
+    /// of finer).
+    #[test]
+    fn the_attach_and_the_seam_law_hold_at_one_slab_per_cell() {
+        let c = cfg_owner();
+        let g = geom_owner();
+        let cw = g.cw as i32;
+        let t0 = Instant::now();
+        let mut rib = Ribbon::new();
+        let mut ms = 0u64;
+        for row in 50..53u16 {
+            type_keys(
+                &mut rib,
+                at(t0, ms),
+                Keys {
+                    g,
+                    row,
+                    col0: 1,
+                    n: 100,
+                    period_ms: 1,
+                    disp: 0.7,
+                },
+                &c,
+            );
+            ms += 100;
+        }
+        let mut col = 2u16;
+        for _ in "and I also seee an ugly gap".chars() {
+            let now = at(t0, ms);
+            let cx = ctx_in(now, &c, (OWNER_ROW, col + 1), 0.7, g);
+            rib.on_event(&typed(), now, &cx);
+            rib.plan(&cx);
+            col += 1;
+            ms += 20;
+        }
+        let mut sink = Sink::default();
+        owner_frame(&mut rib, &mut sink, &c, at(t0, ms - 20 + 100), col, 0.7);
+        assert_eq!(rib.slabs_per_cell(), 1, "327 retina cells plan at one slab");
+        assert!(
+            sink.under.len() + 2 > RIBBON_QUAD_BUDGET - 200,
+            "the frame is at the budget's edge: {} quads",
+            sink.under.len()
+        );
+        let head_x0 = i32::from(col - 1) * cw;
+        let block_x1 = i32::from(col + 1) * cw;
+        let cens = column_census(&sink.under, head_x0 - 3 * cw..block_x1, owner_rows(), 8);
+        let plateau = cens[..3 * cw as usize]
+            .iter()
+            .filter_map(|e| e.map(|(t, _, _)| t))
+            .min()
+            .expect("lit");
+        for (k, e) in cens.iter().enumerate().skip(3 * cw as usize) {
+            let x = head_x0 - 3 * cw + k as i32;
+            let (top, _, _) = e.unwrap_or_else(|| panic!("column {x} is ground-dark at one slab"));
+            assert!(
+                top <= plateau + 1,
+                "column {x} tops out at {top} under the plateau {plateau}"
+            );
+        }
+        let x0 = 2 * cw;
+        let peaks = column_peaks(&sink.under, x0..block_x1);
+        let slivers = sliver_columns(&peaks, cw as usize, cw as usize, 2);
+        assert!(slivers.is_empty(), "slivers at one slab: {slivers:?}");
+        let tops = column_census(&sink.under, x0 + cw..block_x1, owner_rows(), 8);
+        let worst = tops
+            .windows(2)
+            .filter_map(|w| Some((w[0]?.0 - w[1]?.0).abs()))
+            .max()
+            .unwrap_or(0);
+        assert!(
+            worst <= 3,
+            "the top edge steps {worst} rows at one slab per cell"
+        );
     }
 }

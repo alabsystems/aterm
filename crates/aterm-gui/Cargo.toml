@@ -360,11 +360,14 @@ aterm-update-core = { workspace = true }
 aterm-codec = { workspace = true }
 aterm-digest = { workspace = true }
 # Windows only: compile + link the application .ico (assets/aterm.rc → assets/
-# aterm.ico) into the exe so the shell shows the aterm icon (taskbar button,
-# Alt-Tab, titlebar, Explorer) instead of the generic exe glyph. build.rs gates
-# the call on CARGO_CFG_TARGET_OS = "windows" and uses `manifest_optional()`, so
-# non-Windows targets and toolchain-less builds are entirely unaffected.
-embed-resource = "3"
+# aterm.ico) into the DEV `aterm-gui.exe` so the shell shows the aterm icon
+# (taskbar button, Alt-Tab, titlebar, Explorer) instead of the generic exe
+# glyph; the shipped `aterm.exe` gets its resources from crates/aterm/build.rs.
+# First-party (crates/aterm-winres) — that crate's root says why
+# `embed-resource` left. build.rs gates the call on CARGO_CFG_TARGET_OS =
+# "windows" and a missing resource compiler is a warning, so non-Windows
+# targets and toolchain-less builds are entirely unaffected.
+aterm-winres = { workspace = true }
 
 [dev-dependencies]
 # Scratch home directories for the auto-prime pass test (spawn.rs): the pass

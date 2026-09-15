@@ -300,7 +300,32 @@ const RUST_SKILL_BODY: &str = include_str!("../assets/rust-in-aterm-skill.md");
 /// opposite things (`queued=1` vs `no-bridge=1`), the trust rule, the halt, and
 /// the file mirror. This is the one bundled doc that is NOT Claude-only: see
 /// [`skills_for`].
-const FABRIC_SKILL_BODY: &str = include_str!("../assets/aterm-fabric-skill.md");
+/// ONE body, four wrappers. The Markdown is `aterm-fabric-body.md`; each agent
+/// gets it under the header ITS OWN parser reads and nothing else. An audit on
+/// 2026-09-12 found Codex and OpenCode receiving byte-identical copies of the
+/// Claude SKILL.md, Claude's `name:`/`description:` auto-discovery frontmatter
+/// included — which Codex pastes verbatim into the prompt, and for which OpenCode
+/// has no `name:` key. The body begins with the managed-marker line, so every
+/// wrapper carries the marker without restating it.
+const FABRIC_BODY: &str = include_str!("../assets/aterm-fabric-body.md");
+
+/// Claude Code: the skills frontmatter (`name:` + `description:`, the trigger
+/// text auto-discovery matches on), then the body.
+const FABRIC_SKILL_BODY: &str = concat!(
+    include_str!("../assets/aterm-fabric-frontmatter.md"),
+    include_str!("../assets/aterm-fabric-body.md"),
+);
+
+/// Codex CLI: `prompts/<name>.md` is plain Markdown whose FILENAME is the
+/// command; there is no frontmatter contract, so the body alone.
+const CODEX_FABRIC_BODY: &str = FABRIC_BODY;
+
+/// OpenCode: `command/<name>.md` takes a frontmatter with `description:` and no
+/// `name:` (the filename is the name), then the body.
+const OPENCODE_FABRIC_BODY: &str = concat!(
+    "---\ndescription: The aterm fabric — read this session's inbox, post to a peer or a human, and understand hold=/trust=/fabric=.\n---\n",
+    include_str!("../assets/aterm-fabric-body.md"),
+);
 
 /// The same doc, wrapped for Gemini CLI's custom-command format
 /// (`~/.gemini/commands/<name>.toml`, `description` + `prompt`). Built with
@@ -322,7 +347,7 @@ const GEMINI_FABRIC_BODY: &str = concat!(
     "prompt = ",
     "'''",
     "\n",
-    include_str!("../assets/aterm-fabric-skill.md"),
+    include_str!("../assets/aterm-fabric-body.md"),
     "'''",
     "\n",
 );
@@ -412,7 +437,7 @@ fn skills_for(agent: &str) -> &'static [SkillFile] {
         ],
         "codex" => &[SkillFile {
             path: ".codex/prompts/aterm-fabric.md",
-            body: FABRIC_SKILL_BODY,
+            body: CODEX_FABRIC_BODY,
         }],
         "gemini" => &[SkillFile {
             path: ".gemini/commands/aterm-fabric.toml",
@@ -420,7 +445,7 @@ fn skills_for(agent: &str) -> &'static [SkillFile] {
         }],
         "opencode" => &[SkillFile {
             path: ".config/opencode/command/aterm-fabric.md",
-            body: FABRIC_SKILL_BODY,
+            body: OPENCODE_FABRIC_BODY,
         }],
         _ => &[],
     }
@@ -816,17 +841,50 @@ pub fn home_dir() -> Option<PathBuf> {
 
 /// Join a `/`-separated registry path onto `home` segment-by-segment, so the
 /// registry stays readable while Windows gets native separators.
-fn home_join(home: &Path, rel: &str) -> PathBuf {
-    let mut p = home.to_path_buf();
-    for seg in rel.split('/') {
+fn home_join(home: &Path, xdg: Option<&Path>, rel: &str) -> PathBuf {
+    join_with_xdg(home, xdg, rel)
+}
+
+/// `$XDG_CONFIG_HOME`, when it is set to something — the one env read, kept out
+/// of the pure join so a test can hand it a value instead of mutating the
+/// process environment.
+fn xdg_config_home() -> Option<PathBuf> {
+    std::env::var_os("XDG_CONFIG_HOME")
+        .filter(|v| !v.is_empty())
+        .map(PathBuf::from)
+}
+
+/// Resolve an agent-relative path. A `rel` under `.config/` goes under
+/// `$XDG_CONFIG_HOME` when that is set, exactly as the agent that reads it does
+/// — OpenCode resolves its global config there — and under `$HOME/.config`
+/// otherwise. Measured 2026-09-12: with `XDG_CONFIG_HOME` redirected, the primer
+/// and the fabric doc landed in `~/.config/opencode/` where OpenCode would never
+/// read them, and `aterm agents status` reported them `installed`.
+fn join_with_xdg(home: &Path, xdg: Option<&Path>, rel: &str) -> PathBuf {
+    let (base, rest) = match (rel.strip_prefix(".config/"), xdg) {
+        (Some(rest), Some(x)) => (x.to_path_buf(), rest),
+        _ => (home.to_path_buf(), rel),
+    };
+    let mut p = base;
+    for seg in rest.split('/') {
         p.push(seg);
     }
     p
 }
 
+/// How a path is SHOWN: `~/<rel>` in the ordinary case, and the resolved
+/// absolute path when `$XDG_CONFIG_HOME` moved it — so `status` names the file
+/// the agent actually consults, not the one it would have without the override.
+fn display_path(home: &Path, xdg: Option<&Path>, rel: &str) -> String {
+    match (rel.strip_prefix(".config/"), xdg) {
+        (Some(_), Some(_)) => home_join(home, xdg, rel).display().to_string(),
+        _ => format!("~/{rel}"),
+    }
+}
+
 /// Whether the agent's config dir exists — the one detection signal.
-fn detected(home: &Path, agent: &AgentFile) -> bool {
-    home_join(home, agent.dir).is_dir()
+fn detected(home: &Path, xdg: Option<&Path>, agent: &AgentFile) -> bool {
+    home_join(home, xdg, agent.dir).is_dir()
 }
 
 /// One agent's on-disk situation, resolved read-only for `status` and
@@ -840,11 +898,11 @@ enum FileSituation {
     File(Result<BlockState, String>),
 }
 
-fn situation(home: &Path, agent: &AgentFile) -> FileSituation {
-    if !detected(home, agent) {
+fn situation(home: &Path, xdg: Option<&Path>, agent: &AgentFile) -> FileSituation {
+    if !detected(home, xdg, agent) {
         return FileSituation::NotDetected;
     }
-    let path = home_join(home, agent.file);
+    let path = home_join(home, xdg, agent.file);
     match std::fs::read_to_string(&path) {
         Ok(content) => FileSituation::File(block_state(&content, &block_for(agent))),
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => FileSituation::NoFile,
@@ -853,8 +911,8 @@ fn situation(home: &Path, agent: &AgentFile) -> FileSituation {
 }
 
 /// The read-only state of one skill file, in the status vocabulary.
-fn skill_status(home: &Path, s: &SkillFile) -> SkillState {
-    match std::fs::read_to_string(home_join(home, s.path)) {
+fn skill_status(home: &Path, xdg: Option<&Path>, s: &SkillFile) -> SkillState {
+    match std::fs::read_to_string(home_join(home, xdg, s.path)) {
         Err(_) => SkillState::Absent,
         Ok(c) => skill_state(&c, s.body),
     }
@@ -978,12 +1036,18 @@ fn outcome_word(o: &Outcome) -> String {
 ///   half-edited — not even for the instant of the write.
 #[must_use]
 pub fn auto_prime(home: &Path) -> AutoPrime {
+    auto_prime_with_xdg(home, xdg_config_home().as_deref())
+}
+
+// Capture the environment at the public boundary. Every operation in one pass
+// uses the same roots; scratch-home tests supply their own complete path context.
+fn auto_prime_with_xdg(home: &Path, xdg: Option<&Path>) -> AutoPrime {
     let mut agents = Vec::new();
-    for a in AGENT_FILES.iter().filter(|a| detected(home, a)) {
-        let primer = upsert_primer_file(&home_join(home, a.file), &block_for(a));
+    for a in AGENT_FILES.iter().filter(|a| detected(home, xdg, a)) {
+        let primer = upsert_primer_file(&home_join(home, xdg, a.file), &block_for(a));
         let skills: Vec<Result<SkillWrite, String>> = skills_for(a.name)
             .iter()
-            .map(|s| install_skill_file(&home_join(home, s.path), s.body))
+            .map(|s| install_skill_file(&home_join(home, xdg, s.path), s.body))
             .collect();
         agents.push(AgentOutcome {
             agent: a.name,
@@ -992,7 +1056,10 @@ pub fn auto_prime(home: &Path) -> AutoPrime {
         });
     }
     let summary = if agents.is_empty() {
-        let looked: Vec<String> = AGENT_FILES.iter().map(|a| format!("~/{}", a.dir)).collect();
+        let looked: Vec<String> = AGENT_FILES
+            .iter()
+            .map(|a| display_path(home, xdg, a.dir))
+            .collect();
         format!(
             "agent primer: no coding agents detected (looked for {})",
             looked.join(", ")
@@ -1012,10 +1079,14 @@ pub fn auto_prime(home: &Path) -> AutoPrime {
 /// `claude installed, codex stale, gemini not detected, opencode not detected`.
 #[must_use]
 pub fn status_line(home: &Path) -> String {
+    status_line_with_xdg(home, xdg_config_home().as_deref())
+}
+
+fn status_line_with_xdg(home: &Path, xdg: Option<&Path>) -> String {
     let rows: Vec<String> = AGENT_FILES
         .iter()
         .map(|a| {
-            let state = match situation(home, a) {
+            let state = match situation(home, xdg, a) {
                 FileSituation::NotDetected => "not detected".to_string(),
                 FileSituation::NoFile | FileSituation::File(Ok(BlockState::Absent)) => {
                     "absent".to_string()
@@ -1025,9 +1096,9 @@ pub fn status_line(home: &Path) -> String {
                 FileSituation::File(Err(e)) => format!("ERROR: {e}"),
             };
             let mut row = format!("{} {state}", a.name);
-            if detected(home, a) {
+            if detected(home, xdg, a) {
                 for s in skills_for(a.name) {
-                    let word = match skill_status(home, s) {
+                    let word = match skill_status(home, xdg, s) {
                         SkillState::Current => continue,
                         SkillState::Absent => "absent",
                         SkillState::Stale => "stale",
@@ -1090,12 +1161,17 @@ fn select<'a>(names: &[String]) -> Result<Vec<&'a AgentFile>, String> {
         .collect()
 }
 
-/// The `aterm agents` command: `(report, exit_code)`. `home` is injected so the
-/// whole surface is testable against a scratch directory; the real caller passes
-/// [`home_dir`]. Exit codes: 0 success (status is always 0), 1 an install/remove
+/// The `aterm agents` command: `(report, exit_code)`. The real caller passes
+/// [`home_dir`]; `.config/` entries also honor the current `XDG_CONFIG_HOME`.
+/// Tests inject both roots through the same implementation. Exit codes:
+/// 0 success (status is always 0), 1 an install/remove
 /// failure (corrupt block, I/O error), 2 usage.
 #[must_use]
 pub fn agents_report(home: &Path, args: &[String]) -> (String, i32) {
+    agents_report_with_xdg(home, args, xdg_config_home().as_deref())
+}
+
+fn agents_report_with_xdg(home: &Path, args: &[String], xdg: Option<&Path>) -> (String, i32) {
     let sub = args.first().map(String::as_str).unwrap_or("status");
     let names = args.get(1..).unwrap_or(&[]);
     match sub {
@@ -1118,8 +1194,10 @@ pub fn agents_report(home: &Path, args: &[String]) -> (String, i32) {
         "status" => {
             let mut out = String::new();
             for a in AGENT_FILES {
-                let state = match situation(home, a) {
-                    FileSituation::NotDetected => format!("not detected (no ~/{})", a.dir),
+                let state = match situation(home, xdg, a) {
+                    FileSituation::NotDetected => {
+                        format!("not detected (no {})", display_path(home, xdg, a.dir))
+                    }
                     FileSituation::NoFile => "absent (no context file yet)".to_string(),
                     FileSituation::File(Ok(BlockState::Absent)) => "absent".to_string(),
                     FileSituation::File(Ok(BlockState::Current)) => "installed".to_string(),
@@ -1128,17 +1206,27 @@ pub fn agents_report(home: &Path, args: &[String]) -> (String, i32) {
                     }
                     FileSituation::File(Err(e)) => format!("ERROR: {e}"),
                 };
-                let _ = writeln!(out, "{:<9} ~/{:<28} {state}", a.name, a.file);
+                let _ = writeln!(
+                    out,
+                    "{:<9} {:<30} {state}",
+                    a.name,
+                    display_path(home, xdg, a.file)
+                );
                 // Skills are whole managed FILES, listed under their agent so the
                 // status view stays one line per artifact.
                 for s in skills_for(a.name) {
-                    let st = match skill_status(home, s) {
+                    let st = match skill_status(home, xdg, s) {
                         SkillState::Current => "installed",
                         SkillState::Stale => "stale (install updates it)",
                         SkillState::Foreign => "foreign — yours, left alone",
                         SkillState::Absent => "absent",
                     };
-                    let _ = writeln!(out, "{:<9} ~/{:<28} {st}", "  skill", s.path);
+                    let _ = writeln!(
+                        out,
+                        "{:<9} {:<30} {st}",
+                        "  skill",
+                        display_path(home, xdg, s.path)
+                    );
                 }
             }
             out.push_str(
@@ -1157,19 +1245,22 @@ pub fn agents_report(home: &Path, args: &[String]) -> (String, i32) {
             let mut out = String::new();
             let mut failed = false;
             for a in agents {
-                let undetected = !detected(home, a);
+                let undetected = !detected(home, xdg, a);
                 if undetected && !forced {
                     let _ = writeln!(
                         out,
-                        "{:<9} ~/{:<28} skipped — no ~/{} (not detected; name it to force)",
-                        a.name, a.file, a.dir
+                        "{:<9} {:<30} skipped — no {} (not detected; name it to force)",
+                        a.name,
+                        display_path(home, xdg, a.file),
+                        display_path(home, xdg, a.dir)
                     );
                     // A skipped (undetected, unforced) agent skips its skills as
                     // well — never create `~/.claude` for someone who does not
                     // use Claude Code.
                     continue;
                 }
-                let verdict = match upsert_primer_file(&home_join(home, a.file), &block_for(a)) {
+                let verdict = match upsert_primer_file(&home_join(home, xdg, a.file), &block_for(a))
+                {
                     Ok(PrimerWrite::Current) => "already installed".to_string(),
                     Ok(PrimerWrite::Created) => "installed (new file)".to_string(),
                     Ok(PrimerWrite::Appended | PrimerWrite::Replaced) => "installed".to_string(),
@@ -1178,12 +1269,17 @@ pub fn agents_report(home: &Path, args: &[String]) -> (String, i32) {
                         format!("ERROR: {e}")
                     }
                 };
-                let _ = writeln!(out, "{:<9} ~/{:<28} {verdict}", a.name, a.file);
+                let _ = writeln!(
+                    out,
+                    "{:<9} {:<30} {verdict}",
+                    a.name,
+                    display_path(home, xdg, a.file)
+                );
 
                 // Bundled skills ride the SAME install: an agent that gets the
                 // primer gets the skills too.
                 for s in skills_for(a.name) {
-                    let verdict = match install_skill_file(&home_join(home, s.path), s.body) {
+                    let verdict = match install_skill_file(&home_join(home, xdg, s.path), s.body) {
                         Ok(SkillWrite::Current) => "already installed".to_string(),
                         // The user's own file at our path: never clobbered.
                         Ok(SkillWrite::Foreign) => {
@@ -1196,7 +1292,12 @@ pub fn agents_report(home: &Path, args: &[String]) -> (String, i32) {
                             format!("ERROR: {e}")
                         }
                     };
-                    let _ = writeln!(out, "{:<9} ~/{:<28} {verdict}", "  skill", s.path);
+                    let _ = writeln!(
+                        out,
+                        "{:<9} {:<30} {verdict}",
+                        "  skill",
+                        display_path(home, xdg, s.path)
+                    );
                 }
             }
             (out, i32::from(failed))
@@ -1209,7 +1310,7 @@ pub fn agents_report(home: &Path, args: &[String]) -> (String, i32) {
             let mut out = String::new();
             let mut failed = false;
             for a in agents {
-                let path = home_join(home, a.file);
+                let path = home_join(home, xdg, a.file);
                 let verdict = match std::fs::read_to_string(&path) {
                     Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
                         "nothing to remove".to_string()
@@ -1233,13 +1334,18 @@ pub fn agents_report(home: &Path, args: &[String]) -> (String, i32) {
                         }
                     },
                 };
-                let _ = writeln!(out, "{:<9} ~/{:<28} {verdict}", a.name, a.file);
+                let _ = writeln!(
+                    out,
+                    "{:<9} {:<30} {verdict}",
+                    a.name,
+                    display_path(home, xdg, a.file)
+                );
 
                 // Symmetric uninstall: delete only files we still recognise as
                 // OURS. A `Foreign` file (marker removed) is the user's — and a
                 // `Stale` one is ours from an older build, so it does go.
                 for s in skills_for(a.name) {
-                    let sp = home_join(home, s.path);
+                    let sp = home_join(home, xdg, s.path);
                     let verdict = match std::fs::read_to_string(&sp) {
                         Err(_) => "nothing to remove".to_string(),
                         Ok(c) => match skill_state(&c, s.body) {
@@ -1255,7 +1361,12 @@ pub fn agents_report(home: &Path, args: &[String]) -> (String, i32) {
                             },
                         },
                     };
-                    let _ = writeln!(out, "{:<9} ~/{:<28} {verdict}", "  skill", s.path);
+                    let _ = writeln!(
+                        out,
+                        "{:<9} {:<30} {verdict}",
+                        "  skill",
+                        display_path(home, xdg, s.path)
+                    );
                 }
             }
             // A removal the next session would silently undo is a trap; the
@@ -1273,6 +1384,22 @@ pub fn agents_report(home: &Path, args: &[String]) -> (String, i32) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // A scratch HOME is not sufficient isolation: a caller's XDG_CONFIG_HOME
+    // could otherwise send install/remove into its real OpenCode directory.
+    // These wrappers drive the production implementations with complete fixture
+    // roots, without modifying process-global environment in parallel tests.
+    fn auto_prime(home: &Path) -> AutoPrime {
+        auto_prime_with_xdg(home, None)
+    }
+
+    fn agents_report(home: &Path, args: &[String]) -> (String, i32) {
+        agents_report_with_xdg(home, args, None)
+    }
+
+    fn status_line(home: &Path) -> String {
+        status_line_with_xdg(home, None)
+    }
 
     /// The exact v1 block a machine primed before 2026-08-26 carries — pinned as
     /// a literal (not built from today's constants) so the upgrade path is tested
@@ -2093,6 +2220,16 @@ why. If neither variable is set, you are not inside aterm; ignore this section.
         assert_eq!(code, 0);
         for a in AGENT_FILES {
             assert!(out.contains(a.name), "status must list {}", a.name);
+            let state = if a.name == "claude" {
+                "installed".to_string()
+            } else {
+                format!("not detected (no ~/{})", a.dir)
+            };
+            assert!(
+                out.lines()
+                    .any(|line| line == format!("{:<9} ~/{:<28} {state}", a.name, a.file)),
+                "default path spelling and padding must remain byte-identical: {out}"
+            );
         }
         assert!(out.contains("installed"));
         assert!(out.contains("not detected"));
@@ -2296,6 +2433,149 @@ why. If neither variable is set, you are not inside aterm; ignore this section.
         }
     }
 
+    #[test]
+    fn relocated_config_drives_detection_install_status_and_remove_in_one_root() {
+        let home = aterm_tempfile::tempdir().unwrap();
+        let config = aterm_tempfile::tempdir().unwrap();
+        let xdg = Some(config.path());
+        let default_file = home.path().join(".config/opencode/AGENTS.md");
+        std::fs::create_dir_all(default_file.parent().unwrap()).unwrap();
+        let default_user = "# This is the inactive default config\n";
+        std::fs::write(&default_file, default_user).unwrap();
+
+        // Negative control for ignoring relocation: the default root really has
+        // an agent, but the active config has none. It must not be detected or
+        // written, and the diagnostic must name where detection actually looked.
+        let absent = auto_prime_with_xdg(home.path(), xdg);
+        assert!(absent.agents.is_empty(), "{}", absent.summary);
+        assert!(!absent.changed());
+        assert!(
+            absent
+                .summary
+                .contains(config.path().join("opencode").to_str().unwrap()),
+            "{}",
+            absent.summary
+        );
+        assert!(!absent.summary.contains("~/.config/opencode"));
+        assert!(status_line_with_xdg(home.path(), xdg).contains("opencode not detected"));
+
+        let active_file = config.path().join("opencode/AGENTS.md");
+        let active_dir = config.path().join("opencode");
+        let (report, code) = agents_report_with_xdg(home.path(), &[], xdg);
+        assert_eq!(code, 0, "{report}");
+        assert!(
+            report.lines().any(|line| line
+                == format!(
+                    "{:<9} {:<30} not detected (no {})",
+                    "opencode",
+                    active_file.display(),
+                    active_dir.display()
+                )),
+            "undetected status must report the actual lookup directory and context file: {report}"
+        );
+        for skill in skills_for("opencode") {
+            assert!(
+                report.lines().any(|line| line
+                    == format!(
+                        "{:<9} {:<30} absent",
+                        "  skill",
+                        join_with_xdg(home.path(), xdg, skill.path).display()
+                    )),
+                "an absent skill must name the actual lookup path: {report}"
+            );
+        }
+        assert!(!report.contains("~/.config/opencode"));
+        let (report, code) = agents_report_with_xdg(home.path(), &["install".into()], xdg);
+        assert_eq!(code, 0, "{report}");
+        assert!(
+            report.lines().any(|line| line
+                == format!(
+                    "{:<9} {:<30} skipped — no {} (not detected; name it to force)",
+                    "opencode",
+                    active_file.display(),
+                    active_dir.display()
+                )),
+            "skipped install must report the actual missing directory: {report}"
+        );
+        assert!(
+            !active_dir.exists(),
+            "reporting an absent agent must not create it"
+        );
+        std::fs::create_dir_all(active_file.parent().unwrap()).unwrap();
+        let active_user = "# The active OpenCode instructions\n";
+        std::fs::write(&active_file, active_user).unwrap();
+        let installed = auto_prime_with_xdg(home.path(), xdg);
+        assert_eq!(installed.agents.len(), 1, "{}", installed.summary);
+        assert_eq!(installed.agents[0].agent, "opencode");
+        assert_eq!(installed.agents[0].outcome, Outcome::Installed);
+        assert!(
+            std::fs::read_to_string(&active_file)
+                .unwrap()
+                .starts_with(active_user)
+        );
+        assert!(
+            std::fs::read_to_string(&active_file)
+                .unwrap()
+                .contains(MARK_END)
+        );
+        for skill in skills_for("opencode") {
+            let path = join_with_xdg(home.path(), xdg, skill.path);
+            assert_eq!(std::fs::read_to_string(path).unwrap(), skill.body);
+        }
+        assert_eq!(
+            auto_prime_with_xdg(home.path(), xdg).agents[0].outcome,
+            Outcome::Unchanged
+        );
+        assert!(status_line_with_xdg(home.path(), xdg).contains("opencode installed"));
+        let (report, code) = agents_report_with_xdg(home.path(), &["install".into()], xdg);
+        assert_eq!(code, 0, "{report}");
+        assert!(
+            report.lines().any(|line| line
+                == format!(
+                    "{:<9} {:<30} already installed",
+                    "opencode",
+                    active_file.display()
+                )),
+            "install must report the file it actually inspected: {report}"
+        );
+        assert!(!report.contains("~/.config/opencode"));
+        assert_eq!(
+            report.matches("already installed").count(),
+            1 + skills_for("opencode").len(),
+            "{report}"
+        );
+
+        let (report, code) = agents_report_with_xdg(home.path(), &["remove".into()], xdg);
+        assert_eq!(code, 0, "{report}");
+        assert!(
+            report
+                .lines()
+                .any(|line| line
+                    == format!("{:<9} {:<30} removed", "opencode", active_file.display())),
+            "remove must report the file it actually changed: {report}"
+        );
+        for skill in skills_for("opencode") {
+            assert!(
+                report.lines().any(|line| line
+                    == format!(
+                        "{:<9} {:<30} removed",
+                        "  skill",
+                        join_with_xdg(home.path(), xdg, skill.path).display()
+                    )),
+                "remove must report the actual skill path: {report}"
+            );
+        }
+        assert!(!report.contains("~/.config/opencode"));
+        assert_eq!(std::fs::read_to_string(&active_file).unwrap(), active_user);
+        for skill in skills_for("opencode") {
+            assert!(!join_with_xdg(home.path(), xdg, skill.path).exists());
+        }
+        assert_eq!(
+            std::fs::read_to_string(&default_file).unwrap(),
+            default_user
+        );
+    }
+
     /// The `--diagnose` line: one word per registry agent, a skill mentioned
     /// only when it is not current.
     #[test]
@@ -2366,11 +2646,14 @@ why. If neither variable is set, you are not inside aterm; ignore this section.
     /// `name:` and a `description:` (the fields the harness matches on).
     #[test]
     fn bundled_skill_has_usable_frontmatter() {
-        // Markdown docs only: Gemini's is TOML and is pinned by its own test.
+        // Claude's SKILL.md files only: the `---`/`name:`/`description:` block is
+        // the Claude Code auto-discovery contract. Codex's prompt has no
+        // frontmatter at all and OpenCode's has `description:` but no `name:`;
+        // each is pinned by `every_agent_gets_the_body_under_its_own_header`.
         for s in AGENT_FILES
             .iter()
             .flat_map(|a| skills_for(a.name))
-            .filter(|s| s.path.ends_with(".md"))
+            .filter(|s| s.path.contains("/skills/"))
         {
             assert_eq!(
                 s.body.lines().next().map(str::trim),
@@ -2555,11 +2838,11 @@ why. If neither variable is set, you are not inside aterm; ignore this section.
     fn a_gemini_command_is_valid_toml_and_carries_the_marker() {
         let delim = "'''";
         assert!(
-            !FABRIC_SKILL_BODY.contains(delim),
+            !FABRIC_BODY.contains(delim),
             "the fabric asset gained a TOML literal delimiter; the wrapper would break"
         );
         assert!(
-            !FABRIC_SKILL_BODY.contains('\\'),
+            !FABRIC_BODY.contains('\\'),
             "the fabric asset gained a backslash; keep it literal-string safe"
         );
         let body = GEMINI_FABRIC_BODY;
@@ -2589,24 +2872,65 @@ why. If neither variable is set, you are not inside aterm; ignore this section.
     /// how a managed doc goes stale in one place, so there is only ever one.
     #[test]
     fn the_fabric_doc_has_exactly_one_source() {
-        let md: Vec<&str> = ["claude", "codex", "opencode"]
-            .iter()
-            .map(|a| {
-                skills_for(a)
-                    .iter()
-                    .find(|s| s.path.contains("aterm-fabric"))
-                    .expect("fabric doc")
-                    .body
-            })
-            .collect();
+        // Four wrappers over ONE body. Each agent's doc must CONTAIN the body
+        // verbatim (so the Markdown cannot drift between them) and must begin
+        // with the header that agent's parser reads — and nothing else's.
+        let doc = |agent: &str| -> &'static str {
+            skills_for(agent)
+                .iter()
+                .find(|s| s.path.contains("aterm-fabric"))
+                .expect("fabric doc")
+                .body
+        };
+        for agent in ["claude", "codex", "gemini", "opencode"] {
+            assert!(
+                doc(agent).contains(FABRIC_BODY),
+                "{agent}'s fabric doc must embed the one body verbatim"
+            );
+        }
         assert!(
-            md.windows(2).all(|w| std::ptr::eq(w[0], w[1])),
-            "the Markdown agents must share ONE asset, not copies"
+            FABRIC_BODY.starts_with(SKILL_MARK_PREFIX),
+            "the body must open with the managed marker, so every wrapper carries it"
         );
+    }
+
+    /// The header each agent gets is ITS OWN parser's, not Claude's. An audit on
+    /// 2026-09-12 found Codex and OpenCode shipped byte-identical copies of the
+    /// Claude SKILL.md, auto-discovery frontmatter included.
+    #[test]
+    fn every_agent_gets_the_body_under_its_own_header() {
+        let doc = |agent: &str| -> &'static str {
+            skills_for(agent)
+                .iter()
+                .find(|s| s.path.contains("aterm-fabric"))
+                .expect("fabric doc")
+                .body
+        };
+        // Claude: skills frontmatter with BOTH keys, then the body.
+        let claude = doc("claude");
+        assert!(claude.starts_with("---\nname: aterm-fabric\n"));
         assert!(
-            GEMINI_FABRIC_BODY.contains(FABRIC_SKILL_BODY),
-            "the Gemini wrapper must embed the same asset verbatim"
+            claude
+                .lines()
+                .take(4)
+                .any(|l| l.starts_with("description:"))
         );
+        // Codex: NO frontmatter — the filename is the command, and a `name:`
+        // block would be pasted into the prompt verbatim.
+        let codex = doc("codex");
+        assert!(
+            codex.starts_with(SKILL_MARK_PREFIX),
+            "codex's prompt must begin with the body, not a frontmatter: {:?}",
+            codex.lines().next()
+        );
+        assert!(!codex.contains("\nname: aterm-fabric\n"));
+        // OpenCode: `description:` and NO `name:` — the filename is the name.
+        let opencode = doc("opencode");
+        assert!(opencode.starts_with("---\ndescription: "));
+        assert!(!opencode.lines().take(3).any(|l| l.starts_with("name:")));
+        // Gemini: TOML, pinned by its own test; and it must not smuggle the
+        // Claude frontmatter into the prompt either.
+        assert!(!doc("gemini").contains("\nname: aterm-fabric\n"));
     }
 
     /// A managed doc is labelled by its NAME, under either layout. The bug this
@@ -2710,6 +3034,38 @@ why. If neither variable is set, you are not inside aterm; ignore this section.
             overhead <= 300,
             "{overhead} bytes of the block are outside the budgeted paragraphs — \
              a fourth paragraph needs its own budget, like the other three"
+        );
+    }
+
+    /// A `.config/` row follows `$XDG_CONFIG_HOME` when it is set, as OpenCode
+    /// does; every other row, and every row when it is unset, stays under
+    /// `$HOME`. Handed the value rather than reading the environment, so this
+    /// pins the rule without mutating process state.
+    #[test]
+    fn a_dot_config_row_follows_xdg_config_home() {
+        let home = Path::new("/h");
+        let xdg = Path::new("/x/cfg");
+        assert_eq!(
+            join_with_xdg(home, Some(xdg), ".config/opencode/AGENTS.md"),
+            PathBuf::from("/x/cfg/opencode/AGENTS.md")
+        );
+        assert_eq!(
+            join_with_xdg(home, Some(xdg), ".config/opencode/command/aterm-fabric.md"),
+            PathBuf::from("/x/cfg/opencode/command/aterm-fabric.md")
+        );
+        // Unset: the conventional place.
+        assert_eq!(
+            join_with_xdg(home, None, ".config/opencode/AGENTS.md"),
+            PathBuf::from("/h/.config/opencode/AGENTS.md")
+        );
+        // Not a `.config/` row: XDG is irrelevant even when set.
+        assert_eq!(
+            join_with_xdg(home, Some(xdg), ".claude/CLAUDE.md"),
+            PathBuf::from("/h/.claude/CLAUDE.md")
+        );
+        assert_eq!(
+            join_with_xdg(home, Some(xdg), ".codex/prompts/aterm-fabric.md"),
+            PathBuf::from("/h/.codex/prompts/aterm-fabric.md")
         );
     }
 }

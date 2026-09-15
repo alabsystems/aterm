@@ -77,13 +77,14 @@ fn main() -> ExitCode {
 /// Resolve a user-supplied `--root` to an absolute path, refusing by name when
 /// it does not exist — a typo'd root must not read as an empty workspace.
 fn canonical_root(given: PathBuf) -> Result<PathBuf, String> {
-    given.canonicalize().map_err(|e| {
+    let abs = given.canonicalize().map_err(|e| {
         format!(
             "--root `{}` cannot be resolved: {e} — give an existing directory holding the \
              workspace `Cargo.toml`, or drop `--root` and run from inside the workspace",
             given.display()
         )
-    })
+    })?;
+    Ok(aterm_forge::resolve::strip_verbatim_prefix(abs))
 }
 
 /// Walk up from CWD to the directory holding the workspace `Cargo.toml`.

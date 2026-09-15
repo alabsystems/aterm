@@ -40,10 +40,10 @@
 //!
 //! Spikes S1 (grant scope) and S4 (which services a grant covers) have not
 //! been run, so `SpikeEvidence::UNMEASURED` is what the join sees:
-//! `fda_scope` is always `unknown`, `covers=` is empty, `prompt_possible` is
-//! `yes` even while the grant is held, and no folder is ever reported
-//! `covered-by-fda`. Making a stronger claim is a named field flip a reviewer
-//! can see, not a sentence that drifts.
+//! A completed grant establishes `fda_scope=this_process` and Apple's
+//! documented `app-data` coverage for that host. It does not establish
+//! inherited-session or per-folder access: `prompt_possible` remains `yes`
+//! while those claims are unmeasured, and no folder is reported covered.
 
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -60,9 +60,9 @@ use winit::event_loop::EventLoopProxy;
 use crate::{App, Wake};
 
 /// The TCC service classes a Full Disk Access grant is claimed — by Apple, not
-/// by measurement — to subsume. Until §7 S4 measures them they are reported
-/// `unmeasured`, never `uncovered` — except the [`NEVER_COVERED`] class, which
-/// is `uncovered` measured or not: see [`covers_split`].
+/// by measurement — to subsume. App-data follows the observing host's completed
+/// grant and Apple's documented rule. Other classes remain `unmeasured` until
+/// §7 S4 measures them, except [`NEVER_COVERED`]: see [`covers_split`].
 const SERVICES: &[&str] = &[
     "documents",
     "desktop",
@@ -96,6 +96,12 @@ const AWAIT_MAX_MS: u64 = 600_000;
 /// gated by `[privacy] probe_interval_ms`, so this only bounds the tick on
 /// top of it.
 const AWAIT_CONSENT_TICK: Duration = Duration::from_millis(500);
+
+/// A control caller can wait briefly for the asynchronous check it just
+/// requested. GUI reads remain immediate, and a stuck OS call still reports
+/// Pending rather than holding a control worker indefinitely.
+const PRIVACY_READ_WAIT: Duration = Duration::from_millis(500);
+const PRIVACY_READ_TICK: Duration = Duration::from_millis(25);
 
 /// The refusal for a selector on an instance-wide verb.
 const NO_SELECTOR: &str = "ERR privacy is instance-wide and takes no selector\n";
@@ -761,20 +767,15 @@ pub(crate) struct PrivacySnapshot {
 }
 
 /// The `covers=` / `uncovered=` / `unmeasured=` split — THREE buckets, because
-/// "not measured" is not "measured as not covered" (2026-09-10). Until §7 S4
-/// runs, nothing is measured, so `covers` is empty and every service except
-/// the permanently-uncovered ones sits in `unmeasured`. The earlier rendering
-/// put them all in `uncovered`, which told the owner — and any agent parsing
-/// the JSON — that Full Disk Access covers nothing, app-data included: the
-/// exact opposite of Apple's documented order of evaluation, and an argument
-/// against the one switch that stops the prompts they were seeing. And when
-/// the measurement flips, the bucket [`NEVER_COVERED`] stays put instead of
-/// being swept into `covers` with everything else.
-pub(crate) fn covers_split(evidence: SpikeEvidence) -> CoverageSplit {
+/// "not measured" is not "measured as not covered". App-data uses Apple's
+/// documented FDA rule and the observing host's confirmed grant. Other
+/// services remain unmeasured until §7 S4 establishes their coverage. The
+/// [`NEVER_COVERED`] bucket remains separate even after that measurement.
+pub(crate) fn covers_split(fda: FdaState, evidence: SpikeEvidence) -> CoverageSplit {
     let never = |s: &&&str| NEVER_COVERED.contains(s);
     let uncovered: Vec<&'static str> = SERVICES.iter().filter(never).copied().collect();
     let rest: Vec<&'static str> = SERVICES.iter().filter(|s| !never(s)).copied().collect();
-    if evidence.fda_coverage_measured {
+    let mut split = if evidence.fda_coverage_measured {
         CoverageSplit {
             covers: rest,
             uncovered,
@@ -786,7 +787,39 @@ pub(crate) fn covers_split(evidence: SpikeEvidence) -> CoverageSplit {
             uncovered,
             unmeasured: rest,
         }
+    };
+    // Apple documents app-container access as an FDA-covered class (WWDC23,
+    // "What's new in privacy"). A completed grant is positive evidence for
+    // the observing host; it is not proof about adopted sessions or folders.
+    split.covers.retain(|service| *service != "app-data");
+    split.unmeasured.retain(|service| *service != "app-data");
+    if app_data_covered(fda, observed_fda_scope(fda, evidence.fda_scope)) {
+        split.covers.push("app-data");
+    } else {
+        split.unmeasured.push("app-data");
     }
+    split
+}
+
+/// Successful access establishes the observing host's scope directly. It does
+/// not establish when a changed Settings grant reaches another process.
+pub(crate) const fn observed_fda_scope(
+    fda: FdaState,
+    measured: consent::FdaScope,
+) -> consent::FdaScope {
+    if matches!(fda, FdaState::Granted) && matches!(measured, consent::FdaScope::Unknown) {
+        consent::FdaScope::ThisProcess
+    } else {
+        measured
+    }
+}
+
+const fn app_data_covered(fda: FdaState, scope: consent::FdaScope) -> bool {
+    matches!(fda, FdaState::Granted)
+        && matches!(
+            scope,
+            consent::FdaScope::ThisProcess | consent::FdaScope::NewProcesses
+        )
 }
 
 /// The three coverage buckets of [`covers_split`]. Shared with the Security
@@ -806,19 +839,35 @@ fn install_posture_once() -> &'static (&'static str, Option<String>) {
 }
 
 /// The `install=` token and `running=` path: the same classification the
-/// first-open doctor makes (`aterm_update::which_copy::posture_from`), read
-/// off this process's canonical executable path. Pure path work; no TCC.
+/// first-open doctor makes on macOS (`aterm_update::which_copy::posture_from`),
+/// read off this process's canonical executable path; off macOS there is no
+/// bundle, so the token is `not-a-bundle` by construction. Pure path work; no TCC.
+///
+/// Canonicalized on unix only, for the reason `which_copy::observe` records:
+/// on Windows `canonicalize` answers a verbatim `\\?\C:\…` spelling nobody
+/// types, and the row is read by a human.
 fn install_posture_rows() -> (&'static str, Option<String>) {
     let Ok(exe) = std::env::current_exe() else {
         return ("unknown", None);
     };
+    #[cfg(unix)]
     let exe = std::fs::canonicalize(&exe).unwrap_or(exe);
+    // `which_copy::posture_from` is macOS-only, like the `bundle` module it comes
+    // from — App Translocation and mounted images are Gatekeeper/DMG phenomena.
+    // Off macOS there is no `.app` at all: the running copy is a plain binary on
+    // PATH, which is exactly what `InstallPosture::NotABundle` documents
+    // ("nothing is wrong; there is simply no bundle"). Say that, with the path,
+    // rather than fail to compile — this call site was the one non-gated consumer,
+    // and it kept every Linux build of aterm-gui red from 2026-09-10.
+    #[cfg(target_os = "macos")]
     let token = match aterm_update::which_copy::posture_from(&exe) {
         aterm_update::which_copy::InstallPosture::Installed => "installed",
         aterm_update::which_copy::InstallPosture::MountedImage => "mounted-image",
         aterm_update::which_copy::InstallPosture::Translocated => "translocated",
         aterm_update::which_copy::InstallPosture::NotABundle => "not-a-bundle",
     };
+    #[cfg(not(target_os = "macos"))]
+    let token = "not-a-bundle";
     (token, Some(exe.to_string_lossy().into_owned()))
 }
 
@@ -875,14 +924,12 @@ fn opt(value: Option<&str>) -> String {
 }
 
 /// The closing prose row. It states the two things a reader otherwise infers
-/// wrongly, and it promises nothing about elimination. Its `covers is empty`
-/// clause is written for the `SpikeEvidence::UNMEASURED` every `read_privacy`
-/// report carries today; the measured arm of [`PrivacySnapshot::lines`] (reached
-/// only from the tests) renders a `covers=` list above this same sentence, so the
-/// row must turn evidence-conditional when §7 S4 lands.
+/// wrongly. Documented app-data coverage applies only to the scope named by
+/// this host's completed FDA observation, never to adopted sessions by inference.
 const NOTE: &str = "per-folder state is unknown by construction: reading a folder is the act \
-                    that raises the prompt; which services a grant covers is not measured here, \
-                    so covers is empty and prompt_possible stays yes";
+                    that raises the prompt; app-data coverage uses Apple's documented FDA rule \
+                    and the observed fda_scope; adopted-session access is not established, \
+                    so prompt_possible may remain yes";
 
 impl PrivacySnapshot {
     /// `prompt_possible` — the module's own rule, not a second copy of it.
@@ -942,9 +989,9 @@ impl PrivacySnapshot {
             self.probe.as_str(),
             self.probe_age_ms
                 .map_or_else(|| "-".to_string(), |ms| ms.to_string()),
-            self.evidence.fda_scope.as_str(),
+            observed_fda_scope(self.fda, self.evidence.fda_scope).as_str(),
         ));
-        let split = covers_split(self.evidence);
+        let split = covers_split(self.fda, self.evidence);
         out.push(format!("covers={}", list_or_dash(&split.covers)));
         out.push(format!("uncovered={}", list_or_dash(&split.uncovered)));
         out.push(format!("unmeasured={}", list_or_dash(&split.unmeasured)));
@@ -1062,7 +1109,7 @@ fn list_or_dash(items: &[&str]) -> String {
 fn cmd_privacy_json(snapshot: &PrivacySnapshot) -> String {
     use std::fmt::Write as _;
 
-    let split = covers_split(snapshot.evidence);
+    let split = covers_split(snapshot.fda, snapshot.evidence);
     let mut body = String::from("{\"schema\":1,");
     let _ = write!(body, "{},", json_str_field("platform", snapshot.platform));
     let _ = write!(body, "\"os\":{},", json_opt(snapshot.os.as_deref()));
@@ -1095,7 +1142,10 @@ fn cmd_privacy_json(snapshot: &PrivacySnapshot) -> String {
         snapshot
             .probe_age_ms
             .map_or_else(|| "null".to_string(), |ms| ms.to_string()),
-        json_str_field("fda_scope", snapshot.evidence.fda_scope.as_str()),
+        json_str_field(
+            "fda_scope",
+            observed_fda_scope(snapshot.fda, snapshot.evidence.fda_scope).as_str()
+        ),
     );
     let _ = write!(
         body,
@@ -1213,6 +1263,13 @@ pub(crate) enum PrivacyForm {
     Tuple(u64),
 }
 
+/// Internal reply metadata: the worker must not infer readiness by parsing
+/// human text or JSON. Nothing here changes the public report's schema.
+pub(crate) struct PrivacyRead {
+    lines: Vec<String>,
+    pending: bool,
+}
+
 impl App {
     /// Assemble the consent posture on the main thread (`Wake::ReadPrivacy`).
     ///
@@ -1220,7 +1277,7 @@ impl App {
     /// NO dialog: the Full Disk Access probe reads state that already exists,
     /// and nothing here is inferred from anything else — in particular no
     /// folder's state is ever derived from the grant.
-    pub(crate) fn read_privacy(&self, form: PrivacyForm) -> Vec<String> {
+    pub(crate) fn read_privacy(&self, form: PrivacyForm) -> PrivacyRead {
         let policy = self.consent_policy();
         let identity = signing_identity_if_warm();
         let (probe, age) = self
@@ -1268,11 +1325,15 @@ impl App {
         }
 
         if let PrivacyForm::Tuple(target) = form {
-            return sessions
+            let lines = sessions
                 .iter()
                 .find(|row| self.session_sid_matches(target, &row.sid))
                 .map(|row| vec![PrivacySnapshot::observed_tuple_line(row, probe)])
                 .unwrap_or_default();
+            return PrivacyRead {
+                lines,
+                pending: probe.label == ProbeLabel::Pending,
+            };
         }
 
         let mode = aterm_containment::mode_or_containment();
@@ -1317,9 +1378,13 @@ impl App {
                 .as_deref()
                 .map(|id| consent::tccutil_reset_command(id, Folder::Documents).join(" ")),
         };
-        match form {
+        let lines = match form {
             PrivacyForm::Json => vec![cmd_privacy_json(&snapshot)],
             PrivacyForm::Lines | PrivacyForm::Tuple(_) => snapshot.lines(),
+        };
+        PrivacyRead {
+            lines,
+            pending: probe.label == ProbeLabel::Pending,
         }
     }
 
@@ -1586,7 +1651,10 @@ fn session_attribution(session: &crate::Session) -> Attribution {
 ///
 /// Runs on a control worker: it warms the signing identity HERE (it may spawn
 /// `codesign`, which must never land on the event loop) and then takes the one
-/// main-thread hop that reads `App` state and the injected probes.
+/// main-thread hop that reads `App` state and the injected probes. An unfinished
+/// observation gets a short, bounded wait HERE, never on the GUI thread. Thus
+/// occasional calls do not report only Pending by always arriving after the
+/// cache's freshness interval.
 pub(crate) fn cmd_privacy(rest: &str, proxy: &EventLoopProxy<Wake>) -> String {
     let form = match parse_privacy_form(rest) {
         Ok(form) => form,
@@ -1595,13 +1663,24 @@ pub(crate) fn cmd_privacy(rest: &str, proxy: &EventLoopProxy<Wake>) -> String {
     let json = form == PrivacyForm::Json;
     // Warm the process-wide identity off the event loop.
     let _ = signing_identity();
-    let lines = match crate::control::control_media::call_main(proxy, |tx| Wake::ReadPrivacy {
+    let first = match crate::control::control_media::call_main(proxy, |tx| Wake::ReadPrivacy {
         form,
         reply: tx,
     }) {
-        Ok(lines) => lines,
+        Ok(read) => read,
         Err(e) => return format!("ERR {e}\n"),
     };
+    let lines = finish_privacy_read(
+        first,
+        |remaining| {
+            crate::control::control_media::call_main_within(proxy, remaining, |tx| {
+                Wake::ReadPrivacy { form, reply: tx }
+            })
+        },
+        Instant::now,
+        std::thread::sleep,
+    )
+    .lines;
     if json {
         // The JSON body already carries its own `OK 1` framing.
         return lines.into_iter().next().unwrap_or_else(|| json_ok("{}"));
@@ -1612,6 +1691,264 @@ pub(crate) fn cmd_privacy(rest: &str, proxy: &EventLoopProxy<Wake>) -> String {
         out.push('\n');
     }
     out
+}
+
+/// The deadline is fixed before the first retry. Pending refreshes cannot
+/// extend it, and failures preserve the latest honest Pending snapshot.
+fn finish_privacy_read(
+    mut latest: PrivacyRead,
+    mut read: impl FnMut(Duration) -> Result<PrivacyRead, &'static str>,
+    now: impl Fn() -> Instant,
+    mut pause: impl FnMut(Duration),
+) -> PrivacyRead {
+    let deadline = now() + PRIVACY_READ_WAIT;
+    loop {
+        let remaining = deadline.saturating_duration_since(now());
+        if !privacy_read_should_retry(latest.pending, remaining) {
+            return latest;
+        }
+        pause(PRIVACY_READ_TICK.min(remaining));
+        let remaining = deadline.saturating_duration_since(now());
+        if remaining.is_zero() {
+            return latest;
+        }
+        match read(remaining) {
+            Ok(next) => latest = next,
+            Err(_) => return latest,
+        }
+    }
+}
+
+const fn privacy_read_should_retry(pending: bool, remaining: Duration) -> bool {
+    pending && !remaining.is_zero()
+}
+
+#[cfg(test)]
+mod privacy_read_tests {
+    use super::*;
+    use std::cell::Cell;
+
+    fn reply(probe: FdaProbe) -> PrivacyRead {
+        PrivacyRead {
+            lines: vec![probe.state.as_str().to_string()],
+            pending: probe.label == ProbeLabel::Pending,
+        }
+    }
+
+    fn readiness_model() -> aterm_spec::derive::Model {
+        aterm_spec::ty_model! {
+            PrivacyReadReadiness {
+                const Buggy = 0;
+                const Budget = 2;
+                var elapsed = 0;
+                var pending = 1;
+                var returned = 0;
+                action Tick when (returned == 0 && elapsed <= Budget - 1) {
+                    elapsed = elapsed + 1;
+                }
+                action Complete when (returned == 0 && pending == 1) { pending = 0; }
+                action Return when (returned == 0 && (pending == 0 || elapsed == Budget || Buggy == 1)) {
+                    returned = 1;
+                }
+                invariant NoPrematurePending: returned == 0 || pending == 0 || elapsed == Budget;
+                invariant Bounds: elapsed <= Budget && pending <= 1 && returned <= 1;
+            }
+        }
+    }
+
+    #[test]
+    fn privacy_read_model_catches_the_historical_immediate_pending_reply() {
+        let model = readiness_model();
+        aterm_spec::verify::prove_and_catch_scalar(&model, model.name);
+        for elapsed in 0..=2 {
+            for pending in [true, false] {
+                let mut state = model.init_state();
+                for _ in 0..elapsed {
+                    assert!(model.fire("Tick", &mut state));
+                }
+                if !pending {
+                    assert!(model.fire("Complete", &mut state));
+                }
+                let remaining = Duration::from_millis(2 - elapsed);
+                assert_eq!(
+                    !privacy_read_should_retry(pending, remaining),
+                    model.action_enabled("Return", &state),
+                );
+            }
+        }
+        let mut old_reply = model.init_state();
+        old_reply.insert("returned", 1);
+        assert!(!model.check_invariant("NoPrematurePending", &old_reply));
+    }
+
+    #[test]
+    fn privacy_read_observes_the_real_async_cache_completion() {
+        let start = Instant::now();
+        let clock = Cell::new(start);
+        let mut state = ConsentState::inert();
+        state.probes.live = true;
+        let key = ConsentKey::new("fixture.app", "fixture identity");
+        let interval = Duration::from_secs(5);
+        let ((first, _), request) = state.read_at(ProbeGate::on(), interval, key.clone(), start);
+        assert_eq!(first.label, ProbeLabel::Pending);
+        let request = request.unwrap();
+        let denied = consent::classify_probe(consent::ProbeOutcome::Errno(consent::ERRNO_EPERM));
+        let result = finish_privacy_read(
+            reply(first),
+            |_| {
+                state.shared.complete(&request, denied, clock.get());
+                let ((current, _), next) =
+                    state.read_at(ProbeGate::on(), interval, key.clone(), clock.get());
+                assert!(
+                    next.is_none(),
+                    "reading a fresh completion does not launch a probe"
+                );
+                Ok(reply(current))
+            },
+            || clock.get(),
+            |delay| clock.set(clock.get() + delay),
+        );
+        assert!(!result.pending);
+        assert_eq!(result.lines, ["denied"]);
+        assert_eq!(clock.get() - start, PRIVACY_READ_TICK);
+    }
+
+    #[test]
+    fn privacy_read_has_one_deadline_and_keeps_stuck_work_pending() {
+        let start = Instant::now();
+        let clock = Cell::new(start);
+        let reads = Cell::new(0);
+        let result = finish_privacy_read(
+            reply(FdaProbe::pending()),
+            |remaining| {
+                assert!(remaining < PRIVACY_READ_WAIT);
+                reads.set(reads.get() + 1);
+                Ok(reply(FdaProbe::pending()))
+            },
+            || clock.get(),
+            |delay| clock.set(clock.get() + delay),
+        );
+        assert!(result.pending);
+        assert_eq!(result.lines, ["unknown"]);
+        assert_eq!(clock.get() - start, PRIVACY_READ_WAIT);
+        assert_eq!(reads.get(), 19, "the deadline is never extended by Pending");
+    }
+
+    #[test]
+    fn privacy_read_completed_and_failed_reads_do_not_retry_in_a_loop() {
+        let now = Instant::now();
+        let completed = finish_privacy_read(
+            reply(consent::classify_probe(consent::ProbeOutcome::Ok)),
+            |_| panic!("a completed observation needs no retry"),
+            || now,
+            |_| panic!("a completed observation needs no wait"),
+        );
+        assert_eq!(completed.lines, ["granted"]);
+        let clock = Cell::new(now);
+        let reads = Cell::new(0);
+        let failed = finish_privacy_read(
+            reply(FdaProbe::pending()),
+            |_| {
+                reads.set(reads.get() + 1);
+                Err("event loop gone")
+            },
+            || clock.get(),
+            |delay| clock.set(clock.get() + delay),
+        );
+        assert!(failed.pending);
+        assert_eq!(reads.get(), 1);
+    }
+
+    fn app_data_model() -> aterm_spec::derive::Model {
+        aterm_spec::ty_model! {
+            AppDataFdaAuthority {
+                const Buggy = 0;
+                var grant = 0;
+                var scope = 0;
+                var adopted = 0;
+                var decided = 0;
+                var host_covered = 0;
+                var session_covered = 0;
+                action Grant when (decided == 0) { grant = 1; }
+                action CurrentScope when (decided == 0) { scope = 1; }
+                action FutureScope when (decided == 0) { scope = 2; }
+                action Adopt when (decided == 0) { adopted = 1; }
+                action Classify when (decided == 0) {
+                    host_covered = if (grant == 1 && scope > 0) || Buggy == 1 { 1 } else { 0 };
+                    session_covered = if Buggy == 1 && grant == 1 { 1 } else { 0 };
+                    decided = 1;
+                }
+                invariant HostNeedsAuthority: host_covered == 0 || (grant == 1 && scope > 0);
+                invariant NoInheritedGrant: adopted == 0 || session_covered == 0;
+                invariant Bounds: grant <= 1 && scope <= 2 && adopted <= 1 && decided <= 1 && host_covered <= 1 && session_covered <= 1;
+            }
+        }
+    }
+
+    #[test]
+    fn app_data_model_and_real_classifier_require_current_authority() {
+        let model = app_data_model();
+        aterm_spec::verify::prove_and_catch_scalar(&model, model.name);
+        for fda in [FdaState::Granted, FdaState::Denied, FdaState::Unknown] {
+            for scope in [
+                consent::FdaScope::Unknown,
+                consent::FdaScope::ThisProcess,
+                consent::FdaScope::NewProcesses,
+            ] {
+                for adoption in [Attribution::Live, Attribution::Adopted] {
+                    let mut state = model.init_state();
+                    if fda == FdaState::Granted {
+                        assert!(model.fire("Grant", &mut state));
+                    }
+                    match scope {
+                        consent::FdaScope::Unknown => {}
+                        consent::FdaScope::ThisProcess => {
+                            assert!(model.fire("CurrentScope", &mut state))
+                        }
+                        consent::FdaScope::NewProcesses => {
+                            assert!(model.fire("FutureScope", &mut state))
+                        }
+                    }
+                    if adoption == Attribution::Adopted {
+                        assert!(model.fire("Adopt", &mut state));
+                    }
+                    let expected = model.successors("Classify", &state);
+                    let mut projected = expected[0].clone();
+                    projected.insert("host_covered", i64::from(app_data_covered(fda, scope)));
+                    let posture = ConsentPosture::join(PostureInputs {
+                        adoption,
+                        fda,
+                        responsible: Responsible::Unknown,
+                        observed_eperm: false,
+                        evidence: SpikeEvidence::UNMEASURED,
+                    });
+                    projected.insert(
+                        "session_covered",
+                        i64::from(posture.fs_consent == FsConsent::Covered),
+                    );
+                    assert!(expected.contains(&projected));
+                    if adoption == Attribution::Adopted {
+                        projected.insert("session_covered", 1);
+                        assert!(!model.check_invariant("NoInheritedGrant", &projected));
+                    }
+                }
+            }
+            let split = covers_split(fda, SpikeEvidence::UNMEASURED);
+            assert_eq!(split.covers.contains(&"app-data"), fda == FdaState::Granted);
+            assert_eq!(
+                split.unmeasured.contains(&"app-data"),
+                fda != FdaState::Granted
+            );
+            assert_eq!(
+                observed_fda_scope(fda, consent::FdaScope::Unknown),
+                if fda == FdaState::Granted {
+                    consent::FdaScope::ThisProcess
+                } else {
+                    consent::FdaScope::Unknown
+                }
+            );
+        }
+    }
 }
 
 /// The verb's whole grammar: an optional `--json` (or bare `json`) flag and
@@ -1728,7 +2065,7 @@ pub(crate) fn cmd_await_consent(proxy: &EventLoopProxy<Wake>, session: u64, rest
             form: PrivacyForm::Tuple(session),
             reply: tx,
         }) {
-            Ok(lines) => Ok(consent_observation(lines)),
+            Ok(read) => Ok(consent_observation(read.lines)),
             Err(e) => Err(format!("ERR {e}\n")),
         }
     };
@@ -1851,7 +2188,7 @@ mod tests {
     #[test]
     fn a_headless_app_wires_the_inert_consent_probe_arm() {
         let app = crate::App::headless_for_test();
-        let lines = app.read_privacy(PrivacyForm::Lines);
+        let lines = app.read_privacy(PrivacyForm::Lines).lines;
         let fda = lines
             .iter()
             .find(|l| l.starts_with("full_disk_access="))
@@ -1946,17 +2283,20 @@ mod tests {
         }
     }
 
-    /// THE HONESTY POSTURE, as a table. Under today's evidence — spikes S1 and
-    /// S4 unrun — holding the grant changes NOTHING about what is claimed:
-    /// `covers` stays empty, every service but the never-covered class is
-    /// `unmeasured`, `fda_scope` stays
-    /// `unknown`, and `prompt_possible` stays `yes`. The only thing that moves
-    /// any of it is a NAMED `SpikeEvidence` field, which a reviewer sees.
+    /// Apple-documented app-data coverage follows a completed host grant;
+    /// unmeasured folders and handoff propagation stay separate facts.
     #[test]
-    fn the_grant_alone_never_buys_a_coverage_claim() {
+    fn the_grant_confirms_app_data_without_inventing_folder_or_handoff_coverage() {
         for fda in [FdaState::Granted, FdaState::Denied, FdaState::Unknown] {
             let lines = snapshot(1, fda, SpikeEvidence::UNMEASURED).lines();
-            assert!(lines.contains(&"covers=-".to_string()), "{fda:?}");
+            let app_data = fda == FdaState::Granted;
+            assert!(
+                lines.contains(&format!(
+                    "covers={}",
+                    if app_data { "app-data" } else { "-" }
+                )),
+                "{fda:?}"
+            );
             // Unmeasured is NOT uncovered: only the permanently-uncovered class
             // is called uncovered before the measurement has run.
             assert!(
@@ -1968,7 +2308,7 @@ mod tests {
                     "unmeasured={}",
                     SERVICES
                         .iter()
-                        .filter(|s| !NEVER_COVERED.contains(s))
+                        .filter(|s| !NEVER_COVERED.contains(s) && !(app_data && **s == "app-data"))
                         .copied()
                         .collect::<Vec<_>>()
                         .join(",")
@@ -1980,7 +2320,11 @@ mod tests {
                 "{fda:?}"
             );
             assert!(
-                lines.iter().any(|l| l.contains("fda_scope=unknown")),
+                lines.iter().any(|l| l.contains(if app_data {
+                    "fda_scope=this_process"
+                } else {
+                    "fda_scope=unknown"
+                })),
                 "{fda:?}"
             );
         }
@@ -2200,7 +2544,7 @@ mod tests {
         assert_eq!(off.fs_consent, FsConsent::Unknown);
         assert!(!off.at_risk);
 
-        let lines = app.read_privacy(PrivacyForm::Lines);
+        let lines = app.read_privacy(PrivacyForm::Lines).lines;
         assert!(
             lines
                 .iter()
@@ -2231,7 +2575,7 @@ mod tests {
             report_attribution: Some(false),
             ..Default::default()
         });
-        let lines = app.read_privacy(PrivacyForm::Lines);
+        let lines = app.read_privacy(PrivacyForm::Lines).lines;
         assert!(
             lines.iter().any(|l| l.starts_with("warmup=never ")),
             "{lines:?}"
@@ -2290,6 +2634,28 @@ mod tests {
             json.chars().filter(|c| *c == ']').count(),
             "balanced array brackets: {json}"
         );
+    }
+
+    #[test]
+    fn the_json_app_data_claim_stops_at_the_observing_host() {
+        let snapshot = snapshot(2, FdaState::Granted, SpikeEvidence::UNMEASURED);
+        let body = cmd_privacy_json(&snapshot);
+        let json: aterm_json::Value =
+            aterm_json::from_str(body.lines().nth(1).expect("JSON body")).unwrap();
+        assert_eq!(json["full_disk_access"].as_str(), Some("granted"));
+        assert_eq!(json["fda_scope"].as_str(), Some("this_process"));
+        assert_eq!(json["covers"], aterm_json::json!(["app-data"]));
+        assert!(
+            json["unmeasured"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .all(|service| service.as_str() != Some("app-data"))
+        );
+        assert_eq!(json["prompt_possible"].as_bool(), Some(true));
+        for session in json["sessions"].as_array().unwrap() {
+            assert_ne!(session["fs_consent"].as_str(), Some("covered"));
+        }
     }
 
     /// The verb's grammar: the flag in both spellings, and an honest usage

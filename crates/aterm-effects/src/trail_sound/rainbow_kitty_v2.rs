@@ -349,22 +349,21 @@ const AUTOREPEAT_FLOOR_MS: u32 = 25;
 /// §16 row 11 sets to exactly 1.0 for v2; at 600 ms every ordinary think-pause
 /// resolves, and a line that resolves every few words has no line left. 900 ms
 /// is longer than a word-finding pause and shorter than a real stop.
-pub(super) const PHRASE_PAUSE_MS: u32 = 900;
+///
+/// **ONE REST FOR THE SONG AND THE LIGHT** (2026-09-13, Rainbow Path v3 §2.6,
+/// S5): the number lives in [`timing::PHRASE_PAUSE_MS`] and the ribbon's
+/// grace is derived from the same constant; and since v3 the rest is
+/// TEMPO-SCALED through [`timing::phrase_rest_ms`] — `max(900, 2.5 · ioi)`,
+/// so at 2.8 cps or faster this is exactly the 900 ms it always was and a
+/// slower hand's rest grows with its tempo in both halves (D-6).
+pub(super) const PHRASE_PAUSE_MS: u32 = timing::PHRASE_PAUSE_MS;
 
-/// A gap longer than this is not typing at all: the IOI estimator RESTARTS at
-/// [`IOI_DEFAULT_MS`] rather than dragging a stale 600 ms average into the
-/// next burst.
-const IOI_RESET_MS: u32 = 2_000;
-/// IOI clamp floor / ceiling (ms), §9.6.
-const IOI_MIN_MS: f32 = 30.0;
-const IOI_MAX_MS: f32 = 600.0;
-/// The IOI a fresh session assumes — 4 cps, which §9.6's table uses as the
-/// 0 dB reference for the whole loudness arc.
-const IOI_DEFAULT_MS: f32 = 250.0;
-/// EMA weight on the newest gap (§9.6). 0.5 is two-gap memory: fast enough
-/// that a burst is heard as a burst, slow enough that one stumbled key does
-/// not brighten the note after it.
-const IOI_EMA_ALPHA: f32 = 0.5;
+/// The IOI estimator's constants (§9.6) live in [`timing`] since 2026-09-13
+/// so the ribbon's tempo runs the identical law; re-stated here by alias
+/// for every reader in this file.
+const IOI_DEFAULT_MS: f32 = timing::IOI_DEFAULT_MS;
+#[cfg(test)]
+const IOI_MIN_MS: f32 = timing::IOI_MIN_MS;
 
 /// How many keystrokes the undo stack remembers (§10.1). Eight is a word: a
 /// correction runs backwards through the letters you actually mistyped, and a
@@ -2406,7 +2405,8 @@ impl MelodyV2 {
     /// as long as that stream ran.
     fn at_boundary(&self, at: u32) -> bool {
         self.word_pos == 0
-            || (self.seen_key && at.saturating_sub(self.last_key_ms) >= PHRASE_PAUSE_MS)
+            || (self.seen_key
+                && timing::phrase_rest_reached(at.saturating_sub(self.last_key_ms), self.ioi_ms))
     }
 
     fn push_undo(&mut self) {
@@ -2648,7 +2648,7 @@ impl MelodyV2 {
         // and re-latches the subject — then this key derives its own note
         // from the resolved position exactly as any other key would. Nothing
         // here can consume the keystroke.
-        let rest = !first && gap >= PHRASE_PAUSE_MS;
+        let rest = !first && timing::phrase_rest_reached(gap, self.ioi_ms);
         if rest {
             let here = i32::from(self.walk);
             self.walk = self.nearest_lit_within(here, here) as i8;
@@ -2912,14 +2912,7 @@ impl MelodyV2 {
         // A ≥ [`IOI_RESET_MS`] gap still RESTARTS the tempo rather than
         // holding it: after two seconds the hand's tempo is genuinely
         // unknown, and a stale average is worse than the default.
-        self.ioi_ms = if !self.seen_key || gap >= IOI_RESET_MS {
-            IOI_DEFAULT_MS
-        } else if rest {
-            self.ioi_ms
-        } else {
-            (1.0 - IOI_EMA_ALPHA) * self.ioi_ms
-                + IOI_EMA_ALPHA * (gap as f32).clamp(IOI_MIN_MS, IOI_MAX_MS)
-        };
+        self.ioi_ms = timing::ioi_next(self.ioi_ms, gap, !self.seen_key, rest);
 
         // **THE VERDICT'S HOT KEY** (sense 3): the first key after a green
         // long command is LIT whatever the chord thinks — full tine, 0 dB,

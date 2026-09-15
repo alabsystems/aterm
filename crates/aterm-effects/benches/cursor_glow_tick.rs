@@ -100,19 +100,22 @@
 // THREE CAPPED MEASUREMENTS ARE THE EXCEPTION, and they say so at their declaration:
 //
 //   * `halos` is CAPPED at MAX_HALOS = 512 and the truncation happens inside
-//     `tick`, so a saturated halo stream reads 512 whatever was pushed. The seven
-//     workloads that saturate it (`rainbow_typing_{default_retina,underline_retina,1x,light}`,
-//     `rainbow_jump_bursts`, `beam_tube_jump`, `style_crossfade`) therefore
-//     assert `AT_HALO_CAP` — an explicit SATURATION guard, live only in the
-//     "fell off the cap" direction. The two-sided halo guards live on the
-//     workloads that stay under it: fire (423), laser (144), erase (100),
-//     water and the custom pack (3 each, the crown alone).
-//   * `out` is capped at MAX_QUADS = 16_384 the same way, and exactly one
-//     workload (`water_wake_saturated`) is deliberately pinned there — see its
-//     note. Every other workload's `out` is inside its budget.
-//   * the default 2× tall ribbon spends its dedicated half-budget and emits
-//     exactly 8_191 under-quads. Its exact-edge guard detects a lost emitter but
-//     cannot observe growth past the ribbon's deliberate core-first shedding.
+//     `tick`, so a saturated halo stream reads 512 whatever was pushed. The one
+//     workload that saturates it (`beam_tube_jump`) therefore asserts
+//     `AT_HALO_CAP` — an explicit SATURATION guard, live only in the "fell off
+//     the cap" direction. Every other workload keeps a two-sided halo guard:
+//     the rainbow kitty family (93-176 — v2's stars, and on the light theme its
+//     ink fork; before the v2 engine these six saturated the cap), fire (423),
+//     laser (144), erase (29), water and the custom pack (3 each, the crown
+//     alone).
+//   * `out` is capped at MAX_QUADS = 16_384 the same way. No workload reaches
+//     it any more: `water_wake_saturated` was pinned there until the water
+//     wake's reflection moved to the `under` stream (0b5596be0, 2026-09-01),
+//     and its `out` is now the over-ink accents alone — see its note.
+//   * the default 2× tall ribbon spends its dedicated budget
+//     (`RIBBON_QUAD_BUDGET`, 10_240 since the v2 engine) and emits exactly
+//     one quad fewer. Its exact-edge guard detects a lost emitter but cannot
+//     observe growth past the ribbon's deliberate core-first shedding.
 //
 // WHAT EACH WORKLOAD WAS CONFIRMED TO REACH. The guards below prove the STATE
 // from outside; the function names were confirmed once, out of band, by
@@ -180,6 +183,7 @@ use std::time::Instant as WallInstant;
 use aterm_effects::cursor_glow::{
     CursorGlow, Geom, GlowConfig, GlowStyle, RAINBOW_WAKE_PERSIST, TrailParams,
 };
+use aterm_effects::rainbow_kitty::ribbon::RIBBON_QUAD_BUDGET;
 use aterm_effects::trail_pack::{HaloChannel, ParticlePop, RampParams};
 use aterm_render::GlowQuad;
 use criterion::measurement::WallTime;
@@ -857,20 +861,15 @@ const HALO_CAP: usize = 512;
 /// "This workload SATURATES the halo stream." Not a two-sided count guard and
 /// not pretending to be one: it is live only in the "fell off the cap"
 /// direction (a lost emitter, a shrunken ring), because a count INCREASE cannot
-/// be observed past the truncation. The workloads that keep a real two-sided
-/// halo bound are the ones whose halo stream stays under the cap — fire, laser,
-/// erase, water, custom pack.
+/// be observed past the truncation. Every other workload keeps a real
+/// two-sided halo bound — its halo stream stays under the cap.
 const AT_HALO_CAP: Range = (HALO_CAP, HALO_CAP);
 
-/// `CursorGlow::MAX_QUADS`, mirrored — the same story for the `out` stream.
-const QUAD_CAP: usize = 16_384;
-
-/// "This workload SATURATES the quad budget." Exactly one workload declares it.
-const AT_QUAD_CAP: Range = (QUAD_CAP, QUAD_CAP);
-
-/// The hot 2× tall body's exact half-budget edge. The emitter reserves
-/// `MAX_QUADS / 2`, then its half-open append limit yields 8_191 quads.
-const AT_RIBBON_BUDGET_EDGE: Range = (8_191, 8_191);
+/// The hot 2× tall body's exact budget edge: the ribbon's own
+/// [`RIBBON_QUAD_BUDGET`], whose half-open append limit yields one quad fewer.
+/// Read from the engine, not restated: the hand-mirrored `8_191` (half of
+/// `MAX_QUADS`) outlived the budget it mirrored by two weeks (2026-09-14).
+const AT_RIBBON_BUDGET_EDGE: Range = (RIBBON_QUAD_BUDGET - 1, RIBBON_QUAD_BUDGET - 1);
 
 /// The extra, decisive proof a workload carries beyond its volume bounds.
 enum Witness {
@@ -1245,11 +1244,15 @@ fn workloads() -> Vec<Workload> {
             build: f_rainbow_retina,
             arm: arm_typing,
             bounds: [
-                // Measured after the 2026-08-29 sparkle/tall restoration; a
-                // modest two-sided envelope around the deterministic 2_085 peak.
-                (1_850, 2_350),
+                // Re-pinned 2026-09-14 (38fd5de93) on the v2 engine — the
+                // rainbow kitty rewrite, the licence laws and the comet body
+                // all landed after the 2026-08-29 pins, which measured a
+                // different engine. Deterministic peaks: `out` 361 (the stars
+                // and the hot edge), `under` at the ribbon's budget edge,
+                // `halos` 93 (the star field; the v1 engine saturated the cap).
+                (320, 405),
                 AT_RIBBON_BUDGET_EDGE,
-                AT_HALO_CAP,
+                (82, 105),
                 (0, 0),
                 (0, 0),
                 (0, 0),
@@ -1269,12 +1272,14 @@ fn workloads() -> Vec<Workload> {
             build: f_rainbow_underline_retina,
             arm: arm_typing,
             bounds: [
-                // Both presentations saturate the same dedicated budget, so
-                // count cannot distinguish them; `ribbon_tall=0` below is the
-                // non-vacuity guard for the explicit underline alternate.
-                (1_850, 2_350),
-                AT_RIBBON_BUDGET_EDGE,
-                AT_HALO_CAP,
+                // Re-pinned 2026-09-14 (38fd5de93). The quieter underline body
+                // stays UNDER the ribbon's budget (peak 8_171 against the tall
+                // default's saturated 10_239), so the count itself now tells
+                // the two presentations apart; `ribbon_tall=0` below remains
+                // the non-vacuity guard for the explicit alternate.
+                (320, 405),
+                (7_190, 9_150),
+                (82, 105),
                 (0, 0),
                 (0, 0),
                 (0, 0),
@@ -1297,10 +1302,13 @@ fn workloads() -> Vec<Workload> {
             build: f_rainbow_lodpi,
             arm: arm_typing,
             bounds: [
-                // Deterministic post-restoration peak: 1_199 over-ink quads.
-                (1_050, 1_350),
-                AT_RIBBON_BUDGET_EDGE,
-                AT_HALO_CAP,
+                // Re-pinned 2026-09-14 (38fd5de93): peaks 301 / 6_713 / 93. At
+                // 1x the body is inside the budget (the budget is in quads and
+                // a 1x cell is a quarter the pixels), so `under` is a real
+                // two-sided guard here.
+                (265, 337),
+                (5_900, 7_520),
+                (82, 105),
                 (0, 0),
                 (0, 0),
                 (0, 0),
@@ -1311,32 +1319,32 @@ fn workloads() -> Vec<Workload> {
         },
         Workload {
             name: "rainbow_typing_light",
-            note: "2x light rails/veils/twinkles + glyph tint",
+            note: "2x light theme: the ribbon body + the ink fork's halos",
             build: f_rainbow_light,
             arm: arm_typing,
             bounds: [
-                // Light-theme flying marks may replace ink (the shooter arm is
-                // source-over), so the shared text-first policy now sheds the
-                // whole family whenever this realistic three-row probe reports
-                // occupied or unknown. `Fixture::probe` explicitly captures a
-                // blank row below the caret; that proved-clear sky still emits
-                // a measured peak of 210 quads. The positive lower bound is the
-                // non-vacuity control for that surviving sparkle population.
-                (185, 235),
-                // The light body is source-over VEIL RAILS in `halos`, not
-                // additive quads in `under`: an empty under-stream here is the
-                // theme fork working, and a non-empty one would mean the dark
-                // arm ran.
+                // Re-pinned 2026-09-14 (38fd5de93) to the v2 engine's light
+                // theme, which is a different fork from the v1 "rails, veils,
+                // twinkles + glyph tint" these bounds described. The stars
+                // are source-over INK on a light theme (`Engine::tick`'s ink
+                // fork writes `halos`, pinned by the engine's own
+                // `a_scroll_moves_every_live_star_and_the_caret_with_the_viewport`),
+                // so an EMPTY additive `out` is the theme fork working and a
+                // non-empty one would mean the dark arm ran.
                 (0, 0),
-                AT_HALO_CAP,
+                // The ribbon body is one emitter for both themes, with a
+                // theme-solved ink table (`ribbon.rs`, `lut`): it writes
+                // `under` on a light theme too, and stays inside the budget
+                // there (peak 8_840 against the dark tall default's edge).
+                (7_780, 9_900),
+                // The ink fork's halos: 176 at peak, well under the cap.
+                (155, 197),
                 (0, 0),
-                // `charred` is written by exactly one emitter,
-                // `emit_fresh_ink_glyphs`, which is light-theme AND live-pop
-                // gated — so a non-empty glyph-tint stream is a two-in-one
-                // witness: the light arm ran, and `note_typed` really did birth
-                // ink pops. Its ceiling is FRESH_INK_CAP = 32 (the pop ring),
-                // and the post-restoration measured peak is 24.
-                (21, 32),
+                // `charred` is v1's glyph tint (`emit_fresh_ink_glyphs`, gone
+                // with it): under the NO-RECOLOR law the ink never changes
+                // colour, so this stream is empty by design on every theme —
+                // a non-empty one would mean recolouring came back.
+                (0, 0),
                 (0, 0),
             ],
             state: [(0.90, 1.0), ANY, (0.0, 0.0), (1.0, 1.0)],
@@ -1349,13 +1357,15 @@ fn workloads() -> Vec<Workload> {
             build: f_rainbow_jumps,
             arm: arm_jump,
             bounds: [
-                // Restored cold-jump bursts and spark density: deterministic
-                // post-restoration peak 5_902.
-                (5_200, 6_650),
-                // The jump ZOOM and restored tall body share this stream; their
-                // deterministic combined peak is 8_029.
-                (7_100, 8_300),
-                AT_HALO_CAP,
+                // Re-pinned 2026-09-14 (38fd5de93): the ZOOM streaks and
+                // landing starbursts peak at 3_105 additive quads on the v2
+                // engine (5_902 on v1's).
+                (2_730, 3_480),
+                // The jump ZOOM and the tall body share this stream; their
+                // combined peak is 7_091, under the ribbon's budget.
+                (6_240, 7_940),
+                // 104 halos at peak: v1's jumps saturated the cap.
+                (92, 117),
                 (0, 0),
                 (0, 0),
                 (0, 0),
@@ -1366,19 +1376,21 @@ fn workloads() -> Vec<Workload> {
         },
         Workload {
             name: "water_wake_saturated",
-            note: "512-spark fluid wake OVER budget: the load-shed path",
+            note: "512-spark fluid wake: the saturated spark population",
             build: f_water,
             arm: arm_sweep,
-            // `out` is pinned AT MAX_QUADS here and only here, and what that
-            // measures is the LOAD SHED, not the whole wake: `emit_water` walks
-            // its segments newest-first and RETURNS the moment `out` is full,
-            // so past the cap the per-segment `water_ramp(0.34)` +
-            // `comet_beam` work simply stops running. This workload prices the
-            // frame a pathological wake actually costs (the vertex walk over
-            // all 512 sparks, then as many segments as the budget holds, then
-            // the truncate); `water_wake_glide` is the one that prices
-            // `emit_water`'s per-segment walk to completion.
-            bounds: [AT_QUAD_CAP, (0, 0), (3, 8), (0, 0), (0, 0), (0, 0)],
+            // "Saturated" is the SPARK population (MAX_SPARKS = 512), not the
+            // quad budget any more. Until 0b5596be0 (2026-09-01) the wake wrote
+            // `out` and this workload was pinned AT MAX_QUADS to price the
+            // load shed; the wake's broad reflection now "belongs below glyph
+            // ink" and is emitted into `under` (3_537 at peak, nowhere near the
+            // 16_384 budget), with only the crown, landing ripple and free
+            // droplets left in `out` (520). The shed path is therefore not
+            // reached by any workload; what this one prices is the full
+            // 512-spark vertex walk plus every segment rasterized, and
+            // `water_wake_glide` the same walk over a shorter, gliding wake.
+            // Re-pinned 2026-09-14 (38fd5de93).
+            bounds: [(455, 585), (3_110, 3_960), (3, 8), (0, 0), (0, 0), (0, 0)],
             state: [(0.0, 0.0), ANY, (0.0, 0.0), ANY],
             lit_pct: (100, 100),
             witness: Witness::Bounds,
@@ -1388,10 +1400,10 @@ fn workloads() -> Vec<Workload> {
             note: "below-cap fluid wake: every segment rasterized",
             build: f_water_glide,
             arm: arm_glide,
-            // BELOW the cap by construction (see `GLIDE_COLS`), so this `out`
-            // bound is a real two-sided count guard on the wake — the one thing
-            // the saturated workload above structurally cannot give.
-            bounds: [(8_580, 10_440), (0, 0), (3, 8), (0, 0), (0, 0), (0, 0)],
+            // The reflection rides `under` (see `water_wake_saturated`) and the
+            // accents `out`; both are two-sided count guards on the wake.
+            // Re-pinned 2026-09-14 (38fd5de93): peaks 496 / 6_466.
+            bounds: [(435, 555), (5_690, 7_240), (3, 8), (0, 0), (0, 0), (0, 0)],
             state: [(0.0, 0.0), ANY, (0.0, 0.0), ANY],
             lit_pct: (100, 100),
             witness: Witness::Bounds,
@@ -1463,8 +1475,10 @@ fn workloads() -> Vec<Workload> {
             arm: arm_erase,
             // `under` is the rainbow ribbon's stream, and a caret that never
             // moves lays no ribbon — so an EMPTY under-stream is the proof that
-            // what is being timed is the poof and only the poof.
-            bounds: [(44, 54), (0, 0), (100, 130), (0, 0), (0, 0), (0, 0)],
+            // what is being timed is the poof and only the poof. Re-pinned
+            // 2026-09-14 (38fd5de93): the poof peaks at 10 quads and 29 halos
+            // on the v2 engine (49 / 115 on v1's).
+            bounds: [(8, 12), (0, 0), (25, 33), (0, 0), (0, 0), (0, 0)],
             // The erase metric is advanced by exactly `note_backspace` and
             // `note_kill`, so a run this hard IS the poof's licence, observed
             // from outside; and a typing spine at zero proves the light being
@@ -1479,14 +1493,17 @@ fn workloads() -> Vec<Workload> {
             build: f_crossfade,
             arm: arm_crossfade,
             bounds: [
-                (2_100, 2_650),
-                // The rainbow half now follows the shipping tall default. Its
-                // measured 4_045-quad peak is a strict positive witness that
+                // Re-pinned 2026-09-14 (38fd5de93): 1_692 / 1_757 / 405.
+                (1_490, 1_895),
+                // The rainbow half follows the shipping tall default. Its
+                // measured 1_757-quad peak is a strict positive witness that
                 // the rainbow ghost contributes while Fire is live;
                 // `Witness::Ghost` below independently proves the reverse
                 // (Fire's patch stream while rainbow is live).
-                (3_550, 4_550),
-                AT_HALO_CAP,
+                (1_545, 1_970),
+                // Fire's halos plus the rainbow ghost's stars: 405, under the
+                // cap v1's crossfade saturated.
+                (356, 454),
                 (89, 109),
                 (0, 0),
                 (76, 93),

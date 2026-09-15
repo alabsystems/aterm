@@ -24,6 +24,10 @@ use std::process::{Child, Command, Output, Stdio};
 #[cfg(unix)]
 use std::time::{Duration, Instant};
 
+#[cfg(unix)]
+#[path = "support/launch_isolation.rs"]
+mod launch_isolation;
+
 /// How long the CLI gets to run the scripted shell session and exit. GENEROUS —
 /// a healthy run finishes in well under a second even on a loaded CI box — because
 /// the only thing this bound must catch is the exact regression these tests guard:
@@ -37,23 +41,20 @@ const CLI_EXIT_DEADLINE: Duration = Duration::from_secs(60);
 /// THE ONE WAY THIS FILE SPAWNS `aterm --session` (2026-09-10 review). The session
 /// lane reads the machine's atpkg prefix under `$HOME` and may spawn a DETACHED
 /// `aterm pkg update` against it; run as-is from `cargo test`, that pass rewrote
-/// the owner's REAL `<prefix>/status.toml`. Every launch here therefore gets (a)
-/// `ATPKG_DISABLE=1`, which the lane honours before it resolves a store, and (b) a
-/// SCRATCH `HOME` under the temp dir, so even a binary that ignored the knob could
-/// only touch a throwaway prefix. `/bin/sh` is the shell (a known POSIX shell,
-/// env-independent), and piped stdio still routes to the SESSION, not the window.
+/// the owner's REAL `<prefix>/status.toml`. Every launch therefore gets private
+/// HOME/config/data/update roots and explicit opt-outs for package, reroute and
+/// native-update work. `ATPKG_DISABLE` alone does not gate the latter two seams.
+/// `/bin/sh` is the shell, and piped stdio still routes to the SESSION.
 #[cfg(unix)]
 fn session_command(test: &str) -> Command {
-    let home = std::env::temp_dir().join(format!(
+    let root = std::env::temp_dir().join(format!(
         "aterm-protected-spawn-{test}-{}",
         std::process::id()
     ));
-    std::fs::create_dir_all(&home).expect("create the scratch HOME");
+    launch_isolation::prepare(&root).expect("prepare private session state");
     let mut cmd = Command::new(env!("CARGO_BIN_EXE_aterm"));
-    cmd.arg("--session")
-        .env("SHELL", "/bin/sh")
-        .env("HOME", &home)
-        .env("ATPKG_DISABLE", "1");
+    launch_isolation::apply(&mut cmd, &root);
+    cmd.arg("--session");
     cmd
 }
 

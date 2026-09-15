@@ -1,0 +1,20 @@
+# SPDX-License-Identifier: Apache-2.0
+# Copyright 2026 Andrew Yates
+
+[package]
+name = "aterm-phase"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+description = "aterm — the worker-phase reader: busy | prompt | limited | idle | question, the context indicator and the approval box, read from one screen of a Claude Code session; shared by `aterm drive phase` and the fabric bridge's presence rows"
+
+[lints]
+workspace = true
+
+# NO DEPENDENCIES, and that is the point of the crate. The reader is pure
+# functions over `&[String]` rows; `aterm-agent` (the supervisor, `aterm drive`)
+# and `aterm-link` (the fabric bridge, whose presence rows carry `phase=`)
+# both link it, and neither should pull the other. See src/lib.rs.
+[dependencies]

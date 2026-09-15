@@ -13,8 +13,8 @@ use crate::App;
 use crate::native_app::UpdateOutcome;
 use crate::update_screen::{UpdateHit, UpdateState};
 
-/// Serializes the tests that both WRITE and READ the process-wide scratch update
-/// ledger.
+/// Serializes tests that record failures or read standing failure facts in the
+/// process-wide scratch update ledger.
 ///
 /// `App::headless_for_test` points `ATERM_UPDATE_ROOT` at ONE scratch root per test
 /// process (so the unit suite cannot write the developer's real `health.toml`), and
@@ -24,6 +24,9 @@ use crate::update_screen::{UpdateHit, UpdateState};
 /// one for a different build: observed, not theorised, on the first parallel run.
 /// The build numbers below are already unique per test, which keeps the COUNTS
 /// independent; this keeps the standing slots independent too.
+/// Every failure writer must participate, including tests that assert only the
+/// in-memory retry policy. The ledger's own file lock protects each individual
+/// write; this guard also protects a test's later read from another test's write.
 ///
 /// Poison is absorbed deliberately: a panicking test has already failed, and letting
 /// it convert every later ledger test into a second failure only hides the first.
@@ -70,7 +73,17 @@ pub(crate) fn debug_seamless_reexec_armed() -> bool {
         // self-recursive `OnceLock`: the initializer waits on the `Once` it is
         // itself running, so the FIRST caller parks forever. It is reached from
         // `apply_staged_update_now`, i.e. the main thread, on every apply.
-        let on = std::env::var_os("ATERM_DEBUG_SEAMLESS_REEXEC").is_some();
+        //
+        // Value semantics via the ONE shared flag rule (`env_flag_engaged`):
+        // unset, EMPTY and "0" do NOT arm the seam. `is_some()` here armed it on
+        // a present-but-empty variable — the 2026-09-01 empty-inherited-var
+        // species — and an armed seam re-execs THIS binary and reports the apply
+        // as done while the staged build never lands (2026-09-14 audit).
+        let on = aterm_types::control_socket::env_flag_engaged(
+            std::env::var_os("ATERM_DEBUG_SEAMLESS_REEXEC")
+                .map(|v| v.to_string_lossy().into_owned())
+                .as_deref(),
+        );
         if on {
             aterm_log::warn!(
                 "$ATERM_DEBUG_SEAMLESS_REEXEC is set: this process reports a staged \
@@ -84,11 +97,10 @@ pub(crate) fn debug_seamless_reexec_armed() -> bool {
 }
 
 /// The update bar's words for a build that is already installed on disk: the
-/// reducer imports it as an ACTIVATION stage and the seamless lane adopts every
-/// window and shell — there is nothing to relaunch. (Until 2026-09-07 this was
-/// a floating pill; the words are the same, on the row.)
+/// reducer imports it as an ACTIVATION stage. Installed bytes alone do not mean
+/// activation is running: policy may require a manual request.
 pub(crate) const UPDATE_INSTALLED_TITLE: &str = "Update installed";
-pub(crate) const UPDATE_INSTALLED_DETAIL: &str = "activating in place";
+pub(crate) const UPDATE_INSTALLED_DETAIL: &str = "activation pending \u{b7} see Version menu";
 
 /// The three answers about this process [`App::apply_posture_for`] folds in,
 /// read ONCE at the call site so the pure half ([`App::apply_posture_with`]) is
@@ -148,16 +160,10 @@ impl App {
     /// latch that still carries a lapse deadline — and either one means the loop will
     /// come back to this artifact.
     ///
-    /// THEY DO NOT COME BACK THE SAME WAY, which is why the wording this feeds says
-    /// "by itself" and not "a retry is armed". Only the intent's `retry_at` is folded
-    /// into the loop's own deadline (`fold_auto_apply_deadline`); the latch is
-    /// released by `lapse_expired_auto_apply_manual_only` at the top of
-    /// `arm_native_auto_apply`, so on a genuinely idle machine it waits for the next
-    /// background check rather than for its own deadline. Both do land unaided; only
-    /// one of them is armed to the second. Both must name THIS build, because a leftover for
-    /// a superseded artifact schedules nothing for the one on screen, and automatic
-    /// apply has to actually be enabled in config or a lapse would only re-arm into a
-    /// poll that answers `Clear`.
+    /// Both must name the current stage's build AND digest: a leftover from a
+    /// superseded artifact schedules nothing for different bytes sharing its build.
+    /// Automatic apply must also be enabled, including the screenshot-seam veto,
+    /// or a lapse would re-arm into a poll that answers `Clear`.
     ///
     /// Extracted from the failure-pill decision in
     /// [`Self::react_to_update_apply_outcome`] so the STANDING surfaces (the Version
@@ -165,13 +171,28 @@ impl App {
     /// same way the transient pill does. Two answers to "will this retry?" in one
     /// program is how a user ends up waiting on something that stopped.
     pub(crate) fn automatic_apply_retry_scheduled(&self, staged_build: u64) -> bool {
-        crate::app_config::update_auto_apply(&self.config)
-            && (self
-                .auto_apply_intent
-                .is_some_and(|intent| intent.build == staged_build)
-                || self.auto_apply_manual_only.is_some_and(|manual| {
-                    manual.build == staged_build && manual.retry_at.is_some()
-                }))
+        if !crate::app_config::update_auto_apply(&self.config)
+            || Self::relaunch_nudge_seam_suppresses_auto_apply()
+        {
+            return false;
+        }
+        let Some(digest) = self
+            .native_updater_service
+            .snapshot()
+            .staged
+            .as_ref()
+            .filter(|stage| stage.build == staged_build)
+            .and_then(|stage| crate::app_native::decode_dmg_sha256(&stage.dmg_sha256))
+        else {
+            return false;
+        };
+        self.auto_apply_intent
+            .is_some_and(|intent| intent.build == staged_build && intent.dmg_sha256 == digest)
+            || self.auto_apply_manual_only.is_some_and(|manual| {
+                manual.build == staged_build
+                    && manual.dmg_sha256 == digest
+                    && manual.retry_at.is_some()
+            })
     }
 
     /// [`Self::automatic_apply_retry_scheduled`] as the typed value the wording law
@@ -183,6 +204,12 @@ impl App {
         staged_build: Option<u64>,
     ) -> crate::update_apply_trouble::ApplyRetry {
         use crate::update_apply_trouble::ApplyRetry;
+        // The historical failure describes the previous attempt. A current
+        // environmental block can require repair; a later verified repair can
+        // restore scheduling without rewriting that history.
+        if staged_build.is_some_and(|build| self.auto_apply_environment_blocked(build)) {
+            return ApplyRetry::NeedsPerson;
+        }
         match staged_build {
             Some(build) if self.automatic_apply_retry_scheduled(build) => ApplyRetry::Scheduled,
             _ => ApplyRetry::ManualOnly,
@@ -244,10 +271,19 @@ impl App {
                 var: "ATERM_DEBUG_RELAUNCH_NUDGE",
             };
         }
-        if let Some(manual) = self
-            .auto_apply_manual_only
-            .filter(|manual| manual.build == build)
-        {
+        if let Some(manual) = self.auto_apply_manual_only.filter(|manual| {
+            manual.build == build
+                && self
+                    .native_updater_service
+                    .snapshot()
+                    .staged
+                    .as_ref()
+                    .is_some_and(|stage| {
+                        stage.build == build
+                            && crate::app_native::decode_dmg_sha256(&stage.dmg_sha256)
+                                == Some(manual.dmg_sha256)
+                    })
+        }) {
             return P::ManualOnlyLatched {
                 lapses: manual.retry_at.is_some(),
             };
@@ -340,6 +376,24 @@ impl App {
             &snapshot.apply_failure,
             self.apply_retry_for(Some(staged_build)),
         )
+        .map(|trouble| trouble.with_retry_in(self.automatic_apply_retry_in(staged_build)))
+    }
+
+    /// How long until the automatic lane's next attempt at `staged_build`, when a
+    /// latch carries the instant (2026-09-14, audit OBS-5). A live intent's own
+    /// deadline is folded into the event loop and not surfaced here; the latch —
+    /// the stand-down — is the one with a horizon a person plans around.
+    pub(crate) fn automatic_apply_retry_in(
+        &self,
+        staged_build: u64,
+    ) -> Option<std::time::Duration> {
+        if !self.automatic_apply_retry_scheduled(staged_build) {
+            return None;
+        }
+        self.auto_apply_manual_only
+            .filter(|manual| manual.build == staged_build)
+            .and_then(|manual| manual.retry_at)
+            .map(|at| at.saturating_duration_since(std::time::Instant::now()))
     }
 
     /// Canonical human "Check for Updates…" gesture: reveal the durable Settings
@@ -500,7 +554,26 @@ impl App {
         outcome: crate::native_app::UpdateOutcome,
         open_details: bool,
     ) {
-        self.record_apply_outcome_in_ledger(&outcome);
+        let target_build = self
+            .native_updater_service
+            .snapshot()
+            .staged
+            .as_ref()
+            .map_or(0, |staged| staged.build);
+        self.surface_update_apply_outcome_for_target(source, outcome, open_details, target_build);
+    }
+
+    /// A returned worker keeps its attempted build even if reconciliation has
+    /// already imported a different stage. The current stage cannot identify
+    /// which artifact failed.
+    pub(crate) fn surface_update_apply_outcome_for_target(
+        &mut self,
+        source: &str,
+        outcome: crate::native_app::UpdateOutcome,
+        open_details: bool,
+        target_build: u64,
+    ) {
+        self.record_apply_outcome_for_target_in_ledger(&outcome, target_build);
         self.react_to_update_apply_outcome(source, outcome, open_details);
     }
 
@@ -528,15 +601,28 @@ impl App {
     ///
     /// A FAILURE ALSO REPUBLISHES, because the write is the only moment the window
     /// can learn about it in time — see the comment on the `Failed` arm.
-    fn record_apply_outcome_in_ledger(&mut self, outcome: &crate::native_app::UpdateOutcome) {
-        let snapshot = self.native_updater_service.snapshot();
-        let current_build = snapshot.current_build;
-        // WHICH ARTIFACT THE ATTEMPT WAS FOR. Every failure path re-arms the exact
-        // stage before returning here (`abort_apply` leaves `staged` in place), so
-        // the reducer's stage IS the target. `0` — the debug seam, or a stage already
-        // consumed — is recorded honestly as "unknown", and a surface that cannot
-        // match the target simply reports no trouble.
-        let target_build = snapshot.staged.as_ref().map_or(0, |staged| staged.build);
+    pub(crate) fn record_apply_outcome_in_ledger(
+        &mut self,
+        outcome: &crate::native_app::UpdateOutcome,
+    ) {
+        // Synchronous submission outcomes still describe this stage. A returned
+        // worker uses the explicit-target entry point above: its reconciliation
+        // may have retired this artifact and imported another one already.
+        let target_build = self
+            .native_updater_service
+            .snapshot()
+            .staged
+            .as_ref()
+            .map_or(0, |staged| staged.build);
+        self.record_apply_outcome_for_target_in_ledger(outcome, target_build);
+    }
+
+    fn record_apply_outcome_for_target_in_ledger(
+        &mut self,
+        outcome: &crate::native_app::UpdateOutcome,
+        target_build: u64,
+    ) {
+        let current_build = self.native_updater_service.snapshot().current_build;
         match apply_ledger_verdict(outcome) {
             ApplyLedgerVerdict::Failed(message) => {
                 // FEED THE REDUCER AT THE WRITE. The facts that used to carry a
@@ -587,9 +673,10 @@ impl App {
                 aterm_log::info!("update apply ({source}): accepted");
             }
             crate::native_app::UpdateOutcome::InstalledNeedsRelaunch { build, message } => {
+                let retry_scheduled = self.automatic_apply_retry_scheduled(build);
                 aterm_log::warn!(
-                    "update apply ({source}): build {build} is installed on disk; activating it \
-                     in place: {message}"
+                    "update apply ({source}): build {build} is installed on disk; activation \
+                     pending (automatic retry scheduled={retry_scheduled}): {message}"
                 );
                 if open_details {
                     let _ = self
@@ -598,12 +685,15 @@ impl App {
                     self.note_update_outcome(
                         '\u{2191}',
                         UPDATE_INSTALLED_TITLE,
-                        UPDATE_INSTALLED_DETAIL,
+                        if retry_scheduled {
+                            "activation pending \u{b7} retries on its own"
+                        } else {
+                            UPDATE_INSTALLED_DETAIL
+                        },
                         crate::status_bars::Tone::Info,
                     );
-                    // The stage is not merely waiting any more: it is installed
-                    // and activating, so the ready row does not come back when
-                    // this line folds.
+                    // The download's ready row is obsolete now that its bytes
+                    // are installed, even if activation awaits a manual request.
                     self.status_bars.forget_staged_behind_outcome();
                 }
             }
@@ -621,10 +711,20 @@ impl App {
                     let _ = self
                         .open_settings_tab(crate::native_settings::SettingsRoute::SoftwareUpdate);
                 } else if !self.status_bars.update_bar_is_staged() {
+                    let retry_scheduled = self
+                        .native_updater_service
+                        .snapshot()
+                        .staged
+                        .as_ref()
+                        .is_some_and(|stage| self.automatic_apply_retry_scheduled(stage.build));
                     self.note_update_outcome(
                         '\u{21bb}',
                         "Update postponed",
-                        "you were using the terminal \u{b7} it retries on its own",
+                        if retry_scheduled {
+                            "you were using the terminal \u{b7} it retries on its own"
+                        } else {
+                            "you were using the terminal \u{b7} see Version menu"
+                        },
                         crate::status_bars::Tone::Info,
                     );
                 }
@@ -1322,8 +1422,14 @@ mod tests {
         let armed = debug_seamless_reexec_armed();
         assert_eq!(
             armed,
-            std::env::var_os("ATERM_DEBUG_SEAMLESS_REEXEC").is_some(),
-            "the seam is armed exactly when its variable is present"
+            aterm_types::control_socket::env_flag_engaged(
+                std::env::var_os("ATERM_DEBUG_SEAMLESS_REEXEC")
+                    .map(|v| v.to_string_lossy().into_owned())
+                    .as_deref(),
+            ),
+            "the seam is armed exactly when its variable is ENGAGED (non-empty and not \
+             \"0\") — the one flag rule every ATERM_NO_* / QA-seam reader shares, so an \
+             inherited empty variable can never arm it"
         );
         assert_eq!(
             armed,
@@ -1620,6 +1726,151 @@ mod tests {
         });
     }
 
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn returned_failure_ledger_conforms_to_attempt_target_after_stage_replacement() {
+        use crate::native_updater_service::{
+            ApplyDecision, ApplyMode, ApplyPreflightStart, ClosePreflight,
+            ReturnedApplyDisposition, ReturnedApplyFacts,
+        };
+        let _ledger = super::hold_update_ledger_for_test();
+        let model = aterm_spec::derive::native_update_failure_target_model();
+        for replaced in [false, true] {
+            let mut app = App::headless_for_test();
+            let running = app.native_updater_service.snapshot().current_build;
+            let original = running + 65_101 + u64::from(replaced) * 2;
+            let replacement = original + 1;
+            stage_build_with_ledger(&mut app, original);
+            let ApplyPreflightStart::Inspect(preflight) = app
+                .native_updater_service
+                .begin_apply_preflight(ApplyMode::Immediate)
+            else {
+                panic!("the original stage must admit preflight");
+            };
+            let ApplyDecision::Execute(command) = app
+                .native_updater_service
+                .finish_apply_preflight(preflight, ClosePreflight::Ready)
+            else {
+                panic!("preflight must mint the original attempt");
+            };
+            let attempt = command.attempt();
+            command.execute(|| ());
+            let disposition = app.native_updater_service.finish_returned_apply(
+                &attempt,
+                ReturnedApplyFacts::new(
+                    true,
+                    Some(if replaced { replacement } else { original }),
+                    Some(attempt.target_commit()),
+                    Some(attempt.target_dmg_sha256()),
+                    None,
+                ),
+                "the original candidate did not start",
+            );
+            let mut before = model.init_state();
+            if replaced {
+                assert_eq!(disposition, ReturnedApplyDisposition::Retired);
+                stage_build_with_ledger(&mut app, replacement);
+                before = model.successors("ReplaceStage", &before).remove(0);
+            } else {
+                assert_eq!(disposition, ReturnedApplyDisposition::Rearmed);
+            }
+            assert_eq!(
+                app.native_updater_service
+                    .snapshot()
+                    .staged
+                    .as_ref()
+                    .unwrap()
+                    .build,
+                if replaced { replacement } else { original },
+            );
+            app.surface_update_apply_outcome_for_target(
+                "manual handoff",
+                UpdateOutcome::Failed {
+                    message: "the original candidate did not start".to_string(),
+                },
+                false,
+                attempt.target_build(),
+            );
+            let report = aterm_update::apply_lane_report(running).expect("real ledger is readable");
+            assert_eq!(report.last_failure_target_build, original);
+            assert!(report.failures_for_target > 0);
+            let mut after = before.clone();
+            after.insert(
+                "charged",
+                if report.last_failure_target_build == original {
+                    1
+                } else {
+                    2
+                },
+            );
+            assert_eq!(model.successors("Publish", &before), vec![after.clone()]);
+            assert!(model.check_invariant("FailureBelongsToAttempt", &after));
+            if replaced {
+                assert!(
+                    app.apply_trouble_for(replacement).is_none(),
+                    "new bytes inherit no failure"
+                );
+                // Historical path derived the target from the current stage.
+                // Drive it against the real ledger to prove the distinction is
+                // observable, then require the model to reject that result.
+                app.record_apply_outcome_in_ledger(&UpdateOutcome::Failed {
+                    message: "historical inferred target".to_string(),
+                });
+                let historical = aterm_update::apply_lane_report(running).unwrap();
+                assert_eq!(historical.last_failure_target_build, replacement);
+                after.insert("charged", 2);
+                assert!(!model.successors("Publish", &before).contains(&after));
+                assert!(!model.check_invariant("FailureBelongsToAttempt", &after));
+            }
+        }
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn installed_and_deferred_outcomes_only_promise_a_retained_automatic_retry() {
+        let _ledger = super::hold_update_ledger_for_test();
+        for (automatic, armed) in [(false, true), (true, false), (true, true)] {
+            let mut app = App::headless_for_test();
+            let build = app.native_updater_service.snapshot().current_build + 1;
+            stage_build_with_ledger(&mut app, build);
+            app.config.update = Some(crate::app_config::UpdateConfig {
+                auto_apply: Some(automatic),
+                ..app.config.update.clone().unwrap_or_default()
+            });
+            if armed {
+                arm_intent(&mut app, build);
+            }
+            app.react_to_update_apply_outcome(
+                "manual",
+                UpdateOutcome::InstalledNeedsRelaunch {
+                    build,
+                    message: App::INSTALLED_ACTIVATES_IN_PLACE.to_string(),
+                },
+                false,
+            );
+            let installed = app.update_row_text().expect("installed outcome is visible");
+            assert!(installed.contains("activation pending"), "{installed}");
+            assert!(!installed.contains("activating in place"), "{installed}");
+            assert_eq!(installed.contains("retries on its own"), automatic && armed);
+            assert_eq!(
+                installed.contains("see Version menu"),
+                !(automatic && armed)
+            );
+
+            app.react_to_update_apply_outcome(
+                "manual",
+                UpdateOutcome::Deferred {
+                    reason: "typing gap".to_string(),
+                },
+                false,
+            );
+            let deferred = app.update_row_text().expect("deferred outcome is visible");
+            assert!(deferred.contains("Update postponed"), "{deferred}");
+            assert_eq!(deferred.contains("retries on its own"), automatic && armed);
+            assert_eq!(deferred.contains("see Version menu"), !(automatic && armed));
+        }
+    }
+
     /// THE STATUS BAR'S POSTURE, IN THE ORDER THE FACTS OUTRANK EACH OTHER: the
     /// disabled handoff (nothing applies while a terminal is open), then policy
     /// — config, then the
@@ -1645,7 +1896,7 @@ mod tests {
                 && std::env::var_os("ATERM_CONTROL_SOCK").is_none(),
             "PRECONDITION: no update veto may be set in the test environment"
         );
-        let build = 4_242;
+        let build = stage_one_build(&mut app);
         let latch = |build: u64, retry_at: Option<std::time::Instant>| crate::AutoApplyManualOnly {
             build,
             dmg_sha256: [0xab; 32],
@@ -1855,7 +2106,7 @@ mod tests {
                 && std::env::var_os("ATERM_CONTROL_SOCK").is_none(),
             "PRECONDITION: no update veto may be set in the test environment"
         );
-        let build = 4_243;
+        let build = stage_one_build(&mut app);
         let staged = aterm_update::Progress::Staged {
             version: "9.9.9".to_string(),
             build,
@@ -1971,9 +2222,9 @@ mod tests {
     /// write, and no reconcile is run anywhere below. If the failure does not reach
     /// these surfaces at the instant it is recorded, it does not reach them at all.
     ///
-    /// Ledger isolation note: the count asserted here is the ARTIFACT-scoped one, and
-    /// every build number below is unique to this test, so a sibling test writing the
-    /// process-wide scratch ledger in parallel cannot perturb it.
+    /// The ledger guard protects the single standing target slot across writes and
+    /// reads. Unique build numbers alone cannot prevent a sibling failure writer
+    /// from replacing that slot between those operations.
     #[cfg(target_os = "macos")]
     #[test]
     fn one_real_failed_apply_reaches_every_standing_surface_at_once() {
@@ -2319,6 +2570,65 @@ mod tests {
              predicate under test is never reached"
         );
         build
+    }
+
+    #[test]
+    fn retry_and_latch_posture_require_the_exact_current_artifact() {
+        use crate::app_config::AutoApplySetting;
+        use crate::status_bars::ApplyPosture;
+        let mut app = App::headless_for_test();
+        let build = stage_one_build(&mut app);
+        let later = std::time::Instant::now() + std::time::Duration::from_secs(600);
+        let available = ApplyPostureEnv {
+            handoff_unavailable: None,
+            auto_apply: AutoApplySetting::On,
+            nudge_seam: false,
+        };
+        for digest in [[0xab; 32], [0xcd; 32]] {
+            let exact = digest == [0xab; 32];
+            app.auto_apply_manual_only = None;
+            app.auto_apply_intent = Some(crate::AutoApplyIntent {
+                build,
+                dmg_sha256: digest,
+                retry_at: later,
+                attempts: 0,
+                apply_by: later,
+            });
+            assert_eq!(app.automatic_apply_retry_scheduled(build), exact);
+            assert!(!app.automatic_apply_retry_scheduled(build + 1));
+            app.auto_apply_intent = None;
+            app.auto_apply_manual_only = Some(crate::AutoApplyManualOnly {
+                build,
+                dmg_sha256: digest,
+                retry_at: Some(later),
+            });
+            assert_eq!(app.automatic_apply_retry_scheduled(build), exact);
+            assert_eq!(
+                app.apply_posture_with(build, available),
+                if exact {
+                    ApplyPosture::ManualOnlyLatched { lapses: true }
+                } else {
+                    ApplyPosture::Automatic
+                }
+            );
+            // The former build-only predicate says Scheduled for both cases;
+            // the mismatched digest is the required negative control.
+            assert!(
+                app.auto_apply_manual_only
+                    .is_some_and(|latch| { latch.build == build && latch.retry_at.is_some() })
+            );
+        }
+        app.auto_apply_manual_only = Some(crate::AutoApplyManualOnly {
+            build,
+            dmg_sha256: [0xab; 32],
+            retry_at: Some(later),
+        });
+        assert_eq!(
+            app.native_updater_service
+                .reconcile_durable_stage(true, None, None, None, None),
+            crate::native_updater_service::DurableStageDisposition::Retired
+        );
+        assert!(!app.automatic_apply_retry_scheduled(build));
     }
 
     /// THE PILL MUST NOT ASSERT THE PESSIMISTIC ANSWER WHEN A RETRY IS ALREADY

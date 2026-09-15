@@ -68,7 +68,7 @@ update_channel = "alabsystems/aterm"
 # clients verify against were two separately edited values that nothing compared.
 
 [workspace.package]
-version = "0.85.0"
+version = "0.86.0"
 edition = "2024"
 license = "Apache-2.0"
 repository = "https://github.com/alabsystems/aterm"
@@ -166,6 +166,10 @@ aterm-render-api = { path = "crates/aterm-render-api" }
 aterm-time = { path = "crates/aterm-time" }
 # L0.5 semantic surface predicates (regex row-match) over the Observation Kernel.
 aterm-observe = { path = "crates/aterm-observe" }
+# The worker-phase reader (busy | prompt | limited | idle | question, the context
+# indicator, the approval box) over one screen's rows. No dependencies; linked by
+# aterm-agent (`aterm drive phase`) and aterm-link (the presence row's `phase=`).
+aterm-phase = { path = "crates/aterm-phase" }
 # L2 agent interface: turn-completion + self-reflection governor over L0/L0.5/L1.
 aterm-agent = { path = "crates/aterm-agent" }
 # L3 network transport: relay the control protocol over a network boundary with a
@@ -230,6 +234,11 @@ aterm-provenance = { path = "crates/aterm-provenance" }
 aterm-error = { path = "crates/aterm-error" }
 aterm-error-derive = { path = "crates/aterm-error-derive" }
 aterm-tempfile = { path = "crates/aterm-tempfile" }
+# Build-script step: compile a Win32 .rc and link it into the package bins.
+# Replaces the embed-resource build-dependency, whose msvc-only vswhom chain
+# reached libc::wchar_t and libc::wcslen — items the first-party libc
+# deliberately does not declare on Windows (crates/aterm-winres says why).
+aterm-winres = { path = "crates/aterm-winres" }
 # Fd-relative POSIX directory operations (openat/fstat/mkdirat/renameat[2 or
 # renameatx_np]/unlinkat/linkat/fchmod/fsync + a readdir stream) over `libc`,
 # which was already in the graph. Replaces `rustix`, 72,832 lines across 2
@@ -471,6 +480,23 @@ all = { level = "warn", priority = -1 }
 # carries the matching `[profile.dev.build-override]` in its own manifest.
 [profile.dev.package.aterm-census]
 opt-level = 2
+
+# HOST CODE AT THE SAME DEBUGINFO AS EVERYTHING ELSE (2026-09-13, gate speed).
+# Unset, build-override compiles build scripts, proc-macros and their deps at
+# debuginfo 0, while the same crates compiled as ordinary deps get full
+# debuginfo — so a crate reachable both ways (syn, quote, proc-macro2, and all
+# downstream of them) was built in two variants, and `build`, `test`,
+# `test --doc`, the smokes and the drivers in `tools/verify.sh` each rebuilt
+# their own. Measured with `--unit-graph` at 18f19eea6: with this pin the
+# doctest stage (`test --doc --workspace`) needs 3 units beyond
+# `test --workspace --no-run`, all doctest runs and 0 compiles (was 117
+# compiles); the smoke build 22 (was 49); the regex lane 37 (was 57). Only
+# debuginfo moves: features, opt-level, debug-assertions and overflow-checks are
+# untouched, so nothing any stage proves changes. One-time cost: an existing
+# target dir rehashes most units once. Pinned by
+# crates/aterm-verify/tests/profile_pin.rs.
+[profile.dev.build-override]
+debug = 2
 
 [profile.release]
 # Aggressive size+speed, functionality-preserving: fat LTO (whole-program

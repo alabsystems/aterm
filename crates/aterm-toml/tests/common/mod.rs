@@ -21,12 +21,10 @@ pub fn repo_root() -> PathBuf {
 ///
 /// This corpus IS the specification for the purposes of these tests: real
 /// manifests, real vendored manifests, real art assets, the real config files.
-/// `target/` and `.git/` are skipped — one is build output, the other is not
-/// source.
+/// `target/`, the root's `target-*` lane dirs and `.aterm-verify/` are skipped
+/// as build output and gate state, `.git/` because it is not source.
 pub fn corpus() -> Vec<PathBuf> {
-    let mut out = Vec::new();
-    walk(&repo_root(), &mut out);
-    out.sort();
+    let out = corpus_under(&repo_root());
     assert!(
         out.len() > 100,
         "the corpus should be the whole tree, found only {}",
@@ -35,7 +33,28 @@ pub fn corpus() -> Vec<PathBuf> {
     out
 }
 
-fn walk(dir: &Path, out: &mut Vec<PathBuf>) {
+/// Every `.toml` under `root`, sorted, minus the directories [`corpus_skips`]
+/// names.
+pub fn corpus_under(root: &Path) -> Vec<PathBuf> {
+    let mut out = Vec::new();
+    walk(root, root, &mut out);
+    out.sort();
+    out
+}
+
+/// Whether the corpus walk stays out of the directory `name` inside `parent`:
+/// `target`, `.git` and `node_modules` at any depth, and at the repository root
+/// every `target-*` sibling build dir (the gate's per-lane dirs) and the gate's
+/// `.aterm-verify` state dir, which the checked-in .gitignore names as
+/// `/target-*` and `/.aterm-verify/`.
+fn corpus_skips(root: &Path, parent: &Path, name: &str) -> bool {
+    name == "target"
+        || name == ".git"
+        || name == "node_modules"
+        || (parent == root && (name.starts_with("target-") || name == ".aterm-verify"))
+}
+
+fn walk(root: &Path, dir: &Path, out: &mut Vec<PathBuf>) {
     let Ok(entries) = std::fs::read_dir(dir) else {
         return;
     };
@@ -44,10 +63,10 @@ fn walk(dir: &Path, out: &mut Vec<PathBuf>) {
         let name = entry.file_name();
         let name = name.to_string_lossy();
         if path.is_dir() {
-            if name == "target" || name == ".git" || name == "node_modules" {
+            if corpus_skips(root, dir, &name) {
                 continue;
             }
-            walk(&path, out);
+            walk(root, &path, out);
         } else if path.extension().is_some_and(|e| e == "toml") {
             out.push(path);
         }

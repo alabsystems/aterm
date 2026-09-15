@@ -556,7 +556,7 @@ impl PetBrain {
         }
     }
 
-    /// Exact occupancy where the console map covers the whole footprint.
+    /// Exact locomotion occupancy where the map covers the whole footprint.
     /// `None` retains the span fallback; it never licenses an unobserved gap.
     pub(super) fn observed_ink_overlaps(&self, col: f32, row: f32, width: f32) -> Option<bool> {
         let (a, b) = (col + INK_PAD, col + width - INK_PAD);
@@ -580,7 +580,7 @@ impl PetBrain {
             if end > first && end - first <= crate::pet_world::MAX_WORLD_COLS {
                 return (first..end).try_fold(false, |occupied, c| {
                     world
-                        .ink_at(row.round() as usize, c)
+                        .locomotion_ink_at(row.round() as usize, c)
                         .map(|ink| occupied || ink)
                 });
             }

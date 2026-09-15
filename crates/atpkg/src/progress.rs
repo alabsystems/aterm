@@ -279,6 +279,11 @@ impl ProgressSink {
             .map(|st| st.file.pass.clone())
             .unwrap_or_default()
     }
+
+    /// The file this sink writes (`<prefix>/progress.json`).
+    pub fn path(&self) -> Option<PathBuf> {
+        self.inner.lock().ok().map(|st| st.path.clone())
+    }
 }
 
 /// The writer must refresh `heartbeat_unix` at least this often, even with nothing to
@@ -664,6 +669,95 @@ impl PassHeartbeat {
         }
     }
 }
+
+/// Where an orphaned pass's output goes, beside `progress.json`: `<prefix>/orphan-pass.log`.
+pub const ORPHAN_LOG_NAME: &str = "orphan-pass.log";
+
+/// THE ORPHANED PASS KEEPS WORKING (2026-09-14). A window's pass child is spawned with
+/// its stdout and stderr piped to the window and told the window's pid
+/// ([`crate::cli::SPAWNER_PID_ENV`]). When that window exits under it — a self-update
+/// exec'ing into its successor (the incident: 0.84 → 0.85 applied at 15:06:29, the
+/// successor's own child queued behind this one's flock at 15:06:35), the app quit and
+/// reopened for a Full Disk Access grant, a window closed by hand — nobody reads the
+/// pipes any more, Rust leaves SIGPIPE ignored, and the child's next `println!` got EPIPE
+/// and PANICKED (exit 101): minutes of download thrown away, the flock held until that
+/// print, and the successor's window showing a "waiting for another aterm's toolchain
+/// install" row for a pass that was doomed the moment it next spoke. So a watcher
+/// thread, armed at the dispatch edge for the WHOLE process (`crate::cli::main_entry`,
+/// only when the spawner passed `--wait-lock`, which the window always does and a typed
+/// `aterm pkg update` never — the audit of 2026-09-14 caught the first draft riding the
+/// pass heartbeat, which exists only inside a progress pass, so the channel-apply lane
+/// that moves the multi-gigabyte rustc group had no watcher at all), polls every
+/// [`ORPHAN_POLL_MS`] for the parent to CHANGE ([`crate::cli::parent_is_gone`] — the same
+/// rule the lock waiter stands down on) and, once, points fds 1 and 2 at
+/// [`ORPHAN_LOG_NAME`] under the store prefix: every later print lands there, the pass
+/// runs to completion, the store it leaves is what the successor's `--wait-lock` child
+/// finds, and the successor's window shows the REAL progress meanwhile through its
+/// child-scoped tailer of `progress.json`. The window's marker contract
+/// (`lock-waiting:`, `seed-installed:` …) is not blinded: its reader was the parent, and
+/// the parent is gone. `curl` is untouched: its stdout and stderr are piped to atpkg,
+/// never to the window. A print that lands between the parent's exit and the next poll
+/// still dies the old way — a ≤ 100 ms window against passes that print at program
+/// boundaries minutes apart — and costs what every death always cost, one program's
+/// redo on a crash-consistent store (`crate::lock`), nothing more. Two shapes it does
+/// not cover, on purpose: a parent that exec's in place keeps its pid (the cold apply
+/// lane), so nothing changes and nothing needs to; and an orphan that outlives a
+/// self-update resolves its launchd helper by path, so the NEW binary serves its hidden
+/// verbs — a spec of another version is refused through the result file, and the
+/// policy's in-process fallback then records what it wrote.
+pub fn watch_for_orphaning(log: PathBuf) {
+    let _ = std::thread::Builder::new()
+        .name("atpkg-orphan-watch".into())
+        .spawn(move || {
+            loop {
+                if crate::cli::parent_is_gone() {
+                    quiet_stdio(&log);
+                    return;
+                }
+                std::thread::sleep(Duration::from_millis(ORPHAN_POLL_MS));
+            }
+        });
+}
+
+/// How often the orphan watch asks for its parent pid — one `getppid(2)`, so cheap
+/// that the residual EPIPE window is what sets it, not the cost.
+const ORPHAN_POLL_MS: u64 = 100;
+
+/// Point this process's stdout and stderr at `log` (appended, `0600`), then say so —
+/// into the log, which is where that line belongs once the pipes are dead. A log that
+/// cannot be opened leaves the fds alone: the pass then dies at its next print exactly
+/// as it always did, and nothing is worse.
+#[cfg(unix)]
+fn quiet_stdio(log: &Path) {
+    use std::os::unix::fs::OpenOptionsExt as _;
+    use std::os::unix::io::AsRawFd as _;
+    let Ok(file) = std::fs::OpenOptions::new()
+        .append(true)
+        .create(true)
+        .mode(0o600)
+        .open(log)
+    else {
+        return;
+    };
+    let fd = file.as_raw_fd();
+    // SAFETY: `dup2` re-points the two standard descriptors at an open file this
+    // process owns; `file` is leaked on purpose right after, so the descriptor it
+    // wraps stays valid for the rest of the process and neither `dup2` ever names a
+    // closed one. No other thread expects fds 1 and 2 to be anything in particular.
+    unsafe {
+        libc::dup2(fd, 1);
+        libc::dup2(fd, 2);
+    }
+    std::mem::forget(file);
+    eprintln!(
+        "atpkg: the window that spawned this pass (pid {}) is gone; the pass continues \
+         and its output lands here",
+        std::process::id()
+    );
+}
+
+#[cfg(not(unix))]
+fn quiet_stdio(_log: &Path) {}
 
 static GLOBAL_SINK: Mutex<Option<(ProgressSink, std::thread::ThreadId, PassHeartbeat)>> =
     Mutex::new(None);

@@ -60,6 +60,13 @@ pub fn default_prefix(home: &Path) -> PathBuf {
     }
 }
 
+/// `None`: there is no `getpwuid` and no per-host preference domain to protect. The
+/// `[machine]` settings are macOS-only and answer not-applicable before this is asked.
+#[must_use]
+pub fn account_home() -> Option<PathBuf> {
+    None
+}
+
 /// No effective uid on Windows — privacy is the per-user profile ACL, not owner bits.
 /// Returns the `0` sentinel (used only in a diagnostic message never reached on Windows,
 /// since [`dir_meta_is_private`] is always `true`).

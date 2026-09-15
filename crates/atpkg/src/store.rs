@@ -820,11 +820,12 @@ pub(crate) fn clear_build_ready(build_dir: &Path) -> std::io::Result<()> {
 }
 
 /// The record a provenance-tracked installer leaves when it staged `build_dir` IN-PROCESS
-/// under `ATPKG_ALLOW_TRACKED_INSTALL=1` (or kept an untracked lane's tree that came back
-/// tagged): a SIBLING file `store/<program>/<build>.tracked-install`, outside the hashed
-/// tree like `.ready`. It is the CAUSE `aterm pkg doctor` reports beside its "carries
-/// com.apple.provenance" line, and what `aterm pkg repair` names as needing a re-seed —
-/// the archive is reclaimed after every stage, so no local re-stage exists.
+/// because its untracked lane could not run — the default; `ATPKG_REFUSE_TRACKED_INSTALL=1`
+/// refuses instead — or kept an untracked lane's tree that came back tagged: a SIBLING
+/// file `store/<program>/<build>.tracked-install`, outside the hashed tree like `.ready`.
+/// It is the CAUSE `aterm pkg doctor` reports beside its "carries com.apple.provenance"
+/// line, and what `aterm pkg repair` names as needing a re-seed — the archive is
+/// reclaimed after every stage, so no local re-stage exists.
 fn tracked_install_marker_path(build_dir: &Path) -> Option<PathBuf> {
     let name = crate::call1(std::path::Path::file_name, build_dir)?;
     let name = crate::call1(std::ffi::OsStr::to_str, name)?;

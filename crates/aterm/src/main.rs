@@ -33,6 +33,27 @@
 use std::ffi::OsString;
 use std::process::ExitCode;
 
+/// `aterm link` and `aterm fabric` where the fabric bridge cannot exist.
+///
+/// The bridge is Unix-domain sockets and descriptors inherited at fixed numbers
+/// (`aterm_uds::spawnfd`) end to end (`crates/aterm-link`, `vendor/astream`;
+/// on macOS a launchd-kept broker), so `crates/aterm` carries it under
+/// `[target.'cfg(unix)'.dependencies]` and this answers in its place — for
+/// both verbs that live in that crate — on every other target. The verbs STAY
+/// on the roster — the roster is one list on every platform and `aterm help`
+/// must not lie about what the binary knows — and refuse by name, with the
+/// reason, instead of failing to exist: an operator who runs the enable script
+/// from a Mac and then types the verb here learns why in one line, not from
+/// an "unknown verb".
+#[cfg(not(unix))]
+fn link_unavailable(verb: &str) -> ExitCode {
+    eprintln!(
+        "aterm {verb}: not available on this platform. The fabric bridge is Unix-only \
+         (Unix-domain sockets, inherited descriptors); nothing was started."
+    );
+    ExitCode::FAILURE
+}
+
 fn main() -> ExitCode {
     // Start the broad window cold-start clock before argv0 parsing or route
     // selection. The compatibility GUI-entry clock is anchored separately if
@@ -76,12 +97,15 @@ fn main() -> ExitCode {
         AliasRoute::Fleet => return aterm_agent::fleet_cli::main_entry(rest),
         AliasRoute::Drive => return aterm_agent::drive_cli::main_entry(rest),
         AliasRoute::Link => {
+            #[cfg(unix)]
             return aterm_link::cli::dispatch(
                 &rest
                     .iter()
                     .map(|a| a.to_string_lossy().into_owned())
                     .collect::<Vec<String>>(),
             );
+            #[cfg(not(unix))]
+            return link_unavailable("link");
         }
         // `get(1..)` not `rest[1..]`: this arm is only reached with a first
         // token in hand, but that is an argument the verifier cannot follow
@@ -137,12 +161,28 @@ fn main() -> ExitCode {
             // the control protocol already defines as UTF-8 — and lossy is the
             // right conversion for an argument that is about to be rejected by
             // name if it is not one of those.
+            #[cfg(unix)]
             aterm_cli::Verb::Link => aterm_link::cli::dispatch(
                 &forwarded
                     .iter()
                     .map(|a| a.to_string_lossy().into_owned())
                     .collect::<Vec<String>>(),
             ),
+            // The owner's view of the fabric: it lives beside the bridge it
+            // reports on (`aterm-link`'s `fabric` module), and takes `String`s
+            // for the reason `link` does — and is gated the same way, for the
+            // same reason: it lives in the unix-only crate.
+            #[cfg(unix)]
+            aterm_cli::Verb::Fabric => aterm_link::fabric::main(
+                &forwarded
+                    .iter()
+                    .map(|a| a.to_string_lossy().into_owned())
+                    .collect::<Vec<String>>(),
+            ),
+            #[cfg(not(unix))]
+            aterm_cli::Verb::Link => link_unavailable("link"),
+            #[cfg(not(unix))]
+            aterm_cli::Verb::Fabric => link_unavailable("fabric"),
             // The release tool is a separate executable — deliberately NOT carried by
             // the app bundle — so this verb execs where its siblings call a library.
             aterm_cli::Verb::Ship => {
@@ -221,6 +261,9 @@ fn main() -> ExitCode {
         .iter()
         .any(|(name, _)| *name == first);
     if mode_free {
+        // `--version` names the build the updater's start probe looks for
+        // (2026-09-14); the number is aterm-gui's stamp, handed over here.
+        aterm_cli::set_running_build(aterm_gui::running_build_number());
         let _ = aterm_cli::parse_args(rest);
         // parse_args returns only for a launch decision, which cannot happen
         // for a mode-free first token; defend anyway.
@@ -354,19 +397,37 @@ fn main() -> ExitCode {
             .as_deref(),
     ) && let Some(layout) = atpkg::store::resolve_configured()
     {
-        // A failed `lay` must not produce a SILENT un-rerouted session — the
-        // exact thing the reroute exists to end — so it is said, once, here.
-        // (A recorded decline lays nothing and says nothing: that is the
-        // user's own instruction.)
-        if let Err(error) = atpkg::reroute::lay(&layout) {
+        // A SESSION SPAWN NEVER WAITS ON A LAUNCHD JOB (2026-09-14, the perf
+        // audit) — the window entry's twin, and the same measured cost: when
+        // `lay` has files to lay it takes the launchd round trip plus a byte
+        // copy of the helper, 452 ms median non-bundled and 730 ms from the
+        // shipped .app. Here that sits in front of the shell of a new tab.
+        //
+        // What the session needs synchronously is the DIRECTORY, because that is
+        // what goes on its PATH; laying the stubs into it is the same work
+        // whenever it runs, so it runs beside the shell instead of before it. A
+        // failed lay must still never produce a SILENT un-rerouted session, so
+        // the background lane says it, once, exactly as before. (A recorded
+        // decline lays nothing and says nothing: that is the user's own
+        // instruction, and `lay` still honours it.)
+        let dir = layout.reroute_dir();
+        if let Err(error) = layout.ensure_dir(&dir) {
             eprintln!(
-                "aterm: reroute stubs not laid ({error}); the upstream Rust names are NOT rerouted in this session — `aterm pkg doctor` explains (aterm help reroute)"
+                "aterm: reroute dir not created ({error}); the upstream Rust names are NOT rerouted in this session — `aterm pkg doctor` explains (aterm help reroute)"
             );
         }
-        let dir = layout.reroute_dir();
         if dir.is_dir() {
             aterm_log::env::set(atpkg::reroute::REROUTE_DIR_ENV, &dir);
         }
+        let _ = std::thread::Builder::new()
+            .name("aterm-reroute-lay".into())
+            .spawn(move || {
+                if let Err(error) = atpkg::reroute::lay(&layout) {
+                    eprintln!(
+                        "aterm: reroute stubs not laid ({error}); the upstream Rust names are NOT rerouted in this session — `aterm pkg doctor` explains (aterm help reroute)"
+                    );
+                }
+            });
     }
 
     // THE SESSION UPDATE LANE (round-11). The one-binary era made a terminal
@@ -381,9 +442,11 @@ fn main() -> ExitCode {
     // state — a session must never gamble a live PTY on it. The one-line nudge
     // below (before the PTY exists — it never interleaves with a running shell)
     // is the honest bridge: it names the staged build and how to apply it.
-    // Source: env overrides ($ATERM_UPDATE_OWNER/_REPO) + the compiled default —
-    // the same resolution the ctl `update check` verb uses; the GUI-config
-    // repoint keys are a window-side concern.
+    // Source: the `[update]` config repoint under the env override + the
+    // compiled default (`aterm_gui::configured_update_source`, 2026-09-14) — the
+    // same resolution the window's loop and the ctl `update check` verb use.
+    // Resolve on the checker thread each cycle so a config reload also changes
+    // the channel of an already-running session.
     #[cfg(target_os = "macos")]
     {
         let build = aterm_gui::running_build_number();
@@ -396,9 +459,9 @@ fn main() -> ExitCode {
                  window (aterm --window) applies it"
             );
         }
-        aterm_update::spawn_background_check(
+        aterm_update::spawn_background_check_with_source(
             build,
-            aterm_update::Source::resolve(None, None),
+            std::sync::Arc::new(|| Some(aterm_gui::configured_update_source())),
             None,
             None,
         );
@@ -990,7 +1053,7 @@ fn update_verb(rest: &[OsString]) -> ExitCode {
             ExitCode::SUCCESS
         }
         "check" => {
-            let st = aterm_update::check_now(build, &aterm_update::Source::resolve(None, None));
+            let st = aterm_update::check_now(build, &aterm_gui::configured_update_source());
             print_update_status(build, &st);
             ExitCode::SUCCESS
         }
@@ -1039,6 +1102,28 @@ fn print_update_status(build: u64, st: &aterm_update::UpdateStatus) {
             "  failing applies: {} — a verified build is staged but will not start",
             st.failing_applies
         );
+    }
+    // THE REASON, not just the count (2026-09-14, audit OBS-7): the apply lane's
+    // own words — the last failure and any standing refusal or schedule — used to
+    // reach only the control socket's `apply_failure=` (percent-encoded) while
+    // this, the local answer to "why is it not running?", printed a number.
+    if let Some(report) = aterm_update::apply_lane_report(build) {
+        if !report.last_failure.is_empty() {
+            let target = if report.last_failure_target_build > 0 {
+                format!(" (build {})", report.last_failure_target_build)
+            } else {
+                String::new()
+            };
+            println!("  last apply failure{target}: {}", report.last_failure);
+        }
+        if !report.last_refusal.is_empty() {
+            let when = if report.last_refusal_at.is_empty() {
+                String::new()
+            } else {
+                format!(" at {}", report.last_refusal_at)
+            };
+            println!("  apply lane{when}: {}", report.last_refusal);
+        }
     }
     if st.staged_build.is_some_and(|b| b > build) {
         println!("  apply it by opening the aterm window: aterm --window");

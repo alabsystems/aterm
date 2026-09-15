@@ -16,7 +16,7 @@ pub(crate) const DIRECTORY: &str = "astream";
 const BUNDLE: &str = "vendor/astream";
 const INVENTORY: &str = "UPSTREAM.toml";
 // Re-synchronizing requires a new review of the inventory as well as its bytes.
-const RECORD_SHA256: &str = "95dfe0c8ca1198da6a82f6ad7a0863c60c624274e49f9653b6be331f859be298";
+const RECORD_SHA256: &str = "d2ec90f87696468f80f4245af9d3472b5bbe906ebd5e1fdac9faa108f34d909e";
 const UPSTREAM: &str = "https://github.com/alabsystems/astream";
 const REVISION: &str = "bb98d610894afebdbe0ab741a7ad155b942a4375";
 const PACKAGES: [&str; 4] = [

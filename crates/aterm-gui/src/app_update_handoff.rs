@@ -81,6 +81,10 @@ struct HandoffWorkerJob {
     manifest: crate::session_store::SessionHandoff,
     fds: crate::session_store::HandoffFds,
     screens: Vec<(u64, aterm_core::terminal::TerminalCheckpoint)>,
+    /// Each session's CONTROL CARRY capture from the freeze — the archive's
+    /// fence, counters and differ state, and the engine and ledger to export
+    /// the rest from on this worker (`crate::handoff_carry`).
+    carries: Vec<crate::handoff_carry::CarrySource>,
     window: Option<crate::session_store::WindowCarry>,
     layout: crate::restore::RestoreManifest,
     layout_digest: [u8; 32],
@@ -2002,9 +2006,23 @@ fn run_handoff_worker(mut job: HandoffWorkerJob, proxy: winit::event_loop::Event
     if handoff_preparation_cancelled(&job, &proxy, None) {
         return;
     }
-    let Some(outgoing) =
-        crate::seamless::write_outgoing(&job.manifest, &job.fds, &job.screens, job.window.clone())
-    else {
+    // THE CONTROL CARRY'S EXPORT (round 10), HERE on the worker and not in the
+    // freeze: every reader is still parked (until Commit or rollback), so no
+    // engine moves, and cloning up to 1 MiB of archive rows per session costs
+    // the frozen terminal nothing. What the freeze took is the fence; a
+    // session whose archive moved since, or whose lock another thread keeps,
+    // carries its counters alone. The turn-id count rides the manifest itself,
+    // so a ledger that could not be carried cannot lower it.
+    let controls = crate::handoff_carry::export(&job.carries);
+    job.manifest.next_turn_id =
+        crate::handoff_carry::manifest_turn_id(crate::control::turn_ids_minted());
+    let Some(outgoing) = crate::seamless::write_outgoing(
+        &job.manifest,
+        &job.fds,
+        &job.screens,
+        job.window.clone(),
+        &controls,
+    ) else {
         send_handoff_preparation_failure(
             &job,
             &proxy,
@@ -2375,10 +2393,12 @@ fn run_out_of_band_handoff(
 ) -> Option<ForkInstead> {
     use std::os::fd::AsFd as _;
 
-    /// How long LaunchServices gets to answer. An answer normally lands well
-    /// under a second; the rest of the deadline belongs to the dial, which has a
-    /// whole boot apply in front of it.
-    const LAUNCH_ANSWER_BUDGET: std::time::Duration = std::time::Duration::from_secs(5);
+    /// How long the parent waits for LaunchServices' answer AFTER the successor
+    /// has dialled — corroboration of a pid the kernel already attested, so it
+    /// is short: the answer normally lands within a beat of the app checking in,
+    /// and a slow one is not worth a frozen screen (2026-09-14; the 5 s answer
+    /// budget this replaced was spent BEFORE the accept, on every handoff).
+    const LAUNCH_CORROBORATION_BUDGET: std::time::Duration = std::time::Duration::from_millis(150);
 
     let OutgoingArtifacts {
         manifest_path,
@@ -2532,71 +2552,55 @@ fn run_out_of_band_handoff(
     }
     let deadline = handoff_ready_deadline();
     let launch_at = std::time::Instant::now();
-    let launched = match crate::app_launch_successor::launch_app_bundle(
-        &bundle,
-        &arguments,
-        &environment,
-        LAUNCH_ANSWER_BUDGET.min(deadline.saturating_duration_since(std::time::Instant::now())),
-    ) {
-        Ok(launched) => Some(launched.pid()),
-        // A TIMEOUT IS NOT A FAILURE, AND TREATING IT AS ONE THREW AWAY A LIVE
-        // SUCCESSOR. Measured on this machine: a bundle's first launch took
-        // longer than this budget to ANSWER, the parent tore the rendezvous down
-        // on the way out, and the successor — which had started, and was correct
-        // — dialed into a closed socket and exited with
-        // "the parent closed the rendezvous". Nothing was lost (that exit is
-        // before any window, by design) except the update.
-        //
-        // The launch answer was never the liveness signal; the DIAL is, which is
-        // what this lane exists to arrange. So a timeout keeps the rendezvous
-        // open for the rest of the deadline and gives up only if nobody arrives.
-        // What is lost is the pid to compare the dialer against, and that is
-        // defence in depth rather than the lock: the claim secret is checked
-        // first, and the socket is 0700 inside a 0700 directory.
-        Err(crate::app_launch_successor::LaunchError::Timeout(_)) => {
-            aterm_log::info!(
-                "update apply: LaunchServices has not answered yet; keeping the rendezvous open \
-                 for the rest of the deadline — the dial is the liveness signal, not the answer"
-            );
-            None
-        }
-        Err(error) => {
-            // A REFUSAL, not a slow answer: nothing was launched, so no successor
-            // can dial and the fork lane is untouched and still able to carry this
-            // attempt. Hand the job back rather than reporting a failure — the
-            // trade is the orphaned launchd domain this lane exists to avoid,
-            // which is exactly the trade the fork lane already makes today, and it
-            // beats not updating at all on a machine LaunchServices refuses.
-            //
-            // The rendezvous is dropped on the way out, which closes the listener
-            // and unlinks the node, so nothing is left for a late dialer to find.
-            aterm_log::warn!(
-                "update apply: LaunchServices refused the successor ({error}); forking instead"
-            );
-            return Some(ForkInstead {
-                job,
-                artifacts: OutgoingArtifacts {
-                    manifest_path,
-                    layout_path,
-                    nonce,
-                },
-                expected,
-                channels: HandoffChannels {
-                    proof_rd,
-                    proof_wr,
-                    commit_rd,
-                    commit_wr,
-                },
-            });
-        }
-    };
-    match launched {
-        Some(pid) => aterm_log::info!(
-            "update apply: launched successor pid {pid} as its own launchd application job; \
-             awaiting its rendezvous dial"
-        ),
-        None => aterm_log::info!("update apply: awaiting the successor's rendezvous dial"),
-    }
+    // THE LAUNCH IS ISSUED, NOT AWAITED (2026-09-14). The successor dials right
+    // after its boot apply — before any NSApplication exists — and LaunchServices
+    // answers only once the app has checked in, so the dial is structurally
+    // ordered BEFORE the answer. Waiting out the answer first spent the whole
+    // launch-answer budget (5 s) with the dial already queued in the listen
+    // backlog: every launched-lane handoff froze the terminal 5.3–5.8 s on this
+    // machine (the real v0.85.0 apply: 5760 ms park->proof), against 272 ms on
+    // the fork lane. The dial is the liveness signal and the claim secret is
+    // the lock; the launch answer is corroboration, read AFTER the dial.
+    //
+    // A REFUSAL is still a refusal, not a slow answer: nothing was launched, so
+    // no successor can dial and the fork lane is untouched and still able to
+    // carry this attempt. Hand the job back rather than reporting a failure —
+    // the trade is the orphaned launchd domain this lane exists to avoid, which
+    // is exactly the trade the fork lane already makes today, and it beats not
+    // updating at all on a machine LaunchServices refuses. The rendezvous is
+    // dropped on the way out, which closes the listener and unlinks the node.
+    let in_flight =
+        match crate::app_launch_successor::begin_launch(&bundle, &arguments, &environment) {
+            Ok(in_flight) => in_flight,
+            Err(error) => {
+                aterm_log::warn!(
+                    "update apply: LaunchServices refused the successor ({error}); forking instead"
+                );
+                return Some(ForkInstead {
+                    job,
+                    artifacts: OutgoingArtifacts {
+                        manifest_path,
+                        layout_path,
+                        nonce,
+                    },
+                    expected,
+                    channels: HandoffChannels {
+                        proof_rd,
+                        proof_wr,
+                        commit_rd,
+                        commit_wr,
+                    },
+                });
+            }
+        };
+    aterm_log::info!(
+        "update apply: asked LaunchServices for the successor as its own launchd application \
+         job; awaiting its rendezvous dial"
+    );
+    // No expected pid at the gate: the claim secret is what admits a dialer, and
+    // the kernel-attested peer pid is the identity everything below rests on.
+    // The LaunchServices pid, when it lands, corroborates it after the dial.
+    let launched: Option<i32> = None;
     let peer = match rendezvous.accept_claim(launched, deadline, &|| job.cancel.try_recv().is_ok())
     {
         Ok(peer) => peer,
@@ -2648,6 +2652,49 @@ fn run_out_of_band_handoff(
         dial_at.saturating_duration_since(job.park_at).as_millis(),
         dial_at.saturating_duration_since(launch_at).as_millis(),
     );
+    // Corroboration, not the lock: if LaunchServices has answered by now (or does
+    // within a beat), the pid it names must be the dialer's. A mismatch is a
+    // stranger that knew the secret — refuse this peer. No answer yet is what
+    // the ordering predicts, and costs nothing: the dial already proved the
+    // successor alive.
+    match in_flight.wait(LAUNCH_CORROBORATION_BUDGET) {
+        Ok(successor) if successor.pid() == peer.pid() => aterm_log::info!(
+            "update apply: LaunchServices corroborates the dialer as pid {}",
+            successor.pid()
+        ),
+        Ok(successor) => {
+            send_warranted_handoff_failure(
+                HandoffRollbackWarrant::NeverTransferred,
+                &job.cleanup,
+                proxy,
+                job.current_build,
+                crate::UpdateHandoffCompletion::failure(
+                    job.attempt_id,
+                    Some(nonce),
+                    Some(pid_for_completion(successor.pid())),
+                    crate::UpdateHandoffOutcome::Rejected,
+                    format!(
+                        "the dialer (pid {}) is not the successor LaunchServices launched (pid \
+                         {}); refusing the handoff",
+                        peer.pid(),
+                        successor.pid()
+                    ),
+                ),
+            );
+            return None;
+        }
+        Err(crate::app_launch_successor::LaunchError::Timeout(_)) => aterm_log::info!(
+            "update apply: LaunchServices has not answered yet; the dial is the liveness \
+             signal, so the handoff proceeds without its pid corroboration"
+        ),
+        // A late REFUSAL after a dial: the peer is real (it dialled with the
+        // secret); LaunchServices' answer is about a job that evidently ran.
+        // Log it, keep going — the kernel-attested pid is the identity.
+        Err(error) => aterm_log::warn!(
+            "update apply: LaunchServices answered the launch with an error after the \
+             successor had already dialled ({error}); proceeding on the attested dialer"
+        ),
+    }
     // The identity the whole launched lane rests on, taken at the one instant it
     // is available: a pid the KERNEL attested for a process we did not fork,
     // plus the kernel's birth stamp for it. Together they survive pid reuse,
@@ -2692,6 +2739,34 @@ fn run_out_of_band_handoff(
         )
         .err();
     if let Some(error) = transfer_failed {
+        // WHICH SIDE OF THE `sendmsg` (2026-09-14, audit AH-6). Only a failure
+        // BEFORE the descriptors left warrants `NeverTransferred`; after it the
+        // successor holds duplicates of every master, and the rollback owes the
+        // same candidate proof the fork lane owes from `execve` on — kill, reap
+        // or witness, then resume the readers. In practice the partial shape is
+        // EPIPE from a successor that already closed its socket (and, in code,
+        // dropped what it received), so the proof is quick; it is still a proof.
+        if matches!(
+            error,
+            crate::handoff_rendezvous::RendezvousError::TransferPartial(_)
+        ) {
+            drop(rendezvous);
+            drop(peer);
+            drop(proof_wr);
+            drop(commit_rd);
+            let mut handle = HandoffCandidateHandle::Launched(exit_watch);
+            let rejected = worker_reject_and_reap_handoff_child(
+                &job,
+                proxy,
+                &mut handle,
+                candidate,
+                &nonce,
+                crate::UpdateHandoffOutcome::Rejected,
+                format!("the handoff descriptors were delivered but the grant was not: {error}"),
+            );
+            debug_assert!(rejected, "Commit is unreachable before the grant body");
+            return None;
+        }
         send_warranted_handoff_failure(
             HandoffRollbackWarrant::NeverTransferred,
             &job.cleanup,
@@ -2833,6 +2908,11 @@ fn run_handoff_decision(
         debug_assert!(rejected, "Commit is unreachable before ProofReady");
         return;
     }
+    // The proof checked out, so the successor has consumed everything this
+    // attempt published. A successor built before the control carry never
+    // reads the `.ctl` sidecars, and nothing else would ever remove the turn
+    // text and scrolled-off rows in them: unlink them now, Commit or not.
+    crate::seamless::retire_outgoing_controls(nonce);
 
     let (reject, rejected) = std::sync::mpsc::sync_channel(1);
     let ready = Wake::UpdateHandoffFinished(crate::UpdateHandoffCompletion {
@@ -2956,6 +3036,34 @@ fn run_handoff_decision(
 #[cfg(unix)]
 const MAX_HANDOFF_CAPTURE_BUDGET_BYTES: u64 = 4 * 1024 * 1024 * 1024;
 
+/// Acquire a parked session's engine within the freeze budget instead of failing
+/// on the first contention (2026-09-14). After `park_all_readers` every reader is
+/// joined, but the scrollback-compression worker (and the render/status paths)
+/// can take the mutex the instant a reader releases it, and under a flood they
+/// did so on every attempt: an explicit apply while any tab streamed output
+/// failed deterministically in ~4 ms with "a terminal engine was busy", and the
+/// automatic lane burned an attempt per cycle on it (QA runs 1–3 on this
+/// machine; runs 4–6, idle or with the flood finished, committed). The budget
+/// that already bounds the capture — 250 ms explicit, 20 ms first automatic —
+/// is what the wait spends; a poisoned lock is taken as before.
+fn try_lock_by<T>(
+    lock: &std::sync::Mutex<T>,
+    deadline: std::time::Instant,
+) -> Option<std::sync::MutexGuard<'_, T>> {
+    loop {
+        match lock.try_lock() {
+            Ok(guard) => return Some(guard),
+            Err(std::sync::TryLockError::Poisoned(poison)) => return Some(poison.into_inner()),
+            Err(std::sync::TryLockError::WouldBlock) => {
+                if std::time::Instant::now() >= deadline {
+                    return None;
+                }
+                std::thread::yield_now();
+            }
+        }
+    }
+}
+
 /// The wall-clock window the park + capture of a seamless handoff must fit in, measured
 /// from the instant the readers park — the freeze the user actually feels.
 ///
@@ -3048,26 +3156,15 @@ pub(crate) fn seamless_handoff_opted_out() -> bool {
 /// four conjuncts while the posture folded only the first, so a `--control-sock`
 /// or `--headless` process painted "applies in place within ~2 min" over an apply
 /// the gate refused with any terminal open.
+/// Fixed control sockets support overlap too: the candidate's control worker
+/// shares the authenticated reader gate and binds only after Commit and the
+/// parent's exit. Before Commit the parent alone owns the socket and token.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum HandoffUnavailable {
     /// `$ATERM_NO_SEAMLESS_UPDATE` — the one deliberate opt-out.
     OptedOut,
-    /// `--control-sock <path>` / `$ATERM_CONTROL_SOCK`: an explicit control-socket
-    /// path. The successor inherits the variable and would come up on the same
-    /// path, which explicit paths keep under the strict never-hijack probe
-    /// (`control.rs`) while this process still holds it.
-    ///
-    /// HOLDS ONLY FOR AN ACTUAL EXPLICIT PATH — the same
-    /// [`aterm_types::control_socket::socket_directive`] reading the socket
-    /// plan binds by. An EMPTY value means the per-instance default
-    /// (`aterm-<pid>.sock`, collision-free by construction) and `0`/`off`
-    /// means no socket at all; neither has the shared-path hazard. The old
-    /// `var_os(..).is_some()` read called both "explicit": a daily driver
-    /// launched from a shell that happened to export an empty
-    /// `ATERM_CONTROL_SOCK` bound its default socket like any other instance
-    /// yet had every seamless apply refused — 23 consecutive automatic-apply
-    /// failures on the owner's own terminal before the 2026-09-01 diagnosis.
-    ExplicitControlSock,
+    /// A fixed path is configured, but this process never proved it bound it.
+    UnownedControlSocket,
     /// `--headless` / `$ATERM_HEADLESS`: no window to hand across.
     Headless,
     /// No event-loop proxy to drive the handoff's wakes — only
@@ -3081,7 +3178,7 @@ impl HandoffUnavailable {
     /// process shape.
     pub(crate) const ALL: [Self; 4] = [
         Self::OptedOut,
-        Self::ExplicitControlSock,
+        Self::UnownedControlSocket,
         Self::Headless,
         Self::NoEventLoopProxy,
     ];
@@ -3093,8 +3190,8 @@ impl HandoffUnavailable {
     pub(crate) fn cause(self) -> &'static str {
         match self {
             Self::OptedOut => "$ATERM_NO_SEAMLESS_UPDATE is set",
-            Self::ExplicitControlSock => {
-                "$ATERM_CONTROL_SOCK names an explicit socket path (--control-sock)"
+            Self::UnownedControlSocket => {
+                "the configured control socket is not owned by this process"
             }
             Self::Headless => "--headless (no window)",
             Self::NoEventLoopProxy => "no event loop",
@@ -3106,8 +3203,8 @@ impl HandoffUnavailable {
     pub(crate) fn remedy(self) -> &'static str {
         match self {
             Self::OptedOut => " Unset it to restore the default.",
-            Self::ExplicitControlSock => {
-                " Launch without --control-sock / $ATERM_CONTROL_SOCK to restore the default."
+            Self::UnownedControlSocket => {
+                " Resolve the control-socket ownership conflict before updating."
             }
             Self::Headless => " A windowed launch restores the default.",
             Self::NoEventLoopProxy => "",
@@ -3118,33 +3215,29 @@ impl HandoffUnavailable {
     fn holds_for(self, app: &App) -> bool {
         match self {
             Self::OptedOut => seamless_handoff_opted_out(),
-            Self::ExplicitControlSock => control_sock_is_explicit(
-                std::env::var_os("ATERM_CONTROL_SOCK")
-                    .map(|v| v.to_string_lossy().into_owned())
-                    .as_deref(),
-                std::env::var_os("ATERM_NO_CONTROL_SOCK")
-                    .map(|v| v.to_string_lossy().into_owned())
-                    .as_deref(),
-            ),
+            Self::UnownedControlSocket => {
+                use aterm_types::control_socket::{SocketDirective, socket_directive};
+                let socket = std::env::var_os("ATERM_CONTROL_SOCK")
+                    .map(|v| v.to_string_lossy().into_owned());
+                let disabled = std::env::var_os("ATERM_NO_CONTROL_SOCK")
+                    .map(|v| v.to_string_lossy().into_owned());
+                match socket_directive(socket.as_deref(), disabled.as_deref()) {
+                    SocketDirective::Explicit(path) => {
+                        let plan = crate::control_auth::SocketPlan {
+                            sock_path: path.to_string(),
+                            token_path: crate::control_auth::token_path_for_socket(&path),
+                            latest_link: None,
+                        };
+                        !crate::control_socket_identity::published()
+                            .is_some_and(|identity| identity.matches_plan_path(&plan))
+                    }
+                    _ => false,
+                }
+            }
             Self::Headless => app.headless,
             Self::NoEventLoopProxy => app.proxy.is_none(),
         }
     }
-}
-
-/// Whether these `$ATERM_CONTROL_SOCK` / `$ATERM_NO_CONTROL_SOCK` values name
-/// an EXPLICIT socket path — decided by the ONE engine-side reading the socket
-/// plan itself binds by ([`aterm_types::control_socket::socket_directive`],
-/// via `control_auth::resolve_socket_plan`), so the update gate can never
-/// disagree with the bind about what the variable means. Unset and EMPTY are
-/// the per-instance default; `0`/`off` (either variable) is a DISABLED socket;
-/// only a real path carries the shared-path collision the seamless lane must
-/// refuse.
-fn control_sock_is_explicit(sock: Option<&str>, no_sock: Option<&str>) -> bool {
-    matches!(
-        aterm_types::control_socket::socket_directive(sock, no_sock),
-        aterm_types::control_socket::SocketDirective::Explicit(_)
-    )
 }
 
 impl App {
@@ -3153,12 +3246,13 @@ impl App {
     /// seamless lane is available. Read by the apply gate
     /// (`start_unix_update_handoff`) and by the status bar's posture
     /// ([`App::apply_posture_for`]), and nowhere else, so the two cannot
-    /// disagree. Plain reads only — `var_os` and two fields — never a memo: a
+    /// disagree. Plain reads only — environment, two fields and the published
+    /// bound-socket witness; no filesystem probes or recursive memo: a
     /// memo whose initializer could call back into its owner parked the main
     /// thread forever on 2026-08-30.
     ///
     /// NOT folded into `arm_native_auto_apply`'s `enabled` on purpose: the cold
-    /// lane is a real automatic path for a headless or `--control-sock` process
+    /// lane is a real automatic path for a headless or opted-out process
     /// whose last terminal has closed (the classifier admits it at zero live
     /// PTYs, and the cold spawn re-injects `ATERM_HEADLESS`), so a lane that
     /// never arms would never take it.
@@ -3437,7 +3531,7 @@ impl App {
         // status bar's posture folded only the first, so a `--control-sock` or
         // `--headless` process painted "applies in place within ~2 min" over an
         // apply this gate refused (2026-08-30). `seamless_handoff_unavailable`
-        // is now the only place the four are read, and every reason is said in
+        // is now the only place the remaining vetoes are read, and every reason is said in
         // the log the way the opt-out always was.
         let handoff_unavailable = self.seamless_handoff_unavailable();
         if let Some(why) = handoff_unavailable {
@@ -3467,9 +3561,7 @@ impl App {
                 // `failed` counted every deterministic "the seamless lane is
                 // unavailable here" as a hard apply failure (the field's
                 // failing_applies=23) and erased the standing explanation.
-                return Err(crate::UpdateHandoffStartError::refused(
-                    reason.message(facts),
-                ));
+                return Err(update_admission_refusal(reason, facts, handoff_unavailable));
             }
             crate::native_update_admission::AdmissionDecision::Apply(
                 crate::native_update_admission::ApplyLane::Cold,
@@ -3570,10 +3662,24 @@ impl App {
         let preverified = apply_attempt
             .as_ref()
             .and_then(|attempt| self.cached_handoff_preverification(attempt));
-        if preverified == Some(false) {
-            return Err(crate::UpdateHandoffStartError::failed(
-                "the staged update failed verification; the terminal was left untouched",
-            ));
+        // ONLY THE AUTOMATIC MODES HONOUR A CACHED REFUSAL (2026-09-14). An
+        // explicit apply is the person's own request, made — in the case this
+        // was written for — right after they put the signed bundle back: a
+        // refusal cached up to ten minutes earlier must not answer for the
+        // bundle that is there now. The worker re-verifies for them; a cached
+        // PASS is still honoured by every mode, since it only shrinks the park.
+        if preverified == Some(false) && mode.is_automatic() {
+            // The CAUSE the verifier gave, not a generic verdict: an installed
+            // bundle that fails the signing policy (a local build swapped into
+            // /Applications) is the owner's to fix, and only the message can
+            // tell them so.
+            let reason = apply_attempt
+                .as_ref()
+                .and_then(|attempt| self.cached_handoff_preverification_reason(attempt))
+                .unwrap_or_else(|| "the staged update failed verification".to_string());
+            return Err(crate::UpdateHandoffStartError::failed(format!(
+                "{reason}; the terminal was left untouched"
+            )));
         }
         let verify_staged_candidate = !debug_seamless && preverified != Some(true);
 
@@ -3757,6 +3863,7 @@ impl App {
         };
         self.next_update_handoff_id = next_attempt_id;
         let mut command = std::process::Command::new(exe);
+        crate::control_socket_identity::bind_command(&mut command);
         command
             // Leading `--window` pins stripped, as on the cold/Windows lanes.
             .args(aterm_update::reexec_forwarded_args(
@@ -3858,15 +3965,18 @@ impl App {
         // a physical failure of these same bytes, widest for an explicit apply — see
         // `handoff_freeze_budget`. Everything below that used to spell "20 ms" now
         // spells the budget it actually had.
-        let prior_physical_failures = self
-            .auto_apply_physical_retry
-            .filter(|retry| retry.build == build)
-            .map_or(0, |retry| retry.cycles);
+        // Keyed by the ATTEMPT'S TARGET (2026-09-14): every writer of the
+        // physical-retry record stores the staged build it failed to reach,
+        // while `build` here is the RUNNING one — so the filter never matched,
+        // every automatic retry got the first attempt's 20 ms, and the wider
+        // rungs (5f77ff084) were dead on the lane they were written for.
+        let prior_physical_failures = self.prior_physical_failures_of(apply_attempt.as_ref());
         let freeze_budget = handoff_freeze_budget(mode, prior_physical_failures);
         let freeze_ms = freeze_budget.as_millis();
         let handoff_history_comfort = freeze_budget / 2;
         aterm_log::info!(
-            "update apply: freeze budget {freeze_ms} ms ({mode:?}, {prior_physical_failures} prior physical failure(s) of build {build})"
+            "update apply: freeze budget {freeze_ms} ms ({mode:?}, {prior_physical_failures} prior \
+             physical failure(s) of the target artifact; running build {build})"
         );
         // THE INSTANT THE TERMINAL STOPS ECHOING — the start of the freeze the
         // user experiences, and the zero point of the two numbers reported at
@@ -3903,6 +4013,10 @@ impl App {
             ));
         }
         let mut screens = Vec::new();
+        // The control carry's captures. Storage it cannot reserve carries
+        // nothing (`carry_room` false) — never a failed capture.
+        let mut carries = Vec::new();
+        let carry_room = carries.try_reserve_exact(live.len()).is_ok();
         if screens.try_reserve_exact(live.len()).is_err() {
             self.rollback_overlap(None, &live);
             return Err(crate::UpdateHandoffStartError::failed(
@@ -3932,10 +4046,9 @@ impl App {
         let mut cells_reserve = 0_u64;
         let mut bytes_reserve = 0_u64;
         for session in self.pool.iter() {
-            let terminal = match session.term.try_lock() {
-                Ok(guard) => guard,
-                Err(std::sync::TryLockError::Poisoned(poison)) => poison.into_inner(),
-                Err(std::sync::TryLockError::WouldBlock) => {
+            let terminal = match try_lock_by(&session.term, deadline) {
+                Some(guard) => guard,
+                None => {
                     cells_reserve = u64::MAX;
                     bytes_reserve = u64::MAX;
                     break;
@@ -3955,14 +4068,12 @@ impl App {
                 ));
                 break;
             }
-            let terminal = match session.term.try_lock() {
-                Ok(guard) => guard,
-                Err(std::sync::TryLockError::Poisoned(poison)) => poison.into_inner(),
-                Err(std::sync::TryLockError::WouldBlock) => {
-                    capture_failed =
-                        Some("a terminal engine was busy during handoff capture".to_string());
-                    break;
-                }
+            let Some(terminal) = try_lock_by(&session.term, deadline) else {
+                capture_failed = Some(format!(
+                    "a terminal engine stayed busy for the whole {freeze_ms} ms handoff \
+                     capture window"
+                ));
+                break;
             };
             if !terminal.parser_is_ground() {
                 capture_failed =
@@ -4169,6 +4280,27 @@ impl App {
                 checkpoint = visible_only;
             }
             screens.push((session.id, checkpoint));
+            // THE CONTROL CARRY'S SHARE OF THE FREEZE (round 10), and all of it:
+            // the archive's fence and counters, plus the differ's screen-sized
+            // state — under this same lock, so it describes exactly the screen
+            // this checkpoint carries. The rows and the ledger are exported on
+            // the worker, behind the fence. It cannot fail the capture, and past
+            // half the budget it leaves even the differ's state out — the worker
+            // takes it then, while the fence's fingerprint of it holds (nothing
+            // committed since), so the adopting engine still goes on exactly:
+            // the carry is never worth the deadline.
+            let differ = deadline.saturating_duration_since(std::time::Instant::now())
+                >= handoff_history_comfort;
+            // Reserved for every live session above, so this never allocates.
+            if carry_room {
+                carries.push(crate::handoff_carry::capture_head(
+                    session.id,
+                    &terminal,
+                    &session.term,
+                    &session.ctx.turns,
+                    differ,
+                ));
+            }
             if std::time::Instant::now() >= deadline {
                 capture_failed = Some(format!(
                     "bounded visible-screen capture exceeded {freeze_ms} ms"
@@ -4284,6 +4416,7 @@ impl App {
             manifest,
             fds,
             screens,
+            carries,
             window,
             layout,
             layout_digest,
@@ -4833,6 +4966,76 @@ impl App {
     /// proxy) cannot otherwise tell a healthy candidate from one production would
     /// decline outright, which is how a whole retry-policy suite came to be written
     /// against a `passed: false` fixture.
+    /// The cached verdict's own reason for a refusal, when the entry is the
+    /// fresh one for THIS artifact (the same key [`Self::cached_handoff_preverification`]
+    /// reads by).
+    #[cfg(unix)]
+    #[must_use]
+    pub(crate) fn cached_handoff_preverification_reason(
+        &self,
+        attempt: &crate::native_updater_service::ApplyAttemptTicket,
+    ) -> Option<String> {
+        let cached = self
+            .handoff_preverified
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        cached
+            .as_ref()
+            .filter(|entry| {
+                entry.build == attempt.target_build()
+                    && entry.commit == attempt.target_commit()
+                    && entry.artifact == attempt.target_dmg_sha256()
+                    && entry.at.elapsed() < crate::HANDOFF_PREVERIFY_FRESHNESS
+            })
+            .and_then(|entry| entry.reason.clone())
+    }
+
+    /// How many physical handoff failures this process has already booked
+    /// against the artifact `attempt` targets — the number the freeze budget
+    /// widens on. `0` with no attempt (the QA seam) or no record.
+    #[must_use]
+    pub(crate) fn prior_physical_failures_of(
+        &self,
+        attempt: Option<&crate::native_updater_service::ApplyAttemptTicket>,
+    ) -> u8 {
+        let Some(attempt) = attempt else {
+            return 0;
+        };
+        self.auto_apply_physical_retry
+            .filter(|retry| retry.build == attempt.target_build())
+            .map_or(0, |retry| retry.cycles)
+    }
+
+    /// The cached verdict's reason keyed by the ARTIFACT alone — for the
+    /// submission-time failure arm, which has no ticket in hand (the attempt
+    /// failed before any candidate was spawned) but knows the intent's build
+    /// and digest. `Some(reason)` only for a fresh REFUSAL of that artifact.
+    #[cfg(unix)]
+    #[must_use]
+    pub(crate) fn cached_handoff_refusal_reason(&self, build: u64) -> Option<String> {
+        // The artifact the verdict is about is the live stage's digest for
+        // this build — the same stage `poll` admitted the intent against.
+        let snapshot = self.native_updater_service.snapshot();
+        let artifact = snapshot
+            .staged
+            .as_ref()
+            .filter(|staged| staged.build == build)
+            .map(|staged| staged.dmg_sha256.clone())?;
+        let cached = self
+            .handoff_preverified
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        cached
+            .as_ref()
+            .filter(|entry| {
+                !entry.passed
+                    && entry.build == build
+                    && entry.artifact == artifact
+                    && entry.at.elapsed() < crate::HANDOFF_PREVERIFY_FRESHNESS
+            })
+            .and_then(|entry| entry.reason.clone())
+    }
+
     #[cfg(unix)]
     #[must_use]
     pub(crate) fn cached_handoff_preverification(
@@ -4943,6 +5146,10 @@ impl App {
         // used to write is cleared only by a real successful apply, so QA runs
         // accrued forever and escalated to the persistent-failure notification.
         let debug_seam = pending.apply_attempt.is_none();
+        let attempted_build = pending
+            .apply_attempt
+            .as_ref()
+            .map(|attempt| attempt.target_build());
         let surfaced = match (pending.apply_attempt, reconcile) {
             (Some(attempt), Some(facts)) => self.finish_async_native_update_handoff(
                 attempt,
@@ -4970,7 +5177,12 @@ impl App {
             if debug_seam {
                 self.react_to_update_apply_outcome(source, surfaced, false);
             } else {
-                self.surface_update_apply_outcome(source, surfaced, false);
+                self.surface_update_apply_outcome_for_target(
+                    source,
+                    surfaced,
+                    false,
+                    attempted_build.unwrap_or(0),
+                );
             }
         }
         Some(teardown)
@@ -5013,6 +5225,135 @@ impl App {
             let _ = aterm_pty::set_cloexec(*master, true);
         }
         self.resume_deferred_readers_nonblocking();
+    }
+}
+
+/// Keep the actionable handoff cause in the returned refusal, which the updater
+/// records in its durable status. A separate warning cannot answer a later
+/// `update status`, and an unrelated admission failure must keep its own reason.
+#[cfg(unix)]
+fn update_admission_refusal(
+    reason: crate::native_update_admission::AdmissionBlock,
+    facts: crate::native_update_admission::AdmissionFacts,
+    unavailable: Option<HandoffUnavailable>,
+) -> crate::UpdateHandoffStartError {
+    let message = if reason == crate::native_update_admission::AdmissionBlock::LivePtysNeedSeamless
+        && facts.foreground_jobs <= facts.live_ptys
+        && let Some(why) = unavailable
+    {
+        format!(
+            "Update kept {} live terminal session(s), including {} foreground job(s), running: seamless handoff unavailable because {}.{}",
+            facts.live_ptys,
+            facts.foreground_jobs,
+            why.cause(),
+            why.remedy(),
+        )
+    } else {
+        reason.message(facts)
+    };
+    crate::UpdateHandoffStartError::refused(message)
+}
+
+#[cfg(all(test, unix))]
+mod admission_refusal_detail_tests {
+    use super::{HandoffUnavailable, update_admission_refusal};
+    use crate::native_update_admission::{
+        AdmissionBlock, AdmissionDecision, AdmissionFacts, classify,
+    };
+
+    fn live_facts() -> AdmissionFacts {
+        AdmissionFacts {
+            staged_verified: true,
+            seamless_capable: false,
+            native_state_certified: true,
+            live_ptys: 3,
+            foreground_jobs: 2,
+            unknown_foregrounds: 0,
+        }
+    }
+
+    #[test]
+    fn live_session_refusal_retains_exact_handoff_cause_and_remedy() {
+        for (unavailable, cause, remedy) in [
+            (
+                HandoffUnavailable::OptedOut,
+                "$ATERM_NO_SEAMLESS_UPDATE is set",
+                "Unset it to restore the default.",
+            ),
+            (
+                HandoffUnavailable::Headless,
+                "--headless (no window)",
+                "A windowed launch restores the default.",
+            ),
+        ] {
+            let facts = live_facts();
+            let AdmissionDecision::Block(reason) = classify(facts) else {
+                panic!("live terminals without seamless handoff must block");
+            };
+            let refusal = update_admission_refusal(reason, facts, Some(unavailable));
+            assert!(
+                refusal.is_refused(),
+                "a refusal cannot increment a failure streak"
+            );
+            let message = refusal.into_message();
+            assert!(message.contains(cause), "{message}");
+            assert!(message.contains(remedy), "{message}");
+            assert!(message.contains("3 live terminal session(s)"), "{message}");
+            assert!(message.contains("2 foreground job(s)"), "{message}");
+            assert!(
+                message.chars().count() <= 400,
+                "durable health truncates at 400 characters"
+            );
+            // Historical construction kept the counts but lost both actionable facts.
+            assert!(!reason.message(facts).contains(cause));
+            assert!(!reason.message(facts).contains(remedy));
+        }
+    }
+
+    #[test]
+    fn unrelated_admission_refusals_keep_the_primary_reason() {
+        let base = live_facts();
+        for (facts, expected) in [
+            (
+                AdmissionFacts {
+                    staged_verified: false,
+                    ..base
+                },
+                AdmissionBlock::UnverifiedStage,
+            ),
+            (
+                AdmissionFacts {
+                    native_state_certified: false,
+                    ..base
+                },
+                AdmissionBlock::NativeStateUncertified,
+            ),
+            (
+                AdmissionFacts {
+                    unknown_foregrounds: 1,
+                    ..base
+                },
+                AdmissionBlock::ForegroundProbeUnknown,
+            ),
+            (
+                AdmissionFacts {
+                    foreground_jobs: 4,
+                    ..base
+                },
+                AdmissionBlock::LivePtysNeedSeamless,
+            ),
+        ] {
+            assert_eq!(classify(facts), AdmissionDecision::Block(expected));
+            let refusal =
+                update_admission_refusal(expected, facts, Some(HandoffUnavailable::OptedOut));
+            assert!(refusal.is_refused());
+            assert_eq!(refusal.into_message(), expected.message(facts));
+        }
+        assert_eq!(
+            update_admission_refusal(AdmissionBlock::LivePtysNeedSeamless, base, None)
+                .into_message(),
+            AdmissionBlock::LivePtysNeedSeamless.message(base),
+        );
     }
 }
 
@@ -5346,38 +5687,6 @@ mod capture_budget_reservation_tests {
                 );
             }
         }
-    }
-
-    /// REGRESSION (the desk that could not update, part two — 2026-09-01). The
-    /// seamless gate's `ExplicitControlSock` reason used to hold for ANY
-    /// present `$ATERM_CONTROL_SOCK`, while the socket plan reads the same
-    /// variable through `socket_directive`, where EMPTY means the
-    /// per-instance default and `0`/`off` means no socket at all. A daily
-    /// driver that inherited an empty value from its launching shell bound
-    /// its default `aterm-<pid>.sock` like any other instance — no shared
-    /// path, no collision — yet every automatic seamless apply was refused
-    /// (23 consecutive failures in the field log). The gate now asks the one
-    /// engine-side reading the bind uses: only a REAL path holds the reason.
-    #[test]
-    fn only_a_real_control_sock_path_disables_the_seamless_lane() {
-        use crate::app_update_handoff::control_sock_is_explicit;
-        // The hazard: a genuinely explicit shared path.
-        assert!(control_sock_is_explicit(Some("/tmp/x/c.sock"), None));
-        // The field case: empty = the per-instance default socket.
-        assert!(!control_sock_is_explicit(Some(""), None));
-        // Unset = the per-instance default socket.
-        assert!(!control_sock_is_explicit(None, None));
-        // A disabled socket has no path to collide on.
-        assert!(!control_sock_is_explicit(Some("0"), None));
-        assert!(!control_sock_is_explicit(Some("off"), None));
-        assert!(!control_sock_is_explicit(Some("OFF"), None));
-        // `$ATERM_NO_CONTROL_SOCK` wins: no socket, no collision, whatever
-        // the path variable says.
-        assert!(!control_sock_is_explicit(Some("/tmp/x/c.sock"), Some("1")));
-        // …but its inert spellings do not disable the socket, so the path
-        // stays explicit.
-        assert!(control_sock_is_explicit(Some("/tmp/x/c.sock"), Some("0")));
-        assert!(control_sock_is_explicit(Some("/tmp/x/c.sock"), Some("")));
     }
 
     /// The exact boundary the reservation establishes: a session is refused if and
@@ -7609,6 +7918,7 @@ mod returned_handoff_completion_lane_tests {
         use crate::app_native::{
             PHYSICAL_FAILURE_LIFETIME_ATTEMPTS, STRUCTURAL_FAILURE_LIFETIME_ATTEMPTS,
         };
+        let _ledger = crate::app_update_screen::hold_update_ledger_for_test();
         let mut app = App::headless_for_test();
         let build = stage_one_build(&mut app);
         let starved = crate::ChildDeathEvidence::Signalled {
@@ -7680,6 +7990,7 @@ mod returned_handoff_completion_lane_tests {
     #[test]
     fn a_refusing_child_died_converges_to_manual_only_within_its_budget() {
         use crate::app_native::STRUCTURAL_FAILURE_LIFETIME_ATTEMPTS;
+        let _ledger = crate::app_update_screen::hold_update_ledger_for_test();
         let mut app = App::headless_for_test();
         let build = stage_one_build(&mut app);
         let refused = crate::ChildDeathEvidence::Exited { code: 0 };
@@ -7745,6 +8056,7 @@ mod returned_handoff_completion_lane_tests {
             PHYSICAL_FAILURE_LIFETIME_ATTEMPTS, PHYSICAL_FAILURES_PER_EPOCH,
             UNEXPLAINED_FAILURE_LIFETIME_ATTEMPTS,
         };
+        let _ledger = crate::app_update_screen::hold_update_ledger_for_test();
         let mut app = App::headless_for_test();
         let build = stage_one_build(&mut app);
         let deadline = |app: &App| {

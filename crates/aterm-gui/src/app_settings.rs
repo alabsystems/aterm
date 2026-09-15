@@ -426,7 +426,7 @@ impl App {
         let warmup_live = self.consent_warmup_live();
         let warmup_rows = self.consent_warmup_rows().to_vec();
         let evidence = aterm_containment::SpikeEvidence::UNMEASURED;
-        let split = crate::control_privacy::covers_split(evidence);
+        let split = crate::control_privacy::covers_split(facts.fda, evidence);
         crate::native_settings::MacosAccess {
             enabled: facts.enabled,
             fda: facts.fda,
@@ -677,6 +677,10 @@ impl App {
         // never a status.toml parse on the event loop.
         self.publish_native_packages_state();
         self.start_native_packages_refresh();
+        // The Security page's "This Mac" card confirms the [machine] settings from
+        // a fresh `atpkg machine` read every time Settings surfaces — never from a
+        // remembered posture.
+        self.start_native_machine_refresh();
         let action_id = if route == crate::native_settings::SettingsRoute::Manual {
             crate::native_ui::ActionId::new("settings/manual/open")
         } else {

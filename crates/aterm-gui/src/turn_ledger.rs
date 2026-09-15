@@ -32,8 +32,9 @@ const MAX_TEXT: usize = 512;
 /// One completed turn, in the order `cmd_turn` finished it.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct TurnRecord {
-    /// The process-unique turn id (the `id=` the `turn` reply prints, and the id
-    /// the events digest and `ERR busy turn=<id>` refusals name).
+    /// The turn id (the `id=` the `turn` reply prints, and the id the events
+    /// digest and `ERR busy turn=<id>` refusals name): unique in the process,
+    /// and still rising after a self-update handoff, which carries the counter.
     pub id: u64,
     /// Milliseconds since the process epoch when the turn began (monotonic; for
     /// ordering + aligning against the temporal/cast spines, not wall-clock).
@@ -57,16 +58,24 @@ pub struct TurnRecord {
     /// rows a fullscreen app scrolled off the top during and after this turn.
     /// `history` prints it as `arch=<origin>:<last>`.
     pub arch: ArchMark,
+    /// The record came from an EARLIER aterm process, carried to this one by
+    /// a self-update handoff: `history` prints `carried=1`, and its
+    /// `started_ms` and `seq` are that process's clock and content counter
+    /// (neither is comparable with this process's).
+    pub carried: bool,
 }
 
 /// A position in a session's alt-screen archive (`aterm_core`'s `AltArchive`):
 /// the archive's host-assigned `origin` and its newest index `last` (0 = nothing
 /// archived yet). Printed `<origin>:<last>` — the exact token `offscreen
-/// since=` accepts, so a mark from another process (a handoff, a restart) reads
-/// from the start of the new archive instead of from an unrelated index.
+/// since=` accepts. A self-update handoff carries the archive with its origin,
+/// so a mark minted before it still reads the rows after it; a mark from
+/// another origin (a restart, a handoff that could not carry the archive)
+/// reads from the start of the new archive instead of from an unrelated index.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct ArchMark {
-    /// The archive's origin (unique per aterm process; 0 when the host never set one).
+    /// The archive's origin (unique per aterm process that started an archive,
+    /// and kept by a handoff that carries it; 0 when the host never set one).
     pub origin: u64,
     /// The newest archived index at the mark.
     pub last: u64,
@@ -93,6 +102,13 @@ impl std::fmt::Display for ArchMark {
 #[derive(Default)]
 pub struct TurnLedger {
     records: VecDeque<TurnRecord>,
+    /// Turn ids below this may have named records of this session that the
+    /// ledger never got: a self-update handoff could not carry the ledger
+    /// whole (no sidecar, a bad one, a lock another thread kept, records shed
+    /// to fit). [`TurnLedger::low_id`] reports it while no record is held,
+    /// so a resumed `since-turn=` below it is told, as for evicted records.
+    /// 0: none.
+    unheld_below: u64,
 }
 
 impl TurnLedger {
@@ -109,6 +125,38 @@ impl TurnLedger {
         self.records.len()
     }
 
+    /// The ledger a self-update handoff carried from the previous process:
+    /// its records, each marked [`TurnRecord::carried`], newest-last. Only a
+    /// strictly rising run of ids is kept (a record whose id does not rise past
+    /// the one before it is dropped), because [`TurnLedger::since`] seeks by id,
+    /// and only the newest [`LEDGER_CAP`] of them. `unheld_below`: turn ids
+    /// below it may have named records the carry could not bring (0: none).
+    pub(crate) fn carried(records: Vec<TurnRecord>, unheld_below: u64) -> Self {
+        let mut ledger = Self {
+            records: VecDeque::new(),
+            unheld_below,
+        };
+        for mut rec in records {
+            if ledger.records.back().is_some_and(|last| last.id >= rec.id) {
+                continue;
+            }
+            rec.carried = true;
+            ledger.push(rec);
+        }
+        ledger
+    }
+
+    /// Every retained record, oldest first (the handoff's export).
+    pub(crate) fn records(&self) -> impl Iterator<Item = &TurnRecord> {
+        self.records.iter()
+    }
+
+    /// Turn ids below this may have named records the ledger never got (see
+    /// the field); 0: none. The handoff's export carries it on.
+    pub(crate) const fn unheld_below(&self) -> u64 {
+        self.unheld_below
+    }
+
     /// The highest recorded turn id, or `None` when empty — the events digest
     /// seeds its watermark to this so it streams only turns that land AFTER
     /// subscription (a live stream, never the historical backlog).
@@ -121,9 +169,15 @@ impl TurnLedger {
     /// between the anchor and the retained window — the events stream emits a
     /// `GAP … events-resync=` so the resumed subscriber knows it missed some (turn
     /// ids come from a process-global counter, so a client cannot infer the loss from
-    /// a per-session id gap the way it can for contiguous block ids).
+    /// a per-session id gap the way it can for contiguous block ids). An EMPTY
+    /// ledger a self-update handoff could not carry whole reports the first id it
+    /// can vouch for ([`TurnLedger::carried`]'s `unheld_below`): the turns below it
+    /// are just as gone.
     pub(crate) fn low_id(&self) -> Option<u64> {
-        self.records.front().map(|r| r.id)
+        self.records
+            .front()
+            .map(|r| r.id)
+            .or((self.unheld_below > 0).then_some(self.unheld_below))
     }
 
     /// Records with `id > after`, oldest-first (the events digest's scan, and the
@@ -150,6 +204,16 @@ impl TurnLedger {
             Some(a) => self.records.partition_point(|r| r.id <= a),
         };
         self.records.range(start..)
+    }
+}
+
+/// A carried record's `status` word as the one this build prints: `settled`
+/// or `timeout` (what `cmd_turn` records); `None` for any other word.
+pub(crate) fn status_word(word: &str) -> Option<&'static str> {
+    match word {
+        "settled" => Some("settled"),
+        "timeout" => Some("timeout"),
+        _ => None,
     }
 }
 
@@ -201,6 +265,7 @@ mod tests {
             screen_hash: id,
             seq: id,
             arch: ArchMark::default(),
+            carried: false,
         }
     }
 

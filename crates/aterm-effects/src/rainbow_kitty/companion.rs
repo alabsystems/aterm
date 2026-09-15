@@ -1842,6 +1842,7 @@ mod tests {
             phase: 12.0,
             caret: (7, 33),
             caret_t: 0.5,
+            caret_walk: None,
             mend: None,
             surge: 0.0,
             flow: Default::default(),
@@ -1950,6 +1951,7 @@ mod tests {
                 // Frozen on purpose: the last landing the licence gate passed.
                 caret: (3, 5),
                 caret_t: 0.25,
+                caret_walk: None,
                 mend: None,
                 surge: 0.0,
                 flow: Default::default(),

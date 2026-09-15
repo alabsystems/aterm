@@ -98,6 +98,10 @@ name = "effects_pipeline"
 harness = false
 
 [[bench]]
+name = "pet_world_observe"
+harness = false
+
+[[bench]]
 name = "pet_brain"
 harness = false
 

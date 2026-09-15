@@ -44,7 +44,7 @@
 
 use std::fmt;
 
-use super::prompt::parse_prompt;
+use crate::prompt::parse_prompt;
 
 /// The worker's phase.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -448,7 +448,7 @@ fn status_block(rows: &[String], top: usize) -> StatusBlock {
 /// A row that can be the status row: a spinner glyph in column 0, then
 /// whitespace (`✶ Deliberating…`, `· Mustering… (38s)`, `✻ Cooked for 4s ·
 /// done 2:41 PM`).
-fn is_glyph_row(row: &str) -> bool {
+pub fn is_glyph_row(row: &str) -> bool {
     let mut cs = row.chars();
     cs.next().is_some_and(|g| SPINNERS.contains(&g)) && cs.next().is_some_and(char::is_whitespace)
 }
@@ -481,7 +481,7 @@ fn is_tip_or_todo(t: &str) -> bool {
 /// Claude Code's session survey, which it parks above the composer between
 /// turns and during them: `● How is Claude doing this session? (optional)`
 /// and its options row `1: Bad    2: Fine   3: Good   0: Dismiss`.
-fn is_survey(row: &str) -> bool {
+pub fn is_survey(row: &str) -> bool {
     let t = row.trim_start();
     (t.starts_with('●') && t.contains("How is Claude doing this session"))
         || (t.starts_with("1: Bad") && t.contains("0: Dismiss"))
@@ -745,7 +745,7 @@ pub fn transcript_end(rows: &[String]) -> usize {
 
 /// A status row that reports a finished turn rather than work in flight: not
 /// a spinner's `…` activity, not `Waiting for …`.
-fn is_done_row(row: &str) -> bool {
+pub fn is_done_row(row: &str) -> bool {
     !is_activity_row(row) && !row.contains("Waiting for ")
 }
 
@@ -925,8 +925,8 @@ fn find_ascii_ci(hay: &str, needle: &str) -> Option<usize> {
 
 #[cfg(test)]
 mod tests {
-    use super::super::prompt::fixtures::{bash_one_row, composer, rows};
     use super::*;
+    use crate::prompt::fixtures::{bash_one_row, composer, rows};
 
     fn screen(body: &[&str], footer: &str) -> Vec<String> {
         let mut r = rows(body);

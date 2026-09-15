@@ -906,6 +906,7 @@ fn parse(args: &[String]) -> Result<(Config, u64), String> {
         screen: Vec::new(),
         sock: None,
         token: None,
+        presence: crate::presence::Mode::Meta,
     };
     let (mut tcp, mut key_file, mut from) = (false, None, 0u64);
     let mut it = args.iter();

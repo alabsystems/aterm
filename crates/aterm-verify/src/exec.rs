@@ -19,11 +19,13 @@
 //! because the one verdict this gate could not previously reach is "this never
 //! finished" — see that constant for the whole argument.
 
+use std::cell::RefCell;
 use std::ffi::{OsStr, OsString};
 use std::fs::File;
-use std::io;
+use std::io::{self, Write};
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
+use std::sync::Mutex;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 
@@ -113,6 +115,162 @@ pub struct ExecEnv<'a> {
     /// ([`crate::Ctx::exec_env`]); carried per invocation rather than read here
     /// so a stage's decision stays a function of a value a test can construct.
     pub child_ceiling: Option<Duration>,
+    /// Variables REMOVED from every child's inherited environment before its
+    /// own [`Cmd::envs`] are applied — so a stage that names a variable
+    /// explicitly still wins. Every run, in place or not, removes the gate's own
+    /// side channels ([`crate::GATE_CHANNELS`]: `ATERM_VERIFY_TIMINGS` and
+    /// `ATERM_VERIFY_SNAPSHOT`) and otherwise inherits exactly what it always
+    /// did. A SNAPSHOT run also removes `CARGO_TARGET_DIR` (2026-09-13):
+    /// the snapshot's lanes are its own directories, and a caller's redirect
+    /// would put every cargo child straight back into the shared, contended
+    /// target dir the snapshot exists to get away from.
+    pub remove_env: &'a [&'a str],
+    /// Where per-child timing rows go when `ATERM_VERIFY_TIMINGS` names a file.
+    /// `None` spawns nothing extra and writes nothing.
+    pub timings: Option<&'a Timings>,
+}
+
+/// `ATERM_VERIFY_TIMINGS=<file>`: one TSV row per child — and one per stage,
+/// with the child column `(stage)` — naming the stage, the child, the lane, its
+/// start and end in seconds since the gate started, how it ended, and the
+/// one-minute load average at both ends.
+///
+/// WHY IT EXISTS (2026-09-13): a `--fast` run took 14 h, and about 430 min of
+/// it sat inside the doctest stage without printing a single line. Nothing the
+/// gate wrote could say whether that time was work, queueing on a lock, or a
+/// machine shared with other agents' builds. The load columns are what separate
+/// those three. The ladder stays byte-for-byte the same with or without it —
+/// this is a side channel for tuning, never a second vocabulary for outcomes.
+#[derive(Debug)]
+pub struct Timings {
+    file: Mutex<File>,
+    t0: Instant,
+}
+
+/// One TSV row of [`Timings`].
+#[derive(Clone, Copy, Debug)]
+pub struct TimingRow<'a> {
+    pub stage: &'a str,
+    /// The argv, space-joined, or `(stage)` for a stage's own row.
+    pub child: &'a str,
+    pub lane: &'a str,
+    pub start: f64,
+    pub end: f64,
+    /// The exit code, `signal`, or `spawn-error` — for a stage row, `ok`,
+    /// `skip`, `FAIL` or `could-not-run`.
+    pub how: &'a str,
+    pub load_start: Option<f64>,
+    pub load_end: Option<f64>,
+}
+
+thread_local! {
+    /// The stage (title, lane) the current thread is running, for timing rows.
+    /// The scheduler gives every stage its own thread, so a thread-local names
+    /// the stage without threading a label through every argv builder.
+    static STAGE: RefCell<Option<(String, String)>> = const { RefCell::new(None) };
+}
+
+/// Run `f` with this thread's timing rows attributed to `stage` in `lane`.
+pub fn with_stage<T>(stage: &str, lane: &str, f: impl FnOnce() -> T) -> T {
+    STAGE.with(|s| *s.borrow_mut() = Some((stage.to_string(), lane.to_string())));
+    let out = f();
+    STAGE.with(|s| *s.borrow_mut() = None);
+    out
+}
+
+impl Timings {
+    /// The TSV header, written first.
+    pub const HEADER: &'static str =
+        "stage\tchild\tlane\tstart_s\tend_s\texit\tload1_start\tload1_end\n";
+
+    /// Create (truncate) `path` and write the header.
+    ///
+    /// # Errors
+    /// Fails when the file cannot be created or written.
+    pub fn create(path: &Path) -> io::Result<Self> {
+        let mut file = File::create(path)?;
+        file.write_all(Self::HEADER.as_bytes())?;
+        Ok(Self {
+            file: Mutex::new(file),
+            t0: Instant::now(),
+        })
+    }
+
+    /// Seconds since the gate started.
+    #[must_use]
+    pub fn now(&self) -> f64 {
+        self.t0.elapsed().as_secs_f64()
+    }
+
+    /// Append one row. A failed write is dropped: timings decide nothing, so
+    /// they may never turn a run red.
+    pub fn row(&self, r: &TimingRow<'_>) {
+        let cell = |t: &str| t.replace(['\t', '\n', '\r'], " ");
+        let load = |l: Option<f64>| l.map_or_else(|| "-".to_string(), |v| format!("{v:.2}"));
+        let line = format!(
+            "{}\t{}\t{}\t{:.3}\t{:.3}\t{}\t{}\t{}\n",
+            cell(r.stage),
+            cell(r.child),
+            cell(r.lane),
+            r.start,
+            r.end,
+            cell(r.how),
+            load(r.load_start),
+            load(r.load_end),
+        );
+        if let Ok(mut f) = self.file.lock() {
+            let _ = f.write_all(line.as_bytes());
+        }
+    }
+
+    /// A child's row, attributed to the stage this thread is running.
+    fn child_row(&self, cmd: &Cmd, start: f64, load0: Option<f64>, r: &Run) {
+        let (stage, lane) = STAGE
+            .with(|s| s.borrow().clone())
+            .unwrap_or_else(|| ("-".to_string(), "-".to_string()));
+        let how = match (r.code, &r.spawn_error) {
+            (Some(c), _) => c.to_string(),
+            (None, Some(_)) => "spawn-error".to_string(),
+            (None, None) => "signal".to_string(),
+        };
+        self.row(&TimingRow {
+            stage: &stage,
+            child: &cmd.argv().join(" "),
+            lane: &lane,
+            start,
+            end: self.now(),
+            how: &how,
+            load_start: load0,
+            load_end: load_average(),
+        });
+    }
+}
+
+/// The one-minute load average: `/proc/loadavg` where it exists, else
+/// `sysctl -n vm.loadavg` (macOS prints `{ 1.23 2.34 3.45 }`). Only spawned
+/// when timings are on.
+#[must_use]
+pub fn load_average() -> Option<f64> {
+    let text = std::fs::read_to_string("/proc/loadavg").ok().or_else(|| {
+        let out = Command::new("/usr/sbin/sysctl")
+            .args(["-n", "vm.loadavg"])
+            .stdin(Stdio::null())
+            .stderr(Stdio::null())
+            .output()
+            .ok()?;
+        out.status
+            .success()
+            .then(|| String::from_utf8_lossy(&out.stdout).into_owned())
+    })?;
+    parse_load_average(&text)
+}
+
+/// The first number in a load-average line, braces and all.
+#[must_use]
+pub fn parse_load_average(text: &str) -> Option<f64> {
+    text.split(|c: char| c.is_whitespace() || c == '{' || c == '}')
+        .find(|t| !t.is_empty())
+        .and_then(|t| t.parse().ok())
 }
 
 /// What a child did.
@@ -281,8 +439,21 @@ static SEQ: AtomicU64 = AtomicU64::new(0);
 /// reaches its own fail-closed branch.
 #[must_use]
 pub fn run(cmd: &Cmd, env: ExecEnv<'_>) -> Run {
+    let Some(timings) = env.timings else {
+        return run_untimed(cmd, env);
+    };
+    let (start, load0) = (timings.now(), load_average());
+    let r = run_untimed(cmd, env);
+    timings.child_row(cmd, start, load0, &r);
+    r
+}
+
+fn run_untimed(cmd: &Cmd, env: ExecEnv<'_>) -> Run {
     let mut c = Command::new(&cmd.program);
     c.args(&cmd.args).current_dir(env.cwd).env("PATH", env.path);
+    for k in env.remove_env {
+        c.env_remove(k);
+    }
     for (k, v) in &cmd.envs {
         c.env(k, v);
     }
@@ -494,6 +665,8 @@ mod tests {
             path: OsStr::new("/usr/bin:/bin"),
             scratch: dir,
             child_ceiling,
+            remove_env: &[],
+            timings: None,
         }
     }
 

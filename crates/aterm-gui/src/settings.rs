@@ -8336,9 +8336,14 @@ mod tests {
             caps(prefs::Section::Terminal),
             ["Scrollback", "Text direction & width", "Shell", "Updates"]
         );
+        // "This Mac" (2026-09-14): the `[machine]` table's two editable keys —
+        // `machine.universal_control` and `machine.spotlight_noindex` — group under
+        // their own caption between Permissions and the network drive, which is
+        // where `prefs::category_of` puts them. The caption list moved when those
+        // keys became editable and this pin did not, so it was red on main.
         assert_eq!(
             caps(prefs::Section::Security),
-            ["Permissions", "Network drive"]
+            ["Permissions", "This Mac", "Network drive"]
         );
         // The Kitty Log page is READ-ONLY (§F4.6): no editable key ever maps
         // to it, so its grouped layout is empty — the painter renders the
@@ -9053,101 +9058,124 @@ mod tests {
         assert_eq!(s.status, None, "filtered ↑/↓ clears the status");
     }
 
-    /// Design §3.2 (audit): footnotes wrap to the BOX width. On the 64-col rung
-    /// (full sidebar, no preview) the Permissions footnote is wider than its box:
-    /// the shared layout splits it into TWO 1-cell Footnote rows losing no text,
-    /// and every painted footnote Text FITS inside the box — the pre-fix single
-    /// unwrapped row painted ~175 px past the box edge, under the scrollbar.
+    /// Each Security group's paragraph survives the shared two-row layout cap.
+    /// Narrow rows may be visually elided, but every painted row stays inside
+    /// its box. Check Permissions and This Mac independently so adding a group
+    /// cannot disguise lost or misattributed disclosure text.
     #[test]
     fn footnotes_wrap_to_the_box_width() {
-        let g = SettingsGeom {
-            cw: 8.0,
-            ch: 16.0,
-            font_px: 13.0,
-            cols: 64,
-            panel_rows: 38,
-        };
-        let wrap = footnote_wrap_chars(g.cols);
         let mut s = SettingsState::from_config(&cfg());
         s.set_category(prefs::Section::Security);
-        let notes: Vec<&str> = category_layout(&s.fields, s.category, wrap)
-            .iter()
-            .filter_map(|r| match r {
-                GroupRow::Footnote(n) => Some(*n),
-                _ => None,
-            })
-            .collect();
-        assert_eq!(
-            notes.len(),
-            2,
-            "the Permissions footnote wraps to two rows: {notes:?}"
-        );
-        let source = prefs::group_footnote("Permissions").expect("Permissions footnote");
-        assert!(
-            notes[0].starts_with("Off by default."),
-            "the first wrapped row retains the current default-policy disclosure: {notes:?}"
-        );
-        assert_eq!(
-            notes.join(" "),
-            source,
-            "the two-row layout retains the complete current capability disclosure"
-        );
-        assert!(
-            notes[0].chars().count() <= wrap,
-            "the first row respects the authored wrap: {:?}",
-            notes[0]
-        );
-        assert!(
-            notes[1].ends_with("macOS and Windows."),
-            "the current platform disclosure remains in the retained remainder: {notes:?}"
-        );
-
-        // Painted fit: both rows are drawn and end inside the box's right edge
-        // (the band at 38 rows holds the whole Permissions group). The retained
-        // second-row source may be visually elided by the containment backstop,
-        // so match either the exact row or its painted ellipsis prefix.
-        let box_right = g.cols as f32 * g.cw - g.cw * 2.5;
-        let painted: Vec<(f32, f32)> = tray(&s, &g)
-            .prims
-            .iter()
-            .filter_map(|p| match p {
-                DrawPrim::Text { x, s: txt, px, .. }
-                    if notes.iter().any(|note| {
-                        *note == txt
-                            || txt
-                                .strip_suffix('…')
-                                .is_some_and(|prefix| note.starts_with(prefix))
-                    }) =>
-                {
-                    // footnotes paint in the UI face — measure with its metric
-                    Some((*x, *x + ui_text_width(txt, *px)))
-                }
-                _ => None,
-            })
-            .collect();
-        assert_eq!(painted.len(), 2, "both wrapped rows painted");
-        for (x0, x1) in painted {
-            assert!(
-                x1 <= box_right + 0.5,
-                "footnote text fits the box: right {x1} vs box_right {box_right} (x {x0})"
+        for cols in [64, 132] {
+            let g = SettingsGeom {
+                cw: 8.0,
+                ch: 16.0,
+                font_px: 13.0,
+                cols,
+                // The wide rung also reserves its preview card; leave enough
+                // height to measure a whole group rather than its scroll clip.
+                panel_rows: if cols == 64 { 38 } else { 64 },
+            };
+            let wrap = footnote_wrap_chars(cols);
+            let rows = category_layout(&s.fields, s.category, wrap);
+            let expected_total = if cols == 64 { 4 } else { 3 };
+            assert_eq!(
+                rows.iter()
+                    .filter(|row| matches!(row, GroupRow::Footnote(_)))
+                    .count(),
+                expected_total,
+                "only the two authored Security paragraphs produce footnote rows"
             );
-        }
+            for caption in ["Permissions", "This Mac"] {
+                let start = rows
+                    .iter()
+                    .position(|row| *row == GroupRow::Caption(caption))
+                    .expect("the group's caption is present");
+                let notes: Vec<&str> = rows
+                    .iter()
+                    .skip(start + 1)
+                    .take_while(|row| !matches!(row, GroupRow::Caption(_)))
+                    .filter_map(|row| match row {
+                        GroupRow::Footnote(note) => Some(*note),
+                        _ => None,
+                    })
+                    .collect();
+                let source = prefs::group_footnote(caption).expect("the group's paragraph");
+                let expected_rows = if cols == 132 && caption == "Permissions" {
+                    1
+                } else {
+                    2
+                };
+                assert_eq!(
+                    notes.len(),
+                    expected_rows,
+                    "{caption} at {cols} columns: {notes:?}"
+                );
+                assert_eq!(
+                    notes.join(" "),
+                    source,
+                    "{caption} retains its whole paragraph"
+                );
+                assert!(
+                    notes[0].chars().count() <= wrap,
+                    "{caption}: {:?}",
+                    notes[0]
+                );
+                if caption == "Permissions" {
+                    assert!(notes[0].starts_with("Off by default."));
+                    assert!(notes.last().unwrap().ends_with("macOS and Windows."));
+                } else {
+                    assert!(notes[0].starts_with("Every package pass"));
+                    assert!(
+                        notes
+                            .last()
+                            .unwrap()
+                            .ends_with("build output from Spotlight.")
+                    );
+                }
 
-        // The current disclosure fits on one row at the dedicated window's
-        // 132 columns. Crossing to the wide rung may reflow it, but must retain
-        // the complete source rather than dropping the footnote.
-        let wide_notes = category_layout(&s.fields, s.category, footnote_wrap_chars(132))
-            .iter()
-            .filter_map(|row| match row {
-                GroupRow::Footnote(note) => Some(*note),
-                _ => None,
-            })
-            .collect::<Vec<_>>();
-        assert_eq!(
-            wide_notes,
-            vec![source],
-            "wide layout retains the disclosure"
-        );
+                // Reveal this group's caption independently: the added machine
+                // group can push its notes below a short viewport's first page.
+                s.scroll = start;
+                let box_right = g.cols as f32 * g.cw - g.cw * 2.5;
+                let painted: Vec<(f32, f32)> = tray(&s, &g)
+                    .prims
+                    .iter()
+                    .filter_map(|prim| match prim {
+                        DrawPrim::Text { x, s: text, px, .. }
+                            if notes.iter().any(|note| {
+                                *note == text
+                                    || text.strip_suffix('…').is_some_and(|prefix| {
+                                        !prefix.is_empty() && note.starts_with(prefix)
+                                    })
+                            }) =>
+                        {
+                            Some((*x, *x + ui_text_width(text, *px)))
+                        }
+                        _ => None,
+                    })
+                    .collect();
+                assert_eq!(
+                    painted.len(),
+                    expected_rows,
+                    "every {caption} row paints at {cols} columns"
+                );
+                for (left, right) in painted {
+                    assert!(
+                        right <= box_right + 0.5,
+                        "{caption} fits: right {right} vs box {box_right} (left {left})"
+                    );
+                }
+                if cols == 64 {
+                    let box_left = pane_geom(&g).content_x(g.cw) + 2.0 * g.cw;
+                    let available = box_right - box_left - 1.2 * g.cw;
+                    assert!(
+                        ui_text_width(source, TypeStep::Caption.px(g.font_px).get()) > available,
+                        "negative control: the unwrapped {caption} paragraph would overflow"
+                    );
+                }
+            }
+        }
     }
 
     #[test]

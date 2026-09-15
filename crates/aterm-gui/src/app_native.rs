@@ -376,6 +376,15 @@ pub(crate) fn collect_native_update_reconcile_facts(
 
 const MAX_AUTOMATIC_UPDATE_CYCLES: u8 = 3;
 
+/// A refusal about the installed environment, distinct from an exhausted
+/// artifact budget. Only a later verified observation can release this latch.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct AutoApplyEnvironmentBlock {
+    build: u64,
+    dmg_sha256: [u8; 32],
+    blocked_at: std::time::Instant,
+}
+
 /// Activity revocation gets a much larger budget than a preflight block, and a
 /// long-tailed schedule. Rationale from the field: on the machine this feature
 /// exists for — a daily driver with an agent streaming shell output into it —
@@ -1007,7 +1016,7 @@ fn automatic_retry_delay(cycles: u8, kind: AutomaticRetryKind) -> Option<std::ti
 /// are already canonicalized, but automatic application fails closed if a future
 /// producer ever hands this layer malformed identity bytes.
 #[must_use]
-fn decode_dmg_sha256(digest: &str) -> Option<[u8; 32]> {
+pub(crate) fn decode_dmg_sha256(digest: &str) -> Option<[u8; 32]> {
     fn nibble(byte: u8) -> Option<u8> {
         match byte {
             b'0'..=b'9' => Some(byte - b'0'),
@@ -4735,12 +4744,17 @@ impl App {
             return PackagesOutcome::Failed { message };
         }
         let processes = packages_argv(&request);
+        // `atpkg machine apply` is a LOCAL verb: no store, no index, no root key —
+        // it works with the package manager switched off (ATPKG_DISABLE), so the
+        // manager gate below does not apply to it. Its stdout is captured too: the
+        // `machine-settings:` row and the verdict sentence ride it.
+        let machine_apply = matches!(request, PackagesRequest::MachineApply);
         let Some(atpkg) = atpkg else {
             return PackagesOutcome::Failed {
                 message: "no co-located atpkg binary beside this executable".to_string(),
             };
         };
-        if !atpkg::manager_enabled() {
+        if !machine_apply && !atpkg::manager_enabled() {
             // Same trust posture the binary itself enforces; refusing here is
             // honesty, not authority — atpkg would refuse loudly anyway.
             return PackagesOutcome::Blocked {
@@ -4789,18 +4803,51 @@ impl App {
                 // refuses without the Command Line Tools, so a failed first step
                 // ends the sequence with its own sentence rather than a second dialog.
                 let mut command = PackagesCommandOutcome::Succeeded { operation: busy };
+                let mut machine_verdict: Option<String> = None;
                 for verb in &processes {
                     // NO STDIN: a windowed child inherits whatever the app was launched
                     // with (a Terminal's tty when run from one), and atpkg's door reads a
                     // tty on stdin as "sudo may prompt here". The argv table always says
                     // `--elevate=…` outright, and a null stdin makes the fallback the
                     // deferred one too — a child can never sit on a prompt nobody sees.
-                    let result = std::process::Command::new(&atpkg)
+                    //
+                    // STDOUT IS NULL for every verb but the machine apply: the install
+                    // passes stream their multi-GB marker contract there, and this
+                    // worker is not their reader. The machine apply prints a few lines
+                    // — the `machine-settings:` row (which the pull-down and the
+                    // Security card both want) and one verdict sentence — so those are
+                    // captured and fed through the same marker parser the launch pass
+                    // uses (`spawn_machine_settings_once`).
+                    let mut child = std::process::Command::new(&atpkg);
+                    child
                         .args(verb)
                         .stdin(std::process::Stdio::null())
-                        .stdout(std::process::Stdio::null())
-                        .stderr(std::process::Stdio::piped())
-                        .output();
+                        .stdout(if machine_apply {
+                            std::process::Stdio::piped()
+                        } else {
+                            std::process::Stdio::null()
+                        })
+                        .stderr(std::process::Stdio::piped());
+                    if machine_apply {
+                        child
+                            .env(atpkg::cli::SPAWNER_PID_ENV, std::process::id().to_string())
+                            .env("PATH", crate::spawn::atpkg_child_path());
+                    }
+                    if machine_apply {
+                        let result = machine_command_output(
+                            &mut child,
+                            "atpkg machine apply",
+                            std::time::Duration::from_secs(60),
+                        );
+                        (command, machine_verdict) = machine_apply_completion(result, |event| {
+                            let _ = proxy.send_event(event);
+                        });
+                        if matches!(command, PackagesCommandOutcome::Failed { .. }) {
+                            break;
+                        }
+                        continue;
+                    }
+                    let result = child.output();
                     let said = result
                         .as_ref()
                         .ok()
@@ -4816,7 +4863,8 @@ impl App {
                     }
                 }
                 let report = crate::packages_screen::collect_packages_status(true);
-                let completion = PackagesWorkerCompletion::command(report, command);
+                let completion = PackagesWorkerCompletion::command(report, command)
+                    .with_machine_verdict(machine_verdict);
                 let _ = proxy.send_event(Wake::NativePackagesFinished {
                     sequence,
                     completion,
@@ -4872,17 +4920,68 @@ impl App {
         self.publish_native_packages_state();
     }
 
+    /// Start one machine read — bare `atpkg machine`, no verb, no store lock — so
+    /// the Security page's "This Mac" card CONFIRMS the `[machine]` settings from
+    /// what the co-located atpkg measured, never from an in-process `defaults`
+    /// read or a home walk (the one sanctioned seam for touching the machine is
+    /// the atpkg child). A read asked for while one is running is QUEUED behind
+    /// it (`PackagesService::request_machine_read`), never joined — the running
+    /// read may predate an apply. Headless hosts (no proxy) and non-macOS builds
+    /// skip silently, before anything is queued — the card is absent there.
+    pub(crate) fn start_native_machine_refresh(&mut self) {
+        if !cfg!(target_os = "macos") {
+            return;
+        }
+        let Some(proxy) = self.proxy.clone() else {
+            return;
+        };
+        dispatch_native_machine_read(
+            &mut self.native_packages_service,
+            MachineReadEvent::Request,
+            || launch_native_machine_read(proxy),
+        );
+        self.publish_native_packages_state();
+    }
+
+    /// A queued rerun is already admitted by the completion reducer. Dispatch it
+    /// directly; requesting admission again would mistake that reservation for
+    /// a running worker and leave the card refreshing forever.
+    pub(crate) fn finish_native_machine_refresh(
+        &mut self,
+        result: Result<atpkg::machine::MachineState, String>,
+    ) {
+        let proxy = self.proxy.clone();
+        dispatch_native_machine_read(
+            &mut self.native_packages_service,
+            MachineReadEvent::Finished(result),
+            || {
+                let proxy =
+                    proxy.ok_or_else(|| "machine read host is no longer available".to_string())?;
+                launch_native_machine_read(proxy)
+            },
+        );
+        self.publish_native_packages_state();
+    }
+
     /// Main-thread half of the packages worker protocol (the packages analogue
-    /// of [`Self::finish_native_update_check`]): stale sequences are inert.
+    /// of [`Self::finish_native_update_check`]): stale sequences are inert. A
+    /// finished verb that ran atpkg's machine pass — `update`, `install
+    /// --default-set` and `machine apply` itself
+    /// ([`PackagesBusy::applies_machine_settings`]) — re-reads the machine so the
+    /// card confirms rather than assumes.
     pub(crate) fn finish_native_packages(
         &mut self,
         sequence: u64,
         completion: crate::packages_screen::PackagesWorkerCompletion,
     ) {
+        let finished = self.native_packages_service.busy();
         if !self.native_packages_service.finish(sequence, completion) {
             return;
         }
         self.publish_native_packages_state();
+        if finished.is_some_and(PackagesBusy::applies_machine_settings) {
+            self.start_native_machine_refresh();
+        }
     }
 
     /// Publish the shared packages projection to the Settings controller and
@@ -4890,13 +4989,19 @@ impl App {
     /// [`Self::publish_native_update_state`]).
     pub(crate) fn publish_native_packages_state(&mut self) {
         let revision = self.native_packages_service.revision();
-        let state = self.native_packages_service.state(
-            self.config.packages_update_loop_enabled(),
-            self.config.packages_enabled(),
-            self.config.packages_auto_update(),
-            self.config.packages_auto_install(),
-            self.package_update_loop_running,
-        );
+        let state = self
+            .native_packages_service
+            .state(
+                self.config.packages_update_loop_enabled(),
+                self.config.packages_enabled(),
+                self.config.packages_auto_update(),
+                self.config.packages_auto_install(),
+                self.package_update_loop_running,
+            )
+            .with_machine_config(
+                self.config.machine_universal_control(),
+                self.config.machine_spotlight_noindex(),
+            );
         if !self
             .native_runtime
             .replace_settings_packages(state, revision)
@@ -5254,16 +5359,20 @@ impl App {
                         Some(&commit),
                     )
                 };
+                let which = if installed_activation {
+                    "installed bundle"
+                } else {
+                    "staged update"
+                };
                 if let Err(error) = passed.as_ref() {
                     aterm_log::warn!(
-                        "update apply: {} build {build} failed pre-park verification: {error}",
-                        if installed_activation {
-                            "installed"
-                        } else {
-                            "staged"
-                        }
+                        "update apply: {which} build {build} failed pre-park verification: {error}"
                     );
                 }
+                let reason = passed
+                    .as_ref()
+                    .err()
+                    .map(|error| format!("{which} failed pre-park verification: {error}"));
                 *slot
                     .lock()
                     .unwrap_or_else(std::sync::PoisonError::into_inner) =
@@ -5273,6 +5382,7 @@ impl App {
                         artifact,
                         at: std::time::Instant::now(),
                         passed: passed.is_ok(),
+                        reason,
                     });
             });
         if spawned.is_err() {
@@ -5309,11 +5419,10 @@ impl App {
     pub(crate) const RESTORE_IN_FLIGHT_BLOCKS_APPLY: &'static str =
         "Wait for session restore to finish before the update applies";
     /// The `InstalledNeedsRelaunch` outcome's sentence: the bundle on disk is
-    /// already the newer build, and the reducer activates it in place — an
-    /// ACTIVATION stage the seamless lane adopts every window and shell through.
-    /// Nothing to relaunch.
-    pub(crate) const INSTALLED_ACTIVATES_IN_PLACE: &'static str = "The update is already on disk; aterm activates it in place at the next quiet \
-         moment — your shells keep running";
+    /// already the newer build. Activation has its own admission and automatic
+    /// policy, so installation alone cannot promise when it will run.
+    pub(crate) const INSTALLED_ACTIVATES_IN_PLACE: &'static str =
+        "The update is already on disk; activation is pending — your shells keep running";
 
     /// `true` while the `ATERM_DEBUG_RELAUNCH_NUDGE` screenshot seam is
     /// suppressing the automatic update lane — and it SAYS SO, once per process,
@@ -5384,6 +5493,7 @@ impl App {
             }
             ArmDecision::Keep => false,
             ArmDecision::Set(build) => {
+                self.auto_apply_environment_block = None;
                 // SEAM 1, HOISTED OUT OF THE PARKED WINDOW: authenticate the
                 // staged bundle NOW, while every reader is still live and a
                 // cancel costs nothing, instead of as the handoff worker's first
@@ -5633,6 +5743,14 @@ impl App {
                 );
             }
             (AttemptDisposition::Retry, UpdateOutcome::Blocked { reasons }) => {
+                // Every actual blocked attempt leaves its explanation in durable
+                // status, including timer retries with announce=false. UI silence
+                // must not erase why a verified stage is still not running. Polls
+                // that merely wait returned above and never write this ledger.
+                let blocked = UpdateOutcome::Blocked {
+                    reasons: reasons.clone(),
+                };
+                self.record_apply_outcome_in_ledger(&blocked);
                 // A PREFLIGHT BLOCK IS A FACT ABOUT THIS MOMENT, NEVER EVIDENCE
                 // AGAINST THE ARTIFACT — so a spent budget must slow the lane
                 // down, not end it, AND must not become a recurring intrusion.
@@ -5761,13 +5879,9 @@ impl App {
                     );
                 }
                 if announce && intent.attempts == 1 {
-                    self.surface_update_apply_outcome(
-                        "automatic",
-                        UpdateOutcome::Blocked {
-                            reasons: reasons.clone(),
-                        },
-                        false,
-                    );
+                    // Already recorded above: announcement adds UI only, not a
+                    // second durable write for this same refused attempt.
+                    self.react_to_update_apply_outcome("automatic", blocked, false);
                 }
                 if !cooling_down {
                     aterm_log::info!(
@@ -5834,11 +5948,53 @@ impl App {
                     .is_some_and(|staged| {
                         staged.build == intent.build && staged.is_installed_activation()
                     });
+                // ONE TYPED FACT THIS LANE CAN READ (2026-09-14): the cached
+                // pre-park verdict is the verifier's own, not a message match.
+                // When the short-circuit in `start_unix_update_handoff` refused
+                // this artifact, the same verdict reached through the worker
+                // is `PreparationFailed`, which `of_outcome` calls STRUCTURAL —
+                // two attempts, not nine over fourteen hours. And when the
+                // refusal is the INSTALLED copy's (not the signed release: no
+                // lane can install over it until a person changes it), there
+                // is nothing to retry at all: a deadline-less latch, the remedy
+                // said once, and `apply_retry_for` reads the ledger's reason to
+                // show it. The latch clears with the reason — the checker's
+                // installed-bundle probe re-runs every cycle, and a stage that
+                // supersedes this artifact arms a fresh intent.
+                #[cfg(unix)]
+                let cached_refusal = self.cached_handoff_refusal_reason(intent.build);
+                #[cfg(not(unix))]
+                let cached_refusal: Option<String> = None;
+                let needs_person = cached_refusal
+                    .as_deref()
+                    .is_some_and(crate::update_apply_trouble::ApplyTrouble::needs_person);
+                if needs_person {
+                    self.block_native_auto_apply_environment(intent.build, intent.dmg_sha256);
+                    self.restate_staged_bar_posture(intent.build);
+                    aterm_log::warn!(
+                        "update auto-apply: build {} cannot be applied by any lane until \
+                         a person changes the installed bundle — {}; automatic apply is \
+                         suspended for this artifact (no retry is scheduled)",
+                        intent.build,
+                        cached_refusal.as_deref().unwrap_or("")
+                    );
+                    self.surface_update_apply_outcome(
+                        "automatic · needs you",
+                        UpdateOutcome::Failed { message },
+                        false,
+                    );
+                    return;
+                }
+                let shape = if cached_refusal.is_some() {
+                    PhysicalFailureShape::Structural
+                } else {
+                    PhysicalFailureShape::Transient
+                };
                 let schedule = self.spend_physical_failure_budget(
                     intent.build,
                     intent.dmg_sha256,
                     activation,
-                    PhysicalFailureShape::Transient,
+                    shape,
                 );
                 self.auto_apply_manual_only = Some(crate::AutoApplyManualOnly {
                     build: intent.build,
@@ -5855,29 +6011,44 @@ impl App {
                     at.saturating_duration_since(std::time::Instant::now())
                         .as_secs()
                 };
+                // The LIFETIME index of this failure against the artifact's
+                // budget, not the per-intent counter (which restarts at 1 every
+                // time the latch lapses and re-arms — every line of a 599 s →
+                // 1799 s → 21599 s escalation used to read "(attempt 1)").
+                let lifetime = self
+                    .auto_apply_physical_retry
+                    .filter(|retry| retry.build == intent.build)
+                    .map_or(1, |retry| u32::from(retry.cycles));
                 match schedule {
                     PhysicalFailureSchedule::Retry(at) => aterm_log::info!(
                         "update auto-apply: physical handoff failure on build {} \
-                         (attempt {}); automatic apply is latched off until the retry \
-                         window in ~{}s, then eligible again",
+                         (failure {} of {}, {:?}); automatic apply is latched off until \
+                         the retry window in ~{}s, then eligible again",
                         intent.build,
-                        intent.attempts,
+                        lifetime,
+                        shape.lifetime_attempts(),
+                        shape,
                         wait_secs(at)
                     ),
                     PhysicalFailureSchedule::StandDown(at) => aterm_log::warn!(
                         "update auto-apply: physical handoff failure on build {} \
-                         (attempt {}) exhausted this epoch's retry budget; standing down \
-                         for ~{}s, then a fresh epoch",
+                         (failure {} of {}, {:?}) exhausted this epoch's retry budget; \
+                         standing down for ~{}s, then a fresh epoch",
                         intent.build,
-                        intent.attempts,
+                        lifetime,
+                        shape.lifetime_attempts(),
+                        shape,
                         wait_secs(at)
                     ),
                     PhysicalFailureSchedule::Converged => aterm_log::warn!(
                         "update auto-apply: physical handoff failure on build {} \
-                         (attempt {}) spent all {} attempts across {} epochs; automatic \
-                         apply for this artifact is done — the Version menu remains",
+                         (failure {} of {}, {:?}) spent all {} attempts across {} epochs; \
+                         automatic apply for this artifact is done — the Version menu \
+                         remains",
                         intent.build,
-                        intent.attempts,
+                        lifetime,
+                        shape.lifetime_attempts(),
+                        shape,
                         PHYSICAL_FAILURE_LIFETIME_ATTEMPTS,
                         MAX_PHYSICAL_FAILURE_EPOCHS
                     ),
@@ -5899,6 +6070,42 @@ impl App {
                     UpdateOutcome::Failed { message },
                     false,
                 );
+                // THE SCHEDULE, DURABLY (2026-09-14, audit OBS-5). The failure just
+                // booked above clears any standing refusal, so the note goes AFTER
+                // it: `aterm-ctl update status` prints it as `apply_refusal=`, and
+                // `status.toml` carries it — the ~6 h stand-down used to live in
+                // this process's memory and one log line, while every queryable
+                // surface said "failing_applies=N" and nothing about the pause.
+                let horizon = |at: std::time::Instant| {
+                    aterm_types::rfc3339::format_rfc3339(
+                        std::time::SystemTime::now()
+                            .duration_since(std::time::UNIX_EPOCH)
+                            .map_or(0, |d| d.as_secs())
+                            .saturating_add(wait_secs(at)),
+                    )
+                };
+                let standing = match schedule {
+                    PhysicalFailureSchedule::Retry(at) => format!(
+                        "automatic apply of build {} retries at {} (failure {lifetime} of {})",
+                        intent.build,
+                        horizon(at),
+                        shape.lifetime_attempts()
+                    ),
+                    PhysicalFailureSchedule::StandDown(at) => format!(
+                        "automatic apply of build {} is standing down until {} after \
+                         {lifetime} failures; the Version menu applies it sooner",
+                        intent.build,
+                        horizon(at)
+                    ),
+                    PhysicalFailureSchedule::Converged => format!(
+                        "automatic apply of build {} is out of retries after {} attempts \
+                         across {} epochs; the Version menu still applies it",
+                        intent.build,
+                        PHYSICAL_FAILURE_LIFETIME_ATTEMPTS,
+                        MAX_PHYSICAL_FAILURE_EPOCHS
+                    ),
+                };
+                aterm_update::record_apply_refusal(current_build, &standing);
             }
             (_, outcome) => {
                 // A future policy/outcome mismatch must fail safe, never panic in the
@@ -6026,6 +6233,7 @@ impl App {
             return NativeUpdateFactsResult::IgnoredStale;
         }
         self.last_native_update_reconcile_sequence = facts.observation_sequence;
+        self.release_repaired_auto_apply_environment(&facts);
         let NativeUpdateReconcileFacts {
             _ticket: _,
             observation_sequence: _,
@@ -6132,12 +6340,25 @@ impl App {
                         // state and the remedy, and do not attribute the installer
                         // to a process this reducer cannot identify.
                         let message = format!(
-                            "Build {build} is already installed on disk; activating it in place \
+                            "Build {build} is already installed on disk; activation is pending \
                              — your shells keep running"
                         );
                         aterm_log::warn!("update sync: {message}");
                     }
                     DurableStageDisposition::Retired => {
+                        // The latch belongs to the exact retired artifact. Keeping
+                        // it here could suppress a replacement forever when its
+                        // build is lower than the withdrawn stage but still newer
+                        // than this process. A latch for other bytes survives.
+                        if let Some(retired) = current.as_ref()
+                            && self.auto_apply_manual_only.is_some_and(|manual| {
+                                manual.build == retired.build
+                                    && decode_dmg_sha256(&retired.dmg_sha256)
+                                        == Some(manual.dmg_sha256)
+                            })
+                        {
+                            self.auto_apply_manual_only = None;
+                        }
                         aterm_log::warn!(
                             "update sync: stale in-memory stage retired after durable marker changed"
                         );
@@ -6214,7 +6435,7 @@ impl App {
                 durable.staged_dmg_sha256 = Some(activation.dmg_sha256.clone());
                 durable.changelog = None;
                 durable.outcome = format!(
-                    "build {} is already installed on disk; activating it in place",
+                    "build {} is already installed on disk; activation is pending",
                     activation.build
                 );
             } else {
@@ -6244,6 +6465,105 @@ impl App {
         NativeUpdateFactsResult::Reduced {
             effective_stage: self.native_updater_service.snapshot().staged.clone(),
         }
+    }
+
+    fn block_native_auto_apply_environment(&mut self, build: u64, dmg_sha256: [u8; 32]) {
+        self.auto_apply_intent = None;
+        self.auto_apply_environment_block = Some(AutoApplyEnvironmentBlock {
+            build,
+            dmg_sha256,
+            blocked_at: std::time::Instant::now(),
+        });
+        self.auto_apply_manual_only = Some(crate::AutoApplyManualOnly {
+            build,
+            dmg_sha256,
+            retry_at: None,
+        });
+    }
+
+    pub(crate) fn auto_apply_environment_blocked(&self, build: u64) -> bool {
+        self.auto_apply_environment_block.is_some_and(|blocked| {
+            blocked.build == build
+                && self.auto_apply_manual_only.is_some_and(|manual| {
+                    manual.build == build
+                        && manual.dmg_sha256 == blocked.dmg_sha256
+                        && manual.retry_at.is_none()
+                })
+                && self
+                    .native_updater_service
+                    .snapshot()
+                    .staged
+                    .as_ref()
+                    .is_some_and(|stage| {
+                        stage.build == build
+                            && decode_dmg_sha256(&stage.dmg_sha256) == Some(blocked.dmg_sha256)
+                    })
+        })
+    }
+
+    /// This is a memory-only reduction of the facts worker's complete signing
+    /// policy check. Unknown/older evidence cannot rehabilitate a refused source.
+    fn release_repaired_auto_apply_environment(&mut self, facts: &NativeUpdateReconcileFacts) {
+        self.release_repaired_auto_apply_environment_for_commit(
+            facts,
+            crate::build_info::GIT_COMMIT,
+        );
+    }
+
+    fn release_repaired_auto_apply_environment_for_commit(
+        &mut self,
+        facts: &NativeUpdateReconcileFacts,
+        running_commit: &str,
+    ) {
+        let Some(blocked) = self.auto_apply_environment_block else {
+            return;
+        };
+        if !self.auto_apply_environment_blocked(blocked.build) {
+            self.auto_apply_environment_block = None;
+            return;
+        }
+        let snapshot = self.native_updater_service.snapshot();
+        if facts.observed_at <= blocked.blocked_at
+            || !facts
+                .durable
+                .as_ref()
+                .is_some_and(|status| status.enabled && status.installable)
+            || !facts.installed.as_ref().is_some_and(|installed| {
+                installed.build == snapshot.current_build
+                    && aterm_update::commit_matches(&installed.commit, running_commit)
+            })
+        {
+            return;
+        }
+        // A cache publication newer than this read may have observed another
+        // change. Never erase it with older evidence. Matching old denial is
+        // invalidated, not turned into a fabricated full preverification pass.
+        let mut cached = match self.handoff_preverified.try_lock() {
+            Ok(cached) => cached,
+            Err(std::sync::TryLockError::Poisoned(error)) => error.into_inner(),
+            Err(std::sync::TryLockError::WouldBlock) => return,
+        };
+        if cached.as_ref().is_some_and(|entry| {
+            entry.build == blocked.build
+                && decode_dmg_sha256(&entry.artifact) == Some(blocked.dmg_sha256)
+                && entry.at >= facts.observed_at
+        }) {
+            return;
+        }
+        if cached.as_ref().is_some_and(|entry| {
+            entry.build == blocked.build
+                && decode_dmg_sha256(&entry.artifact) == Some(blocked.dmg_sha256)
+        }) {
+            *cached = None;
+        }
+        drop(cached);
+        self.auto_apply_environment_block = None;
+        self.auto_apply_manual_only = None;
+        aterm_log::info!(
+            "update apply: installed source now verifies against the running image; \
+             automatic eligibility restored for build {}",
+            blocked.build
+        );
     }
 
     pub(crate) fn apply_native_update(&mut self, mode: ApplyMode) -> UpdateOutcome {
@@ -7305,6 +7625,327 @@ fn packages_child_failure(
     }
 }
 
+/// Arrival at the machine worker's single dispatch seam.
+enum MachineReadEvent {
+    Request,
+    Finished(Result<atpkg::machine::MachineState, String>),
+}
+
+/// Resolve admission once, then launch at most one worker. A completion's
+/// `true` answer already owns the coalesced rerun; it must not re-enter Request.
+/// The injected operation is thread creation, never the machine read itself.
+fn dispatch_native_machine_read(
+    service: &mut crate::packages_screen::PackagesService,
+    event: MachineReadEvent,
+    spawn: impl FnOnce() -> Result<(), String>,
+) {
+    let admitted = match event {
+        MachineReadEvent::Request => service.request_machine_read(),
+        MachineReadEvent::Finished(result) => service.replace_machine_state(result),
+    };
+    if admitted && let Err(error) = spawn() {
+        // No event can interleave on this synchronous main-thread edge, so a
+        // failed launch has no queued follower and must release its reservation.
+        let rerun = service.replace_machine_state(Err(error));
+        debug_assert!(!rerun);
+    }
+}
+
+fn launch_native_machine_read(
+    proxy: winit::event_loop::EventLoopProxy<Wake>,
+) -> Result<(), String> {
+    let atpkg = crate::co_located_atpkg()
+        .ok_or_else(|| "no co-located atpkg binary beside this executable".to_string())?;
+    spawn_native_machine_read(proxy, atpkg)
+        .map_err(|error| format!("could not start the machine read: {error}"))
+}
+
+/// The detached machine read thread: one `atpkg machine` child, its parsed record
+/// posted back as [`Wake::NativeMachineStateFinished`]. The launch helper serves
+/// both an admitted initial request and an already reserved completion rerun;
+/// the `Err` is the thread-spawn failure.
+fn spawn_native_machine_read(
+    proxy: winit::event_loop::EventLoopProxy<Wake>,
+    atpkg: std::path::PathBuf,
+) -> std::io::Result<()> {
+    std::thread::Builder::new()
+        .name("aterm-machine-status".into())
+        .spawn(move || {
+            // A host-settings probe is cosmetic to the terminal; it lands via
+            // the proxy when done.
+            crate::qos::set_self(crate::qos::Role::Background);
+            let result = read_machine_state(&atpkg);
+            let _ = proxy.send_event(Wake::NativeMachineStateFinished { result });
+        })
+        .map(drop)
+}
+
+/// Run bare `atpkg machine` and parse its `machine-state:` line. The child gets the
+/// same environment the launch-time apply gets (`spawn_machine_settings_once`): the
+/// spawner pid and the atpkg child PATH. Both output streams are bounded; only
+/// the stdout state line is the measured contract.
+fn read_machine_state(atpkg: &std::path::Path) -> Result<atpkg::machine::MachineState, String> {
+    let mut command = std::process::Command::new(atpkg);
+    command
+        .arg("machine")
+        .env(atpkg::cli::SPAWNER_PID_ENV, std::process::id().to_string())
+        .env("PATH", crate::spawn::atpkg_child_path());
+    let output = machine_command_output(
+        &mut command,
+        "atpkg machine",
+        std::time::Duration::from_secs(15),
+    )?;
+    parse_machine_state_output(&String::from_utf8_lossy(&output.stdout)).ok_or_else(|| {
+        if output.status.success() {
+            // The line is printed after atpkg's own platform check, so its absence
+            // means "no state was measured" — which the card must say, and must
+            // never read as "nothing to apply".
+            "atpkg machine printed no state".to_string()
+        } else {
+            format!("atpkg machine exited with {}", output.status)
+        }
+    })
+}
+
+/// A machine command has one deadline and bounded stdout/stderr. Nonblocking
+/// pipe reads avoid a reader thread or a wait for a descendant's inherited stdout.
+/// Cleanup spends only the reserved tail of the original budget and reports an
+/// unconfirmed reap instead of waiting indefinitely after a failed kill.
+#[cfg(unix)]
+fn machine_command_output(
+    command: &mut std::process::Command,
+    operation: &str,
+    limit: std::time::Duration,
+) -> Result<std::process::Output, String> {
+    use std::io::ErrorKind;
+    use std::os::fd::AsRawFd as _;
+    use std::process::Stdio;
+    use std::time::{Duration, Instant};
+
+    const MAX_OUTPUT: usize = 64 * 1024;
+    const POLL: Duration = Duration::from_millis(5);
+    let deadline = Instant::now() + limit;
+    let reserve = Duration::from_millis(250).min(limit / 4);
+    let read_deadline = deadline - reserve;
+    if Instant::now() >= read_deadline {
+        return Err(format!("{operation} timed out"));
+    }
+    let mut child = command
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .map_err(|error| format!("could not launch {operation}: {error}"))?;
+    let result = (|| {
+        let mut stdout_pipe = child
+            .stdout
+            .take()
+            .ok_or("machine command stdout missing")?;
+        let mut stderr_pipe = child
+            .stderr
+            .take()
+            .ok_or("machine command stderr missing")?;
+        for fd in [stdout_pipe.as_raw_fd(), stderr_pipe.as_raw_fd()] {
+            aterm_pty::set_nonblocking(fd, true)
+                .map_err(|error| format!("{operation} output: {error}"))?;
+        }
+        let mut stdout = Vec::new();
+        let mut stderr = Vec::new();
+        let mut stdout_eof = false;
+        let mut stderr_eof = false;
+        let mut status = None;
+        loop {
+            if Instant::now() >= read_deadline {
+                return Err(format!("{operation} timed out"));
+            }
+            // One bounded chunk per pipe per turn checks the deadline during a
+            // flood and drains stderr while stdout is waiting for more data.
+            for (pipe, bytes, eof) in [
+                (
+                    &mut stdout_pipe as &mut dyn std::io::Read,
+                    &mut stdout,
+                    &mut stdout_eof,
+                ),
+                (
+                    &mut stderr_pipe as &mut dyn std::io::Read,
+                    &mut stderr,
+                    &mut stderr_eof,
+                ),
+            ] {
+                if !*eof {
+                    let mut chunk = [0_u8; 4096];
+                    match pipe.read(&mut chunk) {
+                        Ok(0) => *eof = true,
+                        Ok(n) => {
+                            if bytes.len() + n > MAX_OUTPUT {
+                                return Err(format!(
+                                    "{operation} output exceeded 64 KiB per stream"
+                                ));
+                            }
+                            bytes.extend_from_slice(&chunk[..n]);
+                        }
+                        Err(error)
+                            if matches!(
+                                error.kind(),
+                                ErrorKind::WouldBlock | ErrorKind::Interrupted
+                            ) => {}
+                        Err(error) => return Err(format!("{operation} output: {error}")),
+                    }
+                }
+            }
+            if status.is_none() {
+                status = child
+                    .try_wait()
+                    .map_err(|error| format!("{operation} wait: {error}"))?;
+            }
+            if stdout_eof
+                && stderr_eof
+                && let Some(status) = status
+            {
+                return Ok(std::process::Output {
+                    status,
+                    stdout,
+                    stderr,
+                });
+            }
+            std::thread::sleep(POLL.min(read_deadline.saturating_duration_since(Instant::now())));
+        }
+    })();
+    result.map_err(|mut error| {
+        // On early errors, do not turn a short failure into the full command
+        // budget. No blocking wait or reader join is permitted here.
+        let cleanup_deadline = deadline.min(Instant::now() + reserve);
+        if !stop_machine_read_child(&mut child, cleanup_deadline) {
+            error.push_str("; child exit could not be confirmed within the cleanup budget");
+        }
+        error
+    })
+}
+
+#[cfg(unix)]
+fn stop_machine_read_child(child: &mut std::process::Child, deadline: std::time::Instant) -> bool {
+    use std::time::{Duration, Instant};
+    if matches!(child.try_wait(), Ok(Some(_))) {
+        return true;
+    }
+    let _ = child.kill();
+    loop {
+        match child.try_wait() {
+            Ok(Some(_)) => return true,
+            Err(_) => return false,
+            Ok(None) => {}
+        }
+        if Instant::now() >= deadline {
+            return false;
+        }
+        std::thread::sleep(
+            Duration::from_millis(5).min(deadline.saturating_duration_since(Instant::now())),
+        );
+    }
+}
+
+#[cfg(not(unix))]
+fn machine_command_output(
+    _command: &mut std::process::Command,
+    _operation: &str,
+    _limit: std::time::Duration,
+) -> Result<std::process::Output, String> {
+    Err("machine settings commands require macOS".into())
+}
+
+/// The `machine-state:` record in one `atpkg machine` stdout, if any line carries a
+/// parseable one (prose lines are skipped; a malformed record is no record).
+pub(crate) fn parse_machine_state_output(stdout: &str) -> Option<atpkg::machine::MachineState> {
+    stdout.lines().find_map(|line| {
+        crate::r6_marker_body(line, atpkg::cli::MACHINE_STATE_MARKER)
+            .and_then(atpkg::machine::parse_machine_state)
+    })
+}
+
+/// Deliver measured changes before settling the explicit apply. A deadline or
+/// failed write is not success even if earlier changes landed or the child exited 0.
+fn machine_apply_completion(
+    output: Result<std::process::Output, String>,
+    mut emit: impl FnMut(Wake),
+) -> (PackagesCommandOutcome, Option<String>) {
+    let operation = PackagesBusy::MachineApply;
+    let output = match output {
+        Ok(output) => output,
+        Err(message) => {
+            return (
+                PackagesCommandOutcome::Failed {
+                    operation,
+                    message: format!(
+                        "{message}; changes may be partial — refresh This Mac before retrying"
+                    ),
+                },
+                None,
+            );
+        }
+    };
+    let read = machine_apply_stdout(&String::from_utf8_lossy(&output.stdout));
+    for event in read.events {
+        emit(event);
+    }
+    let failure = read.refusal.or_else(|| {
+        packages_child_failure(
+            Ok(output.status),
+            &["machine".to_string(), "apply".to_string()],
+            String::from_utf8_lossy(&output.stderr).trim(),
+        )
+    });
+    let command = match failure {
+        Some(message) => PackagesCommandOutcome::Failed { operation, message },
+        None => PackagesCommandOutcome::Succeeded { operation },
+    };
+    (command, read.verdict)
+}
+
+/// What an `atpkg machine apply` child's stdout said, sorted for the worker.
+pub(crate) struct MachineApplyStdout {
+    /// The marker rows to raise (`machine-settings:` → the pull-down row, the
+    /// appstatus ledger and the card's "Last change").
+    pub(crate) events: Vec<Wake>,
+    /// The verdict sentence after [`atpkg::cli::MACHINE_VERDICT_PREFIX`] —
+    /// `applied — …`, `nothing changed — …` or `not applied — …` — the last such
+    /// line.
+    pub(crate) verdict: Option<String>,
+    /// [`atpkg::cli::MACHINE_NOT_APPLIED_PREFIX`]` <reason>`: the pass refused (a
+    /// home that is not the account's), or `MACHINE_APPLY_FAILED_PREFIX`: a write
+    /// failed. Either is a failure even when the command exits successfully.
+    pub(crate) refusal: Option<String>,
+}
+
+/// Sort an `atpkg machine apply` stdout into marker events, the verdict sentence and
+/// any refusal or failed write. Pure, so these shapes are pinned by tests rather
+/// than a child on the developer's machine. The prefixes are atpkg's own constants: a
+/// re-spelling on either side is a compile error, never a verdict that silently
+/// falls back to the generic headline — or a refusal reported as a success.
+pub(crate) fn machine_apply_stdout(stdout: &str) -> MachineApplyStdout {
+    use atpkg::cli::{
+        MACHINE_APPLY_FAILED_PREFIX, MACHINE_NOT_APPLIED_PREFIX, MACHINE_VERDICT_PREFIX,
+    };
+    let mut read = MachineApplyStdout {
+        events: Vec::new(),
+        verdict: None,
+        refusal: None,
+    };
+    for line in stdout.lines() {
+        let line = line.trim_end();
+        if let Some(reason) = line
+            .strip_prefix(MACHINE_NOT_APPLIED_PREFIX)
+            .or_else(|| line.strip_prefix(MACHINE_APPLY_FAILED_PREFIX))
+        {
+            read.refusal = Some(reason.trim().to_string());
+        } else if let Some(sentence) = line.strip_prefix(MACHINE_VERDICT_PREFIX) {
+            read.verdict = Some(sentence.trim().to_string());
+        } else if let Some(event) = crate::parse_seed_line(line) {
+            read.events.push(event);
+        }
+    }
+    read
+}
+
 /// The exact argv of every `atpkg` process a [`PackagesRequest`] runs, one inner list
 /// per process, in order. THE table the Settings verbs and the first-launch admin card
 /// both go through; pinned verbatim by `packages_argv_is_pinned_per_request`, so a
@@ -7326,6 +7967,9 @@ pub(crate) fn packages_argv(request: &PackagesRequest) -> Vec<Vec<String>> {
             .iter()
             .map(|name| spell(&["install", name, "--elevate=osascript"]))
             .collect(),
+        // The [machine] host settings, now — the same pass every package pass runs
+        // first. No `--wait-lock`: the verb takes no store lock.
+        PackagesRequest::MachineApply => vec![spell(&["machine", "apply"])],
     }
 }
 
@@ -7337,6 +7981,7 @@ pub(crate) fn packages_busy(request: &PackagesRequest) -> PackagesBusy {
         PackagesRequest::UninstallAll => PackagesBusy::Uninstall,
         PackagesRequest::InstallExtra { .. } => PackagesBusy::InstallExtra,
         PackagesRequest::InstallElevated { .. } => PackagesBusy::InstallAdmin,
+        PackagesRequest::MachineApply => PackagesBusy::MachineApply,
     }
 }
 
@@ -7386,6 +8031,13 @@ pub(crate) fn packages_request_admissible(request: &PackagesRequest) -> Result<(
                 ))
             }
         }
+        PackagesRequest::MachineApply => {
+            if cfg!(target_os = "macos") {
+                Ok(())
+            } else {
+                Err("the [machine] settings are macOS host settings".to_string())
+            }
+        }
     }
 }
 
@@ -7425,6 +8077,120 @@ mod packages_argv_tests {
                 s(&["install", "clt", "--elevate=osascript"]),
                 s(&["install", "brew", "--elevate=osascript"]),
             ]
+        );
+        assert_eq!(
+            packages_argv(&PackagesRequest::MachineApply),
+            vec![s(&["machine", "apply"])],
+            "no --wait-lock: the verb takes no store lock"
+        );
+    }
+
+    /// The machine apply worker sorts the child's stdout: the `machine-settings:`
+    /// row becomes the pull-down/card event, the LAST `atpkg machine: …` line is the
+    /// verdict, and a `machine settings not applied — …` line is the refusal the
+    /// worker reports as the failure (with its reason, not the prefix).
+    #[test]
+    fn machine_apply_stdout_is_sorted_into_events_verdict_and_refusal() {
+        use atpkg::cli::{
+            MACHINE_NOT_APPLIED_PREFIX, MACHINE_SETTINGS_MARKER, MACHINE_VERDICT_PREFIX,
+        };
+        // Today's verdict sentences, spelled from atpkg's own prefixes so a
+        // re-spelling there is red here.
+        let nothing_changed = format!(
+            "{MACHINE_VERDICT_PREFIX}nothing changed — already applied, switched off in \
+             [machine], or a change that did not land (the lines above say which)"
+        );
+        let applied = machine_apply_stdout(&format!(
+            "atpkg noindex: /Users//x/ay/target: renamed target.noindex\n\
+             atpkg: {MACHINE_SETTINGS_MARKER}spotlight-noindex 1 dir(s) migrated; universal-control disabled\n\
+             {MACHINE_VERDICT_PREFIX}applied — spotlight-noindex 1 dir(s) migrated; universal-control disabled\n"
+        ));
+        assert_eq!(applied.events.len(), 1);
+        assert!(matches!(
+            &applied.events[0],
+            Wake::PkgMachineSettings(body)
+                if body == "spotlight-noindex 1 dir(s) migrated; universal-control disabled"
+        ));
+        assert_eq!(
+            applied.verdict.as_deref(),
+            Some("applied — spotlight-noindex 1 dir(s) migrated; universal-control disabled")
+        );
+        assert!(applied.refusal.is_none());
+
+        let nothing = machine_apply_stdout(&format!("{nothing_changed}\n"));
+        assert!(nothing.events.is_empty());
+        assert_eq!(
+            nothing.verdict.as_deref(),
+            Some(
+                "nothing changed — already applied, switched off in [machine], or a change \
+                 that did not land (the lines above say which)"
+            )
+        );
+        assert!(nothing.refusal.is_none());
+
+        // A refused apply: the refusal line, then the verb's own `not applied` verdict
+        // (never a "nothing changed" beside a refusal).
+        let refused = machine_apply_stdout(&format!(
+            "{MACHINE_NOT_APPLIED_PREFIX}HOME is /tmp/synthetic, the account home is /Users//x\n\
+             {MACHINE_VERDICT_PREFIX}not applied — HOME is /tmp/synthetic, the account home is /Users//x\n"
+        ));
+        assert_eq!(
+            refused.refusal.as_deref(),
+            Some("HOME is /tmp/synthetic, the account home is /Users//x")
+        );
+        assert_eq!(
+            refused.verdict.as_deref(),
+            Some("not applied — HOME is /tmp/synthetic, the account home is /Users//x")
+        );
+        assert!(refused.events.is_empty());
+
+        // Nothing said: no verdict, no refusal, no events — the worker then reports
+        // the exit status alone.
+        let silent = machine_apply_stdout("");
+        assert!(silent.verdict.is_none() && silent.refusal.is_none() && silent.events.is_empty());
+    }
+
+    /// The machine READ parses the byte-stable `machine-state:` record out of the
+    /// prose `atpkg machine` prints around it; prose alone, or a malformed record,
+    /// is NO record — the worker then reports "printed no state", never a guess.
+    #[test]
+    fn machine_state_is_read_from_the_marker_line_and_never_guessed() {
+        use atpkg::machine::{HomePosture, UcPosture};
+        let stdout = "atpkg machine: warn — Universal Control is at the OS default (…)\n\
+                      atpkg machine: 2 cargo target dir(s) under /Users//x open to Spotlight (1 a pass would hide), 8 hidden ([machine] spotlight_noindex = true)\n\
+                      atpkg: machine-state: universal-control=default; policy=off; noindex=true; spotlight-exposed=2; spotlight-hidden=8; spotlight-migratable=1; scan=complete; home=account\n\
+                      atpkg machine: next — aterm pkg machine apply (Universal Control off for this host; 1 target dir(s) hidden from Spotlight)\n";
+        let state = parse_machine_state_output(stdout).expect("the marker line parses");
+        assert_eq!(state.universal_control, UcPosture::Default);
+        assert_eq!(state.policy, atpkg::config::UniversalControlPolicy::Off);
+        assert!(state.spotlight_noindex);
+        assert_eq!(
+            (state.exposed, state.hidden, state.would_migrate),
+            (2, 8, 1)
+        );
+        assert!(state.scan_complete);
+        assert_eq!(state.home, HomePosture::Account);
+        assert!(state.next().is_some());
+        assert!(
+            parse_machine_state_output(
+                "atpkg machine: ok — Universal Control is disabled on this host\n\
+                 atpkg machine: nothing to apply — Universal Control and Spotlight are where [machine] wants them\n"
+            )
+            .is_none(),
+            "prose is not a record"
+        );
+        assert!(
+            parse_machine_state_output(
+                "atpkg: machine-state: universal-control=default; policy=off\n"
+            )
+            .is_none(),
+            "a record missing fields is no record"
+        );
+        assert!(
+            parse_machine_state_output(
+                "atpkg machine: not applicable — these are macOS host settings\n"
+            )
+            .is_none()
         );
     }
 
@@ -7512,6 +8278,49 @@ mod packages_argv_tests {
             }),
             PackagesBusy::InstallAdmin
         );
+        assert_eq!(
+            packages_busy(&PackagesRequest::MachineApply),
+            PackagesBusy::MachineApply
+        );
+    }
+
+    /// The host re-reads the machine record after exactly the verbs whose atpkg
+    /// pass runs `apply_machine_settings` first — derived from the pinned argv
+    /// table, so the list mirrors atpkg's (`update`, `install --default-set`,
+    /// `machine apply`; NOT `uninstall --all` / `install <name>`).
+    #[test]
+    fn a_pass_that_applies_the_machine_settings_rereads_the_record() {
+        let requests = [
+            PackagesRequest::CheckUpdate,
+            PackagesRequest::InstallDefaultSet,
+            PackagesRequest::UninstallAll,
+            PackagesRequest::InstallExtra {
+                name: "codex".to_string(),
+            },
+            PackagesRequest::InstallElevated {
+                names: vec!["clt".to_string(), "brew".to_string()],
+            },
+            PackagesRequest::MachineApply,
+        ];
+        let mut rereads = 0;
+        for request in requests {
+            let argv = packages_argv(&request);
+            let first = argv
+                .first()
+                .map(|verb| verb.iter().map(String::as_str).collect::<Vec<_>>())
+                .unwrap_or_default();
+            let atpkg_applies = matches!(
+                first.as_slice(),
+                ["update"] | ["install", "--default-set"] | ["machine", "apply"]
+            );
+            assert_eq!(
+                packages_busy(&request).applies_machine_settings(),
+                atpkg_applies,
+                "{request:?} → {argv:?}"
+            );
+            rereads += usize::from(atpkg_applies);
+        }
+        assert_eq!(rereads, 3, "update, install --default-set, machine apply");
     }
 
     /// A name that could change the verb's meaning never reaches a child: flags,
@@ -7566,12 +8375,398 @@ mod packages_argv_tests {
                 "{door:?}"
             );
         }
+        // The [machine] host settings are macOS host settings: admissible there,
+        // refused by name everywhere else — before any child is spawned.
+        let machine = packages_request_admissible(&PackagesRequest::MachineApply);
+        if cfg!(target_os = "macos") {
+            assert!(machine.is_ok());
+        } else {
+            assert!(
+                machine
+                    .as_ref()
+                    .is_err_and(|m| m.contains("macOS host settings")),
+                "{machine:?}"
+            );
+        }
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[cfg(unix)]
+    struct MachineChildFixture(std::path::PathBuf);
+
+    #[cfg(unix)]
+    impl MachineChildFixture {
+        fn new(name: &str) -> Self {
+            let nonce = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos();
+            let path = std::env::temp_dir().join(format!(
+                "aterm-machine-{name}-{}-{nonce}",
+                std::process::id()
+            ));
+            std::fs::create_dir(&path).unwrap();
+            Self(path)
+        }
+    }
+
+    #[cfg(unix)]
+    impl Drop for MachineChildFixture {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.0);
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn machine_command_timeout_reaps_owned_child_and_refresh_recovers() {
+        use std::time::{Duration, Instant};
+        let fixture = MachineChildFixture::new("timeout");
+        let pid_path = fixture.0.join("pid");
+        let mut command = std::process::Command::new("/bin/sh");
+        command
+            .args(["-c", r#"printf '%s' "$$" > "$1"; exec /bin/sleep 30"#, "--"])
+            .arg(&pid_path);
+        let mut service = crate::packages_screen::PackagesService::new();
+        dispatch_native_machine_read(&mut service, MachineReadEvent::Request, || Ok(()));
+        let began = Instant::now();
+        let error =
+            machine_command_output(&mut command, "owned machine read", Duration::from_secs(2))
+                .unwrap_err();
+        assert!(began.elapsed() < Duration::from_secs(5), "{error}");
+        assert!(error.contains("timed out"), "{error}");
+        assert!(!error.contains("could not be confirmed"), "{error}");
+        let pid: libc::pid_t = std::fs::read_to_string(pid_path).unwrap().parse().unwrap();
+        let mut status = 0;
+        // SAFETY: WNOHANG only observes the fixture's recorded direct child. The
+        // helper must already have reaped it, so it is no longer our child.
+        assert_eq!(
+            unsafe { libc::waitpid(pid, &mut status, libc::WNOHANG) },
+            -1
+        );
+        assert_eq!(
+            std::io::Error::last_os_error().raw_os_error(),
+            Some(libc::ECHILD)
+        );
+        dispatch_native_machine_read(&mut service, MachineReadEvent::Finished(Err(error)), || {
+            panic!("no queued rerun")
+        });
+        assert!(!service.machine().refreshing);
+        dispatch_native_machine_read(&mut service, MachineReadEvent::Request, || Ok(()));
+        let mut next = std::process::Command::new("/bin/sh");
+        next.args(["-c", "printf '%s\n' 'atpkg: machine-state: universal-control=default; policy=off; noindex=true; spotlight-exposed=2; spotlight-hidden=8; spotlight-migratable=1; scan=complete; home=account'"]);
+        let output =
+            machine_command_output(&mut next, "owned successful read", Duration::from_secs(2))
+                .unwrap();
+        let record = parse_machine_state_output(&String::from_utf8_lossy(&output.stdout)).unwrap();
+        dispatch_native_machine_read(&mut service, MachineReadEvent::Finished(Ok(record)), || {
+            panic!("no queued rerun")
+        });
+        assert!(!service.machine().refreshing);
+        assert!(service.machine().state.is_some());
+
+        // Historical no-deadline waiting would still own this sleeping child;
+        // verify that premise before exercising the same bounded cleanup seam.
+        let mut old = std::process::Command::new("/bin/sleep")
+            .arg("30")
+            .spawn()
+            .unwrap();
+        assert!(old.try_wait().unwrap().is_none());
+        assert!(stop_machine_read_child(
+            &mut old,
+            Instant::now() + Duration::from_secs(1)
+        ));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn machine_command_bounds_inherited_pipe_eof_and_output_flood() {
+        use std::time::{Duration, Instant};
+        let fixture = MachineChildFixture::new("pipe");
+        let done = fixture.0.join("done");
+        let started = fixture.0.join("started");
+        let mut command = std::process::Command::new("/bin/sh");
+        command
+            .args([
+                "-c",
+                r#"printf started > "$2"; (/bin/sleep 3; printf done > "$1") & exit 0"#,
+                "--",
+            ])
+            .arg(&done)
+            .arg(&started);
+        let began = Instant::now();
+        let result =
+            machine_command_output(&mut command, "owned inherited pipe", Duration::from_secs(2));
+        assert!(started.exists(), "fixture must start before its budget");
+        assert!(
+            result.as_ref().is_err_and(|e| e.contains("timed out")),
+            "{result:?}"
+        );
+        assert!(
+            began.elapsed() < Duration::from_secs(3),
+            "an exited child is not stdout EOF"
+        );
+        // The only descendant is this short, owned fixture. Let it complete
+        // before removing its private directory; no reader thread is joined.
+        let cleanup_deadline = began + Duration::from_secs(8);
+        while !done.exists() && Instant::now() < cleanup_deadline {
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        assert!(done.exists(), "owned descendant completed");
+        let mut flood = std::process::Command::new("/usr/bin/yes");
+        flood.arg("owned output flood");
+        let result = machine_command_output(&mut flood, "owned flood", Duration::from_secs(2));
+        assert!(
+            result.as_ref().is_err_and(|e| e.contains("64 KiB")),
+            "{result:?}"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn machine_apply_timeout_and_failed_write_settle_as_failure() {
+        use std::os::unix::process::ExitStatusExt as _;
+        use std::time::Duration;
+        let mut command = std::process::Command::new("/bin/sleep");
+        command.arg("30");
+        let result =
+            machine_command_output(&mut command, "owned apply", Duration::from_millis(250));
+        let (outcome, verdict) = machine_apply_completion(result, |_| panic!("no marker emitted"));
+        assert!(
+            matches!(&outcome, PackagesCommandOutcome::Failed { operation: PackagesBusy::MachineApply, message }
+            if message.contains("timed out") && message.contains("may be partial"))
+        );
+        assert!(verdict.is_none());
+        let mut app = App::headless_for_test();
+        let sequence = app
+            .native_packages_service
+            .begin(Some(PackagesBusy::MachineApply))
+            .unwrap();
+        let report = crate::packages_screen::PackagesStatusReport::from_parts(
+            true,
+            true,
+            "owned".into(),
+            None,
+            &[],
+        );
+        app.finish_native_packages(sequence, PackagesWorkerCompletion::command(report, outcome));
+        assert!(app.native_packages_service.busy().is_none());
+        // The real completion is admissible and releases the verb. Headless
+        // fixtures have no proxy, so its follow-up read intentionally stays off.
+        assert!(PackagesBusy::MachineApply.applies_machine_settings());
+        assert!(!app.native_packages_service.machine().refreshing);
+
+        let stdout = format!(
+            "atpkg: {}spotlight-noindex 1 dir(s) migrated\n{}preference write did not land\n{}applied — spotlight-noindex 1 dir(s) migrated\n",
+            atpkg::cli::MACHINE_SETTINGS_MARKER,
+            atpkg::cli::MACHINE_APPLY_FAILED_PREFIX,
+            atpkg::cli::MACHINE_VERDICT_PREFIX
+        );
+        let output = |bytes: Vec<u8>| std::process::Output {
+            status: std::process::ExitStatus::from_raw(0),
+            stdout: bytes,
+            stderr: Vec::new(),
+        };
+        let mut events = Vec::new();
+        let (outcome, verdict) =
+            machine_apply_completion(Ok(output(stdout.as_bytes().to_vec())), |event| {
+                events.push(event)
+            });
+        assert!(
+            matches!(&outcome, PackagesCommandOutcome::Failed { message, .. } if message == "preference write did not land")
+        );
+        assert_eq!(events.len(), 1);
+        assert!(
+            matches!(&events[0], Wake::PkgMachineSettings(body) if body == "spotlight-noindex 1 dir(s) migrated")
+        );
+        assert_eq!(
+            verdict.as_deref(),
+            Some("applied — spotlight-noindex 1 dir(s) migrated")
+        );
+        let historical = stdout
+            .lines()
+            .filter(|line| !line.starts_with(atpkg::cli::MACHINE_APPLY_FAILED_PREFIX))
+            .collect::<Vec<_>>()
+            .join("\n");
+        let (old, _) = machine_apply_completion(Ok(output(historical.into_bytes())), |_| {});
+        assert!(
+            matches!(old, PackagesCommandOutcome::Succeeded { .. }),
+            "ignoring the failed-write marker would falsely report success"
+        );
+    }
+
+    fn machine_read_dispatch_model() -> aterm_spec::derive::Model {
+        aterm_spec::ty_model! {
+            NativeMachineReadDispatch {
+                const Buggy = 0;
+                var requests = 0;
+                var refreshing = 0;
+                var rerun = 0;
+                var workers = 0;
+                action Request when (requests <= 2) {
+                    requests = requests + 1;
+                    rerun = if refreshing == 1 { 1 } else { 0 };
+                    refreshing = 1;
+                    workers = 1;
+                }
+                action Complete when (workers == 1) {
+                    workers = if rerun == 1 && Buggy == 0 { 1 } else { 0 };
+                    refreshing = rerun;
+                    rerun = if rerun == 1 && Buggy == 1 { 1 } else { 0 };
+                }
+                action RerunSpawnFailure when (workers == 1 && rerun == 1) {
+                    workers = 0;
+                    refreshing = 0;
+                    rerun = 0;
+                }
+                action InitialSpawnFailure when (refreshing == 0 && requests <= 2) {
+                    requests = requests + 1;
+                    workers = 0;
+                    refreshing = 0;
+                    rerun = 0;
+                }
+                invariant Bounded: requests <= 3 && workers <= 1 && rerun <= 1;
+                invariant ReservedReadHasWorker: refreshing == workers;
+                invariant QueuedReadHasWorker: rerun <= workers;
+            }
+        }
+    }
+
+    #[test]
+    fn machine_read_dispatch_model_proves_and_catches_re_admission() {
+        let model = machine_read_dispatch_model();
+        aterm_spec::verify::prove_and_catch_scalar(&model, model.name);
+    }
+
+    #[test]
+    fn machine_read_dispatch_conforms_and_rejects_the_historical_orphan() {
+        use crate::packages_screen::PackagesService;
+
+        let model = machine_read_dispatch_model();
+        for actions in [
+            &["Request", "Request", "Request", "Complete", "Complete"][..],
+            &[
+                "Request",
+                "Request",
+                "RerunSpawnFailure",
+                "Request",
+                "Complete",
+            ],
+            &["InitialSpawnFailure", "Request", "Complete"],
+            &[
+                "Request", "Complete", "Request", "Request", "Complete", "Complete",
+            ],
+        ] {
+            let mut service = PackagesService::new();
+            let mut expected = model.init_state();
+            let mut requests = 0;
+            let mut workers = 0;
+            let mut launches = 0;
+            for action in actions {
+                let is_request = matches!(*action, "Request" | "InitialSpawnFailure");
+                let spawn_fails = matches!(*action, "InitialSpawnFailure" | "RerunSpawnFailure");
+                let event = if is_request {
+                    requests += 1;
+                    MachineReadEvent::Request
+                } else {
+                    assert_eq!(workers, 1, "only a running worker can complete");
+                    workers -= 1;
+                    // A failed read is still a terminal completion. It must
+                    // release or restart the read exactly like a parsed record.
+                    MachineReadEvent::Finished(Err("owned read fixture completed".to_string()))
+                };
+                dispatch_native_machine_read(&mut service, event, || {
+                    launches += 1;
+                    assert_eq!(workers, 0, "dispatch must never overlap machine workers");
+                    if spawn_fails {
+                        Err("owned spawn refusal".to_string())
+                    } else {
+                        workers += 1;
+                        Ok(())
+                    }
+                });
+                assert!(model.fire(action, &mut expected), "{action}");
+                let mut actual = expected.clone();
+                actual.insert("requests", requests);
+                actual.insert("workers", workers);
+                actual.insert("refreshing", i64::from(service.machine().refreshing));
+                actual.insert("rerun", i64::from(service.machine().rerun));
+                assert_eq!(actual, expected, "{actions:?}: {action}");
+            }
+            assert!(
+                launches >= 2,
+                "every script reaches a real replacement attempt"
+            );
+            assert_eq!(workers, 0);
+            assert!(!service.machine().refreshing);
+        }
+
+        // Replay the historical GUI completion sequence with the genuine
+        // reducers: it requests admission a second time for the reserved rerun,
+        // so the finished worker has no successor despite the refreshing flag.
+        let mut historical = PackagesService::new();
+        assert!(historical.request_machine_read());
+        assert!(!historical.request_machine_read());
+        let mut before = model.init_state();
+        assert!(model.fire("Request", &mut before));
+        assert!(model.fire("Request", &mut before));
+        let expected = model.successors("Complete", &before);
+        let reserved = historical.replace_machine_state(Err("old read completed".into()));
+        assert!(reserved);
+        let spawned = reserved && historical.request_machine_read();
+        assert!(!spawned, "the historical dispatch loses the rerun");
+        let mut broken = before;
+        broken.insert("workers", i64::from(spawned));
+        broken.insert("refreshing", i64::from(historical.machine().refreshing));
+        broken.insert("rerun", i64::from(historical.machine().rerun));
+        assert!(
+            !expected.contains(&broken),
+            "the conformance bind must reject a refreshing card with no worker"
+        );
+    }
+
+    /// Rule 5 fence: a headless host (no event-loop proxy) never spawns the
+    /// machine read and never queues one either — the proxy guard precedes the
+    /// queue — so finishing an apply leaves the posture exactly as it was.
+    #[test]
+    fn a_headless_host_never_queues_or_spawns_a_machine_read() {
+        let mut app = App::headless_for_test();
+        app.native_packages_service.set_machine_refreshing(true);
+        app.start_native_machine_refresh();
+        assert!(app.native_packages_service.machine().refreshing);
+        assert!(
+            !app.native_packages_service.machine().rerun,
+            "no proxy ⇒ nothing queued"
+        );
+        let sequence = app
+            .native_packages_service
+            .begin(Some(PackagesBusy::MachineApply))
+            .unwrap();
+        let report = crate::packages_screen::PackagesStatusReport::from_parts(
+            true,
+            true,
+            "fp".to_string(),
+            None,
+            &[],
+        );
+        app.finish_native_packages(
+            sequence,
+            PackagesWorkerCompletion::command(
+                report,
+                PackagesCommandOutcome::Succeeded {
+                    operation: PackagesBusy::MachineApply,
+                },
+            ),
+        );
+        assert!(app.native_packages_service.busy().is_none());
+        assert!(app.native_packages_service.machine().refreshing);
+        assert!(!app.native_packages_service.machine().rerun);
+        assert!(app.native_packages_service.machine().state.is_none());
+    }
 
     #[test]
     fn serious_mode_dequeue_builds_exact_authored_value_without_mutating_runtime() {
@@ -9314,6 +10509,75 @@ mod tests {
     }
 
     #[test]
+    fn an_unknown_probe_after_returned_activation_keeps_the_bounded_retry() {
+        let _ledger = crate::app_update_screen::hold_update_ledger_for_test();
+        let mut app = App::headless_for_test();
+        let build = app.native_updater_service.snapshot().current_build + 1;
+        let installed = installed_update(build);
+        let _ = app.reconcile_native_update_facts(reconcile_facts_with_installed(
+            1,
+            1,
+            Some(status(None, 0)),
+            Some(installed.clone()),
+        ));
+        assert_activation_stage(&app, build, &installed.commit);
+        let ApplyPreflightStart::Inspect(preflight) = app
+            .native_updater_service
+            .begin_apply_preflight(ApplyMode::AutomaticPastGrace)
+        else {
+            panic!("activation must admit preflight");
+        };
+        let ApplyDecision::Execute(command) = app
+            .native_updater_service
+            .finish_apply_preflight(preflight, ClosePreflight::Ready)
+        else {
+            panic!("ready activation must issue an apply ticket");
+        };
+        let attempt = command.attempt();
+        command.execute(|| ());
+        app.auto_apply_intent = None;
+        let outcome = app.finish_async_native_update_handoff(
+            attempt.clone(),
+            reconcile_facts(2, 2, Some(status(None, 0))),
+            "candidate timed out and installed-bundle verification was inconclusive".to_string(),
+            HandoffFailureLane::Physical(PhysicalFailureShape::Transient),
+        );
+        assert!(matches!(outcome, Some(UpdateOutcome::Failed { .. })));
+        assert_activation_stage(&app, build, &installed.commit);
+        let retry = app
+            .auto_apply_manual_only
+            .expect("failure schedules its retry");
+        assert_eq!(retry.build, build);
+        assert!(
+            retry
+                .retry_at
+                .is_some_and(|at| at > std::time::Instant::now())
+        );
+        assert!(app.automatic_apply_retry_scheduled(build));
+        assert!(
+            app.auto_apply_intent.is_none(),
+            "the cooldown must not be bypassed"
+        );
+
+        let budget = app.auto_apply_physical_retry;
+        assert!(
+            budget.is_some(),
+            "the real completion must charge the physical budget"
+        );
+        assert!(
+            app.finish_async_native_update_handoff(
+                attempt,
+                reconcile_facts(3, 3, Some(status(None, 0))),
+                "duplicate completion".to_string(),
+                HandoffFailureLane::Physical(PhysicalFailureShape::Transient),
+            )
+            .is_none()
+        );
+        assert_eq!(app.auto_apply_physical_retry, budget);
+        assert_eq!(app.auto_apply_manual_only, Some(retry));
+    }
+
+    #[test]
     fn a_freshly_imported_stage_raises_no_card_and_no_glow_and_a_repeat_import_is_quiet() {
         let mut app = App::headless_for_test();
         let running = app.native_updater_service.snapshot().current_build;
@@ -9394,8 +10658,8 @@ mod tests {
         assert_activation_stage(&app, 12, &installed.commit);
         let outcome = app.native_updater_service.snapshot().outcome.clone();
         assert!(
-            outcome.contains("already installed") && outcome.contains("activating"),
-            "the durable outcome says the bytes are on disk and being activated, got {outcome:?}"
+            outcome.contains("already installed") && outcome.contains("activation is pending"),
+            "the durable outcome says the bytes are on disk with activation pending, got {outcome:?}"
         );
 
         // STABLE: the same facts again keep the same activation stage (no retire,
@@ -9524,6 +10788,275 @@ mod tests {
                 .map(|stage| stage.dmg_sha256.as_str()),
             Some("cdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcd")
         );
+    }
+
+    #[test]
+    fn installed_environment_repair_conforms_and_preserves_unrelated_budgets() {
+        use crate::update_apply_trouble::ApplyRetry;
+        let _ledger = crate::app_update_screen::hold_update_ledger_for_test();
+        let model = aterm_spec::derive::native_update_environment_repair_model();
+        // Good, stale, unknown, wrong build, wrong commit, unrelated latch,
+        // newer cache, auto opt-out, an ordinary exhausted budget, and a
+        // verified but noninstallable (for example dev-marked) source.
+        for case in 0..10 {
+            let mut app = App::headless_for_test();
+            app.native_updater_service = NativeUpdaterService::new(10, "test", true);
+            stage_one_build_for_test(&mut app, 11);
+            app.block_native_auto_apply_environment(11, [0xab; 32]);
+            let blocked_at = app.auto_apply_environment_block.unwrap().blocked_at;
+            let reason = "the installed bundle cannot be the rollback source";
+            app.native_updater_service
+                .note_apply_failure(&aterm_update::RecordedApplyFailure {
+                    apply_failures: 1,
+                    failures_for_target: 1,
+                    target_build: 11,
+                    reason: reason.to_string(),
+                    persistent: false,
+                });
+            assert_eq!(app.apply_retry_for(Some(11)), ApplyRetry::NeedsPerson);
+            let blocked_detail = app.update_snapshot(false).projection().detail.unwrap();
+            assert!(
+                blocked_detail
+                    .contains("Install the signed release from the release DMG, then retry."),
+                "the real App must pass its current environment block to the page: {blocked_detail}"
+            );
+            assert!(!blocked_detail.contains("try again by itself"));
+            let cache = std::sync::Arc::clone(&app.handoff_preverified);
+            *cache.lock().unwrap() = Some(crate::HandoffPreverification {
+                build: 11,
+                commit: PREFLIGHT_TEST_COMMIT.to_string(),
+                artifact: "ab".repeat(32),
+                at: if case == 6 {
+                    blocked_at + std::time::Duration::from_secs(2)
+                } else {
+                    blocked_at
+                },
+                passed: false,
+                reason: Some(reason.to_string()),
+            });
+            if case == 5 {
+                app.auto_apply_manual_only.as_mut().unwrap().dmg_sha256 = [0xcd; 32];
+            }
+            if case == 8 {
+                app.auto_apply_environment_block = None;
+            }
+            if case == 7 {
+                app.config.update = Some(crate::app_config::UpdateConfig {
+                    auto_apply: Some(false),
+                    ..Default::default()
+                });
+            }
+            app.auto_apply_physical_retry = Some(crate::AutoOverlapRetry {
+                build: 12,
+                dmg_sha256: [0xcd; 32],
+                activation: false,
+                cycles: PHYSICAL_FAILURE_LIFETIME_ATTEMPTS,
+                last_attempt: blocked_at,
+            });
+            let budget = app.auto_apply_physical_retry;
+            let owned = !matches!(case, 5 | 8);
+            let fresh = !matches!(case, 1 | 6);
+            let verified = !matches!(case, 2..=4 | 9);
+            let mut durable = status(Some(11), 0);
+            durable.failing_applies = 1;
+            durable.apply_failure_build = 11;
+            durable.apply_failures_for_target = 1;
+            durable.apply_failure = reason.to_string();
+            durable.installable = case != 9;
+            let mut facts = reconcile_facts_with_installed(
+                1,
+                1,
+                Some(durable),
+                (case != 2).then(|| InstalledUpdate {
+                    build: if case == 3 { 9 } else { 10 },
+                    commit: if case == 4 {
+                        "f".repeat(40)
+                    } else {
+                        PREFLIGHT_TEST_COMMIT.to_string()
+                    },
+                    version: None,
+                    receipt_build: None,
+                    receipt_dmg_sha256: None,
+                }),
+            );
+            facts.observed_at = if case == 1 {
+                blocked_at - std::time::Duration::from_millis(1)
+            } else {
+                blocked_at + std::time::Duration::from_secs(1)
+            };
+            let mut before = model.init_state();
+            for (guard, action) in [(owned, "Own"), (fresh, "Fresh"), (verified, "Verify")] {
+                if guard {
+                    before = model.successors(action, &before).remove(0);
+                }
+            }
+            if case == 0 {
+                facts.durable.as_mut().unwrap().enabled = false;
+                app.release_repaired_auto_apply_environment_for_commit(
+                    &facts,
+                    PREFLIGHT_TEST_COMMIT,
+                );
+                assert!(
+                    app.auto_apply_manual_only.is_some(),
+                    "disabled updater cannot release a repair latch"
+                );
+                facts.durable.as_mut().unwrap().enabled = true;
+                app.release_repaired_auto_apply_environment_for_commit(
+                    &facts,
+                    &format!("{PREFLIGHT_TEST_COMMIT}-dirty"),
+                );
+                assert!(
+                    app.auto_apply_manual_only.is_some(),
+                    "a dirty running identity cannot prove a signed-source repair"
+                );
+                let held = cache.lock().unwrap();
+                app.release_repaired_auto_apply_environment_for_commit(
+                    &facts,
+                    PREFLIGHT_TEST_COMMIT,
+                );
+                assert!(
+                    app.auto_apply_manual_only.is_some(),
+                    "cache contention must not wait or release"
+                );
+                drop(held);
+            }
+            // A dirty test binary has no verifiable committed identity. Supply a
+            // clean running identity to the same production reduction; shipping
+            // calls pass GIT_COMMIT and retain their dirty-identity refusal.
+            app.release_repaired_auto_apply_environment_for_commit(&facts, PREFLIGHT_TEST_COMMIT);
+            let mut after = before.clone();
+            after.insert("decided", 1);
+            after.insert("latched", i64::from(app.auto_apply_manual_only.is_some()));
+            assert_eq!(
+                model.successors("Reduce", &before),
+                vec![after.clone()],
+                "case {case}"
+            );
+            assert_eq!(app.auto_apply_physical_retry, budget);
+            if owned && fresh && verified {
+                assert!(
+                    cache.lock().unwrap().is_none(),
+                    "old denial is invalidated, never forged into success"
+                );
+                // Substitute the next full preverification result, avoiding any
+                // OS verifier in this policy fixture, then drive real arming.
+                *cache.lock().unwrap() = Some(crate::HandoffPreverification {
+                    build: 11,
+                    commit: PREFLIGHT_TEST_COMMIT.to_string(),
+                    artifact: "ab".repeat(32),
+                    at: std::time::Instant::now(),
+                    passed: true,
+                    reason: None,
+                });
+                assert_eq!(app.arm_native_auto_apply(11, &"ab".repeat(32)), case != 7);
+                assert_eq!(
+                    app.apply_retry_for(Some(11)),
+                    if case == 7 {
+                        ApplyRetry::ManualOnly
+                    } else {
+                        ApplyRetry::Scheduled
+                    }
+                );
+                assert_eq!(app.native_updater_service.snapshot().apply_failure, reason);
+                assert!(
+                    !app.update_snapshot(false)
+                        .projection()
+                        .detail
+                        .unwrap()
+                        .contains("Install the signed release"),
+                    "a repaired source no longer asks for repair, including with auto-apply off"
+                );
+                assert_eq!(
+                    app.apply_trouble_for(11)
+                        .unwrap()
+                        .sentence()
+                        .contains("try again by itself"),
+                    case != 7,
+                    "historical cause cannot override current repaired scheduling"
+                );
+                // Historical permanent-latch behavior fails this recovery law.
+                after.insert("latched", 1);
+                assert!(!model.check_invariant("RepairedSourceRecovers", &after));
+            }
+        }
+    }
+
+    #[test]
+    fn retiring_a_withdrawn_stage_releases_only_its_exact_latch_and_rearms_a_replacement() {
+        let _ledger = crate::app_update_screen::hold_update_ledger_for_test();
+        let model = aterm_spec::derive::native_update_retired_intent_model();
+        for unrelated in [0, 1, 2] {
+            let mut app = App::headless_for_test();
+            let withdrawn = app.native_updater_service.snapshot().current_build + 2;
+            let replacement = withdrawn - 1;
+            let _ = app.reconcile_native_update_facts(reconcile_facts(
+                1,
+                1,
+                Some(status(Some(withdrawn), 0)),
+            ));
+            let latch = crate::AutoApplyManualOnly {
+                build: withdrawn + u64::from(unrelated == 1),
+                dmg_sha256: if unrelated == 2 {
+                    [0xcd; 32]
+                } else {
+                    [0xab; 32]
+                },
+                retry_at: None,
+            };
+            app.auto_apply_manual_only = Some(latch);
+            // An unchanged exact stage and an older observation must keep the
+            // latch: a periodic reconcile is not permission to reset a budget.
+            let _ = app.reconcile_native_update_facts(reconcile_facts(
+                2,
+                2,
+                Some(status(Some(withdrawn), 0)),
+            ));
+            assert_eq!(app.auto_apply_manual_only, Some(latch));
+            assert!(matches!(
+                app.reconcile_native_update_facts(reconcile_facts(1, 1, Some(status(None, 0)))),
+                NativeUpdateFactsResult::IgnoredStale
+            ));
+            assert_eq!(app.auto_apply_manual_only, Some(latch));
+
+            let mut before = model.init_state();
+            if unrelated != 0 {
+                before = model.successors("OtherArtifact", &before).remove(0);
+            }
+            let _ = app.reconcile_native_update_facts(reconcile_facts(3, 3, Some(status(None, 0))));
+            let mut after = before.clone();
+            after.insert(
+                "retired",
+                i64::from(app.native_updater_service.snapshot().staged.is_none()),
+            );
+            after.insert("latched", i64::from(app.auto_apply_manual_only.is_some()));
+            assert_eq!(model.successors("Retire", &before), vec![after.clone()]);
+            if unrelated != 0 {
+                assert_eq!(app.auto_apply_manual_only, Some(latch));
+                continue;
+            }
+            assert!(app.auto_apply_manual_only.is_none());
+            app.finish_native_update_reconcile(
+                NativeUpdateReconcilePurpose::StageAvailable,
+                reconcile_facts(4, 4, Some(status(Some(replacement), 0))),
+            );
+            assert!(
+                app.auto_apply_intent
+                    .is_some_and(|intent| intent.build == replacement)
+            );
+            assert!(app.automatic_apply_retry_scheduled(replacement));
+
+            // Restore only the historical leftover state, then drive the real
+            // arming reducer. It demonstrates why the removed latch stranded a
+            // valid replacement that is newer than the running process.
+            app.auto_apply_manual_only = Some(latch);
+            app.auto_apply_intent = None;
+            assert!(!app.arm_native_auto_apply(replacement, &"ab".repeat(32)));
+            assert!(app.auto_apply_intent.is_none());
+            let mut historical = after;
+            historical.insert("latched", 1);
+            assert!(!model.successors("Retire", &before).contains(&historical));
+            assert!(!model.check_invariant("NoObsoleteLatch", &historical));
+        }
     }
 
     #[test]
@@ -10693,6 +12226,7 @@ mod tests {
                 artifact: "ab".repeat(32),
                 at: std::time::Instant::now(),
                 passed: true,
+                reason: None,
             });
         let current_build = app.native_updater_service.snapshot().current_build;
         assert!(
@@ -11003,6 +12537,116 @@ mod tests {
                 "attempt {attempt} must have consumed exactly one retry budget cycle"
             );
         }
+    }
+
+    /// Drive the real nonannounced timer path into a dirty-Settings refusal and
+    /// read its durable answer. A child process isolates the shared scratch ledger
+    /// from unrelated updater tests that write different standing explanations.
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn nonannounced_automatic_blocks_are_durable_only_after_real_attempts() {
+        const CHILD: &str = "ATERM_TEST_AUTOMATIC_REFUSAL_LEDGER_CHILD";
+        const DONE: &str = "automatic-refusal-ledger assertions completed";
+        if std::env::var_os(CHILD).is_none() {
+            let name = std::thread::current()
+                .name()
+                .expect("the harness names its current test")
+                .to_string();
+            let mut child = std::process::Command::new(std::env::current_exe().unwrap())
+                .args(["--exact", &name, "--nocapture"])
+                .env(CHILD, "1")
+                .env("RUST_TEST_THREADS", "1")
+                .stdout(std::process::Stdio::piped())
+                .stderr(std::process::Stdio::piped())
+                .spawn()
+                .expect("launch isolated automatic-refusal test");
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(60);
+            while child.try_wait().unwrap().is_none() {
+                if std::time::Instant::now() >= deadline {
+                    let _ = child.kill();
+                    let _ = child.wait();
+                    panic!("isolated automatic-refusal test exceeded its deadline");
+                }
+                std::thread::sleep(std::time::Duration::from_millis(20));
+            }
+            let output = child.wait_with_output().unwrap();
+            let stdout = String::from_utf8_lossy(&output.stdout);
+            assert!(
+                output.status.success(),
+                "{stdout}\n{}",
+                String::from_utf8_lossy(&output.stderr),
+            );
+            assert!(
+                stdout.contains(DONE),
+                "the child must execute its assertions"
+            );
+            return;
+        }
+
+        let _ledger = crate::app_update_screen::hold_update_ledger_for_test();
+        let mut app = App::headless_for_test();
+        assert!(crate::app_config::update_auto_apply(&app.config));
+        assert!(!App::relaunch_nudge_seam_suppresses_auto_apply());
+        let wid = WindowId(0);
+        let _ = park_a_settings_draft_in_a_background_tab(&mut app);
+        let working_tab = app.windows[&wid].tab_set.active_id().unwrap();
+        let current = app.native_updater_service.snapshot().current_build;
+        stage_one_build_for_test(&mut app, current + 4_913);
+        let before = aterm_update::status(current).unwrap();
+        app.status_bars = crate::status_bars::StatusBars::default();
+
+        force_auto_apply_attempt_now(&mut app);
+        app.try_pending_native_auto_apply(false);
+        assert_eq!(app.auto_apply_intent.unwrap().attempts, 1);
+        let report = aterm_update::apply_lane_report(current).unwrap();
+        assert_eq!(report.last_refusal, App::UNSAVED_NATIVE_WORK_BLOCKS_APPLY);
+        assert!(!report.last_refusal_at.is_empty());
+        let after = aterm_update::status(current).unwrap();
+        assert!(
+            after
+                .outcome
+                .contains(App::UNSAVED_NATIVE_WORK_BLOCKS_APPLY)
+        );
+        assert_eq!(after.failing_applies, before.failing_applies);
+        assert_eq!(after.failing_checks, before.failing_checks);
+        assert!(
+            app.update_row_text().is_none(),
+            "announce=false remains quiet"
+        );
+        assert_no_probe_disturbance(&app, wid, working_tab);
+
+        // A different durable marker makes an accidental rewrite observable even
+        // if timestamps have only second precision. Merely polling a future retry
+        // must neither consume an attempt nor replace this standing explanation.
+        const BETWEEN: &str = "test marker between actual automatic attempts";
+        aterm_update::record_apply_refusal(current, BETWEEN);
+        for _ in 0..16 {
+            app.try_pending_native_auto_apply(false);
+        }
+        assert_eq!(app.auto_apply_intent.unwrap().attempts, 1);
+        assert_eq!(
+            aterm_update::apply_lane_report(current)
+                .unwrap()
+                .last_refusal,
+            BETWEEN
+        );
+
+        force_auto_apply_attempt_now(&mut app);
+        app.try_pending_native_auto_apply(false);
+        assert_eq!(app.auto_apply_intent.unwrap().attempts, 2);
+        assert_eq!(
+            aterm_update::apply_lane_report(current)
+                .unwrap()
+                .last_refusal,
+            App::UNSAVED_NATIVE_WORK_BLOCKS_APPLY,
+        );
+        assert_eq!(
+            aterm_update::status(current).unwrap().failing_applies,
+            before.failing_applies
+        );
+        assert!(app.update_row_text().is_none());
+        assert_no_probe_disturbance(&app, wid, working_tab);
+        println!("{DONE}");
     }
 
     /// THE "UPDATE PAUSED" REGRESSION, AND THE RECURRING NAG IT WAS ALMOST TRADED
@@ -11367,6 +13011,7 @@ mod tests {
                 artifact: "ab".repeat(32),
                 at: std::time::Instant::now(),
                 passed: false,
+                reason: None,
             });
         assert_eq!(app.cached_handoff_preverification(&download), Some(false));
         assert_eq!(
@@ -11638,8 +13283,8 @@ mod tests {
             "the durable outcome names the installed build, got {outcome:?}"
         );
         assert!(
-            outcome.contains("activating"),
-            "…and says what happens next — activation, not a manual relaunch, got {outcome:?}"
+            outcome.contains("activation is pending"),
+            "…and names the outstanding activation, got {outcome:?}"
         );
         assert!(
             !outcome.to_lowercase().contains("relaunch"),
@@ -12104,6 +13749,7 @@ mod tests {
     /// the `RuntimeError::UnknownInstance` shape `prepare_close` reports.
     #[test]
     fn a_broken_close_reducer_is_a_failure_not_a_block() {
+        let _ledger = crate::app_update_screen::hold_update_ledger_for_test();
         let mut app = App::headless_for_test();
         let wid = crate::WindowId(0);
         assert!(

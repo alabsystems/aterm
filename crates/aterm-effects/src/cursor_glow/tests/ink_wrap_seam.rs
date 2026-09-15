@@ -1,9 +1,8 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! **THE INK WRAP SEAM TRACE** (2026-09-13 — the owner: "the rainbow cursor
-//! streak doesn't follow the new line down in claude code and codex. it's
-//! persistent on the screen. This looks weird.").
+//! **THE INK WRAP SEAM TRACE** — the owner: "the rainbow cursor streak
+//! doesn't follow the new line down in claude code and codex".
 //!
 //! A headless replay of Claude Code's (Ink's) composer WRAP at the seam,
 //! modelled on `a_line_still_being_typed_has_no_dark_cell_inside_its_live_span`:
@@ -370,7 +369,7 @@ fn replay(shape: WrapShape) -> Replay {
                 } else {
                     rk::TypedClass::Glyph
                 };
-                glow.supersede_typed_press(key_at);
+                glow.supersede_typed_press();
                 glow.note_typed_glyph(key_at, 1, false, class);
                 for (delay, to, scroll) in echoes {
                     pending.push(Echo {

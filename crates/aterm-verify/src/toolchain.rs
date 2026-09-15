@@ -490,6 +490,54 @@ impl Toolchain {
         is_executable_file(&self.trustdoc)
     }
 
+    /// The compiler this run is using, for the mid-run tripwire
+    /// ([`crate::identity::Tripwire`]) and the snapshot lanes' stamps.
+    ///
+    /// WHY (2026-09-13): the gate resolves one physical stage2 directory and
+    /// runs every stage with it, but a directory is not a compiler — an atpkg
+    /// update or a promote rewrites the files in place, and a 14 h run spans
+    /// several of those. So the identity is the files: `(dev, ino, len,
+    /// mtime)` of `targo`, `trustc`, `trustdoc` and `tippy`, plus the commit
+    /// `trustc -vV` names. The version query runs under a one-minute ceiling in
+    /// `scratch`, so a wedged driver costs the commit hash, never the run.
+    #[must_use]
+    pub fn identity(&self, path_env: &OsStr, scratch: &Path) -> crate::identity::ToolchainIdentity {
+        let trustc = self.stage2_dir.join("trustc");
+        let tippy = self
+            .tippy
+            .clone()
+            .unwrap_or_else(|| self.stage2_dir.join("tippy"));
+        let files = [&self.targo, &trustc, &self.trustdoc, &tippy]
+            .into_iter()
+            .map(|p| (p.clone(), crate::identity::FileStamp::of(p)))
+            .collect();
+        let commit = if is_executable_file(&trustc) {
+            let log = scratch.join(format!("trustc-vV.{}.log", std::process::id()));
+            let _ = std::fs::remove_file(&log);
+            let run = crate::exec::run(
+                &crate::exec::Cmd::new(&trustc)
+                    .arg("-vV")
+                    .capture(crate::exec::Capture::Append(log.clone())),
+                crate::exec::ExecEnv {
+                    cwd: scratch,
+                    path: path_env,
+                    scratch,
+                    child_ceiling: Some(std::time::Duration::from_secs(60)),
+                    remove_env: &[],
+                    timings: None,
+                },
+            );
+            let text = std::fs::read_to_string(&log).unwrap_or_default();
+            let _ = std::fs::remove_file(&log);
+            run.ok
+                .then(|| crate::identity::commit_hash_in(&text))
+                .flatten()
+        } else {
+            None
+        };
+        crate::identity::ToolchainIdentity { files, commit }
+    }
+
     /// PATH for every child: the stage2 directory first, but only when a `targo`
     /// really lives there — the script guarded the export the same way, so a
     /// stale `TRUST_STAGE2_BIN` cannot shadow the caller's tools with nothing.

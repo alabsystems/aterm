@@ -109,9 +109,11 @@ pub fn never_checked(layout: &Layout) -> bool {
 
 /// Stamp `last_success_at = now` (and `updated_at`, which every write moves) on the
 /// record, creating a minimal one when none exists. Called by the CLI at the END of a
-/// pass that resolved the signed index and applied it without a failure — the one
-/// event that makes "packages can be updated on this machine" true. Best-effort like
-/// every status write.
+/// pass that resolved the signed index and ran to its end — the one event that makes
+/// "packages can be updated on this machine" true. A member that FAILED inside such a
+/// pass is recorded in its own row, not here: until 2026-09-14 only a zero-failure pass
+/// stamped this, so one refused member kept every verb saying no check had ever run.
+/// Best-effort like every status write.
 pub fn stamp_success(layout: &Layout, now: &str) -> io::Result<()> {
     let mut status = read(layout).unwrap_or(Status {
         schema: 1,

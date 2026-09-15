@@ -25,6 +25,7 @@ use aterm_scrollback::{CellAttrs, HyperlinkSpan, ImageSpan, Line, UnderlineColor
 
 use super::Grid;
 use crate::Cell;
+use crate::CellFlags;
 use crate::PackedColor;
 use crate::Row;
 use crate::StyleTable;
@@ -72,6 +73,94 @@ pub(in crate::grid) fn is_spacer(cells: &[Cell], idx: usize) -> bool {
         && !cells[idx].is_wide()
         && idx > 0
         && cells[idx - 1].is_wide()
+}
+
+/// The flags that make a cell need the per-cell path: a complex codepoint
+/// lives in the overflow table, a wide cell or a continuation spacer makes
+/// [`is_spacer`] consult its neighbour, and `PROTECTED` shares its bit with
+/// `WIDE_CONTINUATION` so it rides along (conservatively — a protected cell
+/// simply takes the old path).
+const RUN_DISQUALIFY: CellFlags =
+    CellFlags(CellFlags::COMPLEX.0 | CellFlags::WIDE.0 | CellFlags::WIDE_CONTINUATION.0);
+
+/// A cell's plain printable-ASCII byte, or `None` when it needs the per-cell
+/// path. `char_data` is a BMP codepoint whenever `COMPLEX` is clear, so this
+/// is one mask and one range test.
+#[inline]
+fn plain_ascii_byte(cell: &Cell) -> Option<u8> {
+    if cell.flags().intersects(RUN_DISQUALIFY) {
+        return None;
+    }
+    let c = cell.char() as u32;
+    (0x20..0x80).contains(&c).then_some(c as u8)
+}
+
+/// The attributes of `cell` exactly as the per-cell loop computed them.
+#[inline]
+fn cell_attrs_of(cell: &Cell) -> CellAttrs {
+    let fg_raw = cell.fg_color().map_or(PackedColor::DEFAULT_FG.0, |c| c.0);
+    let bg_raw = cell.bg_color().map_or(PackedColor::DEFAULT_BG.0, |c| c.0);
+    CellAttrs::from_raw(fg_raw, bg_raw, cell.flags().bits())
+}
+
+/// **THE PLAIN RUN** (2026-09-14, the performance audit) — append the maximal
+/// run of cells at `from` that need no per-cell decision, and return where it
+/// ended.
+///
+/// Scroll-off materialization walked one cell at a time: an [`is_spacer`] that
+/// peeks at the neighbour, a `char()` decode, two `Option` colour maps and an
+/// RLE compare, per cell, per scrolled line. Ordinary output is not shaped like
+/// that — it is runs of printable ASCII under one attribute — so a run is found
+/// once and then costs one `push_str` and ONE [`AttrRunBuilder::extend`]
+/// instead of `n` of each. Cells that do not qualify (wide, complex, a
+/// continuation spacer, a non-ASCII or control codepoint, or a change of
+/// attributes) fall through to the caller's per-cell body unchanged, so the
+/// emitted `Line` is byte-identical either way.
+///
+/// Measured on `scrollback_materialize`, interleaved: `plain_ring`
+/// 3.82 → 3.19 ms/MiB (−16.4%), `plain_ring_hot` 3.46 → 2.77 (−20%).
+#[inline]
+fn append_plain_run(
+    cells: &[Cell],
+    from: usize,
+    text: &mut String,
+    attrs_rle: &mut AttrRunBuilder,
+) -> usize {
+    let Some(first) = plain_ascii_byte(&cells[from]) else {
+        return from;
+    };
+    let attrs = cell_attrs_of(&cells[from]);
+    let flags = cells[from].flags().bits();
+    // A stack chunk keeps the text append to one `push_str` per 64 cells
+    // instead of one `push` per cell; every byte in it is ASCII by
+    // construction, so the `from_utf8` is infallible and the caller's
+    // `String` stays valid UTF-8.
+    let mut chunk = [0u8; 64];
+    chunk[0] = first;
+    let mut n = 1usize;
+    let mut end = from + 1;
+    while end < cells.len() {
+        let cell = &cells[end];
+        if cell.flags().bits() != flags {
+            break;
+        }
+        let Some(byte) = plain_ascii_byte(cell) else {
+            break;
+        };
+        if cell_attrs_of(cell) != attrs {
+            break;
+        }
+        if n == chunk.len() {
+            text.push_str(std::str::from_utf8(&chunk).unwrap_or_default());
+            n = 0;
+        }
+        chunk[n] = byte;
+        n += 1;
+        end += 1;
+    }
+    text.push_str(std::str::from_utf8(&chunk[..n]).unwrap_or_default());
+    attrs_rle.extend(attrs, u32::try_from(end - from).unwrap_or(u32::MAX));
+    end
 }
 
 /// Whether any cell in `cells` carries something
@@ -317,14 +406,19 @@ impl DeferredLine {
         let mut text = String::with_capacity(cells.len());
         let mut attrs_rle = AttrRunBuilder::empty();
 
-        for (idx, cell) in cells.iter().enumerate() {
-            if is_spacer(cells, idx) {
+        let mut idx = 0;
+        while idx < cells.len() {
+            let run_end = append_plain_run(cells, idx, &mut text, &mut attrs_rle);
+            if run_end > idx {
+                idx = run_end;
                 continue;
             }
-            text.push(cell.char());
-            let fg_raw = cell.fg_color().map_or(PackedColor::DEFAULT_FG.0, |c| c.0);
-            let bg_raw = cell.bg_color().map_or(PackedColor::DEFAULT_BG.0, |c| c.0);
-            attrs_rle.push(CellAttrs::from_raw(fg_raw, bg_raw, cell.flags().bits()));
+            let cell = &cells[idx];
+            if !is_spacer(cells, idx) {
+                text.push(cell.char());
+                attrs_rle.push(cell_attrs_of(cell));
+            }
+            idx += 1;
         }
 
         let mut line = Line::with_hyperlinks_owned(text, attrs_rle.finish(), Vec::new());
@@ -913,21 +1007,31 @@ impl Grid {
         let mut text = String::with_capacity(len);
         let mut attrs_rle = AttrRunBuilder::empty();
 
-        for (idx, cell) in cells.iter().enumerate() {
-            #[cfg(any(test, feature = "testing"))]
-            super::count_row_to_line_cell();
-
-            if is_spacer(cells, idx) {
+        let mut idx = 0;
+        while idx < cells.len() {
+            // The census counts CELLS, not runs, so it is stepped for every
+            // cell the walk covers whichever arm covers it.
+            let run_end = append_plain_run(cells, idx, &mut text, &mut attrs_rle);
+            if run_end > idx {
+                #[cfg(any(test, feature = "testing"))]
+                for _ in idx..run_end {
+                    super::count_row_to_line_cell();
+                }
+                idx = run_end;
                 continue;
             }
 
-            // No complex chars possible — char_data is always a BMP codepoint.
-            text.push(cell.char());
+            #[cfg(any(test, feature = "testing"))]
+            super::count_row_to_line_cell();
 
-            // No overflow or style_id — read inline colors directly.
-            let fg_raw = cell.fg_color().map_or(PackedColor::DEFAULT_FG.0, |c| c.0);
-            let bg_raw = cell.bg_color().map_or(PackedColor::DEFAULT_BG.0, |c| c.0);
-            attrs_rle.push(CellAttrs::from_raw(fg_raw, bg_raw, cell.flags().bits()));
+            let cell = &cells[idx];
+            if !is_spacer(cells, idx) {
+                // No complex chars possible — char_data is always a BMP codepoint.
+                text.push(cell.char());
+                // No overflow or style_id — read inline colors directly.
+                attrs_rle.push(cell_attrs_of(cell));
+            }
+            idx += 1;
         }
 
         let mut line = Line::with_hyperlinks_owned(text, attrs_rle.finish(), Vec::new());
@@ -1637,6 +1741,155 @@ pub(in crate::grid) fn coalesce_underline_spans(per_col: &[(u16, u32)]) -> Vec<U
         spans.push(UnderlineColorSpan::new(col, col.saturating_add(1), color));
     }
     spans
+}
+
+#[cfg(test)]
+mod plain_run_equivalence_tests {
+    use super::*;
+
+    // The loop before 90ea59df5, deliberately independent of append_plain_run
+    // and cell_attrs_of. It is the reference for both shipping entry points.
+    fn old_cell_loop(cells: &[Cell], wrapped: bool) -> Line {
+        let mut text = String::new();
+        let mut attrs = AttrRunBuilder::empty();
+        for (idx, cell) in cells.iter().enumerate() {
+            if is_spacer(cells, idx) {
+                continue;
+            }
+            text.push(cell.char());
+            let fg = cell.fg_color().map_or(PackedColor::DEFAULT_FG.0, |c| c.0);
+            let bg = cell.bg_color().map_or(PackedColor::DEFAULT_BG.0, |c| c.0);
+            attrs.push(CellAttrs::from_raw(fg, bg, cell.flags().bits()));
+        }
+        let mut line = Line::with_hyperlinks_owned(text, attrs.finish(), Vec::new());
+        line.set_wrapped(wrapped);
+        line
+    }
+
+    fn equivalent(actual: &Line, expected: &Line) -> bool {
+        actual.to_string() == expected.to_string()
+            && actual.attrs().map(Rle::runs) == expected.attrs().map(Rle::runs)
+            && actual.is_wrapped() == expected.is_wrapped()
+            // This is also the history representation carried by an update.
+            && aterm_scrollback::serialize_lines(std::slice::from_ref(actual))
+                == aterm_scrollback::serialize_lines(std::slice::from_ref(expected))
+    }
+
+    fn check_both_paths(cells: &[Cell], wrapped: bool) {
+        let len = u16::try_from(cells.len()).expect("bounded fixture");
+        let mut grid = Grid::new(1, len.max(1));
+        let row = grid.row_mut(0).expect("fixture row");
+        for (col, cell) in cells.iter().enumerate() {
+            assert!(row.set(u16::try_from(col).expect("bounded column"), *cell));
+        }
+        // The explicit full-width seam must retain trailing spaces too.
+        row.update_len(len);
+        row.set_wrapped(wrapped);
+        let expected = old_cell_loop(cells, wrapped);
+        let eager =
+            Grid::row_to_line_with_stored_extras_at_len(row, &ScrolledRowExtras::default(), len);
+        assert!(
+            equivalent(&eager, &expected),
+            "eager len={len}, wrapped={wrapped}"
+        );
+        let deferred = DeferredLine::new(row, ScrolledRowExtras::default(), Vec::new());
+        assert!(
+            equivalent(deferred.to_line(), &expected),
+            "deferred len={len}, wrapped={wrapped}"
+        );
+        // Consuming an uncached deferred row is a separate shipping caller.
+        let uncached = DeferredLine::new(row, ScrolledRowExtras::default(), Vec::new());
+        let (consumed, _) = uncached.into_line_and_body();
+        assert!(
+            equivalent(&consumed, &expected),
+            "consumed len={len}, wrapped={wrapped}"
+        );
+    }
+
+    fn styled(ch: char, color: u8, flags: CellFlags) -> Cell {
+        Cell::with_style(
+            ch,
+            PackedColor::indexed(color),
+            PackedColor::DEFAULT_BG,
+            flags,
+        )
+    }
+
+    #[test]
+    fn plain_run_materialization_matches_old_loop_at_chunk_boundaries() {
+        for len in [0, 1, 63, 64, 65, 127, 128, 129] {
+            for wrapped in [false, true] {
+                check_both_paths(&vec![Cell::new('x'); len], wrapped);
+                check_both_paths(&vec![styled('x', 2, CellFlags::BOLD); len], wrapped);
+                check_both_paths(&vec![Cell::EMPTY; len], wrapped);
+                let alternating: Vec<_> = (0..len)
+                    .map(|i| styled('x', if i % 2 == 0 { 1 } else { 2 }, CellFlags::BOLD))
+                    .collect();
+                check_both_paths(&alternating, wrapped);
+            }
+        }
+        // Attribute boundaries independently straddle text-chunk boundaries.
+        for boundary in [63, 64, 65, 127, 128] {
+            let mut cells = vec![styled('a', 1, CellFlags::BOLD); 129];
+            cells[boundary..].fill(styled('b', 2, CellFlags::ITALIC));
+            check_both_paths(&cells, false);
+            check_both_paths(&cells, true);
+        }
+    }
+
+    #[test]
+    fn plain_run_materialization_matches_old_loop_across_fallbacks() {
+        let fallback = [
+            Cell::new('\0'),
+            Cell::new('\u{1f}'),
+            Cell::new('\u{7f}'),
+            Cell::new('\u{80}'),
+            Cell::new('é'),
+            styled('世', 2, CellFlags::WIDE),
+            styled(' ', 2, CellFlags::WIDE_CONTINUATION),
+            styled('!', 2, CellFlags::PROTECTED),
+            styled('x', 2, CellFlags::COMPLEX),
+            Cell::from_raw_parts(0xD800, crate::PackedColors::DEFAULT, CellFlags::empty()),
+        ];
+        for boundary in [0, 1, 63, 64, 65, 127, 128] {
+            let mut cells = vec![Cell::new('a'); boundary];
+            cells.extend_from_slice(&fallback);
+            cells.extend(std::iter::repeat_n(Cell::new('z'), 65));
+            check_both_paths(&cells, false);
+            check_both_paths(&cells, true);
+        }
+        let expected = old_cell_loop(&fallback, false);
+        assert_eq!(
+            expected.to_string(),
+            "\0\u{1f}\u{7f}\u{80}é世!\u{fffd}\u{fffd}"
+        );
+    }
+
+    #[test]
+    fn plain_run_equivalence_rejects_lost_text_attributes_and_wrap() {
+        let cells = vec![styled('x', 2, CellFlags::BOLD); 65];
+        let expected = old_cell_loop(&cells, true);
+        assert!(
+            equivalent(&expected, &expected),
+            "positive comparator control"
+        );
+        assert!(
+            !equivalent(&old_cell_loop(&cells[..64], true), &expected),
+            "dropping the first byte after a chunk must be caught"
+        );
+        let mut wrong_attrs = cells.clone();
+        wrong_attrs[64] = Cell::new('x');
+        let wrong_attrs = old_cell_loop(&wrong_attrs, true);
+        assert_eq!(wrong_attrs.to_string(), expected.to_string());
+        assert!(
+            !equivalent(&wrong_attrs, &expected),
+            "text equality alone must not hide a lost attribute at the chunk boundary"
+        );
+        assert!(
+            !equivalent(&old_cell_loop(&cells, false), &expected),
+            "losing the wrapped bit must be caught"
+        );
+    }
 }
 
 #[cfg(test)]

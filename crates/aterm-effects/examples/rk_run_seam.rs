@@ -35,7 +35,7 @@ use aterm_time::Instant;
 
 use aterm_effects::cursor_glow::{Geom, SoundCue};
 use aterm_effects::rainbow_kitty::ribbon::{
-    CHAIN_GAP_MAX, LIFT_GRACE_S, RETRACT_START_S, RUN_TAIL_EASE, Ribbon, SLABS_PER_CELL,
+    CHAIN_GAP_MAX, PHRASE_REST_MIN_S, RETRACT_START_S, RUN_TAIL_EASE, Ribbon, SLABS_PER_CELL,
     SWOOSH_TOTAL_S,
 };
 use aterm_effects::rainbow_kitty::{
@@ -470,6 +470,7 @@ impl Rig {
             phase: 0.0,
             caret: self.mirror,
             caret_t: 0.0,
+            caret_walk: None,
             mend: None,
             surge: 0.0,
             flow: Flow {
@@ -1064,7 +1065,7 @@ fn main() {
         .nth(1)
         .unwrap_or_else(|| "rk_run_seam_out".into());
     println!(
-        "RUN-SEAM instrument. RUN_TAIL_EASE={RUN_TAIL_EASE} SLABS_PER_CELL={SLABS_PER_CELL} LIFT_GRACE_S={LIFT_GRACE_S} RETRACT_START_S={RETRACT_START_S} SWOOSH_TOTAL_S={SWOOSH_TOTAL_S} CHAIN_GAP_MAX={CHAIN_GAP_MAX}"
+        "RUN-SEAM instrument. RUN_TAIL_EASE={RUN_TAIL_EASE} SLABS_PER_CELL={SLABS_PER_CELL} PHRASE_REST_MIN_S={PHRASE_REST_MIN_S} RETRACT_START_S={RETRACT_START_S} SWOOSH_TOTAL_S={SWOOSH_TOTAL_S} CHAIN_GAP_MAX={CHAIN_GAP_MAX}"
     );
     println!(
         "ANALYTIC: the feathered first cell of a run whose left neighbour is another run (ease 0.10 -> 1.0 over one cell, sampled at slab centres):"

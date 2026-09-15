@@ -2040,6 +2040,12 @@ pub(crate) enum PackagesRequest {
     /// Trashing aterm.app does not reclaim the store either — it orphans it under
     /// Application Support.
     UninstallAll,
+    /// `atpkg machine apply` — the `[machine]` host settings (Universal Control off
+    /// for this host, cargo build output hidden from Spotlight), applied NOW from
+    /// the Security page's "This Mac" card. The exact pass every package pass runs
+    /// first; a local verb (no store lock, no network) that works with the package
+    /// manager switched off. macOS only.
+    MachineApply,
 }
 
 /// Synchronous admission outcome for a [`PackagesRequest`] (the worker's real

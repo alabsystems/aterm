@@ -36,15 +36,25 @@
 //! # The policy when the lane cannot run
 //!
 //! A tracked process whose lane fails — no launchd, a job that never starts, a helper
-//! that does not answer, a file that came back tagged anyway — does NOT quietly write
-//! the files itself: that is the v0.83.0 shape reproduced by a bug, with nothing on
-//! disk to say so. By default it REFUSES ([`TrackedPolicy::Refuse`]), naming why the
-//! lane failed and the two ways out; `ATPKG_ALLOW_TRACKED_INSTALL=1`
-//! ([`ALLOW_TRACKED_ENV`]) is the escape hatch that accepts tagged files — for an
-//! operator who would rather have a toolchain that cannot cut a release than none —
-//! and the staging lane RECORDS that choice beside the bundle (`<build>.tracked-install`)
-//! for `aterm pkg doctor` and `aterm pkg repair` to name; tagged shims need no record,
-//! the doctor's `bin/` scan sees them directly.
+//! that does not answer, a file that came back tagged anyway — writes the files itself,
+//! says so once on stderr, and (for a staged bundle) RECORDS the choice beside the
+//! bundle (`<build>.tracked-install`) for `aterm pkg doctor` and `aterm pkg repair` to
+//! name ([`TrackedPolicy::Allow`], the default since 2026-09-14); tagged shims need no
+//! record, the doctor's `bin/` scan sees them directly. That is not the v0.83.0 shape:
+//! v0.83.0 was a tagged toolchain NOBODY HAD MEASURED, cut into a release. Now the tag is
+//! measured at every seam that matters — the record here, the doctor's scan, and the
+//! release cutter's pre-claim gate (`gates::provenance_gate`), which refuses a tagged
+//! `trustc`/`targo` BEFORE a build number is burned. Between 2026-09-12 and 2026-09-14
+//! the default was to REFUSE the install instead, and on the owner's own machine that
+//! refused every stage — claude and codex never installed, `trust` and `clean` "aborted:
+//! stage", "⚠ ALab toolchain install failed" on screen — because the lane's one refusal
+//! (a tagged bundle executable) fired on every self-updated app. The lane now handles
+//! that shape ([`crate::stage_helper::HelperPlan::CopyBundleThenExec`]), and a lane that
+//! still cannot run must not leave a user with no toolchain to protect a release cut
+//! that guards itself. `ATPKG_REFUSE_TRACKED_INSTALL=1` ([`REFUSE_TRACKED_ENV`]) restores
+//! the refusal for an operator who would rather have no toolchain than a tagged one;
+//! `ATPKG_ALLOW_TRACKED_INSTALL` ([`ALLOW_TRACKED_ENV`]), the old escape hatch, names
+//! the default and is accepted so nothing that set it breaks.
 //!
 //! A binary that is not `atpkg`/`aterm` — a test harness, some other embedding of this
 //! crate — has NO lane by construction ([`Lane::Unavailable`]: it would not serve the
@@ -67,11 +77,21 @@ pub const HIDDEN_VERB: &str = "__lay-files";
 /// misreads a newer spec.
 const SPEC_HEADER: &str = "atpkg-lay-spec v1";
 
-/// The escape hatch: set (non-empty) to let a provenance-tracked installer whose
-/// untracked lane cannot run write tagged files itself — the staged bundle recorded
-/// beside it as `<build>.tracked-install`, the shims visible to `aterm pkg doctor`'s
-/// `bin/` scan. Off by default: the default is to refuse.
+/// The pre-2026-09-14 escape hatch, now the name of the DEFAULT: a provenance-tracked
+/// installer whose untracked lane cannot run writes tagged files itself without being
+/// asked — the staged bundle recorded beside it as `<build>.tracked-install`, the shims
+/// visible to `aterm pkg doctor`'s `bin/` scan. Accepted (and a no-op) so a script that
+/// set it keeps working; [`REFUSE_TRACKED_ENV`] is the knob that changes the behaviour.
 pub const ALLOW_TRACKED_ENV: &str = "ATPKG_ALLOW_TRACKED_INSTALL";
+
+/// Set (non-empty) to REFUSE instead: a provenance-tracked installer whose untracked
+/// lane cannot run fails the install, naming why the lane failed — the 2026-09-12 to
+/// 2026-09-14 default, kept for an operator who would rather have no toolchain than one
+/// that cannot cut a release (the cutter's own machine). Off by default: `aterm pkg
+/// doctor` and the cutter's pre-claim gate name a tagged toolchain either way, and a
+/// refused install left the owner's machine with no `claude`, no `codex` and a stale
+/// `trust` (2026-09-14). Wins over [`ALLOW_TRACKED_ENV`] when both are set — fail-closed.
+pub const REFUSE_TRACKED_ENV: &str = "ATPKG_REFUSE_TRACKED_INSTALL";
 
 /// One executable to lay: where, and what bytes. Always mode `0755`, always temp+rename.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -99,42 +119,48 @@ impl Executable {
 /// What a tracked process does when its untracked lane cannot run.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum TrackedPolicy {
-    /// Refuse, naming why the lane failed and the escape hatch. The default.
+    /// Refuse, naming why the lane failed and the way out. `ATPKG_REFUSE_TRACKED_INSTALL=1`.
     Refuse,
     /// Write the files in-process (tagged), say so once, and — for a staged bundle —
-    /// record it beside the build. `ATPKG_ALLOW_TRACKED_INSTALL=1`.
+    /// record it beside the build. The default.
     Allow,
 }
 
-/// The policy this process runs under: [`ALLOW_TRACKED_ENV`] non-empty is `Allow`.
+/// The policy this process runs under: [`REFUSE_TRACKED_ENV`] non-empty is `Refuse`,
+/// anything else — including [`ALLOW_TRACKED_ENV`] in any state — is `Allow`.
 #[must_use]
 pub fn tracked_policy() -> TrackedPolicy {
-    tracked_policy_of(std::env::var_os(ALLOW_TRACKED_ENV).as_deref())
+    tracked_policy_of(std::env::var_os(REFUSE_TRACKED_ENV).as_deref())
 }
 
-/// The policy a value of [`ALLOW_TRACKED_ENV`] selects: unset or empty is `Refuse`.
+/// The policy a value of [`REFUSE_TRACKED_ENV`] selects: unset or empty is `Allow`.
 #[must_use]
-pub fn tracked_policy_of(value: Option<&OsStr>) -> TrackedPolicy {
-    if value.is_some_and(|v| !v.is_empty()) {
-        TrackedPolicy::Allow
-    } else {
+pub fn tracked_policy_of(refuse: Option<&OsStr>) -> TrackedPolicy {
+    if refuse.is_some_and(|v| !v.is_empty()) {
         TrackedPolicy::Refuse
+    } else {
+        TrackedPolicy::Allow
     }
 }
 
 /// The refusal both lanes print under [`TrackedPolicy::Refuse`]: what could not be done
 /// (`what`, e.g. "stage the bundle" or "lay 12 executable(s)"), why the lane failed,
-/// what the tag breaks, and the two ways out.
+/// what the tag breaks, and the way out. It no longer recommends "run this from an
+/// untracked process — Terminal.app, or `launchctl submit … <path to atpkg>`": the tag
+/// follows the EXECUTABLE, so on the one machine shape that reaches here in practice — a
+/// self-updated app, whose bundle carries the tag — a Terminal.app shell or a launchd job
+/// running that atpkg is tracked all the same (measured 2026-09-14), and the advice was
+/// a loop.
 #[must_use]
 pub fn tracked_refusal(what: &str, why: &str) -> String {
     format!(
         "this process is provenance-tracked (a probe file it wrote came back carrying \
          com.apple.provenance) and the untracked launchd lane could not {what} ({why}) — \
-         refusing rather than write files that would all carry the tag: {}. fix: run this \
-         from an untracked process — Terminal.app, or `launchctl submit -l aterm-pkg -- \
-         <path to atpkg> <verb…>` — or set {ALLOW_TRACKED_ENV}=1 to accept tagged files (a \
-         bundle staged that way is recorded beside it as <build>.tracked-install, and \
-         `aterm pkg doctor` names it and every tagged shim)",
+         refusing rather than write files that would all carry the tag, because \
+         {REFUSE_TRACKED_ENV} is set: {}. fix: unset {REFUSE_TRACKED_ENV} and the files \
+         are written in-process and recorded beside the build as <build>.tracked-install \
+         (`aterm pkg doctor` names it and every tagged shim), or clear what stopped \
+         launchd from running the helper — named above — and retry",
         crate::provenance::WHAT_IT_BREAKS
     )
 }
@@ -143,8 +169,9 @@ pub fn tracked_refusal(what: &str, why: &str) -> String {
 fn allowed_note(what: &str, why: &str) {
     eprintln!(
         "atpkg: note — this process is provenance-tracked and the untracked lane could not \
-         {what} ({why}); {ALLOW_TRACKED_ENV} is set, so the files are written in-process and \
-         WILL carry com.apple.provenance — `aterm pkg doctor` names what that breaks"
+         {what} ({why}); the files are written in-process and WILL carry \
+         com.apple.provenance — `aterm pkg doctor` names what that breaks; \
+         {REFUSE_TRACKED_ENV}=1 refuses instead"
     );
 }
 
@@ -429,9 +456,9 @@ pub fn lay_untracked(
 /// Lay `files` (mode `0755`, temp+rename each): in this process when it is not
 /// provenance-tracked — measured, [`crate::provenance::process_is_tracked`] — or when
 /// this binary has no lane ([`Lane::Unavailable`]); through the untracked launchd job
-/// when it is tracked; and, when that lane fails, under [`tracked_policy`]: refuse by
-/// default, write in-process under `ATPKG_ALLOW_TRACKED_INSTALL=1`. Empty `files` is a
-/// no-op that measures nothing.
+/// when it is tracked; and, when that lane fails, under [`tracked_policy`]: write
+/// in-process and say so by default, refuse under `ATPKG_REFUSE_TRACKED_INSTALL=1`.
+/// Empty `files` is a no-op that measures nothing.
 pub fn lay_executables(files: &[Executable]) -> io::Result<()> {
     if files.is_empty() {
         return Ok(());
@@ -536,18 +563,21 @@ mod tests {
         let _ = std::fs::remove_dir_all(&d);
     }
 
-    /// The policy knob: unset and empty refuse, anything else allows.
+    /// The policy knob: unset and empty ALLOW (the default since 2026-09-14 — a refused
+    /// install left the owner's machine without a toolchain), anything else refuses.
     #[test]
-    fn the_policy_is_refuse_unless_the_escape_hatch_is_set() {
-        assert_eq!(tracked_policy_of(None), TrackedPolicy::Refuse);
+    fn the_policy_is_allow_unless_refuse_is_set() {
+        assert_eq!(tracked_policy_of(None), TrackedPolicy::Allow);
         assert_eq!(
             tracked_policy_of(Some(OsStr::new(""))),
-            TrackedPolicy::Refuse
+            TrackedPolicy::Allow
         );
         assert_eq!(
             tracked_policy_of(Some(OsStr::new("1"))),
-            TrackedPolicy::Allow
+            TrackedPolicy::Refuse
         );
+        assert_eq!(REFUSE_TRACKED_ENV, "ATPKG_REFUSE_TRACKED_INSTALL");
+        assert_eq!(ALLOW_TRACKED_ENV, "ATPKG_ALLOW_TRACKED_INSTALL");
     }
 
     /// The in-process writer: mode 0755, the exact bytes, an existing file replaced, no
@@ -613,11 +643,12 @@ mod tests {
 
     /// The decision table, with the lane's outcome forced: an untracked process writes
     /// in-process whatever the lane; a tracked one with no lane for its binary writes
-    /// in-process; a tracked one whose lane FAILS refuses by default — nothing laid, the
-    /// refusal naming the cause and the escape hatch — and writes under `Allow`.
+    /// in-process; a tracked one whose lane FAILS refuses under `Refuse` — nothing laid,
+    /// the refusal naming the cause and the way out — and writes under `Allow`, the
+    /// default.
     #[cfg(target_os = "macos")]
     #[test]
-    fn a_tracked_process_whose_lane_fails_refuses_by_default_and_writes_under_allow() {
+    fn a_tracked_process_whose_lane_fails_refuses_under_refuse_and_writes_under_allow() {
         let d = tmp("policy");
         let dest = d.join("dest");
         std::fs::create_dir_all(&dest).unwrap();
@@ -642,16 +673,22 @@ mod tests {
         for f in &wanted {
             std::fs::remove_file(&f.path).unwrap();
         }
-        // Tracked, lane fails, default policy: REFUSED, nothing laid.
+        // Tracked, lane fails, `Refuse` opted into: REFUSED, nothing laid.
         let err = lay_executables_with(&wanted, true, &broken, TrackedPolicy::Refuse)
-            .expect_err("a tracked process with a broken lane must refuse");
+            .expect_err("a tracked process with a broken lane must refuse under Refuse");
         let msg = err.to_string();
         assert!(msg.contains("provenance-tracked"), "{msg}");
         assert!(msg.contains("exited without a result"), "the cause: {msg}");
         assert!(msg.contains("lay 3 executable(s)"), "{msg}");
-        assert!(msg.contains(ALLOW_TRACKED_ENV), "the escape hatch: {msg}");
-        assert!(msg.contains("launchctl submit"), "the other way out: {msg}");
+        assert!(
+            msg.contains(REFUSE_TRACKED_ENV),
+            "the knob that refused: {msg}"
+        );
         assert!(msg.contains("proof_snapshot.py"), "what it breaks: {msg}");
+        assert!(
+            !msg.contains("Terminal.app") && !msg.contains("launchctl submit"),
+            "the looping remedy is gone: {msg}"
+        );
         for f in &wanted {
             assert!(
                 !f.path.exists(),
@@ -659,7 +696,8 @@ mod tests {
                 f.path.display()
             );
         }
-        // Tracked, lane fails, escape hatch: written in-process.
+        // Tracked, lane fails, the default: written in-process.
+        assert_eq!(tracked_policy_of(None), TrackedPolicy::Allow);
         lay_executables_with(&wanted, true, &broken, TrackedPolicy::Allow).unwrap();
         for f in &wanted {
             assert_eq!(std::fs::read(&f.path).unwrap(), f.body);
@@ -678,9 +716,11 @@ mod tests {
         let _ = std::fs::remove_dir_all(&d);
     }
 
-    /// The refusal text names every piece an operator needs.
+    /// The refusal text names every piece an operator needs — and not the remedy that
+    /// looped on a self-updated app (a Terminal.app shell or a launchd job running a
+    /// tagged bundle binary is tracked all the same).
     #[test]
-    fn the_refusal_names_the_cause_the_breakage_and_both_ways_out() {
+    fn the_refusal_names_the_cause_the_breakage_and_the_way_out() {
         let msg = tracked_refusal("stage the bundle", "launchctl submit failed (exit 1)");
         assert!(
             msg.starts_with("this process is provenance-tracked"),
@@ -688,7 +728,8 @@ mod tests {
         );
         assert!(msg.contains("could not stage the bundle (launchctl submit failed (exit 1))"));
         assert!(msg.contains("xattr -d"), "{msg}");
-        assert!(msg.contains("Terminal.app"), "{msg}");
+        assert!(msg.contains(REFUSE_TRACKED_ENV), "{msg}");
         assert!(msg.contains("<build>.tracked-install"), "{msg}");
+        assert!(!msg.contains("Terminal.app"), "{msg}");
     }
 }

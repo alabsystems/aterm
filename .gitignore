@@ -52,7 +52,17 @@ target-trust
 # vendored crate with a `debug` source directory — the bare `debug` rule still
 # covers `target/**/debug`.
 !vendor/**/debug/
-/target-tippy/
+
+# Sibling target dirs at the root (2026-09-13): the merge gate's per-lane dirs
+# (target-regex, target-xtask, target-drivers), its own `target-gate`, and the
+# `target-tippy` lint dir, which is often a SYMLINK. No trailing slash on
+# purpose: `/target-*/` matches directories only, and `git check-ignore` measured
+# it leaving a `target-tippy` symlink untracked. Nothing tracked starts with
+# `target` at the root.
+/target-*
+
+# The merge gate's snapshot lock and trash (crates/aterm-verify).
+/.aterm-verify/
 
 # One-shot Trust/verification campaign scratch — raw sweep logs and gap dumps are
 # regenerable evidence, not source. Keep them out of the tree so they stop drifting

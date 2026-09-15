@@ -339,9 +339,11 @@ pub struct Terminal {
     pub(super) row_text_scratch: Vec<Option<String>>,
     /// The alt-screen scroll-off archive and its `process_at` hook state: the
     /// rows a fullscreen app scrolled off the top of the alternate screen, which
-    /// has no scrollback. EPHEMERAL, observation-only (like `watchers`): never
-    /// checkpointed, never handed off, never forwarded to the handler — the hook
-    /// runs between parser slices and at the batch epilogue. See `alt_archive.rs`.
+    /// has no scrollback. In memory and observation-only (like `watchers`): never
+    /// checkpointed, never forwarded to the handler — the hook runs between
+    /// parser slices and at the batch epilogue. A self-update handoff carries
+    /// its tail BESIDE the checkpoint (`alt_archive_carry_head`/`_rows`, then
+    /// `alt_archive_import`). See `alt_archive.rs`.
     pub(super) alt_archive: super::alt_archive::AltArchiveState,
     /// Current working directory (OSC 7).
     ///

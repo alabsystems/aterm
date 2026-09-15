@@ -71,6 +71,7 @@ const VERBS: &[&str] = &[
     "run",
     "relocate",
     "noindex",
+    "machine",
 ];
 
 /// One usage line per verb — what `atpkg <verb> --help` prints.
@@ -150,6 +151,12 @@ const VERB_USAGE: &[(&str, &str)] = &[
          atpkg noindex apply (--all | <dir>...) [--dry-run] — migrate AND keep cargo pointed: \
          a `target` symlink in a git checkout, [build] target-dir elsewhere (--all: every \
          repo target dir under $HOME, as doctor scans)",
+    ),
+    (
+        "machine",
+        "atpkg machine                 — the [machine] settings, as the doctor reads them\n\
+         atpkg machine apply           — apply them now: Universal Control off for this host,\n\
+         \u{20}                               cargo build output hidden from Spotlight",
     ),
 ];
 
@@ -239,6 +246,7 @@ const VERB_TIERS: &[(&str, &[&str])] = &[
             "gc",
             "repair",
             "noindex",
+            "machine",
         ],
     ),
     (
@@ -354,6 +362,17 @@ pub fn main_entry(argv: Vec<std::ffi::OsString>) -> ExitCode {
                 bound,
                 spawner: spawner_pid(),
             });
+            // THE ORPHAN WATCH, armed HERE for the whole process — not inside a
+            // progress pass, which the channel-apply lane (the multi-gigabyte rustc
+            // group update, exactly the incident's) never opens: a window that exits
+            // under this child (a self-update's successor, a quit-and-reopen) leaves
+            // its pipes unread, and the next print would kill the pass with EPIPE.
+            // The watch notices the parent CHANGE and re-points stdout/stderr at a
+            // log beside the progress file ([`crate::progress::watch_for_orphaning`]).
+            let log = crate::store::resolve_configured()
+                .map(|l| l.prefix.join(crate::progress::ORPHAN_LOG_NAME))
+                .unwrap_or_else(|| std::env::temp_dir().join(crate::progress::ORPHAN_LOG_NAME));
+            crate::progress::watch_for_orphaning(log);
         }
     }
     let verb = args.first().map(String::as_str);
@@ -463,7 +482,22 @@ pub fn main_entry(argv: Vec<std::ffi::OsString>) -> ExitCode {
     let _store_lock = if verb.is_some_and(verb_mutates_store) {
         match mutator_store_lock() {
             Ok(guard) => guard,
-            Err(code) => return code,
+            Err(code) => {
+                // The three passes apply the `[machine]` settings first thing — but the
+                // lock is taken HERE, before the pass body, so a contended or unwritable
+                // store refuses the whole pass and the host settings with it. They need
+                // no lock at all; say so, on stderr (stdout stays the marker channel the
+                // waiter tests pin), and only while someone is there to read it.
+                if matches!(verb, Some("seed" | "update" | "install")) && !parent_is_gone() {
+                    use std::io::Write as _;
+                    let _ = writeln!(
+                        std::io::stderr(),
+                        "atpkg: the [machine] settings take no store lock — `aterm pkg machine \
+                         apply` applies them now"
+                    );
+                }
+                return code;
+            }
         }
     } else {
         None
@@ -509,6 +543,12 @@ pub fn main_entry(argv: Vec<std::ffi::OsString>) -> ExitCode {
         // why `noindex` is absent from `NAME_TAKING_VERBS` (as `relocate` is): its own
         // parser owns every `-`-leading token.
         Some("noindex") => return cmd_noindex(&args[1..]),
+        // The [machine] settings' own door. Every pass applies them first and
+        // unconditionally; this is for the person the doctor just told about them, so
+        // the fix is one verb away and never "wait for the next pass". Writes a per-host
+        // preference and, at most, renames build output inside trees the user owns —
+        // nothing under `<prefix>`, so no store lock, like `noindex`.
+        Some("machine") => return cmd_machine(&args[1..]),
         Some(other) => {
             // The head `atpkg: unknown verb '<x>'` is byte-stable for scripts; the
             // suggestion rides after an em dash so a typo's fix is the FIRST thing on
@@ -1373,12 +1413,17 @@ fn mutator_store_lock() -> Result<Option<crate::lock::StoreLock>, ExitCode> {
     let Some(layout) = crate::store::resolve(configured_prefix().as_deref()) else {
         return Ok(None);
     };
+    // Whether the wait ANNOUNCED itself: only an announced wait is answered below
+    // (`lock-acquired:`) — a wait that ended inside the grace put nothing on the
+    // glass, so there is nothing to retire.
+    let announced = std::cell::Cell::new(false);
     let acquired = match wait_lock() {
         Some(WaitLock { bound, .. }) => crate::lock::lock_store_waiting(
             &layout,
             bound,
             |path| {
                 use std::io::Write as _;
+                announced.set(true);
                 let _ = writeln!(
                     std::io::stdout(),
                     "atpkg: {LOCK_WAITING_MARKER}another atpkg process holds the store lock \
@@ -1392,7 +1437,22 @@ fn mutator_store_lock() -> Result<Option<crate::lock::StoreLock>, ExitCode> {
         None => crate::lock::try_lock_store(&layout),
     };
     match acquired {
-        Ok(guard) => Ok(Some(guard)),
+        Ok(guard) => {
+            // THE WAIT IS OVER, said once and only after it was announced: the verb
+            // that follows may be quiet for the whole length of its own work under
+            // the lock, and the GUI's waiting row has nothing else to retire it
+            // before this child exits (2026-09-14). A lossy write, like the
+            // announcement: the window may have quit meanwhile.
+            if announced.get() {
+                use std::io::Write as _;
+                let _ = writeln!(
+                    std::io::stdout(),
+                    "atpkg: {LOCK_ACQUIRED_MARKER}the other process finished \u{2014} \
+                     running now"
+                );
+            }
+            Ok(Some(guard))
+        }
         Err(e) => {
             // An orphaned waiter has nobody to tell — its stderr and stdout are the
             // dead window's pipes — and the exit code says it all. That guard is a
@@ -1447,7 +1507,7 @@ fn mutator_store_lock() -> Result<Option<crate::lock::StoreLock>, ExitCode> {
 /// lock), not closed. An INSTALLING child is a different case — it dies at its next
 /// line of output (aterm-gui's final-exit path in its `main_entry`, 2026-09-10), and
 /// the store is crash-consistent under that (`crate::lock`).
-fn parent_is_gone() -> bool {
+pub(crate) fn parent_is_gone() -> bool {
     wait_lock().is_some_and(|w| is_orphaned(w.spawner, current_parent_id()))
 }
 
@@ -1683,12 +1743,50 @@ fn which_line(
         }
         return Ok(line);
     }
+    // 1b'. A program DEV-LINKED from a checkout whose own name is not a tool (`trust`
+    //      exposes trustc/targo/…, never a `trust` binary): the link is what runs, and
+    //      `which trust` must say so — before the not-installed arm below, which was
+    //      answering "not installed (fix: aterm pkg install trust)" on a box whose
+    //      every build ran through `aterm pkg link trust <stage2>` (2026-09-14).
+    if crate::linkmode::is_linked(layout, tool) {
+        return Ok(dev_linked_program_line(
+            tool,
+            crate::linkmode::linked_checkout(layout, tool).as_deref(),
+            &crate::linkmode::linked_bins(layout, tool),
+            crate::vendor::system_binary_on_path(&layout.prefix, tool, path_var).as_deref(),
+        ));
+    }
+    // 1c. An INDEX PROGRAM of ALab's own that nothing has installed here — no shim, no
+    //     bundle, no pending stub — while a SAME-NAMED unrelated binary sits on PATH. Arm 2
+    //     below would name that binary as "the system copy": on this Linux host `which
+    //     trust` answered `/usr/bin/trust — system — not managed by aterm`, and that file
+    //     is p11-kit's certificate-store tool, not the Trust compiler. Nothing in the line
+    //     said the program was unserved on this target; the wrong binary was presented as
+    //     the answer. Arm 1b already handles the INSTALLED case ("an unrelated binary, not
+    //     this program"); this is the same sentence for the not-installed case, with the
+    //     truth first — the recorded reason when a row carries one, else plain
+    //     not-installed with the fix.
+    let stub_kind = crate::stub::pending_stub_kind(layout, tool);
+    let index = cached_index(layout);
+    if stub_kind.is_none()
+        && let Some(entry) = index.as_ref().and_then(|i| i.program(tool))
+        && entry.system.is_none()
+        && !entry.extra
+        && !crate::stub::is_agent_program(tool)
+        && let Some(path) = crate::vendor::system_binary_on_path(&layout.prefix, tool, path_var)
+    {
+        let row = row_of(tool).map(|r| r.state);
+        return Ok(index_program_shadowed_by_unrelated_line(
+            tool,
+            row.as_deref(),
+            &path,
+        ));
+    }
     // 2. A system copy on PATH outside the prefix: it runs, and atpkg does not manage it.
     //    With a PENDING STUB in the managed bin/ (an extra's consent stub, a default-set
     //    member's placeholder) the question is which comes FIRST on PATH: a foreign copy
     //    ahead of the managed bin/ runs; one behind it loses to the stub, which asks (or
     //    waits) — the shadow walk answers that, the system walk would skip the stub.
-    let stub_kind = crate::stub::pending_stub_kind(layout, tool);
     let foreign = if stub_kind.is_some() {
         crate::vendor::shadowing_binary_on_path(&layout.prefix, tool, path_var)
     } else {
@@ -1714,11 +1812,20 @@ fn which_line(
                 || st.starts_with(crate::state::UNAVAILABLE_PREFIX)
         });
         return Ok(match (kind, waiting) {
-            (crate::stub::StubKind::Extra, _) if !layout.optin_exists(tool) => format!(
-                "{tool} → {} (consent stub) — {}",
-                shim.display(),
-                crate::state::extra_not_installed(tool)
-            ),
+            // An agent program's stub is never a consent stub: `claude`/`codex` are
+            // default-set members the pass installs unasked (owner decision 2026-09-10);
+            // a stub of the `Extra` kind under one of those names is a stale pre-index
+            // stub, and calling it a consent stub sent the user to opt in to something
+            // the next pass installs anyway (audit 2026-09-14).
+            (crate::stub::StubKind::Extra, _)
+                if !layout.optin_exists(tool) && !crate::stub::is_agent_program(tool) =>
+            {
+                format!(
+                    "{tool} → {} (consent stub) — {}",
+                    shim.display(),
+                    crate::state::extra_not_installed(tool)
+                )
+            }
             (_, Some(st)) => format!("{tool} → {} (pending stub) — {st}", shim.display()),
             _ => format!(
                 "{tool} → {} (pending stub) — not installed yet: the next pass installs it \
@@ -1751,6 +1858,67 @@ fn which_line(
         return Err(no_alias_line(layout, tool, base.as_str()));
     }
     Err(not_installed_fix(tool))
+}
+
+/// The `which` answer for a program dev-linked from a checkout (arm 1b' of
+/// [`which_line`]): where it is linked from, what it exposes, and — when a same-named
+/// unrelated binary sits on PATH — that binary named for what it is. Pure, unit-tested.
+fn dev_linked_program_line(
+    tool: &str,
+    checkout: Option<&std::path::Path>,
+    bins: &[String],
+    foreign: Option<&std::path::Path>,
+) -> String {
+    let mut sorted: Vec<&str> = bins.iter().map(String::as_str).collect();
+    sorted.sort_unstable();
+    let from = checkout.map_or_else(|| "a checkout".to_string(), |c| c.display().to_string());
+    let mut line = if let Some(first) = sorted.first() {
+        format!(
+            "{tool} → {from} (dev-linked; exposes {} — run `aterm pkg which {first}`) — managed from that checkout, not the index; `aterm pkg unlink {tool}` returns it to the index",
+            sorted.join(", ")
+        )
+    } else {
+        format!(
+            "{tool} → {from} (dev-linked; exposes no command of its own) — managed from that checkout, not the index; `aterm pkg unlink {tool}` returns it to the index"
+        )
+    };
+    if let Some(path) = foreign {
+        line.push('\n');
+        line.push_str(&format!(
+            "{} on PATH is an unrelated binary, not this program",
+            path.display()
+        ));
+    }
+    line
+}
+
+/// The `which` answer for an index program of ALab's own that is NOT installed while a
+/// same-named unrelated binary sits on PATH (arm 1c of [`which_line`]). Pure, so the
+/// wording is unit-testable without a signed index cache on disk.
+///
+/// The truth leads: a recorded row that says WHY nothing runs (unserved on this target,
+/// blocked, needing admin) is quoted as-is; otherwise plain not-installed with the fix.
+/// Then the foreign binary, named for what it is — never as "the system copy" of a
+/// program it has nothing to do with.
+fn index_program_shadowed_by_unrelated_line(
+    tool: &str,
+    row_state: Option<&str>,
+    path: &std::path::Path,
+) -> String {
+    let truth = match row_state {
+        Some(st)
+            if st.starts_with(crate::state::UNAVAILABLE_PREFIX)
+                || st.starts_with(crate::state::BLOCKED_PREFIX)
+                || st.starts_with(crate::state::NEEDS_ADMIN_PREFIX) =>
+        {
+            format!("(nothing runs) — {st}")
+        }
+        _ => format!("(nothing runs) — not installed (fix: aterm pkg install {tool})"),
+    };
+    format!(
+        "{tool} → {truth}\n{} on PATH is an unrelated binary, not this program",
+        path.display()
+    )
 }
 
 /// `foreign copies out-ranked: ~/.local/bin/claude (2.1.267), /opt/homebrew/bin/claude
@@ -2747,21 +2915,23 @@ fn run_repair(layout: Option<crate::store::Layout>) -> ExitCode {
     if !tracked.is_empty() {
         println!(
             "repair: {} build(s) carry a tracked-install record (<build>.tracked-install), \
-             written under {}=1 when a provenance-tracked installer either staged the bundle \
-             IN-PROCESS — every executable then carries com.apple.provenance — or KEPT an \
-             untracked lane's tree that came back tagged. Each build's own reason follows it. \
-             Repair does not scan the bundle: `aterm pkg doctor` is what says which files \
+             written when a provenance-tracked installer either staged the bundle IN-PROCESS \
+             because its untracked launchd lane could not run — every executable then carries \
+             com.apple.provenance; that is the default, and {}=1 refuses instead — or KEPT \
+             an untracked lane's tree that came back tagged. Each build's own reason follows \
+             it. Repair does not scan the bundle: `aterm pkg doctor` is what says which files \
              carry the tag today, and it names a stale record when none does: {}",
             tracked.len(),
-            crate::lay::ALLOW_TRACKED_ENV,
+            crate::lay::REFUSE_TRACKED_ENV,
             tracked.join("; ")
         );
         println!(
             "repair: nothing local removes the tag (`xattr -d` exits 0 and removes nothing) \
              and the archive is reclaimed after every stage, so a build whose files really do \
-             carry it needs a re-seed from an untracked process — Terminal.app, or `launchctl \
-             submit -l aterm-pkg -- <path to atpkg> install <program>`: `aterm pkg uninstall \
-             <program> && aterm pkg install <program>`"
+             carry it needs a re-seed through a working untracked lane — from any shell, \
+             atpkg hands the stage to a launchd job running its own binary in place, or from \
+             a clean byte copy of it or of its whole app bundle when the binary is tagged: \
+             `aterm pkg uninstall <program> && aterm pkg install <program>`"
         );
     }
     if !failed.is_empty() {
@@ -2815,8 +2985,8 @@ fn relay_shims(
         }
         // A build a provenance-tracked installer RECORDED (`<build>.tracked-install`,
         // `crate::store::record_tracked_install`). Two outcomes write it
-        // (`install::decide_tracked_stage`): an in-process stage under the escape hatch,
-        // which tags every executable, and `KeepRecorded` — the untracked lane laid the
+        // (`install::decide_tracked_stage`): an in-process stage because the lane could
+        // not run, which tags every executable, and `KeepRecorded` — the untracked lane laid the
         // tree and only its witness came back tagged. This reads the record and never
         // scans, so it reports the record, not the tag; `doctor` does the scan and says
         // "a stale record" when nothing in `bin/` carries it. Exit 1 either way: a
@@ -2887,7 +3057,17 @@ fn run_list(layout: Option<crate::store::Layout>, human: bool) -> ExitCode {
     };
     warn_if_never_checked(&layout);
     let installed = crate::list_installed(&layout);
-    if installed.is_empty() {
+    // A program DEV-LINKED FROM THE START — never installed from the index, so it has no
+    // store build for `list_installed` to find — is still a program this machine runs:
+    // its shims are in the managed bin/ and `which` names them. It was invisible here
+    // (measured 2026-09-14: a Linux box with the Trust stage2 dev-linked listed only
+    // claude and codex), which made "via atpkg" unverifiable from the one verb that
+    // exists to say what atpkg manages. Such programs get a row with no build number.
+    let linked_only: Vec<String> = crate::linkmode::linked_programs(&layout)
+        .into_iter()
+        .filter(|p| !installed.iter().any(|(q, _)| q == p))
+        .collect();
+    if installed.is_empty() && linked_only.is_empty() {
         if human {
             println!("{EMPTY_LIST_HUMAN}");
         } else {
@@ -2911,10 +3091,16 @@ fn run_list(layout: Option<crate::store::Layout>, human: bool) -> ExitCode {
             pinned.insert(program.clone());
         }
     }
+    for program in &linked_only {
+        linked.insert(
+            program.clone(),
+            crate::linkmode::linked_checkout(&layout, program),
+        );
+    }
     let lines = if human {
-        list_human_lines(&installed, &live, &linked, &pinned)
+        list_human_lines(&installed, &linked_only, &live, &linked, &pinned)
     } else {
-        list_porcelain_lines(&installed, &live, &linked, &pinned)
+        list_porcelain_lines(&installed, &linked_only, &live, &linked, &pinned)
     };
     for line in lines {
         println!("{line}");
@@ -2950,12 +3136,26 @@ const EMPTY_VERIFY: &str = "atpkg: nothing installed to verify — install first
 /// the shims, the link marker, the pin state).
 fn list_porcelain_lines(
     installed: &[(String, u64)],
+    linked_only: &[String],
     live: &std::collections::BTreeMap<String, u64>,
     linked: &std::collections::BTreeMap<String, Option<std::path::PathBuf>>,
     pinned: &std::collections::BTreeSet<String>,
 ) -> Vec<String> {
     let mut shown_link = std::collections::BTreeSet::new();
     let mut lines = Vec::new();
+    // Dev-linked from the start: no store build, so the build column is `-` — the same
+    // spelling the human form uses for a build that is not what runs.
+    for program in linked_only {
+        let note = match linked.get(program).and_then(|c| c.as_ref()) {
+            Some(path) => format!("DEV-LINKED -> {}", path.display()),
+            None => "DEV-LINKED".to_string(),
+        };
+        let mut notes = vec![note];
+        if pinned.contains(program) {
+            notes.push("pinned".to_string());
+        }
+        lines.push(format!("{program}\t-\t{}", notes.join("  ")));
+    }
     for (program, build) in installed {
         let mut notes: Vec<String> = Vec::new();
         if let Some(checkout) = linked.get(program) {
@@ -2990,6 +3190,7 @@ fn list_porcelain_lines(
 /// prove; "healthy" is doctor's word, earned by running checks.
 fn list_human_lines(
     installed: &[(String, u64)],
+    linked_only: &[String],
     live: &std::collections::BTreeMap<String, u64>,
     linked: &std::collections::BTreeMap<String, Option<std::path::PathBuf>>,
     pinned: &std::collections::BTreeSet<String>,
@@ -2999,12 +3200,17 @@ fn list_human_lines(
     for (program, build) in installed {
         builds.entry(program).or_default().push(*build);
     }
+    // A dev-linked program with no store build still takes a row: an empty build list.
+    for program in linked_only {
+        builds.entry(program).or_default();
+    }
     let name_width = builds.keys().map(|p| p.len()).max().unwrap_or(0);
     let build_width = installed
         .iter()
         .map(|(_, b)| b.to_string().len())
         .max()
-        .unwrap_or(0);
+        .unwrap_or(0)
+        .max(usize::from(!linked_only.is_empty()));
     let mut live_count = 0usize;
     let mut no_live = 0usize;
     let mut rows = Vec::new();
@@ -3015,10 +3221,14 @@ fn list_human_lines(
                 Some(path) => format!("DEV-LINKED -> {}", path.display()),
                 None => "DEV-LINKED".to_string(),
             };
-            s.push_str(&format!(
-                "  ({} store build(s) shadowed)",
-                program_builds.len()
-            ));
+            if program_builds.is_empty() {
+                s.push_str("  (no store build — linked from the start)");
+            } else {
+                s.push_str(&format!(
+                    "  ({} store build(s) shadowed)",
+                    program_builds.len()
+                ));
+            }
             if is_pinned {
                 s.push_str(", pinned (updates held)");
             }
@@ -4127,6 +4337,31 @@ fn record_adoption(layout: &crate::store::Layout) {
     }
 }
 
+/// Whether an explicit `install --default-set` pass RECORDS adoption: it installed at
+/// least one member (`activated > 0`), or it found the set already complete — there were
+/// builds before it ran, it failed nothing, skipped nothing and owes nothing. The
+/// already-complete arm was missing until 2026-09-14, and the gap was a trap the manager
+/// set for itself: `uninstall` CLEARS adoption and tells the user to re-adopt with this
+/// very verb, and `aterm pkg doctor`'s own re-seed remedy for a tagged bundle is
+/// `uninstall <program> && install <program>` — after which the set is complete again,
+/// this verb printed "default set already complete — nothing to install", recorded
+/// nothing, and unattended set-completion stayed off for good: the next program
+/// published to the index never arrived (observed live on the owner's machine after
+/// re-seeding five bundles, 2026-09-14). Pure for the table test.
+fn default_set_adopts(
+    activated: usize,
+    failures: u32,
+    had_builds_before: bool,
+    skipped: &[String],
+    remaining_missing: &[String],
+) -> bool {
+    activated > 0
+        || (failures == 0
+            && had_builds_before
+            && skipped.is_empty()
+            && remaining_missing.is_empty())
+}
+
 /// Forget adoption. Called by `uninstall`: removing a managed program is an explicit act,
 /// and set-completion must never undo it on the next unattended pass.
 fn clear_adoption(layout: &crate::store::Layout) {
@@ -4245,10 +4480,11 @@ fn reconcile_protocol_members(
 ) -> (Vec<String>, u32) {
     let mut handled = Vec::new();
     let mut failures = 0u32;
-    let Some(ch) = index.channels.iter().find(|c| c.name == cfg.channel()) else {
+    let triple = current_triple();
+    let Some(ch) = index.channel_for(cfg.channel(), triple) else {
         return (handled, failures);
     };
-    let triple = current_triple();
+    let ch = &ch;
     // DEPENDENCY-FIRST (§17.10): the plan's own order, so a member's requirement — clt
     // under brew — has its row written before the member's requirement gate reads it.
     let ordered: Vec<String> = crate::plan_groups(index, ch)
@@ -4852,7 +5088,8 @@ fn write_removed(layout: &crate::store::Layout, all: &std::collections::BTreeSet
 /// after this paragraph first named only the local one) — and the ones that are
 /// neither, which the ledger deliberately leaves unclassified: `LOCK_WAITING` (a
 /// non-terminal "queued behind a sibling" row; [`LOCK_WAITING_MARKER`] says what
-/// retires it) and the informational `SHADOWED`, `MANAGED_CURRENT` and
+/// retires it), `LOCK_ACQUIRED` (what retires that row when the wait ends in the
+/// lock, [`LOCK_ACQUIRED_MARKER`]) and the informational `SHADOWED`, `MANAGED_CURRENT` and
 /// `MACHINE_SETTINGS` rows. [`announcement::MARKERS`] is where that split is recorded
 /// and [`emit_marker_line`] is what keeps the ledger, so the classification lives in
 /// one table rather than in this sentence. An announcement with no answer leaves
@@ -4895,6 +5132,16 @@ pub const NET_FAILED_MARKER: &str = "net-failed: ";
 /// notice), because the row belongs to the lane, not the child. Emitted by exactly
 /// one site ([`mutator_store_lock`]).
 pub const LOCK_WAITING_MARKER: &str = "lock-waiting: ";
+/// The dispatch edge's "the wait is over" line (2026-09-14): printed ONCE, right
+/// after a wait that ANNOUNCED itself ([`LOCK_WAITING_MARKER`]) acquires the lock —
+/// never after a silent wait inside the grace, never after an uncontended try, and
+/// never by a typed verb. Neither a pass start nor a terminal answer, like the line
+/// it answers: the GUI retires its "waiting for another install" row on it, since
+/// nothing else says the holder has let go — the verb that follows may be QUIET (a
+/// seed's index read under the lock takes 6–18 s online, minutes offline) and the
+/// row kept saying another process held the lock until this child exited. Emitted
+/// by the same one site.
+pub const LOCK_ACQUIRED_MARKER: &str = "lock-acquired: ";
 /// The SHADOW reconcile's answer ([`reconcile_shadowed`]): the managed programs a
 /// foreign copy out-ranks on this pass's `PATH`, comma-separated — the pass printed
 /// one `<program>: managed <build> — SHADOWED by <path>` line per member and no
@@ -4914,6 +5161,30 @@ pub const MANAGED_CURRENT_MARKER: &str = "managed-current: ";
 /// ([`crate::machine::UNIVERSAL_CONTROL_REVERT`]).
 pub const MACHINE_SETTINGS_MARKER: &str = "machine-settings: ";
 
+/// The `machine-state:` marker bare `atpkg machine` prints — the READ counterpart of
+/// `machine-settings:` (a change). One byte-stable line, `key=value` pairs joined by
+/// `; `, built by [`crate::machine::machine_state_line`] and parsed back by
+/// [`crate::machine::parse_machine_state`], so a window reader confirms what the machine
+/// measured rather than re-deriving it from prose.
+pub const MACHINE_STATE_MARKER: &str = "machine-state: ";
+
+/// The prefix of every `atpkg machine` / `atpkg machine apply` verdict sentence
+/// (`applied — …`, `nothing changed — …`, `not applied — …`, `next — …`, …). A
+/// window worker keys on it to quote the verdict; spelled once here so a reword is
+/// a compile error on both sides rather than a card that silently stops quoting.
+pub const MACHINE_VERDICT_PREFIX: &str = "atpkg machine: ";
+
+/// The line [`apply_machine_settings`] prints when it refuses to touch the machine
+/// (a home that is not this account's): `atpkg: machine settings not applied — <why>`.
+/// The verb still exits 0, so a window worker keys on THIS prefix to report the
+/// refusal as the outcome rather than a success.
+pub const MACHINE_NOT_APPLIED_PREFIX: &str = "atpkg: machine settings not applied — ";
+
+/// A machine action ran but failed. The shell verb remains best-effort and can
+/// exit 0, so the GUI must read this independently of its change markers and
+/// final verdict. Successful changes from the same pass remain valid.
+pub const MACHINE_APPLY_FAILED_PREFIX: &str = "atpkg: machine settings failed — ";
+
 /// The `machine-settings:` line for `entries` (already non-empty).
 #[must_use]
 pub fn machine_settings_line(entries: &[String]) -> String {
@@ -4926,17 +5197,60 @@ pub fn spotlight_entry(migrated: usize) -> String {
     format!("spotlight-noindex {migrated} dir(s) migrated")
 }
 
-/// Apply the `[machine]` settings at the end of a pass and print what CHANGED, as the
-/// `machine-settings:` marker (nothing printed when nothing changed — the pull-down row
-/// is for a change, not a state). Spotlight: the doctor's scan of `$HOME`, migrated with
+/// Report the actual Universal Control outcome without discarding earlier
+/// Spotlight changes or treating a failed preference write as an applied one.
+fn record_universal_control_outcome(
+    outcome: crate::machine::UniversalControlOutcome,
+    entries: &mut Vec<String>,
+) -> Option<String> {
+    use crate::machine::UniversalControlOutcome;
+    match outcome {
+        UniversalControlOutcome::Disabled => {
+            entries.push(crate::machine::UNIVERSAL_CONTROL_ENTRY.to_string());
+            Some(format!(
+                "atpkg: Universal Control disabled for this host (revert: {})",
+                crate::machine::UNIVERSAL_CONTROL_REVERT
+            ))
+        }
+        UniversalControlOutcome::WriteFailed => Some(format!(
+            "{MACHINE_APPLY_FAILED_PREFIX}Universal Control could not be disabled for this host — \
+             the preference write did not land (`aterm pkg doctor` reads the keys)"
+        )),
+        UniversalControlOutcome::AlreadyDisabled | UniversalControlOutcome::NotApplicable => None,
+    }
+}
+
+/// Apply the `[machine]` settings — at the TOP of every pass, and from `atpkg machine
+/// apply` — and print what CHANGED, as the `machine-settings:` marker (nothing printed
+/// when nothing changed — the pull-down row is for a change, not a state). Returns the
+/// same entries so `atpkg machine apply` can say "nothing changed" without re-reading its own stdout. Spotlight: the doctor's scan of `$HOME`, migrated with
 /// each repo's cargo re-pointed ([`crate::noindex::apply_under`]; a live build is skipped
 /// and retried next pass). Universal Control: [`crate::machine::apply_universal_control`]
 /// through the real `defaults`. Best-effort throughout — a machine setting must never
 /// fail the toolchain pass that carried it — and every migration is also narrated on
 /// its own lines for the log.
-fn apply_machine_settings() {
+fn apply_machine_settings() -> Vec<String> {
     let cfg = crate::config::cached_machine();
     let mut entries: Vec<String> = Vec::new();
+    // Off macOS there is nothing to apply — no Spotlight, no Universal Control — and
+    // nothing to say about it either: the home guard below would otherwise print a
+    // line on every Linux pass whose HOME is not the passwd home (a CI container, this
+    // crate's own integration tests), about settings that do not exist there.
+    if !crate::noindex::SUPPORTED {
+        return entries;
+    }
+    // A SYNTHETIC HOME IS A SYNTHETIC MACHINE. `defaults` writes the ACCOUNT's per-host
+    // domain and ignores `$HOME` (measured 2026-09-14), so a pass pointed at another
+    // home — this crate's own integration tests spawn `seed`/`update`/`install` against a
+    // temp HOME, and did write the developer's real Universal Control keys the moment
+    // this ran ahead of everything — must not touch the real machine at all. The
+    // Spotlight half follows the same rule for symmetry: it walks `$HOME`, and a home
+    // that is not this account's is not one to rename things under. One line says why,
+    // so a `sudo -H` or a CI job is never a silent no-op.
+    if let Some(reason) = machine_home_mismatch() {
+        println!("{MACHINE_NOT_APPLIED_PREFIX}{reason}");
+        return entries;
+    }
     if cfg.spotlight_noindex()
         && crate::noindex::SUPPORTED
         && let Some(home) = aterm_types::dirs::home_dir()
@@ -4957,19 +5271,259 @@ fn apply_machine_settings() {
             entries.push(spotlight_entry(migrated));
         }
     }
-    if crate::machine::apply_universal_control(
+    let outcome = crate::machine::apply_universal_control(
         cfg.universal_control(),
         &crate::machine::SystemDefaults,
-    ) == crate::machine::UniversalControlOutcome::Disabled
-    {
-        println!(
-            "atpkg: Universal Control disabled for this host (revert: {})",
-            crate::machine::UNIVERSAL_CONTROL_REVERT
-        );
-        entries.push(crate::machine::UNIVERSAL_CONTROL_ENTRY.to_string());
+    );
+    if let Some(line) = record_universal_control_outcome(outcome, &mut entries) {
+        println!("{line}");
     }
     if !entries.is_empty() {
         println!("atpkg: {}", machine_settings_line(&entries));
+    }
+    entries
+}
+
+/// Why the `[machine]` settings must NOT touch this process's machine, or `None` when
+/// they may: `$HOME` (what `home_dir()` answers) is not the account's home, or the
+/// account could not be resolved. The decision ([`machine_home_verdict`]) is pure over
+/// its inputs so the rule is pinned by a test rather than by prose.
+fn machine_home_mismatch() -> Option<String> {
+    machine_home().1
+}
+
+/// The synthetic-home rule, resolved against this process: the posture the
+/// `machine-state:` line reports, and — when it is not the account's home — the one
+/// sentence that says why nothing is applied.
+fn machine_home() -> (crate::machine::HomePosture, Option<String>) {
+    let home = aterm_types::dirs::home_dir();
+    let account = crate::platform::account_home();
+    let same = match (&home, &account) {
+        (Some(h), Some(a)) => same_directory(h, a),
+        _ => false,
+    };
+    machine_home_verdict(home.as_deref(), account.as_deref(), same)
+}
+
+/// The decision behind [`machine_home`], on its inputs. FAIL-CLOSED when `HOME` is
+/// set: an account that could not be resolved is not proof that `$HOME` is it, so
+/// nothing is applied — the direction the `account_home` doc promises. No `HOME` at all
+/// (`home_dir()` is `None`: unset, and `/etc/passwd` — where macOS local accounts do not
+/// appear — has no entry) is treated as the account's home, resolved or not: there is no
+/// redirect to guard against, and the Spotlight half has no home to walk. `same` is the
+/// filesystem's own answer ([`same_directory`]) for the spellings a string compare gets
+/// wrong — a symlinked, case-variant or firmlinked home.
+fn machine_home_verdict(
+    home: Option<&std::path::Path>,
+    account: Option<&std::path::Path>,
+    same: bool,
+) -> (crate::machine::HomePosture, Option<String>) {
+    use crate::machine::HomePosture;
+    let Some(home) = home else {
+        return (HomePosture::Account, None);
+    };
+    let Some(account) = account else {
+        return (
+            HomePosture::Unresolved,
+            Some(format!(
+                "HOME is {} but this account's home could not be resolved (getpwuid_r); \
+                 per-host preferences follow the account, and HOME cannot be proven to be it",
+                home.display()
+            )),
+        );
+    };
+    if same {
+        return (HomePosture::Account, None);
+    }
+    match machine_home_mismatch_between(home, account) {
+        None => (HomePosture::Account, None),
+        Some(reason) => (HomePosture::Mismatch, Some(reason)),
+    }
+}
+
+/// Whether two paths name ONE directory — by device and inode, following symlinks —
+/// so `/users/x`, a symlinked home, and the `/System/Volumes/Data/Users//x` firmlink
+/// spelling (which `canonicalize` does not unify; firmlinks are not symlinks) all read
+/// as the account home they are. A missing path is `false`: nothing is proven by it.
+#[cfg(unix)]
+fn same_directory(a: &std::path::Path, b: &std::path::Path) -> bool {
+    use std::os::unix::fs::MetadataExt as _;
+    match (std::fs::metadata(a), std::fs::metadata(b)) {
+        (Ok(x), Ok(y)) => x.dev() == y.dev() && x.ino() == y.ino(),
+        _ => false,
+    }
+}
+
+#[cfg(not(unix))]
+fn same_directory(_a: &std::path::Path, _b: &std::path::Path) -> bool {
+    false
+}
+
+/// The decision behind [`machine_home_mismatch`], on its inputs.
+fn machine_home_mismatch_between(
+    home: &std::path::Path,
+    account: &std::path::Path,
+) -> Option<String> {
+    if home == account {
+        return None;
+    }
+    Some(format!(
+        "HOME is {} but this account's home is {}; a redirected home is a synthetic \
+         machine, and per-host preferences follow the account, not HOME",
+        home.display(),
+        account.display()
+    ))
+}
+
+/// `atpkg machine [apply]` — the `[machine]` settings' own door.
+///
+/// Bare `atpkg machine` READS: the doctor's Universal Control line, a Spotlight line
+/// that counts what a pass WOULD hide (not merely what is exposed), the byte-stable
+/// [`MACHINE_STATE_MARKER`] record a window reader parses, and one verdict — `next — …`
+/// naming what an apply would do, `nothing to apply`, or — on a home that is not this
+/// account's — `not applied here — <why>`. A person sees the state
+/// without wading through the toolchain rows; a window confirms it from the record. `atpkg machine apply` runs
+/// [`apply_machine_settings`] on the spot — the exact pass every launch runs first — and
+/// then says what changed, that nothing changed, or that nothing was applied and why,
+/// because a verb
+/// that applies and prints nothing looks broken. Exit 0 either way: this is a state, not
+/// a gate. Anything else is a usage error.
+fn cmd_machine(rest: &[String]) -> ExitCode {
+    match rest {
+        [] => {
+            if !crate::noindex::SUPPORTED {
+                println!("{MACHINE_VERDICT_PREFIX}not applicable — these are macOS host settings");
+                return ExitCode::SUCCESS;
+            }
+            let cfg = crate::config::cached_machine();
+            let state = crate::machine::universal_control_state(&crate::machine::SystemDefaults);
+            println!(
+                "{MACHINE_VERDICT_PREFIX}{}",
+                state.doctor_line(cfg.universal_control())
+            );
+            let (mut exposed, mut hidden, mut would_migrate, mut scan_complete) =
+                (0usize, 0usize, 0usize, true);
+            if let Some(home) = aterm_types::dirs::home_dir() {
+                let scan = crate::noindex::scan(
+                    &home,
+                    crate::noindex::DOCTOR_DEPTH,
+                    &crate::noindex::Budget::DOCTOR,
+                );
+                (exposed, hidden) = scan.counts();
+                scan_complete = scan.complete;
+                // What a pass WOULD do, not what is exposed: a dry-run apply refuses the
+                // free-standing dir (its pointer is an env var), the live build, the
+                // occupied destination — exactly what the real pass refuses — so this
+                // count can reach zero, which `exposed` never could (the doctor records
+                // that trap). `apply_one(.., true, true)` is pure: `Planned` is returned
+                // before any rename.
+                would_migrate = scan
+                    .exposed()
+                    .filter(|t| {
+                        matches!(
+                            crate::noindex::apply_one(&t.path, true, true),
+                            crate::noindex::Applied::Planned { .. }
+                        )
+                    })
+                    .count();
+                // What an APPLY can hide: nothing when the switch is off, and never the
+                // dirs a pass refuses — a free-standing one (`aterm pkg noindex apply
+                // <dir>` by name migrates it), a live build, a name already in the way.
+                let can_hide = if cfg.spotlight_noindex() {
+                    would_migrate
+                } else {
+                    0
+                };
+                println!(
+                    "{MACHINE_VERDICT_PREFIX}{exposed} cargo target dir(s) under {} open to Spotlight \
+                     ({can_hide} an apply can hide; the rest are free-standing — `aterm pkg \
+                     noindex apply <dir>` by name — or refused for now: a live build, a name \
+                     in the way), {hidden} hidden ([machine] spotlight_noindex = {}){}",
+                    home.display(),
+                    cfg.spotlight_noindex(),
+                    if scan_complete {
+                        ""
+                    } else {
+                        " — at least; the scan hit its budget"
+                    }
+                );
+            }
+            let (home_posture, mismatch) = machine_home();
+            let st = crate::machine::MachineState {
+                universal_control: state.posture(),
+                policy: cfg.universal_control(),
+                spotlight_noindex: cfg.spotlight_noindex(),
+                exposed,
+                hidden,
+                would_migrate,
+                scan_complete,
+                home: home_posture,
+            };
+            // THE LINE THE WINDOW READS — after the prose, so a person still sees
+            // sentences first, and after the SUPPORTED check, so its absence means "not
+            // macOS" and never "nothing to apply".
+            println!(
+                "atpkg: {MACHINE_STATE_MARKER}{}",
+                crate::machine::machine_state_line(&st)
+            );
+            // ONE verdict for both surfaces: `st.next()` is what the window's Apply button
+            // reads too, so the CLI cannot say "nothing to apply" while a pass would rename
+            // a directory — which is exactly what the first cut of this read did.
+            match (mismatch, st.next()) {
+                (Some(reason), _) => {
+                    println!("{MACHINE_VERDICT_PREFIX}not applied here — {reason}")
+                }
+                (None, None) => println!(
+                    "{MACHINE_VERDICT_PREFIX}nothing to apply — Universal Control and Spotlight are \
+                     where [machine] wants them"
+                ),
+                (None, Some(next)) => {
+                    let mut what: Vec<String> = Vec::new();
+                    if next.universal_control {
+                        what.push("Universal Control off for this host".to_string());
+                    }
+                    if next.spotlight > 0 {
+                        what.push(format!(
+                            "{} target dir(s) hidden from Spotlight",
+                            next.spotlight
+                        ));
+                    }
+                    println!(
+                        "{MACHINE_VERDICT_PREFIX}next — aterm pkg machine apply ({})",
+                        what.join("; ")
+                    );
+                }
+            }
+            ExitCode::SUCCESS
+        }
+        [sub] if sub == "apply" => {
+            if !crate::noindex::SUPPORTED {
+                println!("{MACHINE_VERDICT_PREFIX}not applicable — these are macOS host settings");
+                return ExitCode::SUCCESS;
+            }
+            // The guard is asked here as well as inside the apply: the apply prints the
+            // refusal and returns nothing, and a verb that then said "nothing changed"
+            // would contradict the line above it.
+            if let Some(reason) = machine_home_mismatch() {
+                let _ = apply_machine_settings();
+                println!("{MACHINE_VERDICT_PREFIX}not applied — {reason}");
+                return ExitCode::SUCCESS;
+            }
+            let entries = apply_machine_settings();
+            if entries.is_empty() {
+                println!(
+                    "{MACHINE_VERDICT_PREFIX}nothing changed — already applied, switched off in \
+                     [machine], or a change that did not land (the lines above say which)"
+                );
+            } else {
+                println!("{MACHINE_VERDICT_PREFIX}applied — {}", entries.join("; "));
+            }
+            ExitCode::SUCCESS
+        }
+        _ => {
+            eprintln!("usage: {}", usage_of("machine").unwrap_or_default());
+            ExitCode::from(2)
+        }
     }
 }
 
@@ -5026,9 +5580,10 @@ fn managed_current_entries(
     index: &crate::TrustedIndex,
     channel: &str,
 ) -> Vec<(String, Option<String>, u64)> {
-    let Some(ch) = index.channels.iter().find(|c| c.name == channel) else {
+    let Some(ch) = index.channel_for(channel, current_triple()) else {
         return Vec::new();
     };
+    let ch = &ch;
     let installed = crate::active_builds(layout);
     crate::stub::AGENT_PROGRAMS
         .iter()
@@ -5140,6 +5695,8 @@ pub(crate) mod announcement {
     /// contract — not an announcement (nothing to retire) and not an answer (were it
     /// one, a child that waited and then announced would look answered before it
     /// began). [`note`] ignores an unlisted prefix, which is the right reading of it.
+    /// So is `lock-acquired:` ([`super::LOCK_ACQUIRED_MARKER`]), printed at the same
+    /// edge when that wait ends in the lock: it answers the wait, not an announcement.
     pub(crate) const MARKERS: &[(&str, bool)] = &[
         (super::SEED_STARTING_MARKER, true),
         (super::NET_STARTING_MARKER, true),
@@ -5885,6 +6442,16 @@ fn cmd_update_all() -> ExitCode {
 /// [`cmd_update_all`]'s body, returning the raw exit code so the announcement can be
 /// answered with the pass's real verdict rather than a guess read off its output.
 fn cmd_update_all_code() -> u8 {
+    // R5: THE MACHINE SETTINGS, FIRST — before the manager gate, the index, the network,
+    // before anything in this pass that can fail. They used to run at the very end,
+    // inside `if failures == 0`, which coupled a per-host preference to a completely
+    // clean toolchain pass it has nothing to do with: on a machine where one program
+    // aborts at stage (measured 2026-09-14: `trust`/`clean` aborted, `claude`/`codex`
+    // refused by a provenance tag, `last_success_at` never written) the doctor
+    // promised "the next update pass disables it" on every run, forever, and nothing
+    // ever did. Above `manager_enabled()` too: that gate is about the NETWORK verbs
+    // (no root key, `ATPKG_DISABLE`), and host settings are not a network verb.
+    apply_machine_settings();
     if !manager_enabled() {
         eprintln!("atpkg: disabled (no root key pinned) — nothing to update");
         return 1;
@@ -6063,7 +6630,8 @@ fn cmd_update_all_code() -> u8 {
             // said "installing over the network" and then installed nothing
             // must say so, or the held notice outlives its own truth.
             emit_marker_line(&format!(
-                "atpkg: {NET_FAILED_MARKER}network provisioning installed nothing —                  see the lines above for each program's reason"
+                "atpkg: {NET_FAILED_MARKER}network provisioning installed nothing — see the \
+                 lines above for each program's reason"
             ));
         }
         // Retire or refresh a stale `*seed*` pending-consent row against what
@@ -6186,13 +6754,20 @@ fn cmd_update_all_code() -> u8 {
         clear_status_row(&layout, "*toolset*");
         // R6: which managed agents are at the pin, for the pull-down row.
         print_managed_current(&layout, &*fetcher, cfg);
-        // R5: the machine settings per doctor, applied at the end of every pass.
-        apply_machine_settings();
+        // (R5's machine settings ran at the TOP of this pass — see the note there.)
         // A pass that resolved the index and applied it clean: THE event R3's
-        // "never checked" waits for, stamped here and at no failure exit above.
+        // "never checked" waits for.
         record_success(&layout);
         0
     } else {
+        // A pass that resolved the index and RAN TO ITS END with member failures —
+        // each recorded in its own row — is a check that ran, and is stamped as one.
+        // Until 2026-09-14 this exit stamped nothing, so one failing member (claude,
+        // refused at stage on the owner's machine) kept every read-only verb printing
+        // "no update check has run yet on this machine — packages cannot be updated
+        // until the first pass completes" for as long as it failed: false in both
+        // halves, and pointing at the very command that had just run.
+        record_success(&layout);
         1
     }
 }
@@ -6398,7 +6973,7 @@ fn install_default_set_inner(
     }
     // The channel, looked up ONCE on the one resolved index — every group decision
     // below reads the SAME signed state, so a mid-pass publish can't split a tuple.
-    let Some(ch) = index.channels.iter().find(|c| c.name == cfg.channel()) else {
+    let Some(ch) = index.channel_for(cfg.channel(), current_triple()) else {
         let e = crate::FlowError::NoChannel(cfg.channel().to_string());
         eprintln!("atpkg: default-set bootstrap failed: {e}");
         return DefaultSetOutcome {
@@ -6409,6 +6984,7 @@ fn install_default_set_inner(
             remaining_missing: Vec::new(),
         };
     };
+    let ch = &ch;
     let mut installed = crate::active_builds(layout);
     let mut wanted = wanted_programs(layout, &index, cfg);
     // Programs the user removed on purpose are not "missing" — they are absent by
@@ -7276,6 +7852,9 @@ fn cmd_install_default_set() -> ExitCode {
 /// installed nothing, and never will here") is neither success nor a retryable failure,
 /// and the announcement must be answered with which of the three actually happened.
 fn cmd_install_default_set_code() -> u8 {
+    // R5: the machine settings first, above the manager gate and everything that can
+    // fail (see the note in `cmd_update_all_code`).
+    apply_machine_settings();
     if !manager_enabled() {
         eprintln!("atpkg: disabled (no root key pinned) — refusing to install");
         return 1;
@@ -7313,11 +7892,19 @@ fn cmd_install_default_set_code() -> u8 {
         .keys()
         .filter(|k| !before.contains_key(k.as_str()))
         .count();
-    // The explicit "Install ALab toolset" act IS adoption — but only if it actually
-    // laid something down. Adoption grants unattended network set-completion later
-    // (`cmd_update_all`), so recording it after a pass that installed nothing would
-    // switch that on for a machine that received no toolset at all.
-    if activated > 0 {
+    // The explicit "Install ALab toolset" act IS adoption — when it laid something
+    // down, and when it found the whole set already on disk ([`default_set_adopts`]).
+    // Adoption grants unattended network set-completion later (`cmd_update_all`), so
+    // it is NOT recorded after a pass that installed nothing on a machine that received
+    // no toolset at all (the "nothing lands here" exit below), nor over members the
+    // pass skipped or still owes.
+    if default_set_adopts(
+        activated,
+        failures,
+        !before.is_empty(),
+        &failures_outcome.skipped_narrowed,
+        &failures_outcome.remaining_missing,
+    ) {
         record_adoption(&layout);
     }
     // GC + shell-hook refresh once at the CLI edge (the cmd_update_all precedent) — including
@@ -7369,7 +7956,6 @@ fn cmd_install_default_set_code() -> u8 {
                 );
             }
             print_managed_current(&layout, &*fetcher, cfg);
-            apply_machine_settings();
             record_success(&layout);
             return 0;
         }
@@ -7394,7 +7980,6 @@ fn cmd_install_default_set_code() -> u8 {
         );
     }
     print_managed_current(&layout, &*fetcher, cfg);
-    apply_machine_settings();
     record_success(&layout);
     0
 }
@@ -7442,6 +8027,11 @@ fn cmd_seed(rest: &[String]) -> ExitCode {
     let Some(layout) = layout() else {
         return ExitCode::from(1);
     };
+    // R5: the machine settings first — BEFORE the decline check, because a user who
+    // removed the toolset still has a cursor that roams and a home Spotlight walks,
+    // and before the seal, the network and every other thing this lane can fail at
+    // (see the note in `cmd_update_all_code`).
+    apply_machine_settings();
     if declined(&layout) {
         // The user removed this toolset deliberately (`uninstall --all`). The seed
         // lane installs whatever the store lacks, so without this check it would
@@ -7694,9 +8284,7 @@ fn cmd_seed(rest: &[String]) -> ExitCode {
         // earlier launch stops being Settings' answer forever.
         clear_status_row(&layout, "*toolset*");
         reclaim_bundled_seed(&seed_dir);
-        // R5: first open IS this pass on a seeded machine — the machine settings apply
-        // here too, not only on the network pass that follows.
-        apply_machine_settings();
+        // (R5's machine settings ran at the TOP of this lane.)
     } else {
         println!(
             "atpkg: keeping the bundled seed — {failures} member(s) did not install, and the \
@@ -7764,9 +8352,10 @@ fn seed_serviceable(
     index: &crate::TrustedIndex,
     cfg: &crate::config::PackagesConfig,
 ) -> Vec<String> {
-    let Some(ch) = index.channels.iter().find(|c| c.name == cfg.channel()) else {
+    let Some(ch) = index.channel_for(cfg.channel(), current_triple()) else {
         return Vec::new();
     };
+    let ch = &ch;
     let installed = crate::active_builds(layout);
     let wanted = wanted_programs(layout, index, cfg);
     // Programs the user removed on purpose are NOT missing — they are absent by
@@ -7835,8 +8424,9 @@ fn seed_install_bytes(
     cfg: &crate::config::PackagesConfig,
     members: &[String],
 ) -> Option<u64> {
-    let ch = index.channels.iter().find(|c| c.name == cfg.channel())?;
     let triple = current_triple();
+    let ch = index.channel_for(cfg.channel(), triple)?;
+    let ch = &ch;
     let mut total: u64 = 0;
     for m in members {
         let (_, _, pkg) = crate::flow::verified_pkg(fetcher, index, ch, m)?;
@@ -8336,7 +8926,7 @@ fn announce_pending_seed(
             return;
         }
     };
-    let Some(ch) = index.channels.iter().find(|c| c.name == cfg.channel()) else {
+    let Some(ch) = index.channel_for(cfg.channel(), current_triple()) else {
         println!(
             "atpkg: bundled seed present ({}) but names no '{}' channel — nothing to offer",
             seed_dir.display(),
@@ -8344,6 +8934,7 @@ fn announce_pending_seed(
         );
         return;
     };
+    let ch = &ch;
     let installed = crate::active_builds(layout);
     let wanted = wanted_programs(layout, &index, cfg);
     // A program with no artifact for THIS triple can never be installed here
@@ -9515,6 +10106,22 @@ mod tests {
             edge < emission && emission < edge_end,
             "the emission is inside the lock edge, not in a verb body"
         );
+        // Its answer (`lock-acquired:`, 2026-09-14) has the same one site, AFTER the
+        // announcement in the same function: a verb body cannot claim a lock it
+        // did not wait for.
+        assert_eq!(
+            production.matches("LOCK_ACQUIRED_MARKER}").count(),
+            1,
+            "exactly one production emission site for the answer"
+        );
+        assert_eq!(production.matches("\"lock-acquired: \"").count(), 1);
+        let answer = production
+            .find("{LOCK_ACQUIRED_MARKER}")
+            .expect("the answer's emission");
+        assert!(
+            emission < answer && answer < edge_end,
+            "the answer is inside the lock edge, after the announcement"
+        );
     }
     use super::*;
     use std::os::unix::fs::PermissionsExt;
@@ -9892,6 +10499,55 @@ mod tests {
     /// The piped `list` form is a SCRIPT CONTRACT: `program\tbuild\tnotes`, headerless,
     /// ascending builds with superseded rows before the live one — byte-identical to
     /// every earlier release, dev-link and pin notes included.
+    /// A program DEV-LINKED FROM THE START has no store build, and `list` used to omit
+    /// it entirely — on a Linux box with the Trust stage2 dev-linked, `atpkg list`
+    /// showed only claude and codex (2026-09-14). It gets a row in both forms, with `-`
+    /// for the build it does not have, and counts as one program and one dev-link.
+    #[test]
+    fn a_program_dev_linked_from_the_start_is_listed_without_a_store_build() {
+        let installed: Vec<(String, u64)> = vec![("claude".to_string(), 7)];
+        let linked_only = vec!["trust".to_string()];
+        let live: std::collections::BTreeMap<String, u64> = [("claude".to_string(), 7)].into();
+        let linked: std::collections::BTreeMap<String, Option<std::path::PathBuf>> = [(
+            "trust".to_string(),
+            Some(std::path::PathBuf::from("/h/trust/build/host/stage2")),
+        )]
+        .into();
+        let pinned = std::collections::BTreeSet::new();
+
+        let porcelain = list_porcelain_lines(&installed, &linked_only, &live, &linked, &pinned);
+        assert_eq!(
+            porcelain[0], "trust\t-\tDEV-LINKED -> /h/trust/build/host/stage2",
+            "{porcelain:?}"
+        );
+        assert_eq!(
+            porcelain[1], "claude\t7\tlive",
+            "installed rows are byte-identical to before: {porcelain:?}"
+        );
+
+        let human = list_human_lines(&installed, &linked_only, &live, &linked, &pinned);
+        assert!(
+            human[0].starts_with("atpkg: 2 program(s) — 1 live, 1 dev-linked"),
+            "{human:?}"
+        );
+        let row = human
+            .iter()
+            .find(|l| l.contains("trust"))
+            .expect("a trust row");
+        assert!(
+            row.contains("DEV-LINKED -> /h/trust/build/host/stage2"),
+            "{row}"
+        );
+        assert!(
+            row.contains("(no store build — linked from the start)"),
+            "{row}"
+        );
+        assert!(
+            !row.contains("shadowed"),
+            "nothing is shadowed when there is no store build: {row}"
+        );
+    }
+
     #[test]
     fn list_porcelain_is_stable() {
         let installed = vec![
@@ -9905,7 +10561,7 @@ mod tests {
         let mut pinned = std::collections::BTreeSet::new();
         pinned.insert("clean".to_string());
         assert_eq!(
-            list_porcelain_lines(&installed, &live, &linked, &pinned),
+            list_porcelain_lines(&installed, &[], &live, &linked, &pinned),
             vec![
                 "ay\t7987\tsuperseded (kept for rollback)".to_string(),
                 "ay\t8256\tlive".to_string(),
@@ -9928,7 +10584,7 @@ mod tests {
             [("ay".to_string(), 8256), ("clean".to_string(), 7345)].into();
         let none_linked = std::collections::BTreeMap::new();
         let none_pinned = std::collections::BTreeSet::new();
-        let lines = list_human_lines(&installed, &live, &none_linked, &none_pinned);
+        let lines = list_human_lines(&installed, &[], &live, &none_linked, &none_pinned);
         assert_eq!(lines[0], "atpkg: 2 program(s) — 2 live");
         assert!(
             lines
@@ -9942,7 +10598,7 @@ mod tests {
         );
         // A program with builds on disk and nothing live is the row that needs doctor.
         let dead_live: std::collections::BTreeMap<String, u64> = [("ay".to_string(), 8256)].into();
-        let lines = list_human_lines(&installed, &dead_live, &none_linked, &none_pinned);
+        let lines = list_human_lines(&installed, &[], &dead_live, &none_linked, &none_pinned);
         assert_eq!(
             lines[0],
             "atpkg: 2 program(s) — 1 live, 1 without a live build"
@@ -10440,6 +11096,56 @@ mod tests {
     // migrated`, Universal Control as `universal-control disabled`; nothing printed for
     // an empty pass (the callers check).
     #[test]
+    fn machine_write_failure_is_explicit_without_losing_partial_changes() {
+        use crate::machine::UniversalControlOutcome;
+        let spotlight = spotlight_entry(2);
+        let mut entries = vec![spotlight.clone()];
+        let failure =
+            record_universal_control_outcome(UniversalControlOutcome::WriteFailed, &mut entries)
+                .expect("a failed write must be reported even when the verb exits 0");
+        assert_eq!(
+            MACHINE_APPLY_FAILED_PREFIX,
+            "atpkg: machine settings failed — "
+        );
+        assert_eq!(
+            failure.strip_prefix(MACHINE_APPLY_FAILED_PREFIX),
+            Some(
+                "Universal Control could not be disabled for this host — the preference write did not land (`aterm pkg doctor` reads the keys)"
+            )
+        );
+        assert_eq!(
+            entries.as_slice(),
+            std::slice::from_ref(&spotlight),
+            "the successful action survives"
+        );
+        assert_eq!(
+            machine_settings_line(&entries),
+            "machine-settings: spotlight-noindex 2 dir(s) migrated",
+            "a failed Universal Control write cannot mint its success event"
+        );
+        for outcome in [
+            UniversalControlOutcome::NotApplicable,
+            UniversalControlOutcome::AlreadyDisabled,
+        ] {
+            assert!(record_universal_control_outcome(outcome, &mut entries).is_none());
+            assert_eq!(entries.as_slice(), std::slice::from_ref(&spotlight));
+        }
+        // The genuine success arm remains distinct and carries its revert.
+        let success =
+            record_universal_control_outcome(UniversalControlOutcome::Disabled, &mut entries)
+                .unwrap();
+        assert!(!success.starts_with(MACHINE_APPLY_FAILED_PREFIX));
+        assert!(success.contains(crate::machine::UNIVERSAL_CONTROL_REVERT));
+        assert_eq!(
+            entries,
+            [
+                spotlight,
+                crate::machine::UNIVERSAL_CONTROL_ENTRY.to_string()
+            ]
+        );
+    }
+
+    #[test]
     fn the_machine_settings_marker_is_byte_stable() {
         assert_eq!(MACHINE_SETTINGS_MARKER, "machine-settings: ");
         assert_eq!(spotlight_entry(73), "spotlight-noindex 73 dir(s) migrated");
@@ -10612,6 +11318,7 @@ mod tests {
         assert_eq!(SHADOWED_MARKER, "shadowed: ");
         assert_eq!(MANAGED_CURRENT_MARKER, "managed-current: ");
         assert_eq!(LOCK_WAITING_MARKER, "lock-waiting: ");
+        assert_eq!(LOCK_ACQUIRED_MARKER, "lock-acquired: ");
         assert_eq!(
             managed_current_line(&[]),
             None,
@@ -10831,64 +11538,79 @@ mod tests {
         // A consent stub for an extra: the opt-in spelling.
         crate::stub::write_pending_stub_kind(
             &layout,
-            &crate::store::ToolName::new("codex").unwrap(),
+            &crate::store::ToolName::new("emacs").unwrap(),
             crate::stub::StubKind::Extra,
         )
         .unwrap();
-        let line = which_line(&layout, "codex", Some(&managed_only)).unwrap();
-        assert!(line.starts_with("codex → "), "{line}");
+        let line = which_line(&layout, "emacs", Some(&managed_only)).unwrap();
+        assert!(line.starts_with("emacs → "), "{line}");
         assert!(line.contains("(consent stub)"), "{line}");
         assert!(
-            line.ends_with(&crate::state::extra_not_installed("codex")),
+            line.ends_with(&crate::state::extra_not_installed("emacs")),
             "{line}"
         );
         // An extra that is BOTH a consent stub and shadowed by a foreign copy: PATH
         // order decides what runs. Foreign copy ahead of the managed bin/ ⇒ it runs and
         // atpkg does not manage it; behind it ⇒ the stub runs and asks.
-        let exe = local.join("codex");
+        let exe = local.join("emacs");
         std::fs::write(&exe, b"#!/bin/sh\nexit 0\n").unwrap();
         std::fs::set_permissions(&exe, std::fs::Permissions::from_mode(0o755)).unwrap();
         assert_eq!(
-            which_line(&layout, "codex", Some(&ahead)).unwrap(),
+            which_line(&layout, "emacs", Some(&ahead)).unwrap(),
             format!(
-                "codex → {} — {}",
+                "emacs → {} — {}",
                 exe.display(),
                 crate::state::system(&exe, None)
             )
         );
         let stub_first = std::env::join_paths([layout.bin_dir(), local.clone()]).unwrap();
-        let line = which_line(&layout, "codex", Some(&stub_first)).unwrap();
+        let line = which_line(&layout, "emacs", Some(&stub_first)).unwrap();
         assert!(line.contains("(consent stub)"), "{line}");
         assert!(
-            line.ends_with(&crate::state::extra_not_installed("codex")),
+            line.ends_with(&crate::state::extra_not_installed("emacs")),
             "{line}"
         );
         // Opted in and installed, the extra is a managed member like any other: the
         // foreign copy ahead reads SHADOWED.
-        let cbuild = layout.build_dir("codex", 7);
+        let cbuild = layout.build_dir("emacs", 7);
         std::fs::create_dir_all(cbuild.join("bin")).unwrap();
-        std::fs::write(cbuild.join("bin/codex"), b"#!/bin/sh\nexit 0\n").unwrap();
+        std::fs::write(cbuild.join("bin/emacs"), b"#!/bin/sh\nexit 0\n").unwrap();
         std::fs::set_permissions(
-            cbuild.join("bin/codex"),
+            cbuild.join("bin/emacs"),
             std::fs::Permissions::from_mode(0o755),
         )
         .unwrap();
         crate::activate::install_shims(
             &layout,
             &cbuild,
-            &["codex".to_string()],
+            &["emacs".to_string()],
             crate::activate::Aliases::Off,
         )
         .unwrap();
         assert_eq!(
-            which_line(&layout, "codex", Some(&ahead)).unwrap(),
+            which_line(&layout, "emacs", Some(&ahead)).unwrap(),
             format!(
-                "codex → {} — {}",
+                "emacs → {} — {}",
                 exe.display(),
                 crate::state::shadowed(7, &exe)
             )
         );
         let _ = std::fs::remove_file(&exe);
+        // An EXTRA-kind stub under an AGENT PROGRAM's name is stale, never a consent
+        // stub: the agent programs are default-set members the pass installs unasked
+        // (owner decision 2026-09-10; the reconcile files them default-set whatever
+        // set the index put them in), and the line says so (audit 2026-09-14).
+        crate::stub::write_pending_stub_kind(
+            &layout,
+            &crate::store::ToolName::new("codex").unwrap(),
+            crate::stub::StubKind::Extra,
+        )
+        .unwrap();
+        let line = which_line(&layout, "codex", Some(&managed_only)).unwrap();
+        assert!(line.contains("(pending stub)"), "{line}");
+        assert!(!line.contains("consent"), "{line}");
+        assert!(line.contains("the next pass installs it"), "{line}");
+        let _ = std::fs::remove_file(layout.shim(&crate::store::ToolName::new("codex").unwrap()));
         // A recorded non-shim state reads back verbatim.
         record_status(
             &layout,
@@ -10913,13 +11635,13 @@ mod tests {
             not_installed_fix("nothing")
         );
         // The REVERSE case, honestly: an `alab-<x>` nothing answers to says why there is
-        // no alias instead of promising `aterm pkg install alab-x`. codex is installed
+        // no alias instead of promising `aterm pkg install alab-x`. emacs is installed
         // above with the policy Off (a vendor extra); with no cached index the line can
         // only say the tool is installed and not aliased. An unknown base gets the plain
         // name's fix line.
-        let err = which_line(&layout, "alab-codex", Some(&managed_only)).unwrap_err();
-        assert!(err.starts_with("atpkg: no alias alab-codex — "), "{err}");
-        assert!(err.ends_with("type codex"), "{err}");
+        let err = which_line(&layout, "alab-emacs", Some(&managed_only)).unwrap_err();
+        assert!(err.starts_with("atpkg: no alias alab-emacs — "), "{err}");
+        assert!(err.ends_with("type emacs"), "{err}");
         assert_eq!(
             which_line(&layout, "alab-nothing", Some(&managed_only)).unwrap_err(),
             format!(
@@ -11016,6 +11738,80 @@ mod tests {
             "atpkg: \"rustup\" is not a tool name"
         );
         let _ = std::fs::remove_dir_all(&layout.prefix);
+    }
+
+    /// A dev-linked program whose own name is not a tool: `which trust` names the checkout
+    /// and the tools it exposes — and still names p11-kit's `trust` as unrelated.
+    #[test]
+    fn which_names_a_dev_linked_program_by_its_checkout_and_exposes() {
+        let bins = vec!["trustc".to_string(), "targo".to_string()];
+        let line = dev_linked_program_line(
+            "trust",
+            Some(std::path::Path::new("/h/trust/build/host/stage2")),
+            &bins,
+            Some(std::path::Path::new("/usr/bin/trust")),
+        );
+        assert!(line.starts_with("trust → /h/trust/build/host/stage2 (dev-linked; exposes targo, trustc — run `aterm pkg which targo`)"), "{line}");
+        assert!(
+            line.contains("`aterm pkg unlink trust` returns it to the index"),
+            "{line}"
+        );
+        assert!(
+            line.contains("/usr/bin/trust on PATH is an unrelated binary"),
+            "{line}"
+        );
+        assert!(
+            !line.contains("not installed"),
+            "a linked program is not 'not installed': {line}"
+        );
+        let bare = dev_linked_program_line("trust", None, &[], None);
+        assert!(
+            bare.contains("exposes no command of its own") && !bare.contains('\n'),
+            "{bare}"
+        );
+    }
+
+    /// The p11-kit collision (2026-09-14, Linux): `which trust` answered
+    /// `trust → /usr/bin/trust — system: /usr/bin/trust — not managed by aterm`,
+    /// presenting a certificate-store tool as the Trust compiler, with no word that the
+    /// program is unserved on this target. The truth leads, the foreign binary is named
+    /// for what it is, and the phrase that misled — "system" as in "the system copy of
+    /// this program" — is gone.
+    #[test]
+    fn an_uninstalled_index_program_names_a_same_named_binary_as_unrelated() {
+        let path = std::path::Path::new("/usr/bin/trust");
+        let unserved =
+            "unavailable on x86_64-unknown-linux-gnu: no build is published for this target";
+        let line = index_program_shadowed_by_unrelated_line("trust", Some(unserved), path);
+        assert!(
+            line.starts_with("trust → (nothing runs) — unavailable on x86_64"),
+            "{line}"
+        );
+        assert!(
+            line.contains("/usr/bin/trust on PATH is an unrelated binary, not this program"),
+            "{line}"
+        );
+        assert!(
+            !line.contains("system:"),
+            "the misleading 'system copy' phrasing must not survive: {line}"
+        );
+
+        // No recorded row: plain not-installed, with the fix — still never "system".
+        let line = index_program_shadowed_by_unrelated_line("trust", None, path);
+        assert!(
+            line.contains("not installed (fix: aterm pkg install trust)"),
+            "{line}"
+        );
+        assert!(line.contains("unrelated binary"), "{line}");
+        assert!(!line.contains("system:"), "{line}");
+
+        // A row that does not explain absence (e.g. a managed pin) gets the plain answer too.
+        let line = index_program_shadowed_by_unrelated_line(
+            "trust",
+            Some("managed 8595 — index 30"),
+            path,
+        );
+        assert!(line.contains("not installed"), "{line}");
     }
 
     /// DESIGN S7 on the `which` surface: a managed shim that exports its manifest's
@@ -11966,6 +12762,212 @@ mod tests {
         }
     }
 
+    /// THE FIX THIS TEST PINS (2026-09-14): the `[machine]` settings run at the TOP of
+    /// every pass, ahead of the first thing that can fail — never inside `if failures
+    /// == 0`. They used to sit there, at the very end of `update`, which coupled a
+    /// per-host preference to a completely clean toolchain pass: on a machine where one
+    /// program aborted at stage, `last_success_at` was never written, the doctor said
+    /// "the next update pass disables it" on every run, and nothing ever did.
+    ///
+    /// Scrapes this file's source, in the idiom of `verb_hint_matches_dispatch`: for each
+    /// of the three passes the window runs, the call must appear BEFORE the pass's first
+    /// `if failures == 0`, and there must be exactly one call per pass — a second,
+    /// tail-of-pass copy is how the gate grows back.
+    #[test]
+    fn machine_settings_apply_before_anything_can_fail_in_every_pass() {
+        let src = include_str!("cli.rs");
+        let body_of = |name: &str| -> &str {
+            let start = src
+                .find(&format!("\nfn {name}("))
+                .unwrap_or_else(|| panic!("{name} not found"));
+            let rest = &src[start + 1..];
+            // A fn body ends at the next top-level `fn ` — every pass here is followed
+            // by one.
+            let end = rest[3..].find("\nfn ").map_or(rest.len(), |i| i + 3);
+            &rest[..end]
+        };
+        // Per pass: how many `\n    if ` and `\n        return ` may precede the call.
+        // update and install: NONE — the call is the first statement. seed: its usage
+        // check (one `if`, one `return`) and its `layout()` let-else (one `return`),
+        // both of which are refusals of the INVOCATION, not of the machine.
+        let allowed = [
+            ("cmd_update_all_code", 0usize, 0usize),
+            ("cmd_install_default_set_code", 0, 0),
+            ("cmd_seed", 1, 2),
+        ];
+        for (pass, ifs, returns) in allowed {
+            let body = body_of(pass);
+            let calls: Vec<usize> = body
+                .match_indices("apply_machine_settings()")
+                .map(|(i, _)| i)
+                .collect();
+            assert_eq!(
+                calls.len(),
+                1,
+                "{pass}: exactly one apply_machine_settings() call, at the top — found {}",
+                calls.len()
+            );
+            let pre = &body[..calls[0]];
+            assert_eq!(
+                (
+                    pre.matches("\n    if ").count(),
+                    pre.matches("\n        return ").count()
+                ),
+                (ifs, returns),
+                "{pass}: a new gate or return above the machine settings — they must be the \
+                 first thing that can act"
+            );
+            // The CODE form — indented, braced — so a comment quoting the old gate is
+            // not what gets found.
+            if let Some(gate) = body.find("\n    if failures == 0 {") {
+                assert!(
+                    calls[0] < gate,
+                    "{pass}: the machine settings must apply BEFORE `if failures == 0`, not \
+                     inside it"
+                );
+            }
+            if let Some(gate) = body.find("if !manager_enabled()") {
+                assert!(
+                    calls[0] < gate,
+                    "{pass}: apply_machine_settings() must precede the manager gate — host \
+                     settings are not a network verb"
+                );
+            }
+            // And before the network: the first fetcher/index touch in every pass. The
+            // probes are CODE shapes, so a comment mentioning a fetcher cannot match.
+            for touch in ["let fetcher =", "resolve_fetcher(", "resolve_index", "net_"] {
+                if let Some(at) = body.find(touch) {
+                    assert!(
+                        calls[0] < at,
+                        "{pass}: apply_machine_settings() must precede `{touch}`"
+                    );
+                }
+            }
+        }
+    }
+
+    /// The synthetic-home rule, on its inputs: the same path is the real machine; any
+    /// other path is not, and the reason names both so a `sudo -H` reader learns why.
+    /// `defaults` ignores `$HOME` (measured 2026-09-14), which is why this exists.
+    #[test]
+    fn a_redirected_home_is_a_synthetic_machine() {
+        use std::path::Path;
+        assert_eq!(
+            machine_home_mismatch_between(Path::new("/Users//me"), Path::new("/Users//me")),
+            None
+        );
+        let why = machine_home_mismatch_between(Path::new("/tmp/fixture"), Path::new("/Users//me"))
+            .expect("a temp HOME is not the account home");
+        assert!(
+            why.contains("/tmp/fixture") && why.contains("/Users//me"),
+            "{why}"
+        );
+        assert!(why.contains("follow the account"), "{why}");
+    }
+
+    /// FAIL-CLOSED: an account that cannot be resolved is not proof that HOME is it.
+    /// (Some, Some) same → account; different → mismatch naming both; (Some, None) →
+    /// unresolved, naming the reason; (None, _) → the account (an unset HOME falls back
+    /// to the passwd entry in `home_dir()`).
+    #[test]
+    fn an_unresolvable_account_is_a_synthetic_machine() {
+        use crate::machine::HomePosture;
+        use std::path::Path;
+        let me = Path::new("/Users//me");
+        let fixture = Path::new("/tmp/fixture");
+        assert_eq!(
+            machine_home_verdict(Some(me), Some(me), false),
+            (HomePosture::Account, None)
+        );
+        assert_eq!(
+            machine_home_verdict(Some(fixture), Some(me), true).0,
+            HomePosture::Account,
+            "the filesystem's answer wins over the spelling"
+        );
+        let (p, why) = machine_home_verdict(Some(fixture), Some(me), false);
+        assert_eq!(p, HomePosture::Mismatch);
+        let why = why.unwrap();
+        assert!(
+            why.contains("/tmp/fixture") && why.contains("/Users//me"),
+            "{why}"
+        );
+        let (p, why) = machine_home_verdict(Some(fixture), None, false);
+        assert_eq!(p, HomePosture::Unresolved);
+        assert!(why.unwrap().contains("could not be resolved"));
+        assert_eq!(
+            machine_home_verdict(None, Some(me), false).0,
+            HomePosture::Account
+        );
+        assert_eq!(
+            machine_home_verdict(None, None, false).0,
+            HomePosture::Account
+        );
+    }
+
+    /// The same directory under another spelling IS the real home; a different one, or
+    /// a missing one, is not.
+    #[cfg(unix)]
+    #[test]
+    fn the_same_directory_under_another_spelling_is_the_real_home() {
+        let t = std::env::temp_dir().join("atpkg-same-directory-test");
+        let _ = std::fs::remove_dir_all(&t);
+        std::fs::create_dir_all(&t).unwrap();
+        let link = std::env::temp_dir().join("atpkg-same-directory-link");
+        let _ = std::fs::remove_file(&link);
+        std::os::unix::fs::symlink(&t, &link).unwrap();
+        assert!(same_directory(&link, &t), "a symlink to it is it");
+        assert!(same_directory(&t.join("."), &t), "a dotted spelling is it");
+        assert!(
+            !same_directory(&t, &std::env::temp_dir()),
+            "the parent is not it"
+        );
+        assert!(
+            !same_directory(&t.join("missing"), &t),
+            "a missing path proves nothing"
+        );
+        let _ = std::fs::remove_file(&link);
+        let _ = std::fs::remove_dir_all(&t);
+    }
+
+    /// The SUPPORTED gate precedes the home guard in `apply_machine_settings`, so a
+    /// Linux pass with a redirected HOME prints nothing about settings it does not have.
+    #[test]
+    fn the_platform_gate_precedes_the_home_guard() {
+        let src = include_str!("cli.rs");
+        let start = src.find("\nfn apply_machine_settings(").unwrap();
+        let body = &src[start..];
+        let body = &body[..body[3..].find("\nfn ").map_or(body.len(), |i| i + 3)];
+        let gate = body
+            .find("if !crate::noindex::SUPPORTED {")
+            .expect("the platform gate");
+        let guard = body
+            .find("machine_home_mismatch()")
+            .expect("the home guard");
+        assert!(
+            gate < guard,
+            "SUPPORTED must be checked before the home guard speaks"
+        );
+    }
+
+    /// `machine`'s grammar is two spellings and nothing else: bare (read) and `apply`.
+    /// Anything more is a usage error, so a typo never silently reads when someone meant
+    /// to apply.
+    #[test]
+    fn machine_grammar_is_exact() {
+        // Both accepted spellings are answered by `--help` without acting, like every
+        // verb; and a third word is refused. The read/apply bodies touch the real
+        // machine, so they are exercised by hand, not here.
+        let argv = |s: &str| -> Vec<String> { s.split_whitespace().map(String::from).collect() };
+        assert_eq!(
+            cmd_machine(&argv("check")),
+            ExitCode::from(2),
+            "`check` is not a word: bare is the read"
+        );
+        assert_eq!(cmd_machine(&argv("apply --dry-run")), ExitCode::from(2));
+        assert_eq!(cmd_machine(&argv("apply extra")), ExitCode::from(2));
+        assert!(usage_of("machine").is_some_and(|u| u.contains("apply")));
+    }
+
     /// The `noindex` grammar, as a table: the default subcommand (`scan`), the default
     /// root (the cwd — left `None` by the parser so it stays pure), the default depth,
     /// and the part actually worth pinning — a flag on the WRONG subcommand is a usage
@@ -12200,6 +13202,9 @@ mod tests {
             // Drop guard and its one rename lives inside the tree the user named — so a
             // storage-hygiene scan never queues behind an install.
             "noindex",
+            // `machine` writes a per-host preference and renames build output in the
+            // user's own trees; nothing under <prefix> moves.
+            "machine",
             "help",
             "-h",
             "--help",
@@ -12297,6 +13302,42 @@ mod tests {
         assert!(!adopted(&layout), "uninstall opts out of set completion");
         // Clearing what is already clear is not an error.
         clear_adoption(&layout);
+
+        // The whole-set verb's decision table: an install adopts; a set found ALREADY
+        // COMPLETE adopts (the re-adopt the uninstall message and doctor's re-seed remedy
+        // both lead to — it recorded nothing until 2026-09-14); a machine with no builds
+        // before and none after, a failed member, a skipped member or an owed member does
+        // not.
+        let none: Vec<String> = Vec::new();
+        let some = vec![String::from("trust")];
+        assert!(
+            default_set_adopts(1, 0, false, &none, &none),
+            "installed: adopts"
+        );
+        assert!(
+            default_set_adopts(1, 2, true, &some, &some),
+            "installed something: adopts"
+        );
+        assert!(
+            default_set_adopts(0, 0, true, &none, &none),
+            "already complete: adopts"
+        );
+        assert!(
+            !default_set_adopts(0, 0, false, &none, &none),
+            "no toolset before or after: not adopted"
+        );
+        assert!(
+            !default_set_adopts(0, 1, true, &none, &none),
+            "a failure: not adopted"
+        );
+        assert!(
+            !default_set_adopts(0, 0, true, &some, &none),
+            "a skip: not adopted"
+        );
+        assert!(
+            !default_set_adopts(0, 0, true, &none, &some),
+            "owed: not adopted"
+        );
         assert!(!adopted(&layout));
 
         let _ = std::fs::remove_dir_all(&dir);
@@ -12566,10 +13607,21 @@ mod tests {
             !MARKERS.iter().any(|(m, _)| *m == LOCK_WAITING_MARKER),
             "`lock-waiting:` is neither an announcement nor an answer"
         );
+        // …and so does `lock-acquired:`, which answers the WAIT, not an announcement:
+        // were it an answer, a child that waited, acquired and then announced would
+        // look answered before it began.
+        assert!(
+            !MARKERS.iter().any(|(m, _)| *m == LOCK_ACQUIRED_MARKER),
+            "`lock-acquired:` is neither an announcement nor an answer"
+        );
         use super::announcement;
         announcement::reset();
         announcement::note(&format!(
             "atpkg: {LOCK_WAITING_MARKER}another atpkg process holds the store lock"
+        ));
+        assert!(!announcement::is_open());
+        announcement::note(&format!(
+            "atpkg: {LOCK_ACQUIRED_MARKER}the other process finished"
         ));
         assert!(!announcement::is_open());
         announcement::note(&format!(

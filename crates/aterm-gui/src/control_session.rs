@@ -947,8 +947,32 @@ pub(crate) fn cmd_await(
 
 /// Process-wide `turn` id mint: every turn gets a unique id, reported on the
 /// reply status line (`id=<n>`) and named by the lease's `ERR busy turn=<n>` so
-/// a refused writer can tell WHICH exchange it collided with.
+/// a refused writer can tell WHICH exchange it collided with. It holds the last
+/// id minted. A self-update handoff carries it ([`turn_ids_minted`] on the way
+/// out, [`raise_turn_ids`] on the way in), so ids keep rising across the update
+/// and a `subscribe … since-turn=<n>` or `history since=<n>` anchor taken
+/// before it still means "after turn n".
 static NEXT_TURN_ID: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// The last turn id minted — by this process, or by the one it continued the
+/// count from ([`raise_turn_ids`]); 0 before either — for the handoff manifest.
+pub(crate) fn turn_ids_minted() -> u64 {
+    NEXT_TURN_ID.load(std::sync::atomic::Ordering::Relaxed)
+}
+
+/// Continue the turn-id count from `minted` (an earlier process's
+/// [`turn_ids_minted`]): the next id is above it. Never lowers the count, and
+/// never raises it past what a handoff can carry
+/// (`handoff_carry::MAX_TURN_ID`): a count taken from a sidecar or manifest
+/// is input, and one at `u64::MAX` would make the next `turn`'s `+ 1`
+/// overflow (a debug panic, a release wrap to 0 that breaks the rising ids
+/// `history since=` and `ERR busy turn=` rely on).
+pub(crate) fn raise_turn_ids(minted: u64) {
+    NEXT_TURN_ID.fetch_max(
+        minted.min(crate::handoff_carry::MAX_TURN_ID),
+        std::sync::atomic::Ordering::Relaxed,
+    );
+}
 
 /// Input delivery for [`cmd_turn`], resolved by the dispatch site so the ONE
 /// orchestration below serves both targets: the SELF/active-tab path delivers
@@ -1956,6 +1980,7 @@ pub(crate) fn cmd_turn_guarded(
             screen_hash,
             seq,
             arch,
+            carried: false,
         });
     }
     // Wake any `events` subscriber NOW so it scans the fresh record immediately
@@ -2002,7 +2027,10 @@ pub(crate) fn cmd_turn_guarded(
 /// ([`crate::turn_ledger::ArchMark`]): hand it to `offscreen since=` to read what a
 /// fullscreen app scrolled away since. It sits BEFORE `text=` because `text=` is
 /// the free-text tail every reader cuts a row at (aterm-link's hook splits on
-/// `" text="`), so a field after it would be read as part of the message.
+/// `" text="`), so a field after it would be read as part of the message — as
+/// does ` carried=1`, printed on a record a self-update handoff carried from the
+/// previous process ([`crate::turn_ledger::TurnRecord::carried`]: its
+/// `started_ms` and `seq` are that process's).
 pub(crate) fn cmd_history(ctx: &SessionCtx, rest: &str) -> String {
     let mut n = 0usize;
     let mut since: Option<u64> = None;
@@ -2026,7 +2054,7 @@ pub(crate) fn cmd_history(ctx: &SessionCtx, rest: &str) -> String {
     let mut out = format!("OK {}\n", recs.len());
     for r in recs {
         out.push_str(&format!(
-            "turn {} submitted={} status={} started_ms={} dur_ms={} seq={} hash={:016x} arch={} text={}\n",
+            "turn {} submitted={} status={} started_ms={} dur_ms={} seq={} hash={:016x} arch={}{} text={}\n",
             r.id,
             u8::from(r.submitted),
             r.status,
@@ -2035,6 +2063,7 @@ pub(crate) fn cmd_history(ctx: &SessionCtx, rest: &str) -> String {
             r.seq,
             r.screen_hash,
             r.arch,
+            if r.carried { " carried=1" } else { "" },
             super::pct_encode(&r.text),
         ));
     }

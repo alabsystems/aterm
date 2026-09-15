@@ -83,6 +83,15 @@ pub enum PointerError {
     /// non-prerelease) release carrying anything — or is private/nonexistent, which
     /// GitHub renders identically on the web host. A STANDING state, not weather.
     NoRelease { url: String },
+    /// The pointer names a release of THIS repository, carrying THIS asset name
+    /// under a safe tag — everything checks out except that the tag is not one
+    /// this client installs from (an `atpkg-index-<n>` cut published as a
+    /// normal release captures `/releases/latest` away from the app releases;
+    /// `tools/atpkg-index.sh`'s own fallback text warns of exactly this). Not
+    /// a refusal to interpret: the channel is intact and the newest APP
+    /// release below it is elected from the listing (2026-09-14). Nothing at
+    /// the location was fetched.
+    OtherTag { tag: String },
     /// The host asked us to slow down (429) or is having a bad moment (5xx). Weather:
     /// defer and retry on the next cycle. `code` is the status.
     Transient { code: u16, url: String },
@@ -118,6 +127,11 @@ impl std::fmt::Display for PointerError {
                 f,
                 "the release host answered HTTP {code} to HEAD {url}, which is not a release \
                  pointer (a blocked host or proxy?)"
+            ),
+            Self::OtherTag { tag } => write!(
+                f,
+                "the evergreen release pointer names {tag}, a release of this channel that is \
+                 not an app release; the newest app release is elected from the listing"
             ),
             Self::Refused { why } => write!(
                 f,
@@ -174,9 +188,10 @@ pub fn parse_location(
         ));
     }
     if !accept_tag(tag) {
-        return Err(refused(
-            "the redirect's tag is not a release tag this client installs from",
-        ));
+        // This repository, this asset, a safe segment: the one benign refusal.
+        return Err(PointerError::OtherTag {
+            tag: tag.to_string(),
+        });
     }
     // Re-derive and compare: the URL every later GET uses is the DERIVED one, and it
     // must be the very string the server named, or the two would fetch different things.
@@ -360,21 +375,30 @@ mod tests {
         // The `latest` alias itself, and the tag page: neither is a download URL.
         refused("https://github.com/alabsystems/aterm/releases/latest/download/aterm-appcast.toml");
         refused("https://github.com/alabsystems/aterm/releases/tag/v0.74.0");
-        // Tags outside the grammar: legacy two-component, non-canonical spelling,
-        // prerelease suffix, atpkg's tags, an empty tag.
+        // An empty tag never reaches the grammar (it is not a safe segment).
+        refused("https://github.com/alabsystems/aterm/releases/download//aterm-appcast.toml");
+        // Tags outside the grammar ON THIS REPOSITORY, for THIS asset — legacy
+        // two-component, non-canonical spelling, prerelease suffix, atpkg's tags —
+        // are the one benign case (2026-09-14): `OtherTag`, so the caller elects
+        // the newest APP release from the listing instead of filing a network
+        // failure that never escalates. Invariant (d) holds exactly as before:
+        // nothing at the location is fetched, and the tag is named, never
+        // interpreted as a release to install from.
         for tag in [
             "v0.74",
             "v01.74.0",
             "v0.74.0-rc1",
             "atpkg-index-41",
             "0.74.0",
-            "",
         ] {
             let mut loc = String::from("https://github.com/alabsystems/aterm/releases/download/");
             loc.push_str(tag);
             loc.push('/');
             loc.push_str(NAME);
-            refused(&loc);
+            match parse_location(OWNER, REPO, NAME, &loc, &canonical_app_tag) {
+                Err(PointerError::OtherTag { tag: named }) => assert_eq!(named, tag),
+                other => panic!("{loc}: expected OtherTag, got {other:?}"),
+            }
         }
         // …but a caller with a different grammar (atpkg) accepts its own tags.
         let p = parse_location(

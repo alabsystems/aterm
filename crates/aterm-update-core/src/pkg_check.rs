@@ -35,10 +35,24 @@ pub const NEVER_CHECKED_STDERR_LINE: &str = "atpkg: no update check has run yet 
 /// progress file, 2026-09-10). One reader for both edges so they cannot drift.
 #[must_use]
 pub fn update_interval_secs() -> u64 {
-    std::env::var("ATPKG_UPDATE_INTERVAL_SECS")
-        .ok()
+    update_interval_secs_from(std::env::var("ATPKG_UPDATE_INTERVAL_SECS").ok().as_deref())
+}
+
+/// The reader's cap: `u32::MAX` seconds (136 years — "effectively never"). The
+/// window's loop parks on `Instant::now() + interval`, which PANICS past the
+/// clock's range, so a value the parser accepted (`2^63..=u64::MAX`) took the
+/// `atpkg-update` thread down at its first park with no log line (2026-09-13
+/// audit); `u32::MAX` plus any uptime fits every platform's `i64` clock.
+pub const UPDATE_INTERVAL_SECS_CAP: u64 = u32::MAX as u64;
+
+/// [`update_interval_secs`] over the knob's raw value (`None` = unset): an unset or
+/// unparseable value is the six-hour default, and a value past
+/// [`UPDATE_INTERVAL_SECS_CAP`] reads as the cap.
+#[must_use]
+pub fn update_interval_secs_from(value: Option<&str>) -> u64 {
+    value
         .and_then(|s| s.parse::<u64>().ok())
-        .unwrap_or(6 * 60 * 60)
+        .map_or(6 * 60 * 60, |secs| secs.min(UPDATE_INTERVAL_SECS_CAP))
 }
 
 /// The `last_success_at` value of a `status.toml` text, or `None` when the key is
@@ -194,6 +208,33 @@ mod tests {
             Some("2026-09-10T06:40:53Z")
         );
         let _ = std::fs::remove_dir_all(p.parent().unwrap());
+    }
+
+    /// THE KNOB CANNOT OVERFLOW THE PARK'S CLOCK (2026-09-13 audit). The window's
+    /// update loop parks on `Instant::now() + Duration::from_secs(interval)`, and
+    /// `Instant + Duration` PANICS past the clock's range — so a value the parser
+    /// accepted (`2^63..=u64::MAX`) took the `atpkg-update` thread down at its
+    /// first park, silently: the seed ran, one update ran, no tick ever followed.
+    /// The reader caps at `u32::MAX` seconds (136 years, "effectively never"),
+    /// which no uptime clock can overflow; the documented values read unchanged.
+    #[test]
+    fn the_interval_reader_caps_a_value_past_the_clock() {
+        assert_eq!(update_interval_secs_from(None), 6 * 60 * 60);
+        assert_eq!(update_interval_secs_from(Some("banana")), 6 * 60 * 60);
+        assert_eq!(update_interval_secs_from(Some("0")), 0);
+        assert_eq!(update_interval_secs_from(Some("21600")), 21600);
+        let cap = UPDATE_INTERVAL_SECS_CAP;
+        assert_eq!(cap, u64::from(u32::MAX));
+        assert_eq!(update_interval_secs_from(Some("4294967295")), cap);
+        assert_eq!(
+            update_interval_secs_from(Some("9223372036854775808")),
+            cap,
+            "2^63 reads as the cap, not as itself"
+        );
+        assert_eq!(update_interval_secs_from(Some("18446744073709551615")), cap);
+        // The park's own arithmetic over the cap: what the loop evaluates first.
+        let end = std::time::Instant::now().checked_add(std::time::Duration::from_secs(cap));
+        assert!(end.is_some(), "the cap fits the park's clock");
     }
 
     /// The age is measured from the SUCCESS stamp; a future stamp reads as fresh;

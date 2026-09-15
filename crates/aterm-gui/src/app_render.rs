@@ -20,6 +20,7 @@ use aterm_render::{DamageOutcome, Frame, RenderInput, Theme};
 use winit::dpi::PhysicalSize;
 use winit::window::Window;
 
+use crate::app_input::{Deliveries, DeliveryTicket};
 use crate::present::{CpuFrameBuffer as _, CpuPresenter as _};
 use crate::{
     App, BLINK_INTERVAL, Backend, PresentDropAccounting, PresentTarget, RepaintKey,
@@ -291,7 +292,54 @@ fn classify_cursor_fx_commit(
 /// conservative: the cursor kitty, resident pet, and Robi share that untagged
 /// sprite plane, so keeping any of it would risk one frame at the old cursor.
 fn retire_torn_cursor_fx(window: &mut WindowState) {
-    window.cursor_glow.reset();
+    retire_torn_cursor_fx_with(window, TornBandLaw::Curtain);
+}
+
+/// What the torn-frame retirement does with RAINBOW KITTY'S BAND, which — alone
+/// among the engines below — is light about the GRID's cells rather than pixels
+/// of the window, and so has a law of its own at each of the two seams that
+/// reach [`retire_torn_cursor_fx_with`] (Rainbow Path v3 §2.8, D-2/D-3/D-4).
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum TornBandLaw {
+    /// The coordinate space ITSELF was replaced — the alternate screen, a tab
+    /// or terminal switch, a layout re-grid: the cells the band is true about
+    /// are gone, so it is drawn into the caret it last stood under over 0.24 s
+    /// ([`crate::cursor_glow::CursorGlow::curtain`]) instead of cut.
+    Curtain,
+    /// A HISTORY viewport is on glass and the live grid is unchanged beneath
+    /// it: the band is still true about the live grid, so it is KEPT — every
+    /// clock intact, nothing cut — and comes back where its clocks say when
+    /// the live viewport does (D-4, law A4).
+    ///
+    /// It does NOT arm `rk::Engine::hide_next_frame` here. That flag is taken
+    /// by the tick, and the one site this law is reached from — the `Retain`
+    /// arm's `App::retire_composed_cursor_effects_for_history` — advances no
+    /// effect clock at all, so an arm made here would stand until the NEXT
+    /// tick, whatever viewport that turned out to be: a probe that armed it
+    /// and then ticked once on a LIVE viewport read `under = 0` on a frame
+    /// that drew 623 quads. It does not need to: this frame projects nothing
+    /// either way, because `composed_cursor_effect_valid` is cleared below.
+    /// The two sites that DO tick in the same frame
+    /// (`splice_focused_composed_cursor_effects_sampled_with_plan`'s
+    /// `display_offset != 0` and the live-viewport retire) arm it themselves.
+    Keep,
+}
+
+fn retire_torn_cursor_fx_with(window: &mut WindowState, band: TornBandLaw) {
+    // Rainbow Kitty's ribbon takes the CURTAIN here (Rainbow Path v3 §2.8,
+    // A2): drawn into the caret over 0.24 s instead of cut in one frame at
+    // the alternate screen, a tab switch or a torn coordinate space — or, over
+    // history, is hidden with its clocks intact. Either way the fallback for
+    // the other nine styles, and for every other engine, is the reset it
+    // always was: their marks are pixels of the space that just went.
+    match band {
+        TornBandLaw::Curtain => window.cursor_glow.curtain(std::time::Instant::now()),
+        TornBandLaw::Keep => {
+            if !window.cursor_glow.v2_owns_frame() {
+                window.cursor_glow.reset();
+            }
+        }
+    }
     window.cursor_trail.reset();
     window.cursor_rainbow = crate::cursor_rainbow::CursorRainbow::default();
     window.cursor_droplet = crate::cursor_droplet::CursorDroplet::default();
@@ -529,6 +577,463 @@ mod cursor_fx_generation_fence_tests {
             visibility_changed,
             style_changed,
         }
+    }
+
+    /// A rainbow-kitty window with one lit ribbon cell on glass, built through
+    /// the REAL frame path: the seam twins below each fire one host seam at it
+    /// and read what the band does. `peak` is the brightest `glow_under` quad —
+    /// the ribbon's own stream — so "gone" means gone from the composite, not
+    /// merely flagged.
+    fn rainbow_window_with_a_lit_band(t0: Instant) -> (App, WindowId, Instant) {
+        let mut app = App::headless_for_test();
+        app.config.motion = Some("full".into());
+        app.config.cursor_trail = Some(true);
+        app.config.cursor_trail_style = Some("rainbow kitty".into());
+        app.config.trail_sounds = Some(false);
+        let wid = WindowId(0);
+        let mut seed = super::CursorFxInputs::sample_for_test(t0);
+        seed.cur = Some((2, 2));
+        app.tick_cursor_fx(wid, seed).expect("seed cursor engines");
+        let typed = t0 + Duration::from_millis(1);
+        {
+            let ws = app.windows.get_mut(&wid).expect("window");
+            ws.last_key_at = Some(typed);
+            ws.typing_cadence.on_keystroke(typed);
+            ws.cursor_glow.note_typed(typed);
+        }
+        let mut live = super::CursorFxInputs::sample_for_test(t0 + Duration::from_millis(2));
+        live.cur = Some((2, 3));
+        app.tick_cursor_fx(wid, live).expect("live cursor tick");
+        // SETTLED, past the ribbon's one 18 ms `edge-in` attack: every seam
+        // below asks whether the light only ever goes DOWN from here, and a
+        // baseline read mid-attack would answer that question about the
+        // attack instead of about the seam.
+        let settled = t0 + Duration::from_millis(40);
+        let mut on = super::CursorFxInputs::sample_for_test(settled);
+        on.cur = Some((2, 3));
+        app.tick_cursor_fx(wid, on).expect("settle tick");
+        (app, wid, settled)
+    }
+
+    /// The brightest quad of the `glow_under` stream — the ribbon body's own.
+    fn band_peak(app: &App, wid: WindowId) -> u8 {
+        app.windows[&wid]
+            .cursor_glow
+            .under_quads()
+            .iter()
+            .map(|q| q.alpha)
+            .max()
+            .unwrap_or(0)
+    }
+
+    /// `(leftmost x, rightmost x + w)` of the band on glass, in window pixels.
+    fn band_span(app: &App, wid: WindowId) -> Option<(i32, i32)> {
+        let quads = app.windows[&wid].cursor_glow.under_quads();
+        let l = quads.iter().map(|q| i32::from(q.x)).min()?;
+        let r = quads
+            .iter()
+            .map(|q| i32::from(q.x) + i32::from(q.w))
+            .max()?;
+        Some((l, r))
+    }
+
+    fn tick_at(app: &mut App, wid: WindowId, at: Instant, cur: (u16, u16), live_viewport: bool) {
+        let mut fx = super::CursorFxInputs::sample_for_test(at);
+        fx.cur = Some(cur);
+        fx.live_viewport = live_viewport;
+        app.tick_cursor_fx(wid, fx).expect("cursor tick");
+    }
+
+    /// **RAINBOW PATH v3 step 7 (A2): a coordinate-space seam curtains the
+    /// ribbon instead of cutting it.** `retire_torn_cursor_fx` — the alt
+    /// screen, a tab switch, a torn frame, a layout re-grid — used to `reset()`
+    /// the glow: a lit band was gone on the next frame (15 → 0 lit cells inside
+    /// one 17 ms frame on glass, audit s8). Through the real seam: a typed key
+    /// lays a lit cell, the seam fires, and the body is still on glass half-way
+    /// through the 0.24 s curtain — spending, drawn toward the caret — and
+    /// exactly gone at its end, with the engine still owning the frame and
+    /// every other coordinate-bound owner retired as before.
+    #[test]
+    fn a_coordinate_space_seam_curtains_the_rainbow_ribbon_over_a_quarter_second() {
+        // The seam under test reads the wall clock itself, so the band is laid
+        // 300 ms IN THE PAST — inside its grace, whole and settled — and the
+        // seam then falls at the real present with the frames after it in the
+        // real future. A band seeded at `now` would be curtained before it was
+        // laid.
+        let t0 = Instant::now() - Duration::from_millis(300);
+        let (mut app, wid, _settled) = rainbow_window_with_a_lit_band(t0);
+        let full = band_peak(&app, wid);
+        assert!(
+            full > 0,
+            "precondition: the typed key laid a lit ribbon cell"
+        );
+
+        // THE SEAM, on its own clock (`Instant::now()` inside it).
+        retire_torn_cursor_fx(app.windows.get_mut(&wid).expect("window"));
+        let fell = Instant::now();
+        assert!(
+            app.windows[&wid]
+                .cursor_glow
+                .v2_ribbon()
+                .is_some_and(|r| r.curtained() && !r.at_rest()),
+            "the ribbon is curtaining, its cells kept"
+        );
+        assert!(
+            !app.windows[&wid].cursor_trail.is_active(),
+            "…while the other engines are retired as before"
+        );
+        // A2's own oracle: never > 4 lit to 0 in one frame, and ≥ 3 frames of
+        // it at 30 fps. Six 33 ms frames inside the 0.24 s span.
+        let mut prev = full;
+        let mut spending = 0;
+        for ms in [33_u64, 66, 99, 132, 165, 198] {
+            tick_at(
+                &mut app,
+                wid,
+                fell + Duration::from_millis(ms),
+                (2, 3),
+                true,
+            );
+            let now = band_peak(&app, wid);
+            assert!(
+                now <= prev,
+                "+{ms} ms: the curtain never brightens ({prev} -> {now})"
+            );
+            if now > 0 {
+                spending += 1;
+            }
+            prev = now;
+        }
+        assert!(
+            spending >= 3,
+            "the curtain draws on at least three frames at 30 fps (A2), not {spending}"
+        );
+        assert!(
+            app.windows[&wid].cursor_glow.is_active(),
+            "…and the glow reports itself live so the frame train keeps running"
+        );
+        tick_at(
+            &mut app,
+            wid,
+            fell + Duration::from_millis(260),
+            (2, 3),
+            true,
+        );
+        assert_eq!(
+            band_peak(&app, wid),
+            0,
+            "at the curtain's end the body is exactly gone"
+        );
+        assert!(
+            app.windows[&wid]
+                .cursor_glow
+                .v2_ribbon()
+                .is_some_and(|r| r.at_rest() && !r.curtained()),
+            "…and the pool is empty, the engine still owning the frame"
+        );
+    }
+
+    /// **D-2: entering the alternate screen curtains, and leaving it brings
+    /// nothing back.** The alt-screen edge reaches the engines through
+    /// `sync_cursor_effect_coordinate_space`, which is the seam the audit
+    /// measured cutting the band in one frame (15 lit cells → 0 between −2.7 ms
+    /// and +12.5 ms). Here it curtains; and on EXIT the same seam fires again
+    /// with an empty pool, which is a no-op — the band that was on the main
+    /// screen is not restored, because it was spent, not parked.
+    #[test]
+    fn entering_the_alternate_screen_curtains_the_band_and_leaving_it_returns_nothing() {
+        // The seam under test reads the wall clock itself, so the band is laid
+        // 300 ms IN THE PAST — inside its grace, whole and settled — and the
+        // seam then falls at the real present with the frames after it in the
+        // real future. A band seeded at `now` would be curtained before it was
+        // laid.
+        let t0 = Instant::now() - Duration::from_millis(300);
+        let (mut app, wid, _settled) = rainbow_window_with_a_lit_band(t0);
+        assert!(band_peak(&app, wid) > 0, "precondition: a lit band");
+        {
+            let ws = app.windows.get_mut(&wid).expect("window");
+            // The frame path's own first observation of this space.
+            super::sync_cursor_effect_coordinate_space(ws, 7, false);
+            // …then the program enters the alternate screen.
+            assert!(
+                super::sync_cursor_effect_coordinate_space(ws, 7, true),
+                "the alt-screen edge is a coordinate-space change"
+            );
+        }
+        let fell = Instant::now();
+        assert!(
+            app.windows[&wid]
+                .cursor_glow
+                .v2_ribbon()
+                .is_some_and(|r| r.curtained()),
+            "alt-screen ENTRY drops the curtain (D-2), it does not cut"
+        );
+        tick_at(
+            &mut app,
+            wid,
+            fell + Duration::from_millis(100),
+            (2, 3),
+            true,
+        );
+        assert!(
+            band_peak(&app, wid) > 0,
+            "…and the app's first alt-screen frames are drawn under a band that is still there"
+        );
+        tick_at(
+            &mut app,
+            wid,
+            fell + Duration::from_millis(260),
+            (2, 3),
+            true,
+        );
+        assert_eq!(band_peak(&app, wid), 0, "gone at the curtain's end");
+        // EXIT: nothing returns (D-2). The seam fires on an empty pool.
+        {
+            let ws = app.windows.get_mut(&wid).expect("window");
+            assert!(super::sync_cursor_effect_coordinate_space(ws, 7, false));
+        }
+        tick_at(
+            &mut app,
+            wid,
+            fell + Duration::from_millis(300),
+            (2, 3),
+            true,
+        );
+        assert_eq!(
+            band_peak(&app, wid),
+            0,
+            "leaving the alternate screen brings nothing back"
+        );
+        assert!(
+            app.windows[&wid]
+                .cursor_glow
+                .v2_ribbon()
+                .is_some_and(|r| r.at_rest() && !r.curtained()),
+            "…and no second curtain was armed over an empty pool"
+        );
+    }
+
+    /// **D-3: a terminal / tab switch takes the same curtain.** The other half
+    /// of the same seam — the `terminal_id` that changes when the front tab or
+    /// pane does — with the screen flag unchanged.
+    #[test]
+    fn a_terminal_switch_curtains_the_band() {
+        // The seam under test reads the wall clock itself, so the band is laid
+        // 300 ms IN THE PAST — inside its grace, whole and settled — and the
+        // seam then falls at the real present with the frames after it in the
+        // real future. A band seeded at `now` would be curtained before it was
+        // laid.
+        let t0 = Instant::now() - Duration::from_millis(300);
+        let (mut app, wid, _settled) = rainbow_window_with_a_lit_band(t0);
+        assert!(band_peak(&app, wid) > 0, "precondition: a lit band");
+        {
+            let ws = app.windows.get_mut(&wid).expect("window");
+            super::sync_cursor_effect_coordinate_space(ws, 7, false);
+            assert!(
+                super::sync_cursor_effect_coordinate_space(ws, 8, false),
+                "a different terminal is a different coordinate space"
+            );
+        }
+        let fell = Instant::now();
+        assert!(
+            app.windows[&wid]
+                .cursor_glow
+                .v2_ribbon()
+                .is_some_and(|r| r.curtained() && !r.at_rest()),
+            "a tab / terminal switch curtains (D-3)"
+        );
+        tick_at(
+            &mut app,
+            wid,
+            fell + Duration::from_millis(100),
+            (2, 3),
+            true,
+        );
+        assert!(band_peak(&app, wid) > 0, "still drawing half-way through");
+        tick_at(
+            &mut app,
+            wid,
+            fell + Duration::from_millis(260),
+            (2, 3),
+            true,
+        );
+        assert_eq!(band_peak(&app, wid), 0, "gone at the curtain's end");
+    }
+
+    /// **A content INVALIDATION curtains too.** `sync_cursor_effect_scroll`'s
+    /// `Invalidate` arm is the seam where the retained coordinates stop sharing
+    /// one transform (RIS, `ESC[3J`, a splice) — the same class of fact as the
+    /// alternate screen, and it took the same one-frame `reset()`.
+    #[test]
+    fn a_content_invalidation_curtains_the_band_instead_of_cutting_it() {
+        // The seam under test reads the wall clock itself, so the band is laid
+        // 300 ms IN THE PAST — inside its grace, whole and settled — and the
+        // seam then falls at the real present with the frames after it in the
+        // real future. A band seeded at `now` would be curtained before it was
+        // laid.
+        let t0 = Instant::now() - Duration::from_millis(300);
+        let (mut app, wid, _settled) = rainbow_window_with_a_lit_band(t0);
+        assert!(band_peak(&app, wid) > 0, "precondition: a lit band");
+        let change = {
+            let ws = app.windows.get_mut(&wid).expect("window");
+            super::sync_cursor_effect_scroll(ws, ContentScrollState::default());
+            super::sync_cursor_effect_scroll(
+                ws,
+                ContentScrollState {
+                    invalidation_epoch: 9,
+                    ..ContentScrollState::default()
+                },
+            )
+        };
+        let fell = Instant::now();
+        assert!(change.invalidated, "precondition: the arm under test");
+        assert!(
+            app.windows[&wid]
+                .cursor_glow
+                .v2_ribbon()
+                .is_some_and(|r| r.curtained() && !r.at_rest()),
+            "an invalidation curtains the band"
+        );
+        tick_at(
+            &mut app,
+            wid,
+            fell + Duration::from_millis(100),
+            (2, 3),
+            true,
+        );
+        assert!(band_peak(&app, wid) > 0, "still drawing half-way through");
+        tick_at(
+            &mut app,
+            wid,
+            fell + Duration::from_millis(260),
+            (2, 3),
+            true,
+        );
+        assert_eq!(band_peak(&app, wid), 0, "gone at the curtain's end");
+    }
+
+    /// **D-4 / law A4: scrollback HIDES the band and the live viewport brings
+    /// it back on its own clocks.** A history viewport used to `reset()` the
+    /// glow — a wheel over a live band ended it for good. Now nothing is
+    /// composed while history shows (no `glow_under` quad at all), every clock
+    /// runs underneath, and the live viewport returns the band AT THE SAME SPAN
+    /// it had, dimmer by exactly the time that passed. A hide is not a reset,
+    /// and the span is how you tell.
+    #[test]
+    fn a_history_viewport_hides_the_band_and_the_live_viewport_returns_it_on_its_own_clocks() {
+        // Every clock in this twin is the injected one: the hide seam reads no
+        // wall clock of its own.
+        let t0 = Instant::now();
+        let (mut app, wid, settled) = rainbow_window_with_a_lit_band(t0);
+        let before = band_peak(&app, wid);
+        let span = band_span(&app, wid).expect("a band on glass");
+        assert!(before > 0, "precondition: a lit band");
+        let cells = app.windows[&wid]
+            .cursor_glow
+            .v2_ribbon()
+            .map(|r| r.cells().len())
+            .expect("v2 owns the frame");
+
+        // HISTORY: three frames of it, nothing composed, nothing destroyed.
+        for ms in [20_u64, 60, 120] {
+            tick_at(
+                &mut app,
+                wid,
+                settled + Duration::from_millis(ms),
+                (2, 3),
+                false,
+            );
+            assert_eq!(
+                app.windows[&wid].cursor_glow.under_quads().len(),
+                0,
+                "+{ms} ms of history composes no ribbon quad (A4)"
+            );
+            assert_eq!(
+                app.windows[&wid]
+                    .cursor_glow
+                    .v2_ribbon()
+                    .map(|r| r.cells().len()),
+                Some(cells),
+                "+{ms} ms of history keeps every cell — a hide is not a reset"
+            );
+        }
+
+        // BACK: the same span, dimmer by the elapsed time.
+        tick_at(
+            &mut app,
+            wid,
+            settled + Duration::from_millis(160),
+            (2, 3),
+            true,
+        );
+        let after = band_peak(&app, wid);
+        assert!(after > 0, "the live viewport brings the band back");
+        assert_eq!(
+            band_span(&app, wid),
+            Some(span),
+            "…at the span its clocks say, not re-laid and not moved"
+        );
+        assert!(
+            after <= before,
+            "…and its clocks ran while it was hidden ({before} -> {after})"
+        );
+        assert!(
+            app.windows[&wid]
+                .cursor_glow
+                .v2_ribbon()
+                .is_some_and(|r| !r.curtained()),
+            "a history viewport is not a coordinate-space seam: no curtain (D-4)"
+        );
+    }
+
+    /// **THE RESIZE SEAM CURTAINS TOO, and it is the reflow map's absence that
+    /// makes that the law** (Rainbow Path v3 §2.8 + §9's open question).
+    /// `apply_term_resize` is where the grid's meaning changes under every
+    /// retained cell; the audit measured it taking the band from 21 lit cells
+    /// to 0 inside one capture. §2.8 says the cells should be translated
+    /// through `aterm-grid`'s reflow map where it reaches and curtained where
+    /// it does not — and it does not reach here (`mod reflow_map;` is private
+    /// inside `grid/reflow.rs`, its functions are `pub(super)`, and `resize`
+    /// returns no map), so the curtain is the whole law at this seam and this
+    /// twin is its proof.
+    #[test]
+    fn a_grid_resize_curtains_the_band_because_no_reflow_map_reaches_this_seam() {
+        let t0 = Instant::now() - Duration::from_millis(300);
+        let (mut app, wid, _settled) = rainbow_window_with_a_lit_band(t0);
+        assert!(band_peak(&app, wid) > 0, "precondition: a lit band");
+        let (rows, cols) = (app.windows[&wid].rows, app.windows[&wid].cols);
+        app.apply_term_resize(
+            wid,
+            rows.saturating_sub(2).max(2),
+            cols.saturating_sub(7).max(8),
+        );
+        let fell = Instant::now();
+        assert!(
+            app.windows[&wid]
+                .cursor_glow
+                .v2_ribbon()
+                .is_some_and(|r| r.curtained() && !r.at_rest()),
+            "a reflow curtains the band (§2.8's fallback, and the only law here)"
+        );
+        tick_at(
+            &mut app,
+            wid,
+            fell + Duration::from_millis(100),
+            (2, 3),
+            true,
+        );
+        assert!(
+            band_peak(&app, wid) > 0,
+            "half-way through the resize's curtain the band is still on glass"
+        );
+        tick_at(
+            &mut app,
+            wid,
+            fell + Duration::from_millis(260),
+            (2, 3),
+            true,
+        );
+        assert_eq!(band_peak(&app, wid), 0, "gone at the curtain's end");
     }
 
     #[test]
@@ -1744,8 +2249,11 @@ pub(crate) fn sync_cursor_effect_scroll(
         CursorEffectScrollDecision::Invalidate => {
             // Coordinates no longer share one uniform transform. Drop every
             // live point and every row-bound probe identity before the current
-            // row is probed.
-            window.cursor_glow.reset();
+            // row is probed — Rainbow Kitty's ribbon through its 0.24 s
+            // CURTAIN (Rainbow Path v3 §2.8, A2), never a cut: an invalidation
+            // means the retained coordinates no longer share one transform,
+            // which is the same "the space ended" fact the alternate screen is.
+            window.cursor_glow.curtain(std::time::Instant::now());
             window.cursor_trail.reset();
             CursorEffectScrollChange {
                 invalidated: true,
@@ -1994,7 +2502,13 @@ mod cursor_scroll_signal_tests {
             win_h: 160,
             head: 0,
         };
-        let t0 = Instant::now();
+        // The invalidation seam below stamps its curtain from the WALL CLOCK
+        // (`sync_cursor_effect_scroll` reads `Instant::now()` itself), so this
+        // take's whole script runs 500 ms in the PAST — the band is earned,
+        // whole and inside its grace when the real present arrives, and the
+        // curtain's own frames are then in the real future. On a `t0` of `now`
+        // the seam would fall before the cells it is curtaining were born.
+        let t0 = Instant::now() - Duration::from_millis(500);
 
         // A terminal with a line on it, and a window whose ribbon is earned by
         // typing that line — the two halves the owner has in front of him.
@@ -2095,10 +2609,47 @@ mod cursor_scroll_signal_tests {
         );
         let change = sync_cursor_effect_scroll(ws, term.content_scroll_state());
         assert!(change.invalidated);
+        // THE RETIREMENT THAT STOPS A PHANTOM COMET IS INTACT — and since
+        // Rainbow Path v3 step 7 (§2.8, D-2's law applied to this seam) it is a
+        // 0.24 s CURTAIN rather than a one-frame cut: the coordinates stopped
+        // sharing one transform, so the band is drawn into the caret it last
+        // stood under instead of vanishing. A host that had simply stopped
+        // listening would leave the ribbon un-curtained AND lit, so both halves
+        // are asserted: the curtain is armed now, and the light is exactly gone
+        // by its end.
+        assert!(
+            ws.cursor_glow
+                .v2_ribbon()
+                .is_some_and(|r| r.curtained() && !r.at_rest()),
+            "an invalidation must still act on the earned light"
+        );
+        let fell = Instant::now();
+        let mut lit = Vec::new();
+        for ms in [0_u64, 16, 33, 50] {
+            ws.cursor_glow.tick(
+                Some((0, 9)),
+                fell + Duration::from_millis(ms),
+                &cfg,
+                geom,
+                &mut out,
+            );
+            lit.push(ws.cursor_glow.ribbon_segments());
+        }
+        assert!(
+            lit.iter().all(|&n| n > 0) && lit.windows(2).all(|w| w[1] <= w[0]),
+            "the curtain draws on at least the first four frames after the seam              and never brightens: {lit:?}"
+        );
+        ws.cursor_glow.tick(
+            Some((0, 9)),
+            fell + Duration::from_millis(260),
+            &cfg,
+            geom,
+            &mut out,
+        );
         assert_eq!(
             ws.cursor_glow.ribbon_segments(),
             0,
-            "the reset that stops a phantom comet is intact"
+            "…and it is exactly gone by the curtain's end"
         );
     }
 
@@ -2130,7 +2681,13 @@ mod cursor_scroll_signal_tests {
             win_h: 320,
             head: 0,
         };
-        let t0 = Instant::now();
+        // The invalidation seam below stamps its curtain from the WALL CLOCK
+        // (`sync_cursor_effect_scroll` reads `Instant::now()` itself), so this
+        // take's whole script runs 500 ms in the PAST — the band is earned,
+        // whole and inside its grace when the real present arrives, and the
+        // curtain's own frames are then in the real future. On a `t0` of `now`
+        // the seam would fall before the cells it is curtaining were born.
+        let t0 = Instant::now() - Duration::from_millis(500);
 
         // One interior-region line feed per parser batch: 16 of them, with the
         // host never presenting in between.
@@ -2185,10 +2742,27 @@ mod cursor_scroll_signal_tests {
         let change = sync_cursor_effect_scroll(ws, seventeen);
         assert!(change.invalidated);
         assert_eq!(change.band_moves, 0);
+        // The overflow takes the wholesale retirement, not a stale replay — and
+        // since Rainbow Path v3 step 7 that retirement is the 0.24 s CURTAIN
+        // (§2.8): armed here, exactly gone at its end, never a replayed band.
+        assert!(
+            ws.cursor_glow
+                .v2_ribbon()
+                .is_some_and(|r| r.curtained() && !r.at_rest()),
+            "the overflow must still retire the earned light"
+        );
+        let fell = Instant::now();
+        ws.cursor_glow.tick(
+            Some((0, 9)),
+            fell + Duration::from_millis(260),
+            &cfg,
+            geom,
+            &mut out,
+        );
         assert_eq!(
             ws.cursor_glow.ribbon_segments(),
             0,
-            "the overflow takes today's wholesale retirement, not a stale replay"
+            "…and it is exactly gone at the curtain's end"
         );
     }
 
@@ -7642,6 +8216,8 @@ pub(crate) fn companion_pet_sense(
         phase: 0.0,
         caret: host.caret.unwrap_or((0, 0)),
         caret_t: 0.0,
+        // No band under a router caret: the landing walks from its own field.
+        caret_walk: None,
         // The same zeros, for the same reason: the router reads neither the
         // crisp edge's stretch nor the flow state.
         surge: 0.0,
@@ -18148,6 +18724,113 @@ mod composed_cursor_effect_advance_tests {
         );
     }
 
+    /// **A HISTORY RETAIN ARMS NO HIDE THE NEXT LIVE FRAME WOULD TAKE**
+    /// (2026-09-14, Rainbow Path v3 §2.8, D-4).
+    ///
+    /// `rk::Engine::hide_next_frame` is taken by the TICK, so "the next
+    /// frame" is only the frame its caller means when that caller goes on to
+    /// tick. The `Retain` arm never ticks — it reads `under_quads()` and
+    /// projects them — so a hide armed from
+    /// [`App::retire_composed_cursor_effects_for_history`] stood until the
+    /// next tick, whatever viewport that turned out to be: armed, then one
+    /// tick on a LIVE viewport, `under = 0` on a frame that drew 623 quads.
+    /// A blank frame of the band on the live path.
+    ///
+    /// The history frame needs no hide — it projects nothing either way,
+    /// because `composed_cursor_effect_valid` is cleared — so
+    /// `TornBandLaw::Keep` asks `CursorGlow::v2_owns_frame` (a READ) instead
+    /// of arming one. This pins both halves: nothing is armed over history,
+    /// the band is kept rather than cut, and the live frame that follows
+    /// draws it.
+    #[test]
+    fn a_history_retain_keeps_the_band_and_arms_no_hide_the_next_live_frame_would_take() {
+        let (mut app, wid, session) = mixed_fixture("rainbow kitty");
+        let term = app.pool.get(session).expect("terminal leaf").term.clone();
+        let t0 = Instant::now();
+        let advance = |app: &mut App, at: Instant| {
+            assert!(
+                app.prepare_heterogeneous_input_scratch_with_cursor_fx(
+                    wid,
+                    Some(ComposedCursorFxClock::Advance(at)),
+                )
+                .is_some()
+            );
+        };
+        // The scrollback to scroll INTO is written BEFORE the band is laid:
+        // forty fresh lines afterwards would scroll the band's own rows off
+        // the grid, and the frame it did not draw would be honest.
+        {
+            let mut terminal = term_lock(&term);
+            terminal.process(&b"history\r\n".repeat(40));
+            terminal.scroll_to_bottom();
+        }
+        advance(&mut app, t0);
+        for i in 1..=6u64 {
+            type_one_licensed_echo(&mut app, wid, &term, t0 + Duration::from_millis(i * 8));
+            advance(&mut app, t0 + Duration::from_millis(i * 8 + 2));
+        }
+        let live_quads = app
+            .windows
+            .get(&wid)
+            .expect("test window")
+            .cursor_glow
+            .under_quads()
+            .len();
+        assert!(
+            live_quads > 0,
+            "fixture: a rainbow kitty band is on the live frame"
+        );
+
+        // INTO HISTORY. The Retain arm reaches the Keep law and ticks nothing.
+        {
+            let mut terminal = term_lock(&term);
+            terminal.scroll_display(1);
+            assert!(
+                terminal.grid().display_offset() > 0,
+                "fixture entered history"
+            );
+        }
+        assert!(
+            app.prepare_heterogeneous_input_scratch_with_cursor_fx(
+                wid,
+                Some(ComposedCursorFxClock::Retain {
+                    observed_at: t0 + Duration::from_millis(60),
+                }),
+            )
+            .is_some()
+        );
+        {
+            let window = app.windows.get(&wid).expect("test window");
+            assert!(
+                window.input_scratch.glow_under.is_empty(),
+                "the history frame projects none of the band"
+            );
+            assert!(
+                !window.cursor_glow.v2_hide_armed(),
+                "the non-ticking history arm left a one-frame hide standing for whatever \
+                 viewport ticks next"
+            );
+            assert!(
+                window.cursor_glow.v2_owns_frame(),
+                "the band was cut instead of kept"
+            );
+        }
+
+        // BACK TO THE LIVE VIEWPORT: the very next tick must draw the band.
+        {
+            let mut terminal = term_lock(&term);
+            terminal.scroll_to_bottom();
+            assert_eq!(terminal.grid().display_offset(), 0, "back on the live grid");
+        }
+        advance(&mut app, t0 + Duration::from_millis(68));
+        let window = app.windows.get(&wid).expect("test window");
+        assert!(
+            !window.cursor_glow.under_quads().is_empty(),
+            "the first live frame after a history retain drew nothing: the hide armed over \
+             history was taken by it"
+        );
+    }
+
     #[test]
     fn mixed_retain_cannot_project_a_live_cursor_frame_over_new_history() {
         let (mut app, wid, session) = mixed_fixture("comet");
@@ -18406,6 +19089,383 @@ mod composed_cursor_effect_advance_tests {
         );
         assert!(!bottom.row_below_present, "bottom edge has no row below");
         assert!(bottom.row_below_probe.is_empty());
+    }
+
+    // ---- THE CONTENT WITNESS ON A COMPOSED FRAME (2026-09-13) -------------
+    //
+    // Round A wired Rainbow Kitty's content witness (`ribbon_rows` →
+    // `observe_ribbon_row` → `Engine::witness_rows`) at LOCK A in
+    // `redraw_window` — the SINGLE-PANE path — and nowhere else. Every split
+    // pane, every ZOOMED pane (a single zoomed leaf routes as composed too)
+    // and every `aterm ctl image`/`video` capture therefore ran with the
+    // witness starved: `ribbon_retired=` was structurally 0 and an abandoned
+    // band stayed lit until it expired. Row-scoped renewal cannot cover it —
+    // in a split the caret never leaves its row, so the cohort is renewed by
+    // every key and only the witness can retire the stale band.
+
+    /// The focused terminal leaf's pane origin in the composed window.
+    fn focused_pane_origin(app: &mut App, wid: WindowId) -> (usize, usize) {
+        let plan = app.active_visible_leaf_plan(wid).expect("composed plan");
+        let leaf = plan
+            .leaves
+            .iter()
+            .find(|leaf| leaf.focused)
+            .expect("focused terminal leaf");
+        (
+            leaf.rect.origin.y.round().max(0.0) as usize,
+            leaf.rect.origin.x.round().max(0.0) as usize,
+        )
+    }
+
+    /// Resident ribbon cells on one WINDOW row: `(col, leaving)`.
+    fn composed_ribbon_row(app: &App, wid: WindowId, row: u16) -> Vec<(u16, bool)> {
+        let mut v: Vec<(u16, bool)> = app
+            .windows
+            .get(&wid)
+            .expect("test window")
+            .cursor_glow
+            .v2_ribbon()
+            .expect("rainbow kitty owns the composed frame")
+            .cells()
+            .iter()
+            .filter(|c| c.row == row)
+            .map(|c| (c.col, c.leaving()))
+            .collect();
+        v.sort_unstable();
+        v
+    }
+
+    fn composed_ribbon_retired(app: &App, wid: WindowId) -> u64 {
+        app.windows
+            .get(&wid)
+            .expect("test window")
+            .cursor_glow
+            .v2_status()
+            .map_or(0, |s| s.retired)
+    }
+
+    /// Type `text` into the composed fixture one licensed key at a time, at
+    /// the owner's 90 ms cadence, presenting a composed frame per key.
+    /// Returns the clock of the last present.
+    fn composed_type(
+        app: &mut App,
+        wid: WindowId,
+        term: &std::sync::Arc<std::sync::Mutex<aterm_core::terminal::Terminal>>,
+        mut t: Instant,
+        text: &str,
+    ) -> Instant {
+        for ch in text.bytes() {
+            t += Duration::from_millis(90);
+            app.windows
+                .get_mut(&wid)
+                .expect("test window")
+                .cursor_glow
+                .note_typed_cells(t, 1);
+            term_lock(term).process(&[ch]);
+            assert!(
+                app.splice_focused_composed_cursor_effects(wid, ComposedCursorFxClock::Advance(t))
+            );
+        }
+        t
+    }
+
+    /// Idle composed frames at 16 ms until `ms` have passed.
+    fn composed_idle(app: &mut App, wid: WindowId, mut t: Instant, ms: u64) -> Instant {
+        let end = t + Duration::from_millis(ms);
+        while t < end {
+            t += Duration::from_millis(16);
+            assert!(
+                app.splice_focused_composed_cursor_effects(wid, ComposedCursorFxClock::Advance(t))
+            );
+        }
+        t
+    }
+
+    /// The composed shapes the witness is fed under. All of them route through
+    /// `splice_focused_composed_cursor_effects_sampled_with_plan`; what
+    /// differs is where the focused pane sits in the window.
+    #[derive(Clone, Copy, Debug)]
+    enum ComposedShape {
+        /// One split beside the native sibling: a COLUMN offset (Horizontal)
+        /// or a ROW offset (Vertical).
+        Split(crate::tab_model::SplitAxis),
+        /// Two splits: the focused leaf carries BOTH offsets at once.
+        ThreePane,
+        /// A split, then the focused leaf ZOOMED — one visible leaf that still
+        /// routes as composed (`visible_content_route_from_plan`: `composed:
+        /// plan.zoomed`), so it must be fed here and not at LOCK A.
+        Zoomed,
+    }
+
+    /// A ribbon laid on a composed frame, and the window row it sits on.
+    fn composed_hello(
+        shape: ComposedShape,
+    ) -> (
+        App,
+        WindowId,
+        std::sync::Arc<std::sync::Mutex<aterm_core::terminal::Terminal>>,
+        Instant,
+        u16,
+        u16,
+    ) {
+        let mut app = App::headless_for_test();
+        app.config.cursor_trail = Some(true);
+        app.config.cursor_trail_style = Some("rainbow kitty".into());
+        app.config.trail_sounds = Some(false);
+        let wid = WindowId(0);
+        assert!(app.open_settings_tab(crate::native_settings::SettingsRoute::Home));
+        use crate::tab_model::SplitAxis;
+        let session = match shape {
+            ComposedShape::Split(axis) => app.split_active_with_stub_terminal(wid, axis).0,
+            ComposedShape::ThreePane => {
+                let _ = app.split_active_with_stub_terminal(wid, SplitAxis::Horizontal);
+                app.split_active_with_stub_terminal(wid, SplitAxis::Vertical)
+                    .0
+            }
+            ComposedShape::Zoomed => {
+                let (session, _) = app.split_active_with_stub_terminal(wid, SplitAxis::Horizontal);
+                assert!(
+                    app.windows
+                        .get_mut(&wid)
+                        .expect("test window")
+                        .tab_set
+                        .active_mut()
+                        .expect("active tab")
+                        .toggle_zoom(),
+                    "the focused terminal leaf zooms"
+                );
+                app.resize_panes(wid);
+                session
+            }
+        };
+        let term = app.pool.get(session).expect("terminal leaf").term.clone();
+        let (row_off, col_off) = focused_pane_origin(&mut app, wid);
+        // The shape is what it claims: a three-pane focused leaf is offset on
+        // BOTH axes, and a zoomed tab plans as zoomed.
+        match shape {
+            ComposedShape::ThreePane => assert!(
+                row_off > 0 && col_off > 0,
+                "{shape:?}: the focused leaf carries both offsets ({row_off}, {col_off})"
+            ),
+            ComposedShape::Zoomed => assert!(
+                app.active_visible_leaf_plan(wid)
+                    .is_some_and(|plan| plan.zoomed),
+                "{shape:?}: the plan is zoomed"
+            ),
+            ComposedShape::Split(_) => {}
+        }
+        let t0 = Instant::now();
+        // Park the caret on the pane's own row 5 and seed the engine.
+        term_lock(&term).process(b"\x1b[6;1H");
+        assert!(
+            app.splice_focused_composed_cursor_effects(wid, ComposedCursorFxClock::Advance(t0))
+        );
+        let t = composed_type(&mut app, wid, &term, t0, "hello world");
+        let win_row = u16::try_from(row_off).expect("pane row fits") + 5;
+        let win_col = u16::try_from(col_off).expect("pane col fits");
+        let laid: Vec<(u16, bool)> = (0..11).map(|k| (win_col + k, false)).collect();
+        assert_eq!(
+            composed_ribbon_row(&app, wid, win_row),
+            laid,
+            "the typed band is laid under the text, in the pane's own columns"
+        );
+        assert_eq!(composed_ribbon_retired(&app, wid), 0);
+        (app, wid, term, t, win_row, win_col)
+    }
+
+    /// THE DEFECT: a program re-lays its input box two rows down with no key
+    /// behind it. The move is declined, the text under the old band is gone,
+    /// and the witness must retire every one of its eleven cells inside the
+    /// melt. RED before the composed path fed the witness: `ribbon_retired=0`,
+    /// eleven cells still LIVE, still lit 400 ms later.
+    #[test]
+    fn a_relocated_input_box_retires_its_abandoned_band_on_a_composed_frame() {
+        for shape in [
+            ComposedShape::Split(crate::tab_model::SplitAxis::Horizontal),
+            ComposedShape::ThreePane,
+            ComposedShape::Zoomed,
+        ] {
+            let (mut app, wid, term, t, win_row, _) = composed_hello(shape);
+            let t = composed_idle(&mut app, wid, t, 400);
+            term_lock(&term).process(b"\x1b[2J\x1b[8;1Hhello world");
+            let t = composed_idle(&mut app, wid, t, 16);
+            let leaving: Vec<(u16, bool)> = composed_ribbon_row(&app, wid, win_row)
+                .into_iter()
+                .filter(|&(_, leaving)| leaving)
+                .collect();
+            assert_eq!(
+                leaving.len(),
+                11,
+                "{shape:?}: every cell of the abandoned band is retired on the \
+                 composed frame"
+            );
+            assert_eq!(composed_ribbon_retired(&app, wid), 11, "{shape:?}");
+            let _ = composed_idle(&mut app, wid, t, 200);
+            assert!(
+                composed_ribbon_row(&app, wid, win_row).is_empty(),
+                "{shape:?}: the abandoned band is out of the pool inside 200 ms"
+            );
+        }
+    }
+
+    /// …AND IT READS THE FOCUSED PANE'S OWN CELLS. A witness fed the pane's
+    /// rows without the pane's COLUMN rotation — or the window's rows without
+    /// the pane's ROW offset — compares each ribbon cell against SOMEONE
+    /// ELSE'S glyph, and retires light the owner earned: worse than sampling
+    /// nothing at all. Both splits (one offset each), a three-pane layout
+    /// (both offsets at once) and a zoomed leaf, and the band deliberately
+    /// left on a row the caret has LEFT, which is the only row read through
+    /// `witness_row_buf` rather than through the caret's own probe.
+    #[test]
+    fn the_composed_witness_reads_the_focused_pane_s_own_rows_and_columns() {
+        for axis in [
+            ComposedShape::Split(crate::tab_model::SplitAxis::Horizontal),
+            ComposedShape::Split(crate::tab_model::SplitAxis::Vertical),
+            ComposedShape::ThreePane,
+            ComposedShape::Zoomed,
+        ] {
+            let (mut app, wid, term, t, win_row, win_col) = composed_hello(axis);
+            // A redraw that puts the SAME text back under the caret is the
+            // same text — the caret's row rides this frame's own probe.
+            term_lock(&term).process(b"\x1b[6;1Hhello world");
+            let t = composed_idle(&mut app, wid, t, 32);
+            assert_eq!(
+                composed_ribbon_retired(&app, wid),
+                0,
+                "{axis:?}: a redraw of the same text retired the caret's row"
+            );
+
+            // Return: the caret LEAVES the band's row on a licensed move, so
+            // the band stays where it was typed and row-scoped renewal no
+            // longer touches it. From here on row `win_row` is sampled through
+            // `witness_row_buf` — the pane-local read this test is about.
+            let t = t + Duration::from_millis(90);
+            app.windows
+                .get_mut(&wid)
+                .expect("test window")
+                .cursor_glow
+                .note_return(t);
+            term_lock(&term).process(b"\r\n");
+            assert!(
+                app.splice_focused_composed_cursor_effects(wid, ComposedCursorFxClock::Advance(t))
+            );
+            let t = composed_idle(&mut app, wid, t, 200);
+            let live: Vec<(u16, bool)> = (0..11).map(|k| (win_col + k, false)).collect();
+            assert_eq!(
+                composed_ribbon_row(&app, wid, win_row),
+                live,
+                "{axis:?}: the band the owner typed is untouched — its text \
+                 never moved"
+            );
+            assert_eq!(
+                composed_ribbon_retired(&app, wid),
+                0,
+                "{axis:?}: the witness read another pane's rows or columns and \
+                 retired light the owner earned"
+            );
+
+            // …and ONE changed glyph on that same abandoned row, written
+            // without disturbing the caret, IS seen. The non-vacuity arm: the
+            // witness is fed, it is fed the right cells, and it still fires.
+            term_lock(&term).process(b"\x1b7\x1b[6;5HX\x1b8");
+            let _ = composed_idle(&mut app, wid, t, 32);
+            assert!(
+                composed_ribbon_retired(&app, wid) > 0,
+                "{axis:?}: the witness never saw the glyph change"
+            );
+        }
+    }
+
+    #[test]
+    fn composed_witness_defers_rows_changed_after_cell_extraction() {
+        for shape in [ComposedShape::ThreePane, ComposedShape::Zoomed] {
+            let (mut app, wid, term, t, win_row, win_col) = composed_hello(shape);
+            // Leave a live band on the preceding row, read through the second lock.
+            let t = t + Duration::from_millis(90);
+            app.windows
+                .get_mut(&wid)
+                .unwrap()
+                .cursor_glow
+                .note_return(t);
+            term_lock(&term).process(b"\r\n");
+            assert!(
+                app.splice_focused_composed_cursor_effects(wid, ComposedCursorFxClock::Advance(t))
+            );
+            let plan = app.active_visible_leaf_plan(wid).unwrap();
+            let session = app.windows[&wid].composed_cursor_effect_session.unwrap();
+            let sample = focused_composed_cursor_fx_sample(
+                session,
+                &term_lock(&term),
+                true,
+                Vec::new(),
+                Vec::new(),
+                Vec::new(),
+            );
+            // The grid now differs from the cells this frame extracted.
+            term_lock(&term).process(b"\x1b7\x1b[6;5HX\x1b8");
+            assert!(!sample.witness_stamp.matches(&term_lock(&term)));
+            assert!(
+                app.splice_focused_composed_cursor_effects_sampled_with_plan(
+                    wid,
+                    ComposedCursorFxClock::Advance(t + Duration::from_millis(16)),
+                    Some(sample),
+                    &plan,
+                )
+            );
+            assert_eq!(
+                composed_ribbon_retired(&app, wid),
+                0,
+                "{shape:?}: newer glyphs retired the old frame"
+            );
+            assert_eq!(
+                composed_ribbon_row(&app, wid, win_row),
+                (0..11).map(|k| (win_col + k, false)).collect::<Vec<_>>()
+            );
+            // A fresh observation must still retire the real replacement.
+            composed_idle(&mut app, wid, t + Duration::from_millis(16), 32);
+            assert!(
+                composed_ribbon_retired(&app, wid) > 0,
+                "{shape:?}: witness was disabled"
+            );
+        }
+    }
+
+    #[test]
+    fn composed_witness_generation_model_matches_real_terminal_mutations() {
+        let model = aterm_spec::ty_model! {
+            ComposedWitnessGeneration {
+                const Buggy = 0;
+                var changed = 0;
+                var admitted = 0;
+                action Mutate when (changed == 0 && admitted == 0) { changed = 1; }
+                action Read when (admitted == 0 && (changed == 0 || Buggy == 1)) { admitted = 1; }
+                invariant Coherent: admitted == 0 || changed == 0;
+            }
+        };
+        aterm_spec::verify::prove_and_catch_scalar(&model, model.name);
+        for bytes in [
+            b"X".as_slice(),
+            b"\x1b[?2026h",
+            b"\x1b[?2026h\x1b[?2026l",
+            b"\x1b[?1049h",
+        ] {
+            let (_, _, term, _, _, _) = composed_hello(ComposedShape::Zoomed);
+            let stamp = ComposedWitnessStamp::read(&term_lock(&term));
+            let mut state = model.init_state();
+            assert_eq!(
+                stamp.matches(&term_lock(&term)),
+                model.action_enabled("Read", &state)
+            );
+            term_lock(&term).process(bytes);
+            assert!(model.fire("Mutate", &mut state));
+            assert_eq!(
+                stamp.matches(&term_lock(&term)),
+                model.action_enabled("Read", &state)
+            );
+            // The retired guard accepted all of these unrelated generations.
+            assert_eq!(stamp.terminal_id, term_lock(&term).render_identity());
+            assert_eq!(term_lock(&term).grid().display_offset(), 0);
+        }
     }
 
     #[derive(Debug, PartialEq)]
@@ -22675,6 +23735,38 @@ impl ComposedCursorFxClock {
     }
 }
 
+/// A later witness read may join the extracted cells only while this exact
+/// terminal generation still owns the grid. In particular, a partial TUI
+/// redraw must not retire a band over the previously committed cell frame.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct ComposedWitnessStamp {
+    terminal_id: u64,
+    content_seq: u64,
+    display_offset: usize,
+    alternate_screen: bool,
+    scroll: ContentScrollState,
+    sync_active: bool,
+    sync_end_seq: u64,
+}
+
+impl ComposedWitnessStamp {
+    fn read(terminal: &Terminal) -> Self {
+        Self {
+            terminal_id: terminal.render_identity(),
+            content_seq: terminal.content_seq(),
+            display_offset: terminal.grid().display_offset(),
+            alternate_screen: terminal.is_alternate_screen(),
+            scroll: terminal.content_scroll_state(),
+            sync_active: terminal.modes().synchronized_output(),
+            sync_end_seq: terminal.sync_end_seq(),
+        }
+    }
+
+    fn matches(self, terminal: &Terminal) -> bool {
+        self == Self::read(terminal)
+    }
+}
+
 /// Exact focused-terminal observation paired with one composed cell extraction.
 ///
 /// The heterogeneous compositor captures this while it still owns the SAME
@@ -22683,6 +23775,7 @@ impl ComposedCursorFxClock {
 /// would splice cursor/effect state from a newer PTY update over older cells.
 struct FocusedComposedCursorFxSample {
     session: u64,
+    witness_stamp: ComposedWitnessStamp,
     terminal_id: u64,
     cursor: (u16, u16),
     cursor_visible: bool,
@@ -22751,6 +23844,7 @@ fn focused_composed_cursor_fx_sample(
     }
     FocusedComposedCursorFxSample {
         session,
+        witness_stamp: ComposedWitnessStamp::read(terminal),
         terminal_id: terminal.render_identity(),
         cursor: (cursor.row, cursor.col),
         cursor_visible: terminal.cursor_visible(),
@@ -22819,6 +23913,46 @@ fn visible_match_range(
     let (start, lower_comparisons) = lower_bound_match_row(matches, lower_row);
     let (end, upper_comparisons) = lower_bound_match_row(matches, upper_row);
     (start..end, lower_comparisons + upper_comparisons)
+}
+
+/// THE DELIVERY EDGE, applied: one receipt arms its licences on this
+/// window's engines at the delivery instant `at`. The INSERT half is
+/// applied on whichever window reads the session's receipt, Rainbow
+/// Kitty's alone (every other style is byte-identical by construction),
+/// and bounded at the receipt's dispatch — a hop refused before the key or
+/// paste was dispatched is program output.
+/// The KEY half re-stamps only the window that dispatched the key (a
+/// second window fronting the session banked nothing and re-banks
+/// nothing): the revoked licence put back as a pure stamp, the v2 events
+/// and thermals having gone out at the key; the classic trail takes the
+/// twins it stamps at dispatch — the typed stamp, the generic move (Return,
+/// the gesture), nav — and nothing else.
+fn apply_delivery(
+    ws: &mut WindowState,
+    id: WindowId,
+    rainbow: bool,
+    at: Instant,
+    ticket: DeliveryTicket,
+) {
+    use crate::cursor_glow::DeliveredClass;
+    if rainbow && let Some(width) = ticket.insert {
+        ws.cursor_glow
+            .note_insert_delivered_from(ticket.dispatched_at, at, width);
+    }
+    if ticket.window != Some(id) {
+        return;
+    }
+    if let Some(class) = ticket.key {
+        ws.cursor_glow.note_delivered(at, class);
+        match class {
+            DeliveredClass::Typed => ws.cursor_trail.note_typed(at),
+            DeliveredClass::Return | DeliveredClass::Gesture => {
+                ws.cursor_trail.note_move_delivered(at);
+            }
+            DeliveredClass::Nav => ws.cursor_trail.note_motion_delivered(at),
+            DeliveredClass::Newline | DeliveredClass::Erase | DeliveredClass::Kill { .. } => {}
+        }
+    }
 }
 
 impl App {
@@ -23684,6 +24818,32 @@ impl App {
                 .is_some_and(|ws| ws.cursor_fx_typed_wake(now))
     }
 
+    /// THE DELIVERY EDGE, read: the receipts the session's writer thread
+    /// published for completed QUEUED writes since this window last looked
+    /// — a paste's priced insert width, a Tab / ⌃V queued behind it, a
+    /// plain key whose arrival stamp was revoked at enqueue — with the
+    /// session they belong to. Read on the frame that first observes the
+    /// echo (the same `Wake::Output` redraw or headless `image` capture
+    /// ticks the engine) and applied immediately before the print-anchor
+    /// feed, so the frame that judges the insert's hop already holds its
+    /// licence; no new wake, since with no echo there is nothing to light.
+    /// Keyed by `(session, serial)`: a window with no baseline for this
+    /// session (a fresh window, a session switch) is handed the tracker's
+    /// newest serial and nothing to apply.
+    fn read_deliveries(&self, id: WindowId, now: Instant) -> Option<(u64, Deliveries)> {
+        let seen = self.windows.get(&id)?.delivery_seen;
+        let session = self.front_terminal(id)?.session;
+        let after = match seen {
+            Some((seen_session, serial)) if seen_session == session => Some(serial),
+            _ => None,
+        };
+        let ctx = &self.pool.get(session)?.ctx;
+        Some((
+            session,
+            ctx.output_echo.deliveries_after(&ctx.sink, after, now),
+        ))
+    }
+
     /// Whether the raw overload latch is allowed to suppress decorative work
     /// under the current user policy. `perf_reduced` is diagnostic history;
     /// explicit `motion = "full"` and `load_adaptive_motion = false` both opt
@@ -24193,6 +25353,8 @@ impl App {
             spawns: ws.cursor_glow.spawns(),
             ribbon_segments: ws.cursor_glow.ribbon_segments(),
             ribbon_hue_bands: ws.cursor_glow.ribbon_hue_bands(),
+            ribbon_drawn: ws.cursor_glow.ribbon_drawn(),
+            ribbon_curtain_ms: ws.cursor_glow.curtain_left_ms(std::time::Instant::now()),
             field: ws.cursor_glow.rainbow_field(),
             sparks: ws.cursor_glow.live_sparks(),
             momentum: ws.cursor_glow.typing_momentum(now),
@@ -24307,34 +25469,9 @@ impl App {
         // real-window trail/kitty blackout).
         let raw_focused = self.windows.get(&id)?.focused;
         let win_focused = self.cursor_fx_focus(id, raw_focused, frame_started);
-        // THE DELIVERY EDGE (2026-09-10, "the image insert breaks the
-        // rainbow"): the receipts the session's writer thread published for
-        // completed QUEUED writes since this window last looked — a paste's
-        // priced insert width, a Tab / ⌃V queued behind it, a plain key
-        // whose arrival stamp was revoked at enqueue. Read HERE, on the
-        // frame that first observes the echo (the same `Wake::Output` redraw
-        // or headless `image` capture ticks the engine), and applied to the
-        // engines immediately before the print-anchor feed below, so the
-        // frame that judges the insert's hop already holds its licence. No
-        // new wake: with no echo there is nothing to light. Keyed by
-        // `(session, serial)`: a session switch baselines silently.
-        let delivery_seen = self.windows.get(&id)?.delivery_seen;
-        let deliveries = self
-            .front_terminal(id)
-            .map(|mirror| mirror.session)
-            .and_then(|session| {
-                let after = match delivery_seen {
-                    Some((seen_session, serial)) if seen_session == session => Some(serial),
-                    // A different session (or the first read): baseline at the
-                    // tracker's newest serial and apply nothing.
-                    _ => None,
-                };
-                let ctx = &self.pool.get(session)?.ctx;
-                let batch = ctx
-                    .output_echo
-                    .deliveries_after(&ctx.sink, after, frame_started);
-                Some((session, after.is_some(), batch))
-            });
+        // The delivery edge is read here and applied below, immediately
+        // before the print-anchor feed ([`Self::read_deliveries`]).
+        let deliveries = self.read_deliveries(id, frame_started);
         // Keep the legacy hard-shed policy for downstream non-cursor effects.
         // Cursor-family consumers use `cursor_motion` plus the soft envelope.
         let motion = self.motion_policy(win_focused);
@@ -24441,8 +25578,13 @@ impl App {
             // Cursor effects are retained in active-grid/window coordinates.
             // A history viewport shows unrelated rows, so decay-in-place still
             // paints stale light. Retire both engines and their row identity
-            // before this frame can project any cursor-owned channel.
-            ws.cursor_glow.reset();
+            // before this frame can project any cursor-owned channel —
+            // except Rainbow Kitty's, which is HIDDEN (Rainbow Path v3 §2.8,
+            // A4): its clocks run and nothing is written, so the band is
+            // where its clocks say when the live viewport returns.
+            if !ws.cursor_glow.hide_v2() {
+                ws.cursor_glow.reset();
+            }
             ws.cursor_trail.reset();
         }
         // Advance the LUMEN aurora off the cursor cell (terminal coords →
@@ -24508,14 +25650,10 @@ impl App {
                 below_present.then_some(ws.poof_row_below_buf.as_slice()),
             );
         }
-        // THE DELIVERY EDGE, applied: each receipt newer than the window's
-        // read head arms its licence at the delivery instant — the
-        // DELIVERED-INSERT class for Rainbow Kitty only (every other style
-        // is byte-identical by construction), the typed re-stamp for every
-        // style (the classic trail gets its lockstep twin). A receipt older
-        // than the insert window is marked seen and applied to nothing.
-        if let Some((session, same_session, batch)) = deliveries {
-            let rainbow = matches!(glow_cfg.style, crate::cursor_glow::GlowStyle::RainbowKitty);
+        // THE DELIVERY EDGE, applied ([`apply_delivery`]), immediately
+        // before the print-anchor feed so the frame that judges the
+        // insert's hop already holds its licence.
+        if let Some((session, batch)) = deliveries {
             if batch.evicted > 0 {
                 // The register holds a frame's worth of receipts
                 // (`DELIVERY_RING`, 32 — deliberately shallower than the
@@ -24529,26 +25667,18 @@ impl App {
                     batch.latest
                 );
             }
-            // A window with no baseline for this session (`!same_session`)
-            // was handed nothing to apply; the guard states the intent.
-            if same_session {
-                for (at, ticket) in batch.items.iter().flatten() {
-                    let fresh = frame_started.saturating_duration_since(*at).as_secs_f32()
-                        <= crate::cursor_glow::CursorGlow::INSERT_HINT_FRESH;
-                    if !fresh {
-                        continue;
-                    }
-                    if rainbow && let Some(width) = ticket.insert {
-                        ws.cursor_glow.note_insert_delivered(*at, width);
-                    }
-                    if ticket.typed {
-                        ws.cursor_glow.note_typed_stamp_delivered(*at);
-                        ws.cursor_trail.note_typed(*at);
-                    }
+            let rainbow = matches!(glow_cfg.style, crate::cursor_glow::GlowStyle::RainbowKitty);
+            // A receipt older than the insert window is marked seen and
+            // applied to nothing; a window with no baseline was handed no
+            // items, and only the head is recorded.
+            for (at, ticket) in batch.items.iter().flatten() {
+                if frame_started.saturating_duration_since(*at).as_secs_f32()
+                    > crate::cursor_glow::CursorGlow::INSERT_HINT_FRESH
+                {
+                    continue;
                 }
+                apply_delivery(ws, id, rainbow, *at, *ticket);
             }
-            // Either way the head is recorded: applied receipts are seen,
-            // and a fresh baseline is the tracker's newest serial.
             ws.delivery_seen = Some((session, batch.latest));
         }
         // ECHO-ANCHOR feed, immediately before the tick like the row probe:
@@ -25359,7 +26489,15 @@ impl App {
     /// pane already proved that active-grid coordinates are not presentable.
     fn retire_composed_cursor_effects_for_history(&mut self, wid: WindowId) {
         if let Some(window) = self.windows.get_mut(&wid) {
-            retire_torn_cursor_fx(window);
+            // HISTORY, not a new space (Rainbow Path v3 §2.8, D-4): the live
+            // grid the band is true about has not moved, so the band is KEPT
+            // rather than curtained. `composed_cursor_effect_valid` is dropped
+            // with the rest below, so this frame projects none of it either
+            // way — what the keep buys is the band still being there, on its
+            // own clocks, when the live viewport returns. No one-frame hide is
+            // armed here: this arm advances no effect clock, so the flag would
+            // outlive the frame it named (see [`TornBandLaw::Keep`]).
+            retire_torn_cursor_fx_with(window, TornBandLaw::Keep);
         }
     }
 
@@ -25508,6 +26646,7 @@ impl App {
         };
         let FocusedComposedCursorFxSample {
             session: _,
+            witness_stamp,
             terminal_id,
             cursor,
             cursor_visible,
@@ -25544,7 +26683,11 @@ impl App {
                 // active-grid anchors retained by both engines. Hard-clear at
                 // the shared live/headless composed seam; a retained capture
                 // may then project only the newly committed empty frame.
-                window.cursor_glow.reset();
+                // Rainbow Kitty's ribbon is HIDDEN instead (Rainbow Path v3
+                // §2.8, A4): kept, not composed, back where its clocks say.
+                if !window.cursor_glow.hide_v2() {
+                    window.cursor_glow.reset();
+                }
                 window.cursor_trail.reset();
             }
             if window.blink_reseed {
@@ -25602,6 +26745,75 @@ impl App {
                 let len = probe.len();
                 probe.resize(len.saturating_add(col), ' ');
                 probe.rotate_right(col);
+            }
+        }
+        // THE CONTENT WITNESS, on the COMPOSED frame (2026-09-13). Round A
+        // wired Rainbow Kitty's witness at LOCK A in `redraw_window` — the
+        // SINGLE-PANE path — and nowhere else, so every split pane, every
+        // ZOOMED pane (a single zoomed leaf routes through here too) and every
+        // `aterm ctl image`/`video` capture ran with it starved: an abandoned
+        // band stayed lit for its whole life and `ribbon_retired=` was
+        // structurally 0. Row-scoped renewal cannot stand in for it — in a
+        // split the caret often never leaves its row, so every key renews the
+        // cohort and only the witness can retire the stale band.
+        //
+        // THE PANE IS THE COORDINATE SPACE. Both engines are fed WINDOW rows
+        // and columns here, and the terminal answers in PANE-LOCAL ones, so
+        // every sample is translated exactly as the row probes above were: the
+        // caret's row rides the probe this frame already holds (rotated into
+        // window columns by `col`, the same cells `observe_row_with_trust` is
+        // about to judge, from the sample's own lock hold), and each further
+        // ribbon row is read at `r - row` and rotated by `col` before the
+        // engine sees it. A witness fed another pane's cells would retire
+        // light the owner earned, which is worse than sampling nothing.
+        if let Some((caret_row, _, _)) = row_probe {
+            let mut ribbon_rows = [0u16; aterm_effects::rainbow_kitty::witness::WITNESS_ROWS];
+            let wanted = {
+                let Some(window) = self.windows.get_mut(&wid) else {
+                    return false;
+                };
+                let WindowState {
+                    cursor_glow,
+                    poof_row_buf,
+                    ..
+                } = window;
+                cursor_glow.observe_ribbon_row(caret_row, poof_row_buf);
+                cursor_glow.ribbon_rows(&mut ribbon_rows)
+            };
+            // These rows join the caret probe captured at extraction. If a
+            // PTY batch intervened, defer them to the next coherent frame;
+            // newer glyphs cannot revoke light over older displayed cells.
+            if ribbon_rows[..wanted].iter().any(|&r| r != caret_row) {
+                let terminal = term_lock(&term);
+                if witness_stamp.matches(&terminal) {
+                    let grid_rows = usize::from(terminal.grid().rows());
+                    for &r in &ribbon_rows[..wanted] {
+                        if r == caret_row {
+                            continue;
+                        }
+                        let Some(local) = usize::from(r).checked_sub(row) else {
+                            continue;
+                        };
+                        if local >= grid_rows.min(pane_rows) {
+                            continue;
+                        }
+                        let Some(window) = self.windows.get_mut(&wid) else {
+                            return false;
+                        };
+                        terminal.row_cols_into(local, &mut window.witness_row_buf);
+                        if col > 0 {
+                            let len = window.witness_row_buf.len();
+                            window.witness_row_buf.resize(len.saturating_add(col), ' ');
+                            window.witness_row_buf.rotate_right(col);
+                        }
+                        let WindowState {
+                            cursor_glow,
+                            witness_row_buf,
+                            ..
+                        } = window;
+                        cursor_glow.observe_ribbon_row(r, witness_row_buf);
+                    }
+                }
             }
         }
         let effect_cursor = (cursor_visible && display_offset == 0).then_some((
@@ -38268,8 +39480,24 @@ impl App {
             // A terminal reflow changes the meaning of every retained cell and
             // pixel endpoint even when the focused caret ultimately lands at
             // the same numeric cell. Clear before any headless/direct caller
-            // can tick between this commit and the next normal layout prepare.
-            ws.cursor_glow.reset();
+            // can tick between this commit and the next normal layout prepare
+            // — Rainbow Kitty's ribbon through its 0.24 s CURTAIN (Rainbow
+            // Path v3 §2.8, A2), never a cut.
+            //
+            // THE REFLOW MAP IS NOT REACHABLE HERE, which is what §9 asked the
+            // implementing lane to find out, so §2.8's fallback ("if the map is
+            // not reachable from the host at that seam, `Curtain`") is the law
+            // and not a compromise. Measured in the tree: `reflow_map` is
+            // declared `mod reflow_map;` — PRIVATE — inside
+            // `aterm-grid/src/grid/reflow.rs:10`, every one of its five
+            // functions is `pub(super)`, and the only re-chunking entry points
+            // `aterm-grid` exports (`Grid::resize`, `resize_no_reflow`,
+            // `resize_with_reflow_mode`) return `()`. No old→new cell map is
+            // built to outlive the call, so there is nothing here to translate
+            // the band's cells through even if the module were public — and
+            // this line runs BEFORE `resize_panes` re-lays the grids below, so
+            // at this point the reflow has not happened at all.
+            ws.cursor_glow.curtain(std::time::Instant::now());
             ws.cursor_trail.reset();
             ws.rows = rows;
             ws.cols = cols;

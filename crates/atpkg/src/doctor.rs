@@ -97,14 +97,17 @@ fn problem_listing_start(declined: bool, store_empty: bool, problems: usize) -> 
 fn missing_against_index(
     layout: &Layout,
     installed: &std::collections::BTreeMap<String, u64>,
-) -> (Vec<String>, Vec<String>) {
+) -> (Vec<String>, Vec<String>, Vec<String>) {
     let Some(index) = crate::cli::cached_index(layout) else {
-        return (Vec::new(), Vec::new());
+        return (Vec::new(), Vec::new(), Vec::new());
     };
     split_missing(
         &crate::cli::wanted_programs(layout, &index, crate::config::cached()),
         installed,
         &layout.removed_programs(),
+        &crate::linkmode::linked_programs(layout)
+            .into_iter()
+            .collect(),
     )
 }
 
@@ -118,20 +121,30 @@ fn split_missing(
     wanted: &std::collections::BTreeSet<String>,
     installed: &std::collections::BTreeMap<String, u64>,
     removed: &std::collections::BTreeSet<String>,
-) -> (Vec<String>, Vec<String>) {
+    linked: &std::collections::BTreeSet<String>,
+) -> (Vec<String>, Vec<String>, Vec<String>) {
     let mut unexplained = Vec::new();
     let mut on_purpose = Vec::new();
+    let mut dev_linked = Vec::new();
     for program in wanted {
         if installed.contains_key(program) {
             continue;
         }
-        if removed.contains(program) {
+        // A DEV-LINKED program is PRESENT — its shims are in the managed bin/ and they
+        // run — it just has no store build for `installed` to count. It outranks the
+        // removed ledger: this box carried a `# deliberate` removal of trust from
+        // 2026-08-27, and after `aterm pkg link trust <stage2>` doctor still said
+        // "removed on purpose — no unattended pass reinstalls it" about a toolchain that
+        // was running every build on the machine. The link is the newer decision.
+        if linked.contains(program) {
+            dev_linked.push(program.clone());
+        } else if removed.contains(program) {
             on_purpose.push(program.clone());
         } else {
             unexplained.push(program.clone());
         }
     }
-    (unexplained, on_purpose)
+    (unexplained, on_purpose, dev_linked)
 }
 
 /// EVERY recorded fault, formatted `"<program>: <state>"`, in program order — `BTreeMap`
@@ -160,10 +173,10 @@ pub(crate) fn recorded_problems(status: Option<&crate::Status>) -> Vec<String> {
 
 /// The doctor line for a bundle whose executables carry `com.apple.provenance` — the
 /// count, one example, the CAUSE when the store recorded one (`recorded`: the
-/// `<build>.tracked-install` record a tracked installer left under
-/// `ATPKG_ALLOW_TRACKED_INSTALL=1`, [`crate::store::tracked_install_record`]), what it
-/// breaks, and the cure. Pure, so the words are pinned by a test that mints a synthetic
-/// attribute rather than the one it cannot.
+/// `<build>.tracked-install` record a tracked installer left when its untracked lane
+/// could not run, [`crate::store::tracked_install_record`]), what it breaks, and the
+/// cure. Pure, so the words are pinned by a test that mints a synthetic attribute rather
+/// than the one it cannot.
 pub(crate) fn provenance_bundle_line(
     program: &str,
     build: u64,
@@ -183,10 +196,7 @@ pub(crate) fn provenance_bundle_line(
         // stage, and a KEPT lane tree that came back tagged. Naming the first as the
         // cause made the second read "staged in-process … because the untracked lane
         // ran", a sentence contradicting its own evidence.
-        Some(why) => format!(
-            " — recorded cause ({}=1): {why}",
-            crate::lay::ALLOW_TRACKED_ENV
-        ),
+        Some(why) => format!(" — recorded cause: {why}"),
         None => String::new(),
     };
     format!(
@@ -700,6 +710,27 @@ pub fn run_with(
     }
     let _ = writeln!(out, "{p}: ok — {} program(s) active", active.len());
 
+    // (5a) THE INSTALLER ITSELF, when it is a browser download. A quarantined app is
+    // provenance-tracked in EVERY invocation — a job launchd spawns from it included,
+    // which is the escape the untracked lane leans on — so its installs go through the
+    // lane's copy plan and its own executable is the carrier. Named here because every
+    // surface said "a probe file it wrote came back tagged" and none said why
+    // (2026-09-14). A note, not a warning: the lane handles it.
+    if let Some(carrier) = std::env::current_exe()
+        .ok()
+        .and_then(|exe| std::fs::canonicalize(exe).ok())
+        .and_then(|exe| crate::provenance::quarantined_carrier(&exe))
+    {
+        let _ = writeln!(
+            out,
+            "{p}: note — {} carries com.apple.quarantine (a browser download): every \
+             process this app starts is provenance-tracked, so its installs and shims go \
+             through the untracked launchd lane; an app laid down by aterm's own updater \
+             carries no such tag",
+            carrier.display()
+        );
+    }
+
     // (5b) PROVENANCE-TAGGED EXECUTABLES AND SHIMS (macOS).
     //
     // macOS stamps `com.apple.provenance` on every file a provenance-tracked process
@@ -721,9 +752,9 @@ pub fn run_with(
             let bin = build_dir.join("bin");
             let scan = crate::provenance::tagged_files_in(&bin, probes.provenance_attr);
             // The CAUSE, when the store recorded one: a tracked installer that staged
-            // this build in-process under the escape hatch wrote `<build>.tracked-install`
-            // beside it, and the line names it rather than leaving the operator to guess
-            // which shell seeded what.
+            // this build in-process because its untracked lane could not run wrote
+            // `<build>.tracked-install` beside it, and the line names it rather than
+            // leaving the operator to guess which shell seeded what.
             let recorded = crate::store::tracked_install_record(&build_dir);
             if scan.carriers.is_empty() {
                 if let Some(why) = &recorded {
@@ -741,13 +772,20 @@ pub fn run_with(
                 provenance_bundle_line(program, *build, &bin, &scan, recorded.as_deref())
             );
         }
-        let shims = crate::provenance::tagged_files_in(&layout.bin_dir(), probes.provenance_attr);
-        if !shims.carriers.is_empty() {
-            let _ = writeln!(
-                out,
-                "{p}: {}",
-                provenance_shim_line(&layout.bin_dir(), &shims)
-            );
+        // Every directory of executables atpkg lays, not `bin/` alone: the `agents/`
+        // twin is what actually runs `claude`/`codex` (first on every PATH) and is laid
+        // by its own lane job, and the reroute stubs run every upstream `cargo`/`rustc`
+        // typed in a session — a tagged file in either tracks the tool exactly as a
+        // tagged `bin/` shim does, and until 2026-09-14 neither was looked at.
+        for dir in [
+            layout.bin_dir(),
+            layout.agents_dir(),
+            crate::reroute::dir(layout),
+        ] {
+            let shims = crate::provenance::tagged_files_in(&dir, probes.provenance_attr);
+            if !shims.carriers.is_empty() {
+                let _ = writeln!(out, "{p}: {}", provenance_shim_line(&dir, &shims));
+            }
         }
     }
 
@@ -818,111 +856,69 @@ pub fn run_with(
         }
     }
 
-    // (5f) THE TRUST BUNDLE'S `rustc` MUST BE ITS `trustc`, OR tippy DOES NOT RUN.
+    // (5f) tippy's COMPILER IS A PLAIN FILE, AND THE RUSTUP VIEW IS ONE INODE PER TOOL.
     //
-    // tippy starts by checking that the bundle's `bin/trustc` and its rustc-compatible
-    // alias `bin/rustc` are plain files and that the alias is the selected compiler, and
-    // lints nothing when either check fails. Measured 2026-09-12 on bundles 8571 and
-    // 8589: every `tippy -p <crate> --tests` exited 1 with "tippy: setup error:
-    // rustc-compatible sibling `…/bin/rustc` is not the selected Trust compiler
-    // `…/bin/trustc`; repair or reinstall the toolchain", while this report said
-    // "healthy". The two files ARE one program — same size, same code — and differ only
-    // inside their ad-hoc code signatures, because an ad-hoc signature embeds the file's
-    // own name (`rustc-<hash>` beside `trustc-<hash>`).
+    // History, because the check that stood here until 2026-09-14 was about a file
+    // that no longer ships. The bundle carried `rustc` as a second COPY of `trustc` for
+    // rustup's sake, tippy preferred that copy and demanded it be byte-identical to
+    // `trustc`, and macOS makes that impossible: an ad-hoc signature bakes the file's
+    // own name into itself (measured on 8571/8589/8595 — 2,428 differing bytes, every
+    // one inside the signature blob). So this report compared the two modulo their
+    // signatures to say whether tippy would refuse. Trust now ships its tools under
+    // Trust's names only, tippy runs `trustc` directly, and the stock names live in
+    // atpkg's rustup VIEW ([`crate::seam::refresh_view`]) as hard links — so there are
+    // no two files to compare, and the two things left to check are cheap and exact.
     //
-    // The cure lives in the bundle, and not every plausible cure cures. Measured the same
-    // day on an APFS clone of 8589 (the store untouched): `rustc` as a hard link to
-    // `trustc`, or as a byte-for-byte copy of the signed `trustc`, lints; `rustc` as a
-    // symbolic link, relative or absolute, is refused ("compiler rustc-compatible alias
-    // `…/bin/rustc` is not a regular file or is a symlink/reparse point; selected Trust
-    // toolchain executables require a plain file"), and so is a symlinked `trustc` —
-    // which the tippy-driver route below refuses too; and re-signing the signed `rustc`
-    // under trustc's identifier matches the CDHash but leaves the files different inside
-    // the signature (byte 318 193), so tippy still refuses. What this machine can do is
-    // say which of these it is looking at, and what still lints.
-    //
-    // So: a `trustc` or `rustc` that is not a plain file, or the two one program under
-    // two signatures ([`crate::macho`], pure Rust, no `codesign` spawn), is a WARN that
-    // withholds "healthy" while tippy is in the bundle to be refused; two different
-    // programs are a FAIL; identical plain files say nothing; a file that is not a thin
-    // 64-bit Mach-O (an ELF on Linux) makes no claim about the program it holds — the
-    // plain-file check does not depend on the format, so a link is still reported.
+    // (a) `trustc` must be a plain file: tippy (and tippy-driver) refuse a symbolic
+    //     link for the selected compiler, measured. That is the one way a bundle can
+    //     still leave tippy unable to run, and it withholds "healthy" while tippy is
+    //     in the bundle to be refused.
+    // (b) For every recorded seam, each stock name rustup resolves must BE the store's
+    //     Trust tool — same device and inode — or `cargo +trust` / `rustc +trust` run
+    //     something other than the managed toolchain, or nothing. `aterm pkg repair`
+    //     rebuilds the view; a mismatch is a warn that withholds "healthy".
     let mut tools_cannot_run = 0usize;
     if let Some(trust_build) = active.get("trust").copied() {
-        use crate::macho::Modulo;
         let bin = layout.build_dir("trust", trust_build).join("bin");
-        let (rustc, trustc) = (bin.join("rustc"), bin.join("trustc"));
-        if let Some(found) = trust_siblings(&rustc, &trustc, TRUST_SIBLING_READ_LIMIT) {
-            match &found.verdict {
-                Ok(Modulo::Identical | Modulo::SameProgram | Modulo::Unparseable) => {}
-                Ok(Modulo::Different { offset }) => {
-                    fails += 1;
-                    let _ = writeln!(
-                        err,
-                        "{p}: FAIL — trust build {trust_build}: {} is not the same program as \
-                         the selected compiler {} (the first byte no code signature accounts \
-                         for differs at offset {offset}), so a tool that runs the bundle's \
-                         rustc runs something other than trustc; `aterm pkg verify trust` says \
-                         whether the store still matches what was published",
-                        rustc.display(),
-                        trustc.display()
-                    );
+        let trustc = bin.join("trustc");
+        let refused = match std::fs::symlink_metadata(&trustc) {
+            Ok(m) if m.file_type().is_symlink() => Some("a symbolic link"),
+            Ok(m) if !m.is_file() => Some("not a regular file"),
+            // Absent: the bundle is missing its compiler, which the shim and
+            // integrity checks above already name; nothing tippy-specific to add.
+            _ => None,
+        };
+        if let Some(what) = refused
+            && bin.join("tippy").is_file()
+        {
+            tools_cannot_run += 1;
+            let _ = writeln!(
+                out,
+                "{p}: warn — trust build {trust_build}: tippy cannot run — {} is {what}, and \
+                 tippy requires the selected compiler trustc to be a plain file, so every tippy \
+                 run stops at a setup error (the bundle's fix: {TRUST_COMPILER_FIX})",
+                trustc.display()
+            );
+        }
+        for name in crate::seam::recorded_names(layout) {
+            let view_bin = crate::seam::view_dir(layout, &name).join("bin");
+            for (public, trust) in crate::seam::STOCK_NAMES {
+                let store_tool = bin.join(trust);
+                if !store_tool.is_file() {
+                    continue;
                 }
-                Err(why) => {
+                let view_tool = view_bin.join(public);
+                if !same_file(&view_tool, &store_tool) {
+                    tools_cannot_run += 1;
                     let _ = writeln!(
                         out,
-                        "{p}: warn — trust build {trust_build}: could not compare its rustc \
-                         with its trustc ({why}), so whether tippy can run is unchecked"
+                        "{p}: warn — rustup `{name}`: {} is not the store's {} (absent, or a \
+                         separate file), so `{public} +{name}` runs something other than the \
+                         managed {trust}, or nothing; fix: `aterm pkg repair` rebuilds the view",
+                        view_tool.display(),
+                        store_tool.display()
                     );
                 }
-            }
-            // Why tippy stops, in the order it checks: trustc a plain file, rustc a plain
-            // file, then rustc the selected compiler.
-            let refusal = [(&trustc, found.trustc), (&rustc, found.rustc)]
-                .into_iter()
-                .find_map(|(path, file)| {
-                    Some(format!(
-                        "{} is {}, and tippy requires the selected compiler trustc and its \
-                         rustc-compatible alias rustc to be plain files",
-                        path.display(),
-                        file.refused_as()?
-                    ))
-                })
-                .or_else(|| {
-                    matches!(found.verdict, Ok(Modulo::SameProgram)).then(|| {
-                        format!(
-                            "{} is the same program as the selected compiler {}, but the two \
-                             differ inside their code signatures (an ad-hoc signature embeds \
-                             the file's own name) and tippy's sibling check reads that as a \
-                             different compiler",
-                            rustc.display(),
-                            trustc.display()
-                        )
-                    })
-                });
-            if let Some(refusal) = refusal
-                && bin.join("tippy").is_file()
-            {
-                tools_cannot_run += 1;
-                // The wrapper route skips tippy's sibling check, but tippy-driver still
-                // refuses a trustc that is not a plain file (measured), so it is offered
-                // only over a plain one.
-                let driver = bin.join("tippy-driver");
-                let today = if found.trustc == SiblingFile::Plain && driver.is_file() {
-                    format!(
-                        "; lint today with RUSTC_WORKSPACE_WRAPPER='{}' targo --unverified \
-                         check …",
-                        driver.display()
-                    )
-                } else {
-                    String::new()
-                };
-                let _ = writeln!(
-                    out,
-                    "{p}: warn — trust build {trust_build}: tippy cannot run — {refusal}, so \
-                     every tippy run stops at a setup error{today} (the bundle's fix: \
-                     {TRUST_SIBLING_FIX})"
-                );
             }
         }
     }
@@ -1532,7 +1528,8 @@ pub fn run_with(
     // The index is the only thing that knows what SHOULD be here, so ask it. Offline and
     // best-effort by construction (`cached_index`): an unreachable index must never
     // invent a missing program.
-    let (missing_unexplained, missing_on_purpose) = missing_against_index(layout, &installed);
+    let (missing_unexplained, missing_on_purpose, dev_linked) =
+        missing_against_index(layout, &installed);
     let mut toolset_problem = false;
     if declined {
         // Intended emptiness. Say so, so it does not read as a fault.
@@ -1597,7 +1594,10 @@ pub fn run_with(
             "{p}: PROBLEM — the toolset is incomplete: {} of {} program(s) the signed \
              index serves are not installed ({})",
             missing_unexplained.len(),
-            installed.len() + missing_unexplained.len() + missing_on_purpose.len(),
+            installed.len()
+                + missing_unexplained.len()
+                + missing_on_purpose.len()
+                + dev_linked.len(),
             missing_unexplained.join(", ")
         );
     } else {
@@ -1607,6 +1607,16 @@ pub fn run_with(
     // records it is a file no user reads, and its effect (no stub, no unattended
     // reinstall, and a coherence group that never activates) is indistinguishable from
     // the program never having existed. Say it plainly, and name the way back.
+    for program in &dev_linked {
+        let from = crate::linkmode::linked_checkout(layout, program)
+            .map(|c| c.display().to_string())
+            .unwrap_or_else(|| "a checkout".to_string());
+        let _ = writeln!(
+            out,
+            "{p}: ok — {program}: dev-linked from {from} (not the index build; `aterm pkg unlink \
+             {program}` returns it to the index)"
+        );
+    }
     for program in &missing_on_purpose {
         let _ = writeln!(
             out,
@@ -1693,108 +1703,30 @@ fn probe_version(bin: &Path) -> String {
     token.split('+').next().unwrap_or(token).to_string()
 }
 
-/// What the bundle has to ship for tippy to run, as (5f) words it: every shape it names
-/// was measured on a clone of bundle 8589 — the hard link and the copy lint; a symbolic
-/// link is refused, and so is a second signing of an already-signed copy.
-const TRUST_SIBLING_FIX: &str = "ship trustc as one signed plain file and rustc as a hard \
-                                 link to it or a byte-for-byte copy of it, never a symbolic \
-                                 link";
+/// What the bundle has to ship for tippy to run, as (5f) words it. tippy runs the
+/// compiler under its own name and refuses a symbolic link there, measured; the
+/// `rustc` alias it once also demanded is gone with the alias.
+const TRUST_COMPILER_FIX: &str = "ship trustc as one signed plain file, never a symbolic link";
 
-/// The most bytes (5f) reads of either Trust compiler file. Bundle 8589's `rustc` and
-/// `trustc` are 336 192 bytes each — the thin driver that loads the compiler's shared
-/// library — so this is some fifty times what was measured; a file over it is reported
-/// as not compared, never read whole.
-const TRUST_SIBLING_READ_LIMIT: u64 = 16 << 20;
-
-/// How one of the Trust bundle's compiler files sits in `bin/`, as tippy's plain-file
-/// check sees it: the directory entry itself, not what a link points at.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum SiblingFile {
-    Plain,
-    Symlink,
-    NotAFile,
-}
-
-impl SiblingFile {
-    /// What a report line calls a file tippy refuses; `None` for a plain file.
-    fn refused_as(self) -> Option<&'static str> {
-        match self {
-            Self::Plain => None,
-            Self::Symlink => Some("a symbolic link"),
-            Self::NotAFile => Some("not a regular file"),
+/// Whether two paths are one file — same device and inode on Unix, following links
+/// (a view entry is a hard link, so what it reaches is what matters). Elsewhere, two
+/// regular files of one length; the view is a Unix construction and this is a report.
+fn same_file(a: &Path, b: &Path) -> bool {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt;
+        match (std::fs::metadata(a), std::fs::metadata(b)) {
+            (Ok(x), Ok(y)) => x.is_file() && x.dev() == y.dev() && x.ino() == y.ino(),
+            _ => false,
         }
     }
-}
-
-/// What (5f) finds about the Trust bundle's `rustc` beside its `trustc`.
-#[derive(Debug)]
-struct TrustSiblings {
-    rustc: SiblingFile,
-    trustc: SiblingFile,
-    /// The two compared modulo their code signatures ([`crate::macho::compare`]),
-    /// through any link; `Err` when either could not be read within the bound.
-    verdict: Result<crate::macho::Modulo, String>,
-}
-
-/// The Trust bundle's `rustc` and `trustc` as tippy meets them, or `None` when either
-/// directory entry is absent or cannot be looked at.
-///
-/// Read-only and bounded. Each entry is looked at without following it — a link is what
-/// tippy's plain-file check refuses, so a link must not be judged by the file it
-/// reaches — and then each is read, following any link, only as a regular file of at
-/// most `limit` bytes ([`read_bounded`]). A file that cannot be read that way is an `Err`
-/// verdict, never a claim about the program it holds.
-fn trust_siblings(rustc: &Path, trustc: &Path, limit: u64) -> Option<TrustSiblings> {
-    let entry = |path: &Path| {
-        let file_type = std::fs::symlink_metadata(path).ok()?.file_type();
-        Some(if file_type.is_symlink() {
-            SiblingFile::Symlink
-        } else if file_type.is_file() {
-            SiblingFile::Plain
-        } else {
-            SiblingFile::NotAFile
-        })
-    };
-    let (rustc_file, trustc_file) = (entry(rustc)?, entry(trustc)?);
-    let read = |path: &Path| read_bounded(path, limit);
-    let verdict = read(rustc).and_then(|r| Ok(crate::macho::compare(&r, &read(trustc)?)));
-    Some(TrustSiblings {
-        rustc: rustc_file,
-        trustc: trustc_file,
-        verdict,
-    })
-}
-
-/// `path`'s bytes, following any link, when it is a regular file of at most `limit`
-/// bytes — the bound enforced, not assumed. The type is checked before the open, so
-/// nothing that could block an open (a FIFO) is opened; the length is checked on the
-/// open handle and again on what the read returns, so a file that grows in between is
-/// refused rather than read whole.
-fn read_bounded(path: &Path, limit: u64) -> Result<Vec<u8>, String> {
-    use std::io::Read as _;
-    let named = |e: std::io::Error| format!("{}: {e}", path.display());
-    if !std::fs::metadata(path).map_err(named)?.is_file() {
-        return Err(format!("{}: not a regular file", path.display()));
+    #[cfg(not(unix))]
+    {
+        match (std::fs::metadata(a), std::fs::metadata(b)) {
+            (Ok(x), Ok(y)) => x.is_file() && y.is_file() && x.len() == y.len(),
+            _ => false,
+        }
     }
-    let file = std::fs::File::open(path).map_err(named)?;
-    let len = file.metadata().map_err(named)?.len();
-    if len > limit {
-        return Err(format!(
-            "{}: {len} bytes, over the {limit}-byte bound this check reads",
-            path.display()
-        ));
-    }
-    let mut bytes = Vec::with_capacity(usize::try_from(len).unwrap_or(0));
-    file.take(limit.saturating_add(1))
-        .read_to_end(&mut bytes)
-        .map_err(named)?;
-    if u64::try_from(bytes.len()).unwrap_or(u64::MAX) > limit {
-        return Err(format!(
-            "{}: grew past the {limit}-byte bound while being read",
-            path.display()
-        ));
-    }
-    Ok(bytes)
 }
 
 /// Render a divergence's contested build numbers for the report line.
@@ -1819,11 +1751,11 @@ fn index_age_days(updated_at: &str, now: i64) -> Option<i64> {
 /// A foreign LINK names the exact re-point (one `ln -sfn`, then `aterm pkg repair` to
 /// record it); a foreign DIRECTORY/FILE cannot be re-pointed over — `ln -sfn` onto a
 /// directory would lay the link INSIDE it — so that shape gets [`crate::seam::DETACH_FIX`].
-/// A link into the store at a NUMBERED build is a note, not a warn: `repair` re-points
-/// it to `current` by itself.
+/// A link into the store — `current`, or a numbered build, the layouts from before the
+/// view — is a note, not a warn: `repair` re-points it to the view by itself.
 fn seam_line(st: &crate::seam::SeamStatus, layout: &Layout) -> Option<String> {
     use crate::seam::Entry;
-    let target = crate::seam::seam_target(layout);
+    let target = crate::seam::seam_target(layout, "trust");
     match &st.entry {
         Ok(Entry::Link(raw)) if !st.in_prefix => Some(format!(
             "warn — rustup `trust` -> {} is NOT the managed store ({}): `cargo +trust`, \
@@ -1836,10 +1768,12 @@ fn seam_line(st: &crate::seam::SeamStatus, layout: &Layout) -> Option<String> {
             target.display(),
             st.path.display()
         )),
-        Ok(Entry::Link(_)) if !st.targets_current => Some(format!(
-            "note — rustup `trust` -> {} is a numbered build inside the store, not \
-             `current`; `aterm pkg repair` re-points it so updates move the channel",
-            st.target.as_deref().unwrap_or(&st.path).display()
+        Ok(Entry::Link(_)) if !st.targets_view => Some(format!(
+            "note — rustup `trust` -> {} is inside the store, not the view atpkg lays \
+             ({}); `aterm pkg repair` re-points it so the stock names rustup resolves are \
+             the managed tools and updates move the channel",
+            st.target.as_deref().unwrap_or(&st.path).display(),
+            target.display()
         )),
         Ok(entry @ (Entry::Dir | Entry::File | Entry::Other)) => Some(format!(
             "warn — rustup `trust` at {} is {} — not a link into the managed store ({}), so \
@@ -2230,10 +2164,42 @@ mod tests {
     /// A program the machine wants, does not have, and has NO ledger entry for is the
     /// state no other check in this report can see: no shim, no `status.toml` row, no
     /// recorded fault. It must be named.
+    /// A DEV-LINKED program is present, not missing — and the link outranks a stale
+    /// removed-ledger line. Measured 2026-09-14: a `# deliberate` removal of trust from
+    /// 2026-08-27 made doctor say "removed on purpose" about the toolchain every build on
+    /// the box was running through `aterm pkg link trust <stage2>`.
+    #[test]
+    fn a_dev_linked_program_is_neither_missing_nor_removed_even_when_the_ledger_names_it() {
+        let (unexplained, on_purpose, dev_linked) = split_missing(
+            &names(&["ay", "trust"]),
+            &builds(&[]),
+            &names(&["trust"]),
+            &names(&["trust"]),
+        );
+        assert_eq!(
+            dev_linked,
+            vec!["trust".to_string()],
+            "the link is the newer decision"
+        );
+        assert!(
+            on_purpose.is_empty(),
+            "a linked program is not 'removed on purpose': {on_purpose:?}"
+        );
+        assert_eq!(
+            unexplained,
+            vec!["ay".to_string()],
+            "only the genuinely absent one is missing"
+        );
+    }
+
     #[test]
     fn a_wanted_program_that_never_arrived_is_unexplained() {
-        let (unexplained, on_purpose) =
-            split_missing(&names(&["ay", "trust"]), &builds(&["ay"]), &names(&[]));
+        let (unexplained, on_purpose, _dev_linked) = split_missing(
+            &names(&["ay", "trust"]),
+            &builds(&["ay"]),
+            &names(&[]),
+            &names(&[]),
+        );
         assert_eq!(unexplained, vec!["trust".to_string()]);
         assert!(on_purpose.is_empty());
     }
@@ -2243,10 +2209,11 @@ mod tests {
     /// other half of what went wrong: the ledger is a file nobody reads.
     #[test]
     fn a_removed_program_is_explained_never_a_fault() {
-        let (unexplained, on_purpose) = split_missing(
+        let (unexplained, on_purpose, _dev_linked) = split_missing(
             &names(&["ay", "trust"]),
             &builds(&["ay"]),
             &names(&["trust"]),
+            &names(&[]),
         );
         assert!(unexplained.is_empty(), "a recorded decision is not a fault");
         assert_eq!(on_purpose, vec!["trust".to_string()]);
@@ -2254,9 +2221,10 @@ mod tests {
 
     #[test]
     fn a_complete_machine_reports_nothing() {
-        let (unexplained, on_purpose) = split_missing(
+        let (unexplained, on_purpose, _dev_linked) = split_missing(
             &names(&["ay", "trust"]),
             &builds(&["ay", "trust"]),
+            &names(&[]),
             &names(&[]),
         );
         assert!(unexplained.is_empty() && on_purpose.is_empty());
@@ -2276,13 +2244,14 @@ mod tests {
     /// report that points at the real state.
     #[test]
     fn the_suppressed_compiler_tuple_is_reported() {
-        let (unexplained, on_purpose) = split_missing(
+        let (unexplained, on_purpose, _dev_linked) = split_missing(
             &names(&[
                 "ay", "clean", "nn", "ny", "trust", "trust-cg", "trust-ir", "trust-mc", "trust-vc",
                 "ty",
             ]),
             &builds(&["ay", "clean", "nn", "ny", "trust-mc", "ty"]),
             &names(&["trust"]),
+            &names(&[]),
         );
         assert_eq!(
             unexplained,
@@ -2306,8 +2275,8 @@ mod tests {
     #[test]
     fn no_cached_index_invents_no_missing_programs() {
         let l = layout("no-index");
-        let (unexplained, on_purpose) = missing_against_index(&l, &builds(&["ay"]));
-        assert!(unexplained.is_empty() && on_purpose.is_empty());
+        let (unexplained, on_purpose, dev_linked) = missing_against_index(&l, &builds(&["ay"]));
+        assert!(unexplained.is_empty() && on_purpose.is_empty() && dev_linked.is_empty());
         let _ = std::fs::remove_dir_all(&l.prefix);
     }
 
@@ -2336,7 +2305,8 @@ mod tests {
         // The managed store: trust/6808 with current -> 6808.
         let build = l.build_dir("trust", 6808);
         std::fs::create_dir_all(build.join("bin")).unwrap();
-        crate::activate::atomic_symlink(&build, &crate::seam::seam_target(&l)).unwrap();
+        std::fs::write(build.join("bin").join("trustc"), b"trustc").unwrap();
+        crate::activate::atomic_symlink(&build, &crate::seam::store_current(&l)).unwrap();
         let home = synthetic_home("foreign-seam");
         let rustup = home.join(".rustup");
         std::fs::create_dir_all(rustup.join("toolchains")).unwrap();
@@ -2351,7 +2321,7 @@ mod tests {
         assert!(
             line.contains(&format!(
                 "ln -sfn '{}' '{}'",
-                crate::seam::seam_target(&l).display(),
+                crate::seam::seam_target(&l, "trust").display(),
                 entry.display()
             )),
             "the exact re-point command, quoted — the real prefix has a space in \
@@ -2365,10 +2335,16 @@ mod tests {
         std::os::unix::fs::symlink(&build, &entry).unwrap();
         let line = seam_line(&crate::seam::status(&l, &rustup, "trust"), &l).unwrap();
         assert!(line.starts_with("note — "), "{line}");
-        assert!(line.contains("numbered build"), "{line}");
+        assert!(line.contains("inside the store, not the view"), "{line}");
+        // So is the layout from before the view: a link at `current`.
+        std::fs::remove_file(&entry).unwrap();
+        std::os::unix::fs::symlink(crate::seam::store_current(&l), &entry).unwrap();
+        let line = seam_line(&crate::seam::status(&l, &rustup, "trust"), &l).unwrap();
+        assert!(line.starts_with("note — "), "{line}");
         // The seam itself, and no entry at all: nothing to say from this line.
         std::fs::remove_file(&entry).unwrap();
-        std::os::unix::fs::symlink(crate::seam::seam_target(&l), &entry).unwrap();
+        crate::seam::refresh_view(&l, "trust").unwrap();
+        std::os::unix::fs::symlink(crate::seam::seam_target(&l, "trust"), &entry).unwrap();
         assert_eq!(
             seam_line(&crate::seam::status(&l, &rustup, "trust"), &l),
             None
@@ -4269,7 +4245,7 @@ mod tests {
             "{warn}"
         );
         assert!(
-            warn.ends_with(&format!(" (the bundle's fix: {TRUST_SIBLING_FIX})")),
+            warn.ends_with(&format!(" (the bundle's fix: {TRUST_COMPILER_FIX})")),
             "every refusal carries the one fix that was measured to work: {warn}"
         );
         warn
@@ -4292,280 +4268,98 @@ mod tests {
         assert!(!err.contains("FAIL"), "{err}");
     }
 
-    /// What the fix line says, every shape of it measured on a clone of bundle 8589: a
-    /// hard link or a byte-for-byte copy lints; a symbolic link does not.
+    /// (5f) THE VIEW. With no seam recorded the check has nothing to say. Once a seam
+    /// is attached against a synthetic rustup home, the view's stock names are the
+    /// store's tools and the report is healthy; a view whose `rustc` was replaced by a
+    /// COPY is named — with the repair — and withholds "healthy"; `repair`'s
+    /// re-assertion rebuilds the view and the report is healthy again.
+    #[cfg(unix)]
     #[test]
-    fn the_bundle_fix_names_only_shapes_that_let_tippy_run() {
-        assert_eq!(
-            TRUST_SIBLING_FIX,
-            "ship trustc as one signed plain file and rustc as a hard link to it or a \
-             byte-for-byte copy of it, never a symbolic link"
+    fn a_rustup_view_whose_stock_names_are_not_the_stores_tools_is_not_healthy() {
+        let (l, home, path, bin) = tippy_sibling_store("view");
+        for tool in ["trustc", "targo", "trustdoc", "tippy", "tippy-driver"] {
+            std::fs::write(bin.join(tool), tool).unwrap();
+        }
+        let (ok, out, err) = whole_report(&l, &home, &path);
+        assert!(ok && healthy(&out), "{out}{err}");
+
+        let rustup = home.join(".rustup");
+        std::fs::create_dir_all(rustup.join("toolchains")).unwrap();
+        crate::seam::attach(&l, &rustup, "trust").unwrap();
+        let (ok, out, err) = whole_report(&l, &home, &path);
+        assert!(ok && healthy(&out), "{out}{err}");
+        assert!(!out.contains("is not the store's"), "{out}");
+        let view_rustc = crate::seam::view_dir(&l, "trust").join("bin").join("rustc");
+        assert!(same_file(&view_rustc, &bin.join("trustc")));
+
+        // A copy where the link should be: `rustc +trust` would run a different file.
+        std::fs::remove_file(&view_rustc).unwrap();
+        std::fs::write(&view_rustc, b"trustc").unwrap();
+        let (ok, out, err) = whole_report(&l, &home, &path);
+        assert_not_healthy_exit_0(ok, &out, &err);
+        assert!(
+            out.contains(&format!(
+                "doctor: warn — rustup `trust`: {} is not the store's {} (absent, or a separate \
+                 file), so `rustc +trust` runs something other than the managed trustc, or \
+                 nothing; fix: `aterm pkg repair` rebuilds the view",
+                view_rustc.display(),
+                bin.join("trustc").display()
+            )),
+            "{out}"
         );
+
+        // What repair does: re-assert, which rebuilds the view.
+        let lines = crate::seam::reassert(&l, &rustup);
+        assert!(lines.is_empty(), "{lines:?}");
+        assert!(same_file(&view_rustc, &bin.join("trustc")));
+        let (ok, out, err) = whole_report(&l, &home, &path);
+        assert!(ok && healthy(&out), "{out}{err}");
     }
 
-    /// (5f) THE MEASURED DEFECT, through the whole report. Bundle 8589's `rustc` and
-    /// `trustc` are one program under two ad-hoc signatures, tippy refuses to start over
-    /// that, and this report said "healthy". Now: a warn naming the bundle, both paths
-    /// and what still lints, and a verdict that withholds "healthy" without claiming a
-    /// structural problem (exit 0). The same pair byte-identical says nothing; a code
-    /// byte apart is a FAIL; with no tippy in the bundle nothing is refused; files that
-    /// are not Mach-O make no claim.
+    /// (5f) tippy runs `trustc` under its own name and refuses a symbolic link there —
+    /// so a bundle whose `trustc` is a link is a tippy that cannot run, and the report
+    /// says so with the one fix. A plain `trustc` says nothing. A bundle with no tippy
+    /// has nothing to refuse.
+    #[cfg(unix)]
     #[test]
-    fn a_trust_rustc_that_differs_from_trustc_only_in_its_signature_is_not_healthy() {
-        let (l, home, path, bin) = tippy_sibling_store("tippy-sibling");
-        let rustc_bytes = crate::macho::tests::signed("rustc-5555494429441d12e5e3340fa96ce4b");
-        let trustc_bytes = crate::macho::tests::signed("trustc-5555494429441d12e5e3340fa96ce4b");
-        std::fs::write(bin.join("rustc"), &rustc_bytes).unwrap();
-        std::fs::write(bin.join("trustc"), &trustc_bytes).unwrap();
+    fn a_symlinked_trust_compiler_is_a_tippy_that_cannot_run() {
+        let (l, home, path, bin) = tippy_sibling_store("symlinked-trustc");
+        let trustc = bin.join("trustc");
+        std::fs::write(bin.join("targo"), b"targo").unwrap();
+        std::fs::write(bin.join("real"), b"trustc").unwrap();
+        std::os::unix::fs::symlink("real", &trustc).unwrap();
         std::fs::write(bin.join("tippy"), b"tippy").unwrap();
         std::fs::write(bin.join("tippy-driver"), b"tippy-driver").unwrap();
-        let run = || whole_report(&l, &home, &path);
-
-        let (ok, out, err) = run();
+        let (ok, out, err) = whole_report(&l, &home, &path);
         assert_not_healthy_exit_0(ok, &out, &err);
         let warn = tippy_warn(&out);
         assert!(
             warn.contains(&format!(
-                "tippy cannot run — {} is the same program as the selected compiler {}, but \
-                 the two differ inside their code signatures (an ad-hoc signature embeds the \
-                 file's own name) and tippy's sibling check reads that as a different \
-                 compiler, so every tippy run stops at a setup error; lint today with \
-                 RUSTC_WORKSPACE_WRAPPER='{}' targo --unverified check … (the bundle's fix: \
-                 ship trustc as one signed plain file and rustc as a hard link to it or a \
-                 byte-for-byte copy of it, never a symbolic link)",
-                bin.join("rustc").display(),
-                bin.join("trustc").display(),
-                bin.join("tippy-driver").display()
+                "{} is a symbolic link, and tippy requires the selected compiler trustc to be a \
+                 plain file",
+                trustc.display()
             )),
             "{warn}"
         );
 
-        // No tippy in the bundle: nothing is refused, so nothing is withheld.
-        std::fs::remove_file(bin.join("tippy")).unwrap();
-        let (ok, out, _) = run();
-        assert!(
-            ok && healthy(&out) && !out.contains("tippy cannot run"),
-            "{out}"
-        );
-        std::fs::write(bin.join("tippy"), b"tippy").unwrap();
-
-        // The pair byte-identical (what a byte-for-byte copy gives): nothing to say.
-        std::fs::write(bin.join("rustc"), &trustc_bytes).unwrap();
-        let (ok, out, _) = run();
-        assert!(
-            ok && healthy(&out) && !out.contains("tippy cannot run"),
-            "{out}"
-        );
-
-        // A code byte apart: two programs, a FAIL naming the offset.
-        let mut other = rustc_bytes.clone();
-        other[crate::macho::tests::CODE_AT + 7] ^= 0x01;
-        std::fs::write(bin.join("rustc"), &other).unwrap();
-        let (ok, out, err) = run();
-        assert!(
-            !ok,
-            "a different program is a structural problem:\n{out}{err}"
-        );
-        assert!(
-            err.contains(&format!(
-                "doctor: FAIL — trust build 8589: {} is not the same program as the selected \
-                 compiler {} (the first byte no code signature accounts for differs at \
-                 offset {})",
-                bin.join("rustc").display(),
-                bin.join("trustc").display(),
-                crate::macho::tests::CODE_AT + 7
-            )),
-            "{err}"
-        );
-        assert!(out.contains("doctor: found 1 problem(s)"), "{out}");
-        assert!(!out.contains("tippy cannot run"), "{out}");
-
-        // Not Mach-O (an ELF on Linux): no claim either way.
-        std::fs::write(bin.join("rustc"), b"\x7fELF rustc").unwrap();
-        std::fs::write(bin.join("trustc"), b"\x7fELF trustc").unwrap();
-        let (ok, out, err) = run();
-        assert!(ok && healthy(&out), "{out}{err}");
-        assert!(!out.contains("trust build 8589:") && !err.contains("trust build 8589:"));
-
-        let _ = std::fs::remove_dir_all(&l.prefix);
-        let _ = std::fs::remove_dir_all(&home);
-    }
-
-    /// (5f) THE LINK THE FIRST FIX LINE RECOMMENDED. tippy refuses a symbolic link for
-    /// either compiler file before comparing a byte — measured on a clone of 8589:
-    /// `rustc -> trustc`, relative or absolute, stops at "compiler rustc-compatible alias
-    /// `…/bin/rustc` is not a regular file or is a symlink/reparse point", a symlinked
-    /// `trustc` at "compiler trustc `…` is not a regular file…", and a hard link lints.
-    /// Following the link, the bytes are trustc's own, so a check that reads through it
-    /// sees identical files and said "healthy". The entry is judged as it sits in `bin/`.
-    #[cfg(unix)]
-    #[test]
-    fn a_symlinked_trust_compiler_is_a_tippy_that_cannot_run_though_its_bytes_match() {
-        let (l, home, path, bin) = tippy_sibling_store("tippy-symlink");
-        let trustc_bytes = crate::macho::tests::signed("trustc-5555494429441d12e5e3340fa96ce4b");
-        let (rustc, trustc) = (bin.join("rustc"), bin.join("trustc"));
-        std::fs::write(&trustc, &trustc_bytes).unwrap();
-        std::fs::write(bin.join("tippy"), b"tippy").unwrap();
-        std::fs::write(bin.join("tippy-driver"), b"tippy-driver").unwrap();
-        let run = || whole_report(&l, &home, &path);
-        let lint_today = format!(
-            "; lint today with RUSTC_WORKSPACE_WRAPPER='{}' targo --unverified check …",
-            bin.join("tippy-driver").display()
-        );
-        let link_refusal = |path: &Path| {
-            format!(
-                "tippy cannot run — {} is a symbolic link, and tippy requires the selected \
-                 compiler trustc and its rustc-compatible alias rustc to be plain files, so \
-                 every tippy run stops at a setup error",
-                path.display()
-            )
-        };
-
-        // rustc -> trustc, relative then absolute: the same bytes, still refused, and the
-        // tippy-driver route still lints (measured), so it is offered.
-        for target in [PathBuf::from("trustc"), trustc.clone()] {
-            let _ = std::fs::remove_file(&rustc);
-            std::os::unix::fs::symlink(&target, &rustc).unwrap();
-            assert_eq!(std::fs::read(&rustc).unwrap(), trustc_bytes, "same bytes");
-            let (ok, out, err) = run();
-            assert_not_healthy_exit_0(ok, &out, &err);
-            let warn = tippy_warn(&out);
-            assert!(
-                warn.contains(&format!("{}{lint_today}", link_refusal(&rustc))),
-                "{warn}"
-            );
-        }
-
-        // No tippy in the bundle: a link refuses nothing, and the bytes match.
-        std::fs::remove_file(bin.join("tippy")).unwrap();
-        let (ok, out, _) = run();
-        assert!(
-            ok && healthy(&out) && !out.contains("tippy cannot run"),
-            "{out}"
-        );
-        std::fs::write(bin.join("tippy"), b"tippy").unwrap();
-
-        // A hard link: one plain file under two names, which lints. Nothing to say.
-        std::fs::remove_file(&rustc).unwrap();
-        std::fs::hard_link(&trustc, &rustc).unwrap();
-        let (ok, out, err) = run();
+        // A plain compiler: healthy, nothing said.
+        std::fs::remove_file(&trustc).unwrap();
+        std::fs::write(&trustc, b"trustc").unwrap();
+        let (ok, out, err) = whole_report(&l, &home, &path);
         assert!(
             ok && healthy(&out) && !out.contains("tippy cannot run"),
             "{out}{err}"
         );
 
-        // trustc the link and rustc the plain file: tippy names trustc, and tippy-driver
-        // refuses the same link (measured), so no lint-today route is offered.
-        std::fs::remove_file(&rustc).unwrap();
-        std::fs::write(&rustc, &trustc_bytes).unwrap();
+        // The link back, but no tippy in the bundle: nothing is refused.
         std::fs::remove_file(&trustc).unwrap();
-        std::os::unix::fs::symlink("rustc", &trustc).unwrap();
-        let (ok, out, err) = run();
-        assert_not_healthy_exit_0(ok, &out, &err);
-        let warn = tippy_warn(&out);
+        std::os::unix::fs::symlink("real", &trustc).unwrap();
+        std::fs::remove_file(bin.join("tippy")).unwrap();
+        let (ok, out, err) = whole_report(&l, &home, &path);
         assert!(
-            warn.contains(&format!("{} (the bundle's fix", link_refusal(&trustc))),
-            "{warn}"
+            ok && healthy(&out) && !out.contains("tippy cannot run"),
+            "{out}{err}"
         );
-        assert!(!warn.contains("lint today"), "{warn}");
-        std::fs::remove_file(&trustc).unwrap();
-        std::fs::write(&trustc, &trustc_bytes).unwrap();
-
-        // A link to a different program: the FAIL, and the link named beside it.
-        let other = bin.join("other-rustc");
-        let mut other_bytes = trustc_bytes.clone();
-        other_bytes[crate::macho::tests::CODE_AT] ^= 0x01;
-        std::fs::write(&other, &other_bytes).unwrap();
-        std::fs::remove_file(&rustc).unwrap();
-        std::os::unix::fs::symlink(&other, &rustc).unwrap();
-        let (ok, out, err) = run();
-        assert!(!ok, "{out}{err}");
-        assert!(
-            err.contains(&format!(
-                "doctor: FAIL — trust build 8589: {} is not the same program",
-                rustc.display()
-            )),
-            "{err}"
-        );
-        assert!(tippy_warn(&out).contains(&link_refusal(&rustc)), "{out}");
-        assert!(out.contains("doctor: found 1 problem(s)"), "{out}");
-
-        // A dangling link: nothing to compare, and still a link tippy refuses.
-        std::fs::remove_file(&other).unwrap();
-        let (ok, out, err) = run();
-        assert_not_healthy_exit_0(ok, &out, &err);
-        assert!(
-            out.contains(
-                "doctor: warn — trust build 8589: could not compare its rustc with its trustc ("
-            ),
-            "{out}"
-        );
-        assert!(tippy_warn(&out).contains(&link_refusal(&rustc)), "{out}");
-
-        let _ = std::fs::remove_dir_all(&l.prefix);
-        let _ = std::fs::remove_dir_all(&home);
-    }
-
-    /// (5f) reads the two compiler files whole, so the bound on that read is enforced
-    /// rather than assumed: a file over it — or one that is not a regular file — is not
-    /// compared, and says so; a missing entry is no claim at all.
-    #[test]
-    fn the_trust_sibling_read_is_bounded_and_only_of_regular_files() {
-        let dir = synthetic_home("tippy-bound");
-        let (rustc, trustc) = (dir.join("rustc"), dir.join("trustc"));
-        let bytes = crate::macho::tests::signed("trustc-5555494429441d12e5e3340fa96ce4b");
-        let len = bytes.len() as u64;
-        std::fs::write(&rustc, &bytes).unwrap();
-        std::fs::write(&trustc, &bytes).unwrap();
-
-        assert_eq!(
-            read_bounded(&rustc, len).unwrap(),
-            bytes,
-            "at the bound: read"
-        );
-        let over = read_bounded(&rustc, len - 1).unwrap_err();
-        assert_eq!(
-            over,
-            format!(
-                "{}: {len} bytes, over the {}-byte bound this check reads",
-                rustc.display(),
-                len - 1
-            )
-        );
-        let found = trust_siblings(&rustc, &trustc, len).unwrap();
-        assert_eq!(
-            (found.rustc, found.trustc, found.verdict),
-            (
-                SiblingFile::Plain,
-                SiblingFile::Plain,
-                Ok(crate::macho::Modulo::Identical)
-            )
-        );
-        let found = trust_siblings(&rustc, &trustc, len - 1).unwrap();
-        assert_eq!(found.verdict, Err(over), "over the bound: not compared");
-        const {
-            assert!(
-                TRUST_SIBLING_READ_LIMIT >= 336_192 * 16,
-                "the bound sits well above the measured 336 192 bytes"
-            )
-        };
-
-        // A directory where rustc should be: not a regular file, never opened as one.
-        std::fs::remove_file(&rustc).unwrap();
-        std::fs::create_dir(&rustc).unwrap();
-        assert_eq!(
-            read_bounded(&rustc, len).unwrap_err(),
-            format!("{}: not a regular file", rustc.display())
-        );
-        let found = trust_siblings(&rustc, &trustc, len).unwrap();
-        assert_eq!(found.rustc, SiblingFile::NotAFile);
-        assert!(found.verdict.is_err(), "{found:?}");
-
-        // No rustc at all: nothing to say.
-        std::fs::remove_dir(&rustc).unwrap();
-        assert!(trust_siblings(&rustc, &trustc, len).is_none());
-
-        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]
@@ -4676,8 +4470,8 @@ mod tests {
         let _ = std::fs::remove_dir_all(&home);
     }
 
-    /// The RECORD a tracked installer left under the escape hatch is reported as the
-    /// cause on the tagged bundle's line; a record with no tagged file behind it is
+    /// The RECORD a tracked installer left when its lane could not run is reported as
+    /// the cause on the tagged bundle's line; a record with no tagged file behind it is
     /// named as stale rather than presented as a tagged bundle.
     #[cfg(target_os = "macos")]
     #[test]
@@ -4723,8 +4517,7 @@ mod tests {
             .unwrap_or_else(|| panic!("the bundle line is missing:\n{out}"));
         assert!(
             bundle_line.contains(
-                "recorded cause (ATPKG_ALLOW_TRACKED_INSTALL=1): the untracked lane could \
-                 not run (launchctl submit failed)"
+                "recorded cause: the untracked lane could not run (launchctl submit failed)"
             ),
             "{bundle_line}"
         );

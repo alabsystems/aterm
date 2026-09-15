@@ -34,7 +34,7 @@ use crate::native_ui::{
     SliderSpec, StyleRef, SwitchSpec, TAB_COLOR_WHEEL_AUDIT, TextFieldSpec, TextSpec, UiContent,
     UiKey, UiNode, UiTree,
 };
-use crate::packages_screen::{PackagesBusy, PackagesProjection, PackagesState};
+use crate::packages_screen::{MachineProjection, PackagesBusy, PackagesProjection, PackagesState};
 use crate::prefs::{self, EditField, EditKind, Section};
 use crate::settings::SettingsState;
 use crate::settings_preview::{
@@ -2576,6 +2576,17 @@ impl SettingsApp {
                 );
                 EventResult::Handled
             }
+            // The Security page's "This Mac" card: apply the [machine] host settings
+            // now, through the same host executor and busy gate as every other verb.
+            "machine/apply" => {
+                self.reduce_packages_verb(
+                    view,
+                    cx,
+                    PackagesRequest::MachineApply,
+                    "Applying the machine settings…",
+                );
+                EventResult::Handled
+            }
             _ => {
                 // The per-row Install controls. Each is admitted ONLY against the live
                 // projection — a stale or forged action id for a name that is not an
@@ -2655,12 +2666,31 @@ impl SettingsApp {
         feedback: &str,
     ) {
         let packages = self.packages.projection();
+        // `atpkg machine apply` is a local verb: it needs the co-located binary and
+        // an idle worker slot, but NOT the package manager — it works with the
+        // manager switched off, exactly as the host executor admits it.
+        let machine_apply = matches!(request, PackagesRequest::MachineApply);
         if !packages.observed {
             view.feedback = Some("Package status is still being read…".to_string());
         } else if !packages.available {
             view.feedback =
                 Some("The bundled atpkg binary is not present beside this executable.".to_string());
-        } else if !packages.manager_enabled {
+        } else if machine_apply && !packages.machine.supported {
+            view.feedback = Some("The [machine] settings are macOS host settings.".to_string());
+        } else if machine_apply && (!packages.machine.observed || packages.machine.refreshing) {
+            view.feedback = Some("The machine state is still being read…".to_string());
+        } else if machine_apply
+            && !packages.machine.apply_enabled
+            && packages.busy.is_none()
+            && !packages.refreshing
+        {
+            // Observed and idle, yet nothing for an apply to do — or a reason in the
+            // way (a home that is not the account's, an unreadable state). Say which.
+            view.feedback = Some(packages.machine.reason.clone().unwrap_or_else(|| {
+                "Nothing to apply — Universal Control and Spotlight are where [machine] wants them."
+                    .to_string()
+            }));
+        } else if !machine_apply && !packages.manager_enabled {
             // The projection's detail line names the TRUE inert cause
             // (ATPKG_DISABLE opt-out vs no pinned root key) — reuse it rather
             // than asserting one cause here.
@@ -3527,6 +3557,12 @@ fn native_advanced_effect(key: &str) -> Option<AdvancedEffectPath> {
         | prefs::EDIT_PACKAGES_AUTO_UPDATE
         | prefs::EDIT_PACKAGES_AUTO_INSTALL
         | prefs::EDIT_PACKAGES_SEED_INSTALL => Some(Effect::PackageRuntime),
+        // The [machine] host settings actuate only on macOS (`defaults`, Spotlight):
+        // ordinary Security rows there, Modified/Manual-only elsewhere — the
+        // FONT_THICKEN pattern.
+        prefs::EDIT_MACHINE_UNIVERSAL_CONTROL | prefs::EDIT_MACHINE_SPOTLIGHT_NOINDEX => {
+            cfg!(target_os = "macos").then_some(Effect::PackageRuntime)
+        }
         _ => None,
     }
 }
@@ -3883,6 +3919,17 @@ impl NativeAppModel for SettingsApp {
                 shortcut: None,
                 enabled: packages.actions_enabled,
             });
+        }
+        if view.route == SettingsRoute::Security {
+            let packages = self.packages.projection();
+            if packages.machine.supported {
+                out.push(Command {
+                    id: ActionId::new("machine/apply"),
+                    title: "This Mac: Apply Machine Settings Now".to_string(),
+                    shortcut: None,
+                    enabled: packages.machine.apply_enabled,
+                });
+            }
         }
         if view.route == SettingsRoute::About {
             out.push(Command {
@@ -6678,14 +6725,14 @@ fn page(
 ) -> UiNode {
     let global_search = !state.search.trim().is_empty();
     let children = if global_search {
-        settings_fields_page(state, false, cx, width)
+        settings_fields_page(state, false, cx, width, packages)
     } else if width == SettingsWidth::Compact && state.compact_navigation {
         compact_navigation_page(state, cx)
     } else {
         match state.route {
             SettingsRoute::Home => top_settings_page(state, width, cx),
             SettingsRoute::Manual => manual_page(state, cx, width),
-            SettingsRoute::Modified => settings_fields_page(state, true, cx, width),
+            SettingsRoute::Modified => settings_fields_page(state, true, cx, width, packages),
             SettingsRoute::TabColor => tab_color_page(state, width),
             SettingsRoute::Wallpaper => wallpaper_page(state, width),
             SettingsRoute::SoftwareUpdate => update_page(
@@ -6704,7 +6751,7 @@ fn page(
                 cx.viewport.height,
             ),
             SettingsRoute::About => about_page(state, width, cx.viewport.width, cx.viewport.height),
-            _ => settings_fields_page(state, false, cx, width),
+            _ => settings_fields_page(state, false, cx, width, packages),
         }
     };
     let maximum = page_maximum(state.route, width);
@@ -10251,6 +10298,9 @@ struct LandscapeResults<'slice, 'field> {
     /// landscape pager never showed it at all (measured at 624x348 on
     /// 2026-09-10): it is a slice of its own now, first after the preview.
     macos_access: Option<&'slice MacosAccess>,
+    /// The "This Mac" card, when the Security page carries one — its own slice
+    /// after the access block, for the same reason.
+    machine: Option<&'slice PackagesProjection>,
 }
 
 fn settings_fields_landscape_page(
@@ -10266,12 +10316,15 @@ fn settings_fields_landscape_page(
         manual_overrides,
         show_renderer_preview,
         macos_access,
+        machine,
     } = results;
     let preview_slices = usize::from(show_renderer_preview);
     let access_slices = usize::from(macos_access.is_some());
+    let machine_slices = usize::from(machine.is_some());
     let manual_search_slices = usize::from(manual_matches > 0);
     let total = preview_slices
         + access_slices
+        + machine_slices
         + manual_search_slices
         + manual_overrides.len()
         + fields.len();
@@ -10330,7 +10383,19 @@ fn settings_fields_landscape_page(
             budget,
         );
     }
-    let mut cursor = offset.saturating_sub(preview_slices + access_slices);
+    if let Some(packages) = machine
+        && offset == preview_slices + access_slices
+    {
+        return compact_landscape_result_page(
+            label,
+            offset,
+            total,
+            machine_card(packages, true),
+            machine_card_height(&packages.machine, true),
+            budget,
+        );
+    }
+    let mut cursor = offset.saturating_sub(preview_slices + access_slices + machine_slices);
     if manual_matches > 0 {
         if cursor == 0 {
             let (node, height) = manual_search_result_landscape_node(manual_matches);
@@ -10385,6 +10450,7 @@ fn settings_fields_page(
     modified_only: bool,
     cx: &ViewCx<'_>,
     width: SettingsWidth,
+    packages: &PackagesProjection,
 ) -> Vec<UiNode> {
     configure_choice_picker_for_width(state, width);
     let query = state.search.trim().to_ascii_lowercase();
@@ -10454,6 +10520,22 @@ fn settings_fields_page(
     // 700x420 window paged "1–0 of N" — the block and no toggle, on every page.
     let show_macos_access_now =
         show_macos_access && (!compact_macos_access || state.page_scroll == 0);
+    // THE "THIS MAC" CARD: the [machine] host settings as the co-located atpkg
+    // measured them, with Apply now. Same slot rules as the macOS access block —
+    // Security route, no search, no picker — and only on macOS once the host's
+    // machine read has completed, so a headless instance, a unit test and every
+    // non-macOS build render the ordinary page unchanged.
+    let show_machine_card = !modified_only
+        && !global_search
+        && prefers_machine_card(state, &packages.machine)
+        && state.choice_picker.is_none()
+        && !show_renderer_preview_now
+        && !show_smart_title_health;
+    let compact_machine_card = show_machine_card
+        && width == SettingsWidth::Compact
+        && (cx.viewport.height <= 420.0 || settings_text_scale() > 1.25);
+    let show_machine_card_now =
+        show_machine_card && (!compact_machine_card || state.page_scroll == 0);
     let display_faces_showcase =
         display_faces_showcase_eligible.then(|| display_faces_card(state, width));
     // THE CURSOR KITTY CARD. Unlike the Display Faces showcase it can never be
@@ -10597,6 +10679,7 @@ fn settings_fields_page(
                 manual_overrides: &manual_overrides,
                 show_renderer_preview,
                 macos_access: state.macos_access.as_ref().filter(|_| show_macos_access),
+                machine: show_machine_card.then_some(packages),
             },
             budget,
         );
@@ -10683,6 +10766,10 @@ fn settings_fields_page(
         .filter(|_| show_macos_access_now)
     {
         macos_access_height(access, compact_macos_access)
+    } else {
+        0.0
+    } + if show_machine_card_now {
+        machine_card_height(&packages.machine, compact_machine_card)
     } else {
         0.0
     };
@@ -10932,6 +11019,9 @@ fn settings_fields_page(
         .filter(|_| show_macos_access_now)
     {
         out.push(macos_access_card(access, compact_macos_access));
+    }
+    if show_machine_card_now {
+        out.push(machine_card(packages, compact_machine_card));
     }
     if let Some((card, _height)) = display_faces_showcase {
         out.push(card);
@@ -13453,8 +13543,8 @@ const fn macos_access_row_label(row: crate::consent_warmup::WarmupRow) -> &'stat
 /// THE WHOLE STRING TABLE, as a total function of the published facts.
 ///
 /// Read the module header before changing a sentence here: the coverage line is
-/// gated on measured evidence, there is deliberately no scope sentence, and
-/// nothing promises that interruptions are eliminated.
+/// the service rows distinguish Apple's documented host coverage from measured
+/// propagation, and nothing promises that interruptions are eliminated.
 pub(crate) fn macos_access_copy(access: &MacosAccess) -> MacosAccessCopy {
     let headline = if !access.enabled {
         "File access \u{2014} not checked. aterm's privacy checks are switched off in aterm.toml."
@@ -13506,15 +13596,17 @@ pub(crate) fn macos_access_copy(access: &MacosAccess) -> MacosAccessCopy {
     // unproven for exactly that — an argument against the fix, on the screen
     // that exists to confirm it. What is documented is stated as documented;
     // what is measured is stated per service in the rows below; nothing is
-    // claimed as covered while the measurement is unrun.
+    // claimed as measured while the measurement is unrun. The app-data row
+    // separately names Apple's documented coverage for a confirmed host grant.
     let coverage = if access.evidence.fda_coverage_measured {
         "Full Disk Access is the single grant macOS offers for this, and its reach was measured on \
          this Mac: the rows below and aterm ctl privacy list exactly what the measurement found."
     } else {
         "Full Disk Access is the single grant macOS offers for this. Apple documents it as the \
          grant behind the \"access data from other applications\" request a program run in aterm \
-         can raise; aterm has not measured on this Mac what it reaches, and it does not reach \
-         cloud-storage folders."
+         can raise. The app-data row below reflects aterm's own access check; aterm has not \
+         measured its reach to other service classes or existing sessions on this Mac. \
+         Cloud-storage folders remain separate."
     };
     let identity = {
         let posture = match access.install {
@@ -13525,7 +13617,7 @@ pub(crate) fn macos_access_copy(access: &MacosAccess) -> MacosAccessCopy {
             _ => "at a location aterm could not read",
         };
         let consequence = match access.install {
-            "installed" => "a grant made for this path applies to it.",
+            "installed" => "check the Full Disk Access entry for this installed app.",
             _ => {
                 "a grant made for the copy in Applications does not reach this one; move it \
                   there and open that copy."
@@ -13543,8 +13635,9 @@ pub(crate) fn macos_access_copy(access: &MacosAccess) -> MacosAccessCopy {
         );
         if access.sessions_adopted > 0 {
             text.push_str(&format!(
-                " {} of {} sessions were taken over from a previous aterm copy and are attributed \
-                 to it.",
+                " {} of {} sessions kept running across an update. This check does not establish \
+                 their access. A new tab starts a fresh session under the running copy; existing \
+                 work can keep running.",
                 access.sessions_adopted, access.sessions_total
             ));
         }
@@ -13553,6 +13646,10 @@ pub(crate) fn macos_access_copy(access: &MacosAccess) -> MacosAccessCopy {
     let services = {
         let mut rows = Vec::new();
         for service in access.covers.iter() {
+            if *service == "app-data" && !access.evidence.fda_coverage_measured {
+                rows.push("Other applications' data \u{2014} Full Disk Access confirmed for the observing aterm host; Apple-documented coverage".to_string());
+                continue;
+            }
             rows.push(format!(
                 "{} \u{2014} measured: Full Disk Access applies",
                 macos_access_service_label(service)
@@ -13589,8 +13686,19 @@ pub(crate) fn macos_access_copy(access: &MacosAccess) -> MacosAccessCopy {
         "For the services measured as covered, macOS is not expected to interrupt a program run in \
          aterm."
     };
-    let route = crate::menu::privacy_settings_path_words(crate::menu::PrivacyPane::FullDiskAccess)
-        .to_string();
+    let mut route =
+        crate::menu::privacy_settings_path_words(crate::menu::PrivacyPane::FullDiskAccess)
+            .to_string();
+    if access.install == "installed"
+        && let Some(bundle) = access.running.as_deref().and_then(|path| {
+            aterm_containment::consent::app_bundle_root(std::path::Path::new(path))
+        })
+    {
+        route.push_str(&format!(
+            " \u{2014} enable {}; use + to add it if absent. App Management is a different setting.",
+            bundle.display()
+        ));
+    }
     let observation = "aterm reports only what its own check observed, never the switch in System \
                        Settings: a switch that reads on while every check quietly fails is exactly \
                        the failure worth seeing.";
@@ -13932,6 +14040,164 @@ fn macos_access_card(access: &MacosAccess, compact: bool) -> UiNode {
     .layout(
         Layout::column()
             .height(Length::Fixed(macos_access_height(access, compact)))
+            .padding(Insets::all(12.0))
+            .gap(0.0)
+            .clipped(),
+    )
+    .children(children)
+}
+
+/// The Security page's "This Mac" card's action id (the Apply now button and the
+/// contextual command share it).
+pub(crate) const MACHINE_APPLY: &str = "machine/apply";
+
+/// Whether the Security page carries the "This Mac" card right now: macOS only,
+/// and only once the host's machine read has completed — a headless instance, a
+/// unit test and every non-macOS build stay without it rather than showing an
+/// invented posture.
+fn prefers_machine_card(state: &SettingsViewState, machine: &MachineProjection) -> bool {
+    state.route == SettingsRoute::Security
+        && state.search.trim().is_empty()
+        && machine.supported
+        && machine.observed
+}
+
+/// The card's text rows in order: `(key, text, role, style)`. Compact keeps the two
+/// measured lines and whatever is in the way; the tall card adds the memory lines.
+fn machine_card_lines(
+    machine: &MachineProjection,
+    compact: bool,
+) -> Vec<(String, String, SemanticRole, StyleRef)> {
+    let settled = if machine.nothing_to_apply {
+        StyleRef::Success
+    } else {
+        StyleRef::Primary
+    };
+    let mut lines = vec![
+        (
+            "settings/machine/universal-control".to_string(),
+            machine.universal_control.clone(),
+            SemanticRole::Status,
+            settled,
+        ),
+        (
+            "settings/machine/spotlight".to_string(),
+            machine.spotlight.clone(),
+            SemanticRole::Status,
+            settled,
+        ),
+    ];
+    if let Some(reason) = machine.reason.clone() {
+        lines.push((
+            "settings/machine/home".to_string(),
+            reason,
+            SemanticRole::Status,
+            StyleRef::Danger,
+        ));
+    }
+    if let Some(saved) = machine.saved.clone() {
+        lines.push((
+            "settings/machine/saved".to_string(),
+            saved,
+            SemanticRole::Status,
+            StyleRef::Primary,
+        ));
+    }
+    if machine.refreshing {
+        lines.push((
+            "settings/machine/refreshing".to_string(),
+            "Reading the machine state\u{2026}".to_string(),
+            SemanticRole::Status,
+            StyleRef::Quiet,
+        ));
+    } else if !machine.next.is_empty() {
+        lines.push((
+            "settings/machine/next".to_string(),
+            machine.next.clone(),
+            SemanticRole::Status,
+            settled,
+        ));
+    }
+    if !compact {
+        lines.push((
+            "settings/machine/last-applied".to_string(),
+            machine.last_change.clone(),
+            SemanticRole::Text,
+            StyleRef::Quiet,
+        ));
+        if let Some(verdict) = machine.last_verdict.clone() {
+            lines.push((
+                "settings/machine/verdict".to_string(),
+                format!("Last apply: {verdict}"),
+                SemanticRole::Text,
+                StyleRef::Quiet,
+            ));
+        }
+    }
+    lines
+}
+
+/// Exact authored height, so the page budget sees the same card the renderer
+/// draws.
+fn machine_card_height(machine: &MachineProjection, compact: bool) -> f32 {
+    let scale = settings_text_scale();
+    let line_height = 24.0_f32.max(20.0 * scale);
+    let heading_height = 28.0_f32.max(22.0 * scale);
+    let lines = machine_card_lines(machine, compact).len();
+    heading_height + lines as f32 * line_height + scaled_control_height() + 12.0 + 24.0
+}
+
+/// The "This Mac" card: what the co-located atpkg MEASURED about the two
+/// `[machine]` checks (Universal Control, Spotlight), what this launch changed,
+/// and Apply now. Every word comes from the packages projection so pixels,
+/// accessibility and introspection agree.
+fn machine_card(packages: &PackagesProjection, compact: bool) -> UiNode {
+    let machine = &packages.machine;
+    let line_height = 24.0_f32.max(20.0 * settings_text_scale());
+    let heading_height = 28.0_f32.max(22.0 * settings_text_scale());
+    let mut children = vec![
+        UiNode::new(
+            "settings/machine/heading",
+            UiContent::Text(TextSpec {
+                text: "THIS MAC".to_string(),
+                role: SemanticRole::Heading,
+                style: StyleRef::Quiet,
+            }),
+        )
+        .layout(Layout::default().height(Length::Fixed(heading_height))),
+    ];
+    for (key, text, role, style) in machine_card_lines(machine, compact) {
+        children.push(
+            UiNode::new(key, UiContent::Text(TextSpec { text, role, style }))
+                .layout(Layout::default().height(Length::Fixed(line_height))),
+        );
+    }
+    let applying = packages.busy == Some(PackagesBusy::MachineApply);
+    children.push(
+        UiNode::new(
+            "settings/machine/actions",
+            UiContent::Group(GroupSpec::new("This Mac actions")),
+        )
+        .layout(
+            Layout::row()
+                .width(Length::Fill)
+                .height(Length::Fixed(scaled_control_height()))
+                .gap(8.0),
+        )
+        .children(vec![macos_access_button(
+            MACHINE_APPLY,
+            "Apply now",
+            machine.apply_enabled && !applying,
+            applying,
+        )]),
+    );
+    UiNode::new(
+        "settings/machine",
+        UiContent::Group(GroupSpec::new("This Mac").style(StyleRef::Secondary)),
+    )
+    .layout(
+        Layout::column()
+            .height(Length::Fixed(machine_card_height(machine, compact)))
             .padding(Insets::all(12.0))
             .gap(0.0)
             .clipped(),
@@ -20530,9 +20796,9 @@ mod tests {
         "will not be interrupted",
     ];
 
-    /// Words that would state how far a grant reaches. §7 S1 has not been run,
-    /// so `FdaScope` is `Unknown` and §3.4's escalation says: no scope sentence
-    /// in the UI at all. Neither pre-drafted variant may appear.
+    /// Words that would overstate propagation of a changed grant. §7 S1 has
+    /// not been run; the current host's successful probe is not evidence that
+    /// an existing or future session has gained access.
     const SCOPE_WORDS: &[&str] = &[
         "this process",
         "sessions started",
@@ -20583,11 +20849,62 @@ mod tests {
         }
     }
 
+    #[test]
+    fn macos_access_app_data_uses_host_authority_without_claiming_adopted_access() {
+        use aterm_containment::FdaScope;
+        for fda in [FdaState::Granted, FdaState::Denied, FdaState::Unknown] {
+            let mut access = access_fixture(fda, DrClass::Identity, FdaScope::Unknown);
+            let split = crate::control_privacy::covers_split(fda, access.evidence);
+            access.covers = split.covers;
+            access.uncovered = split.uncovered;
+            access.unmeasured = split.unmeasured;
+            let copy = macos_access_copy(&access);
+            let app_data = copy
+                .services
+                .iter()
+                .find(|row| row.starts_with("Other applications' data"))
+                .unwrap();
+            if fda == FdaState::Granted {
+                assert!(
+                    app_data.contains("Full Disk Access confirmed for the observing aterm host"),
+                    "{app_data}"
+                );
+                assert!(app_data.contains("Apple-documented coverage"), "{app_data}");
+                assert!(!app_data.contains("not measured"), "{app_data}");
+            } else {
+                assert!(app_data.contains("not measured"), "{app_data}");
+                assert!(!app_data.contains("confirmed"), "{app_data}");
+            }
+            assert!(copy.responsible.contains("does not establish their access"));
+        }
+    }
+
     fn denied_rows() -> Vec<MacosAccessRow> {
         Folder::ALL
             .iter()
             .map(|folder| (*folder, crate::consent_warmup::WarmupRow::Denied))
             .collect()
+    }
+
+    #[test]
+    fn macos_access_recovery_names_the_bundle_without_claiming_adopted_access() {
+        let access = access_fixture(
+            FdaState::Denied,
+            DrClass::Identity,
+            aterm_containment::FdaScope::Unknown,
+        );
+        let copy = macos_access_copy(&access);
+        assert!(copy.headline.contains("may already be enabled"));
+        assert!(copy.route.contains("/Applications/fixture.app"));
+        assert!(
+            !copy.route.contains("Contents/MacOS"),
+            "Settings takes the app, not its executable"
+        );
+        assert!(copy.route.contains("App Management is a different setting"));
+        assert!(!copy.identity.contains("a grant made for this path applies"));
+        assert!(copy.responsible.contains("does not establish their access"));
+        assert!(copy.responsible.contains("A new tab"));
+        assert!(copy.responsible.contains("existing work can keep running"));
     }
 
     /// THE MATRIX §3.4 asks for: `{granted, denied, unknown}` ×
@@ -24314,6 +24631,84 @@ mod tests {
         )
     }
 
+    /// A live packages snapshot whose machine read has ALSO completed — the exact
+    /// path the host takes (`replace_machine_state` after the status worker), so
+    /// the card is fed the way it is fed in production.
+    fn live_packages_state_with_machine(
+        busy: Option<crate::packages_screen::PackagesBusy>,
+        machine: Result<atpkg::machine::MachineState, String>,
+    ) -> PackagesState {
+        live_packages_state_with_machine_reads(busy, true, None, vec![machine])
+    }
+
+    /// The general form: `manager_enabled` and a collection error seed the report
+    /// (the package-manager gate), and `reads` are reduced in order — so a read
+    /// error AFTER a good record is built the way the host builds it.
+    fn live_packages_state_with_machine_reads(
+        busy: Option<crate::packages_screen::PackagesBusy>,
+        manager_enabled: bool,
+        collection_error: Option<&str>,
+        reads: Vec<Result<atpkg::machine::MachineState, String>>,
+    ) -> PackagesState {
+        let mut programs = std::collections::BTreeMap::new();
+        programs.insert(
+            "ay".to_string(),
+            atpkg::ProgramStatus {
+                installed_build: Some(1971),
+                state: "active".to_string(),
+                tree_root: String::new(),
+            },
+        );
+        let status = atpkg::Status {
+            schema: 1,
+            updated_at: "2026-07-21T00:00:00Z".to_string(),
+            enabled: true,
+            index_source: "alabsystems/aterm".to_string(),
+            outcome: "up to date".to_string(),
+            seams: Vec::new(),
+            last_success_at: String::new(),
+            programs,
+        };
+        let mut service = crate::packages_screen::PackagesService::new();
+        let sequence = service.begin(None).unwrap();
+        let mut report = crate::packages_screen::PackagesStatusReport::from_parts(
+            true,
+            manager_enabled,
+            "fp".to_string(),
+            Some(&status),
+            &[],
+        );
+        report.collection_error = collection_error.map(str::to_string);
+        assert!(service.finish(
+            sequence,
+            crate::packages_screen::PackagesWorkerCompletion::refresh(report),
+        ));
+        for read in reads {
+            let _ = service.replace_machine_state(read);
+        }
+        if busy.is_some() {
+            let _ = service.begin(busy).unwrap();
+        }
+        service.state(true, true, true, false, true)
+    }
+
+    fn machine_state_fixture(
+        uc: atpkg::machine::UcPosture,
+        would_migrate: usize,
+        home: atpkg::machine::HomePosture,
+    ) -> atpkg::machine::MachineState {
+        atpkg::machine::MachineState {
+            universal_control: uc,
+            policy: atpkg::config::UniversalControlPolicy::Off,
+            spotlight_noindex: true,
+            exposed: would_migrate + 1,
+            hidden: 8,
+            would_migrate,
+            scan_complete: true,
+            home,
+        }
+    }
+
     fn failed_packages_state() -> PackagesState {
         let mut service = crate::packages_screen::PackagesService::new();
         let old = crate::packages_screen::PackagesStatusReport::from_parts(
@@ -24595,6 +24990,516 @@ mod tests {
                 .label
                 .contains("Automatic maintenance Saved Off")
         );
+    }
+
+    /// The Security page's "This Mac" card exists only on macOS and only once the
+    /// host's machine read has completed; it carries the measured lines, the
+    /// "Apply now would" verdict, the last-change memory and the Apply now button
+    /// (enabled exactly when the verdict says something is left to do); and it is
+    /// absent from Modified and from a global search. On a short landscape window
+    /// it is a slice of its own, never shed.
+    #[test]
+    fn the_security_page_paints_the_machine_card_only_on_macos_once_observed() {
+        use atpkg::machine::{HomePosture, UcPosture};
+        let (mut runtime, instance, view) = setup();
+        {
+            let Some(AppViewState::Settings(state)) = runtime.view_state_mut(view) else {
+                unreachable!();
+            };
+            state.navigate(SettingsRoute::Security);
+        }
+        let cx = view_cx_at(1100.0, 760.0);
+        // Unobserved: no card on any platform — nothing invented.
+        assert!(runtime.replace_settings_packages(live_packages_state(None), 2));
+        let compiled = compile_settings_view(&runtime, instance, view, &cx);
+        compiled.validate_parity().unwrap();
+        assert!(
+            compiled
+                .semantic(&UiKey::new("settings/machine/heading"))
+                .is_none(),
+            "no machine read yet ⇒ no card"
+        );
+
+        // Observed with something left to do.
+        assert!(runtime.replace_settings_packages(
+            live_packages_state_with_machine(
+                None,
+                Ok(machine_state_fixture(
+                    UcPosture::Default,
+                    2,
+                    HomePosture::Account
+                )),
+            ),
+            3,
+        ));
+        let compiled = compile_settings_view(&runtime, instance, view, &cx);
+        compiled.validate_parity().unwrap();
+        let heading = compiled.semantic(&UiKey::new("settings/machine/heading"));
+        assert_eq!(
+            heading.is_some(),
+            cfg!(target_os = "macos"),
+            "the card is a macOS host-settings surface"
+        );
+        if !cfg!(target_os = "macos") {
+            return;
+        }
+        let text = |key: &str| {
+            compiled
+                .semantic(&UiKey::new(key))
+                .unwrap_or_else(|| panic!("{key} is painted"))
+                .label
+                .clone()
+        };
+        assert_eq!(
+            text("settings/machine/universal-control"),
+            "Universal Control: at the OS default — the cursor roams to other Macs and iPads"
+        );
+        assert_eq!(
+            text("settings/machine/spotlight"),
+            "Build output: 8 target dirs hidden, 3 open to Spotlight — 2 a pass would hide"
+        );
+        assert_eq!(
+            text("settings/machine/next"),
+            "Apply now would set: Universal Control off for this host; 2 target dir(s) hidden from Spotlight"
+        );
+        assert_eq!(
+            text("settings/machine/last-applied"),
+            "No change recorded this launch"
+        );
+        assert!(
+            compiled
+                .semantic(&UiKey::new("settings/machine/home"))
+                .is_none(),
+            "nothing in the way ⇒ no reason line"
+        );
+        let apply = compiled
+            .semantic(&UiKey::new(MACHINE_APPLY))
+            .expect("Apply now is a hit target");
+        assert!(apply.state.as_ref().is_some_and(|s| s.enabled));
+
+        // Nothing left: the verdict line says so and the button is disabled.
+        assert!(runtime.replace_settings_packages(
+            live_packages_state_with_machine(
+                None,
+                Ok(machine_state_fixture(
+                    UcPosture::Disabled,
+                    0,
+                    HomePosture::Account
+                )),
+            ),
+            4,
+        ));
+        let compiled = compile_settings_view(&runtime, instance, view, &cx);
+        compiled.validate_parity().unwrap();
+        assert_eq!(
+            compiled
+                .semantic(&UiKey::new("settings/machine/universal-control"))
+                .unwrap()
+                .label,
+            "Universal Control: disabled on this Mac"
+        );
+        assert!(
+            compiled
+                .semantic(&UiKey::new("settings/machine/next"))
+                .unwrap()
+                .label
+                .starts_with("Nothing to apply")
+        );
+        assert!(
+            compiled
+                .semantic(&UiKey::new(MACHINE_APPLY))
+                .unwrap()
+                .state
+                .as_ref()
+                .is_some_and(|s| !s.enabled)
+        );
+
+        // A home mismatch names the reason and disables the button.
+        assert!(runtime.replace_settings_packages(
+            live_packages_state_with_machine(
+                None,
+                Ok(machine_state_fixture(
+                    UcPosture::Default,
+                    2,
+                    HomePosture::Mismatch
+                )),
+            ),
+            5,
+        ));
+        let compiled = compile_settings_view(&runtime, instance, view, &cx);
+        compiled.validate_parity().unwrap();
+        assert!(
+            compiled
+                .semantic(&UiKey::new("settings/machine/home"))
+                .unwrap()
+                .label
+                .starts_with("Not applied here")
+        );
+        assert!(
+            compiled
+                .semantic(&UiKey::new(MACHINE_APPLY))
+                .unwrap()
+                .state
+                .as_ref()
+                .is_some_and(|s| !s.enabled)
+        );
+
+        // A read error after a good record: the measured lines say they are prior,
+        // the reason line names the error, and Apply now is off.
+        assert!(runtime.replace_settings_packages(
+            live_packages_state_with_machine_reads(
+                None,
+                true,
+                None,
+                vec![
+                    Ok(machine_state_fixture(
+                        UcPosture::Default,
+                        2,
+                        HomePosture::Account
+                    )),
+                    Err("atpkg machine printed no state".to_string()),
+                ],
+            ),
+            6,
+        ));
+        let compiled = compile_settings_view(&runtime, instance, view, &cx);
+        compiled.validate_parity().unwrap();
+        assert!(
+            compiled
+                .semantic(&UiKey::new("settings/machine/universal-control"))
+                .unwrap()
+                .label
+                .ends_with("(from the last successful read)")
+        );
+        assert!(
+            compiled
+                .semantic(&UiKey::new("settings/machine/home"))
+                .unwrap()
+                .label
+                .starts_with("Could not read the machine state")
+        );
+        assert!(
+            compiled
+                .semantic(&UiKey::new(MACHINE_APPLY))
+                .unwrap()
+                .state
+                .as_ref()
+                .is_some_and(|s| !s.enabled)
+        );
+
+        // Modified and a global search never carry the card.
+        {
+            let Some(AppViewState::Settings(state)) = runtime.view_state_mut(view) else {
+                unreachable!();
+            };
+            state.navigate(SettingsRoute::Modified);
+        }
+        let compiled = compile_settings_view(&runtime, instance, view, &cx);
+        assert!(
+            compiled
+                .semantic(&UiKey::new("settings/machine/heading"))
+                .is_none()
+        );
+        {
+            let Some(AppViewState::Settings(state)) = runtime.view_state_mut(view) else {
+                unreachable!();
+            };
+            state.navigate(SettingsRoute::Security);
+            state.search = "spotlight".to_string();
+        }
+        let compiled = compile_settings_view(&runtime, instance, view, &cx);
+        assert!(
+            compiled
+                .semantic(&UiKey::new("settings/machine/heading"))
+                .is_none(),
+            "a search lists rows, not the card"
+        );
+
+        // Short landscape (624x348 takes the landscape pager): page 0 is the card.
+        {
+            let Some(AppViewState::Settings(state)) = runtime.view_state_mut(view) else {
+                unreachable!();
+            };
+            state.search.clear();
+            state.page_scroll = 0;
+        }
+        let landscape = view_cx_at(624.0, 348.0);
+        let compiled = compile_settings_view(&runtime, instance, view, &landscape);
+        compiled.validate_parity().unwrap();
+        assert!(
+            compiled
+                .semantic(&UiKey::new("settings/machine/heading"))
+                .is_some(),
+            "the landscape pager keeps the card as its own slice"
+        );
+        assert!(
+            compiled.semantic(&UiKey::new(MACHINE_APPLY)).is_some(),
+            "and Apply now is a hit target there"
+        );
+    }
+
+    /// `machine/apply` goes through the same reducer as every package verb: refused
+    /// honestly before the machine is read (no effect minted), dispatched as the
+    /// typed `MachineApply` request when the measured state says something is left
+    /// to do, settled through PackagesFinished, refused while a verb runs, and
+    /// refused — with the verdict — when there is nothing to apply.
+    #[test]
+    fn machine_apply_gates_dispatch_and_finish() {
+        use atpkg::machine::{HomePosture, UcPosture};
+        let (mut runtime, instance, view) = setup();
+        runtime
+            .dispatch(
+                instance,
+                view,
+                AppEvent::Action(ActionInvocation {
+                    id: route_action(SettingsRoute::Security),
+                    value: None,
+                }),
+            )
+            .unwrap();
+        let apply = || {
+            AppEvent::Action(ActionInvocation {
+                id: ActionId::new(MACHINE_APPLY),
+                value: None,
+            })
+        };
+        let no_effect = |result: &crate::native_app::DispatchOutcome| {
+            result
+                .effects
+                .iter()
+                .all(|effect| !matches!(effect, AppEffect::Packages { .. }))
+        };
+        let feedback = |runtime: &NativeRuntime| -> String {
+            let Some(AppViewState::Settings(state)) = runtime.view_state(view) else {
+                unreachable!();
+            };
+            state.feedback.clone().unwrap_or_default()
+        };
+
+        // Unobserved (fresh controller): refuse without an effect.
+        let refused = runtime.dispatch(instance, view, apply()).unwrap();
+        assert!(
+            no_effect(&refused),
+            "no effect before the first observation"
+        );
+        assert!(feedback(&runtime).contains("still being read"));
+
+        // Packages observed, machine not yet read: still refused, in machine words.
+        assert!(runtime.replace_settings_packages(live_packages_state(None), 3));
+        let refused = runtime.dispatch(instance, view, apply()).unwrap();
+        assert!(no_effect(&refused));
+        if cfg!(target_os = "macos") {
+            assert!(
+                feedback(&runtime).contains("machine state is still being read"),
+                "{}",
+                feedback(&runtime)
+            );
+        } else {
+            assert!(feedback(&runtime).contains("macOS host settings"));
+            return;
+        }
+
+        // Nothing to apply: refused with the verdict, no effect.
+        assert!(runtime.replace_settings_packages(
+            live_packages_state_with_machine(
+                None,
+                Ok(machine_state_fixture(
+                    UcPosture::Disabled,
+                    0,
+                    HomePosture::Account
+                )),
+            ),
+            4,
+        ));
+        let refused = runtime.dispatch(instance, view, apply()).unwrap();
+        assert!(no_effect(&refused));
+        assert!(
+            feedback(&runtime).starts_with("Nothing to apply"),
+            "{}",
+            feedback(&runtime)
+        );
+
+        // A home mismatch: refused with the reason.
+        assert!(runtime.replace_settings_packages(
+            live_packages_state_with_machine(
+                None,
+                Ok(machine_state_fixture(
+                    UcPosture::Default,
+                    2,
+                    HomePosture::Mismatch
+                )),
+            ),
+            5,
+        ));
+        let refused = runtime.dispatch(instance, view, apply()).unwrap();
+        assert!(no_effect(&refused));
+        assert!(
+            feedback(&runtime).starts_with("Not applied here"),
+            "{}",
+            feedback(&runtime)
+        );
+
+        // Something left to do: the typed request reaches the host executor.
+        assert!(runtime.replace_settings_packages(
+            live_packages_state_with_machine(
+                None,
+                Ok(machine_state_fixture(
+                    UcPosture::Default,
+                    2,
+                    HomePosture::Account
+                )),
+            ),
+            6,
+        ));
+        let accepted = runtime.dispatch(instance, view, apply()).unwrap();
+        let operation = accepted
+            .effects
+            .iter()
+            .find_map(|effect| match effect {
+                AppEffect::Packages { request, reply } => {
+                    assert_eq!(*request, crate::native_app::PackagesRequest::MachineApply);
+                    Some(reply.operation)
+                }
+                _ => None,
+            })
+            .expect("a live machine dispatches the machine apply");
+        assert_eq!(feedback(&runtime), "Applying the machine settings…");
+        let Some(AppViewState::Settings(state)) = runtime.view_state(view) else {
+            unreachable!();
+        };
+        assert_eq!(state.pending.len(), 1);
+        runtime
+            .dispatch(
+                instance,
+                view,
+                AppEvent::PackagesFinished {
+                    operation,
+                    outcome: crate::native_app::PackagesOutcome::Accepted,
+                },
+            )
+            .unwrap();
+        let Some(AppViewState::Settings(state)) = runtime.view_state(view) else {
+            unreachable!();
+        };
+        assert!(state.pending.is_empty());
+        assert!(state.feedback.as_deref().unwrap().contains("accepted"));
+
+        // Busy with the apply itself: a second press is refused without an effect.
+        assert!(runtime.replace_settings_packages(
+            live_packages_state_with_machine(
+                Some(crate::packages_screen::PackagesBusy::MachineApply),
+                Ok(machine_state_fixture(
+                    UcPosture::Default,
+                    2,
+                    HomePosture::Account
+                )),
+            ),
+            7,
+        ));
+        let busy = runtime.dispatch(instance, view, apply()).unwrap();
+        assert!(no_effect(&busy), "a running verb blocks a second one");
+        assert!(
+            feedback(&runtime).contains("already running"),
+            "{}",
+            feedback(&runtime)
+        );
+    }
+
+    /// With the package manager switched off (ATPKG_DISABLE / no pinned root key)
+    /// or the status collection torn, `packages/check` is refused with the true
+    /// cause — and `machine/apply`, a local verb, still dispatches.
+    #[test]
+    fn machine_apply_dispatches_with_the_manager_off() {
+        use atpkg::machine::{HomePosture, UcPosture};
+        for (manager_enabled, collection_error) in
+            [(false, None), (true, Some("status.toml: torn record"))]
+        {
+            let (mut runtime, instance, view) = setup();
+            runtime
+                .dispatch(
+                    instance,
+                    view,
+                    AppEvent::Action(ActionInvocation {
+                        id: route_action(SettingsRoute::Security),
+                        value: None,
+                    }),
+                )
+                .unwrap();
+            assert!(runtime.replace_settings_packages(
+                live_packages_state_with_machine_reads(
+                    None,
+                    manager_enabled,
+                    collection_error,
+                    vec![Ok(machine_state_fixture(
+                        UcPosture::Default,
+                        2,
+                        HomePosture::Account
+                    ))],
+                ),
+                3,
+            ));
+            let outcome = runtime
+                .dispatch(
+                    instance,
+                    view,
+                    AppEvent::Action(ActionInvocation {
+                        id: ActionId::new(MACHINE_APPLY),
+                        value: None,
+                    }),
+                )
+                .unwrap();
+            let dispatched = outcome.effects.iter().any(|effect| {
+                matches!(
+                    effect,
+                    AppEffect::Packages {
+                        request: crate::native_app::PackagesRequest::MachineApply,
+                        ..
+                    }
+                )
+            });
+            let Some(AppViewState::Settings(state)) = runtime.view_state(view) else {
+                unreachable!();
+            };
+            let feedback = state.feedback.clone().unwrap_or_default();
+            if cfg!(target_os = "macos") {
+                assert!(
+                    dispatched,
+                    "manager_enabled={manager_enabled} error={collection_error:?}: {feedback}"
+                );
+                assert_eq!(feedback, "Applying the machine settings…");
+            } else {
+                assert!(!dispatched);
+                assert!(feedback.contains("macOS host settings"), "{feedback}");
+                continue;
+            }
+            if !manager_enabled {
+                // The package verb in the same state is still refused, with the cause.
+                let refused = runtime
+                    .dispatch(
+                        instance,
+                        view,
+                        AppEvent::Action(ActionInvocation {
+                            id: ActionId::new("packages/check"),
+                            value: None,
+                        }),
+                    )
+                    .unwrap();
+                assert!(
+                    refused
+                        .effects
+                        .iter()
+                        .all(|effect| !matches!(effect, AppEffect::Packages { .. }))
+                );
+                let Some(AppViewState::Settings(state)) = runtime.view_state(view) else {
+                    unreachable!();
+                };
+                let feedback = state.feedback.clone().unwrap_or_default();
+                assert!(
+                    feedback.contains("ATPKG_DISABLE") || feedback.contains("No package root key"),
+                    "{feedback}"
+                );
+            }
+        }
     }
 
     /// The action reducer refuses honestly (unobserved / busy) without minting
@@ -34556,10 +35461,17 @@ enabled = true
         // not a Manual-only expert key. It sits in the Cursor box beside
         // `cursor_blink`, the row it partly replaces (a warm cursor does not
         // blink), and is searchable as "blink".
+        // THE [MACHINE] HOST SETTINGS (2026-09-14): +2 on macOS only. The owner
+        // asked for "a settings panel for these checks to show confirmation":
+        // `universal_control` and `spotlight_noindex` are applied by the
+        // co-located atpkg at the top of every package pass and by the Security
+        // page's Apply now, and the page's "This Mac" card confirms what the
+        // machine measured. Both actuate only on macOS (`defaults`, Spotlight),
+        // so elsewhere they stay Modified/Manual-only like `font_thicken`.
         assert_eq!(
             ordinary_count,
             if cfg!(target_os = "macos") {
-                56
+                58
             } else if cfg!(windows) {
                 53
             } else {
@@ -34620,6 +35532,9 @@ enabled = true
         ];
         if cfg!(target_os = "macos") {
             group_witnesses.push(("Transparency", prefs::EDIT_BACKGROUND_OPACITY));
+            // The Security page's second box: the [machine] host settings the
+            // "This Mac" card confirms.
+            group_witnesses.push(("This Mac", prefs::EDIT_MACHINE_SPOTLIGHT_NOINDEX));
         }
         group_witnesses.push(("Paste safety", prefs::EDIT_CONFIRM_MULTILINE_PASTE));
         assert_eq!(
@@ -34650,6 +35565,9 @@ enabled = true
             ("Scrollback", "Searchable lines"),
             ("Text direction & width", "right-to-left"),
             ("Permissions", "request access"),
+            // The This Mac box must say the second way its rows apply — the
+            // card's own button — and how each change is undone.
+            ("This Mac", "Apply now"),
             // The Sound box's footnote must name what the VOLUME slider does
             // and does not reach — the reason the bell needed its own row.
             ("Sound", "Volume"),
@@ -37190,6 +38108,18 @@ enabled = true
                 compiled.semantic(&line.key).is_none()
                     && matches!(&line.content, UiContent::Text(_))
             }));
+            // ONE footnote per group box on the page — the Security page carries
+            // Permissions everywhere and, on macOS, the [machine] "This Mac" box
+            // too (2026-09-14); a compact page may show only the first group.
+            let painted_groups = compiled
+                .semantics
+                .iter()
+                .filter_map(|node| node.key.as_str().strip_prefix("settings/row/"))
+                .filter_map(|rest| rest.split_once('/').map(|(_, key)| key))
+                .map(|key| prefs::group_of(key).0)
+                .filter(|group| prefs::group_footnote(group).is_some())
+                .collect::<BTreeSet<_>>();
+            assert!(painted_groups.contains("Permissions"), "{painted_groups:?}");
             assert_eq!(
                 compiled
                     .semantics
@@ -37199,7 +38129,8 @@ enabled = true
                             && node.role == SemanticRole::Status
                     })
                     .count(),
-                1
+                painted_groups.len(),
+                "{viewport_width}×{viewport_height} at {scale}×: {painted_groups:?}"
             );
             let overflow = compiled
                 .paint_audit_lines()

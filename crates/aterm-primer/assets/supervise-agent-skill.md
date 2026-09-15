@@ -86,11 +86,47 @@ idle composer, a limit notice, an Edit/Write/workflow box: no line. Without
 `--auto-reads` the file stays empty for the whole run. Everything else in the
 notes is yours to write.
 
+**Keep a `--journal` too.** `aterm drive watch --journal "$JOURNAL"` (or
+`supervise --journal`) appends one JSON object per line the loop prints — every
+`EVENT`, `APPROVED`, `DISMISSED`, `RECONNECT`, `TIMEOUT` and `EXIT`, with the
+Unix time it was printed, the phase, the seq and the line itself — so the loop
+can be replayed after the fact. The notes are what YOU decided; the journal is
+what the LOOP decided, and without it nothing can say when the worker stopped or
+how long you took to answer (measured 2026-09-14: the `--notes` file held none
+of the watcher's own decisions).
+
 ## The loop
 
-Repeat until **done**, **escalated**, or **budget spent**. `aterm drive` carries the
-mechanical steps (`aterm drive --help`, *SUPERVISING A WORKER*); an older `aterm` answers
-`unknown command 'phase'`, and the manual form under each step is the same loop by hand.
+**Mail is your channel; the screen is the safety net.** With the fabric on (`aterm
+fabric`) and the worker's wake hooks installed (`aterm link hook install claude
+--report-to "@$ME" --accept-from "$ME"` — round 12's hooks, round 14's flag; `$ME` is
+your own sid, `$ATERM_PARENT_SESSION_ID`; `--accept-from` is who may wake it beside
+every human, so it must name YOUR sid, `s-…` — the node id the bridge's own
+`--accept-from` lists is a different list, and without yours a `task` from you is
+delivered but never woken for), the whole loop is four commands:
+
+```sh
+aterm drive watch "@$SID" --mail --auto-reads --journal "$JOURNAL"   # under ONE Monitor: one line per worker turn
+aterm drive task "@$SID" --no-nudge 'run the suite and report'       # assign: the body goes by mail (the hook wakes it)
+aterm ctl @self inbox get <id>                                       # read the report the EVENT turn line names
+aterm drive ledger "@$SID" --journal "$JOURNAL"                      # replay the run
+```
+
+`watch --mail` parks ONE `await inbox` on YOUR session beside the worker's screen (a
+thread with a client of its own; the worker's socket sees nothing more but one screen
+read per 20 s step while an idle point is held; no polling) and
+prints `MAIL id=<n> off=<o> from=<sid> kind=<k> len=<n> [re=<o>]` per delivery as it
+lands. The worker's end-of-turn `report` — its Stop hook posts it — is folded into the
+idle point of the same turn: ONE line, `EVENT turn seq=<n> report=<id> rows=<n>
+<summary>`, per worker turn; you read the body with `inbox get <id>` (2 KB) instead of a
+`report` of the screen (measured 2026-09-14: 689 rows for the same turn). An idle with no
+report inside `--idle-grace` (180 s) prints `EVENT idle-no-report …` — THEN fall back to
+`aterm drive report "@$SID" --final`, and only then. A worker without the hook needs
+`task` WITHOUT `--no-nudge`: it types the one-line `Inbox: task @<off>` as a turn, only
+when the worker is idle (a busy one gets the mail alone: re-nudge at its next EVENT).
+`task --wait` parks for the `answer|report|ack` that carries `re=<off>` and prints it.
+The steps below are the same loop by hand, and what `watch` does for you; an older
+`aterm` answers `unknown command 'phase'`.
 
 1. **SWEEP** — cheapest possible change check.
    ```sh
@@ -155,7 +191,16 @@ mechanical steps (`aterm drive --help`, *SUPERVISING A WORKER*); an older `aterm
    - **done** — ground truth PROVES completion for THIS objective (tests pass, exit 0, the expected artifact exists — whatever the objective's check actually is) → STOP.
    - **escalate** — unsafe, surprising, or you cannot tell → STOP for a human.
 
-   **Read what the worker said since your turn with `aterm drive report "@$SID"`, not
+   **Read the worker's final message with `aterm drive report "@$SID" --final`, not
+   the screen:** `--final` prints only its LAST message block — from its last `⏺`
+   message row through the done row that ended the turn — with no tool rows and no
+   `⎿` output; `--messages` prints every message block and your own `❯` rows the
+   same way. Both keep the header (plus ` view=… kept=<n>`), so `complete=` still
+   says whether anything was lost. Measured 2026-09-14: a manager read whole
+   reports of 689 and 249 rows to find a final message of about 70 — read the view
+   first and the whole report only when you need the tool output.
+
+   **The whole report, when you do need it, is `aterm drive report "@$SID"`, not
    the screen:** Claude Code runs on the alternate screen, so what scrolled off its top
    is gone from `text` — measured, 7 of the 35 message blocks of one worker turn were
    still on the screen; a lost one reported a broken build. `report` joins the rows the
@@ -248,7 +293,8 @@ the drive budget below is still yours to count.
 ### Let the harness wake you: `aterm drive watch`
 
 ```sh
-aterm drive watch "@$SID" --auto-reads --notes "$NOTES" --report   # under your harness's background monitor
+aterm drive watch "@$SID" --mail --auto-reads --notes "$NOTES" --journal "$JOURNAL"   # under ONE background monitor
+aterm drive watch "@$SID" --auto-reads --notes "$NOTES" --report                      # no fabric: the screen alone
 ```
 
 When your harness can run a long-lived command in the background and wake you once per
@@ -297,12 +343,33 @@ except that a review point prints one line and the loop keeps going.
   context`, run `aterm drive phase` before the next `supervise`; no `context <n>%` line
   (and no box up) means it compacted. Never type `/compact` or `/clear` into the worker
   for it without the human.
-- **`--report` counts what was said:** each idle, question and limited EVENT carries
-  `complete=<0|1> rows=<n>` before its summary (`EVENT idle seq=812 complete=1 rows=57 …`)
-  — the `report` of everything the worker said since your turn, which the one-line
-  summary is not. Read it with `aterm drive report "@$SID"` before you REVIEW.
+- **`--mail` makes the worker's own report the wake.** `MAIL id=<n> off=<o> from=<sid>
+  kind=<k> len=<n> [re=<o>]` is one delivery to YOUR inbox (an `ask` from a human, an
+  `answer` from a peer, the worker's `report`); `EVENT turn seq=<n> report=<id> rows=<n>
+  <summary>` is one worker turn with its report folded in — `aterm ctl @self inbox get
+  <id>` is the whole of what it said, and the REVIEW starts there (ground truth still
+  applies: run the check yourself). `EVENT idle-no-report seq=<n> …` is a turn whose
+  report never came within `--idle-grace` (default 180 s), or one a prompt or a new
+  turn superseded while it was held (the screen is read once a 20 s step under the
+  hold, so a prompt after an idle is seen within a step): read `aterm drive report
+  "@$SID" --final` for THAT turn only. A report is the turn's when it came after the
+  worker was read busy for the turn or after the point; one from before the last
+  point handed over never is (a question turn's report does not become the next
+  turn's); `--report-window` (default 120 s) bounds only a report from before the turn
+  was seen to begin. A question, a prompt and a limit notice are never held for mail.
+  `MAIL lane off: <why>` once means the lane could not run (no fabric, an older host)
+  and the lines are as without the flag from then on. The process ends with its last
+  line: the lane's parked wait is cut short.
+- **`--report` counts what was said** when there is no mail: each idle, question and
+  limited EVENT carries `complete=<0|1> rows=<n>` before its summary (`EVENT idle
+  seq=812 complete=1 rows=57 …`) — the `report` of everything the worker said since
+  your turn, which the one-line summary is not. Read it with `aterm drive report
+  "@$SID"` before you REVIEW. With `--mail` it rides only on an `idle-no-report` line.
 - **`APPROVED seq=<n> <command>` lines are the audit trail** of what it waved through —
   the same reads `supervise --auto-reads` approves, noted in `--notes` too.
+- **`--journal FILE` records every line it prints**, one JSON object per line
+  (see *Set up the worker*), and `aterm drive ledger` replays it: pass it to
+  every `watch` so the run can be read back later.
 - **`RECONNECT <reason>` and `RECONNECTED after <ms> ms` are informational:** `watch`
   rides through an aterm self-update (the worker keeps its `@sid` on the new instance)
   and carries on from a fresh read — the EVENT it last printed comes once more if it is
@@ -322,6 +389,54 @@ except that a review point prints one line and the loop keeps going.
   or — before the loop ran — one of its flags or the host (the error is on stderr too).
   Relaunch it or escalate. Like `supervise` it presses option 1 only and never types
   text.
+
+### Assign work by mail: `aterm drive task`
+
+```sh
+aterm drive task "@$SID" --no-nudge --deadline 1800 'run the suite; report the counts'   # a worker with the wake hook
+aterm drive task "@$SID" 'run the suite; report the counts'                              # no hook: nudged when idle
+aterm drive task "@$SID" --wait --deadline 600 'which branch is this?'                   # park for the answer
+```
+
+The body is posted `kind=task` from your own session (`@self`; `--inbox @sid` when you
+are not inside aterm) and never goes through the worker's PTY: it prints `task @<off>
+nudged=0|1` once the post LANDED (`off=` is what the worker's `inbox` row shows and its
+answer carries as `re=`). Without `--no-nudge` it reads the worker's phase once and, ONLY
+when idle, types the one-line `Inbox: task @<off>` as a turn (not waited on); a busy
+worker gets the mail alone. A worker with round 12's hooks that accept you (`aterm link
+hook install claude --accept-from "$ME"`) wakes on its next Stop and needs `--no-nudge`
+— a nudge over that is a second turn; hooks that do not list your sid deliver the task
+and wake nobody, so nudge. A post that did not land is the error in the server's words:
+`queued=1` means it
+is in the outbox and WILL land when a bridge drains it (never re-post), `no-bridge=1`
+that this instance has no bridge at all. `--wait` parks `await inbox` on your inbox for
+the `answer|report|ack` with `re=<off>` (bounded by `--deadline`, else `--timeout`, and
+re-armed past the host's 600 s clamp on one wait) and prints its MAIL line and body;
+`TIMEOUT …` / exit 124 when none came.
+
+### See how the loop ran: `aterm drive ledger`
+
+```sh
+aterm drive ledger "@$SID" --journal "$JOURNAL" --format text          # at your terminal
+aterm drive ledger "@$SID" --journal "$JOURNAL" --format html --out ledger.html   # for the human
+```
+
+One timeline over four sources: the worker's turn ledger (`history`) — your turns,
+when each started and how its `turn` verb settled — the size in rows of the reply
+each turn drew (from one `offscreen` read, joined the way `report` joins it), the
+watcher's `--journal` lines (`EVENT turn` and `idle-no-report` count as the worker
+stopping, and every `MAIL` line is there), and this session's fabric mail with that worker
+(`inbox --peek --meta` rows from it and its `timeline`'s posts to it; nothing is
+listed or handled). SUMMARY gives the turns, the worker's busy time, YOUR response
+latency (median and max from each `EVENT idle`/`question` to your next turn),
+approvals, dismissals, context warnings and compactions, reconnects, mail and how
+many reports were complete; TIMELINE is one row per item — time, lane (manager |
+worker | watcher | fabric), what, duration/latency. `--format html --out PATH`
+writes ONE self-contained page (nothing fetched) with the manager, watcher and
+worker swimlanes and the fabric's mail on a fourth, turns
+as bars and every line on hover: that is the thing to hand a human who asks what
+you have been doing. It only reads, it says which source it could not read, and
+`--since <time>` narrows it to the last stretch.
 
 ### Auto-approving reads
 

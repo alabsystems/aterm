@@ -4,7 +4,7 @@ description = "astream AEAD wire: XChaCha20-Poly1305 seal/open over a pre-shared
 version = "0.1.0"
 edition = "2021"
 license = "Apache-2.0"
-authors = ["Andrew Yates"]
+authors = ["Andrew Yates <andrewyates.name@gmail.com>"]
 rust-version = "1.89"
 
 # The vetted, IETF-standard AEAD (RustCrypto). This crate is the deliberate,

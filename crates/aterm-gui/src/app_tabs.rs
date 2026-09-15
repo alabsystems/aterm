@@ -2269,9 +2269,10 @@ impl App {
         let active = self.windows.get(&wid).map_or(0, |ws| ws.tabs.active);
         assert!(self.sync_tab_model_from_layout(wid, active));
         // Size the split panes explicitly, mirroring the real split path —
-        // `sync_window` only re-fits when a shared (views > 1) session exists.
+        // `sync_window` only re-fits when a shared (views > 1) session exists —
+        // and re-publish the global handle exactly as the real split does.
         self.resize_panes(wid);
-        self.sync_window(wid);
+        self.resync_active_or_window(wid);
         sid
     }
 

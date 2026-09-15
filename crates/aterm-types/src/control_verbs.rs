@@ -202,7 +202,12 @@ pub const SUMMARY_MAX_CHARS: usize = summary_max_chars!();
 /// verbs' prose to make room, which is the drift a generated golden exists to
 /// catch. The shape is unchanged: one summary row per verb under
 /// [`SUMMARY_MAX_CHARS`].
-pub const SHORT_CATALOG_MAX_BYTES: usize = 9728;
+///
+/// RAISED AGAIN FROM 9728 on 2026-09-14, for `link` — the round-13 bridge-only
+/// verb the bridge reports its broker link on, taking the table from 101
+/// entries to 102. The GUI's short `help` MEASURES 9 838 B with the row; same
+/// accounting as the three raises above, and the shape is unchanged.
+pub const SHORT_CATALOG_MAX_BYTES: usize = 9856;
 /// The column a catalog row's text starts in: a 28-wide name plus one space.
 pub const CATALOG_TEXT_COLUMN: usize = 29;
 /// The width a `help <verb>` entry is wrapped to.
@@ -339,8 +344,8 @@ pub const VERBS: &[VerbSpec] = &[
         Status,
         Meta,
         AnyScopeMeta,
-        "self-updater [status|check|apply]: staged build state; apply lands a staged build in place",
-        "The apply is the seamless in-session handoff: the running app hands every window, tab, split and live shell to the staged build (your shells keep running; automatic within ~2 min by default, or now via `apply`). `relaunch_ready=` on `status` is a historical key name: a strictly-newer build is staged and can be applied in place now.",
+        "self-updater [status|check|apply]: staged build state; apply requests an in-session handoff",
+        "Apply requests the seamless handoff, preserving live shells after validation and preflight. Check synchronously uses the current GUI release source and notifies its reducer after completion. The historical `relaunch_ready=true` means a newer stage exists; `apply_posture` reports live policy and scheduling: automatic, automatic-idle, manual-config, disabled-env, retry-wait, manual-only, handoff-unavailable, applying, unreconciled, none, disabled, or unknown. `apply_policy_reason` names a current policy block when known. It is not a preflight guarantee.",
     ),
     va(
         "help",
@@ -398,9 +403,11 @@ pub const VERBS: &[VerbSpec] = &[
          `observer` row is a THIRD value, distinct from `off` and from `false`: the observer \
          could not be consulted, which is not the same as its having answered no. \
          `full_disk_access=granted` removes this class of interruption for the folders that \
-         grant covers; which services it covers is not measured here, so `fda_scope=unknown` and \
-         the `folder` rows stay `unknown`. Only a human can change any of this — aterm cannot \
-         grant it, and neither can you.",
+         grant covers, and establishes exactly two things: `fda_scope=this_process` and Apple's \
+         documented `app-data` coverage for THIS host (`covers=app-data`). Every other service \
+         stays `unmeasured` (the never-covered class `uncovered`), an adopted session inherits \
+         nothing, and the `folder` rows stay `unknown`. Only a human can change any of this — \
+         aterm cannot grant it, and neither can you.",
     ),
     // screen / terminal state
     v(
@@ -458,17 +465,23 @@ pub const VERBS: &[VerbSpec] = &[
         "offscreen [since=<i>] [tail=<n>] [max=<n>] [screen=1]: rows a TUI scrolled off",
         "— Claude Code and other fullscreen apps repaint the ALTERNATE screen in place, so \
          `lines` stays 0 and a row that leaves the top is gone from the grid; aterm keeps those \
-         rows per session, in memory only (4 MiB, on unless ATERM_ALT_ARCHIVE=0), by comparing \
+         rows per session, in memory (4 MiB, on unless ATERM_ALT_ARCHIVE=0), by comparing \
          each committed frame (a DEC 2026 close; at most one per 16 ms for an app that sends \
          none) with the one before. Reply `OK <n> first=<i> last=<j> lost=<k> breaks=<b> back=<d> \
          [back_at=<i> pin=<p>] epoch=<e> origin=<o> alt=<0|1> seq=<s> [enabled=0] [more=1] \
          [screen_rows=<m>]` then n lines, oldest first: line m is archived row first+m, and last= \
          is the reply's own last row. since= is exclusive, so page and poll with since=<last>; \
          since=<origin>:<i> (a `history` arch= mark) from another origin reads from the start and \
-         origin= shows it; an index past the newest is `ERR bad since`. At most 2000 rows per \
+         origin= shows it; an index past the newest is `ERR bad since`. An aterm self-update \
+         hands the archive to the new instance with its origin, so marks go on reading: it \
+         carries the rows after the marks of the last 8 submitted turns, and at least the \
+         running app's last 8 screens (without a turn, the newest), up to 1 MiB (older ones \
+         count in lost=); a handoff that cannot carry it starts a new origin, and a resize as \
+         the new instance takes over is a breaks= gap that loses nothing. At most 2000 rows per \
          reply, or max=<n>; tail=<n> takes the newest n instead; more=1 says rows were left out. \
          lost= counts rows after since that were evicted or wiped, breaks= the discontinuities at \
-         or after since (a redraw with no overlap, a resize, leaving the alt screen, a reset), \
+         or after since (a redraw with no overlap, a scroll-back past the oldest row kept — its \
+         rows come again after the gap — a resize, leaving the alt screen, a reset), \
          back= how many archived rows the screen shows again: screen rows pin..pin+back are \
          archived rows back_at.. (pin= header rows above them). enabled=0: the archive is off, so \
          nothing that scrolled away was kept. screen=1 appends the current screen rows, read \
@@ -742,7 +755,10 @@ pub const VERBS: &[VerbSpec] = &[
         Session,
         "history [<n>] [since=<id>]: the turn LEDGER",
         "- id/submitted/status/dur_ms/seq/hash/arch/text per completed turn; arch=<origin>:<last> \
-         is the alt-screen archive's mark when the turn started, for `offscreen since=`",
+         is the alt-screen archive's mark when the turn started, for `offscreen since=`. An aterm \
+         self-update carries the ledger and the id count to the new instance when it can: ids \
+         keep rising, and the carried records print carried=1 before text= (their started_ms and \
+         seq are the old instance's)",
     ),
     // `meta` reads/writes the USER-settable session metadata. Base op-class Read
     // (the bare form is a pure metadata readout); the `meta set`/`meta unset`
@@ -778,7 +794,8 @@ pub const VERBS: &[VerbSpec] = &[
          outcome=none|success|failure|signal exit_code= signal= detail= \
          confidence=exact|strong|heuristic|unknown reasons= attribution=live|adopted|unknown \
          fs_consent=covered|denied|unknown conflict= revision= enabled= hold=<0|1> \
-         fabric=<connected|disconnected|absent>. `attribution=`/`fs_consent=` are this \
+         fabric=<connected|stalled|disconnected|absent> fabric_rtt_ms=<n|-> \
+         fabric_link_age_ms=<n|->. `attribution=`/`fs_consent=` are this \
          session's consent posture (see `privacy` and `await consent`). \
          Read-only. `observed=false` means never classified, which is NOT `phase=unknown` \
          (classified, no evidence); `subject_source=unavailable` means the terminal lock was \
@@ -799,8 +816,19 @@ pub const VERBS: &[VerbSpec] = &[
          agent before typing into it. \
          `hold=1` means a fleet halt is in force for this session, so every PTY-reaching verb \
          answers `ERR halted` — read the reason from `inbox`. `fabric=` is INSTANCE state, not \
-         this session's: `absent` = no bridge was ever launched, `connected` = one is serving, \
-         `disconnected` = the bridge this instance had is gone, which is itself a held state. \
+         this session's, and it is the BRIDGE'S BROKER LINK, not the bridge process: `absent` = \
+         no bridge was ever launched; `connected` = a bridge is attached AND its last exchange \
+         with the broker was acknowledged; `stalled` = a bridge is attached but its link is down \
+         (the dial failed — no socket, connection refused — the broker closed the connection, or \
+         an ack did not arrive within the bridge's 5 s ack deadline; the bridge redials with \
+         back-off from 100 ms to 5 s, mail queues and none arrives meanwhile, and `post --wait` \
+         answers `ERR fabric stalled id=<n> queued=1` at once); `disconnected` = the bridge this \
+         instance had is gone, which is itself a held state. NO HEARTBEAT keeps these honest: \
+         the bridge reports its link over its own control lane (`link`) on every change and \
+         after an ack that moved the round trip by more than 2x, so `fabric_rtt_ms=` is the \
+         last acknowledged round trip to the broker in ms (`-` before the first) and \
+         `fabric_link_age_ms=` is how long ago that ack was — a large age on `connected` means \
+         a quiet link, not a dead one, and only the next exchange can tell. \
          No `window=` here: `status` is \
          polled, and the window lives on the main thread, so a per-poll hop would be a \
          latency regression — ask `sessions`/`ls` (one hop for the whole fleet) or `dims`",
@@ -1262,7 +1290,9 @@ pub const VERBS: &[VerbSpec] = &[
          and the ribbon retracted to it), or `none` on a decline. A move paints only if a \
          keypress or a delivered insert LICENSED it, so a \
          decline carries one of five reasons: `no-fresh-hint` (no key hint was fresh — the \
-         move was program output nobody's fingers asked for), `no-credits` (a multi-cell \
+         move was program output nobody's fingers asked for; under Rainbow Kitty also a \
+         fresh typed stamp whose press was already paid, since a stamp licenses light \
+         only while the credit ring still owes a cell), `no-credits` (a multi-cell \
          coalesce outran the press CREDIT budget), `off-shape` (licensed and classified, but \
          the style's shape gates laid nothing), `program-row` (the anchored-echo lane refused \
          a row that has advanced keylessly, or one contesting a fresher row's echo — a \
@@ -1276,7 +1306,8 @@ pub const VERBS: &[VerbSpec] = &[
          `trail status`: one standing-state row instead — `trail style= resolved= \
          config_enabled= effective= focused= motion= motion_stage= shed= intensity= \
          licensed= declined= last_decline_reason= spawns= ribbon_active= ribbon_look= \
-         ribbon_segments= ribbon_hue_bands= field= sparks= momentum= \
+         ribbon_segments= ribbon_hue_bands= ribbon_drawn= ribbon_curtain_ms= \
+         field= sparks= momentum= \
          momentum_display= momentum_glow= flow= combo= combo_best= glow_active= pet_active= cat_active= \
          block_fill= block_fill_rgb= block_fill_base= block_fill_base_from= \
          pet_action= pet_content= pet_pending= pet_body= pet_focus= pet_reason= \
@@ -1286,7 +1317,16 @@ pub const VERBS: &[VerbSpec] = &[
          from the config knob to the glass, in the order the frame path walks them, plus \
          the cumulative tally the ring has forgotten — `licensed=0 declined>0` blames the \
          licence and names why, `licensed>0` over a dark screen blames everything \
-         downstream of it). The `inserts_*` four are the DELIVERED INSERTS, and advance \
+         downstream of it). `ribbon_drawn=` is THE FACT BESIDE THE CLAIM, and \
+         `ribbon_curtain_ms=` is why the two can differ: `ribbon_segments=` counts the \
+         planned boundaries the row is willing to CLAIM are lit, floored once for the \
+         arc's dimmest stop, while `ribbon_drawn=` counts the last frame's own quads \
+         whose composite a glass census would read as band ink, and \
+         `ribbon_curtain_ms=` is the milliseconds left in a falling curtain (`none` \
+         when none is falling) — so `ribbon_segments=0 ribbon_drawn>0 \
+         ribbon_curtain_ms=` a number is a band still gathering into the hand at a \
+         level under the claim floor, not a band that is gone. Both are 0 on every \
+         style but rainbow kitty. The `inserts_*` four are the DELIVERED INSERTS, and advance \
          under Rainbow Kitty only: how many the host reported delivered (a paste's completed \
          write, a bare Tab's or ⌃V's dispatch), how many the seam lit as one sweep, how many \
          placeholder rewrites it retracted, and the last one's width in cells (priced from \
@@ -1298,8 +1338,12 @@ pub const VERBS: &[VerbSpec] = &[
          ten seconds) — `inflight_licensed=` counts batches the waiting presses alone \
          licensed after a stalled prompt caught up (the ring row reads `licence=inflight`), \
          `inflight_forgotten=` counts the edges that dropped a non-empty pool (a backward \
-         or cross-row hop, a refused hop, a Return, an arrow, a kill), and `credits=` is \
-         the pool right now — `credits>0` over a silent row is a stall in progress. \
+         or cross-row hop, a forward hop the share rule (`no-credits`) or the cap refused, \
+         a Return's own row change, an arrow, a kill — a same-row forward hop refused \
+         `no-fresh-hint` keeps its one credit for the next key, and a glyph's echo that \
+         lands with Enter pressed behind it spends neither the Enter nor the pool), and \
+         `credits=` is the pool right now — \
+         `credits>0` over a silent row is a stall in progress. \
          `swallowed_no_echo=` counts the presses that banked NOTHING because the pty was in \
          canonical no-echo mode at the key (`read -s`, `sudo`, an `ssh` passphrase, `passwd` \
          — iTerm2's password-mode rule, read off the master's termios): the tty will never \
@@ -1339,11 +1383,13 @@ pub const VERBS: &[VerbSpec] = &[
          v2_meteors= v2_bridged= ribbon_retired=` — the frame's quads, halos, live stars and \
          meteors; `v2_bridged=`, the cells the engine's echo ledger relit for a late echo the \
          ring scored `declined`; and `ribbon_retired=`, the window's cumulative count of ribbon \
-         cells retired by CONTENT: the host saw the glyph under a cell change or go (an input \
-         box re-laid a row up, a row cleared and not put back), or the caret was observed on \
-         another row through a move the licence gate declined — the number that says a band \
-         went out because its text moved, as against expiring (a redraw that puts the same \
-         text back counts nothing). \
+         cells taken off by CONTENT: the host saw the glyph under a cell change (an input box \
+         re-laid a row up, or elsewhere with the same text — the band melts in 120 ms) or go \
+         (a submit that cleared the composer, a row cleared and not put back — the band is \
+         released to its own swoosh, drawn into the hand over 0.64 s) — the number that says \
+         a band went out because its text moved or went, as against expiring (a redraw that \
+         puts the same text back counts nothing, and a caret relocation the gate declined \
+         over a row whose text still stands retires nothing: only the mirror moves). \
          In a `--headless` instance the engine ticks only while a capture drives its clock (`image` \
          after each key, or a `video`), and a caret on ROW 0 has no sky band there (no chrome \
          head band above the grid), so `v2_stars=0` on row 0 is the geometry, not a dark trail \
@@ -1656,6 +1702,30 @@ pub const VERBS: &[VerbSpec] = &[
          agent's. `deliver <sid> landed=<post-id> off=<n>` is the \
          other form: it closes an outbound `post` and releases its `--wait`.",
     ),
+    // `link`: the bridge's report of ITS OWN broker link — what turns `fabric=`
+    // from "a bridge process is attached" into "mail can move". Bridge-only
+    // because Owner scope is what every in-session client holds, and a client
+    // that could say `link up` would make `post --wait` burn its timeout on a
+    // link the bridge itself knows is down.
+    va(
+        "link",
+        Write,
+        Status,
+        Meta,
+        BridgeOnly,
+        "link up rtt=<ms> | link down reason=<token> [rtt=<ms>]: the bridge reports its broker link",
+        "BRIDGE-ONLY. The record behind `status`'s `fabric=`, `fabric_rtt_ms=` and \
+         `fabric_link_age_ms=`: `up` with the round trip of the ack just received moves the \
+         instance to `fabric=connected` and stamps the ack's time; `down` with a one-token \
+         reason (`no-socket`, `refused`, `denied`, `no-ack`, `closed`, `attach`, `subscribe`, \
+         `read`) moves it to `fabric=stalled` and wakes every parked `post --wait` so it answers \
+         `ERR fabric stalled id=<n> queued=1` instead of sitting out its timeout. The bridge \
+         sends it on every change, after an ack that moved the round trip by more than 2x, and \
+         otherwise after an ack at most once per 2 s (so the age stays honest on a busy link) \
+         — never on a timer, never as a heartbeat. `OK`, or `OK stale=1` when the report came \
+         from a bridge incarnation that no longer owns the link (a ghost lane; the report is \
+         dropped, the live bridge's state stands). `ERR usage` for anything else.",
+    ),
     va(
         "hold",
         Write,
@@ -1778,8 +1848,14 @@ pub const VERBS: &[VerbSpec] = &[
         Meta,
         OwnerOnly,
         "fabric status|attach [<command...>]: the bridge supervisor of a RUNNING instance (Owner-only)",
-        "`fabric status` -> `OK state=<absent|connected|disconnected> supervised=<0|1> \
-         command=<pct|->`: `state=` is the link (`status`'s own `fabric=` token), `supervised=` \
+        "`fabric status` -> `OK state=<absent|connected|stalled|disconnected> supervised=<0|1> \
+         command=<pct|-> reason=<token|-> rtt_ms=<n|-> link_age_ms=<n|->`: `state=` is the \
+         link (`status`'s own `fabric=` token — the bridge's BROKER link, `stalled` while a \
+         bridge is attached but that link is down), `reason=` why it is down (`starting` before \
+         the bridge's first report, `no-socket`, `refused`, `denied`, `no-ack`, `closed`, \
+         `attach`, `subscribe`, `read`, `bridge-lost`; `-` when up), `rtt_ms=`/`link_age_ms=` \
+         the last acknowledged round trip and its age exactly as `status` carries them, \
+         `supervised=` \
          whether a supervisor is armed in this process (the latch that flips `post`'s refusal \
          from `no-bridge=1` to `queued=1`), `command=` the argv it runs — or, unarmed, the one \
          the instance was launched with. `fabric attach [<command...>]` arms the supervisor NOW, \
@@ -2756,9 +2832,12 @@ mod tests {
             .filter(|s| matches!(s.access, Access::BridgeOnly))
             .map(|s| s.name)
             .collect();
+        // `link` joined the set in round 13: it is how the bridge reports its
+        // own broker link, and an Owner client that could say `link up` would
+        // turn `fabric=stalled` back into a `post --wait` that burns its timeout.
         assert_eq!(
             bridge_only,
-            ["deliver", "outbox", "outbox sent"],
+            ["deliver", "link", "outbox", "outbox sent"],
             "the BridgeOnly set (only the inherited bridge connection may run these)",
         );
 
@@ -2808,6 +2887,7 @@ mod tests {
             ("inbox seen", Write, Status, Session, Scoped),
             ("post", Write, Status, Session, Scoped),
             ("deliver", Write, Status, Meta, BridgeOnly),
+            ("link", Write, Status, Meta, BridgeOnly),
             // Owner-class, not bridge-only: the local owner's halt rides the Owner
             // token; the fleet hold is kept bridge-issued in the handler.
             ("hold", Write, Status, Meta, OwnerOnly),
@@ -3057,14 +3137,16 @@ mod tests {
             "`unknown` BY CONSTRUCTION",
             "THIRD value",
             "distinct from `off` and from `false`",
-            "`fda_scope=unknown`",
+            "`fda_scope=this_process`",
+            "`covers=app-data`",
             "`sessions_total=` always equals the number of `session` lines",
         ] {
             assert!(help.contains(phrase), "privacy help lacks {phrase:?}");
         }
         // The scope ruling: a grant MITIGATES a class of interruption for the
-        // folders it covers. Which services those are is unmeasured, so the help
-        // may never say the grant ends prompting.
+        // folders it covers. Beyond app-data (Apple's documented rule, claimed
+        // for the observing host only) which services those are is unmeasured,
+        // so the help may never say the grant ends prompting.
         assert!(
             help.contains("removes this class of interruption for the folders that grant covers"),
             "the Full Disk Access claim must stay scoped to a class and to covered folders"

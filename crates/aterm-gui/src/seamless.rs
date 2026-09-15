@@ -897,9 +897,34 @@ fn write_private(path: &std::path::Path, bytes: &[u8]) -> Option<()> {
     }
 }
 
-/// Read a regular file without following a symlink and without allocating past
-/// its protocol cap. The caller supplies an exact private-dir path; it is
-/// consumed on every parse outcome so an invalid attempt cannot be replayed.
+/// Create `path` afresh with owner-only permissions and write `bytes`:
+/// `O_CREAT|O_EXCL|O_NOFOLLOW`, so nothing already there — a file, or a
+/// symlink someone planted to steer the write — is ever written through. A
+/// partial write is unlinked. `None` on any failure.
+fn write_private_new(path: &std::path::Path, bytes: &[u8]) -> Option<()> {
+    use std::io::Write as _;
+    let mut options = std::fs::OpenOptions::new();
+    options.write(true).create_new(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt as _;
+        options
+            .mode(0o600)
+            .custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC);
+    }
+    let mut file = options.open(path).ok()?;
+    if file.write_all(bytes).is_err() {
+        drop(file);
+        let _ = std::fs::remove_file(path);
+        return None;
+    }
+    Some(())
+}
+
+/// Read a regular file without following a symlink, without blocking on
+/// whatever else sits at the path, and without allocating past its protocol
+/// cap. The caller supplies an exact private-dir path; it is consumed on every
+/// parse outcome so an invalid attempt cannot be replayed.
 fn take_regular_capped(
     path: &std::path::Path,
     dir: &std::path::Path,
@@ -915,7 +940,13 @@ fn take_regular_capped(
         #[cfg(unix)]
         {
             use std::os::unix::fs::OpenOptionsExt as _;
-            options.custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC);
+            // O_NONBLOCK: a FIFO swapped in at the path (a same-user process
+            // racing the handoff) would block `open(2)` until a writer came —
+            // past the parent's ready deadline, rolling the update back. Opened
+            // non-blocking it returns at once and the handle is refused below
+            // as not a regular file; for a regular file the flag changes
+            // nothing.
+            options.custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC | libc::O_NONBLOCK);
         }
         let file = options.open(path).ok()?;
         let metadata = file.metadata().ok()?;
@@ -943,6 +974,30 @@ fn take_grid_capped(
     let bytes = take_regular_capped(path, dir, per_grid_cap.min(*remaining))?;
     *remaining = remaining.checked_sub(u64::try_from(bytes.len()).ok()?)?;
     Some(bytes)
+}
+
+/// Read, delete and decode one CONTROL CARRY sidecar at its exact `path`:
+/// `None` — the session adopts without it — when the stamp is malformed or
+/// names more than a sidecar may hold or the handoff has left, or the file is
+/// missing, bigger than stamped, truncated, of another sha, or not a sidecar
+/// this build reads. The file is deleted on every outcome that reaches it.
+fn take_control_sidecar(
+    path: &std::path::Path,
+    dir: &std::path::Path,
+    stamp: &str,
+    remaining: &mut u64,
+) -> Option<crate::handoff_carry::ControlCarry> {
+    let Some(len) = crate::handoff_carry::stamp_len(stamp)
+        .filter(|&len| len <= crate::handoff_carry::MAX_SIDECAR_BYTES && len <= *remaining)
+    else {
+        let _ = std::fs::remove_file(path);
+        return None;
+    };
+    let bytes = take_regular_capped(path, dir, len)?;
+    *remaining = remaining.saturating_sub(bytes.len() as u64);
+    crate::handoff_carry::stamp_matches(stamp, &bytes)
+        .then(|| crate::handoff_carry::decode(&bytes))
+        .flatten()
 }
 
 fn checkpoint_cursor_is_bounded(
@@ -1288,11 +1343,18 @@ pub(crate) struct OutgoingHandoff {
 /// every authenticated PTY must have one valid meta+grid checkpoint (and an
 /// alt-grid blob when its checkpoint names one). Any omission fails the whole
 /// preparation so a child can never Commit a blank or incomplete engine.
+///
+/// `controls` are the sessions' CONTROL CARRY sidecars (`crate::handoff_carry`,
+/// by `local_id`), written as `seamless-<pid>-<nonce>.s<id>.ctl` and named from
+/// the record by `control = "<len> <sha256hex>"`. The opposite of the screen
+/// carry: best-effort, outside both proof digests — a sidecar that cannot be
+/// written is left out, and never fails the preparation.
 pub(crate) fn write_outgoing(
     manifest: &SessionHandoff,
     fds: &HandoffFds,
     screens: &[(u64, TerminalCheckpoint)],
     window: Option<WindowCarry>,
+    controls: &[(u64, Vec<u8>)],
 ) -> Option<OutgoingHandoff> {
     let dir = crate::control_auth::socket_dir()?;
     let nonce = random_nonce();
@@ -1442,6 +1504,35 @@ pub(crate) fn write_outgoing(
         }
         return None;
     };
+    drop(wire_entries);
+    // THE CONTROL CARRY, after the commitment above on purpose: nothing here
+    // is in it. Each sidecar joins `written_blobs`, so every failure below
+    // retires it with the grids.
+    let mut aggregate_control = 0_u64;
+    for (local_id, bytes) in controls {
+        let len = bytes.len() as u64;
+        if len > crate::handoff_carry::MAX_SIDECAR_BYTES
+            || aggregate_control + len > crate::handoff_carry::MAX_AGGREGATE_BYTES
+        {
+            continue;
+        }
+        let Some(rec) = manifest
+            .sessions
+            .iter_mut()
+            .find(|r| r.local_id == *local_id)
+        else {
+            continue;
+        };
+        let path = dir.join(format!(
+            "seamless-{}-{nonce}.s{local_id}.ctl",
+            std::process::id()
+        ));
+        if write_private_new(&path, bytes).is_some() {
+            aggregate_control += len;
+            written_blobs.push(path);
+            rec.control = Some(crate::handoff_carry::stamp(bytes));
+        }
+    }
     let manifest = &manifest;
 
     let Some(toml) = manifest.to_toml().ok() else {
@@ -1552,7 +1643,9 @@ impl Drop for IncomingPtyGuard {
 /// which is still running — must retire them itself (a fresh nonce is minted
 /// per retry, so nothing here blocks a later attempt). Best-effort, prefix-
 /// bound to our own pid + the exact nonce: never unlinks anything we did not
-/// write this attempt.
+/// write this attempt — the control carry's `.ctl` sidecars included. (A
+/// sender that crashed cannot run this; [`sweep_dead_handoff_leftovers`] is
+/// the stale sweep that retires what it left.)
 pub(crate) fn discard_outgoing(nonce: &str) {
     let Some(dir) = crate::control_auth::socket_dir() else {
         return;
@@ -1566,6 +1659,73 @@ pub(crate) fn discard_outgoing(nonce: &str) {
             let _ = std::fs::remove_file(e.path());
         }
     }
+}
+
+/// Unlink this attempt's CONTROL CARRY sidecars (`seamless-<pid>-<nonce>.s<id>.ctl`)
+/// once the successor's proof has checked out. A receiver that reads them
+/// deletes them as it does; one built before the carry never looks at them,
+/// and nothing else would ever remove the turn text and scrolled-off rows they
+/// hold. Prefix- and suffix-bound to our own pid and this exact nonce.
+///
+/// THE RECEIVER'S RULE this relies on: a successor reads every sidecar it
+/// wants BEFORE it publishes its proof (`take_incoming` does, while still
+/// single-threaded, ahead of `take_ready_fd`). A receiver that deferred the
+/// read past its proof would find the files gone.
+pub(crate) fn retire_outgoing_controls(nonce: &str) {
+    let Some(dir) = crate::control_auth::socket_dir() else {
+        return;
+    };
+    let prefix = format!("seamless-{}-{nonce}.", std::process::id());
+    let Ok(entries) = std::fs::read_dir(&dir) else {
+        return;
+    };
+    for e in entries.flatten() {
+        let name = e.file_name();
+        let name = name.to_string_lossy();
+        if name.starts_with(&prefix) && name.ends_with(".ctl") {
+            let _ = std::fs::remove_file(e.path());
+        }
+    }
+}
+
+/// Remove the handoff files (`seamless-<pid>-…`: manifests, layouts, grids,
+/// control sidecars) a process that is no longer alive left in the control
+/// dir. An attempt's own rollback retires its files and a successor consumes
+/// them, but a sender that CRASHED between writing and either left them on
+/// disk forever — screens, and since the control carry, submitted turn text
+/// and scrolled-off rows. Run at startup. A live pid's files — ours, and a
+/// running handoff's, whose successor may not have read them yet — are
+/// never touched; a reused pid only keeps a dead process's files a while
+/// longer.
+pub(crate) fn sweep_dead_handoff_leftovers() {
+    if let Some(dir) = crate::control_auth::socket_dir() {
+        sweep_dead_handoff_leftovers_in(&dir, &crate::control_auth::pid_alive);
+    }
+}
+
+fn sweep_dead_handoff_leftovers_in(dir: &std::path::Path, alive: &dyn Fn(u32) -> bool) {
+    let own = std::process::id();
+    let Ok(entries) = std::fs::read_dir(dir) else {
+        return;
+    };
+    for e in entries.flatten() {
+        let name = e.file_name();
+        let Some(pid) = name.to_str().and_then(handoff_leftover_pid) else {
+            continue;
+        };
+        if pid == own || alive(pid) || e.file_type().is_ok_and(|t| t.is_dir()) {
+            continue;
+        }
+        let _ = std::fs::remove_file(e.path());
+    }
+}
+
+/// The `<pid>` of a `seamless-<pid>-<rest>` file name.
+fn handoff_leftover_pid(name: &str) -> Option<u32> {
+    let (pid, rest) = name.strip_prefix("seamless-")?.split_once('-')?;
+    (!pid.is_empty() && !rest.is_empty() && pid.bytes().all(|b| b.is_ascii_digit()))
+        .then(|| pid.parse().ok())
+        .flatten()
 }
 
 /// The overlap-handoff readiness pipe's write fd, passed by the PARKED parent
@@ -1870,7 +2030,7 @@ impl AttestedParent {
     /// Is the attested process — that exact process, not merely something at
     /// its pid — still running?
     #[must_use]
-    fn still_alive(self) -> bool {
+    pub(crate) fn still_alive(self) -> bool {
         match self.witness {
             ParentWitness::Birth(birth) => read_process_birth(self.pid) == Some(birth),
             ParentWitness::ForkLink => {
@@ -1878,6 +2038,19 @@ impl AttestedParent {
                 let creator = unsafe { libc::getppid() };
                 creator == self.pid
             }
+        }
+    }
+
+    /// A lingering listener may still report its deceased creator. Refuse a
+    /// different PID, or a reused PID whose birth no longer matches our witness.
+    pub(crate) fn owns_retiring_socket(self, peer: u32) -> bool {
+        if u32::try_from(self.pid).ok() != Some(peer) {
+            return false;
+        }
+        match (self.witness, read_process_birth(self.pid)) {
+            (ParentWitness::Birth(expected), Some(current)) => current == expected,
+            (_, None) => true,
+            (ParentWitness::ForkLink, Some(_)) => false,
         }
     }
 
@@ -2468,6 +2641,12 @@ pub(crate) struct CommitReceiver {
 
 #[cfg(unix)]
 impl CommitReceiver {
+    /// Reuse the already-attested identity when the control listener waits for
+    /// this exact predecessor to exit after Commit.
+    pub(crate) fn parent(&self) -> AttestedParent {
+        self.parent
+    }
+
     fn raw(fd: std::os::fd::OwnedFd, fail_stop: bool, parent: AttestedParent) -> Self {
         Self {
             fd: Some(fd),
@@ -2811,7 +2990,40 @@ pub(crate) fn take_commit_fd(
 /// `main`, while single-threaded (env mutation is only sound before any thread spawns).
 ///
 /// SAFETY (env): the caller guarantees this runs before any thread/session spawn.
+///
+/// The CONTROL CARRY rides along best-effort: each record's `.ctl` sidecar is
+/// read (and deleted) at its exact path, checked against the record's
+/// `control` stamp and decoded onto [`Adopted::control`], and the manifest's
+/// `next_turn_id` continues this process's turn-id count — while still single-
+/// threaded. Nothing about either can make this return an empty handoff.
 pub(crate) fn take_incoming() -> IncomingHandoff {
+    take_incoming_as(ReceiverShape::Current)
+}
+
+/// Which manifest SHAPE [`take_incoming_as`] reads with. Production is always
+/// [`ReceiverShape::Current`]. The tests also play a receiver built BEFORE the
+/// control carry — the older build a rollback hands off to — whose manifest
+/// types have no `control` or `next_turn_id` and which never opens a `.ctl`,
+/// so a new sender's handoff to it is exercised end to end, proof included.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum ReceiverShape {
+    Current,
+    #[cfg(all(test, unix))]
+    PreCarry,
+}
+
+impl ReceiverShape {
+    fn parse(self, toml: &str) -> Option<SessionHandoff> {
+        match self {
+            Self::Current => SessionHandoff::from_toml(toml),
+            #[cfg(all(test, unix))]
+            Self::PreCarry => carry_tests::pre_carry_parse(toml),
+        }
+    }
+}
+
+/// [`take_incoming`] as a receiver of `shape` reads the handoff.
+fn take_incoming_as(shape: ReceiverShape) -> IncomingHandoff {
     let ready_env_present = std::env::var_os(ENV_READY_FD).is_some();
     let commit_env_present = std::env::var_os(ENV_COMMIT_FD).is_some();
     let manifest_path = std::env::var(ENV_MANIFEST).ok();
@@ -2859,7 +3071,7 @@ pub(crate) fn take_incoming() -> IncomingHandoff {
     if file_nonce != env_nonce {
         return IncomingHandoff::default();
     }
-    let Some(manifest) = SessionHandoff::from_toml(toml) else {
+    let Some(manifest) = shape.parse(toml) else {
         return IncomingHandoff::default();
     };
     let Some(expected) = validated_identities(&manifest, &fds) else {
@@ -2919,6 +3131,7 @@ pub(crate) fn take_incoming() -> IncomingHandoff {
     };
     let mut remaining_grid_bytes = MAX_HANDOFF_AGGREGATE_GRID_BYTES;
     let mut used_grid_cells = 0_u64;
+    let mut remaining_control_bytes = crate::handoff_carry::MAX_AGGREGATE_BYTES;
     let adopted = manifest
         .sessions
         .iter()
@@ -2934,12 +3147,12 @@ pub(crate) fn take_incoming() -> IncomingHandoff {
             // child image. Re-arm before ANY child/session spawn; failure rejects
             // this adoption so no later subprocess can inherit the PTY master.
             aterm_pty::set_cloexec(fd, true).ok()?;
-            // SCREEN CARRY is mandatory and exact-path bound. Modern grids are
-            // canonical visible-only streams of precisely `rows` records. The
-            // v0.52 is accepted only with its no-history witness (screen schema
-            // absent/0 and exactly `rows` records); its meta omitted the viewport
-            // offset, so a history-bearing payload cannot prove live-bottom state.
-            // Alt meta/blob presence must agree.
+            // SCREEN CARRY is mandatory and exact-path bound: a canonical line
+            // stream of precisely `rows + history_lines` records for the main
+            // grid (the carried scrollback is bounded by
+            // `MAX_HANDOFF_HISTORY_LINES` and priced before a byte is decoded),
+            // and exactly `rows` for the alt grid, whose presence must agree
+            // with the meta's alt cursor.
             let sc = rec.screen.as_ref()?;
             let meta = parse_checkpoint_meta(sc)?;
             let grid_cap = checkpoint_grid_cap(&meta)?;
@@ -2980,6 +3193,21 @@ pub(crate) fn take_incoming() -> IncomingHandoff {
                 _ => return None,
             };
             let checkpoint = meta.into_checkpoint(grid, alt_grid);
+            // The CONTROL CARRY, best-effort: whatever happens to it, this
+            // session adopts.
+            let control = match shape {
+                ReceiverShape::Current => rec.control.as_deref().and_then(|stamp| {
+                    take_control_sidecar(
+                        &manifest_path
+                            .with_file_name(format!("{manifest_stem}.s{}.ctl", rec.local_id)),
+                        &dir,
+                        stamp,
+                        &mut remaining_control_bytes,
+                    )
+                }),
+                #[cfg(all(test, unix))]
+                ReceiverShape::PreCarry => None,
+            };
             Some(Adopted {
                 // Carry the outgoing pool id so the boot re-adopts this shell into its
                 // original pane (the restore manifest's leaf carries the same id).
@@ -2998,6 +3226,7 @@ pub(crate) fn take_incoming() -> IncomingHandoff {
                 sid: SessionId::new(rec.sid.clone()),
                 nonce: LaunchNonce::generate(),
                 checkpoint: Some(checkpoint),
+                control,
             })
         })
         .collect::<Option<Vec<_>>>();
@@ -3036,6 +3265,19 @@ pub(crate) fn take_incoming() -> IncomingHandoff {
         return IncomingHandoff::default();
     };
     drop(wire_entries);
+    // TURN IDS GO ON (round 10): above the outgoing process's count, and above
+    // every carried record, while this process is still single-threaded — so a
+    // `since-turn=`/`since=` anchor taken before the update still means "after
+    // that turn", and no new turn reuses a carried id.
+    if let Some(minted) = manifest.next_turn_id {
+        crate::control::raise_turn_ids(minted);
+    }
+    for high in adopted
+        .iter()
+        .filter_map(|a| a.control.as_ref()?.high_turn_id())
+    {
+        crate::control::raise_turn_ids(high);
+    }
     #[cfg(unix)]
     incoming_pty_guard.transfer_all();
     IncomingHandoff {
@@ -3065,19 +3307,19 @@ mod tests {
     /// env-touching test must hold this lock for its WHOLE body. Acquire via
     /// `unwrap_or_else(PoisonError::into_inner)`: a failed (panicked) test must
     /// not poison the lock for the other.
-    static ENV_LOCK: Mutex<()> = Mutex::new(());
+    pub(super) static ENV_LOCK: Mutex<()> = Mutex::new(());
 
     /// RAII save/RESTORE of one env var: captures the prior value on creation
     /// and puts it BACK (not merely removes it) on drop — including the unwind
     /// of an early failed assert — so unrelated tests that resolve the runtime
     /// dir keep the environment they started with. Must only live while
     /// `ENV_LOCK` is held: declare it AFTER the lock guard so it drops FIRST.
-    struct RestoreVar {
+    pub(super) struct RestoreVar {
         key: &'static str,
         prior: Option<std::ffi::OsString>,
     }
     impl RestoreVar {
-        fn new(key: &'static str) -> Self {
+        pub(super) fn new(key: &'static str) -> Self {
             Self {
                 key,
                 prior: std::env::var_os(key),
@@ -4292,6 +4534,8 @@ mod tests {
             dir.join(format!("seamless-{pid}-aaaa.toml")),
             dir.join(format!("seamless-{pid}-aaaa.s0.grid")),
             dir.join(format!("seamless-{pid}-aaaa.s3.altgrid")),
+            // The control carry's sidecar: a rollback retires it with the rest.
+            dir.join(format!("seamless-{pid}-aaaa.s0.ctl")),
         ];
         let kept = [
             dir.join(format!("seamless-{pid}-bbbb.toml")), // a DIFFERENT attempt
@@ -4493,14 +4737,26 @@ mod tests {
     /// string to the layout sidecar than this binary's codec would produce —
     /// standing in for "the outgoing process was a different build".
     #[cfg(unix)]
-    struct StagedHandoff {
-        manifest_path: std::path::PathBuf,
-        nonce: String,
-        fds_wire: String,
-        expected: AdoptionProof,
+    pub(super) struct StagedHandoff {
+        pub(super) manifest_path: std::path::PathBuf,
+        pub(super) nonce: String,
+        pub(super) fds_wire: String,
+        pub(super) expected: AdoptionProof,
+        /// The screen commitment the parent took over the bytes it wrote.
+        pub(super) screen_digest: [u8; 32],
         masters: Vec<i32>,
         slaves: Vec<i32>,
         scratch: std::path::PathBuf,
+    }
+
+    /// What a control-carry stage hands the outgoing process in place of the
+    /// default prompt screens: each session's checkpoint (by index), its
+    /// sidecar JSON, and the turn-id count the manifest carries.
+    #[cfg(unix)]
+    pub(super) struct StageCarry {
+        pub(super) screens: Vec<aterm_core::terminal::TerminalCheckpoint>,
+        pub(super) controls: Vec<(u64, Vec<u8>)>,
+        pub(super) next_turn_id: Option<u64>,
     }
 
     #[cfg(unix)]
@@ -4510,6 +4766,13 @@ mod tests {
         layout_wire_override: Option<&dyn Fn(&str) -> String>,
     ) -> StagedHandoff {
         stage_outgoing_handoff_with(label, sessions, layout_wire_override, None)
+    }
+
+    /// As [`stage_outgoing_handoff`], but the outgoing process carries the
+    /// given screens and CONTROL CARRY (one session per checkpoint).
+    #[cfg(unix)]
+    pub(super) fn stage_carry_handoff(label: &str, carry: &StageCarry) -> StagedHandoff {
+        stage_outgoing_handoff_full(label, carry.screens.len(), None, None, Some(carry))
     }
 
     /// As [`stage_outgoing_handoff`], but `meta_wire_override` also rewrites the
@@ -4523,6 +4786,23 @@ mod tests {
         sessions: usize,
         layout_wire_override: Option<&dyn Fn(&str) -> String>,
         meta_wire_override: Option<&dyn Fn(&str) -> String>,
+    ) -> StagedHandoff {
+        stage_outgoing_handoff_full(
+            label,
+            sessions,
+            layout_wire_override,
+            meta_wire_override,
+            None,
+        )
+    }
+
+    #[cfg(unix)]
+    fn stage_outgoing_handoff_full(
+        label: &str,
+        sessions: usize,
+        layout_wire_override: Option<&dyn Fn(&str) -> String>,
+        meta_wire_override: Option<&dyn Fn(&str) -> String>,
+        carry: Option<&StageCarry>,
     ) -> StagedHandoff {
         let scratch =
             std::env::temp_dir().join(format!("aterm-handoff-e2e-{label}-{}", std::process::id()));
@@ -4567,8 +4847,13 @@ mod tests {
                 icon: None,
                 role: None,
                 attention: None,
+                control: None,
             });
             live.push((local_id, master, 4000 + index as i32));
+            if let Some(carry) = carry {
+                screens.push((local_id, carry.screens[index].clone()));
+                continue;
+            }
             let mut terminal = aterm_core::terminal::Terminal::new(24, 80);
             terminal.process(
                 format!("\x1b[1;38;5;202muser@mac\x1b[0m ~ % session {index}").as_bytes(),
@@ -4604,12 +4889,19 @@ mod tests {
                 Vec::new()
             },
             sessions: records,
+            next_turn_id: carry.and_then(|c| c.next_turn_id),
         };
         let fds = HandoffFds {
             entries: live.clone(),
         };
-        let outgoing = write_outgoing(&manifest, &fds, &screens, manifest.window.clone())
-            .expect("outgoing handoff is written");
+        let outgoing = write_outgoing(
+            &manifest,
+            &fds,
+            &screens,
+            manifest.window.clone(),
+            carry.map_or(&[][..], |c| &c.controls[..]),
+        )
+        .expect("outgoing handoff is written");
 
         // The PARENT's layout commitment is a pure function of the bytes it
         // writes to the sidecar — `restore::write_to` writes exactly
@@ -4689,6 +4981,7 @@ mod tests {
             nonce: outgoing.nonce,
             fds_wire: outgoing.fds_wire,
             expected,
+            screen_digest: parent_screen_digest,
             masters,
             slaves,
             scratch,
@@ -4697,7 +4990,12 @@ mod tests {
 
     #[cfg(unix)]
     impl StagedHandoff {
-        fn publish_env(&self, ready_write: i32, commit_read: i32, target: Option<String>) {
+        pub(super) fn publish_env(
+            &self,
+            ready_write: i32,
+            commit_read: i32,
+            target: Option<String>,
+        ) {
             let layout_path = self.manifest_path.with_extension("layout.toml");
             // SAFETY: `getppid` is a side-effect-free libc getter.
             let parent_pid = unsafe { libc::getppid() };
@@ -4723,7 +5021,7 @@ mod tests {
             }
         }
 
-        fn teardown(self) {
+        pub(super) fn teardown(self) {
             for fd in self.masters.into_iter().chain(self.slaves) {
                 aterm_pty::close_fd(fd);
             }
@@ -4732,7 +5030,7 @@ mod tests {
     }
 
     #[cfg(unix)]
-    fn pipe_pair(label: &str) -> (i32, i32) {
+    pub(super) fn pipe_pair(label: &str) -> (i32, i32) {
         let mut fds = [0i32; 2];
         // SAFETY: plain pipe(2) into a valid 2-slot out-array.
         assert_eq!(unsafe { libc::pipe(fds.as_mut_ptr()) }, 0, "{label} pipe");
@@ -4747,13 +5045,21 @@ mod tests {
     /// spelled with the crate-wide [`SessionIdentity`] alias, so the test oracle
     /// and the production signatures it drives cannot drift on field ORDER.
     #[cfg(unix)]
-    type ReadyChild = (AdoptionProof, ReadySignal, Vec<SessionIdentity>);
+    pub(super) type ReadyChild = (AdoptionProof, ReadySignal, Vec<SessionIdentity>);
 
     /// Drive the CHILD half exactly as `run()` does: consume the manifest,
     /// prove the target identity, adopt the ready channel, compute the proof.
     #[cfg(unix)]
-    fn child_proof() -> Option<ReadyChild> {
-        let incoming = take_incoming();
+    pub(super) fn child_proof() -> Option<ReadyChild> {
+        child_proof_from(take_incoming()).map(|(ready, _)| ready)
+    }
+
+    /// [`child_proof`] from an already-consumed handoff, handing the adopted
+    /// sessions back too (their control carries are what a carry test reads).
+    #[cfg(unix)]
+    pub(super) fn child_proof_from(
+        mut incoming: IncomingHandoff,
+    ) -> Option<(ReadyChild, Vec<Adopted>)> {
         if incoming.adopted.is_empty() {
             return None;
         }
@@ -4776,7 +5082,10 @@ mod tests {
             .map(|item| (item.local_id, item.master, item.pid))
             .collect::<Vec<_>>();
         let proof = ready.proof(&adopted)?;
-        Some((proof, ready, adopted))
+        Some((
+            (proof, ready, adopted),
+            std::mem::take(&mut incoming.adopted),
+        ))
     }
 
     /// THE TEST THAT WAS MISSING. Parent prepares → child consumes, adopts and
@@ -5343,6 +5652,10 @@ mod tests {
 /// `screen_wire_digest`) — so each "break" below is now a statement about the
 /// CODEC, not about the protocol, and the protocol-level proof that the fix
 /// holds lives in `tests::a_handoff_across_a_version_boundary_still_completes`.
+#[cfg(all(test, unix))]
+#[path = "seamless_carry_tests.rs"]
+mod carry_tests;
+
 #[cfg(test)]
 mod f4_adoption_proof_asymmetry {
     use super::*;

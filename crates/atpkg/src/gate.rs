@@ -85,6 +85,7 @@ mod tests {
             min_build,
             yanked: yanked.iter().map(|s| (*s).to_string()).collect(),
             pin: pin.iter().map(|(k, v)| ((*k).to_string(), *v)).collect(),
+            pin_by_target: Default::default(),
             meta: BTreeMap::new(),
         }
     }

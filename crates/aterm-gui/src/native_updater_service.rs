@@ -1136,7 +1136,8 @@ impl NativeUpdaterService {
         self.pending_preflight = None;
         self.active_apply = None;
         self.snapshot.outcome =
-            "A newer build is already installed at this bundle's path; activating it".to_string();
+            "A newer build is already installed at this bundle's path; activation is pending"
+                .to_string();
         self.record(UpdaterTransitionAction::RetireStage, before);
         self.publish();
         true
@@ -1255,12 +1256,12 @@ impl NativeUpdaterService {
     }
 
     /// The outcome sentence for a build whose bundle is already installed at the
-    /// canonical app path: the App imports it as an ACTIVATION stage and the
-    /// seamless lane applies it in place at the next quiet moment — nothing to
-    /// relaunch. Shared by the consumed-stage and the returned-apply paths.
+    /// canonical app path. The App imports an ACTIVATION stage; its policy and
+    /// safety gates still decide when activation runs. Shared by the consumed-stage
+    /// and the returned-apply paths.
     #[must_use]
     pub(crate) fn installed_activation_outcome(build: u64) -> String {
-        format!("Update build {build} is installed and activates in place at the next quiet moment")
+        format!("Update build {build} is installed; activation is pending")
     }
 
     /// The outcome sentence for a physical apply attempt that returned safely:
@@ -1326,10 +1327,14 @@ impl NativeUpdaterService {
         // A returned ACTIVATION attempt: the installed bundle is the artifact. While it
         // still backs the ticket the stage is re-armed exactly like a durable download
         // (the App's bounded automatic budget decides how many more times, then the
-        // manual-only latch); once the bundle has moved on, retire.
+        // manual-only latch); once the bundle is observed to have moved on, retire.
+        // A failed installed-bundle probe is unknown, just as in
+        // `reconcile_durable_stage`: it cannot establish that the bundle changed.
+        // Retaining the stage does not authorize a replacement; the next attempt
+        // still needs its own native preflight and physical bundle verification.
         if ticket.is_installed_activation() {
             let backed = self.snapshot.enabled
-                && facts.installed.is_some_and(|installed| {
+                && facts.installed.is_none_or(|installed| {
                     installed.backs_activation(
                         self.snapshot.current_build,
                         ticket.artifact_build,
@@ -2222,6 +2227,110 @@ mod tests {
         );
     }
 
+    #[test]
+    fn activation_observation_conforms_in_idle_and_returned_lanes() {
+        let model = aterm_spec::derive::native_update_activation_observation_model();
+        let observations = [
+            (None, false),
+            (Some(installed(11, TEST_COMMIT, None, None)), false),
+            (Some(installed(12, TEST_COMMIT, None, None)), true),
+            (Some(installed(11, &"f".repeat(40), None, None)), true),
+        ];
+        for returned in [false, true] {
+            for (observation, changed) in &observations {
+                let mut service = NativeUpdaterService::new(10, "1.0.10", true);
+                stage_activation(&mut service, 11);
+                let stage = service.snapshot().staged.clone();
+                let mut before = model.init_state();
+                if observation.is_some() {
+                    let action = if *changed {
+                        "ObserveChange"
+                    } else {
+                        "ObserveMatch"
+                    };
+                    before = model.successors(action, &before).remove(0);
+                }
+                if returned {
+                    before = model.successors("Return", &before).remove(0);
+                    let ApplyPreflightStart::Inspect(ticket) =
+                        service.begin_apply_preflight(ApplyMode::Automatic)
+                    else {
+                        panic!("activation must enter preflight");
+                    };
+                    let ApplyDecision::Execute(command) =
+                        service.finish_apply_preflight(ticket, ClosePreflight::Ready)
+                    else {
+                        panic!("exact ready preflight must issue one apply authority");
+                    };
+                    let attempt = command.attempt();
+                    let disposition = service.finish_returned_apply(
+                        &attempt,
+                        ReturnedApplyFacts::new(true, None, None, None, observation.as_ref()),
+                        "candidate timed out; installed-bundle probe may be unavailable",
+                    );
+                    assert_eq!(
+                        disposition,
+                        if *changed {
+                            ReturnedApplyDisposition::Retired
+                        } else {
+                            ReturnedApplyDisposition::Rearmed
+                        }
+                    );
+                    // The completion consumes the old authority even when its
+                    // stage survives. A duplicate cannot spend the retry budget.
+                    assert_eq!(
+                        service.finish_returned_apply(
+                            &attempt,
+                            ReturnedApplyFacts::new(true, None, None, None, observation.as_ref()),
+                            "duplicate completion",
+                        ),
+                        ReturnedApplyDisposition::Ignored
+                    );
+                } else {
+                    assert_eq!(
+                        service.reconcile_durable_stage(
+                            true,
+                            None,
+                            None,
+                            None,
+                            observation.as_ref()
+                        ),
+                        if *changed {
+                            DurableStageDisposition::Retired
+                        } else {
+                            DurableStageDisposition::Unchanged
+                        }
+                    );
+                }
+                let retained = service.snapshot().staged.is_some();
+                let mut after = before.clone();
+                after.insert("reduced", 1);
+                after.insert("retained", i64::from(retained));
+                assert_eq!(
+                    model.successors("Reduce", &before),
+                    vec![after.clone()],
+                    "real activation reducer must conform: returned={returned}, observation={observation:?}"
+                );
+                for invariant in &model.invariants {
+                    assert!(model.check_invariant(invariant.name, &after));
+                }
+                if retained {
+                    assert_eq!(service.snapshot().staged, stage);
+                    assert_eq!(service.snapshot().phase, UpdaterPhase::Staged);
+                    assert!(service.active_apply.is_none());
+                }
+                if returned && observation.is_none() {
+                    // Historical behavior: unknown became a changed-bundle
+                    // retirement. The same model must reject that actual bug.
+                    let mut historical = after;
+                    historical.insert("retained", 0);
+                    assert!(!model.successors("Reduce", &before).contains(&historical));
+                    assert!(!model.check_invariant("NoRetirementWithoutEvidence", &historical));
+                }
+            }
+        }
+    }
+
     /// A RETURNED activation attempt (the handoff came back without committing)
     /// re-arms while the bundle still backs it — the App's bounded automatic budget
     /// and manual-only latch decide how many more times — and retires once the
@@ -2349,10 +2458,7 @@ mod tests {
         assert_eq!(service.snapshot().reexec_count, 0);
         assert!(service.snapshot().outcome.contains("installed"));
         assert!(
-            service
-                .snapshot()
-                .outcome
-                .contains("activates in place at the next quiet moment")
+            service.snapshot().outcome.contains("activation is pending")
                 && !service.snapshot().outcome.contains("relaunch"),
             "an installed bundle is activated in place, never left for a relaunch: {:?}",
             service.snapshot().outcome

@@ -4437,6 +4437,7 @@ mod tests {
             sid: aterm_session::SessionId::generate(),
             nonce: aterm_session::LaunchNonce::generate(),
             checkpoint: None,
+            control: None,
         }
     }
 

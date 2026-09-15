@@ -21,8 +21,13 @@ use crate::paths::Staging;
 #[derive(Serialize)]
 struct Status<'a> {
     schema: u32,
-    /// RFC3339 UTC time this record was written.
+    /// RFC3339 UTC time this record was written — the file's ANY-WRITER clock.
     updated_at: String,
+    /// Last completed-check receipt's timestamp, copied for operator visibility.
+    /// The dedup gate reads the source/build-bound check.toml receipt itself;
+    /// no generic status writer may manufacture a completed check.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    checked_at: Option<String>,
     /// Whether the updater is configured to act: a macOS installed `.app` and not
     /// opted out via `ATERM_NO_AUTO_UPDATE`. No pinned anchor is required (the
     /// default Tier REPO); inertness on unsigned/repo builds comes from
@@ -42,8 +47,8 @@ struct Status<'a> {
     /// GitHub — the server's own `x-ratelimit-reset` for this IP, jittered and clamped
     /// (`github::hold_until_reset`). Present ONLY on a rate-limit deferral that knew the
     /// reset; readers default it, so the record's schema stays 1. The sibling checker
-    /// gate (`checker_skip`) reads it FIRST, and releases exactly here rather than by
-    /// widening its window.
+    /// reads the corresponding hold from the completed-check receipt instead of this
+    /// any-writer record.
     #[serde(skip_serializing_if = "Option::is_none")]
     held_until: Option<String>,
     /// Which lane the last check read the channel on: `web` (the unmetered download
@@ -62,7 +67,7 @@ struct Status<'a> {
     /// staged, covered, or found up to date). The web lane's steady state: a check whose
     /// evergreen pointer names this tag stops at its one HEAD — but only while the
     /// ledger still describes THIS machine's decision: the reader ([`latest_tag`])
-    /// honours it only when `current_build` is the caller's build (a manual downgrade
+    /// honours it only when `latest_authorized_build` is the caller's build (a manual downgrade
     /// or an applied stage moved the build, so the old verdict no longer applies) and
     /// `latest_source` is the caller's channel (a repointed updater has never judged
     /// the new repository's release). STICKY across records — every writer (the apply
@@ -76,6 +81,15 @@ struct Status<'a> {
     /// an older file without it is read as "no tag", which costs one unmetered re-fetch.
     #[serde(skip_serializing_if = "Option::is_none")]
     latest_source: Option<String>,
+    /// The running build that actually authorized `latest_tag`. Kept separate from
+    /// `current_build`: an unrelated status write must not rebind cached authority.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    latest_authorized_build: Option<u64>,
+    /// The signed release build that the cached decision judged. If it is newer
+    /// than the running build, the shortcut also requires a still-publishable stage
+    /// covering it. Missing fields in an older ledger force one fresh check.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    latest_release_build: Option<u64>,
     /// The API budget this check's LIST headers reported, exactly as GitHub said it —
     /// absent when the headers did not carry it (always, on the web lane).
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -97,7 +111,7 @@ struct Delivery {
     note: Option<String>,
     /// A tag the CURRENT check authorized, with the `owner/repo` it was authorized
     /// against; `None` means "carry the file's forward".
-    latest: Option<(String, String)>,
+    latest: Option<LatestRecord>,
     budget_remaining: Option<u32>,
     budget_limit: Option<u32>,
     budget_reset: Option<u64>,
@@ -140,11 +154,21 @@ pub(crate) fn set_delivery_note(note: &str) {
 /// onto every record from now on (and carried forward by every later writer), so the
 /// next web-lane check on the same build and channel can stop at its HEAD when the
 /// pointer still names it.
-pub(crate) fn set_latest_tag(tag: &str, source: &crate::Source) {
+pub(crate) fn set_latest_tag(
+    tag: &str,
+    source: &crate::Source,
+    current_build: u64,
+    release_build: u64,
+) {
     DELIVERY
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner)
-        .latest = Some((tag.to_string(), source_slug(source)));
+        .latest = Some(LatestRecord {
+        tag: tag.to_string(),
+        source: source_slug(source),
+        build: current_build,
+        release_build,
+    });
 }
 
 /// `owner/repo`, the spelling `latest_source` records.
@@ -157,10 +181,12 @@ fn source_slug(source: &crate::Source) -> String {
 
 /// What the ledger on disk says about the last authorized release, raw: the tag, the
 /// source it was recorded against, and the build that recorded it.
+#[derive(Clone)]
 struct LatestRecord {
     tag: String,
-    source: Option<String>,
-    build: Option<u64>,
+    source: String,
+    build: u64,
+    release_build: u64,
 }
 
 /// Read [`LatestRecord`] off the ledger. Absent, unreadable or empty tag ⇒ `None`.
@@ -176,12 +202,16 @@ fn read_latest(staging: &Staging) -> Option<LatestRecord> {
         tag,
         source: v
             .get("latest_source")
-            .and_then(aterm_toml::Value::as_str)
-            .map(str::to_string),
+            .and_then(aterm_toml::Value::as_str)?
+            .to_string(),
         build: v
-            .get("current_build")
+            .get("latest_authorized_build")
             .and_then(aterm_toml::Value::as_integer)
-            .and_then(|b| u64::try_from(b).ok()),
+            .and_then(|b| u64::try_from(b).ok())?,
+        release_build: v
+            .get("latest_release_build")
+            .and_then(aterm_toml::Value::as_integer)
+            .and_then(|b| u64::try_from(b).ok())?,
     })
 }
 
@@ -191,22 +221,24 @@ fn read_latest(staging: &Staging) -> Option<LatestRecord> {
 /// an apply, a manual install or a downgrade, so the old verdict is about another
 /// build), or was authorized against a DIFFERENT `owner/repo` (a repointed updater has
 /// never judged this repository's release; an older file that recorded no source is
-/// treated the same way). The next check then fetches and re-judges the head, which
-/// costs unmetered requests only.
+/// treated the same way), or the newer stage it depended on is no longer publishable.
+/// The next check then fetches and re-judges the head, which costs unmetered requests only.
 pub(crate) fn latest_tag(
     staging: &Staging,
     current_build: u64,
     source: &crate::Source,
 ) -> Option<String> {
     let latest = read_latest(staging)?;
-    if latest.build != Some(current_build) {
+    if latest.build != current_build {
         return None;
     }
     let slug = source_slug(source);
-    if !latest
-        .source
-        .as_deref()
-        .is_some_and(|recorded| recorded.eq_ignore_ascii_case(&slug))
+    if !latest.source.eq_ignore_ascii_case(&slug) {
+        return None;
+    }
+    if latest.release_build > current_build
+        && !crate::manifest::Ready::read_publishable(staging)
+            .is_some_and(|ready| ready.build_number >= latest.release_build)
     {
         return None;
     }
@@ -218,9 +250,9 @@ pub(crate) fn latest_tag(
 /// stage is RETIRED ([`Staging::retire_published`]): "up to date (channel head vX)"
 /// would otherwise be the answer of every later check while the stage that verdict
 /// rested on is gone, and the machine would sit on the old build until the publisher
-/// cut a NEW tag. Best-effort, like every write to this file; a lost clear costs
-/// nothing (the stale verdict is re-judged on the next moved pointer) and a lost
-/// carry-forward costs one unmetered re-fetch.
+/// cut a NEW tag. Best-effort, like every write to this file; even if another writer
+/// restores an old tag, the reader rechecks its required stage. A lost carry-forward
+/// costs one unmetered re-fetch.
 pub(crate) fn clear_latest_tag(staging: &Staging) {
     DELIVERY
         .lock()
@@ -239,6 +271,8 @@ pub(crate) fn clear_latest_tag(staging: &Staging) {
         return;
     }
     table.remove("latest_source");
+    table.remove("latest_authorized_build");
+    table.remove("latest_release_build");
     let Ok(text) = aterm_toml::to_string(&v) else {
         return;
     };
@@ -331,16 +365,13 @@ fn record_with_hold(staging: &Staging, current_build: u64, held_until: Option<u6
     // refusal) carries the file's `latest_tag` (and its source) forward rather than
     // erasing it — the ledger is one overwritten line, and losing the tag costs the
     // next check a full (unmetered) re-fetch for nothing.
-    let (latest_tag, latest_source) = match delivery.latest {
-        Some((tag, source)) => (Some(tag), Some(source)),
-        None => match read_latest(staging) {
-            Some(latest) => (Some(latest.tag), latest.source),
-            None => (None, None),
-        },
-    };
+    let latest = delivery.latest.or_else(|| read_latest(staging));
+    let updated_at = crate::install::now_rfc3339();
+    let checked_at = crate::check_receipt::completed_at(staging);
     let status = Status {
         schema: 1,
-        updated_at: crate::install::now_rfc3339(),
+        updated_at,
+        checked_at,
         enabled: crate::enabled(),
         current_build,
         staged_build: ready.as_ref().map(|r| r.build_number),
@@ -349,8 +380,10 @@ fn record_with_hold(staging: &Staging, current_build: u64, held_until: Option<u6
         held_until: held_until.map(aterm_types::rfc3339::format_rfc3339),
         lane: delivery.lane,
         delivery: delivery.note,
-        latest_tag,
-        latest_source,
+        latest_tag: latest.as_ref().map(|record| record.tag.clone()),
+        latest_source: latest.as_ref().map(|record| record.source.clone()),
+        latest_authorized_build: latest.as_ref().map(|record| record.build),
+        latest_release_build: latest.as_ref().map(|record| record.release_build),
         budget_remaining: delivery.budget_remaining,
         budget_limit: delivery.budget_limit,
         budget_reset: delivery
@@ -578,7 +611,7 @@ mod tests {
         // A check that authorized a tag records it, with the source it judged.
         clear_check_note();
         set_delivery("web".into(), None, None, None);
-        set_latest_tag("v0.74.0", &source);
+        set_latest_tag("v0.74.0", &source, 42, 42);
         record(&s, 42, "up to date (channel head v0.74.0)");
         let text = std::fs::read_to_string(&s.status).unwrap();
         let v: aterm_toml::Value = aterm_toml::from_str(&text).expect("valid TOML");
@@ -654,7 +687,7 @@ mod tests {
         assert_eq!(latest_tag(&s, 42, &source), None);
         // RETIREMENT clears the tag on disk (and the source with it) but nothing else
         // in the record, and a record written afterwards does not resurrect it.
-        set_latest_tag("v0.74.0", &source);
+        set_latest_tag("v0.74.0", &source, 42, 42);
         record(&s, 42, "staged 0.74.0");
         assert_eq!(latest_tag(&s, 42, &source).as_deref(), Some("v0.74.0"));
         s.retire_published();
@@ -706,5 +739,138 @@ mod tests {
         std::fs::write(&s.status, "not toml {{{").unwrap();
         assert_eq!(latest_tag(&s, 42, &source), None);
         let _ = std::fs::remove_dir_all(&root);
+    }
+
+    fn write_cache_stage(staging: &Staging, build: u64) {
+        let commit = "0123456789abcdef0123456789abcdef01234567";
+        let ready = crate::manifest::Ready {
+            build_number: build,
+            version: "0.85.0".into(),
+            commit: Some(commit.into()),
+            dmg_sha256: "ab".repeat(32),
+            team_id: "T".into(),
+            staged_at: String::new(),
+            changelog: None,
+            machine_id: None,
+            roster_seq: None,
+        };
+        let contents = staging.staged_app.join("Contents");
+        std::fs::create_dir_all(&contents).unwrap();
+        std::fs::write(
+            contents.join("Info.plist"),
+            format!(
+                "<plist><dict><key>CFBundleVersion</key><string>{build}</string>\
+                 <key>ATermGitCommit</key><string>{commit}</string></dict></plist>"
+            ),
+        )
+        .unwrap();
+        std::fs::write(&staging.ready, ready.to_toml().unwrap()).unwrap();
+    }
+
+    fn cache_decision_matches_model(staging: &Staging, build: u64, source: &crate::Source) -> bool {
+        let model = aterm_spec::derive::native_update_web_cache_model();
+        let latest = read_latest(staging).expect("test wrote a complete cache record");
+        let mut state = model.init_state();
+        state.insert("running", i64::try_from(build).unwrap());
+        state.insert("author", i64::try_from(latest.build).unwrap());
+        state.insert("release", i64::try_from(latest.release_build).unwrap());
+        state.insert(
+            "stage",
+            crate::manifest::Ready::read_publishable(staging)
+                .map(|ready| i64::try_from(ready.build_number).unwrap())
+                .unwrap_or(0),
+        );
+        state.insert(
+            "same_source",
+            i64::from(latest.source.eq_ignore_ascii_case(&source_slug(source))),
+        );
+        let allowed = model.action_enabled("UseCache", &state);
+        assert_eq!(
+            latest_tag(staging, build, source).is_some(),
+            allowed,
+            "the shipping cache reader must agree with the derived guard: {state:?}"
+        );
+        allowed
+    }
+
+    fn historical_cache_would_skip(staging: &Staging, build: u64) -> bool {
+        // The old reader trusted the status writer's current_build and never
+        // inspected the stage that the authorized release still needed.
+        let text = std::fs::read_to_string(&staging.status).unwrap();
+        let value: aterm_toml::Value = text.parse().unwrap();
+        value.get("latest_tag").is_some()
+            && value
+                .get("current_build")
+                .and_then(aterm_toml::Value::as_integer)
+                == Some(i64::try_from(build).unwrap())
+    }
+
+    #[test]
+    fn cache_rechecks_its_stage_and_never_rebinds_authority_on_a_status_write() {
+        let _guard = crate::STRANDED_TEST_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let staging = Staging::scratch("cache-evidence");
+        let source = crate::Source {
+            owner: "alabsystems".into(),
+            repo: "aterm".into(),
+        };
+        clear_check_note();
+        write_cache_stage(&staging, 2);
+        set_latest_tag("v0.85.0", &source, 1, 2);
+        record(&staging, 1, "verified stage published");
+        assert!(cache_decision_matches_model(&staging, 1, &source));
+
+        // A failed replacement can remove the old marker before the new marker
+        // commits. No explicit retirement/clear ran: the reader must notice.
+        std::fs::remove_file(&staging.ready).unwrap();
+        clear_check_note();
+        record(&staging, 1, "replacement publication failed");
+        assert!(!cache_decision_matches_model(&staging, 1, &source));
+        assert!(
+            historical_cache_would_skip(&staging, 1),
+            "negative control: the old shortcut would strand this missing stage"
+        );
+
+        write_cache_stage(&staging, 2);
+        std::fs::remove_dir_all(&staging.staged_app).unwrap();
+        assert!(!cache_decision_matches_model(&staging, 1, &source));
+        write_cache_stage(&staging, 1);
+        assert!(!cache_decision_matches_model(&staging, 1, &source));
+        write_cache_stage(&staging, 2);
+        assert!(cache_decision_matches_model(&staging, 1, &source));
+        std::fs::write(staging.staged_app.join("Contents/Info.plist"), "corrupt").unwrap();
+        assert!(!cache_decision_matches_model(&staging, 1, &source));
+        write_cache_stage(&staging, 3);
+        assert!(cache_decision_matches_model(&staging, 1, &source));
+
+        // A new process writes a refusal before its first network check. Neither
+        // an in-process carry nor a disk-only carry may mint authority for it.
+        set_latest_tag("v0.85.0", &source, 1, 2);
+        for in_memory in [true, false] {
+            if !in_memory {
+                clear_check_note();
+            }
+            record(&staging, 0, "apply refused before the first check");
+            assert!(!cache_decision_matches_model(&staging, 0, &source));
+            assert!(historical_cache_would_skip(&staging, 0));
+            assert_eq!(read_latest(&staging).unwrap().build, 1);
+        }
+        assert!(!cache_decision_matches_model(
+            &staging,
+            1,
+            &crate::Source {
+                owner: "example".into(),
+                repo: "mirror".into(),
+            }
+        ));
+
+        // A signed release already covered by the running build needs no stage.
+        set_latest_tag("v0.85.0", &source, 1, 1);
+        record(&staging, 1, "up to date");
+        std::fs::remove_file(&staging.ready).unwrap();
+        assert!(cache_decision_matches_model(&staging, 1, &source));
+        clear_check_note();
+        let _ = std::fs::remove_dir_all(staging.root);
     }
 }

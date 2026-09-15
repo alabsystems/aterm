@@ -12,6 +12,11 @@
 //! header, the ladder, the verdict; its doc lists every line — so a run can be
 //! diffed, piped or pasted into a review. Progress goes to stderr, and only when
 //! stderr is a terminal — a captured log is a record of decisions, not of waiting.
+//!
+//! The one exception is a run that could not get its SNAPSHOT (2026-09-13):
+//! it prints the `snapshot:` FAIL and COULD NOT RUN and exits `3` before any
+//! stage, because running in place instead would bring back the live-checkout
+//! hazards the snapshot exists to remove ([`aterm_verify::snapshot`]).
 
 use std::io::{IsTerminal, Write};
 use std::path::{Path, PathBuf};
@@ -19,7 +24,7 @@ use std::time::Instant;
 
 use aterm_verify::cli;
 use aterm_verify::ladder::Report;
-use aterm_verify::{Ctx, EnvSnapshot, Scope, Toolchain, changed, exit};
+use aterm_verify::{Ctx, EnvSnapshot, Scope, Toolchain, changed, exec, exit, identity, snapshot};
 
 fn main() {
     let args: Vec<String> = std::env::args().skip(1).collect();
@@ -55,19 +60,51 @@ fn main() {
         }
     };
 
+    // Timings are a side channel: a file that cannot be opened is said on
+    // stderr and costs the TSV, never the run.
+    let timings = env.verify_timings.as_deref().and_then(|p| {
+        exec::Timings::create(p)
+            .map_err(|e| {
+                eprintln!(
+                    "verify: cannot open ATERM_VERIFY_TIMINGS={}: {e}",
+                    p.display()
+                )
+            })
+            .ok()
+    });
+
+    // THE SNAPSHOT, before anything reads the tree — `--changed` included, so
+    // its selection is of the same tree the stages build.
+    let (snap, notes) = match choose_source(&parsed, &root, &env, &scratch) {
+        Ok(chosen) => chosen,
+        Err(why) => {
+            print!("{}", snapshot::could_not_run_text(&why));
+            std::fs::remove_dir_all(&scratch).ok();
+            std::process::exit(exit::COULD_NOT_RUN);
+        }
+    };
+    let run_root = snap
+        .as_ref()
+        .map_or_else(|| root.clone(), |s| s.root.clone());
+
     // `--changed` decides the scope BEFORE the ladder is planned, so it runs
     // here rather than as a stage: every header below names the scope it picks.
-    let (scope, prelude) = resolve_scope(&parsed, &root, &env);
+    let (scope, prelude) = resolve_scope(&parsed, &run_root, &env);
 
-    let ctx = Ctx::new(
-        root,
+    let mut ctx = Ctx::new(
+        run_root,
         parsed.mode,
         scope,
         parsed.selftest,
         env,
         scratch.clone(),
     )
-    .with_prelude(prelude);
+    .with_prelude(prelude)
+    .with_timings(timings)
+    .with_notes(notes);
+    if let Some(s) = &snap {
+        ctx = ctx.in_snapshot_of(s.caller.clone(), s.tree.clone(), s.notes.clone());
+    }
 
     let started = Instant::now();
     let stdout = std::io::stdout();
@@ -82,6 +119,9 @@ fn main() {
     let _ = out.flush();
     drop(out);
     std::fs::remove_dir_all(&scratch).ok();
+    if let Some(s) = snap {
+        s.finish();
+    }
 
     if std::io::stderr().is_terminal() {
         let secs = started.elapsed().as_secs_f64();
@@ -116,6 +156,61 @@ fn resolve_scope(parsed: &cli::Args, root: &Path, env: &EnvSnapshot) -> (Scope, 
     let selection = changed::resolve(root, &tools, &path_env, &base);
     let (scope, report) = changed::stage_report(&base, &selection);
     (scope, Some(report))
+}
+
+/// Where this run's stages execute: a prepared snapshot (the default), or the
+/// caller's checkout — for `--in-place`, for `--selftest` (it builds nothing, so
+/// there is nothing to protect), and for a root that is not a git checkout at
+/// all, which has no HEAD to pin and says so in the header. A root that holds a
+/// `.git` git cannot open is neither: it is an `Err`.
+///
+/// # Errors
+/// Why a snapshot that should have been had could not be.
+fn choose_source(
+    parsed: &cli::Args,
+    root: &Path,
+    env: &EnvSnapshot,
+    scratch: &Path,
+) -> Result<(Option<snapshot::Snapshot>, Vec<String>), String> {
+    if parsed.in_place || parsed.selftest {
+        return Ok((None, Vec::new()));
+    }
+    if !identity::is_git_toplevel(root, &env.path) {
+        // A `.git` git cannot open is a checkout the run cannot pin, not a root
+        // without one: falling back in place would run with no source tripwire.
+        if identity::has_git_entry(root) {
+            return Err(identity::unopenable_reason(root));
+        }
+        return Ok((
+            None,
+            vec![format!(
+                "verify: {} is not a git checkout, so there is no HEAD to snapshot — this run is IN PLACE",
+                root.display()
+            )],
+        ));
+    }
+    // The compiler's commit, for the lane stamps: the same discovery `Ctx::new`
+    // makes, so the stamp names the compiler the stages will run.
+    let prefix = aterm_verify::toolchain::atpkg_prefix(&env.home, env.xdg_config_home.as_deref());
+    let tools = Toolchain::discover_with_store(
+        env.trust_stage2_bin.as_deref(),
+        &env.home,
+        Some(&prefix),
+        &env.path,
+        aterm_verify::toolchain::pinned_channel(root).as_deref(),
+    );
+    let path_env = tools.path_with_stage2_first(&env.path);
+    let snap = snapshot::prepare(&snapshot::Options {
+        caller: root,
+        snapshot: env
+            .verify_snapshot
+            .clone()
+            .unwrap_or_else(|| snapshot::default_root(root)),
+        path_env: &path_env,
+        lane_env: snapshot::lane_env_from_process(),
+        trustc_commit: tools.identity(&path_env, scratch).commit,
+    })?;
+    Ok((Some(snap), Vec::new()))
 }
 
 /// `--root`, then `ATERM_VERIFY_ROOT`, then a walk up from the cwd.

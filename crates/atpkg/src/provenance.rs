@@ -54,9 +54,10 @@ pub const WHAT_IT_BREAKS: &str = "the tag follows the executable and the parent 
 /// The cure, for every refusal that names it.
 pub const REMEDY: &str = "re-seed the bundle untagged — `aterm pkg uninstall <program> && \
     aterm pkg install <program>` (this atpkg stages through an untracked launchd job when it \
-    measures itself as tracked) — or point TRUST_STAGE2_BIN at an untagged bundle's bin/ \
-    (`xattr -l <bin>/trustc` prints nothing on a clean one), and run the cut itself via \
-    `launchctl submit` from an untagged cutter (docs/RELEASING.md)";
+    measures itself as tracked; the uninstall clears toolset adoption, so finish with `aterm \
+    pkg install --default-set` to keep the set auto-completing) — or point TRUST_STAGE2_BIN \
+    at an untagged bundle's bin/ (`xattr -l <bin>/trustc` prints nothing on a clean one), and \
+    run the cut itself via `launchctl submit` from an untagged cutter (docs/RELEASING.md)";
 
 /// The extended-attribute NAMES on `path` (symlinks followed), in the order the kernel
 /// lists them.
@@ -147,6 +148,34 @@ pub fn carries(path: &Path, attr: &str) -> bool {
 #[must_use]
 pub fn carries_provenance(path: &Path) -> bool {
     carries(path, PROVENANCE_XATTR)
+}
+
+/// The attribute macOS stamps on a browser download. It matters here because a
+/// QUARANTINED executable is provenance-tracked in every invocation — a job launchd
+/// spawns from it included, which is the one escape the untracked lane relies on
+/// (measured 2026-09-14 on m16: a launchd job that exec'd the quarantined, UNTAGGED
+/// `aterm.app` binary in place wrote a result file carrying `com.apple.provenance`).
+/// So a quarantined helper is as unusable in place as a tagged one, and
+/// [`crate::stage_helper::plan_for_exe`] must treat it the same way. An app laid down
+/// by aterm's own updater carries neither attribute.
+pub const QUARANTINE_XATTR: &str = "com.apple.quarantine";
+
+/// The quarantined carrier behind `exe`, if any: `exe` itself, or the enclosing `.app`
+/// bundle root — a browser stamps the bundle it downloaded and the executable inside
+/// it, and either is enough to make every invocation tracked. `None` when neither
+/// carries the attribute, and on every non-macOS platform.
+#[must_use]
+pub fn quarantined_carrier(exe: &Path) -> Option<PathBuf> {
+    if !cfg!(target_os = "macos") {
+        return None;
+    }
+    if carries(exe, QUARANTINE_XATTR) {
+        return Some(exe.to_path_buf());
+    }
+    exe.ancestors()
+        .find(|a| a.extension().is_some_and(|x| x == "app"))
+        .filter(|app| carries(app, QUARANTINE_XATTR))
+        .map(Path::to_path_buf)
 }
 
 /// The regular files DIRECTLY under `dir` that carry `attr`, and how many regular files
@@ -269,6 +298,32 @@ mod tests {
                 .iter()
                 .any(|n| n == "user.aterm.probe")
         );
+        let _ = std::fs::remove_dir_all(&d);
+    }
+
+    /// A quarantined BUNDLE makes its executable a quarantined carrier, and so does the
+    /// executable itself — the Safari-download shape, which reads as untagged and is
+    /// nevertheless tracked under every parent (2026-09-14).
+    #[test]
+    fn a_quarantined_bundle_or_executable_is_found_as_the_carrier() {
+        let d = tmp("quarantine");
+        let contents = d.join("aterm.app").join("Contents");
+        std::fs::create_dir_all(contents.join("MacOS")).unwrap();
+        let exe = contents.join("MacOS").join("aterm");
+        std::fs::write(&exe, b"x").unwrap();
+        assert_eq!(quarantined_carrier(&exe), None, "clean to begin with");
+        // The attribute a browser sets is one a test CAN mint (unlike the provenance tag).
+        set_xattr_for_test(&d.join("aterm.app"), QUARANTINE_XATTR, b"0083;0;Safari;").unwrap();
+        assert_eq!(
+            quarantined_carrier(&exe),
+            Some(d.join("aterm.app")),
+            "the bundle is the carrier"
+        );
+        let lone = d.join("atpkg");
+        std::fs::write(&lone, b"x").unwrap();
+        assert_eq!(quarantined_carrier(&lone), None);
+        set_xattr_for_test(&lone, QUARANTINE_XATTR, b"0083;0;Safari;").unwrap();
+        assert_eq!(quarantined_carrier(&lone), Some(lone.clone()));
         let _ = std::fs::remove_dir_all(&d);
     }
 

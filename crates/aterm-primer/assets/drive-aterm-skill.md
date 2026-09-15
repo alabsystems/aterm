@@ -630,6 +630,12 @@ aterm drive await-turn "@$SID" --timeout 600000               # block until not 
 aterm drive supervise "@$SID" --auto-reads --max-s 1800 --notes notes.txt   # the manager loop; see the supervise-agent skill
 aterm drive watch "@$SID" --auto-reads --notes notes.txt      # the same loop under a background monitor: one line per decision
 aterm drive report "@$SID"                                    # what the worker said since your turn, what scrolled off included
+aterm drive report "@$SID" --final                            # only its LAST message block (no tool rows, no ⎿ output); --messages for every one
+aterm drive watch "@$SID" --journal j.jsonl                   # …and one JSON object per line it prints, for the ledger below
+aterm drive watch "@$SID" --mail --journal j.jsonl            # …with your inbox parked beside it: MAIL per delivery, ONE `EVENT turn` per worker turn
+aterm drive task "@$SID" --no-nudge 'run the suite and report'  # the task by MAIL (kind=task), never through the PTY; `task @<off> nudged=0|1`
+aterm drive task "@$SID" --wait 'which branch?'               # …and park for the answer|report|ack with re=<off>
+aterm drive ledger "@$SID" --journal j.jsonl --format html --out ledger.html   # how the loop ran: swimlanes on a time axis
 ```
 
 `prompt` is `send` → `key enter` → `await idle <ms> timeout <ms>` → best-effort
@@ -642,12 +648,33 @@ program *is* Claude. Point it at your own REPL's prompt otherwise, or pass `''` 
 idle-only. Also settable via `$ATERM_DRIVE_READY` (the flag wins). A non-matching pattern
 costs a bounded extra wait, never a failed turn.
 
-The last six are the `supervise-agent` skill's loop (`aterm drive --help`, *SUPERVISING A
-WORKER*): `classify` is the read-only judgment, `phase` one read → one word, `await-turn`
-the wait that never sleeps, `supervise` the loop that approves only a read-only Bash prompt
-(guarded: `key if=Do.you.want.to.proceed 1`) and stops at everything else, `watch` that loop
-printing one `EVENT` line per review point and keeping on, `report` what the worker said
-since your turn. `--timeout` is milliseconds; `--max-s` is seconds.
+Everything from `classify` down is the `supervise-agent` skill's loop (`aterm drive
+--help`, *SUPERVISING A WORKER*): `classify` is the read-only judgment, `phase` one read →
+one word, `await-turn` the wait that never sleeps, `supervise` the loop that approves only
+a read-only Bash prompt (guarded: `key if=Do.you.want.to.proceed 1`) and stops at
+everything else, `watch` that loop printing one `EVENT` line per review point and keeping
+on, `task` the work sent by mail, `report` what the worker said since your turn (`--final`
+its last message block alone), `ledger` how the whole loop ran. `--timeout` is
+milliseconds; `--max-s` is seconds.
+
+**With the fabric on, mail is the channel and the screen is the safety net.** `watch
+--mail` parks ONE `await inbox since=<id>` on YOUR session (`@self`, or `--inbox @sid`)
+from a thread with a control client of its own — the worker's socket sees not one request
+more, except one screen read per 20 s step while an idle point is held, and nothing polls
+— and prints `MAIL id=<n> off=<o> from=<sid> kind=<k> len=<n>
+[re=<o>]` as each row lands (`aterm ctl @self inbox get <id>` is the body). The worker's
+end-of-turn `report` (its Stop hook posts it: `aterm link hook install claude --report-to
+@<you>`) is folded into the idle point of the same turn: `EVENT turn seq=<n> report=<id>
+rows=<n> <summary>`, one line per worker turn — measured 2026-09-14, one wake and one 2 KB
+read where the same turn was a 689-row `report`. An idle whose report never came within
+`--idle-grace` (180 s) is `EVENT idle-no-report …` — and so is one a prompt or a new turn
+superseded under the hold (the screen is read once a step there). A report is the turn's
+when it came after the worker was read busy for the turn, or after the point; one from
+before the last point handed over never is; `--report-window` (120 s) bounds only a report
+from before the turn was seen to begin. `task` posts `kind=task` from your session and, only
+when the worker is idle and `--no-nudge` is not given, types the one-line nudge `Inbox:
+task @<off>` as a turn; a worker whose wake hooks accept you (`--accept-from` naming your
+sid) needs `--no-nudge`.
 
 **Never rate a session for the human.** While Claude Code's session survey (`● How is
 Claude doing this session?` over `1: Bad    2: Fine   3: Good   0: Dismiss`) is open
@@ -689,7 +716,28 @@ read, from your turn's `❯` row down to the live zone, every row verbatim. Its 
 last=<o:i|->` says whether anything may be missing and why (`archive-gap`, `archive-reset`,
 `max-rows`, `marker-not-found`, `no-archive` for the screen alone, `main-screen` when the
 worker is off the alternate screen); then `--` and the rows. `watch --report` adds
-`complete=<0|1> rows=<n>` to each idle, question and limited `EVENT`.
+`complete=<0|1> rows=<n>` to each idle, question and limited `EVENT`. An aterm self-update
+hands the worker's archive and turn ledger to the new instance (its `history` records say
+`carried=1`), so a report across one is whole when the rows since your turn fit what it
+carries (at most the newest 1 MiB); a resize as the new instance takes over makes it
+`archive-gap` with nothing lost. One that could not carry them starts both afresh: `history`
+is empty, so `report` starts at the last `❯` row it can still see (`marker=user-row`, or
+`marker-not-found`), and `--since` a mark from before it says `archive-reset`.
+
+**`aterm drive ledger` replays the loop.** It joins the worker's turn ledger
+(`history`: your turns, their settle verdicts), the rows each reply drew (one
+`offscreen … screen=1` read, joined as `report` joins it), the watcher's
+`--journal` lines (`watch|supervise --journal FILE` writes one JSON object per
+line it prints — every EVENT, APPROVED, DISMISSED, RECONNECT, TIMEOUT and EXIT,
+with the wall-clock time; opened append-only, created 0600, and a failure to
+write it is said once and stops nothing) and this session's fabric mail with that
+worker (`inbox --peek --meta` and the `timeline`'s posts; nothing is listed or
+handled). `--format text` aligns columns, `md` writes tables, `html --out PATH`
+writes ONE self-contained page with the manager, watcher and worker swimlanes on a
+time axis and the fabric's mail on a fourth. `history`,
+the inbox and the timeline are stamped by the aterm process's own clock, so they
+are placed by the birth time of its control socket; anything that cannot be
+placed is marked `~` and no latency is claimed. Reads only.
 
 `drive` **shells out** to `aterm-ctl`, so through a bare symlink with no sibling client it
 fails with `could not run aterm-ctl`. Set `$ATERM_CTL`, or just use `aterm ctl` — that path

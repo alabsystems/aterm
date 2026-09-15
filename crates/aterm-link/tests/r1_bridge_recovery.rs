@@ -23,7 +23,7 @@ mod harness;
 
 use std::time::Duration;
 
-use harness::{until, until_within, World, FLEET};
+use harness::{until, World, FLEET};
 
 /// The `msg` row ids and texts a session's ring holds, `--peek` so nothing is
 /// listed or marked by looking.
@@ -558,19 +558,28 @@ fn a_post_that_becomes_unroutable_leaves_no_reservation_and_no_pin() {
     });
     std::fs::remove_file(&marker).expect("let the publish through");
 
-    // PERIOD-DRIVEN, so it waits on the harness's slower clock (see
-    // `until_within`): nothing PUSHES this retirement. The door re-resolves the
-    // address on a drain, and the drain that finally answers `unroutable` is the
-    // one that runs after the bridge's own periodic re-read has moved the roster
-    // under it — `FEED_RETRY` (250 ms) gated by `ROSTER_REFRESH` (2 s). On a
-    // quiet machine it lands in milliseconds; under the workspace gate (dozens of
-    // test binaries, this bridge one starved process among them) it did not land
-    // inside the 60 s event-driven budget on 2026-09-13, and the crate is
-    // untouched by that train. This is still a hang detector: a door that never
-    // retires the post fails, just later.
-    let verdict = until_within(
-        harness::PERIODIC_DEADLINE,
-        "the post to be retired at the door (a drain after the periodic roster re-read)",
+    // AND THE NEXT DRAIN RETIRES IT — [`DEADLINE`]'s ordinary budget, because
+    // this is an ordinary wait again.
+    //
+    // IT WAS NOT, AND THE HISTORY IS THE POINT. This wait was moved to
+    // `until_within(PERIODIC_DEADLINE, …)` on 2026-09-13, on the argument that
+    // the retirement is period-driven and 60 s was simply not enough of a slow
+    // machine's clock. It timed out at 180 s on 2026-09-14, and a bound that has
+    // to grow twice is a bound standing in for a defect: the failure was never
+    // slowness. The drain resolved `@<sid>` from the bridge's CACHED roster, so
+    // in the window between aterm dropping the session and the bridge taking
+    // `session-exited` off its own mailbox the post was PUBLISHED to a dead
+    // session's `in` face and acked to its sender as landed — after which no
+    // verdict exists to wait for and no budget is long enough (measured: 2 of 16
+    // concurrent runs under load, the losing drain 67 ms ahead of the line).
+    // `Bridge::drain_outbox` now re-reads the roster before it resolves
+    // anything, so the first drain after the close answers `unroutable` whatever
+    // the bridge remembered — the idle arm's 250 ms, or sooner.
+    //
+    // `a_post_to_a_session_whose_exit_line_never_arrives_is_still_retired`
+    // pins the same door without needing a loaded machine.
+    let verdict = until(
+        "the post to be retired at the door (the first drain after the close)",
         || {
             w.ev()
                 .into_iter()
@@ -585,6 +594,93 @@ fn a_post_that_becomes_unroutable_leaves_no_reservation_and_no_pin() {
         !reservation.exists(),
         "a retired post's sequence reservation is forgotten on BOTH arms: {}",
         reservation.display()
+    );
+    let pins = std::fs::read_to_string(w.state.join("pins")).unwrap_or_default();
+    assert!(
+        !pins.contains(&b),
+        "no TOFU pin is written for a session that no longer exists: {pins:?}"
+    );
+}
+
+/// **A POST TO A SESSION WHOSE `session-exited` LINE NEVER ARRIVES IS STILL
+/// RETIRED AT THE DOOR.**
+///
+/// The sibling above stages the same defect through a RACE — the window between
+/// aterm dropping a session and the bridge taking `session-exited` off its
+/// mailbox — and a race needs a loaded machine to lose. This one holds that
+/// window open for as long as the assertion takes, with
+/// `ATERM_LINK_FAULT=drop-session-exited-while-marked`, so the property is
+/// asserted rather than sampled.
+///
+/// THE LINE GENUINELY GOES MISSING. §4.2's `GAP` is aterm saying frames were
+/// coalesced away and a line "may simply not exist any more"; a bridge that
+/// attaches after the exit never had it; either half of the verb/push pair can
+/// be lost while the process lives. What every one of those leaves behind is a
+/// bridge whose picture of which sessions exist is older than the endpoint's,
+/// and the door is the one consumer of that picture that can LOSE A MESSAGE: it
+/// routed the post to the departed session's own `in` face and answered its
+/// sender `off=<n>` — landed — for a face nothing will ever fetch from.
+///
+/// Both halves of the repair are asserted here, because either alone still
+/// delivers the post: `epochs` must be re-derived before the address is
+/// resolved (or the door routes it as hosted), and the departure must withdraw
+/// the presence row in the same breath (or `advertisers` still names this node
+/// as the single claimant, writes a TOFU pin for a sid that no longer exists,
+/// and routes it anyway).
+#[test]
+fn a_post_to_a_session_whose_exit_line_never_arrives_is_still_retired() {
+    let w = World::boot_with(
+        "r3noexit",
+        &[],
+        &[("ATERM_LINK_FAULT", "drop-session-exited-while-marked")],
+    );
+    w.wait_ready();
+    // OPEN THE WINDOW BEFORE THE SESSION THAT WILL FALL INTO IT EXISTS.
+    std::fs::write(w.state.join("drop-session-exited"), b"1\n").expect("arm the dropped line");
+    let (a, b) = w.two_sessions();
+
+    // THE FABRIC HAS ADVERTISED THE PEER. Without this the test could not fail:
+    // a sid with no `live` row anywhere is unroutable for the ordinary reason,
+    // and the defect is precisely that a STALE `live` row keeps answering.
+    let presence = format!("/f/{FLEET}/pub/{}/{b}/presence", w.node);
+    until("the peer's presence row to say live", || {
+        let mut c = w.god();
+        let (rows, _) = c.last(&presence, "", 8).ok()?;
+        rows.iter()
+            .find(|(_, s, _)| *s == presence)
+            .filter(|(_, _, body)| String::from_utf8_lossy(body).contains("state=live"))
+            .map(|_| ())
+    });
+
+    // THE PEER GOES, and the bridge is never told.
+    assert!(w.verb(&format!("@{b} close")).ok(), "close the peer");
+    until("the peer to leave the roster", || {
+        (!w.sessions().iter().any(|(_, sid, _)| *sid == b)).then_some(())
+    });
+
+    let posted = w.verb(&format!("@{a} post to=@{b} kind=note hello"));
+    assert!(posted.ok(), "post: {}", posted.header());
+
+    let verdict = until(
+        "the post to be retired at the door with no exit line to go on",
+        || {
+            w.ev()
+                .into_iter()
+                .find(|e| e.starts_with("undeliverable ") && e.contains(&format!("to=@{b}")))
+        },
+    );
+    assert!(
+        verdict.contains("reason=unroutable"),
+        "a session aterm's own roster no longer lists is not a route: {verdict}"
+    );
+    // AND NOTHING WAS PUT ON THE DEAD SESSION'S FACE. The `undeliverable` row is
+    // the verdict; this is the loss it exists to prevent.
+    let inbound = format!("/f/{FLEET}/in/{}/{b}/{}/note", w.node, w.node);
+    let mut c = w.god();
+    let landed = c.last(&inbound, "", 8).map_or(0, |(rows, _)| rows.len());
+    assert_eq!(
+        landed, 0,
+        "a post acked as landed on the `in` face of a session that no longer exists: {inbound}"
     );
     let pins = std::fs::read_to_string(w.state.join("pins")).unwrap_or_default();
     assert!(

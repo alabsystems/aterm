@@ -1245,7 +1245,8 @@ fn frame_gap(sid: &str, seq: u64) -> String {
 
 /// A `GAP <sid> events-resync=<floor>` frame: a `since-turn=` resume anchor sat below
 /// the ledger's retained low-water, so turn records in `(anchor, floor)` were
-/// drop-oldest evicted and are gone — the resumed subscriber missed them (re-read
+/// drop-oldest evicted, or left behind by a self-update handoff that could not carry
+/// the ledger whole, and are gone — the resumed subscriber missed them (re-read
 /// `history` if it needs the content). The events-stream twin of `frame_gap`.
 ///
 /// Returns a [`Frame`], not a `String`, because unlike its sibling formatters this
@@ -1807,10 +1808,11 @@ fn pump<W: Write, P: FnMut() -> bool>(
     egress.begin_wake();
 
     // EVENTS-RESUME GAP: a `since-turn=<n>` anchor BELOW the ledger's retained
-    // low-water means turn records were drop-oldest evicted between the anchor and the
-    // window — signal it so the resumed subscriber knows it missed some (turn ids are
-    // process-global, so a per-session id gap can't reveal the loss). Resume anchors
-    // are single-target (R4), so at most one watch matches.
+    // low-water means turn records were drop-oldest evicted (or not carried by a
+    // self-update handoff) between the anchor and the window — signal it so the
+    // resumed subscriber knows it missed some (turn ids are process-global, so a
+    // per-session id gap can't reveal the loss). Resume anchors are single-target
+    // (R4), so at most one watch matches.
     if streams.events
         && let Some(anchor) = since_turn
     {
@@ -2456,6 +2458,7 @@ pub(crate) mod bench_seam {
             screen_hash: id.wrapping_mul(0x9E37_79B9_7F4A_7C15),
             seq: id,
             arch: crate::turn_ledger::ArchMark::default(),
+            carried: false,
         }
     }
 }
@@ -4058,6 +4061,7 @@ mod tests {
                 screen_hash: id,
                 seq: id,
                 arch: crate::turn_ledger::ArchMark::default(),
+                carried: false,
             });
         };
 

@@ -62,6 +62,11 @@
 /// failure is even worth a pill.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub(crate) enum ApplyRetry {
+    /// The cause is a PERSON's to change — the copy in /Applications is not the
+    /// signed release, so no lane can install over it (2026-09-14) — and no retry
+    /// will succeed until they do. The surfaces say the remedy instead of a
+    /// promise.
+    NeedsPerson,
     /// The lane still intends this artifact: a live intent, or a latch with a lapse
     /// deadline, both of which `about_to_wait` comes back to. The honest advice is
     /// "nothing to do".
@@ -100,6 +105,11 @@ pub(crate) struct ApplyTrouble {
     reason: String,
     /// Whether the automatic lane will try again unaided.
     retry: ApplyRetry,
+    /// HOW LONG until the scheduled retry, when the lane can say (2026-09-14, audit
+    /// OBS-5): a six-hour stand-down used to read exactly like a two-minute one —
+    /// "It will try again by itself." — and the horizon lived only in the log.
+    /// `None` keeps the bare promise (a latch the next background check releases).
+    retry_in: Option<std::time::Duration>,
 }
 
 /// `(full clause, short clause)` for a reason this program does not recognise.
@@ -206,6 +216,20 @@ const CAUSES: &[(&str, &str, &str)] = &[
     // ── Preparation, all of it BEFORE any successor existed
     // (`send_handoff_preparation_failure`, plus the descriptor transfer on the
     // out-of-band lane). Nothing was started, so nothing "failed to start".
+    // ── The INSTALLED copy cannot be the swap's rollback source (2026-09-14):
+    // `install::rollback_source_refusal`, both lanes. This is the historical
+    // failure, not evidence that the source is still broken. Only the current
+    // NeedsPerson policy carries repair advice in the next-step clause.
+    (
+        "cannot be the rollback source",
+        "the installed copy could not be verified for replacement",
+        "installed copy did not verify",
+    ),
+    (
+        "does not run from an installed bundle",
+        "aterm was not running from an installed copy the updater could replace",
+        "no replaceable installed copy",
+    ),
     (
         "pre-park verification",
         "the handover could not be set up",
@@ -285,6 +309,19 @@ fn named_cause(reason: &str) -> Option<(&'static str, &'static str)> {
         .map(|(_, full, short)| (*full, *short))
 }
 
+/// "6 h" / "30 min" / "a minute" — a wait a sentence can contain, at the
+/// precision a person plans around (a stand-down is hours; a retry, minutes).
+fn about(wait: std::time::Duration) -> String {
+    let secs = wait.as_secs();
+    if secs >= 3600 {
+        format!("{} h", secs.div_ceil(3600))
+    } else if secs >= 90 {
+        format!("{} min", secs.div_ceil(60))
+    } else {
+        "a minute".to_string()
+    }
+}
+
 /// "once" / "twice" / "3 times" — a count a sentence can contain.
 ///
 /// The first two have words in English and the rest do not; writing "1 times" in a
@@ -304,13 +341,26 @@ impl ApplyTrouble {
     /// that has been DEFERRED (waiting for a quiet window) or BLOCKED advances no
     /// streak — those are recorded as refusals — so zero attempts really does mean
     /// "nothing has gone wrong yet", and that state must keep reading as ready.
+    ///
+    /// The caller supplies current retry policy. A historical installed-source
+    /// failure cannot override a later verified repair that restored scheduling.
     #[must_use]
     pub(crate) fn new(attempts: u32, reason: &str, retry: ApplyRetry) -> Option<Self> {
         (attempts > 0).then(|| Self {
             attempts,
             reason: reason.trim().to_string(),
             retry,
+            retry_in: None,
         })
+    }
+
+    /// Name how long until the scheduled retry. Ignored unless the retry is
+    /// [`ApplyRetry::Scheduled`]: a duration under any other promise would be a
+    /// contradiction the sentence cannot render.
+    #[must_use]
+    pub(crate) fn with_retry_in(mut self, retry_in: Option<std::time::Duration>) -> Self {
+        self.retry_in = retry_in.filter(|_| self.retry == ApplyRetry::Scheduled);
+        self
     }
 
     /// Whether this program could name the cause, or fell back to [`GENERIC`].
@@ -325,11 +375,25 @@ impl ApplyTrouble {
 
     /// The clause that says what happens NEXT — the half that decides whether the
     /// reader has to do anything.
-    fn next_step(&self) -> &'static str {
-        match self.retry {
-            ApplyRetry::Scheduled => "It will try again by itself.",
-            ApplyRetry::ManualOnly => "It will not try again until you ask.",
+    fn next_step(&self) -> String {
+        match (self.retry, self.retry_in) {
+            (ApplyRetry::Scheduled, Some(wait)) => {
+                format!("It will try again by itself in about {}.", about(wait))
+            }
+            (ApplyRetry::Scheduled, None) => "It will try again by itself.".to_string(),
+            (ApplyRetry::ManualOnly, _) => "It will not try again until you ask.".to_string(),
+            (ApplyRetry::NeedsPerson, _) => {
+                "Install the signed release from the release DMG, then retry.".to_string()
+            }
         }
+    }
+
+    /// Whether the standing reason is one only a person can clear (the installed
+    /// copy is not the signed release): the surfaces stop promising a retry and
+    /// the auto-apply lane stops scheduling one.
+    #[must_use]
+    pub(crate) fn needs_person(reason: &str) -> bool {
+        aterm_update::refusal_needs_person(reason)
     }
 
     /// The full sentence, for a detail row that has a line to spend: attempts, cause,
@@ -357,6 +421,7 @@ impl ApplyTrouble {
         let next = match self.retry {
             ApplyRetry::Scheduled => "retrying on its own",
             ApplyRetry::ManualOnly => "apply now to retry",
+            ApplyRetry::NeedsPerson => "install the signed release",
         };
         format!("tried {}, {short}; {next}", times(self.attempts))
     }
@@ -369,6 +434,7 @@ impl ApplyTrouble {
         let next = match self.retry {
             ApplyRetry::Scheduled => "retrying",
             ApplyRetry::ManualOnly => "ask to retry",
+            ApplyRetry::NeedsPerson => "install the signed release",
         };
         format!("Tried {}, {short} \u{b7} {next}.", times(self.attempts))
     }
@@ -719,5 +785,149 @@ mod tests {
         };
         assert_eq!(micro(1), "1 try failed.");
         assert_eq!(micro(2), "2 tries failed.");
+    }
+
+    /// THE 2026-09-14 INCIDENT, AT THE WORDS. A hand-built, ad-hoc-signed
+    /// `/Applications/aterm.app` refused six automatic applies of v0.85.0 over ~8 h
+    /// because it cannot be the rollback source the swap installs. After 368d6b9e0
+    /// the ledger reason names the installed bundle (this is the exact string
+    /// `start_unix_update_handoff` now mints from the cached verdict). The table maps
+    /// it — by its `pre-park verification` token — to "the handover could not be set
+    /// up", which is (a) true of every preparation failure and therefore says nothing
+    /// about THIS one, and (b) paired with "It will try again by itself", a promise
+    /// the lane keeps for a day of six-hour stand-downs while nothing can change:
+    /// the boot-time fallback runs the same team-pinned `codesign` gate
+    /// (`install.rs` step 7, "current installed rollback source is not verified") and
+    /// refuses too. This is the one apply failure whose remedy is entirely the
+    /// person's — put the signed release bundle back — and no surface says so.
+    /// THE STAND-DOWN HAS A HORIZON (2026-09-14, audit OBS-5): a scheduled retry
+    /// that knows its wait says it at planning precision; one that does not keeps
+    /// the bare promise; and a wait under any other promise is dropped, not
+    /// rendered into a contradiction.
+    #[test]
+    fn a_scheduled_retry_says_how_long_when_it_knows() {
+        use std::time::Duration;
+        let reason = "handoff proof ended ChildDied";
+        let six_hours = ApplyTrouble::new(3, reason, ApplyRetry::Scheduled)
+            .expect("trouble")
+            .with_retry_in(Some(Duration::from_secs(21_599)));
+        assert!(
+            six_hours
+                .sentence()
+                .ends_with("It will try again by itself in about 6 h."),
+            "{}",
+            six_hours.sentence()
+        );
+        let ten_minutes = ApplyTrouble::new(1, reason, ApplyRetry::Scheduled)
+            .expect("trouble")
+            .with_retry_in(Some(Duration::from_secs(599)));
+        assert!(
+            ten_minutes.sentence().ends_with("in about 10 min."),
+            "{}",
+            ten_minutes.sentence()
+        );
+        let soon = ApplyTrouble::new(1, reason, ApplyRetry::Scheduled)
+            .expect("trouble")
+            .with_retry_in(Some(Duration::from_secs(20)));
+        assert!(
+            soon.sentence().ends_with("in about a minute."),
+            "{}",
+            soon.sentence()
+        );
+        let unknown = ApplyTrouble::new(1, reason, ApplyRetry::Scheduled)
+            .expect("trouble")
+            .with_retry_in(None);
+        assert!(unknown.sentence().ends_with("It will try again by itself."));
+        let manual = ApplyTrouble::new(1, reason, ApplyRetry::ManualOnly)
+            .expect("trouble")
+            .with_retry_in(Some(Duration::from_secs(3600)));
+        assert!(
+            manual
+                .sentence()
+                .ends_with("It will not try again until you ask."),
+            "a wait under a manual-only promise is not rendered: {}",
+            manual.sentence()
+        );
+    }
+
+    #[test]
+    fn observability_audit_a_rollback_source_refusal_names_the_installed_copy_and_the_remedy() {
+        let reason = "installed bundle failed pre-park verification: the installed bundle at \
+                      /Applications/aterm.app cannot be the rollback source the swap installs: \
+                      bundle policy: codesign --verify (team-pinned requirement) failed: \
+                      /Applications/aterm.app: valid on disk\n/Applications/aterm.app: \
+                      satisfies its Designated Requirement\ntest-requirement: code failed to \
+                      satisfy specified code requirement(s); the terminal was left untouched";
+        let trouble = ApplyTrouble::new(6, reason, ApplyRetry::NeedsPerson).expect("trouble");
+        let (full, short) = clauses(reason);
+        assert!(
+            trouble.cause_is_named(),
+            "a reason this program writes must be one it can name"
+        );
+        assert!(
+            full.contains("installed") || full.contains("Applications"),
+            "the cause must name the INSTALLED copy — the staged update is fine and the \
+             generic preparation clause blames neither: {full}"
+        );
+        assert!(
+            trouble.sentence().contains("Install the signed release"),
+            "the current NeedsPerson next step must carry the remedy: {}",
+            trouble.sentence()
+        );
+        assert!(
+            short != "couldn\u{2019}t be set up",
+            "the row tail must not read as a transient setup hiccup: {short}"
+        );
+        // Retrying cannot change the bytes in /Applications, so the sentence must not
+        // end on the automatic lane's reassurance.
+        let sentence = trouble.sentence();
+        assert!(
+            !sentence.contains("try again by itself"),
+            "a structural refusal must not promise a retry that cannot succeed: {sentence}"
+        );
+    }
+
+    #[test]
+    fn historical_installed_source_failure_only_requests_repair_while_currently_blocked() {
+        for (reason, historical) in [
+            (
+                "the installed bundle cannot be the rollback source",
+                "the installed copy could not be verified for replacement",
+            ),
+            (
+                "aterm does not run from an installed bundle",
+                "aterm was not running from an installed copy the updater could replace",
+            ),
+        ] {
+            for retry in [
+                ApplyRetry::NeedsPerson,
+                ApplyRetry::Scheduled,
+                ApplyRetry::ManualOnly,
+            ] {
+                let trouble = ApplyTrouble::new(2, reason, retry).expect("historical failure");
+                assert!(trouble.sentence().contains(historical));
+                for surface in [trouble.sentence(), trouble.row_tail(), trouble.compact()] {
+                    assert_eq!(
+                        surface
+                            .to_lowercase()
+                            .contains("install the signed release"),
+                        retry == ApplyRetry::NeedsPerson,
+                        "historical reason cannot override current policy: {surface}"
+                    );
+                }
+                match retry {
+                    ApplyRetry::Scheduled => {
+                        assert!(trouble.sentence().ends_with("It will try again by itself."));
+                        assert!(trouble.row_tail().ends_with("retrying on its own"));
+                    }
+                    ApplyRetry::ManualOnly => assert!(
+                        trouble
+                            .sentence()
+                            .ends_with("It will not try again until you ask.")
+                    ),
+                    ApplyRetry::NeedsPerson => assert!(!trouble.sentence().contains("by itself")),
+                }
+            }
+        }
     }
 }

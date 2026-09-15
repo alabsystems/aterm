@@ -12,24 +12,42 @@
 //!   from one read (busy only from the live zone around the composer);
 //!   [`phase::survey_open`] — the session survey parked above it;
 //!   [`phase::context_left`] — how much context is left before auto-compact.
+//!   (Both modules are the `aterm-phase` crate, re-exported: the fabric
+//!   bridge reads the same functions for its presence rows.)
 //! * [`run::Session`] — `await-turn`, `supervise` and `watch`, over the
 //!   control verbs.
 //! * [`report`] — `report`: what the worker said since the manager's turn,
 //!   the rows a fullscreen app scrolled off (`offscreen`) joined with the
 //!   screen's.
+//! * [`mail`] — `watch --mail`'s lane on the manager's inbox and `task`: the
+//!   worker's report comes by mail, one line per worker turn.
 //!
 //! It moved here from a scratchpad script because every rule in it was paid for
 //! by a misclassification in a real session; a supervisor that is itself an
 //! agent should not have to rediscover them.
 
+pub mod blocks;
 pub mod classify;
-pub mod phase;
-pub mod prompt;
+// THE PHASE READER AND THE PROMPT PARSER LIVE IN `aterm-phase` since round 13
+// (the fabric bridge publishes `phase=` from the same reader `aterm drive phase`
+// prints), re-exported here under the paths they always had.
+pub use aterm_phase::{phase, prompt};
+pub mod journal;
+pub mod ledger;
+pub mod ledger_html;
+pub mod mail;
 pub mod report;
 pub mod run;
 pub mod screen;
 
+pub use blocks::{Block, BlockKind, View, blocks, view_rows};
 pub use classify::{DEFAULT_PYTHON_ALLOW, Verdict, classify_command, classify_command_with};
+pub use journal::{Journal, JournalRecord, read_journal};
+pub use ledger::{
+    ClockAnchor, Format as LedgerFormat, Ledger, LedgerHost, LedgerOpts, gather, parse_since,
+    render as render_ledger,
+};
+pub use mail::{DEFAULT_IDLE_GRACE, DEFAULT_REPORT_WINDOW, MailOpts, MailRow, TaskOpts, task};
 pub use phase::{
     Busy, Phase, Zone, busy_signal, context_left, is_placeholder, limit_notice, survey_open,
     transcript_end, worker_phase,
@@ -37,7 +55,8 @@ pub use phase::{
 pub use prompt::{Prompt, PromptKind, parse_prompt};
 pub use report::{DEFAULT_MAX_ROWS, Mark, Marker, Reason, Report, ReportOpts};
 pub use run::{
-    Caps, Ctl, CtlReply, EXIT_TIMEOUT, ReportBrief, Session, SuperviseOpts, Turn, event_line,
-    exit_reason, render_phase, render_phase_and_survey, render_result, reported_event_line,
+    Caps, Ctl, CtlReply, EXIT_TIMEOUT, Fold, Interrupter, NoLane, ReportBrief, Session,
+    SuperviseOpts, Turn, event_line, exit_reason, render_phase, render_phase_and_survey,
+    render_result, render_result_mail, reported_event_line,
 };
 pub use screen::{Screen, parse_text_json};

@@ -587,10 +587,62 @@ pub struct Baseline {
 //     and never reached aterm-forge. That hole is closed (`--no-fail-fast`,
 //     merged 2026-09-10), which is the only reason this round happened before
 //     a cut instead of after one.
+//
+// RE-MEASURED 2026-09-14 — THE FABRIC LEFT THE WINDOWS CELL, and only that
+//     cell moves. `aterm-link` became a `[target.'cfg(unix)'.dependencies]`
+//     entry of crates/aterm (the bridge is Unix-domain sockets and inherited
+//     descriptors end to end, and the unconditional row had made the shipped
+//     Windows binary unbuildable since v0.82.0 — `std::os::unix` at module
+//     level in three of its files), so on x86_64-pc-windows-msvc the resolver
+//     no longer reaches aterm-link, the three first-party astream crates, or
+//     the sha2 chain astream-cap alone dragged in:
+//
+//       win      172 -> 161 resolved, 74 -> 70 workspace, 98 -> 91
+//                third-party, 3,635,765 -> 3,586,896 LOC, 20 -> 19 build scripts
+//
+//     which is the v0.81.0 raise above undone to the line on this one cell —
+//     -11 resolved, -4 workspace, -7 / -48,869 / -1 — and the 2026-09-10
+//     numbers exactly. mac-arm and linux still carry the fabric and do not move
+//     by a line; the two browser modules never reached it. The `link` verb on
+//     Windows refuses by name (crates/aterm/src/main.rs `link_unavailable`)
+//     instead of failing to exist.
+//
+//     MEASURED ON A WINDOWS HOST, the first time `cargo forge` ran on one, and
+//     it could not until the same change: `resolve::abs_root` canonicalised the
+//     workspace root, Windows answers the verbatim `\\?\C:\…` spelling, and
+//     cargo then refused every cell under `--locked` with "cannot update the
+//     lock file" against a current lock. The prefix is now stripped there.
+//
+//     THE SAME CHANGE LOWERED `lock third_party_packages` 520 -> 513, for an
+//     unrelated reason recorded on that row: the `embed-resource`
+//     build-dependency left with crates/aterm-winres (its msvc-only `vswhom`
+//     chain needed `libc` items the first-party libc withholds on Windows),
+//     taking seven registry packages out of the lock. No cell's `-e normal`
+//     graph moves for that: build-dependencies were never in these numbers.
+//
+// RE-MEASURED 2026-09-14 — `aterm-phase` ENTERED EVERY SHIPPED CELL, one
+//     workspace crate and nothing else. c1fc82257 (round 13) moved the
+//     worker-phase reader out of `aterm-agent/src/supervise` into
+//     `crates/aterm-phase` so the fabric bridge's presence rows could carry
+//     `phase=` without linking the supervisor; `aterm-agent` and `aterm-link`
+//     both depend on it, and the shipped root reaches `aterm-agent` on every
+//     cell (`aterm fleet` / `aterm drive`), so:
+//
+//       mac-arm  121 -> 122 resolved, 74 -> 75 workspace
+//       linux    271 -> 272, 76 -> 77
+//       win      161 -> 162, 70 -> 71
+//
+//     Nothing else moves by a line on any cell: the crate declares NO
+//     dependencies (its manifest says that is the point of it), so
+//     third-party packages, LOC, build scripts, proc macros and duplicate
+//     names all stand, and the two browser modules never reach `aterm-agent`,
+//     so [`WASM_CPU`] and [`WASM_GPU`] are untouched. The commit that added
+//     the crate did not touch this file, and the six baseline tests were red
+//     at origin/main from its merge until this note.
 pub const MAC_ARM: Baseline = Baseline {
     cell: "mac-arm",
-    resolved: 121,
-    workspace: 74,
+    resolved: 122,
+    workspace: 75,
     third_party: 47,
     third_party_loc: 440_327,
     build_scripts: 10,
@@ -600,8 +652,8 @@ pub const MAC_ARM: Baseline = Baseline {
 
 pub const LINUX: Baseline = Baseline {
     cell: "linux",
-    resolved: 271,
-    workspace: 76,
+    resolved: 272,
+    workspace: 77,
     third_party: 195,
     third_party_loc: 2_788_536,
     build_scripts: 32,
@@ -611,11 +663,11 @@ pub const LINUX: Baseline = Baseline {
 
 pub const WIN: Baseline = Baseline {
     cell: "win",
-    resolved: 172,
-    workspace: 74,
-    third_party: 98,
-    third_party_loc: 3_635_765,
-    build_scripts: 20,
+    resolved: 162,
+    workspace: 71,
+    third_party: 91,
+    third_party_loc: 3_586_896,
+    build_scripts: 19,
     proc_macros: 7,
     duplicate_names: 1,
 };

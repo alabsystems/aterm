@@ -1445,6 +1445,48 @@ mod tests {
         );
     }
 
+    /// THE SOFTWARE UPDATE PAGE ON 2026-09-14. The pull-down said "Run `aterm-ctl
+    /// update status` … — see Settings ▸ Software Update", and this is what Settings
+    /// showed for six failed applies of a staged v0.85.0 refused by an ad-hoc-signed
+    /// `/Applications/aterm.app`: "Update ready, but it keeps failing to apply." over
+    /// "aterm tried to update 6 times and the handover could not be set up. It will
+    /// try again by itself. See aterm.log". While the App still reports a current
+    /// installed-source block, the page must carry that repair advice. A historical
+    /// failure on its own cannot override later repaired scheduling.
+    #[test]
+    fn observability_audit_the_page_tells_the_owner_to_reinstall_over_an_unsigned_install() {
+        let mut st = staged_status();
+        st.failing_applies = 6;
+        st.failing_kind = "apply".to_string();
+        st.failing_persistent = true;
+        let p = UpdateState::from_status(828, "0.5.14", Some(&st), false)
+            .with_apply_lane(
+                "installed bundle failed pre-park verification: the installed bundle at \
+                 /Applications/aterm.app cannot be the rollback source the swap installs: \
+                 bundle policy: codesign --verify (team-pinned requirement) failed; the \
+                 terminal was left untouched",
+                ApplyRetry::NeedsPerson,
+            )
+            .projection();
+        let detail = p.detail.expect("detail");
+        assert!(
+            detail.contains("the installed copy could not be verified for replacement"),
+            "the page must name the refused installed copy: {detail}"
+        );
+        assert!(
+            detail.contains("Install the signed release from the release DMG, then retry."),
+            "a current installed-source block must carry its remedy: {detail}"
+        );
+        assert!(
+            !detail.contains("try again by itself"),
+            "a current installed-source block cannot promise an automatic retry: {detail}"
+        );
+        assert!(
+            !detail.contains("could not be set up"),
+            "not the generic preparation clause — the installed copy is the cause: {detail}"
+        );
+    }
+
     #[test]
     fn snapshot_renders_staged_update_notes() {
         let st = staged_status();

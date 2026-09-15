@@ -366,11 +366,20 @@ pub fn resolve(root: &Path, tools: &Toolchain, path_env: &OsStr, base: &str) -> 
     ) else {
         return Selection::Widened("git could not list the changed files".to_string());
     };
+    // Plus every edit an assume-unchanged or skip-worktree flag hides from `git
+    // diff` (2026-09-13, review of batch B, round 3): without them a flagged
+    // crate's edit selected 0 crates, built nothing, and went VERIFY: PASS.
+    let Some(hidden) = crate::identity::flag_hidden_edits(root, path_env) else {
+        return Selection::Widened("git could not list the index-flagged edits".to_string());
+    };
     let paths: Vec<String> = tracked
         .lines()
         .chain(untracked.lines())
         .filter(|l| !l.is_empty())
         .map(str::to_string)
+        .chain(hidden)
+        .collect::<BTreeSet<String>>()
+        .into_iter()
         .collect();
 
     let members = read_members(root, tools, path_env);

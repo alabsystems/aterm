@@ -10138,6 +10138,17 @@ impl GpuRenderer {
             cb: submitted,
             ticket,
         });
+        // THE NEXT FRAME'S DRAWABLE, ASKED FOR NOW (2026-09-14, the perf
+        // audit). The present consumed the frame, so the surface is free and
+        // the worker can be started on the next drawable — so the next redraw
+        // finds one WAITING instead of composing the whole frame, discovering
+        // there is none, and composing it again. See
+        // `MetalWindowSurface::prefetch_drawable` for why this is here — after
+        // a present that really happened — and not at the top of a redraw.
+        // (`frame.present` consumed the frame, so the surface is free again.)
+        if let Some(ms) = surf.metal.as_mut() {
+            ms.prefetch_drawable();
+        }
         self.metal_maybe_inject_loss();
         Ok(())
     }

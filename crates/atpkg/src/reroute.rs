@@ -743,15 +743,27 @@ pub fn lay(layout: &Layout) -> io::Result<()> {
     let atpkg = crate::stub::embedded_atpkg_path();
     for row in TABLE {
         let path = dir.join(row.upstream);
+        let body = stub_body_sh(row.upstream, &atpkg, &dir);
         match std::fs::symlink_metadata(&path) {
-            Err(_) => {}                          // absent: ours to claim
-            Ok(_) if is_reroute_stub(&path) => {} // ours: rewrite refreshes the path
-            Ok(_) => continue,                    // foreign: never touched
+            Err(_) => {} // absent: ours to claim
+            Ok(_) if is_reroute_stub(&path) => {
+                // Ours already. Byte-identical and untagged: nothing to lay — this
+                // runs at every session spawn and every pass end, and re-laying eight
+                // identical files meant a launchd job (and, from a tagged app, a
+                // whole-bundle copy) per GUI launch, plus the chance for a lane that
+                // could not run to replace a CLEAN stub with a tagged one under the
+                // in-process fallback (audit 2026-09-14). A body that differs — the
+                // embedded atpkg path moved with a relocation or a self-update — or
+                // a stub that carries the tag is rewritten as before.
+                if std::fs::read(&path).is_ok_and(|have| have == body.as_bytes())
+                    && !crate::provenance::carries_provenance(&path)
+                {
+                    continue;
+                }
+            }
+            Ok(_) => continue, // foreign: never touched
         }
-        files.push(crate::lay::Executable::new(
-            &path,
-            stub_body_sh(row.upstream, &atpkg, &dir),
-        ));
+        files.push(crate::lay::Executable::new(&path, body));
     }
     crate::lay::lay_executables(&files)?;
     if let Ok(entries) = std::fs::read_dir(&dir) {

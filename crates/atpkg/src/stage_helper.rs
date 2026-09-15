@@ -33,12 +33,19 @@
 //!      copy is clean and runs clean, measured; `cp`/`ditto` would carry the tag across)
 //!      and the copy is run;
 //!    * a TAGGED binary that is a bundle's own executable (`….app/Contents/MacOS/…`)
-//!      is REFUSED up front: run in place it would be tracked, and a copy of it will not
-//!      run — its code signature covers the bundle's `Info.plist`, so the kernel kills
-//!      the copy at exec (measured 2026-09-13 on the Developer ID `aterm.app`: `codesign
-//!      -v` on the copy says "invalid Info.plist (plist or signature have been
-//!      modified)", the exec dies with SIGKILL, and the old lane — which copied EVERY
-//!      binary — reported that as "exited without a result" with an empty stderr).
+//!      is run from a byte copy of its WHOLE bundle, made by the job (directories,
+//!      symlinks re-linked, regular files `cat`'d, executables re-marked): run in place
+//!      it would be tracked, and a LONE copy of the executable will not run — its code
+//!      signature covers the bundle's `Info.plist`, so the kernel kills that copy at
+//!      exec (measured 2026-09-13 on the Developer ID `aterm.app`: `codesign -v` on the
+//!      lone copy says "invalid Info.plist (plist or signature have been modified)", the
+//!      exec dies with SIGKILL, and the old lane — which copied EVERY binary — reported
+//!      that as "exited without a result" with an empty stderr). A faithful copy of the
+//!      bundle keeps its seal — `codesign --verify --deep --strict` passes, the copy
+//!      runs, and what it lays is clean (measured 2026-09-14 on the shipped, notarized
+//!      v0.85.0 bundle, tagged by its own in-place self-update). Between 2026-09-13 and
+//!      this arm the shape was REFUSED instead, and since a self-updated or
+//!      browser-downloaded app is tagged, that refusal was every user's every install.
 //! 3. It submits a one-shot launchd job — `/bin/sh -c '<wrapper>'` — that runs the helper
 //!    on the hidden verb with the spec file as its one argument, RECORDS the helper's exit
 //!    status in `<job>/status` (a signal as `128 + n`, `/bin/sh`'s convention), removes its
@@ -62,14 +69,16 @@
 //! Not a trust boundary: the helper is our own bytes (in place, or a copy in our own
 //! `0700` staging dir under the store lock), and the root it reports is re-verified
 //! against the SIGNED root by the parent as always (`ATPKG_STAGE_DISK_REVERIFY` re-arms
-//! the on-disk walk). Not optional once it is needed: a tracked installer whose lane
+//! the on-disk walk). Not silent once it is needed: a tracked installer whose lane
 //! cannot run — no launchd, a job that never starts, a helper that does not answer —
-//! REFUSES the install ([`crate::install::StageError::TrackedInstaller`]) rather than lay
-//! a bundle that would carry the tag on every executable; the one escape hatch,
-//! `ATPKG_ALLOW_TRACKED_INSTALL=1`, accepts the in-process stage and RECORDS it beside the
-//! build (`<build>.tracked-install`), which `aterm pkg doctor` reports as the cause and
-//! `aterm pkg repair` names as needing a re-seed ([`crate::install::stage_for_store_with`]
-//! has the decision). And it is only half of the story: `bin/<tool>` is a `#!/bin/sh`
+//! stages in-process, says so, and RECORDS it beside the build
+//! (`<build>.tracked-install`), which `aterm pkg doctor` reports as the cause and
+//! `aterm pkg repair` names as needing a re-seed; `ATPKG_REFUSE_TRACKED_INSTALL=1`
+//! REFUSES the install instead ([`crate::install::StageError::TrackedInstaller`]) for an
+//! operator who would rather have no toolchain than a tagged one
+//! ([`crate::install::stage_for_store_with`] has the decision, [`crate::lay`] the policy
+//! and why the default flipped on 2026-09-14). And it is only half of the story:
+//! `bin/<tool>` is a `#!/bin/sh`
 //! script, and a tagged shim tracks the tool it execs (law m21) — so the shims, the
 //! `agents/` twins, the pending and reroute stubs and the tombstones go through the same
 //! job under a second hidden verb ([`crate::lay`]), sharing the [`Job`] below.
@@ -108,7 +117,7 @@ const EXIT_GRACE: Duration = Duration::from_secs(3);
 
 /// The absolute ceiling on one staged extraction (the shipped `trust` member is 3.4 GB;
 /// a slow disk is minutes, never hours). Past this the lane is declared wedged — a lane
-/// failure, which the caller's policy answers (refuse by default).
+/// failure, which the caller's policy answers (an in-process stage, recorded, by default).
 const CEILING: Duration = Duration::from_secs(6 * 60 * 60);
 
 // ---------------------------------------------------------------------------------------
@@ -443,7 +452,7 @@ pub(crate) fn first_regular_file(dir: &Path) -> Option<PathBuf> {
 /// How the launchd job runs the helper — decided by [`plan_helper`] from a MEASUREMENT
 /// of the binary (its tag) and its shape (a bundle's own executable or free-standing),
 /// never from where it was built.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub enum HelperPlan {
     /// The binary is untagged: the job runs it in place, by its real path. launchd is
     /// the parent and the tag follows the executable, so the job is untracked.
@@ -451,6 +460,24 @@ pub enum HelperPlan {
     /// The binary is tagged and free-standing: the job `cat`s it to a clean copy first
     /// (a byte copy made by an untracked process is clean — measured) and runs the copy.
     CopyThenExec,
+    /// The binary is tagged and is a bundle's own executable (`<bundle>.app/Contents/
+    /// MacOS/<exe>`): the job byte-copies the WHOLE bundle — every directory, every
+    /// symlink re-linked, every regular file `cat`'d, executables re-marked `0755` —
+    /// into its scratch and runs the copy's executable of the same name. A lone copy
+    /// of the executable dies at exec (its Developer ID signature seals the bundle's
+    /// `Info.plist`, which the lone copy lacks — SIGKILL, measured 2026-09-13); a
+    /// faithful copy of the bundle keeps its seal: `codesign --verify --deep --strict`
+    /// passes on it, it runs, and — launchd being its parent and the copy untagged —
+    /// the files it lays are CLEAN while the same verb run from the tagged bundle in
+    /// place lays tagged ones (measured 2026-09-14 on the shipped, notarized v0.85.0
+    /// `aterm.app`, which carried the tag because the in-place self-updater — a tracked
+    /// process — wrote it). Until this arm existed such a bundle was REFUSED, which on
+    /// a machine whose app had ever self-updated or been downloaded by a browser was
+    /// every install: "ALab toolchain install failed" on 2026-09-14.
+    CopyBundleThenExec {
+        /// The bundle root (`<bundle>.app`), the tree the job replicates.
+        bundle: PathBuf,
+    },
 }
 
 /// The bundle `exe` is the executable of — `<bundle>.app` for
@@ -477,29 +504,26 @@ pub fn bundle_of(exe: &Path) -> Option<PathBuf> {
 /// Decide how the job runs `exe` from the two facts about it: `tagged` (measured —
 /// [`crate::provenance::carries_provenance`]) and the bundle it belongs to, if any
 /// ([`bundle_of`]). An untagged binary runs in place whatever its shape; a tagged
-/// free-standing one is copied clean by the job; a tagged bundle executable is refused
-/// with the reason, because neither way would work — in place it is tracked, copied it
-/// cannot run.
-pub fn plan_helper(exe: &Path, tagged: bool, bundle: Option<&Path>) -> Result<HelperPlan, String> {
+/// free-standing one is copied clean by the job; a tagged bundle executable is run from
+/// a clean copy of its WHOLE bundle ([`HelperPlan::CopyBundleThenExec`]) — in place it
+/// would be tracked, and a lone copy of the executable cannot run. Every shape has a
+/// plan; `exe` is unused now that no shape is refused, and stays in the signature so
+/// the table reads as the three facts it is decided from.
+#[must_use]
+pub fn plan_helper(_exe: &Path, tagged: bool, bundle: Option<&Path>) -> HelperPlan {
     match (tagged, bundle) {
-        (false, _) => Ok(HelperPlan::ExecOriginal),
-        (true, None) => Ok(HelperPlan::CopyThenExec),
-        (true, Some(bundle)) => Err(format!(
-            "{} carries com.apple.provenance and is the executable of the bundle {}: a \
-             launchd job running it in place would be tracked (the tag follows the \
-             executable), and a byte copy of it will not run — its code signature covers \
-             the bundle's Info.plist, so the kernel kills the copy at exec (SIGKILL; \
-             measured 2026-09-13). re-seed that bundle from an untracked process, or run \
-             this verb from one",
-            exe.display(),
-            bundle.display()
-        )),
+        (false, _) => HelperPlan::ExecOriginal,
+        (true, None) => HelperPlan::CopyThenExec,
+        (true, Some(bundle)) => HelperPlan::CopyBundleThenExec {
+            bundle: bundle.to_path_buf(),
+        },
     }
 }
 
-/// [`plan_helper`] for a real binary: the tag measured with `xattr`, the bundle read off
+/// [`plan_helper`] for a real binary: the tag AND the quarantine attribute measured with
+/// `xattr` (on the binary, and for a bundle executable on the bundle), the bundle read off
 /// the path. A binary that cannot be inspected is an error, not "untagged" — a plan built
-/// on a failure to look would run a possibly tagged helper and call its files clean.
+/// on a failure to look would run a possibly tainted helper and call its files clean.
 pub fn plan_for_exe(exe: &Path) -> Result<HelperPlan, String> {
     let names = crate::provenance::xattr_names(exe).map_err(|e| {
         format!(
@@ -510,11 +534,35 @@ pub fn plan_for_exe(exe: &Path) -> Result<HelperPlan, String> {
     let tagged = names
         .iter()
         .any(|n| n == crate::provenance::PROVENANCE_XATTR);
-    plan_helper(exe, tagged, bundle_of(exe).as_deref())
+    // QUARANTINE COUNTS THE SAME. A browser download carries `com.apple.quarantine` and
+    // no provenance tag at all, so it reads as untagged — and yet a launchd job that
+    // exec's it IN PLACE is tracked and writes tagged files (measured 2026-09-14 on m16
+    // with the Safari-installed 0.84.0: the result file its hidden verb wrote came back
+    // tagged). Planning that binary `ExecOriginal` is the one way this lane can still
+    // hand out a tagged toolchain while believing it laid a clean one, so a quarantined
+    // helper takes the copy lane exactly as a tagged one does.
+    let quarantined = crate::provenance::quarantined_carrier(exe).is_some();
+    Ok(plan_helper(
+        exe,
+        tagged || quarantined,
+        bundle_of(exe).as_deref(),
+    ))
 }
 
 /// The wrapper `/bin/sh -c` runs, positional: `$1` helper, `$2` spec, `$3` verb,
-/// `$4` status file, `$5` this job's label, `$6` the copy path (empty to run in place).
+/// `$4` status file, `$5` this job's label, `$6` the copy path (empty to run in place),
+/// `$7` the bundle root to replicate (empty for a free-standing helper).
+///
+/// With `$7` set, `$6` is a DIRECTORY and the wrapper replicates the bundle into it
+/// before anything runs — the directories first, then every symlink re-linked to the
+/// target `readlink` reports (relative stays relative: `atpkg -> aterm`), then every
+/// regular file byte-copied by `cat` with the executable bit restored — and runs the
+/// copy's `Contents/MacOS/<name of $1>`. `find … -exec sh -c '…' "$6" {} +` rather than a
+/// `while read` loop so a name with a space or a newline cannot split; `$0` inside is
+/// the copy root. The helper's own path is absolute, as are the spec and the status
+/// file, so the `cd` into the bundle (in a subshell) changes nothing that follows. A
+/// replica that fails at any step runs nothing and is recorded as
+/// [`STATUS_COPY_FAILED`], exactly like a lone copy that could not be made.
 ///
 /// It runs the helper, records the helper's exit status — `128 + n` for a signal, the
 /// shell's convention — in `$4` (temp + rename), removes its own label and exits 0. The
@@ -524,7 +572,9 @@ pub fn plan_for_exe(exe: &Path) -> Result<HelperPlan, String> {
 /// The self-removal is what makes a parent killed before its `Drop` leak nothing.
 #[cfg(target_os = "macos")]
 const WRAPPER: &str = r#"exe="$1"
-if [ -n "$6" ]; then
+if [ -n "$7" ]; then
+  if mkdir -p "$6" && ( cd "$7" && find . -type d -exec sh -c 'for d; do mkdir -p "$0/$d" || exit 1; done' "$6" {} + && find . -type l -exec sh -c 'for l; do ln -s "$(readlink "$l")" "$0/$l" || exit 1; done' "$6" {} + && find . -type f -exec sh -c 'for f; do cat "$f" > "$0/$f" || exit 1; if [ -x "$f" ]; then chmod 755 "$0/$f" || exit 1; fi; done' "$6" {} + ); then exe="$6/Contents/MacOS/$(basename "$1")"; else exe=""; fi
+elif [ -n "$6" ]; then
   if cat "$1" > "$6" && chmod 755 "$6"; then exe="$6"; else exe=""; fi
 fi
 if [ -n "$exe" ]; then "$exe" "$3" "$2"; s=$?; else echo "atpkg-untracked: could not copy $1 to $6" >&2; s=125; fi
@@ -566,6 +616,7 @@ impl Job {
     /// parents left behind ([`Self::sweep_orphans`]).
     pub(crate) fn prepare(scratch: &Path, stem: &str) -> Result<Self, String> {
         Self::sweep_orphans();
+        Self::sweep_dead_job_dirs(scratch);
         static SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
         let seq = SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         let nonce = std::time::SystemTime::now()
@@ -574,7 +625,11 @@ impl Job {
             .unwrap_or(0);
         let stem = format!("{stem}-{}-{seq}-{nonce:x}", std::process::id());
         let dir = scratch.join(&stem);
-        std::fs::create_dir_all(&dir).map_err(|e| format!("create {}: {e}", dir.display()))?;
+        // `create_dir`, not `create_dir_all`: a directory already there under this
+        // name would be adopted with whatever stale `result` it holds, and the parent
+        // would read that as the job's answer. The name carries pid, sequence and a
+        // nanosecond nonce, so this fails only when something is wrong.
+        std::fs::create_dir(&dir).map_err(|e| format!("create {}: {e}", dir.display()))?;
         crate::platform::set_mode(&dir, 0o700)
             .map_err(|e| format!("chmod {}: {e}", dir.display()))?;
         Ok(Self {
@@ -621,16 +676,57 @@ impl Job {
         }
     }
 
+    /// Remove every job directory under `scratch` — `<stem>-<pid>-<seq>-<nonce>`, the
+    /// same shape as the label — whose `<pid>` no longer exists: a parent killed
+    /// between `prepare` and its `Drop` (a `kill -9`, a test under a timeout) left its
+    /// scratch behind, and with a whole-bundle replica inside that is ~51 MB a leak; the
+    /// store's `gc` sweeps regular files, never these directories (audit 2026-09-14).
+    /// Only directories, only our naming, only a dead pid — an archive or a `.part`
+    /// beside them never parses as a label, and a live sibling's job is left alone.
+    fn sweep_dead_job_dirs(scratch: &Path) {
+        let Ok(entries) = std::fs::read_dir(scratch) else {
+            return;
+        };
+        let me = std::process::id();
+        for entry in entries.flatten() {
+            let path = entry.path();
+            if !path.is_dir() {
+                continue;
+            }
+            let Some(name) = entry.file_name().to_str().map(str::to_owned) else {
+                continue;
+            };
+            let Some(pid) = owner_pid_of_label(&format!("{LABEL_PREFIX}{name}")) else {
+                continue;
+            };
+            if pid == me || pid_exists(pid) {
+                continue;
+            }
+            let _ = std::fs::remove_dir_all(&path);
+        }
+    }
+
     /// `launchctl submit` the one-shot job: the wrapper runs `helper_exe` on `verb` with
-    /// the spec file as its one argument, in place or from a clean copy as
-    /// [`plan_for_exe`] decides; launchd — not this process — is its parent. A helper
-    /// that can be run neither way is refused here, before anything is submitted.
+    /// the spec file as its one argument — in place, from a clean copy of the binary, or
+    /// from a clean copy of its whole bundle, as [`plan_for_exe`] decides; launchd — not
+    /// this process — is its parent. Only a binary that cannot be INSPECTED for the tag
+    /// is refused here, before anything is submitted.
     pub(crate) fn submit(&mut self, helper_exe: &Path, verb: &str) -> Result<(), String> {
         let plan = plan_for_exe(helper_exe)?;
         self.helper = helper_exe.to_path_buf();
-        let copy: &Path = match plan {
-            HelperPlan::ExecOriginal => Path::new(""),
-            HelperPlan::CopyThenExec => &self.copy,
+        let (copy, bundle): (PathBuf, PathBuf) = match plan {
+            HelperPlan::ExecOriginal => (PathBuf::new(), PathBuf::new()),
+            HelperPlan::CopyThenExec => (self.copy.clone(), PathBuf::new()),
+            // The replica keeps the bundle's own name (`aterm.app`) inside the job's
+            // scratch: the name is not part of the seal, but a `.app` suffix is what
+            // every tool that looks at it expects.
+            HelperPlan::CopyBundleThenExec { bundle } => {
+                let name = bundle.file_name().map_or_else(
+                    || std::ffi::OsString::from("bundle.app"),
+                    |n| n.to_os_string(),
+                );
+                (self.dir.join(name), bundle)
+            }
         };
         let out = std::process::Command::new("/bin/launchctl")
             .arg("submit")
@@ -650,6 +746,7 @@ impl Job {
             .arg(&self.status)
             .arg(&self.label)
             .arg(copy)
+            .arg(bundle)
             .output()
             .map_err(|e| format!("spawn /bin/launchctl: {e}"))?;
         if !out.status.success() {
@@ -1074,11 +1171,13 @@ mod tests {
         let _ = std::fs::remove_dir_all(&d);
     }
 
-    /// The plan never copies a bundle's own executable: untagged, it runs in place; tagged,
-    /// it is refused with the reason (a copy is killed at exec, in place it is tracked).
-    /// A free-standing binary runs in place untagged and is copied tagged.
+    /// The plan has an arm for EVERY shape — nothing is refused: untagged runs in place,
+    /// bundle or not; a tagged free-standing binary is copied; a tagged bundle executable
+    /// is run from a copy of its WHOLE bundle, never a lone copy (killed at exec) and never
+    /// in place (tracked). The refusal this replaced (2026-09-13) was every install on a
+    /// self-updated app, whose bundle carries the tag.
     #[test]
-    fn a_bundle_resident_executable_is_never_copied() {
+    fn a_tagged_bundle_executable_is_run_from_a_copy_of_its_whole_bundle() {
         let d =
             std::env::temp_dir().join(format!("atpkg-stage-helper-bundle-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&d);
@@ -1093,24 +1192,69 @@ mod tests {
         assert_eq!(bundle, d.join("aterm.app"));
         assert_eq!(
             plan_helper(&exe, false, Some(&bundle)),
-            Ok(HelperPlan::ExecOriginal)
+            HelperPlan::ExecOriginal
         );
-        let refused = plan_helper(&exe, true, Some(&bundle)).unwrap_err();
-        assert!(refused.contains("Info.plist"), "{refused}");
-        assert!(refused.contains("SIGKILL"), "{refused}");
-        assert!(refused.contains("aterm.app"), "{refused}");
+        assert_eq!(
+            plan_helper(&exe, true, Some(&bundle)),
+            HelperPlan::CopyBundleThenExec {
+                bundle: bundle.clone()
+            }
+        );
         // Free-standing.
         let free = Path::new("/x/target/debug/aterm");
         assert_eq!(bundle_of(free), None);
-        assert_eq!(plan_helper(free, false, None), Ok(HelperPlan::ExecOriginal));
-        assert_eq!(plan_helper(free, true, None), Ok(HelperPlan::CopyThenExec));
+        assert_eq!(plan_helper(free, false, None), HelperPlan::ExecOriginal);
+        assert_eq!(plan_helper(free, true, None), HelperPlan::CopyThenExec);
+        let _ = std::fs::remove_dir_all(&d);
+    }
+
+    /// Quarantine is taint. A clean copy of a base-OS binary plans in place; the same
+    /// copy stamped `com.apple.quarantine` — the attribute a browser sets, and one a
+    /// test CAN mint, unlike the provenance tag — plans a copy. This is the
+    /// Safari-download shape that read as untagged, ran in place and laid tagged files
+    /// (2026-09-14).
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn a_quarantined_helper_is_planned_as_tainted() {
+        let d = std::env::temp_dir().join(format!(
+            "atpkg-stage-helper-quarantine-{}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&d);
+        std::fs::create_dir_all(&d).unwrap();
+        let exe = d.join("atpkg");
+        std::fs::copy("/usr/bin/true", &exe).unwrap();
+        let tagged = crate::provenance::carries_provenance(&exe);
+        assert_eq!(
+            plan_for_exe(&exe).unwrap(),
+            if tagged {
+                HelperPlan::CopyThenExec
+            } else {
+                HelperPlan::ExecOriginal
+            },
+            "before the stamp the plan follows the tag alone (this process tracked: {tagged})"
+        );
+        crate::provenance::set_xattr_for_test(
+            &exe,
+            crate::provenance::QUARANTINE_XATTR,
+            b"0083;00000000;Safari;",
+        )
+        .unwrap();
+        assert_eq!(
+            plan_for_exe(&exe).unwrap(),
+            HelperPlan::CopyThenExec,
+            "quarantined ⇒ copied, never run in place"
+        );
         let _ = std::fs::remove_dir_all(&d);
     }
 
     /// The wrapper, run by `/bin/sh` directly (no launchd): in place it makes no copy and
     /// records the helper's exit status; a helper killed by SIGKILL is recorded as 137
     /// (`128 + 9`, the shell's convention); with a copy path it `cat`s the helper there,
-    /// mode 0755, and runs the copy; and it exits 0 every time.
+    /// mode 0755, and runs the copy; with a bundle root it replicates the WHOLE bundle —
+    /// directories, symlinks (relative stays relative), regular files with the executable
+    /// bit restored and a name with a space intact — and runs the replica's executable of
+    /// the helper's name, from INSIDE the replica; and it exits 0 every time.
     #[cfg(target_os = "macos")]
     #[test]
     fn the_wrapper_records_the_helpers_fate_and_copies_only_when_told_to() {
@@ -1119,7 +1263,7 @@ mod tests {
             std::env::temp_dir().join(format!("atpkg-stage-helper-wrapper-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&d);
         std::fs::create_dir_all(&d).unwrap();
-        let run = |helper: &Path, copy: &Path, tag: &str| -> (i32, String) {
+        let run = |helper: &Path, copy: &Path, bundle: &Path, tag: &str| -> (i32, String) {
             let status = d.join(format!("status-{tag}"));
             let out = std::process::Command::new("/bin/sh")
                 .arg("-c")
@@ -1131,37 +1275,111 @@ mod tests {
                 .arg(&status)
                 .arg("systems.alab.atpkg.test.no-such-label")
                 .arg(copy)
+                .arg(bundle)
                 .output()
                 .unwrap();
             let recorded = std::fs::read_to_string(&status).unwrap_or_default();
             (out.status.code().unwrap_or(-1), recorded)
         };
+        let none = Path::new("");
         // In place: /usr/bin/true exits 0; no copy appears.
         let copy = d.join("atpkg");
-        let (wrapper_exit, recorded) = run(Path::new("/usr/bin/true"), Path::new(""), "inplace");
+        let (wrapper_exit, recorded) = run(Path::new("/usr/bin/true"), none, none, "inplace");
         assert_eq!(wrapper_exit, 0);
         assert_eq!(recorded.trim(), "0");
         assert!(!copy.exists(), "no copy was asked for");
         // Copied: the copy exists at 0755 and ran.
-        let (wrapper_exit, recorded) = run(Path::new("/usr/bin/true"), &copy, "copied");
+        let (wrapper_exit, recorded) = run(Path::new("/usr/bin/true"), &copy, none, "copied");
         assert_eq!(wrapper_exit, 0);
         assert_eq!(recorded.trim(), "0");
         assert!(copy.exists());
         assert_eq!(
-            std::fs::metadata(&copy).unwrap().permissions().mode() & 0o777,
+            std::fs::metadata(&copy).unwrap().permissions().mode() & 0o755,
             0o755
         );
         // Killed: a helper that SIGKILLs itself is recorded as 137, and the wrapper still exits 0.
         let killer = d.join("killer.sh");
         std::fs::write(&killer, "#!/bin/sh\nkill -9 $$\n").unwrap();
         std::fs::set_permissions(&killer, std::fs::Permissions::from_mode(0o755)).unwrap();
-        let (wrapper_exit, recorded) = run(&killer, Path::new(""), "killed");
+        let (wrapper_exit, recorded) = run(&killer, none, none, "killed");
         assert_eq!(wrapper_exit, 0);
         assert_eq!(recorded.trim(), "137");
         // A copy that cannot be made (destination dir missing) is 125 and runs nothing.
-        let (wrapper_exit, recorded) = run(&killer, &d.join("no-such-dir").join("atpkg"), "nocopy");
+        let (wrapper_exit, recorded) = run(
+            &killer,
+            &d.join("no-such-dir").join("atpkg"),
+            none,
+            "nocopy",
+        );
         assert_eq!(wrapper_exit, 0);
         assert_eq!(recorded.trim(), STATUS_COPY_FAILED.to_string());
+        // A bundle: replicated whole, and the replica's own executable is what runs.
+        // The tool records its `$0` (the path it ran as) beside the spec.
+        let src = d.join("src.app");
+        let macos = src.join("Contents").join("MacOS");
+        let resources = src.join("Contents").join("Resources");
+        std::fs::create_dir_all(&macos).unwrap();
+        std::fs::create_dir_all(&resources).unwrap();
+        std::fs::write(src.join("Contents").join("Info.plist"), b"<plist/>").unwrap();
+        let tool = macos.join("tool");
+        std::fs::write(
+            &tool,
+            "#!/bin/sh\nprintf '%s\\n' \"$0\" > \"$(dirname \"$2\")/ran-from\"\n",
+        )
+        .unwrap();
+        std::fs::set_permissions(&tool, std::fs::Permissions::from_mode(0o755)).unwrap();
+        std::os::unix::fs::symlink("tool", macos.join("alias")).unwrap();
+        std::fs::write(resources.join("with space.txt"), b"data\n").unwrap();
+        std::fs::set_permissions(
+            resources.join("with space.txt"),
+            std::fs::Permissions::from_mode(0o644),
+        )
+        .unwrap();
+        let replica = d.join("copy.app");
+        let (wrapper_exit, recorded) = run(&tool, &replica, &src, "bundle");
+        assert_eq!(wrapper_exit, 0);
+        assert_eq!(recorded.trim(), "0", "the replica's tool ran and exited 0");
+        assert!(replica.join("Contents").join("Info.plist").is_file());
+        let replica_tool = replica.join("Contents").join("MacOS").join("tool");
+        assert_eq!(
+            std::fs::metadata(&replica_tool)
+                .unwrap()
+                .permissions()
+                .mode()
+                & 0o755,
+            0o755,
+            "the executable bit is restored"
+        );
+        assert_eq!(
+            std::fs::read_link(replica.join("Contents").join("MacOS").join("alias")).unwrap(),
+            PathBuf::from("tool"),
+            "a relative symlink stays relative"
+        );
+        let data = replica
+            .join("Contents")
+            .join("Resources")
+            .join("with space.txt");
+        assert_eq!(std::fs::read(&data).unwrap(), b"data\n");
+        assert_eq!(
+            std::fs::metadata(&data).unwrap().permissions().mode() & 0o111,
+            0,
+            "a data file is not made executable"
+        );
+        assert_eq!(
+            std::fs::read_to_string(d.join("ran-from")).unwrap().trim(),
+            replica_tool.display().to_string(),
+            "the replica's executable ran, not the original"
+        );
+        // A bundle that cannot be replicated (its root is gone) is 125 and runs nothing.
+        let (wrapper_exit, recorded) = run(
+            &tool,
+            &d.join("copy2.app"),
+            &d.join("no-such.app"),
+            "nobundle",
+        );
+        assert_eq!(wrapper_exit, 0);
+        assert_eq!(recorded.trim(), STATUS_COPY_FAILED.to_string());
+        assert!(!d.join("copy2.app").join("Contents").exists());
         let _ = std::fs::remove_dir_all(&d);
     }
 

@@ -12,7 +12,7 @@
 
 mod common;
 
-use common::{corpus, values_agree};
+use common::{corpus, corpus_under, values_agree};
 
 #[test]
 fn every_toml_file_in_the_repository_parses_identically() {
@@ -106,4 +106,41 @@ fn what_we_print_the_oracle_reads_back_unchanged() {
         checked += 1;
     }
     eprintln!("differential: {checked} documents re-read identically by the oracle");
+}
+
+/// The walk stays out of the gate's sibling build dirs (`target-regex/`,
+/// `target-xtask/`, `target-drivers/`, `target-gate/`) and its `.aterm-verify/`
+/// state dir at the repository root — gigabytes of build output, with a
+/// `.toml` in every build script's OUT_DIR fixture — while a `target-*` name
+/// deeper in the tree is still walked.
+#[test]
+fn the_corpus_walk_skips_root_lane_dirs_and_verify_state() {
+    let root = std::env::temp_dir().join(format!("aterm-toml-corpus-skip-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&root);
+    for rel in [
+        "target-regex/debug/build/x/out/Cargo.toml",
+        "target-drivers/lane.toml",
+        ".aterm-verify/state.toml",
+        "target/debug/y.toml",
+        "crates/a/Cargo.toml",
+        "crates/a/target-input/c.toml",
+    ] {
+        let path = root.join(rel);
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        std::fs::write(&path, "a = 1\n").unwrap();
+    }
+    let found: Vec<String> = corpus_under(&root)
+        .iter()
+        .map(|p| {
+            p.strip_prefix(&root)
+                .unwrap()
+                .to_string_lossy()
+                .replace('\\', "/")
+        })
+        .collect();
+    std::fs::remove_dir_all(&root).unwrap();
+    assert_eq!(
+        found,
+        ["crates/a/Cargo.toml", "crates/a/target-input/c.toml"]
+    );
 }

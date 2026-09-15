@@ -704,8 +704,13 @@ mod sh_shim_tests {
         install_shim_to_env(&shim, &target, &env).unwrap();
         assert_eq!(resolve_shim(&shim).as_deref(), Some(target.as_path()));
         assert_eq!(shim_env_of(&shim), env);
+        // The test's own process may run under a managed agent shim that already
+        // exports DISABLE_AUTOUPDATER=1 (an aterm-spawned Claude Code session does);
+        // the child must see only what the shim under test lays, so scrub the
+        // ambient copy from both invocations.
         let out = std::process::Command::new(&shim)
             .arg("arg")
+            .env_remove("DISABLE_AUTOUPDATER")
             .output()
             .unwrap();
         assert!(out.status.success());
@@ -715,6 +720,7 @@ mod sh_shim_tests {
         assert_eq!(shim_env_of(&shim), crate::shim_env::ShimEnv::NONE);
         let out = std::process::Command::new(&shim)
             .arg("arg")
+            .env_remove("DISABLE_AUTOUPDATER")
             .output()
             .unwrap();
         assert_eq!(String::from_utf8_lossy(&out.stdout), "unset|arg\n");

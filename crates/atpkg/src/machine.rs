@@ -59,9 +59,9 @@ impl UniversalControlState {
         match policy {
             UniversalControlPolicy::Off => format!(
                 "warn — Universal Control is at the OS default (the cursor roams to other \
-                 Macs and iPads on this Apple account){}; the next update pass disables it \
-                 ([machine] universal_control = \"off\") — keep it: universal_control = \
-                 \"leave\"",
+                 Macs and iPads on this Apple account){}; every pass disables it first thing \
+                 ([machine] universal_control = \"off\") — now: `aterm pkg machine apply`; \
+                 keep it: universal_control = \"leave\"",
                 self.partial_note()
             ),
             UniversalControlPolicy::Leave => format!(
@@ -173,6 +173,258 @@ pub fn apply_universal_control(
     } else {
         UniversalControlOutcome::WriteFailed
     }
+}
+
+// ---------------------------------------------------------------------------------------
+// The READ verb's state — one byte-stable line the window parses, and the one pure
+// verdict both the CLI's `next —` line and the window's Apply button derive from.
+// ---------------------------------------------------------------------------------------
+
+/// Universal Control, as the two per-host keys read — the coarse posture a report
+/// names, derived from [`UniversalControlState`] and nothing else.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum UcPosture {
+    /// Both keys true: the pass's wanted state.
+    Disabled,
+    /// Neither key set: the OS default — the cursor roams.
+    Default,
+    /// Exactly one of the two set: a half state the pass completes rather than reports
+    /// as done.
+    Partial,
+    /// A key read as something this module does not treat as a switch, or the read
+    /// could not be made. Never "off".
+    Unknown,
+}
+
+impl UcPosture {
+    /// The wire spelling.
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            UcPosture::Disabled => "disabled",
+            UcPosture::Default => "default",
+            UcPosture::Partial => "partial",
+            UcPosture::Unknown => "unknown",
+        }
+    }
+
+    fn parse(s: &str) -> Option<Self> {
+        Some(match s {
+            "disabled" => UcPosture::Disabled,
+            "default" => UcPosture::Default,
+            "partial" => UcPosture::Partial,
+            "unknown" => UcPosture::Unknown,
+            _ => return None,
+        })
+    }
+}
+
+impl UniversalControlState {
+    /// The coarse posture. `Unknown` only when NEITHER key could be read as a switch —
+    /// `[None, None]` is the OS default (an absent key is the ordinary state of a
+    /// machine that never turned the feature off), which is why the platform layer
+    /// returns `None` for absent and this cannot tell absent from unreadable; the
+    /// distinction the doctor makes is carried by `disable_read`'s prose, not here.
+    #[must_use]
+    pub fn posture(&self) -> UcPosture {
+        match (self.disable, self.magic_edges) {
+            (Some(true), Some(true)) => UcPosture::Disabled,
+            (Some(true), _) | (_, Some(true)) => UcPosture::Partial,
+            _ => UcPosture::Default,
+        }
+    }
+}
+
+/// Whether this process's home is the account's — the synthetic-home rule the apply
+/// path enforces (`defaults` writes the account's per-host domain and ignores `$HOME`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum HomePosture {
+    /// `$HOME` is the account home: the settings apply here.
+    Account,
+    /// `$HOME` is somewhere else: a synthetic machine, nothing is applied.
+    Mismatch,
+    /// The account home could not be resolved, so `$HOME` cannot be proven to be it:
+    /// nothing is applied.
+    Unresolved,
+}
+
+impl HomePosture {
+    /// The wire spelling.
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            HomePosture::Account => "account",
+            HomePosture::Mismatch => "mismatch",
+            HomePosture::Unresolved => "unresolved",
+        }
+    }
+
+    fn parse(s: &str) -> Option<Self> {
+        Some(match s {
+            "account" => HomePosture::Account,
+            "mismatch" => HomePosture::Mismatch,
+            "unresolved" => HomePosture::Unresolved,
+            _ => return None,
+        })
+    }
+}
+
+/// What bare `atpkg machine` measured — the whole of it, as one record. Printed as the
+/// [`MACHINE_STATE_MARKER`](crate::cli::MACHINE_STATE_MARKER) line and parsed back by
+/// the window through [`parse_machine_state`], so the two cannot disagree about a
+/// field's spelling.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct MachineState {
+    /// The two keys' posture.
+    pub universal_control: UcPosture,
+    /// `[machine] universal_control`, resolved.
+    pub policy: UniversalControlPolicy,
+    /// `[machine] spotlight_noindex`, resolved.
+    pub spotlight_noindex: bool,
+    /// Cargo target dirs under the home whose NAME leaves them open to Spotlight.
+    pub exposed: usize,
+    /// Cargo target dirs already hidden by name.
+    pub hidden: usize,
+    /// Of the exposed, how many a pass WOULD migrate (a dry-run apply: beside a
+    /// `Cargo.toml`, no live build, nothing in the way). The rest need
+    /// `aterm pkg noindex apply <dir>` by name, and a count that could never fall to
+    /// zero is the trap the doctor records — so this is the number the verdict uses.
+    pub would_migrate: usize,
+    /// `false` when the scan hit its budget, so a report says "at least".
+    pub scan_complete: bool,
+    /// The synthetic-home rule's answer.
+    pub home: HomePosture,
+}
+
+/// What is left for an apply to do, if anything.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct MachineNext {
+    /// Universal Control is not yet fully disabled and the policy says disable it.
+    pub universal_control: bool,
+    /// Target dirs a pass would rename now.
+    pub spotlight: usize,
+}
+
+/// THE verdict: `None` when an apply would change nothing — the CLI then says so and
+/// the window's Apply button is disabled — else what it would do. Pure over its inputs
+/// so the two surfaces cannot drift, and so the half-state and the "counts but cannot
+/// migrate" cases are pinned by a table rather than by prose.
+///
+/// The home posture is NOT an input: a mismatched home means nothing is applied at
+/// all, and that is the caller's line to print before it asks what is left.
+#[must_use]
+pub fn machine_next(
+    uc: UcPosture,
+    policy: UniversalControlPolicy,
+    spotlight_noindex: bool,
+    would_migrate: usize,
+) -> Option<MachineNext> {
+    let universal_control =
+        policy == UniversalControlPolicy::Off && !matches!(uc, UcPosture::Disabled);
+    let spotlight = if spotlight_noindex { would_migrate } else { 0 };
+    if !universal_control && spotlight == 0 {
+        return None;
+    }
+    Some(MachineNext {
+        universal_control,
+        spotlight,
+    })
+}
+
+impl MachineState {
+    /// What an apply would still do on this machine.
+    #[must_use]
+    pub fn next(&self) -> Option<MachineNext> {
+        if self.home != HomePosture::Account {
+            return None;
+        }
+        machine_next(
+            self.universal_control,
+            self.policy,
+            self.spotlight_noindex,
+            self.would_migrate,
+        )
+    }
+}
+
+/// The marker body, `key=value` pairs joined by `; ` — the same shape as the
+/// `machine-settings:` body, so one reader handles both.
+#[must_use]
+pub fn machine_state_line(s: &MachineState) -> String {
+    format!(
+        "universal-control={}; policy={}; noindex={}; spotlight-exposed={}; \
+         spotlight-hidden={}; spotlight-migratable={}; scan={}; home={}",
+        s.universal_control.as_str(),
+        match s.policy {
+            UniversalControlPolicy::Off => "off",
+            UniversalControlPolicy::Leave => "leave",
+        },
+        s.spotlight_noindex,
+        s.exposed,
+        s.hidden,
+        s.would_migrate,
+        if s.scan_complete {
+            "complete"
+        } else {
+            "partial"
+        },
+        s.home.as_str(),
+    )
+}
+
+/// Parse a [`machine_state_line`] body. Every field required, order free, unknown
+/// keys ignored (a newer atpkg may add one); a missing or malformed field is `None`,
+/// never a default — a window that guessed a posture would be the false confidence the
+/// pass had before 2026-09-14.
+#[must_use]
+pub fn parse_machine_state(body: &str) -> Option<MachineState> {
+    let mut uc = None;
+    let mut policy = None;
+    let mut noindex = None;
+    let mut exposed = None;
+    let mut hidden = None;
+    let mut migratable = None;
+    let mut scan = None;
+    let mut home = None;
+    for pair in body.split(';') {
+        let Some((k, v)) = pair.trim().split_once('=') else {
+            continue;
+        };
+        let v = v.trim();
+        match k.trim() {
+            "universal-control" => uc = UcPosture::parse(v),
+            "policy" => {
+                policy = match v {
+                    "off" => Some(UniversalControlPolicy::Off),
+                    "leave" => Some(UniversalControlPolicy::Leave),
+                    _ => None,
+                }
+            }
+            "noindex" => noindex = v.parse::<bool>().ok(),
+            "spotlight-exposed" => exposed = v.parse::<usize>().ok(),
+            "spotlight-hidden" => hidden = v.parse::<usize>().ok(),
+            "spotlight-migratable" => migratable = v.parse::<usize>().ok(),
+            "scan" => {
+                scan = match v {
+                    "complete" => Some(true),
+                    "partial" => Some(false),
+                    _ => None,
+                }
+            }
+            "home" => home = HomePosture::parse(v),
+            _ => {}
+        }
+    }
+    Some(MachineState {
+        universal_control: uc?,
+        policy: policy?,
+        spotlight_noindex: noindex?,
+        exposed: exposed?,
+        hidden: hidden?,
+        would_migrate: migratable?,
+        scan_complete: scan?,
+        home: home?,
+    })
 }
 
 #[cfg(test)]
@@ -295,7 +547,19 @@ mod tests {
         let default = UniversalControlState::default();
         let line = default.doctor_line(UniversalControlPolicy::Off);
         assert!(line.starts_with("warn — "), "{line}");
-        assert!(line.contains("next update pass disables it"), "{line}");
+        // The promise, and the door: "first thing" is the 2026-09-14 fix (the apply used
+        // to sit inside `if failures == 0` at the END of the pass, so a machine whose
+        // toolchain pass never came clean was promised this on every run and never got
+        // it), and the verb is how a person gets it NOW rather than at the next pass.
+        assert!(
+            line.contains("every pass disables it first thing"),
+            "{line}"
+        );
+        assert!(line.contains("now: `aterm pkg machine apply`"), "{line}");
+        assert!(
+            !line.contains("next update pass"),
+            "the old promise must not survive: {line}"
+        );
         assert!(line.contains("universal_control = \"leave\""), "{line}");
         let line = default.doctor_line(UniversalControlPolicy::Leave);
         assert!(line.starts_with("ok — "), "{line}");
@@ -309,5 +573,130 @@ mod tests {
                 .contains("Disable is set, DisableMagicEdges is not")
         );
         assert_eq!(UNIVERSAL_CONTROL_ENTRY, "universal-control disabled");
+    }
+
+    /// Every posture round-trips through the wire line, so the window and the CLI cannot
+    /// disagree about a spelling; an unknown key is ignored (a newer atpkg), a missing
+    /// one is a refusal, never a guess.
+    #[test]
+    fn machine_state_line_round_trips() {
+        for uc in [
+            UcPosture::Disabled,
+            UcPosture::Default,
+            UcPosture::Partial,
+            UcPosture::Unknown,
+        ] {
+            for policy in [UniversalControlPolicy::Off, UniversalControlPolicy::Leave] {
+                for home in [
+                    HomePosture::Account,
+                    HomePosture::Mismatch,
+                    HomePosture::Unresolved,
+                ] {
+                    let s = MachineState {
+                        universal_control: uc,
+                        policy,
+                        spotlight_noindex: policy == UniversalControlPolicy::Off,
+                        exposed: 4,
+                        hidden: 2,
+                        would_migrate: 3,
+                        scan_complete: home != HomePosture::Mismatch,
+                        home,
+                    };
+                    let line = machine_state_line(&s);
+                    assert_eq!(parse_machine_state(&line), Some(s.clone()), "{line}");
+                }
+            }
+        }
+        let full = "universal-control=disabled; policy=off; noindex=true; spotlight-exposed=1; \
+                    spotlight-hidden=9; spotlight-migratable=0; scan=complete; home=account";
+        assert!(parse_machine_state(full).is_some());
+        assert!(parse_machine_state(&format!("{full}; future-key=whatever")).is_some());
+        assert!(parse_machine_state("universal-control=disabled; policy=off").is_none());
+        assert!(parse_machine_state(&full.replace("home=account", "home=elsewhere")).is_none());
+        assert!(parse_machine_state("").is_none());
+    }
+
+    /// The posture derivation: both keys = disabled, one key = partial, neither = the
+    /// OS default (an absent key is the ordinary state, not an unknown one).
+    #[test]
+    fn universal_control_posture_reads_both_keys() {
+        let at = |d, e| UniversalControlState {
+            disable: d,
+            magic_edges: e,
+        };
+        assert_eq!(at(Some(true), Some(true)).posture(), UcPosture::Disabled);
+        assert_eq!(at(Some(true), None).posture(), UcPosture::Partial);
+        assert_eq!(at(None, Some(true)).posture(), UcPosture::Partial);
+        assert_eq!(at(Some(false), Some(true)).posture(), UcPosture::Partial);
+        assert_eq!(at(None, None).posture(), UcPosture::Default);
+        assert_eq!(at(Some(false), Some(false)).posture(), UcPosture::Default);
+    }
+
+    /// THE VERDICT TABLE — the read verb's `next —` line and the window's Apply button
+    /// both read this. The live case that motivated it: Universal Control already off,
+    /// one target dir a pass would rename — the old read said "nothing to apply".
+    #[test]
+    fn machine_read_hint_covers_spotlight_as_well_as_universal_control() {
+        use UcPosture::*;
+        use UniversalControlPolicy::*;
+        assert_eq!(
+            machine_next(Disabled, Off, true, 1),
+            Some(MachineNext {
+                universal_control: false,
+                spotlight: 1
+            }),
+            "the live case: UC done, one dir to hide"
+        );
+        assert_eq!(
+            machine_next(Disabled, Off, true, 0),
+            None,
+            "everything done"
+        );
+        assert_eq!(
+            machine_next(Disabled, Off, false, 1),
+            None,
+            "noindex switched off"
+        );
+        assert_eq!(
+            machine_next(Default, Off, true, 0),
+            Some(MachineNext {
+                universal_control: true,
+                spotlight: 0
+            })
+        );
+        assert_eq!(
+            machine_next(Partial, Off, true, 0).map(|n| n.universal_control),
+            Some(true),
+            "a half state is completed, not reported done"
+        );
+        assert_eq!(machine_next(Default, Leave, true, 0), None, "policy leave");
+        assert_eq!(
+            machine_next(Unknown, Off, true, 2),
+            Some(MachineNext {
+                universal_control: true,
+                spotlight: 2
+            }),
+            "an unreadable posture is re-applied, never skipped"
+        );
+        // And the record's own `next()` refuses under a synthetic home, whatever is left.
+        let s = MachineState {
+            universal_control: Default,
+            policy: Off,
+            spotlight_noindex: true,
+            exposed: 3,
+            hidden: 0,
+            would_migrate: 3,
+            scan_complete: true,
+            home: HomePosture::Mismatch,
+        };
+        assert_eq!(s.next(), None);
+        assert!(
+            MachineState {
+                home: HomePosture::Account,
+                ..s
+            }
+            .next()
+            .is_some()
+        );
     }
 }

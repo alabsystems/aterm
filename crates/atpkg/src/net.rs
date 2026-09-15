@@ -591,8 +591,9 @@ impl GithubFetcher {
     /// When it IS asked: a 404 (`NoRelease`) — the dedicated repo has no published
     /// non-prerelease index release — falls back to the listing, which then diagnoses
     /// the real state exactly as before; an unsafe slug likewise (the listing refuses
-    /// it on its own terms). A refused redirect (a non-index tag holding `latest`) or
-    /// an unexpected status is a VERDICT about that host, and a 429/5xx or a transport
+    /// it on its own terms). A refused redirect, a non-index tag holding `latest`
+    /// (`PointerError::OtherTag`) or an unexpected status is a VERDICT about that
+    /// host, and a 429/5xx or a transport
     /// failure is a failed resolution: neither is quietly turned into an API listing
     /// the web lane promises not to make.
     fn index_lane(
@@ -619,6 +620,10 @@ impl GithubFetcher {
         ) {
             Ok(p) => Ok(pointer_quad(&slug, &p.tag).map(std::sync::Arc::new)),
             Err(PointerError::NoRelease { .. } | PointerError::UnsafeName) => Ok(None),
+            // A non-index tag holding `latest` arrives typed as `OtherTag` since
+            // 2026-09-14 (the app updater elects from its listing on it); for THIS
+            // lane it stays the verdict the doc above names — never quietly turned
+            // into an API listing the web lane promises not to make.
             Err(error) => {
                 let mut msg = String::from("index pointer for ");
                 msg.push_str(&slug);
@@ -2074,6 +2079,9 @@ mod tests {
                 ),
             })
         };
+        // An app tag under the index asset on the shared repo: the one benign
+        // other-tag answer (2026-09-14), which the pointer lane maps to "no
+        // pointer; the listing elects" rather than a refusal.
         assert!(matches!(
             resolve_with(
                 "alabsystems",
@@ -2082,7 +2090,7 @@ mod tests {
                 &index_pointer_tag,
                 &mut app_release
             ),
-            Err(PointerError::Refused { .. })
+            Err(PointerError::OtherTag { .. })
         ));
         let mut none = |_: &str| -> Result<HeadAnswer, HttpError> {
             Ok(HeadAnswer {

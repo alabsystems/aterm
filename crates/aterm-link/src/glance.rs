@@ -494,7 +494,7 @@ impl Glance {
 /// Render one JSON string. Every byte outside printable ASCII becomes a `\u`
 /// escape, so a value that arrived off the bus can never close the string, open
 /// a new key, or put a control byte into a file another program renders.
-fn json_string(s: &str) -> String {
+pub(crate) fn json_string(s: &str) -> String {
     let mut out = String::with_capacity(s.len() + 2);
     out.push('"');
     for c in s.chars() {

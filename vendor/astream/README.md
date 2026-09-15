@@ -19,7 +19,13 @@ which is why no release ever shipped the bridge.
 | `astream-aead` | the sealed TCP transport. Present but NOT BUILT by default |
 
 `astream-aead` is vendored so the sealed cross-host transport is one feature flag
-away (`-p aterm-link --features sealed`), not so it ships. A default build must
+away (`-p aterm-link --features sealed`), not so it ships. Two of its four source
+files — `handshake.rs` and `identity.rs`, 680 lines — are reachable from NO aterm
+feature at all: `sealed` maps only to `astream-broker/aead`, and nothing maps to
+`handshake` or `identity`. They are carried for copy-fidelity (a re-sync is a
+copy) and pinned like the rest, which is also why `Cargo.lock` lists
+`x25519-dalek`, `ed25519-dalek` and `curve25519-dalek` that no aterm build can
+ever pull. That is expected, not drift. A default build must
 not grow chacha20poly1305, getrandom and the dalek curves for a transport a local
 fleet never uses — this repository counts third-party packages, and
 `crates/aterm-digest` exists because `sha2` + `hmac` cost eight of them.
@@ -40,11 +46,13 @@ aterm's root, supplied here rather than claimed to be a retained upstream file.
 
 `forge attest` checks the recorded files against the tracked checkout and Cargo
 metadata, including the actual direct dependency paths. This is a named direct
-source bundle, not a crates.io patch. The existing forge ownership metric still
-counts its code under vendor/ as third-party: 11,122 lines in broker/cap/wire,
-plus 48,869 in sha2 and its six dependencies. The bridge therefore adds ten
-third-party packages, 59,991 lines, and one build script to each native graph.
-Being present in Cargo.lock beforehand did not make those dependencies free.
+source bundle, not a crates.io patch. The forge does NOT count these crates as
+third-party — `aterm forge attest` names `vendor/astream` a FIRST-PARTY vendored
+path dependency, same owner as aterm, and `forge survey` lists no astream row.
+The bridge's real third-party cost is the `sha2` dominator under `astream-cap`:
+7 packages, 48,869 lines, in each native graph (measured 2026-09-12; an earlier
+version of this paragraph counted the first-party lines as third-party and said
+ten packages). Being present in Cargo.lock beforehand did not make `sha2` free.
 Both browser graphs and the default sealed-transport exclusion are unchanged.
 
 ## Re-syncing
@@ -74,7 +82,7 @@ produces a tree that neither builds nor matches its pins.
    version = "0.1.0"        # NOT upstream's 0.0.0 — see below
    edition = "2021"
    license = "Apache-2.0"
-   authors = ["Andrew Yates"]
+   authors = ["Andrew Yates <andrewyates.name@gmail.com>"]   # upstream's, verbatim
    rust-version = "1.89"
    ```
 
@@ -90,8 +98,10 @@ produces a tree that neither builds nor matches its pins.
    `File::try_lock` (stable 1.89), and a lower number fails
    `clippy::incompatible_msrv` under this repo's `-D warnings`.
 2. `{ workspace = true }` dependencies become paths, and `sha2` a version.
-3. `[dev-dependencies]` is dropped — aterm does not run astream's suites, and the
-   broker's dev-dependency on `astream-agent` is not vendored.
+3. `[dev-dependencies]` and `[[example]]` are dropped — aterm does not run
+   astream's suites, and the broker's dev-dependency on `astream-agent` is not
+   vendored. (No upstream manifest has a `[[bench]]`; an earlier version of this
+   list named one, which sent a syncer hunting for a section that never existed.)
 4. The broker's feature table keeps every upstream feature NAME (the source
    references them in `cfg(feature = …)`, and a missing one is an
    `unexpected_cfg` warning, which is an error under this repo's `-D warnings`),

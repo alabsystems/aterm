@@ -4,7 +4,7 @@ description = "astream pure vocabulary: frame codec, Subject/Filter, partitionin
 version = "0.1.0"
 edition = "2021"
 license = "Apache-2.0"
-authors = ["Andrew Yates"]
+authors = ["Andrew Yates <andrewyates.name@gmail.com>"]
 rust-version = "1.89"
 
 # astream-wire has NO normal dependencies, on purpose. It is the one crate

@@ -58,13 +58,21 @@ pub mod bridge;
 /// The bridge command line, as a library entry - see [`cli::dispatch`].
 pub mod cli;
 pub mod ctl;
+/// `aterm fabric on|off|doctor` — see [`enable::on`].
+pub mod enable;
+/// `aterm fabric` — the fabric's state on one screen, and its traffic live.
+pub mod fabric;
 pub mod glance;
 pub mod handoff;
 pub mod hook;
+/// A minimal JSON value, for the one document `hook install --merge` edits.
+pub mod json;
 pub mod mailbox;
 pub mod mirror;
 pub mod notify;
 pub mod pct;
+/// The presence row's meaning fields (`role= detail= phase= context= title=`).
+pub mod presence;
 pub mod replay;
 pub mod state;
 pub mod subject;
@@ -171,6 +179,8 @@ mod tests {
             ("subject", include_str!("subject.rs")),
             ("ctl", include_str!("ctl.rs")),
             ("hook", include_str!("hook.rs")),
+            ("json", include_str!("json.rs")),
+            ("fabric", include_str!("fabric.rs")),
             ("transport", include_str!("transport.rs")),
         ] {
             let reads = source

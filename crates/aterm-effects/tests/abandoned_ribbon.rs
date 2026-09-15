@@ -43,7 +43,9 @@
 use aterm_core::render::GlowQuad;
 use aterm_core::terminal::Terminal;
 use aterm_effects::cursor_glow::{CursorGlow, Geom, GlowConfig, GlowStyle};
-use aterm_effects::rainbow_kitty::ribbon::{LIFT_GRACE_S, RETIRE_MELT_S, SWOOSH_TOTAL_S};
+use aterm_effects::rainbow_kitty::ribbon::{
+    PHRASE_REST_MIN_S, RETIRE_MELT_S, RETRACT_DUR_S, RETRACT_FADE_S, SWOOSH_TOTAL_S,
+};
 use aterm_effects::rainbow_kitty::witness::WITNESS_ROWS;
 use std::time::{Duration, Instant};
 
@@ -278,7 +280,7 @@ impl Host {
     }
 }
 
-const GRACE_S: f32 = 0.75;
+const GRACE_S: f32 = PHRASE_REST_MIN_S;
 const TEXT: &str = "hello world";
 
 fn hello(row: u16) -> Host {
@@ -294,10 +296,21 @@ fn hello(row: u16) -> Host {
 /// the right margin at 90 ms a key; the caret advances to the next row and
 /// the hand keeps typing there. The first row's band must stop being renewed
 /// the moment the caret leaves it and go out on ITS OWN clock — the swoosh,
-/// `SWOOSH_TOTAL_S` (1.54 s) after its last key — while the second row's band
-/// stays under the hand. RED on main at "row 5 is dark by …": every key on
-/// row 6 renewed row 5's cohort, so the first row held a flat full band for
-/// as long as the hand typed below it.
+/// `SWOOSH_TOTAL_S` after its last key — while the second row's band stays
+/// under the hand. RED before 2026-09-12 at "row 5 is dark by …": every key
+/// on row 6 renewed row 5's cohort, so the first row held a flat full band
+/// for as long as the hand typed below it.
+///
+/// THE RULING RECORDED (merged 2026-09-14). Rainbow Path v3 §2.3 (S6) would
+/// hold the whole wrapped line as ONE PHRASE, and the step-5 lane re-pinned
+/// this test that way. The merge does not take that half: the row scope is
+/// model-checked (`aterm-spec`'s `ribbon_row_hold_model`, invariant
+/// `OnlyOwnerRenews`, whose named falsifier is a global hold) and it is the
+/// shipped answer to the owner's 0.83.0 screenshot. What v3 DOES move here
+/// is the clock the bound is read against: the grace is the phrase rest
+/// (0.90 s at the floor, not a 0.75 s literal), so the swoosh is
+/// `SWOOSH_TOTAL_S` = 1.69 s, and both numbers are derived rather than
+/// written down.
 #[test]
 fn a_wrapped_line_s_first_row_goes_out_on_its_own_clock_while_the_hand_types_on_the_second() {
     let mut h = Host::at_row(5);
@@ -310,18 +323,19 @@ fn a_wrapped_line_s_first_row_goes_out_on_its_own_clock_while_the_hand_types_on_
     assert_eq!(c.row, 5, "eighty keys: the caret is still on row 5");
     assert!(h.lit(5), "row 5 is lit under the hand");
     let left_row_5 = h.now;
-    // Twenty-two more keys on row 6 — 90 ms apart, two full seconds of
-    // typing on the row below.
+    // Twenty-six more keys on row 6 — 90 ms apart, well past the swoosh.
     let mut row_5_dark_at: Option<f32> = None;
     let mut row_5_lit_at_grace = false;
-    for i in 0..22u16 {
+    for i in 0..26u16 {
         h.key(&[b'a' + (i % 26) as u8], 1);
         let c = h.term.cursor();
         assert_eq!(c.row, 6, "the wrap: the caret is on row 6");
         let since = h.now.saturating_duration_since(left_row_5).as_secs_f32();
         assert!(h.lit(6), "row 6 is lit under the hand at +{since:.2} s");
-        if since < LIFT_GRACE_S * 0.9 {
-            // Inside the grace the first row keeps its light: no early cut.
+        if since < (RETRACT_DUR_S + RETRACT_FADE_S) * 0.9 {
+            // The wrap ABANDONS the row the caret left (`leave_row`), so it
+            // leaves on the retract's own span rather than its grace — and
+            // it must keep its light the whole way down: no early cut.
             assert!(
                 h.lit(5),
                 "row 5 keeps the life it had through its grace (+{since:.2} s)"
@@ -334,19 +348,27 @@ fn a_wrapped_line_s_first_row_goes_out_on_its_own_clock_while_the_hand_types_on_
     }
     assert!(row_5_lit_at_grace, "the grace was observed");
     let dark = row_5_dark_at.expect(
-        "row 5 must go dark while the hand is still typing on row 6 — main holds it \
-         at full light for as long as any key is live",
+        "row 5 must go dark while the hand is still typing on row 6 — a global hold          keeps it at full light for as long as any key is live",
     );
     // THE BOUND: its own swoosh, and not a frame later than one key's cadence
     // past it (the read is once per key, 90 ms apart).
     assert!(
-        (LIFT_GRACE_S..=SWOOSH_TOTAL_S + 0.1).contains(&dark),
-        "row 5 went out at +{dark:.2} s after the caret left it; the bound is its own \
-         swoosh, {SWOOSH_TOTAL_S} s (never past 1.6 s)"
+        (RETRACT_DUR_S + RETRACT_FADE_S..=SWOOSH_TOTAL_S + 0.1).contains(&dark),
+        "row 5 went out at +{dark:.2} s after the caret left it; the bound is the \
+         abandon's own retract, and never past its swoosh, {SWOOSH_TOTAL_S} s"
     );
+    // THE ABSOLUTE CEILING, AND WHY IT MOVED. This read 1.6 s while the swoosh
+    // was a 1.54 s literal. The phrase rest is now the melody's — 0.90 s at 2.8
+    // characters a second or faster, where it was a 0.75 s literal — and the
+    // swoosh is DERIVED from it (rest + 0.79 s = 1.69 s at the floor rest), so
+    // the old number would fail on arithmetic rather than on any regression.
+    // The ceiling is restated at the new derived value plus the same margin the
+    // old one carried, and it is still an absolute bound on how long a row the
+    // caret has left may hold light: it is not a function of the constant it
+    // guards, so shortening the rest cannot silently relax it.
     assert!(
-        (SWOOSH_TOTAL_S * 1000.0) as u64 <= 1600,
-        "the pinned bound: a row the caret left is dark inside 1.6 s"
+        (SWOOSH_TOTAL_S * 1000.0) as u64 <= 1750,
+        "the pinned bound: a row the caret left is dark inside 1.75 s"
     );
     assert!(h.lit(6), "…and the live row's band is untouched");
     assert!(
@@ -762,8 +784,16 @@ fn a_key_typed_over_an_abandoned_cohorts_cell_keeps_its_own_light() {
     let c = h.term.cursor();
     assert_eq!((c.row, c.col), (5, 8), "Up, Down, Left×3 from (5,11)");
     let before = h.cells_at(5, 8);
-    assert_eq!(before.len(), 1, "one stale owner at (5,8): {before:?}");
-    assert!(!before[0].1, "…abandoned, not leaving: {before:?}");
+    // Since the per-row drain (Rainbow Path v3 §2.6, 2026-09-13) the band
+    // the Up left BELOW the caret drains from its RIGHT end, so by the third
+    // Left (+450 ms) the stale cell at (5,8) has spent to zero and the hop
+    // has laid a fresh wake cell over it (a hop lights what the drain has
+    // emptied). The stale cell is still resident and not `leaving`; it is
+    // the OLDEST at the position, and the one the witness must name.
+    assert!(
+        !before.is_empty() && !before[0].1,
+        "the stale owner at (5,8) is resident and abandoned, not leaving: {before:?}"
+    );
     let stale_born = before[0].0;
     let retired_before = h.retired();
 
@@ -771,14 +801,18 @@ fn a_key_typed_over_an_abandoned_cohorts_cell_keeps_its_own_light() {
     let c = h.term.cursor();
     assert_eq!((c.row, c.col), (5, 9), "the key echoed at (5,8)");
     let at = h.cells_at(5, 8);
-    assert_eq!(at.len(), 2, "two owners at (5,8), stale and fresh: {at:?}");
+    assert!(
+        at.len() >= 2,
+        "the stale cell and the fresh one at (5,8): {at:?}"
+    );
     assert_eq!(at[0].0, stale_born, "oldest first is the stale cell");
     assert!(at[0].1, "the stale cell (o → X) is retired: {at:?}");
+    let fresh = at[at.len() - 1];
     assert!(
-        !at[1].1,
+        !fresh.1,
         "the key's own cell keeps its light on its birth frame: {at:?}"
     );
-    let fresh_born = at[1].0;
+    let fresh_born = fresh.0;
     assert!(fresh_born > stale_born);
     assert_eq!(
         h.retired() - retired_before,
@@ -831,6 +865,8 @@ fn trail_status_appends_ribbon_retired_after_the_v2_rows() {
         spawns: h.glow.spawns(),
         ribbon_segments: h.glow.ribbon_segments(),
         ribbon_hue_bands: h.glow.ribbon_hue_bands(),
+        ribbon_drawn: h.glow.ribbon_drawn(),
+        ribbon_curtain_ms: None,
         field: h.glow.rainbow_field(),
         sparks: h.glow.live_sparks(),
         momentum: 0.0,

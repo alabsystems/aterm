@@ -193,6 +193,17 @@ pub struct Channel {
     /// The pinned SET — exact per-program builds that move together (`program -> build`).
     #[serde(default)]
     pub pin: BTreeMap<String, u64>,
+    /// PER-TARGET pin overlays (`triple -> (program -> build)`), applied over [`Self::pin`]
+    /// by [`Self::for_target`]. A build number is platform-agnostic in `pin`, which forces
+    /// every target to move on one cadence: a Linux toolchain could only be published by
+    /// riding the Mac's build number — and the Mac's exact source for a given number is
+    /// not always recoverable (measured 2026-09-14: trust 8595's public tag names a
+    /// staging commit that no longer exists). An overlay lets one target pin its own
+    /// build without touching another's, and an old client that does not know this key
+    /// ignores it (the index parser tolerates unknown keys), so it is additive on the
+    /// wire. Absent ⇒ no overlay: `for_target` is the identity.
+    #[serde(default)]
+    pub pin_by_target: BTreeMap<String, BTreeMap<String, u64>>,
     /// `[channels.meta]` — the attested reproducibility tuple (nightly id, trust-mc rev,
     /// …). Stored generically here; Phase 4/5 validate it. Not all fields are attested
     /// (§4.1 — `trust_fork_rev`/`llvm`/`clean_kernel_rev` are net-new, unproven).
@@ -200,7 +211,43 @@ pub struct Channel {
     pub meta: BTreeMap<String, String>,
 }
 
+impl Channel {
+    /// This channel as seen from ONE target: [`Self::pin`] with `pin_by_target[triple]`
+    /// laid over it — an overlay entry REPLACES the platform-agnostic pin for that program
+    /// and an entry for a program `pin` never named ADDS it. Every other field is carried
+    /// unchanged, and `pin_by_target` itself is cleared in the view so a consumer cannot
+    /// overlay twice. Programs pinned for OTHER targets are not this target's business:
+    /// they neither appear nor mask anything.
+    ///
+    /// Every consumer that plans, decides or fetches for a host goes through this view,
+    /// so `plan_groups`, `decide` and `verified_pkg` stay pure over `pin` and never learn
+    /// that targets exist — the overlay is resolved once, where the channel is chosen.
+    #[must_use]
+    pub fn for_target(&self, triple: &str) -> Channel {
+        let mut view = self.clone();
+        if let Some(overlay) = self.pin_by_target.get(triple) {
+            for (program, build) in overlay {
+                view.pin.insert(program.clone(), *build);
+            }
+        }
+        view.pin_by_target.clear();
+        view
+    }
+}
+
 impl Index {
+    /// The named channel as seen from `triple` — [`Channel::for_target`] over the channel
+    /// of that name — or `None` when the index carries no such channel. THE one lookup
+    /// every host-facing path uses, so a per-target pin can never be missed by a caller
+    /// that read `channels` directly.
+    #[must_use]
+    pub fn channel_for(&self, name: &str, triple: &str) -> Option<Channel> {
+        self.channels
+            .iter()
+            .find(|c| c.name == name)
+            .map(|c| c.for_target(triple))
+    }
+
     /// The named program, **iff** the verified index names it. `None` ⇒ the repo is
     /// unreachable (R4): private-config repos, half-finished repos, anything unlisted is
     /// never named, so this is exclusion *by construction*, not by heuristic.
@@ -850,6 +897,84 @@ trust_mc_rev = "0.67.0"
             ch.meta.get("nightly").map(String::as_str),
             Some("nightly-2025-12-03")
         );
+    }
+
+    /// A per-target overlay changes ONLY the target it names: that target sees the
+    /// overlaid build for a program `pin` also names (replace), sees a program `pin`
+    /// never named (add), and every other target sees `pin` exactly as published.
+    #[test]
+    fn a_per_target_pin_overlays_its_own_target_and_no_other() {
+        let mut body = full_index();
+        body = body.replace(
+            "[channels.meta]",
+            "pin_by_target = { \"x86_64-unknown-linux-gnu\" = { trust = 9122, nn = 108 } }\n[channels.meta]",
+        );
+        let idx = parse_index(&verified(&body)).expect("an index with a per-target overlay parses");
+        let raw = &idx.channels[0];
+        assert_eq!(
+            raw.pin.get("trust"),
+            Some(&4821),
+            "the platform-agnostic pin is untouched on the wire"
+        );
+
+        let linux = idx
+            .channel_for("stable", "x86_64-unknown-linux-gnu")
+            .expect("stable exists");
+        assert_eq!(
+            linux.pin.get("trust"),
+            Some(&9122),
+            "REPLACED for the overlaid target"
+        );
+        assert_eq!(
+            linux.pin.get("nn"),
+            Some(&108),
+            "ADDED: a program `pin` never named"
+        );
+        assert_eq!(
+            linux.pin.get("ay"),
+            Some(&18),
+            "carried: a program the overlay does not mention"
+        );
+        assert!(
+            linux.pin_by_target.is_empty(),
+            "the view cannot be overlaid twice"
+        );
+        assert_eq!(linux.name, "stable");
+        assert_eq!(
+            linux.min_build, raw.min_build,
+            "every other field rides along"
+        );
+
+        let mac = idx
+            .channel_for("stable", "aarch64-apple-darwin")
+            .expect("stable exists");
+        assert_eq!(
+            mac.pin.get("trust"),
+            Some(&4821),
+            "another target sees the published pin"
+        );
+        assert_eq!(
+            mac.pin.get("nn"),
+            None,
+            "and not the other target's additions"
+        );
+        assert!(
+            idx.channel_for("nightly", "x86_64-unknown-linux-gnu")
+                .is_none(),
+            "no such channel"
+        );
+    }
+
+    /// The key is OPTIONAL and additive: an index without it (every index published
+    /// before this key existed) resolves to exactly its `pin` for every target.
+    #[test]
+    fn without_an_overlay_the_view_is_the_published_pin() {
+        let idx = parse_index(&verified(&full_index())).expect("valid index parses");
+        let view = idx
+            .channel_for("stable", "x86_64-unknown-linux-gnu")
+            .unwrap();
+        assert_eq!(view.pin, idx.channels[0].pin);
+        assert!(idx.channels[0].pin_by_target.is_empty());
     }
 
     /// A LEFTOVER `[keys]` table carries no authority any more: it parses (unknown tables

@@ -373,13 +373,41 @@ pub fn graph(root: &Path, cell: &Cell) -> Result<Graph, String> {
 ///
 /// Canonicalising HERE fixes it for every caller at once, rather than once per
 /// verb — `check` had already grown its own private workaround.
+///
+/// ON WINDOWS THE CANONICAL SPELLING IS THEN UN-VERBATIMED, and that is a
+/// measured defect too (2026-09-14, the first `cargo forge` run on a Windows
+/// host): `canonicalize` there answers `\\?\C:\Users\…`, cargo accepted that
+/// as `--manifest-path`, and then refused every cell with "cannot update the
+/// lock file `\\?\C:\…\Cargo.lock` because `--locked` was passed" — a lock
+/// that was byte-for-byte current. The retry path diagnosed it as a stale
+/// registry cache and told the operator to run `cargo fetch`, which again
+/// could not help. `crates/aterm-update/src/which_copy.rs` records the same
+/// property of Windows `canonicalize` for the same reason.
 fn abs_root(root: &Path) -> Result<PathBuf, String> {
-    root.canonicalize().map_err(|e| {
+    let abs = root.canonicalize().map_err(|e| {
         format!(
             "workspace root `{}` cannot be resolved: {e}. FIX: pass `--root` an existing              directory holding the workspace `Cargo.toml`, or omit `--root` and run from              anywhere inside the workspace.",
             root.display()
         )
-    })
+    })?;
+    Ok(strip_verbatim_prefix(abs))
+}
+
+/// `\\?\C:\x` -> `C:\x`. Only the verbatim-DISK form is rewritten: a verbatim
+/// UNC path has no shorter spelling every tool accepts, and every other prefix
+/// is left exactly as `canonicalize` produced it. A no-op off Windows, where
+/// no path carries a prefix component at all.
+pub fn strip_verbatim_prefix(path: PathBuf) -> PathBuf {
+    use std::path::{Component, Prefix};
+    let verbatim_disk = matches!(
+        path.components().next(),
+        Some(Component::Prefix(prefix)) if matches!(prefix.kind(), Prefix::VerbatimDisk(_))
+    );
+    if !verbatim_disk {
+        return path;
+    }
+    let text = path.to_string_lossy();
+    PathBuf::from(text.strip_prefix(r"\\?\").unwrap_or(&text))
 }
 
 fn run_tree(root: &Path, cell: &Cell, offline: bool) -> Result<String, String> {
@@ -436,6 +464,38 @@ mod tests {
             .and_then(Path::parent)
             .expect("crates/aterm-forge sits two levels under the workspace root")
             .to_path_buf()
+    }
+
+    /// The verbatim-disk spelling Windows `canonicalize` answers is the one
+    /// cargo refuses under `--locked`; everything else passes through untouched.
+    #[test]
+    fn abs_root_drops_the_verbatim_disk_prefix_and_nothing_else() {
+        if cfg!(windows) {
+            assert_eq!(
+                strip_verbatim_prefix(PathBuf::from(r"\\?\C:\Users\x\aterm")),
+                PathBuf::from(r"C:\Users\x\aterm")
+            );
+            assert_eq!(
+                strip_verbatim_prefix(PathBuf::from(r"\\?\UNC\server\share\aterm")),
+                PathBuf::from(r"\\?\UNC\server\share\aterm")
+            );
+            assert_eq!(
+                strip_verbatim_prefix(PathBuf::from(r"C:\Users\x\aterm")),
+                PathBuf::from(r"C:\Users\x\aterm")
+            );
+        } else {
+            // No prefix component exists off Windows; the text is a plain
+            // relative path there and must come back byte-identical.
+            let p = PathBuf::from(r"\\?\C:\Users\x\aterm");
+            assert_eq!(strip_verbatim_prefix(p.clone()), p);
+        }
+        let real = abs_root(&repo_root()).expect("the workspace root resolves");
+        assert!(
+            !real.to_string_lossy().starts_with(r"\\?\"),
+            "{}",
+            real.display()
+        );
+        assert!(real.join("Cargo.toml").is_file());
     }
 
     fn names(cells: &[Cell]) -> Vec<&str> {

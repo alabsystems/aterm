@@ -127,12 +127,58 @@ where
 /// Ends a subscription from outside its reading thread by shutting the socket
 /// underneath it down in both directions: the parked `recv` returns `Ok(None)`
 /// and the broker sees the peer go away. Idempotent.
-pub struct Closer(Box<dyn Fn() + Send>);
+///
+/// It is also the ONE handle to the socket under the erased stream, so it is
+/// where a read deadline is set: `Conn` is `Client<Box<dyn Stream>>` and the
+/// socket cannot be reached through it, while a bridge must bound how long a
+/// request may wait for the broker's answer ([`Closer::set_read_timeout`]) — a
+/// broker that accepts the connection and never acks is otherwise a bridge
+/// parked forever in `attach`, reporting nothing.
+pub struct Closer {
+    close: Box<dyn Fn() + Send>,
+    timeout: Box<dyn Fn(Option<std::time::Duration>) -> io::Result<()> + Send>,
+}
 
 impl Closer {
     /// Shut the connection down.
     pub fn close(&self) {
-        (self.0)();
+        (self.close)();
+    }
+
+    /// Bound how long a read on this connection parks with nothing arriving —
+    /// `SO_RCVTIMEO` on the socket under whatever wrapper the transport put on
+    /// top, so it applies to every frame the `Conn` reads from now on. Past it
+    /// the read fails `WouldBlock`/`TimedOut` and, on a request/reply
+    /// connection, the stream is no longer framed (the late reply may still
+    /// arrive): the caller drops the connection, it does not retry on it. A
+    /// subscription that has been opened wants `None` here, because parking in
+    /// `recv` with nothing to deliver is its normal state.
+    ///
+    /// # Errors
+    ///
+    /// The `setsockopt`.
+    pub fn set_read_timeout(&self, d: Option<std::time::Duration>) -> io::Result<()> {
+        (self.timeout)(d)
+    }
+
+    fn unix(dup: UnixStream) -> io::Result<Self> {
+        let timeout_dup = dup.try_clone()?;
+        Ok(Self {
+            close: Box::new(move || {
+                let _ = dup.shutdown(std::net::Shutdown::Both);
+            }),
+            timeout: Box::new(move |d| timeout_dup.set_read_timeout(d)),
+        })
+    }
+
+    fn tcp(dup: TcpStream) -> io::Result<Self> {
+        let timeout_dup = dup.try_clone()?;
+        Ok(Self {
+            close: Box::new(move || {
+                let _ = dup.shutdown(std::net::Shutdown::Both);
+            }),
+            timeout: Box::new(move |d| timeout_dup.set_read_timeout(d)),
+        })
     }
 }
 
@@ -185,24 +231,14 @@ pub fn connect(transport: &Transport, endpoint: &str) -> io::Result<(Conn, Close
     match transport {
         Transport::Unix => {
             let s = UnixStream::connect(endpoint)?;
-            let dup = s.try_clone()?;
-            Ok((
-                Client::from_stream(Box::new(s)),
-                Closer(Box::new(move || {
-                    let _ = dup.shutdown(std::net::Shutdown::Both);
-                })),
-            ))
+            let closer = Closer::unix(s.try_clone()?)?;
+            Ok((Client::from_stream(Box::new(s)), closer))
         }
         Transport::Tcp => {
             let s = TcpStream::connect(endpoint)?;
             s.set_nodelay(true)?;
-            let dup = s.try_clone()?;
-            Ok((
-                Client::from_stream(Box::new(s)),
-                Closer(Box::new(move || {
-                    let _ = dup.shutdown(std::net::Shutdown::Both);
-                })),
-            ))
+            let closer = Closer::tcp(s.try_clone()?)?;
+            Ok((Client::from_stream(Box::new(s)), closer))
         }
         #[cfg(not(feature = "sealed"))]
         Transport::Sealed(key) => {
@@ -225,16 +261,13 @@ pub fn connect(transport: &Transport, endpoint: &str) -> io::Result<(Conn, Close
         Transport::Sealed(key) => {
             let sealed = Client::connect_tcp_sealed(endpoint, **key)?.into_stream();
             // The DUP IS OF THE SOCKET, not of the sealed wrapper: shutting the
-            // socket down is what unparks the reader. A second `SealedStream`
-            // over the same socket would be a second record-layer sequence and
-            // is exactly what must not exist.
-            let dup = sealed.get_ref().try_clone()?;
-            Ok((
-                Client::from_stream(Box::new(sealed)),
-                Closer(Box::new(move || {
-                    let _ = dup.shutdown(std::net::Shutdown::Both);
-                })),
-            ))
+            // socket down is what unparks the reader, and a read deadline set on
+            // it lands under the record layer, which resumes a partial record
+            // exactly as a partial frame. A second `SealedStream` over the same
+            // socket would be a second record-layer sequence and is exactly what
+            // must not exist.
+            let closer = Closer::tcp(sealed.get_ref().try_clone()?)?;
+            Ok((Client::from_stream(Box::new(sealed)), closer))
         }
     }
 }
@@ -313,6 +346,45 @@ mod tests {
         assert!(read_key_file(p).is_err());
         std::fs::write(&path, "ab".repeat(33)).expect("write");
         assert!(read_key_file(p).is_err());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// THE READ DEADLINE REACHES THE SOCKET UNDER THE ERASED STREAM. A listener
+    /// that accepts and never answers used to park a `hello` for ever; with the
+    /// deadline set through the closer's dup, the same `hello` fails
+    /// `WouldBlock`/`TimedOut` at the deadline — which is what turns "a broker
+    /// that accepts and never acks" into `fabric=stalled reason=no-ack` rather
+    /// than a bridge that reports nothing for the life of the process.
+    #[test]
+    fn a_read_deadline_set_through_the_closer_ends_a_hello_nobody_answers() {
+        use std::os::unix::net::UnixListener;
+        let dir = std::env::temp_dir().join(format!("atlink-deadline-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).expect("scratch");
+        let sock = dir.join("s.sock");
+        let _ = std::fs::remove_file(&sock);
+        let listener = UnixListener::bind(&sock).expect("bind");
+        let (mut conn, closer) =
+            connect(&Transport::Unix, sock.to_str().expect("utf8")).expect("connect");
+        let (peer, _) = listener.accept().expect("accept");
+        closer
+            .set_read_timeout(Some(std::time::Duration::from_millis(300)))
+            .expect("deadline");
+        let started = std::time::Instant::now();
+        let err = conn.hello().expect_err("nobody answers");
+        let waited = started.elapsed();
+        assert!(
+            matches!(
+                err.kind(),
+                io::ErrorKind::WouldBlock | io::ErrorKind::TimedOut
+            ),
+            "{err:?}"
+        );
+        assert!(
+            waited >= std::time::Duration::from_millis(250)
+                && waited < std::time::Duration::from_secs(5),
+            "the deadline, not a hang and not an instant refusal: {waited:?}"
+        );
+        drop(peer);
         let _ = std::fs::remove_dir_all(&dir);
     }
 

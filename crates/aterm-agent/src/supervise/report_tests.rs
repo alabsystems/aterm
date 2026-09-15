@@ -6,6 +6,7 @@
 
 use std::collections::{BTreeMap, VecDeque};
 
+use super::super::blocks::View;
 use super::super::phase::transcript_end;
 use super::super::prompt::fixtures::{composer, rows};
 use super::*;
@@ -337,7 +338,7 @@ fn a_turn_that_scrolled_off_is_joined_back_from_its_user_row() {
 /// the tip under it are the live zone, and the report is the user block.
 #[test]
 fn a_wrapped_user_block_on_the_screen_is_the_start() {
-    let screen = fixture(include_str!("fixtures/wait_bg2.out"));
+    let screen = fixture(super::super::prompt::fixtures::WAIT_BG2);
     assert!(screen[transcript_end(&screen)].starts_with("✶ Deliberating"));
     let text = "Go on the amended lever, with one correction: the ghost-key site comment \
                 says that entry is not safe to replay, so that gate has an auditing reason; \
@@ -629,7 +630,14 @@ fn since_counts_every_row_after_it() {
     read.back = 3;
     read.back_at = Some(204);
     let mut host = Host::default().on("offscreen", read.ctl());
-    let report = run(&mut host, ReportOpts { since, max_rows: 2 });
+    let report = run(
+        &mut host,
+        ReportOpts {
+            since,
+            max_rows: 2,
+            ..ReportOpts::default()
+        },
+    );
     assert_eq!(
         host.requests,
         ["@s-1 offscreen since=7730:200 max=2 screen=1"]
@@ -669,6 +677,7 @@ fn a_cut_page_and_the_main_screen_are_incomplete() {
         ReportOpts {
             since: None,
             max_rows: 2,
+            ..ReportOpts::default()
         },
     );
     assert_eq!(report.reasons, [Reason::MaxRows]);
@@ -805,9 +814,7 @@ fn the_readers_match_the_wire() {
 /// after the last non-blank row.
 #[test]
 fn the_transcript_ends_at_the_live_zone() {
-    let idle = fixture(include_str!(
-        "fixtures/idle-after-limit-and-model-switch.txt"
-    ));
+    let idle = fixture(super::super::prompt::fixtures::IDLE_AFTER_LIMIT_AND_MODEL_SWITCH);
     let end = transcript_end(&idle);
     assert!(
         idle[end - 1].starts_with("  ⎿  Set model to"),
@@ -1069,5 +1076,142 @@ fn a_paste_row_that_does_not_fit_the_turn_is_not_the_start() {
         [Reason::MarkerNotFound],
         "{}",
         report.header()
+    );
+}
+
+// ------------------------------------------- round-11: the report's two views
+
+/// The `--final` and `--messages` views on the saved screen of a REAL worker
+/// (`idle-after-limit-and-model-switch`, the fixture
+/// [`the_transcript_ends_at_the_live_zone`] reads): the default report is
+/// byte-identical to what it always printed, `--final` is the worker's last
+/// message and the done row that ended the turn, and `--messages` keeps every
+/// message block, the user's `❯` row and the done rows while dropping every
+/// tool row — a collapsed `Ran N shell commands` group, a `⏺ Stop Task`, a
+/// `⏺ Workflow(…)` call, Claude Code's `Dynamic workflow`/`Background
+/// command` notices, the `✻ Waiting for …` status row — and all their `⎿`
+/// output.
+#[test]
+fn the_views_keep_the_worker_words_and_drop_the_tool_rows() {
+    let screen = fixture(super::super::prompt::fixtures::IDLE_AFTER_LIMIT_AND_MODEL_SWITCH);
+    let opts = |view: View| ReportOpts {
+        since: Some(Mark {
+            origin: Some(7730),
+            index: 0,
+        }),
+        view,
+        ..ReportOpts::default()
+    };
+    let host = || Host::default().on("offscreen", Read::new(1, &[], screen.clone()).ctl());
+    let report = run(&mut host(), opts(View::All));
+    // The default is unchanged: the same bytes, no `view=` in the header.
+    assert_eq!(report.render_view(View::All), report.render());
+    assert!(!report.header().contains("view="), "{}", report.header());
+
+    let final_view = report.render_view(View::Final);
+    let (head, body) = final_view.split_once("\n--\n").expect("a header and rows");
+    assert_eq!(head, format!("{} view=final kept=3", report.header()));
+    assert_eq!(
+        body.lines().collect::<Vec<_>>(),
+        [
+            "⏺ Second-pass reviewers are out and the build is running. Nothing else can start until one of those returns.",
+            "",
+            "✻ Cooked for 23m 0s · done 11:24 PM",
+        ]
+    );
+
+    let messages = report.render_view(View::Messages);
+    let (head, body) = messages.split_once("\n--\n").expect("a header and rows");
+    let kept: Vec<&str> = body.lines().collect();
+    assert_eq!(
+        head,
+        format!("{} view=messages kept={}", report.header(), kept.len())
+    );
+    for want in [
+        "⏺ The reviewers earned their keep: one lens found that the eviction scan honours only the literal --max-entries N spelling, while the",
+        "⏺ Second-pass reviewers are out and the build is running. Nothing else can start until one of those returns.",
+        "✻ Cooked for 23m 0s · done 11:24 PM",
+        "✻ Churned for 0s · done 11:30 PM",
+        "❯ /model",
+    ] {
+        assert!(kept.contains(&want), "the messages view dropped {want:?}");
+    }
+    for gone in [
+        "  Ran 1 shell command",
+        "  Ran 3 shell commands",
+        "⏺ Stop Task",
+        "✻ Waiting for 1 dynamic workflow to finish",
+    ] {
+        assert!(!kept.contains(&gone), "the messages view kept {gone:?}");
+    }
+    for row in &kept {
+        assert!(
+            !row.trim_start().starts_with('⎿')
+                && !row.starts_with("⏺ Workflow(")
+                && !row.starts_with("⏺ Dynamic workflow")
+                && !row.starts_with("⏺ Background command"),
+            "the messages view kept a tool row: {row:?}"
+        );
+    }
+    // Every kept row is a row the report holds, in its order.
+    let mut at = 0;
+    for row in &kept {
+        if row.is_empty() {
+            continue;
+        }
+        at = report.rows[at..]
+            .iter()
+            .position(|r| r == row)
+            .map(|i| at + i + 1)
+            .unwrap_or_else(|| panic!("{row:?} is not a report row, or is out of order"));
+    }
+}
+
+/// `--final` on the saved screen of a worker whose message began before the
+/// screen did (`wait_bg3`: the head scrolled off, so the rows open with the
+/// message's own wrapped rows): the words are kept — the table border, the
+/// bullets, the recommendation — and the done row that ended the turn with
+/// them, while the composer, its footer and the live zone are not report rows
+/// at all.
+#[test]
+fn a_final_view_of_a_headless_message_keeps_its_words_and_its_done_row() {
+    let screen = fixture(super::super::prompt::fixtures::WAIT_BG3);
+    let mut host = Host::default().on("offscreen", Read::new(1, &[], screen).ctl());
+    let report = run(
+        &mut host,
+        ReportOpts {
+            since: Some(Mark {
+                origin: Some(7730),
+                index: 0,
+            }),
+            view: View::Final,
+            ..ReportOpts::default()
+        },
+    );
+    let text = report.render_view(View::Final);
+    let (head, body) = text.split_once("\n--\n").expect("a header and rows");
+    assert!(head.contains(" view=final kept="), "{head}");
+    let kept: Vec<&str> = body.lines().collect();
+    assert!(
+        kept[0].starts_with("  └──────────"),
+        "the table border: {:?}",
+        kept[0]
+    );
+    assert!(
+        kept.iter()
+            .any(|r| r.starts_with("  - Sets B and C: key interning")),
+        "the bullets are kept"
+    );
+    assert!(
+        kept.iter().any(|r| r.trim() == "Waiting for your call."),
+        "the last words are kept"
+    );
+    assert_eq!(
+        kept.last().copied(),
+        Some("✻ Sautéed for 50m 35s · done 10:57 AM")
+    );
+    assert!(
+        !kept.iter().any(|r| r.contains("⏵⏵ auto mode on")),
+        "the footer is not a report row"
     );
 }

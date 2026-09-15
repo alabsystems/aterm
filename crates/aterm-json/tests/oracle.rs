@@ -1026,8 +1026,22 @@ fn repository_json_corpus_matches_the_oracle() {
         .and_then(std::path::Path::parent)
         .expect("workspace root")
         .to_path_buf();
-    let mut stack = vec![root];
     let mut files = 0usize;
+    for path in json_corpus(&root) {
+        let Ok(text) = std::fs::read_to_string(&path) else {
+            continue;
+        };
+        agree_parse(&text);
+        files += 1;
+    }
+    eprintln!("json corpus: {files} files");
+}
+
+/// Every `.json` of at most 4 MiB under `root`, minus the directories
+/// [`corpus_skips`] names.
+fn json_corpus(root: &std::path::Path) -> Vec<std::path::PathBuf> {
+    let mut stack = vec![root.to_path_buf()];
+    let mut out = Vec::new();
     while let Some(dir) = stack.pop() {
         let Ok(entries) = std::fs::read_dir(&dir) else {
             continue;
@@ -1036,10 +1050,7 @@ fn repository_json_corpus_matches_the_oracle() {
             let path = entry.path();
             let Ok(meta) = entry.metadata() else { continue };
             if meta.is_dir() {
-                if path
-                    .file_name()
-                    .is_some_and(|n| n == "target" || n == ".git" || n == "target-tippy")
-                {
+                if corpus_skips(root, &path) {
                     continue;
                 }
                 stack.push(path);
@@ -1047,15 +1058,60 @@ fn repository_json_corpus_matches_the_oracle() {
                 && meta.len() <= 4 * 1024 * 1024
                 && path.extension().is_some_and(|e| e == "json")
             {
-                let Ok(text) = std::fs::read_to_string(&path) else {
-                    continue;
-                };
-                agree_parse(&text);
-                files += 1;
+                out.push(path);
             }
         }
     }
-    eprintln!("json corpus: {files} files");
+    out.sort();
+    out
+}
+
+/// Whether the corpus walk stays out of `dir`: `target`, `.git` and
+/// `target-tippy` at any depth, and at the repository root every `target-*`
+/// sibling build dir (the gate's per-lane dirs) and the gate's `.aterm-verify`
+/// state dir, which the checked-in .gitignore names as `/target-*` and
+/// `/.aterm-verify/`.
+fn corpus_skips(root: &std::path::Path, dir: &std::path::Path) -> bool {
+    let Some(name) = dir.file_name().and_then(|n| n.to_str()) else {
+        return false;
+    };
+    name == "target"
+        || name == ".git"
+        || name == "target-tippy"
+        || (dir.parent() == Some(root) && (name.starts_with("target-") || name == ".aterm-verify"))
+}
+
+/// The walk stays out of the gate's sibling build dirs (`target-regex/`,
+/// `target-xtask/`, `target-drivers/`, `target-gate/`) and its `.aterm-verify/`
+/// state dir at the repository root — gigabytes of build output, some of it
+/// JSON — while a `target-*` name deeper in the tree is still walked.
+#[test]
+fn the_corpus_walk_skips_root_lane_dirs_and_verify_state() {
+    let root = std::env::temp_dir().join(format!("aterm-json-corpus-skip-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&root);
+    for (rel, body) in [
+        ("target-regex/debug/.fingerprint/x.json", "{}"),
+        ("target-gate/lane.json", "{}"),
+        (".aterm-verify/state.json", "{}"),
+        ("target/debug/y.json", "{}"),
+        ("crates/a/b.json", "[]"),
+        ("crates/a/target-input/c.json", "[]"),
+    ] {
+        let path = root.join(rel);
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        std::fs::write(&path, body).unwrap();
+    }
+    let found: Vec<String> = json_corpus(&root)
+        .iter()
+        .map(|p| {
+            p.strip_prefix(&root)
+                .unwrap()
+                .to_string_lossy()
+                .replace('\\', "/")
+        })
+        .collect();
+    std::fs::remove_dir_all(&root).unwrap();
+    assert_eq!(found, ["crates/a/b.json", "crates/a/target-input/c.json"]);
 }
 
 /// THE ONE DOCUMENTED DIVERGENCE, and it is the oracle that gives ground.

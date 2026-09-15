@@ -11791,9 +11791,10 @@ pub enum PointerProbe {
     /// 404: no published (non-draft, non-prerelease) release — or a private repository,
     /// which GitHub renders identically on this host.
     NoRelease,
-    /// Anything else the client would not read as a tag — a refused redirect (another
-    /// repository, a non-canonical tag), a non-redirect status, a throttle — worded as
-    /// the client words it.
+    /// Anything else the client would not install this cut from — a refused redirect
+    /// (another repository, a non-canonical tag), a tag of this repository the client
+    /// does not install from, a non-redirect status, a throttle — worded as the client
+    /// words it.
     Other(String),
 }
 
@@ -11838,8 +11839,17 @@ fn pointer_probe_from(
         Err(PointerError::UnsafeName) => Err(Error::new(format!(
             "{slug} is not a URL-safe release source"
         ))),
+        // `OtherTag` (2026-09-14): the pointer names a release of THIS repository
+        // under a tag the client does not install from (an `atpkg-index-<n>` cut
+        // holding `latest`). The deployed client elects the newest app release
+        // from the listing instead of refusing, but the cut's law is that the
+        // pointer NAMES this tag — the second half of the gate reads the appcast
+        // at the pointer's own location — so it stays a failing verdict here,
+        // worded as the client words it, and the remedy the error names
+        // (`gh release edit … --latest`) is the right one.
         Err(
             other @ (PointerError::Refused { .. }
+            | PointerError::OtherTag { .. }
             | PointerError::Transient { .. }
             | PointerError::Unexpected { .. }),
         ) => Ok(PointerProbe::Other(other.to_string())),
@@ -13176,6 +13186,11 @@ mod lean_dmg_ceiling_tests {
             PointerError::Refused {
                 why: "the redirect's tag is not a release tag this client installs from",
             },
+            // The pointer captured by a non-app release of this same channel: the client
+            // recovers from it, the publisher's gate must still refuse to call it this cut.
+            PointerError::OtherTag {
+                tag: "atpkg-index-30".into(),
+            },
             PointerError::Transient {
                 code: 429,
                 url: "x".into(),
@@ -13183,6 +13198,11 @@ mod lean_dmg_ceiling_tests {
             PointerError::Unexpected {
                 code: 200,
                 url: "x".into(),
+            },
+            // This repository, this asset, a tag the client elects around
+            // (2026-09-14): the cut still reads it as "not this tag".
+            PointerError::OtherTag {
+                tag: "atpkg-index-30".into(),
             },
         ] {
             let text = refused.to_string();

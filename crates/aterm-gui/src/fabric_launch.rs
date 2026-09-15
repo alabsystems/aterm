@@ -419,9 +419,9 @@ fn launch_once(argv: &[String]) -> std::io::Result<std::process::Child> {
     )?;
 
     // ATTACH BOTH, and only after the spawn succeeded: a near end served against
-    // a child that never started would report `fabric=connected` for a bridge
-    // that does not exist. Either end closing fires the fail-closed halt, which
-    // is exactly §11.2's "when either fd closes".
+    // a child that never started would report a bridge (`fabric=stalled`, the
+    // attach state) that does not exist. Either end closing fires the
+    // fail-closed halt, which is exactly §11.2's "when either fd closes".
     // ONE GENERATION PER LAUNCH, shared by both lanes: either lane closing still
     // reports the link lost, and neither lane's late-unwinding guard can report a
     // LATER launch's live bridge disconnected. See

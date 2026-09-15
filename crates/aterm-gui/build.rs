@@ -29,6 +29,7 @@
 // than failing the build (so a source tarball without a .git still compiles).
 
 use aterm_digest::Sha256;
+use std::path::PathBuf;
 use std::process::Command;
 
 /// Fixed 64-byte lowercase record used only by unpinned development builds.
@@ -223,28 +224,99 @@ fn main() {
 
     // Re-stamp when HEAD moves (new commit / checkout) or the workspace source
     // version changes. The release build number comes from SOURCE_DATE_EPOCH;
-    // ordinary builds fall back to HEAD's committer epoch. The workspace `.git`
-    // + Cargo.toml are two levels up from this manifest.
-    println!("cargo:rerun-if-changed=../../.git/HEAD");
-    println!("cargo:rerun-if-changed=../../.git/index");
+    // ordinary builds fall back to HEAD's committer epoch. Cargo.toml is two
+    // levels up from this manifest; the git paths are asked of git.
+    //
+    // 2026-09-13: these were the literal `../../.git/HEAD` and `../../.git/index`.
+    // In a linked worktree `.git` is a FILE, so neither path ever existed and cargo
+    // — which treats a missing watched path as changed — reran this script and
+    // relinked aterm-gui on EVERY build (measured: a no-change rebuild compiled
+    // aterm-gui again). In the main checkout the index watch did the same
+    // whenever `git status` refreshed the index. The index is not watched at all
+    // now: the stamp needs HEAD, and the dirty flag is still computed whenever
+    // the script runs (it was already stale for unstaged edits).
+    for path in git_watch_paths() {
+        println!("cargo:rerun-if-changed={}", path.display());
+    }
     println!("cargo:rerun-if-changed=../../Cargo.toml");
     println!("cargo:rerun-if-env-changed=SOURCE_DATE_EPOCH");
 
-    // Windows: compile + link the application icon into the exe so the taskbar
-    // button, Alt-Tab, titlebar and Explorer show the aterm icon instead of the
-    // generic exe glyph. Gated on the TARGET os (build scripts run on the host,
-    // so `cfg!` would reflect the wrong platform) and `manifest_optional()` keeps
-    // a toolchain-less build working — it downgrades a missing resource compiler
-    // to a warning rather than failing. No-op on every non-Windows target.
+    // Windows: compile + link the application icon into the DEV `aterm-gui.exe`
+    // so the taskbar button, Alt-Tab, titlebar and Explorer show the aterm icon
+    // instead of the generic exe glyph (the shipped `aterm.exe` gets its
+    // resources from crates/aterm/build.rs — link args reach only the emitting
+    // package's own bins). Gated on the TARGET os (build scripts run on the
+    // host, so `cfg!` would reflect the wrong platform); a missing resource
+    // compiler is a warning rather than a failure, so a toolchain-less build
+    // still works. No-op on every non-Windows target.
     if std::env::var("CARGO_CFG_TARGET_OS").as_deref() == Ok("windows") {
-        println!("cargo:rerun-if-changed=assets/aterm.rc");
         println!("cargo:rerun-if-changed=assets/aterm.ico");
-        if let Err(e) =
-            embed_resource::compile("assets/aterm.rc", embed_resource::NONE).manifest_optional()
-        {
-            println!("cargo:warning=aterm-gui: window icon not embedded: {e}");
+        let outcome = aterm_winres::compile(std::path::Path::new("assets/aterm.rc"));
+        if !outcome.is_linked() {
+            println!("cargo:warning=aterm-gui: window icon not embedded: {outcome}");
         }
     }
+}
+
+/// A path git prints, made absolute. `--path-format=absolute` arrived after
+/// `--git-common-dir`/`--git-path`, so an older git's relative answer is joined
+/// to this script's working directory (the package root, where git ran).
+fn git_abs_path(args: &[&str]) -> Option<PathBuf> {
+    let mut with_format = vec!["rev-parse", "--path-format=absolute"];
+    with_format.extend_from_slice(args);
+    let value = run("git", &with_format).or_else(|| {
+        let mut plain = vec!["rev-parse"];
+        plain.extend_from_slice(args);
+        run("git", &plain)
+    })?;
+    let path = PathBuf::from(value);
+    if path.is_absolute() {
+        Some(path)
+    } else {
+        std::env::current_dir().ok().map(|cwd| cwd.join(path))
+    }
+}
+
+/// The git files whose change means the commit stamp may be stale, resolved
+/// through git so a linked worktree (whose `.git` is a file) and the main
+/// checkout both work. Only EXISTING paths are returned: cargo reruns a build
+/// script on every build while a watched path is missing. Modelled on
+/// `git_watch_paths` in crates/aterm-release/build.rs, minus the index.
+fn git_watch_paths() -> Vec<PathBuf> {
+    let mut paths = Vec::new();
+    let Some(git_dir) = run("git", &["rev-parse", "--absolute-git-dir"]).map(PathBuf::from) else {
+        return paths;
+    };
+    let common_dir = git_abs_path(&["--git-common-dir"]).unwrap_or_else(|| git_dir.clone());
+
+    // HEAD is worktree-private: a checkout, or a commit on a detached HEAD.
+    paths.push(git_dir.join("HEAD"));
+
+    // The loose ref HEAD names moves on every commit to the branch. If it is
+    // packed right now, the loose file does not exist yet, so watch the nearest
+    // existing directory below `refs/` — the commit that writes it is observed.
+    if let Some(reference) = run("git", &["symbolic-ref", "--quiet", "HEAD"])
+        && let (Some(ref_path), Some(refs_root)) = (
+            git_abs_path(&["--git-path", &reference]),
+            git_abs_path(&["--git-path", "refs"]),
+        )
+        && let Some(watch) = ref_path
+            .ancestors()
+            .take_while(|p| p.starts_with(&refs_root))
+            .find(|p| p.exists())
+    {
+        paths.push(watch.to_path_buf());
+    }
+
+    // A currently packed ref changes here; a reftable-backend repo keeps every
+    // ref below `reftable/` (and HEAD is a stub there), so watch it when present.
+    paths.push(common_dir.join("packed-refs"));
+    paths.push(common_dir.join("reftable"));
+
+    paths.retain(|p| p.exists());
+    paths.sort();
+    paths.dedup();
+    paths
 }
 
 /// `"on"` iff this compile really runs the Trust verification pipeline.

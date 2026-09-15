@@ -1527,6 +1527,13 @@ pub(crate) mod test_fixtures {
         "crates/aterm-objc/src",
         "crates/aterm-observe/src",
         "crates/aterm-parser/src",
+        // Entered the closure with c1fc82257: the worker-phase and approval-box
+        // readers moved from aterm-agent into aterm-phase so the fabric bridge
+        // can share them. The normal dependency chain is aterm-gui ->
+        // aterm-agent -> aterm-phase; supervise re-exports the same readers.
+        // This dependency-free crate parses screen rows without locks, but its
+        // source remains GUI process code and belongs in the derived census.
+        "crates/aterm-phase/src",
         // Entered the closure when the first-party PNG codec replaced `png`
         // and the second compression stack behind it (flate2 + miniz_oxide +
         // fdeflate + simd-adler32 + adler2, 7 packages / 33,439 lines):
@@ -1535,6 +1542,10 @@ pub(crate) mod test_fixtures {
         // is GUI process code. Its only synchronisation is a `OnceLock` over
         // the CRC tables — a pure function of nothing, acquiring no other lock
         // inside its initialiser, so it cannot participate in an order.
+        // `aterm-phase` joined the GUI's closure with the fabric round that made
+        // presence carry role, phase and context (2026-09-14). A crate the shipping
+        // GUI links is a crate this census must scan, so the pin grows with it —
+        // the list is REVIEWED, which is why it is a pin and not a derivation.
         "crates/aterm-png/src",
         "crates/aterm-policy/src",
         "crates/aterm-predict/src",

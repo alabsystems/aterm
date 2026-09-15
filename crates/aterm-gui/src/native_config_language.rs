@@ -138,6 +138,7 @@ const RIGHT_CLICK_ALIASES: &[&str] = &["copy-paste"];
 const TAB_MENU_CHORDS: &[&str] = &["on", "menu_key", "off"];
 const TAB_MENU_CHORD_ALIASES: &[&str] = &["both", "menu-key", "menu"];
 const TAB_BAND_HEIGHTS: &[&str] = &["compact", "standard"];
+const UNIVERSAL_CONTROL_POLICIES: &[&str] = &["off", "leave"];
 const WINDOWING_BEHAVIOR_ALIASES: &[&str] = &[
     "new-window",
     "newwindow",
@@ -833,6 +834,39 @@ const MANUAL_SCHEMA: &[ManualSchemaEntry] = &[
         &["atpkg", "checkout", "repository", "development"],
         true,
     ),
+    // atpkg reads these from the same aterm.toml even when its package loop is
+    // disabled. They are real settings, not GUI Config fields or unknown keys.
+    // A false warning here paints an eight-second banner over the terminal.
+    manual(
+        "machine",
+        "Host maintenance",
+        ConfigSchemaKind::Table,
+        &["atpkg", "host", "maintenance"],
+        false,
+    ),
+    manual(
+        "machine.spotlight_noindex",
+        "Hide build output from Spotlight",
+        ConfigSchemaKind::Scalar(EditKind::Bool),
+        &["atpkg", "spotlight", "index", "build"],
+        true,
+    ),
+    manual(
+        "machine.universal_control",
+        "Universal Control policy",
+        ConfigSchemaKind::Scalar(EditKind::Enum {
+            options: UNIVERSAL_CONTROL_POLICIES,
+        }),
+        &["atpkg", "mouse", "keyboard", "sharing"],
+        true,
+    ),
+    manual(
+        "machine",
+        "Machine settings",
+        ConfigSchemaKind::Table,
+        &["universal control", "spotlight", "noindex", "host", "mac"],
+        false,
+    ),
     manual(
         "matrix_rain",
         "Matrix rain",
@@ -1445,6 +1479,7 @@ pub(crate) fn ignored_key_warnings(source: &str) -> Vec<String> {
         return Vec::new();
     };
     let mut analysis = ConfigAnalysis::default();
+    validate_machine_types(source, &document, &mut analysis);
     warn_compatibility_only_values(source, &document, &mut analysis);
     warn_unknown_values(source, &document, &mut analysis);
     let mut lines = analysis
@@ -1526,10 +1561,15 @@ fn unaccepted_enum_values(source: &str) -> Vec<(&'static str, String, String)> {
             // a fourteen-option list is the part nobody reads. The recovery is
             // the half worth guaranteeing; the domain is the reference behind it.
             format!(
-                "{}: {value:?} is not accepted{} (expected one of: {}; the default is used at load)",
+                "{}: {value:?} is not accepted{} (expected one of: {}; {})",
                 setting.key,
                 did_you_mean(nearest_enum_value(value, options)),
                 options.join(", "),
+                if setting.key == "machine.universal_control" {
+                    "Universal Control is left unchanged"
+                } else {
+                    "the default is used at load"
+                },
             ),
         ));
     }
@@ -1603,6 +1643,7 @@ pub(crate) fn analyze(source: &str) -> ConfigAnalysis {
         }
     };
 
+    validate_machine_types(source, &document, &mut analysis);
     validate_registered_values(source, &document, &mut analysis);
     warn_runtime_semantics(source, &document, &config, &mut analysis);
     warn_compatibility_only_values(source, &document, &mut analysis);
@@ -1678,6 +1719,46 @@ fn compatibility_only_message(key: &str) -> String {
         );
     }
     format!("{key} is compatibility-only and has no effect in this build")
+}
+
+/// The GUI parser leaves this table to atpkg. Both startup notices and Manual
+/// still need its type errors: atpkg falls back to active defaults on a malformed
+/// machine table, so these cannot become silent just because the keys are known.
+fn validate_machine_types(
+    source: &str,
+    document: &aterm_toml::edit::DocumentMut,
+    analysis: &mut ConfigAnalysis,
+) {
+    for setting in config_schema()
+        .iter()
+        .filter(|setting| setting.key == "machine" || setting.key.starts_with("machine."))
+    {
+        let Some(item) = dotted_item(document, setting.key) else {
+            continue;
+        };
+        let range = source_value_range(source, setting.key)
+            .or_else(|| item.span())
+            .unwrap_or(0..source.len().min(1));
+        let machine_type_error = match setting.key {
+            "machine" if item.as_table_like().is_none() => Some("machine must be a table"),
+            "machine.spotlight_noindex" if item.as_bool().is_none() => {
+                Some("machine.spotlight_noindex must be a boolean (true or false)")
+            }
+            "machine.universal_control" if item.as_str().is_none() => {
+                Some("machine.universal_control must be a string (off or leave)")
+            }
+            _ => None,
+        };
+        if let Some(message) = machine_type_error {
+            push_diagnostic(
+                analysis,
+                source,
+                range,
+                ConfigDiagnosticSeverity::Error,
+                format!("{message}; atpkg uses the default machine settings at load"),
+            );
+        }
+    }
 }
 
 fn validate_registered_values(
@@ -2189,6 +2270,12 @@ fn structured_warning_word_index(message: &str, record_path: &str) -> Option<usi
 
 pub(crate) fn registered_enum_value_is_valid(key: &str, value: &str, options: &[&str]) -> bool {
     let value = value.trim();
+    if key == "machine.universal_control" {
+        // MachineConfig trims but is CASE-SENSITIVE; blank selects its default
+        // Off policy. Other spellings warn and Leave, so the generic enum's
+        // case-insensitive acceptance would promise a setting atpkg ignores.
+        return value.is_empty() || UNIVERSAL_CONTROL_POLICIES.contains(&value);
+    }
     if key == "sparkle_words.custom.ink.colorway" {
         return custom_ink_colorway_is_valid(value);
     }
@@ -5251,6 +5338,9 @@ home = "~/aterm"
             "cursor_style",
             "cursor_trail_style",
             "display_font",
+            // `[machine] universal_control`: "off" | "leave", the two spellings
+            // atpkg's own reader resolves (the Security page's picker).
+            "machine.universal_control",
             "motion",
             "predictive_echo",
             "sparkle_words.feline.style",
@@ -5274,6 +5364,7 @@ home = "~/aterm"
             "right_click",
             "tab_menu_chord",
             "tab_band_height",
+            "machine.universal_control",
         ]);
         assert_eq!(actual, expected, "new enum needs language-domain coverage");
 
@@ -5361,6 +5452,93 @@ home = "~/aterm"
             let source = source_for(crate::prefs::EDIT_CURSOR_TRAIL_STYLE, pack);
             assert!(analyze(&source).has_errors(), "empty trail pack {pack:?}");
         }
+    }
+
+    #[test]
+    fn machine_opt_outs_are_real_atpkg_settings_and_do_not_cover_the_terminal() {
+        #[derive(serde::Deserialize)]
+        struct Document {
+            machine: atpkg::config::MachineConfig,
+        }
+        let source = "[packages]\nenabled = false\n\
+                      [machine]\nspotlight_noindex = false\nuniversal_control = \"leave\"\n";
+        let parsed: Document = aterm_toml::from_str(source).expect("real machine schema");
+        assert!(!parsed.machine.spotlight_noindex());
+        assert_eq!(
+            parsed.machine.universal_control(),
+            atpkg::config::UniversalControlPolicy::Leave
+        );
+        assert!(ignored_key_warnings(source).is_empty());
+        assert!(unaccepted_value_warnings(source, &[]).is_empty());
+        assert!(analyze(source).diagnostics.is_empty());
+        let notices = crate::app_config::ignored_key_notices(source);
+        assert!(
+            crate::config_notice::ConfigNotice::new(notices, std::time::Instant::now()).is_none(),
+            "valid machine opt-outs must not paint a banner over a real terminal"
+        );
+
+        // A real typo must still create the notice the historical omission
+        // incorrectly created for both supported keys.
+        let typo = source.replace("spotlight_noindex", "spotlight_noindx");
+        let notices = crate::app_config::ignored_key_notices(&typo);
+        assert!(notices.iter().any(|line| {
+            line.contains("machine.spotlight_noindx") && line.contains("machine.spotlight_noindex")
+        }));
+        assert!(
+            crate::config_notice::ConfigNotice::new(notices, std::time::Instant::now()).is_some()
+        );
+    }
+
+    #[test]
+    fn machine_policy_domain_matches_atpkg_and_bad_types_remain_errors() {
+        use atpkg::config::{MachineConfig, UniversalControlPolicy};
+        for (value, policy) in [
+            ("off", UniversalControlPolicy::Off),
+            ("leave", UniversalControlPolicy::Leave),
+            (" off ", UniversalControlPolicy::Off),
+            (" leave ", UniversalControlPolicy::Leave),
+            ("", UniversalControlPolicy::Off),
+            ("  ", UniversalControlPolicy::Off),
+        ] {
+            let fields = format!("universal_control = {value:?}\n");
+            let machine: MachineConfig = aterm_toml::from_str(&fields).unwrap();
+            assert_eq!(machine.universal_control(), policy, "{value:?}");
+            let source = format!("[machine]\n{fields}");
+            assert!(analyze(&source).diagnostics.is_empty(), "{value:?}");
+            assert!(unaccepted_value_warnings(&source, &[]).is_empty());
+        }
+        for value in ["OFF", "Leave", "leav"] {
+            let fields = format!("universal_control = {value:?}\n");
+            let machine: MachineConfig = aterm_toml::from_str(&fields).unwrap();
+            assert_eq!(machine.universal_control(), UniversalControlPolicy::Leave);
+            let source = format!("[machine]\n{fields}");
+            assert!(analyze(&source).has_errors(), "unsupported {value:?}");
+            let warnings = unaccepted_value_warnings(&source, &[]).join("\n");
+            assert!(warnings.contains("machine.universal_control"));
+            assert!(warnings.contains("Universal Control is left unchanged"));
+            assert!(!warnings.contains("the default is used"));
+        }
+        for fields in [
+            "spotlight_noindex = \"false\"\n",
+            "universal_control = true\n",
+        ] {
+            assert!(aterm_toml::from_str::<MachineConfig>(fields).is_err());
+            let source = format!("[machine]\n{fields}");
+            assert!(analyze(&source).has_errors());
+            let notices = crate::app_config::ignored_key_notices(&source);
+            assert!(notices.iter().any(|line| line.contains("must be")));
+            assert!(
+                notices
+                    .iter()
+                    .any(|line| line.contains("default machine settings"))
+            );
+        }
+        assert!(analyze("machine = false\n").has_errors());
+        assert!(
+            ignored_key_warnings("machine = false\n")
+                .iter()
+                .any(|line| line.contains("machine must be a table"))
+        );
     }
 
     #[test]

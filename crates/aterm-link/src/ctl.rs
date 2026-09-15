@@ -68,6 +68,7 @@
 use std::io::{self, BufRead, BufReader, Read, Write};
 use std::os::fd::{FromRawFd, OwnedFd, RawFd};
 use std::os::unix::net::UnixStream;
+use std::time::Duration;
 
 use aterm_types::control_verbs::{framing_of, Framing};
 
@@ -216,11 +217,48 @@ impl Ctl {
     ///
     /// The connect, the token read, or the write.
     pub fn connect(sock: &str, token: &str) -> io::Result<Self> {
+        Self::authenticate(UnixStream::connect(sock)?, token)
+    }
+
+    /// [`Ctl::connect`] with EVERY byte of the lane bounded by `deadline` —
+    /// the `AUTH` write included, which [`Ctl::connect`] followed by a
+    /// [`Ctl::set_deadline`] would leave unbounded.
+    ///
+    /// For a short-lived caller that must not be held by a peer that accepted
+    /// and then said nothing: a hook, whose vendor reads a stall as a 60 s hang
+    /// per tool call. A request that runs past the deadline fails with
+    /// [`io::ErrorKind::TimedOut`] and LATCHES the connection lost, because a
+    /// reply arriving after the caller gave up on it would be read as the
+    /// header of the next.
+    ///
+    /// # Errors
+    ///
+    /// As [`Ctl::connect`], or setting the socket's timeouts.
+    pub fn connect_within(sock: &str, token: &str, deadline: Duration) -> io::Result<Self> {
         let stream = UnixStream::connect(sock)?;
+        stream.set_read_timeout(Some(deadline))?;
+        stream.set_write_timeout(Some(deadline))?;
+        Self::authenticate(stream, token)
+    }
+
+    fn authenticate(stream: UnixStream, token: &str) -> io::Result<Self> {
         let mut ctl = Self::from_stream(stream)?;
         ctl.writer.write_all(format!("AUTH {token}\n").as_bytes())?;
         ctl.writer.flush()?;
         Ok(ctl)
+    }
+
+    /// Re-arm the lane's deadline: how long one read or write may take from
+    /// now on, or `None` for unbounded. A caller that is about to park on a
+    /// long `await` raises it past the wait it asked for and lowers it again
+    /// after.
+    ///
+    /// # Errors
+    ///
+    /// Setting the socket's timeouts.
+    pub fn set_deadline(&self, deadline: Option<Duration>) -> io::Result<()> {
+        self.writer.set_read_timeout(deadline)?;
+        self.writer.set_write_timeout(deadline)
     }
 
     /// The underlying stream, for a caller that must bound a read.
@@ -243,11 +281,23 @@ impl Ctl {
     }
 
     /// Run one request, LATCHING the connection on an I/O failure.
+    ///
+    /// A deadline that fired ([`Ctl::connect_within`], [`Ctl::set_deadline`])
+    /// surfaces from the socket as `WouldBlock` on some platforms and
+    /// `TimedOut` on others, with a message ("Resource temporarily
+    /// unavailable") that names neither; it is reported as ONE kind and one
+    /// sentence, so a caller printing it says what happened.
     fn guarded<T>(&mut self, r: io::Result<T>) -> io::Result<T> {
-        if r.is_err() {
+        r.map_err(|e| {
             self.lost = true;
-        }
-        r
+            match e.kind() {
+                io::ErrorKind::WouldBlock | io::ErrorKind::TimedOut => io::Error::new(
+                    io::ErrorKind::TimedOut,
+                    "aterm did not answer within the lane's deadline",
+                ),
+                _ => e,
+            }
+        })
     }
 
     /// Send one request line and read its reply, framed per the verb table.

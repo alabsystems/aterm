@@ -49,6 +49,511 @@ const APPLY_LOCK_WAIT: std::time::Duration = std::time::Duration::from_secs(10);
 /// gone away mid-copy — not to hurry a real one.
 const CROSS_VOLUME_COPY_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(120);
 
+// ---------------------------------------------------------------------------
+// Unpacking from a provenance-TRACKED app (2026-09-14).
+//
+// macOS stamps `com.apple.provenance` on every file a tracked process writes, and a
+// process is tracked when its executable carries the tag or its parent is tracked
+// (`crates/atpkg/src/provenance.rs` holds the measured law). This updater writes the
+// SUCCESSOR bundle — so a tracked aterm hands the tag to the app that replaces it, and
+// to every app after that, forever: measured on m16, the 0.85.0 laid down by a tracked
+// 0.84.0 carried the tag on `Contents/MacOS/aterm` and `Info.plist`, which is exactly
+// what makes atpkg's untracked lane take its copy plan for the life of the install.
+//
+// The one thing that escapes is a job LAUNCHD spawns from an untagged executable:
+// launchd is the job's parent, not us, and `/usr/bin/ditto` is a base-OS binary
+// (measured the same day: ditto of a clean tree by a launchd job → clean; by this
+// process → tagged). So when this process measures itself tracked, the unpacks run as
+// one-shot launchd jobs. The renames that follow are safe as they are: a tracked
+// rename tags the DIRECTORY it moves, not the files inside it (measured).
+// ---------------------------------------------------------------------------
+
+/// Whether THIS process is provenance-tracked — MEASURED, by writing a probe file into
+/// `scratch` and reading the attribute back, never inferred from the binary's own
+/// attributes (a clean binary under a tracked parent is tracked, which is the whole
+/// point). `false` when the probe cannot be written or inspected: a lane that cannot
+/// measure must not route an unpack through machinery it has no evidence it needs. The
+/// probe is removed before returning.
+#[cfg(target_os = "macos")]
+fn process_is_tracked(scratch: &Path) -> bool {
+    use std::os::unix::ffi::OsStrExt as _;
+    let probe = scratch.join(format!(".provenance-probe-{}", std::process::id()));
+    if std::fs::write(&probe, b"probe\n").is_err() {
+        return false;
+    }
+    let verdict = (|| {
+        let c_path = std::ffi::CString::new(probe.as_os_str().as_bytes()).ok()?;
+        // SAFETY: `c_path` is NUL-terminated and outlives both calls; a null buffer with
+        // size 0 is the documented size query; the second call passes `buf`'s own length.
+        let needed = unsafe { libc::listxattr(c_path.as_ptr(), std::ptr::null_mut(), 0, 0) };
+        if needed <= 0 {
+            return Some(false);
+        }
+        let mut buf = vec![0u8; needed as usize];
+        let got = unsafe {
+            libc::listxattr(
+                c_path.as_ptr(),
+                buf.as_mut_ptr().cast::<libc::c_char>(),
+                buf.len(),
+                0,
+            )
+        };
+        if got < 0 {
+            return None;
+        }
+        buf.truncate(got as usize);
+        Some(
+            buf.split(|b| *b == 0)
+                .any(|name| name == b"com.apple.provenance"),
+        )
+    })();
+    let _ = std::fs::remove_file(&probe);
+    verdict.unwrap_or(false)
+}
+
+/// Each copy owns a fresh private directory on the destination volume. A helper
+/// that outlives its deadline can write only here, never into a later attempt,
+/// the published stage, or the fixed rollback path. Unconfirmed attempts retain
+/// their directory; its random name is never handed to another copy or swept as
+/// legacy `zx-*` scratch.
+struct IsolatedCopy {
+    root: PathBuf,
+    payload: PathBuf,
+}
+
+impl IsolatedCopy {
+    fn create(destination: &Path) -> Result<Self, String> {
+        use std::os::unix::fs::DirBuilderExt;
+        let parent = destination
+            .parent()
+            .ok_or_else(|| "copy destination has no parent directory".to_string())?;
+        let nonce = random_nonce().ok_or_else(|| "copy attempt nonce unavailable".to_string())?;
+        let root = parent.join(format!(".aterm-copy-{nonce}"));
+        // Exclusive creation rejects a collision; never adopt an existing attempt.
+        std::fs::DirBuilder::new()
+            .mode(0o700)
+            .create(&root)
+            .map_err(|error| format!("create isolated copy directory: {error}"))?;
+        if let Err(error) = std::fs::write(root.join("copy-layout"), "aterm-copy-v1\n") {
+            let _ = std::fs::remove_dir(&root);
+            return Err(format!("record isolated copy layout: {error}"));
+        }
+        Ok(Self {
+            payload: root.join("payload"),
+            root,
+        })
+    }
+}
+
+/// Reclaim only explicitly abandoned attempts whose fenced writer published a
+/// terminal status. A live caller may have finished copying but not promoted yet;
+/// completion alone is therefore not permission to remove its directory. The
+/// background checker owns this recursive maintenance. Copy allocation creates
+/// only its own directory and marker, regardless of abandoned payloads nearby.
+pub(crate) fn reap_abandoned_copy_attempts(parent: &Path) {
+    use std::os::unix::fs::{MetadataExt, PermissionsExt};
+    let Ok(entries) = std::fs::read_dir(parent) else {
+        return;
+    };
+    // SAFETY: geteuid has no pointer arguments or preconditions.
+    let owner = unsafe { libc::geteuid() };
+    // Bound expensive inspection/reclamation, not unrelated directory names.
+    // This is best effort: pending attempts can consume the candidate budget.
+    for entry in entries
+        .flatten()
+        .filter(|entry| {
+            entry
+                .file_name()
+                .to_string_lossy()
+                .starts_with(".aterm-copy-")
+        })
+        .take(128)
+    {
+        let name = entry.file_name();
+        let name = name.to_string_lossy();
+        let Some(nonce) = name.strip_prefix(".aterm-copy-") else {
+            continue;
+        };
+        if nonce.len() != 32 || !nonce.bytes().all(|byte| byte.is_ascii_hexdigit()) {
+            continue;
+        }
+        let root = entry.path();
+        let Ok(metadata) = std::fs::symlink_metadata(&root) else {
+            continue;
+        };
+        if !metadata.is_dir()
+            || metadata.uid() != owner
+            || metadata.permissions().mode() & 0o077 != 0
+            || crate::read_ledger_text(&root.join("copy-layout")).as_deref()
+                != Some("aterm-copy-v1\n")
+            || crate::read_ledger_text(&root.join("abandoned")).as_deref() != Some("1\n")
+        {
+            continue;
+        }
+        let Some(label) = crate::read_ledger_text(&root.join("launchd.job")) else {
+            continue;
+        };
+        let Some(nonce) = label.strip_prefix("systems.alab.aterm-update.unpack-") else {
+            continue;
+        };
+        if nonce.len() != 32 || !nonce.bytes().all(|byte| byte.is_ascii_hexdigit()) {
+            continue;
+        }
+        let status = root.join(format!(".{label}.status"));
+        if !is_non_symlink_dir(&root.join(format!(".{label}.status.once"))) {
+            continue;
+        }
+        if crate::read_ledger_text(&status).is_some_and(|text| text.trim().parse::<u8>().is_ok()) {
+            let _ = std::fs::remove_dir_all(&root);
+        }
+    }
+}
+
+/// The shipping promotion boundary, shared by DMG extraction, ZIP extraction,
+/// and cross-volume apply. `run` must report success only after the copy exits;
+/// the launchd wrapper additionally fences its own automatic restarts.
+fn copy_into_isolated_destination(
+    args: &[std::ffi::OsString],
+    what: &str,
+    run: impl FnOnce(
+        &[std::ffi::OsString],
+        &Path,
+    ) -> Result<(std::process::ExitStatus, String), crate::verify::HelperFailure>,
+) -> Result<(std::process::ExitStatus, String), String> {
+    let (destination, prefix) = args
+        .split_last()
+        .ok_or_else(|| format!("{what}: missing copy destination"))?;
+    let destination = Path::new(destination);
+    let attempt = IsolatedCopy::create(destination)?;
+    let mut isolated_args = prefix.to_vec();
+    isolated_args.push(attempt.payload.as_os_str().to_os_string());
+    let completed = run(&isolated_args, &attempt.root);
+    let result = match completed {
+        Err(failure) if failure.writer_stopped => Err(failure.message),
+        Err(failure) => {
+            // Even a successful launchctl remove is asynchronous. Keep the
+            // one-shot claim and completion evidence for a future conservative
+            // sweep. A late completion licenses cleanup only, never promotion.
+            let marker_error = std::fs::write(attempt.root.join("abandoned"), "1\n")
+                .err()
+                .map(|error| format!("; could not mark abandoned copy: {error}"))
+                .unwrap_or_default();
+            return Err(format!(
+                "{}; unconfirmed copy remains isolated at {}{marker_error}",
+                failure.message,
+                attempt.root.display()
+            ));
+        }
+        Ok((status, stderr)) if status.success() => {
+            if !is_non_symlink_dir(&attempt.payload) {
+                Err(format!("{what}: copied payload is not a real directory"))
+            } else {
+                std::fs::rename(&attempt.payload, destination)
+                    .map(|()| (status, stderr))
+                    .map_err(|error| format!("{what}: promote completed copy: {error}"))
+            }
+        }
+        Ok(completed) => Ok(completed),
+    };
+    // A terminal copy owns no live writer. A restarted wrapper cannot recreate
+    // its claim after this never-reused parent disappears (plain mkdir, no -p).
+    let _ = std::fs::remove_dir_all(&attempt.root);
+    result
+}
+
+/// Run `/usr/bin/ditto` into an isolated attempt, bounded by `limit`, then promote
+/// only its completed output. A provenance-tracked process delegates the copy to
+/// launchd so the successor's files do not inherit its provenance tag.
+fn ditto_bounded_clean(
+    args: &[std::ffi::OsString],
+    what: &str,
+    limit: std::time::Duration,
+    scratch: &Path,
+) -> Result<(std::process::ExitStatus, String), String> {
+    copy_into_isolated_destination(args, what, |args, attempt_root| {
+        #[cfg(target_os = "macos")]
+        if process_is_tracked(scratch) {
+            return ditto_via_launchd(args, what, limit, attempt_root).map_err(|message| {
+                crate::verify::HelperFailure {
+                    message,
+                    writer_stopped: false,
+                }
+            });
+        }
+        crate::verify::status_bounded_with_stderr_observed(
+            Command::new("/usr/bin/ditto").args(args),
+            what,
+            limit,
+        )
+    })
+}
+
+/// The tracked half of [`ditto_bounded_clean`]. Submit, job completion, and
+/// timeout cleanup share one deadline. A short reserve allows bounded removal
+/// after a stuck submit or copy; neither launchctl invocation can wait forever.
+#[cfg(target_os = "macos")]
+fn ditto_via_launchd(
+    args: &[std::ffi::OsString],
+    what: &str,
+    limit: std::time::Duration,
+    scratch: &Path,
+) -> Result<(std::process::ExitStatus, String), String> {
+    ditto_via_launchd_using(args, what, limit, scratch, Path::new("/bin/launchctl"))
+}
+
+#[cfg(target_os = "macos")]
+struct LaunchdCopyBudget {
+    work: std::time::Instant,
+    finish: std::time::Instant,
+}
+
+#[cfg(target_os = "macos")]
+impl LaunchdCopyBudget {
+    fn new(now: std::time::Instant, limit: std::time::Duration) -> Self {
+        let finish = now + limit;
+        let reserve = std::time::Duration::from_secs(2).min(limit / 4);
+        Self {
+            work: finish - reserve,
+            finish,
+        }
+    }
+
+    fn deadline(&self, cleanup: bool) -> std::time::Instant {
+        if cleanup { self.finish } else { self.work }
+    }
+}
+
+// launchctl submit can restart a failed wrapper, including after it published a
+// successful ditto status. The exclusive claim survives that gap: no incarnation
+// may copy twice, and a removed attempt parent cannot be recreated by this claim.
+#[cfg(target_os = "macos")]
+const LAUNCHD_COPY_WRAPPER: &str = r#"st="$1"; lab="$2"; ctl="$3"; shift 3; /bin/mkdir "$st.once" 2>/dev/null || exit 0; "$@"; s=$?; printf '%s
+' "$s" > "$st.tmp" && mv -f "$st.tmp" "$st"; "$ctl" remove "$lab"; exit 0"#;
+
+#[cfg(target_os = "macos")]
+fn ditto_via_launchd_using(
+    args: &[std::ffi::OsString],
+    what: &str,
+    limit: std::time::Duration,
+    scratch: &Path,
+    launchctl: &Path,
+) -> Result<(std::process::ExitStatus, String), String> {
+    use std::os::unix::process::ExitStatusExt as _;
+    use std::process::Stdio;
+    use std::time::{Duration, Instant};
+    let budget = LaunchdCopyBudget::new(Instant::now(), limit);
+    let work_deadline = budget.deadline(false);
+    let nonce = random_nonce().ok_or_else(|| "launchd copy nonce unavailable".to_string())?;
+    let label = format!("systems.alab.aterm-update.unpack-{nonce}");
+    std::fs::write(scratch.join("launchd.job"), &label)
+        .map_err(|error| format!("record launchd copy identity: {error}"))?;
+    let status_file = scratch.join(format!(".{label}.status"));
+    let status_tmp = scratch.join(format!(".{label}.status.tmp"));
+    let err_log = scratch.join(format!(".{label}.err"));
+    aterm_log::info!(
+        "aterm-update: this process is provenance-tracked — running {what} as a launchd job \
+         so the bundle it lays carries no com.apple.provenance"
+    );
+    let run_until = |cmd: &mut Command, operation: &str, until: Instant| {
+        let remaining = until.saturating_duration_since(Instant::now());
+        if remaining.is_zero() {
+            return Err(format!("{operation}: unpack deadline exhausted"));
+        }
+        crate::verify::status_bounded_with_stderr(cmd.stdout(Stdio::null()), operation, remaining)
+    };
+    let result = (|| {
+        let (status, stderr) = run_until(
+            Command::new(launchctl)
+                .arg("submit")
+                .args(["-l", &label])
+                .arg("-e")
+                .arg(&err_log)
+                .arg("--")
+                .arg("/bin/sh")
+                .arg("-c")
+                .arg(LAUNCHD_COPY_WRAPPER)
+                .arg("aterm-update-unpack")
+                .arg(&status_file)
+                .arg(&label)
+                .arg(launchctl)
+                .arg("/usr/bin/ditto")
+                .args(args),
+            &format!("launchctl submit for {what}"),
+            work_deadline,
+        )?;
+        if !status.success() {
+            return Err(ditto_failure(
+                &format!("launchctl submit for {what}"),
+                status,
+                &stderr,
+            ));
+        }
+        loop {
+            let remaining = work_deadline.saturating_duration_since(Instant::now());
+            if remaining.is_zero() {
+                return Err(format!(
+                    "{what} did not finish within its {}s launchd job budget; treating as a failure",
+                    limit.as_secs()
+                ));
+            }
+            // The same bounded regular-file reader used for updater ledgers:
+            // a FIFO, oversized file or incomplete publication is not a result.
+            if let Some(text) = crate::read_ledger_text(&status_file) {
+                let code = text
+                    .trim()
+                    .parse::<u8>()
+                    .map_err(|_| format!("{what}: launchd job returned a malformed exit status"))?;
+                let stderr = launchd_stderr_tail(&err_log);
+                // This is the wrapper's shell exit code (signals are 128+n),
+                // not the unavailable raw wait status of launchd's child.
+                return Ok((
+                    std::process::ExitStatus::from_raw(i32::from(code) << 8),
+                    stderr,
+                ));
+            }
+            std::thread::sleep(Duration::from_millis(50).min(remaining));
+        }
+    })();
+    let result = match result {
+        Ok(completed) => Ok(completed),
+        Err(error) => {
+            // A timed-out submit may already have created the job. Try removal
+            // even on that path, using only the original budget's remaining time.
+            match run_until(
+                Command::new(launchctl).args(["remove", &label]),
+                &format!("launchctl remove for {what}"),
+                budget.deadline(true),
+            ) {
+                Ok((status, _)) if status.success() => Err(error),
+                Ok((status, stderr)) => Err(format!(
+                    "{error}; cleanup not confirmed: {}",
+                    ditto_failure("launchctl remove", status, &stderr)
+                )),
+                Err(cleanup) => Err(format!("{error}; cleanup not confirmed: {cleanup}")),
+            }
+        }
+    };
+    if result.is_ok() {
+        for path in [&status_file, &status_tmp, &err_log] {
+            let _ = std::fs::remove_file(path);
+        }
+    }
+    result
+}
+
+/// Match the direct helper's bounded diagnostic tail without loading a job's
+/// entire stderr log. Opening nonblocking and requiring a regular file avoids
+/// mistaking a FIFO for a log and waiting on a writer that may never arrive.
+#[cfg(target_os = "macos")]
+fn launchd_stderr_tail(path: &Path) -> String {
+    use std::io::{Read, Seek, SeekFrom};
+    use std::os::unix::fs::OpenOptionsExt;
+    const KEEP: u64 = 512;
+    let read = || -> Option<String> {
+        let mut file = std::fs::OpenOptions::new()
+            .read(true)
+            .custom_flags(libc::O_CLOEXEC | libc::O_NONBLOCK)
+            .open(path)
+            .ok()?;
+        let metadata = file.metadata().ok()?;
+        if !metadata.is_file() {
+            return None;
+        }
+        file.seek(SeekFrom::Start(metadata.len().saturating_sub(KEEP)))
+            .ok()?;
+        let mut bytes = Vec::new();
+        file.take(KEEP).read_to_end(&mut bytes).ok()?;
+        Some(String::from_utf8_lossy(&bytes).trim().to_string())
+    };
+    read().unwrap_or_default()
+}
+
+/// Ceiling on one staging unpack (the DMG copy or the zip extract). A release is
+/// ~100 MB; minutes is a wedged volume, not a slow one. Before 2026-09-14 these
+/// two `ditto`s had no ceiling at all.
+const STAGE_UNPACK_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(300);
+
+/// Slack the free-space check demands over the declared size: filesystem
+/// metadata, the extract's own scratch dir, and the verify step's writes.
+const STAGE_FREE_SPACE_HEADROOM: u64 = 64 * 1024 * 1024;
+
+/// A `ditto` failure that says WHY, from the tail of its stderr (2026-09-14).
+fn ditto_failure(what: &str, status: std::process::ExitStatus, stderr: &str) -> String {
+    match crate::verify::last_stderr_line(stderr) {
+        Some(line) => format!("{what} ({status}): {line}"),
+        None => format!("{what} ({status})"),
+    }
+}
+
+/// Bytes still available to this user on the volume holding `path`, or `None`
+/// when the volume will not say (an unmounted or foreign path).
+pub(crate) fn free_bytes_at(path: &Path) -> Option<u64> {
+    use std::os::unix::ffi::OsStrExt;
+    let c_path = std::ffi::CString::new(path.as_os_str().as_bytes()).ok()?;
+    // SAFETY: `statvfs` is zeroed storage the call fills; `c_path` outlives it.
+    let mut vfs: libc::statvfs = unsafe { std::mem::zeroed() };
+    let rc = unsafe { libc::statvfs(c_path.as_ptr(), &raw mut vfs) };
+    if rc != 0 {
+        return None;
+    }
+    // `f_bavail` is what an unprivileged writer may take; `f_frsize` is the unit it
+    // is counted in. Widen the available block count before multiplication.
+    Some(u64::from(vfs.f_bavail) * vfs.f_frsize)
+}
+
+/// Refuse to unpack `needed` bytes into `dir` when the volume cannot hold them plus
+/// [`STAGE_FREE_SPACE_HEADROOM`] (2026-09-14). The message names both numbers and
+/// the volume, so a full disk reads as a full disk in the ledger and the pull-down
+/// instead of "ditto zip extract failed (exit status: 1)" — and no container is
+/// re-unpacked (or, on the zip lane, extracted at all) to learn what `statvfs`
+/// already knows. Not a size ceiling: `checked_zip_extraction_claim` bounds the
+/// fleet-wide cost; this bounds THIS machine's. A volume that will not report its
+/// free space is let through — `ditto` then decides, with its stderr kept.
+fn refuse_without_room(dir: &Path, needed: u64, what: &str) -> Result<(), String> {
+    let Some(free) = free_bytes_at(dir) else {
+        return Ok(());
+    };
+    let wanted = needed.saturating_add(STAGE_FREE_SPACE_HEADROOM);
+    if free >= wanted {
+        return Ok(());
+    }
+    let mib = |bytes: u64| bytes.div_ceil(1024 * 1024);
+    Err(format!(
+        "not enough free space to unpack {what}: {} MiB free on the volume holding {}, \
+         {} MiB needed ({} MiB declared plus {} MiB headroom); free some space and the \
+         next check retries",
+        mib(free),
+        dir.display(),
+        mib(wanted),
+        mib(needed),
+        mib(STAGE_FREE_SPACE_HEADROOM)
+    ))
+}
+
+/// Bytes a copy of the tree at `root` writes: every regular file's length, links
+/// and directories counted as nothing. Symlinks are NOT followed — the mounted
+/// image controls them.
+fn tree_bytes(root: &Path) -> u64 {
+    let mut total = 0_u64;
+    let mut stack = vec![root.to_path_buf()];
+    while let Some(dir) = stack.pop() {
+        let Ok(entries) = std::fs::read_dir(&dir) else {
+            continue;
+        };
+        for entry in entries.flatten() {
+            let Ok(meta) = entry.metadata() else {
+                continue;
+            };
+            if meta.is_dir() {
+                stack.push(entry.path());
+            } else if meta.is_file() {
+                total = total.saturating_add(meta.len());
+            }
+        }
+    }
+    total
+}
+
 const EXPECTED_BUILD_ENV: &str = "ATERM_UPDATE_EXPECTED_BUILD";
 const EXPECTED_COMMIT_ENV: &str = "ATERM_UPDATE_EXPECTED_COMMIT";
 const EXPECTED_DIGEST_ENV: &str = "ATERM_UPDATE_EXPECTED_DMG_SHA256";
@@ -242,9 +747,15 @@ use crate::relaunch::reexec_forwarded_args;
 /// handoff: without the restored pairs it classifies the handoff malformed and
 /// exits before writing the readiness proof, the parked parent reads EOF
 /// (`ChildDied`), and the seamless lane can never succeed.
+///
+/// `ATERM_UPDATED_FROM` names the build this image was (2026-09-14, audit BA-6):
+/// the successor's `main` reads it for the quiet post-update "leveled-up" notice
+/// and clears it. Only the in-session lane used to set it, so a Finder-launch
+/// fallback apply came up with no notice at all.
 fn boot_reexec_command(
     new_exe: &std::path::Path,
     reexec_value: &str,
+    updated_from: u64,
     handoff_env: &[(std::ffi::OsString, std::ffi::OsString)],
 ) -> Command {
     let mut reexec = Command::new(new_exe);
@@ -260,7 +771,8 @@ fn boot_reexec_command(
         // stripped of the leading pins earlier swaps prepended, so exactly ONE
         // `--window` survives however many updates this process has ridden.
         .args(reexec_forwarded_args(std::env::args_os().skip(1)))
-        .env("ATERM_UPDATE_REEXEC", reexec_value);
+        .env("ATERM_UPDATE_REEXEC", reexec_value)
+        .env("ATERM_UPDATED_FROM", updated_from.to_string());
     for (key, value) in handoff_env {
         reexec.env(key, value);
     }
@@ -307,6 +819,24 @@ const FOREIGN_TRIAL_OWNER_IDLE: std::time::Duration = std::time::Duration::from_
 /// stamp (skew, a restored backup) reads as "not idle", the fail-safe direction.
 fn mtime(path: &Path) -> Option<std::time::SystemTime> {
     std::fs::metadata(path).and_then(|m| m.modified()).ok()
+}
+
+/// Launches of the trialed build closer together than this count as ONE
+/// (2026-09-14, audit BA-3). The sentinel counted every launch of the trial from
+/// the owning install, so three processes of the new build started inside the
+/// trial window — parallel headless engines from agent tooling, `open -n -a aterm`
+/// three times, a launcher script — were three counted launches with zero
+/// crashes, the third reverted, and the quarantine poisoned a healthy release for
+/// good. A real crash loop is user- or launcher-driven and every relaunch passes
+/// dyld and GPU init, so its launches are seconds apart and still reach the budget.
+const BOOT_LAUNCH_BURST_WINDOW: std::time::Duration = std::time::Duration::from_secs(2);
+
+/// Whether this launch is part of a burst the sentinel already counted: an
+/// OBSERVED trial (attempts > 0 — the arm itself is never a burst, so the first
+/// launch always counts) whose file was written inside
+/// [`BOOT_LAUNCH_BURST_WINDOW`]. Pure, so the law is testable without a bundle.
+fn launch_is_burst(attempts: u32, sentinel_age: Option<std::time::Duration>) -> bool {
+    attempts > 0 && sentinel_age.is_some_and(|age| age < BOOT_LAUNCH_BURST_WINDOW)
 }
 
 fn prepare_trial(
@@ -890,17 +1420,22 @@ fn prepare_fixed_swap_candidate(
         // at all — an unplugged or wedged external volume meant a launch that
         // never finished and a lock every other launch queued behind.
         let copy_started = std::time::Instant::now();
-        let status = crate::verify::status_bounded(
-            Command::new("/usr/bin/ditto").arg(staged).arg(&fixed),
+        let (status, stderr) = ditto_bounded_clean(
+            &[staged.into(), fixed.as_os_str().to_os_string()],
             "ditto to fixed swap path",
             CROSS_VOLUME_COPY_TIMEOUT,
+            staged.parent().unwrap_or(staged),
         )
         .inspect_err(|_| {
             let _ = remove_path_no_follow(&fixed);
         })?;
         if !status.success() {
             let _ = remove_path_no_follow(&fixed);
-            return Err(format!("ditto to fixed swap path failed ({status})"));
+            return Err(ditto_failure(
+                "ditto to fixed swap path failed",
+                status,
+                &stderr,
+            ));
         }
         // Disk time, not helper time: a slow volume must not spend the
         // verification budget that the checks after this copy still need.
@@ -1025,6 +1560,12 @@ fn validate_fixed_rollback(
 #[derive(Debug)]
 struct VerifiedRollback {
     path: PathBuf,
+    /// The sealed build the validation proved (2026-09-14): the revert names it,
+    /// and compares it with the operator floor — a crash loop is strictly worse
+    /// than a yank, so the revert still happens, but a restored build below the
+    /// floor is said out loud instead of the machine silently running a yanked
+    /// build the activation lane would have refused.
+    build: u64,
 }
 
 fn ensure_fixed_rollback(installed: &Path, current_build: u64) -> Result<VerifiedRollback, String> {
@@ -1032,11 +1573,10 @@ fn ensure_fixed_rollback(installed: &Path, current_build: u64) -> Result<Verifie
     match std::fs::symlink_metadata(&fixed) {
         Ok(_) => {
             // Validation is the whole point of this call — it refuses a rollback
-            // whose sealed build is not a strict predecessor. Callers need only
-            // the verified PATH; the build number it proved is not carried on.
-            validate_fixed_rollback(&fixed, installed, current_build)
+            // whose sealed build is not a strict predecessor.
+            let (build, _) = validate_fixed_rollback(&fixed, installed, current_build)
                 .map_err(|error| format!("fixed rollback is invalid: {error}"))?;
-            return Ok(VerifiedRollback { path: fixed });
+            return Ok(VerifiedRollback { path: fixed, build });
         }
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
         Err(error) => return Err(format!("inspect fixed rollback: {error}")),
@@ -1115,7 +1655,7 @@ fn ensure_current_trial_receipt(
     installed: &Path,
     current_build: u64,
     current_commit: Option<&str>,
-) -> Result<PathBuf, String> {
+) -> Result<VerifiedRollback, String> {
     let verified_rollback = ensure_fixed_rollback(installed, current_build)?;
     let (sealed_build, sealed_commit) = verified_bundle_identity(installed)
         .map_err(|error| format!("installed trial is not verified: {error}"))?;
@@ -1140,7 +1680,7 @@ fn ensure_current_trial_receipt(
                 && receipt.dmg_sha256.eq_ignore_ascii_case(&trial_digest)
         },
     ) {
-        return Ok(verified_rollback.path);
+        return Ok(verified_rollback);
     }
 
     // Process-crash cut after fixed RENAME_SWAP but before receipt commit: ready
@@ -1162,7 +1702,7 @@ fn ensure_current_trial_receipt(
             &commit,
             &ready_digest,
         )?;
-        return Ok(verified_rollback.path);
+        return Ok(verified_rollback);
     }
 
     Err("installed trial has no exact receipt or authorized recovery record".to_string())
@@ -1358,6 +1898,18 @@ fn sweep_stale_extracts(staging: &Staging) {
     }
 }
 
+/// BOTH LANES SWEEP BOTH KINDS OF SCRATCH (2026-09-14): every current release
+/// ships a zip, so a `mnt-<pid>` a DMG-era stage left behind (a process
+/// killed mid-stage; on the owner's machine `Updates/mnt-21441` from
+/// 2026-08-31 survived every stage and an apply) was never reclaimed by the
+/// lane that now runs, and an image still attached behind it stayed attached
+/// until reboot. Each lane runs this before it unpacks, so a container
+/// `ditto` cannot even open still reclaims the other lane's leftover.
+fn sweep_stale_scratch(staging: &Staging) {
+    sweep_stale_mounts(staging);
+    sweep_stale_extracts(staging);
+}
+
 fn canonical_release_commit(commit: Option<&str>) -> Option<String> {
     let commit = commit?.trim();
     (commit.len() == 40 && commit.bytes().all(|byte| byte.is_ascii_hexdigit()))
@@ -1441,6 +1993,38 @@ pub fn preverify_staged_handoff_candidate(
 /// ADDITIVE, exactly like the staged half above: it can only ever refuse an
 /// attempt the swap was going to refuse anyway, and the swap re-runs it under
 /// `apply_lock` regardless.
+/// **THE REMEDY, said where the refusal is minted** (2026-09-14, the owner's
+/// desk): an installed bundle that fails the team-pinned policy can never be
+/// updated by ANY lane — the seamless apply refuses it as the rollback source
+/// here, the cold-launch apply refuses it at step 7 for the same reason — and
+/// until now neither refusal said what to do. A local build that was swapped
+/// into `/Applications` by hand (ad-hoc signed, no `ATermDevBuild` mark) is a
+/// state the owner's own workflow produces routinely; it sat on v0.85.0 for
+/// eight hours with six refusals and a red bar, and the only fix was never
+/// written anywhere. Both lanes now append this sentence; the trouble
+/// classifier keys on its first clause (`ROLLBACK_SOURCE_REFUSAL_KEY`) to
+/// render the cause and the remedy on the Software Update page and to stop
+/// scheduling retries that cannot succeed.
+pub const ROLLBACK_SOURCE_REFUSAL_KEY: &str = "cannot be the rollback source";
+
+/// The one sentence that names the way out of an unverifiable install.
+pub const ROLLBACK_SOURCE_REMEDY: &str = "this install cannot update itself: reinstall the      signed release (tools/install.sh, or drag it from the release DMG) — or, for a local      build, mark it ATermDevBuild (tools/dev-app.sh) so the updater leaves it alone";
+
+/// The refusal both apply lanes mint when the INSTALLED bundle cannot be the
+/// swap's rollback source, with the remedy attached.
+pub fn rollback_source_refusal(installed: &Path, error: &str) -> String {
+    format!(
+        "the installed bundle at {} {ROLLBACK_SOURCE_REFUSAL_KEY} the swap installs: {error};          {ROLLBACK_SOURCE_REMEDY}",
+        installed.display()
+    )
+}
+
+/// True when a refusal string is the installed-bundle one — permanent for this
+/// process until a person changes the bundle, never a retry candidate.
+pub fn is_rollback_source_refusal(reason: &str) -> bool {
+    reason.contains(ROLLBACK_SOURCE_REFUSAL_KEY)
+}
+
 fn preverify_installed_rollback_source(
     installed: Option<&Path>,
     current_build: u64,
@@ -1472,11 +2056,7 @@ fn preverify_installed_rollback_source(
                 ))
             }
         }
-        Err(error) => Err(format!(
-            "the installed bundle at {} cannot be the rollback source the swap installs: \
-             {error}",
-            installed.display()
-        )),
+        Err(error) => Err(rollback_source_refusal(installed, &error)),
     }
 }
 
@@ -1642,7 +2222,7 @@ pub fn stage_from_dmg(
     ensure_private_dir(&staging.staged_dir()).map_err(|e| format!("staged dir: {e}"))?;
     // Clean up any mount a previously-killed run leaked, then mount at a fresh private
     // mountpoint under our 0700 dir (never /Volumes).
-    sweep_stale_mounts(staging);
+    sweep_stale_scratch(staging);
     let mountpoint = staging.root.join(format!("mnt-{}", std::process::id()));
     let mounted = Mounted::attach(dmg, &mountpoint)?;
     let src = mounted.mountpoint.join("aterm.app");
@@ -1662,16 +2242,26 @@ pub fn stage_from_dmg(
 
     let incoming = staging.staged_dir().join("aterm.app.incoming");
     let _ = std::fs::remove_dir_all(&incoming);
+    // The mounted bundle's size is what the copy will write; refuse a volume that
+    // cannot hold it before a byte lands (2026-09-14, see `refuse_without_room`).
+    refuse_without_room(&staging.staged_dir(), tree_bytes(&src), "the update bundle")?;
     // `ditto` (not `cp -R`) preserves extended attributes + the _CodeSignature
     // layout, so the copied bundle's signature stays valid.
-    let status = Command::new("/usr/bin/ditto")
-        .arg(&src)
-        .arg(&incoming)
-        .status()
-        .map_err(|e| format!("spawn ditto: {e}"))?;
+    let (status, stderr) = ditto_bounded_clean(
+        &[
+            src.as_os_str().to_os_string(),
+            incoming.as_os_str().to_os_string(),
+        ],
+        "ditto",
+        STAGE_UNPACK_TIMEOUT,
+        &staging.staged_dir(),
+    )
+    .inspect_err(|_| {
+        let _ = std::fs::remove_dir_all(&incoming);
+    })?;
     if !status.success() {
         let _ = std::fs::remove_dir_all(&incoming);
-        return Err(format!("ditto extract failed ({status})"));
+        return Err(ditto_failure("ditto extract failed", status, &stderr));
     }
     // detach the DMG now; everything we need is in `incoming`.
     drop(mounted);
@@ -2142,8 +2732,9 @@ pub fn stage_from_zip(
     ));
     ensure_private_dir(&staging.staged_dir()).map_err(|e| format!("staged dir: {e}"))?;
     // Reclaim any extract dir a previously-killed run leaked (same intent as
-    // `sweep_stale_mounts`: nothing under our 0700 dir may accumulate).
-    sweep_stale_extracts(staging);
+    // `sweep_stale_mounts`: nothing under our 0700 dir may accumulate — and the
+    // DMG lane's own leftovers too (`sweep_stale_scratch`, 2026-09-14).
+    sweep_stale_scratch(staging);
     // Extract into a fresh scratch dir rather than straight into `staged/`: the
     // archive's root entry is `aterm.app` (`--keepParent`), and unpacking that
     // name next to the PUBLISHED `staged/aterm.app` would collide with it.
@@ -2151,18 +2742,34 @@ pub fn stage_from_zip(
         .staged_dir()
         .join(format!("zx-{}", std::process::id()));
     let _ = std::fs::remove_dir_all(&extract);
+    // The archive's own declared size, against the volume's free space: a full disk
+    // used to surface as the bare "ditto zip extract failed (exit status: 1)" and a
+    // re-download per backoff step (2026-09-14, see `refuse_without_room`).
+    refuse_without_room(
+        &staging.staged_dir(),
+        claim.uncompressed_bytes,
+        "the update zip",
+    )?;
     std::fs::create_dir_all(&extract).map_err(|e| format!("create zip extract dir: {e}"))?;
     // `ditto -x -k` (not `unzip`) restores extended attributes and the sequestered
     // resource forks, so the extracted bundle's codesign seal stays intact.
-    let status = Command::new("/usr/bin/ditto")
-        .args(["-x", "-k"])
-        .arg(zip)
-        .arg(&extract)
-        .status()
-        .map_err(|e| format!("spawn ditto: {e}"))?;
+    let (status, stderr) = ditto_bounded_clean(
+        &[
+            "-x".into(),
+            "-k".into(),
+            zip.as_os_str().to_os_string(),
+            extract.as_os_str().to_os_string(),
+        ],
+        "ditto zip extract",
+        STAGE_UNPACK_TIMEOUT,
+        &staging.staged_dir(),
+    )
+    .inspect_err(|_| {
+        let _ = std::fs::remove_dir_all(&extract);
+    })?;
     if !status.success() {
         let _ = std::fs::remove_dir_all(&extract);
-        return Err(format!("ditto zip extract failed ({status})"));
+        return Err(ditto_failure("ditto zip extract failed", status, &stderr));
     }
     let src = extract.join("aterm.app");
     // `symlink_metadata`, not `is_dir`: the archive controls this entry, and a
@@ -2417,20 +3024,10 @@ fn apply_staged_if_ready_inner(
     //    relaunching a crashing build still has to accrue attempts toward the revert
     //    (the re-exec env is only set on the FIRST post-swap launch).
     if let Some(s) = &staging
-        && let Some(outcome) = check_boot_health(s, current_build, current_commit, handoff_fds)
+        && let Some(outcome) =
+            check_boot_health(s, current_build, current_commit, handoff_fds, handoff_env)
     {
         return outcome;
-    }
-    // NEVER SWAP THE BUNDLE OUT FROM UNDER A TOOLCHAIN INSTALL. `atpkg seed` reads
-    // the sealed payload inside this bundle by path, lazily, for minutes; the swap
-    // below would leave its next read resolving into the replacement, which came
-    // from the lean zip with the seal stripped. Deliberately AFTER the boot-health
-    // lane above, so a crash-looping build can still revert (2026-08-20 round-8
-    // audit).
-    if crate::is_toolchain_install_active() {
-        return ApplyOutcome::Deferred(
-            "a toolchain install is reading this bundle's sealed payload".to_string(),
-        );
     }
     if reexec_authority == ReexecAuthority::Invalid {
         crate::warn(
@@ -2480,6 +3077,22 @@ fn apply_staged_if_ready_inner(
         ));
         return ApplyOutcome::NoUpdate;
     }
+    // NEVER SWAP THE BUNDLE OUT FROM UNDER A TOOLCHAIN INSTALL. `atpkg seed` reads
+    // the sealed payload inside this bundle by path, lazily, for minutes; the swap
+    // below would leave its next read resolving into the replacement, which came
+    // from the lean zip with the seal stripped. Deliberately AFTER the boot-health
+    // lane above, so a crash-looping build can still revert (2026-08-20 round-8
+    // audit) — and, since 2026-09-14, after startup authority is settled and the
+    // handoff target has answered: the deferral guards the SWAP, and firing it
+    // first booked "boot apply refused: a toolchain install is reading …" against
+    // a just-swapped re-exec (a Matched nonce) and against an authorized handoff
+    // successor — launches that ARE the successful apply — for as long as `atpkg
+    // seed` held the marker after a launch.
+    if crate::is_toolchain_install_active() {
+        return ApplyOutcome::Deferred(
+            "a toolchain install is reading this bundle's sealed payload".to_string(),
+        );
+    }
     // 2. Must be a real installed bundle.
     let Some(b) = bundle::resolve() else {
         return ApplyOutcome::NotApplicable;
@@ -2524,6 +3137,25 @@ fn apply_staged_if_ready_inner(
         let armed_build = boot_sentinel(&staging)
             .read_state()
             .map_or(0, |(build, _)| build);
+        // THE JUST-SWAPPED SHAPE (2026-09-14, audit BA-7): a sibling cold launch
+        // that lost the apply-lock race is still the OLD image, and the bundle
+        // under it now holds the NEW build mid-trial — installed == armed, both
+        // newer than this process. That is a healthy apply in progress, not a
+        // wedged trial: it must neither spend the foreign-trial budget (three such
+        // launches would disarm a live trial) nor be booked as a refusal. This
+        // image keeps running; the check lane's installed-bundle announcement
+        // activates it later. The plist read is bounded and the trial owner's
+        // sentinel keeps its authority either way.
+        if armed_build != 0
+            && armed_build > current_build
+            && crate::verify::bundle_build_number(&b.app_root).ok() == Some(armed_build)
+        {
+            crate::log(&format!(
+                "boot apply: build {armed_build} is already installed and mid-trial; this \
+                 launch is the previous build {current_build} and leaves the trial to its owner"
+            ));
+            return ApplyOutcome::NoUpdate;
+        }
         // A sentinel armed for a build that is not the running one can never be
         // cleared by the same-build lanes, so an unrecoverable one blocks EVERY
         // future apply forever. Budget it — with its own counter, never the
@@ -2697,6 +3329,25 @@ fn apply_staged_if_ready_inner(
         return ApplyOutcome::Deferred("commit rebind mismatch".to_string());
     }
 
+    // 7-pre. ON A CROSS-VOLUME INSTALL ONLY, ask the cheap-to-answer question
+    // first (2026-09-14, audit SV-5): can the installed bundle be the rollback
+    // source at all? The authoritative answer is re-asked below, AFTER the
+    // candidate is prepared (TOCTOU hygiene — the swap must trust nothing older
+    // than the exchange). But preparing a candidate across volumes is a ≤120 s
+    // `ditto` plus a five-helper re-verify, and an install that cannot verify
+    // (a hand-installed or ad-hoc bundle) did all of that on EVERY cold launch
+    // only to undo it. On the common same-volume path the preparation is two
+    // renames and the early pass would put five helper spawns back on every
+    // successful launch (the law recorded at `prepare_fixed_swap_candidate`), so
+    // it is gated on the volume.
+    if !same_volume(&staging.staged_app, &b.app_root)
+        && let Err(error) = verified_bundle_identity(&b.app_root)
+    {
+        return ApplyOutcome::Deferred(format!(
+            "current installed rollback source is not verified: {}",
+            rollback_source_refusal(&b.app_root, &error)
+        ));
+    }
     // 7. Prepare/verify NEW at the fixed destination-volume recovery path BEFORE
     // the point of no return. One atomic exchange then puts NEW at installed and
     // OLD directly at that fixed path; every process-crash cut is discoverable.
@@ -2730,8 +3381,12 @@ fn apply_staged_if_ready_inner(
         }
         Err(error) => {
             recover_prepared_candidate(&prepared, &staging);
+            // The same refusal the seamless lane mints, remedy included: the
+            // cold launch is the "fallback" the stager promises, and on this
+            // bundle it refuses for the same reason.
             return ApplyOutcome::Deferred(format!(
-                "current installed rollback source is not verified: {error}"
+                "current installed rollback source is not verified: {}",
+                rollback_source_refusal(&b.app_root, &error)
             ));
         }
     };
@@ -2848,7 +3503,7 @@ fn apply_staged_if_ready_inner(
     // `b.exe` is the canonical path we launched from; after the in-place swap it
     // resolves to the NEW binary at the same location.
     let new_exe = &b.exe;
-    let mut reexec = boot_reexec_command(new_exe, &reexec_value, handoff_env);
+    let mut reexec = boot_reexec_command(new_exe, &reexec_value, current_build, handoff_env);
     let err = exec_preserving_handoff_fds(&mut reexec, handoff_fds); // never returns on success
     // exec ITSELF failed (not a later crash): the nonce stamp we wrote is now stale —
     // remove it (F9); then restore the OLD bundle from the retained rollback source,
@@ -2891,6 +3546,20 @@ fn apply_staged_if_ready_inner(
         unix_now_secs(),
     );
     crate::manifest::FailedMark::clear(&staging.trial());
+    // Booked in the failure ledger too (2026-09-14): a swap that was rolled
+    // back because the new binary would not exec is an apply that failed, and
+    // the wrapper deliberately leaves `ReExecFailed` out of the refusal slot
+    // ("a re-exec FAILURE belongs in the failure ledger") — which nothing
+    // wrote until now.
+    crate::health::Health::record_apply_failure(
+        &staging.health(),
+        current_build,
+        ready.build_number,
+        &format!(
+            "re-exec of build {} failed (rolled back): {err}",
+            ready.build_number
+        ),
+    );
     crate::status::record(
         &staging,
         current_build,
@@ -2912,6 +3581,25 @@ fn check_boot_health(
     current_build: u64,
     current_commit: Option<&str>,
     handoff_fds: &[i32],
+    handoff_env: &[(std::ffi::OsString, std::ffi::OsString)],
+) -> Option<ApplyOutcome> {
+    check_boot_health_with_lock_wait(
+        staging,
+        current_build,
+        current_commit,
+        handoff_fds,
+        handoff_env,
+        APPLY_LOCK_WAIT,
+    )
+}
+
+fn check_boot_health_with_lock_wait(
+    staging: &Staging,
+    current_build: u64,
+    current_commit: Option<&str>,
+    handoff_fds: &[i32],
+    handoff_env: &[(std::ffi::OsString, std::ffi::OsString)],
+    lock_wait: std::time::Duration,
 ) -> Option<ApplyOutcome> {
     let sentinel = boot_sentinel(staging);
     // Cheap non-mutating early-out: nothing armed for us. A sentinel for another
@@ -2919,7 +3607,7 @@ fn check_boot_health(
     if !matches!(sentinel.read_state(), Some((b, _)) if b == current_build) {
         return None;
     }
-    let apply_lock = match FileLock::acquire(&staging.apply_lock) {
+    let apply_lock = match FileLock::acquire_within(&staging.apply_lock, lock_wait) {
         Ok(lock) => lock,
         Err(error) => return Some(ApplyOutcome::Deferred(format!("health lock: {error}"))),
     };
@@ -2950,7 +3638,19 @@ fn check_boot_health(
     // never apply another one, with nothing in the UI to say why. The attempt count
     // must measure LAUNCHES OBSERVED, which is a fact about this boot, not a
     // conclusion that depends on a proof that may itself be what is broken.
-    if let Err(error) = sentinel.observe_launch(current_build) {
+    //
+    // A BURST IS ONE LAUNCH (2026-09-14): a second process of the trial build
+    // starting within `BOOT_LAUNCH_BURST_WINDOW` of the last counted one is the
+    // same launch event, not a relaunch after a crash — see `launch_is_burst`.
+    let attempts_now = sentinel.read_state().map_or(0, |(_, attempts)| attempts);
+    let sentinel_age = mtime(&staging.root.join("boot.sentinel")).and_then(|t| t.elapsed().ok());
+    if launch_is_burst(attempts_now, sentinel_age) {
+        crate::log(&format!(
+            "boot sentinel for build {current_build}: a launch {} ms after the last counted \
+             one is the same burst and is not counted (attempt {attempts_now} stands)",
+            sentinel_age.map_or(0, |age| age.as_millis())
+        ));
+    } else if let Err(error) = sentinel.observe_launch(current_build) {
         return Some(ApplyOutcome::Deferred(format!(
             "trial launch observation: {error}"
         )));
@@ -2989,8 +3689,11 @@ fn check_boot_health(
                         staging,
                         &sentinel,
                         current_build,
-                        rollback.path,
-                        handoff_fds,
+                        rollback,
+                        RollbackHandoff {
+                            fds: handoff_fds,
+                            env: handoff_env,
+                        },
                         apply_lock,
                     ));
                 }
@@ -3044,30 +3747,51 @@ fn check_boot_health(
         &sentinel,
         current_build,
         verified_rollback,
-        handoff_fds,
+        RollbackHandoff {
+            fds: handoff_fds,
+            env: handoff_env,
+        },
         apply_lock,
     ))
+}
+
+/// Captured descriptors and the authority environment restored together when
+/// rollback re-execs the predecessor during an inherited handoff.
+struct RollbackHandoff<'a> {
+    fds: &'a [i32],
+    env: &'a [(std::ffi::OsString, std::ffi::OsString)],
 }
 
 /// The trialed build is crash-looping: swap the retained OLD bundle back over the
 /// install, discard the failed new build + sentinel + staged bundle, and re-exec
 /// the restored OLD binary. A missing/temporarily failing inverse swap preserves
 /// all recovery authority and returns Deferred; NEW may still be installed.
+#[allow(
+    clippy::too_many_arguments,
+    reason = "a private step of the apply; its eight inputs are the apply's own handles, not a public surface"
+)]
 fn revert_to_rollback(
     b: &bundle::Bundle,
     staging: &Staging,
     sentinel: &Sentinel,
     current_build: u64,
-    verified_rollback: PathBuf,
-    handoff_fds: &[i32],
+    verified_rollback: VerifiedRollback,
+    handoff: RollbackHandoff<'_>,
     _apply_lock: FileLock,
 ) -> ApplyOutcome {
+    let RollbackHandoff {
+        fds: handoff_fds,
+        env: handoff_env,
+    } = handoff;
     // check_boot_health acquired apply_lock before observing/incrementing. Keep that
     // same CLOEXEC guard through rollback exec; this function never takes stage_lock.
     if !sentinel.should_revert(current_build, MAX_BOOT_ATTEMPTS) {
         return ApplyOutcome::NotApplicable;
     }
-    let rb = verified_rollback;
+    let VerifiedRollback {
+        path: rb,
+        build: restored_build,
+    } = verified_rollback;
     if !is_non_symlink_dir(&rb) || !same_volume(&rb, &b.app_root) {
         return ApplyOutcome::Deferred(
             "verified crash-loop rollback changed before inverse swap".to_string(),
@@ -3117,15 +3841,70 @@ fn revert_to_rollback(
     crate::manifest::InstalledReceipt::clear(&staging.installed_receipt());
     crate::manifest::FailedMark::clear(&staging.trial());
     staging.retire_published(); // the staged build is bad — never re-apply it
+    // BOOKED IN THE FAILURE LEDGER (2026-09-14): the one outcome that means the
+    // update landed and was taken back used to leave `health.toml` at
+    // `apply_failures = 0`, so `update status` said failing=0, the pull-down
+    // never showed the failing row, the persistent notice could not fire, and
+    // the only trace — one status line — was overwritten by the next check.
+    // The user experienced an app that silently went back a version.
+    // THE FLOOR, SAID OUT LOUD (2026-09-14, audit BA-4). The activation lane
+    // refuses an installed bundle below the operator floor ("a yanked build found
+    // under our own path is still a yanked build"); the revert restores whatever
+    // verified predecessor the fixed path holds, and a crash loop is strictly
+    // worse than a yank, so it must. But the two lanes must not disagree in
+    // silence: the ledger, the status line and the notice name the breach and the
+    // remedy, so the machine does not sit on a known-bad build with a status
+    // line that reads like a repair.
+    let floor = crate::manifest::Floor::read(&staging.floor()).min_build;
+    let breach = (restored_build < floor).then(|| {
+        format!(
+            " — the restored build {restored_build} is below the operator floor {floor} \
+             (a yanked release); reinstall the current release"
+        )
+    });
+    let breach = breach.as_deref().unwrap_or("");
+    crate::health::Health::record_apply_failure(
+        &staging.health(),
+        current_build,
+        current_build,
+        &format!(
+            "crash-loop revert: build {current_build} failed to confirm boot health \
+             {MAX_BOOT_ATTEMPTS} times in a row and was reverted to build \
+             {restored_build}{breach}"
+        ),
+    );
     crate::status::record(
         staging,
         current_build,
-        "reverted crash-looping update to the previous build",
+        &format!("reverted crash-looping update to the previous build {restored_build}{breach}"),
     );
-    crate::warn("reverted a crash-looping update to the previous build");
+    crate::warn(&format!(
+        "reverted a crash-looping update to the previous build {restored_build}{breach}"
+    ));
     // Re-exec the restored OLD binary as a FRESH boot: no re-exec env, no sentinel
     // (already cleared), and nothing staged, so it comes up clean on the old build.
+    //
+    // THE HANDOFF AUTHORITY RIDES ALONG (2026-09-14, audit BA-6). The handoff
+    // descriptors were already kept open across this exec, but the authority
+    // variables the GUI's prearm consumed were not restored, so a reverted
+    // overlap candidate came up with the fds in its environment and no parent
+    // identity — `rejected malformed inherited handoff`, a stderr-only line — and
+    // the parked parent read EOF with nothing in the log joining the two facts.
+    // With the pairs restored the OLD image re-validates the inherited handoff
+    // and refuses it on target identity through its loud, logged path; the
+    // parent's verdict is the same (the candidate did not commit) and the record
+    // says why.
     let mut reexec = Command::new(&b.exe);
+    for (key, value) in handoff_env {
+        reexec.env(key, value);
+    }
+    if !handoff_fds.is_empty() {
+        crate::warn(&format!(
+            "the crash-loop revert of build {current_build} happened inside a seamless \
+             handoff; the restored build {restored_build} will refuse the handoff and the \
+             parked outgoing process keeps its sessions"
+        ));
+    }
     reexec
         .args(reexec_forwarded_args(std::env::args_os().skip(1)))
         // NO --window here: the restored ROLLBACK build may predate the
@@ -3433,6 +4212,12 @@ pub(crate) fn rfc3339_delta_secs(earlier: &str, later: &str) -> Option<u64> {
 // the updater client, the GUI and atpkg all stamp with.
 use aterm_types::rfc3339::format_rfc3339;
 
+// Boot-apply audit tests (2026-09-14): red until their findings are fixed; see the
+// file header. A child module so they reach this file's private entry points.
+#[cfg(test)]
+#[path = "install_boot_tests.rs"]
+mod boot_tests;
+
 #[cfg(test)]
 mod tests {
 
@@ -3519,6 +4304,7 @@ mod tests {
         let command = super::boot_reexec_command(
             std::path::Path::new("/Applications/aterm.app/Contents/MacOS/aterm"),
             "0123456789abcdef",
+            1785910394,
             &handoff_env,
         );
         assert_eq!(
@@ -3537,6 +4323,14 @@ mod tests {
                 Some(std::ffi::OsStr::new("0123456789abcdef")),
             )),
             "re-exec nonce set"
+        );
+        assert!(
+            envs.contains(&(
+                std::ffi::OsStr::new("ATERM_UPDATED_FROM"),
+                Some(std::ffi::OsStr::new("1785910394")),
+            )),
+            "the cold-launch apply names the build it came from, so the successor shows \
+             the post-update notice (2026-09-14)"
         );
         assert!(
             envs.contains(&(
@@ -5254,6 +6048,56 @@ staged_at = "2026-08-17T00:00:00Z"
         );
     }
 
+    /// THIS MACHINE's free space is asked before `ditto` is spawned (2026-09-14,
+    /// audit SV-3). `checked_zip_extraction_claim` bounds the fleet-wide cost; a
+    /// declared size the volume cannot hold used to be learned by extracting into
+    /// it and reading "ditto zip extract failed (exit status: 1)" — then re-downloading
+    /// the container on every backoff step. The refusal names free, needed and the
+    /// volume; a size the volume holds passes; a volume that will not report passes
+    /// too (ditto decides, with its stderr kept).
+    #[test]
+    fn the_stage_refuses_an_unpack_the_volume_cannot_hold_and_names_the_numbers() {
+        let (_s, root) = temp_staging();
+        let free = free_bytes_at(&root).expect("the scratch volume reports its free space");
+        // More than the volume has, by a margin no headroom explains.
+        let error = refuse_without_room(&root, free.saturating_add(1 << 40), "the update zip")
+            .expect_err("a declared size past the volume is refused before any byte lands");
+        assert!(
+            error.contains("not enough free space")
+                && error.contains("MiB free")
+                && error.contains("MiB needed")
+                && error.contains(&root.display().to_string()),
+            "the refusal names the numbers and the volume: {error}"
+        );
+        // A modest size the volume holds is let through.
+        refuse_without_room(&root, 1024, "the update zip").expect("a small unpack fits");
+        // A path no volume answers for is let through, not refused: ditto decides.
+        refuse_without_room(
+            Path::new("/nonexistent/volume/for/this/test"),
+            u64::MAX / 2,
+            "the update zip",
+        )
+        .expect("an unanswerable volume defers to ditto");
+        assert!(free_bytes_at(Path::new("/nonexistent/volume/for/this/test")).is_none());
+    }
+
+    /// `tree_bytes` is what the DMG lane's copy will write: regular files summed,
+    /// directories and symlinks counted as nothing and not followed.
+    #[test]
+    fn tree_bytes_sums_regular_files_and_never_follows_links() {
+        let (_s, root) = temp_staging();
+        let tree = root.join("tree.app");
+        std::fs::create_dir_all(tree.join("Contents/MacOS")).unwrap();
+        std::fs::write(tree.join("Contents/MacOS/aterm"), vec![7u8; 1000]).unwrap();
+        std::fs::write(tree.join("Contents/Info.plist"), vec![1u8; 24]).unwrap();
+        // A link to a big file outside the tree must not be counted through.
+        let big = root.join("big.bin");
+        std::fs::write(&big, vec![0u8; 100_000]).unwrap();
+        std::os::unix::fs::symlink(&big, tree.join("Contents/MacOS/link")).unwrap();
+        assert_eq!(tree_bytes(&tree), 1024);
+        assert_eq!(tree_bytes(&root.join("absent")), 0);
+    }
+
     /// Many small entries are refused on COUNT even though their declared bytes
     /// are zero — the inode/block cost bytes alone cannot see.
     #[test]
@@ -5386,5 +6230,695 @@ staged_at = "2026-08-17T00:00:00Z"
             error.contains("end-of-central-directory"),
             "refusal names the missing end record: {error}"
         );
+    }
+
+    // -----------------------------------------------------------------------
+    // 2026-09-14 stage-verify audit.
+    // -----------------------------------------------------------------------
+
+    /// THE OWNER'S DESK, 2026-09-14 (aterm.log 1789364570 … 1789390973): six automatic
+    /// applies of v0.85.0 refused with exactly this error, escalating stand-downs up
+    /// to ~6 h — and the cold-launch fallback refuses for the SAME reason at step 7 of
+    /// `apply_staged_if_ready_inner` ("current installed rollback source is not
+    /// verified"), so a hand-installed, ad-hoc-signed bundle in `/Applications` can
+    /// never be updated by ANY lane. The refusal names the cause and the path; it must
+    /// also name the way out, because nothing else on the machine does: put the signed
+    /// release back (`tools/install.sh`, or drag it from the release DMG), or mark a
+    /// local build `ATermDevBuild` so the updater leaves it alone instead of failing
+    /// every half hour.
+    #[test]
+    fn a_rollback_source_refusal_names_the_remedy() {
+        let root = std::env::temp_dir().join(format!(
+            "aterm-rollback-remedy-{}-{}",
+            std::process::id(),
+            super::unix_now_secs()
+        ));
+        let error = super::preverify_installed_rollback_source(Some(&root), 100, Some("abcdef0"))
+            .expect_err("a path that is not a bundle cannot be a rollback source");
+        assert!(
+            error.contains("tools/install.sh"),
+            "the refusal must say how to put a signed release back: {error}"
+        );
+        assert!(
+            error.contains("ATermDevBuild"),
+            "…and how to take a local build out of the channel on purpose: {error}"
+        );
+    }
+
+    /// `sweep_stale_mounts` runs only on the DMG lane and `sweep_stale_extracts` only
+    /// on the zip lane. Every current release carries a zip, so a `mnt-<pid>` that a
+    /// DMG-era stage left behind (a process killed mid-stage; on this machine
+    /// `Updates/mnt-21441`, 2026-08-31, still present on 2026-09-14) is never
+    /// reclaimed — and if the image behind it was still attached, it stays attached
+    /// until reboot. Both lanes must sweep both kinds of scratch. The sweep runs
+    /// BEFORE the unpack, so a zip `ditto` cannot even open still reclaims the
+    /// leftover.
+    #[test]
+    fn the_zip_lane_reclaims_a_dmg_era_mountpoint() {
+        let (s, root) = temp_staging();
+        let stale_mount = s.root.join("mnt-424242");
+        std::fs::create_dir_all(&stale_mount).unwrap();
+        let stale_extract = s.staged_dir().join("zx-424242");
+        std::fs::create_dir_all(&stale_extract).unwrap();
+        let zip = TempZip::new("sweep", &well_formed_zip(&[("aterm.app/", 0)]));
+        let manifest = Manifest {
+            schema: 1,
+            version: "0.0.9".into(),
+            build_number: 9,
+            commit: Some("0123456789abcdef0123456789abcdef01234567".into()),
+            sha256: "ab".repeat(32),
+            dmg: "aterm-0.0.9.dmg".into(),
+            url: None,
+            zip: Some("aterm-0.0.9-mac.zip".into()),
+            zip_sha256: Some("cd".repeat(32)),
+            min_build: None,
+            machine_id: None,
+            roster_seq: None,
+            changelog: None,
+        };
+        let outcome = stage_from_zip(&s, &zip.0, &manifest, "");
+        assert!(
+            outcome.is_err(),
+            "a synthetic central directory has nothing ditto can unpack: {outcome:?}"
+        );
+        assert!(
+            !stale_extract.exists(),
+            "the zip lane reclaims its own leftover extract dir"
+        );
+        assert!(
+            !stale_mount.exists(),
+            "the DMG lane's leftover mountpoint must be reclaimed by the zip lane too"
+        );
+        let _ = std::fs::remove_dir_all(root);
+    }
+}
+
+#[cfg(all(test, target_os = "macos"))]
+mod launchd_copy_tests {
+    use super::*;
+    use std::os::unix::fs::PermissionsExt;
+    use std::time::{Duration, Instant};
+
+    fn budget_model() -> aterm_spec::derive::Model {
+        aterm_spec::ty_model! {
+            LaunchdCopyDeadline {
+                const Buggy = 0;
+                var now = 0;
+                var deadline = 3;
+                var cleanup = 0;
+                action Tick when (now <= 3) { now = now + 1; }
+                action Cleanup when (cleanup == 0) {
+                    cleanup = 1;
+                    deadline = if Buggy == 1 { now + 4 } else { 4 };
+                }
+                invariant NoRenewedDeadline: deadline <= 4;
+            }
+        }
+    }
+
+    #[test]
+    fn launchd_copy_deadline_proves_and_catches_renewed_cleanup_budget() {
+        let model = budget_model();
+        aterm_spec::verify::prove_and_catch_scalar(&model, "launchd copy deadline");
+        let started = Instant::now();
+        let limit = Duration::from_secs(4);
+        let budget = LaunchdCopyBudget::new(started, limit);
+        for seconds in 0..=4 {
+            let now = started + Duration::from_secs(seconds);
+            for cleanup in [false, true] {
+                let mut state = model.init_state();
+                state.insert("now", i64::try_from(seconds).unwrap());
+                state.insert("cleanup", i64::from(cleanup));
+                let until = budget.deadline(cleanup);
+                state.insert(
+                    "deadline",
+                    i64::try_from(until.duration_since(started).as_secs()).unwrap(),
+                );
+                assert!(model.check_invariant("NoRenewedDeadline", &state));
+                assert!(
+                    until.saturating_duration_since(now)
+                        <= limit.saturating_sub(now.duration_since(started))
+                );
+                if cleanup && seconds > 0 {
+                    // Historical per-operation timeout: a fresh deadline after
+                    // submit has already consumed part of the caller's budget.
+                    state.insert(
+                        "deadline",
+                        i64::try_from((now + limit).duration_since(started).as_secs()).unwrap(),
+                    );
+                    assert!(!model.check_invariant("NoRenewedDeadline", &state));
+                }
+            }
+        }
+    }
+
+    fn publication_model() -> aterm_spec::derive::Model {
+        aterm_spec::ty_model! {
+            IsolatedCopyPublication {
+                const Buggy = 0;
+                var phase = 0;
+                var current_target = 1;
+                var old_target = 1;
+                var opened_target = 0;
+                var published_target = 0;
+                var corrupted = 0;
+                action Timeout when (phase == 0) { phase = 1; }
+                action Retry when (phase == 1) {
+                    phase = 2;
+                    current_target = if Buggy == 1 { old_target } else { 2 };
+                }
+                action OpenOld when (phase == 2) {
+                    phase = 3;
+                    opened_target = old_target;
+                }
+                action Publish when (phase == 3) {
+                    phase = 4;
+                    published_target = current_target;
+                }
+                action LateWrite when (phase == 4) {
+                    phase = 5;
+                    corrupted = if opened_target == published_target { 1 } else { 0 };
+                }
+                invariant NoLateMutation: corrupted == 0;
+            }
+        }
+    }
+
+    fn wrapper_model() -> aterm_spec::derive::Model {
+        aterm_spec::ty_model! {
+            LaunchdCopyOnce {
+                const Buggy = 0;
+                var claimed = 0;
+                var complete = 0;
+                var copies = 0;
+                var replayed = 0;
+                var removed = 0;
+                action Start when (claimed == 0 && removed == 0) {
+                    claimed = 1;
+                    copies = 1;
+                }
+                action Complete when (claimed == 1 && complete == 0) { complete = 1; }
+                action Replay when (complete == 1 && replayed == 0) {
+                    replayed = 1;
+                    copies = if Buggy == 1 { 2 } else { copies };
+                }
+                action Remove when (complete == 1 && removed == 0) { removed = 1; }
+                invariant OneCopy: copies <= 1;
+            }
+        }
+    }
+
+    fn copy_model_step(
+        model: &aterm_spec::derive::Model,
+        state: &mut aterm_spec::interp::State,
+        action: &str,
+    ) {
+        let next = model.successors(action, state);
+        assert_eq!(next.len(), 1, "{action}: {state:?}");
+        *state = next[0].clone();
+    }
+
+    #[test]
+    fn isolated_copy_and_one_shot_wrapper_prove_and_catch() {
+        for model in [publication_model(), wrapper_model()] {
+            aterm_spec::verify::prove_and_catch_scalar(&model, "isolated update copy");
+        }
+    }
+
+    // The negative control replays the old shipping policy: ditto receives the
+    // caller's reusable path directly, and returning success needs no promotion.
+    fn copy_with_policy(
+        isolated: bool,
+        args: &[std::ffi::OsString],
+        run: impl FnOnce(
+            &[std::ffi::OsString],
+            &Path,
+        )
+            -> Result<(std::process::ExitStatus, String), crate::verify::HelperFailure>,
+    ) -> Result<(std::process::ExitStatus, String), String> {
+        if isolated {
+            copy_into_isolated_destination(args, "copy fixture", run)
+        } else {
+            run(args, Path::new(args.last().unwrap()).parent().unwrap())
+                .map_err(|failure| failure.message)
+        }
+    }
+
+    #[test]
+    fn a_timed_out_writer_cannot_mutate_a_retry_after_stage_or_swap_publication() {
+        use std::io::Write;
+        use std::os::unix::process::ExitStatusExt;
+        use std::sync::mpsc;
+        for shape in ["dmg", "zip", "cross-volume"] {
+            for isolated in [true, false] {
+                let staging = Staging::scratch(&format!("copy-late-{shape}-{isolated}"));
+                std::fs::create_dir_all(staging.staged_dir()).unwrap();
+                let installed = staging.root.join("aterm.app");
+                let destination = match shape {
+                    "dmg" => staging.staged_dir().join("aterm.app.incoming"),
+                    "zip" => staging.staged_dir().join("zx-fixture"),
+                    _ => rollback_path(&installed),
+                };
+                let bundle_in = |payload: &Path| {
+                    if shape == "zip" {
+                        payload.join("aterm.app")
+                    } else {
+                        payload.to_path_buf()
+                    }
+                };
+                let args = ["source".into(), destination.as_os_str().to_os_string()];
+                let (open_tx, open_rx) = mpsc::sync_channel(1);
+                let (opened_tx, opened_rx) = mpsc::sync_channel(1);
+                let (write_tx, write_rx) = mpsc::sync_channel(1);
+                let mut old_payload = None;
+                let mut writer = None;
+                let error = copy_with_policy(isolated, &args, |actual, _| {
+                    let payload = PathBuf::from(actual.last().unwrap());
+                    let bundle = bundle_in(&payload);
+                    std::fs::create_dir_all(&bundle).unwrap();
+                    std::fs::write(bundle.join("id"), "OLD-COPY").unwrap();
+                    old_payload = Some(payload);
+                    // Open the old job's absolute destination only AFTER the
+                    // retry has materialized, then keep that actual file open
+                    // across the retry's publication/atomic exchange.
+                    writer = Some(std::thread::spawn(move || {
+                        open_rx.recv_timeout(Duration::from_secs(30)).unwrap();
+                        let mut file = std::fs::OpenOptions::new()
+                            .write(true)
+                            .open(bundle.join("id"))
+                            .unwrap();
+                        opened_tx.send(()).unwrap();
+                        write_rx.recv_timeout(Duration::from_secs(30)).unwrap();
+                        file.set_len(0).unwrap();
+                        file.write_all(b"LATE-WRITE").unwrap();
+                        file.sync_all().unwrap();
+                    }));
+                    Err(crate::verify::HelperFailure {
+                        message: "copy deadline elapsed; cleanup not confirmed".to_string(),
+                        writer_stopped: false,
+                    })
+                })
+                .unwrap_err();
+                assert!(error.contains("cleanup not confirmed"), "{error}");
+                let old_payload = old_payload.unwrap();
+                let mut model = publication_model();
+                model
+                    .consts
+                    .iter_mut()
+                    .find(|(name, _)| *name == "Buggy")
+                    .unwrap()
+                    .1 = i64::from(!isolated);
+                let mut state = model.init_state();
+                copy_model_step(&model, &mut state, "Timeout");
+                // The real callers reclaim their requested destination after
+                // failure. The isolated attempt must remain outside that cleanup.
+                remove_path_no_follow(&destination).unwrap();
+                if shape == "zip" {
+                    std::fs::create_dir(&destination).unwrap();
+                }
+                copy_with_policy(isolated, &args, |actual, _| {
+                    let payload = PathBuf::from(actual.last().unwrap());
+                    let bundle = bundle_in(&payload);
+                    std::fs::create_dir_all(&bundle).unwrap();
+                    std::fs::write(bundle.join("id"), "NEW").unwrap();
+                    copy_model_step(&model, &mut state, "Retry");
+                    assert_eq!(
+                        state["current_target"],
+                        if payload == old_payload { 1 } else { 2 },
+                        "the model must bind actual destination identity"
+                    );
+                    if isolated {
+                        assert_eq!(payload.parent().unwrap().parent(), destination.parent());
+                        assert!(
+                            old_payload.exists(),
+                            "caller cleanup cannot reclaim a live attempt"
+                        );
+                    }
+                    open_tx.send(()).unwrap();
+                    opened_rx.recv_timeout(Duration::from_secs(30)).unwrap();
+                    copy_model_step(&model, &mut state, "OpenOld");
+                    Ok((std::process::ExitStatus::from_raw(0), String::new()))
+                })
+                .unwrap();
+
+                let published = if shape == "cross-volume" {
+                    std::fs::create_dir(&installed).unwrap();
+                    std::fs::write(installed.join("id"), "ROLLBACK").unwrap();
+                    checked_bundle_exchange(&destination, &installed, "copy fixture swap").unwrap();
+                    installed
+                } else {
+                    let ready = Ready {
+                        build_number: 42,
+                        version: "0.42.0".to_string(),
+                        commit: Some("ab".repeat(20)),
+                        dmg_sha256: "cd".repeat(32),
+                        team_id: String::new(),
+                        staged_at: String::new(),
+                        changelog: None,
+                        machine_id: None,
+                        roster_seq: None,
+                    };
+                    // The fixture models already-verified bytes; publication and
+                    // the apply lock below are the genuine shipping transaction.
+                    publish_verified_stage(&staging, &bundle_in(&destination), &ready).unwrap();
+                    staging.staged_app.clone()
+                };
+                copy_model_step(&model, &mut state, "Publish");
+                write_tx.send(()).unwrap();
+                writer.unwrap().join().unwrap();
+                copy_model_step(&model, &mut state, "LateWrite");
+                let actual = std::fs::read_to_string(published.join("id")).unwrap();
+                assert_eq!(state["corrupted"], i64::from(actual != "NEW"));
+                assert_eq!(model.check_invariant("NoLateMutation", &state), isolated);
+                assert_eq!(actual, if isolated { "NEW" } else { "LATE-WRITE" });
+                if shape == "cross-volume" {
+                    assert_eq!(
+                        std::fs::read_to_string(destination.join("id")).unwrap(),
+                        "ROLLBACK"
+                    );
+                }
+                let _ = std::fs::remove_dir_all(staging.root);
+            }
+        }
+    }
+
+    #[test]
+    fn the_real_launchd_wrapper_cannot_copy_again_after_publishing_status() {
+        use std::os::unix::process::ExitStatusExt;
+        for guarded in [true, false] {
+            let staging = Staging::scratch(&format!("copy-wrapper-replay-{guarded}"));
+            let cleanup = staging.root.join("cleanup-fixture");
+            std::fs::write(&cleanup, "#!/bin/sh\nexit 0\n").unwrap();
+            std::fs::set_permissions(&cleanup, std::fs::Permissions::from_mode(0o700)).unwrap();
+            let destination = staging.root.join("result");
+            let calls = staging.root.join("copies");
+            let script = if guarded {
+                LAUNCHD_COPY_WRAPPER.to_string()
+            } else {
+                LAUNCHD_COPY_WRAPPER.replace("/bin/mkdir \"$st.once\" 2>/dev/null || exit 0; ", "")
+            };
+            assert_eq!(script == LAUNCHD_COPY_WRAPPER, guarded);
+            let run_wrapper = |root: &Path, payload: &Path| {
+                let (exit, stderr) = crate::verify::status_bounded_with_stderr(
+                    Command::new("/bin/sh")
+                        .arg("-c")
+                        .arg(&script)
+                        .arg("fixture-wrapper")
+                        .arg(root.join("status"))
+                        .arg("fixture-label")
+                        .arg(&cleanup)
+                        .arg("/bin/sh")
+                        .arg("-c")
+                        .arg(r#"/bin/mkdir -p "$1"; printf NEW > "$1/id"; printf 'copy\n' >> "$2""#)
+                        .arg("fixture-copy")
+                        .arg(payload)
+                        .arg(&calls),
+                    "one-shot wrapper fixture",
+                    Duration::from_secs(5),
+                )
+                .unwrap();
+                assert!(exit.success(), "{stderr}");
+            };
+            let mut model = wrapper_model();
+            model
+                .consts
+                .iter_mut()
+                .find(|(name, _)| *name == "Buggy")
+                .unwrap()
+                .1 = i64::from(!guarded);
+            let mut state = model.init_state();
+            let mut old_paths = None;
+            copy_into_isolated_destination(
+                &[destination.clone().into_os_string()],
+                "wrapper copy",
+                |args, root| {
+                    let payload = Path::new(args.last().unwrap());
+                    run_wrapper(root, payload);
+                    copy_model_step(&model, &mut state, "Start");
+                    assert_eq!(std::fs::read_to_string(root.join("status")).unwrap(), "0\n");
+                    copy_model_step(&model, &mut state, "Complete");
+                    // Replay the exact shipping shell after its terminal status is
+                    // visible, before the parent gets to rename the completed tree.
+                    run_wrapper(root, payload);
+                    copy_model_step(&model, &mut state, "Replay");
+                    assert_eq!(
+                        state["copies"],
+                        i64::try_from(std::fs::read_to_string(&calls).unwrap().lines().count())
+                            .unwrap()
+                    );
+                    assert_eq!(model.check_invariant("OneCopy", &state), guarded);
+                    old_paths = Some((root.to_path_buf(), payload.to_path_buf()));
+                    Ok((std::process::ExitStatus::from_raw(0), String::new()))
+                },
+            )
+            .unwrap();
+            copy_model_step(&model, &mut state, "Remove");
+            if guarded {
+                let (root, payload) = old_paths.unwrap();
+                assert!(!root.exists());
+                run_wrapper(&root, &payload);
+                assert_eq!(std::fs::read_to_string(&calls).unwrap(), "copy\n");
+                assert!(!root.exists(), "a replay cannot recreate a retired attempt");
+            }
+            assert_eq!(
+                std::fs::read_to_string(destination.join("id")).unwrap(),
+                "NEW"
+            );
+            let _ = std::fs::remove_dir_all(staging.root);
+        }
+    }
+
+    fn reaper_model() -> aterm_spec::derive::Model {
+        aterm_spec::ty_model! {
+            AbandonedCopyReclamation {
+                const Buggy = 0;
+                var abandoned = 0;
+                var complete = 0;
+                var fenced = 1;
+                var reaped = 0;
+                action Abandon when (abandoned == 0 && reaped == 0) { abandoned = 1; }
+                action Complete when (complete == 0 && reaped == 0) { complete = 1; }
+                action LoseFence when (fenced == 1 && reaped == 0) { fenced = 0; }
+                action Reap when (reaped == 0 && complete == 1 && fenced == 1 && (abandoned == 1 || Buggy == 1)) {
+                    reaped = 1;
+                }
+                invariant ReclaimOnlyAbandoned: reaped == 0 || abandoned == 1;
+                invariant ReclaimOnlyCompleted: reaped == 0 || complete == 1;
+                invariant ReclaimOnlyFenced: reaped == 0 || fenced == 1;
+            }
+        }
+    }
+
+    #[test]
+    fn abandoned_copy_reaping_requires_terminal_status_and_the_one_shot_fence() {
+        let model = reaper_model();
+        aterm_spec::verify::prove_and_catch_scalar(&model, "abandoned copy reclamation");
+        for abandoned in [false, true] {
+            for completed in ["absent", "malformed", "complete"] {
+                for fenced in [false, true] {
+                    let staging = Staging::scratch("copy-reaper");
+                    let attempt = IsolatedCopy::create(&staging.root.join("destination")).unwrap();
+                    let label = format!("systems.alab.aterm-update.unpack-{}", "ab".repeat(16));
+                    std::fs::write(attempt.root.join("launchd.job"), &label).unwrap();
+                    if abandoned {
+                        std::fs::write(attempt.root.join("abandoned"), "1\n").unwrap();
+                    }
+                    if fenced {
+                        std::fs::create_dir(attempt.root.join(format!(".{label}.status.once")))
+                            .unwrap();
+                    }
+                    match completed {
+                        "complete" => {
+                            std::fs::write(attempt.root.join(format!(".{label}.status")), "0\n")
+                                .unwrap()
+                        }
+                        "malformed" => std::fs::write(
+                            attempt.root.join(format!(".{label}.status")),
+                            "unfinished",
+                        )
+                        .unwrap(),
+                        _ => {}
+                    }
+                    let mut state = model.init_state();
+                    state.insert("abandoned", i64::from(abandoned));
+                    state.insert("complete", i64::from(completed == "complete"));
+                    state.insert("fenced", i64::from(fenced));
+                    let admitted = model.action_enabled("Reap", &state);
+                    // Creating an apply/copy attempt must not recursively sweep
+                    // predecessors, even when their cleanup is already authorized.
+                    // The historical allocation-time sweep fails this assertion.
+                    let next =
+                        IsolatedCopy::create(&staging.root.join("next-destination")).unwrap();
+                    assert!(
+                        attempt.root.exists(),
+                        "allocation must leave bulk cleanup to the checker"
+                    );
+                    reap_abandoned_copy_attempts(&staging.root);
+                    assert!(
+                        next.root.exists(),
+                        "maintenance cannot reclaim the live new attempt"
+                    );
+                    assert_eq!(!attempt.root.exists(), admitted);
+                    if admitted {
+                        copy_model_step(&model, &mut state, "Reap");
+                        assert!(model.check_invariant("ReclaimOnlyAbandoned", &state));
+                        assert!(
+                            !staging.root.join("destination").exists(),
+                            "late completion cannot promote abandoned bytes"
+                        );
+                    }
+                    if !abandoned && completed == "complete" && fenced {
+                        // Negative control: completion alone is not authority to
+                        // delete the current caller's not-yet-promoted output.
+                        std::fs::remove_dir_all(&attempt.root).unwrap();
+                        state.insert("reaped", 1);
+                        assert!(!model.check_invariant("ReclaimOnlyAbandoned", &state));
+                    }
+                    let _ = std::fs::remove_dir_all(staging.root);
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn an_observed_stopped_writer_reclaims_its_failed_attempt_immediately() {
+        let staging = Staging::scratch("copy-confirmed-failure");
+        let destination = staging.root.join("destination");
+        let mut root = None;
+        let error = copy_into_isolated_destination(
+            &[destination.clone().into_os_string()],
+            "failed copy",
+            |_, attempt| {
+                root = Some(attempt.to_path_buf());
+                Err(crate::verify::HelperFailure {
+                    message: "the owned child was reaped".to_string(),
+                    writer_stopped: true,
+                })
+            },
+        )
+        .unwrap_err();
+        assert_eq!(error, "the owned child was reaped");
+        assert!(!root.unwrap().exists());
+        assert!(!destination.exists());
+        let _ = std::fs::remove_dir_all(staging.root);
+    }
+
+    fn fake_launchctl(staging: &Staging, mode: &str) -> std::path::PathBuf {
+        let script = staging.root.join("launchctl-fixture");
+        std::fs::write(staging.root.join("mode"), mode).unwrap();
+        // No launchd mutation and no inherited background child: a hung helper
+        // replaces itself with sleep, so the real bounded runner can kill/reap it.
+        std::fs::write(
+            &script,
+            r##"#!/bin/sh
+dir="${0%/*}"
+printf '%s\n' "$1" >> "$dir/calls"
+IFS= read -r mode < "$dir/mode"
+if [ "$1" = remove ]; then
+    if [ "$mode" = remove-hangs ] || [ "$mode" = both-hang ]; then exec /bin/sleep 30; fi
+    exit 0
+fi
+if [ "$mode" = submit-hangs ] || [ "$mode" = both-hang ]; then exec /bin/sleep 30; fi
+# submit -l LABEL -e STDERR -- /bin/sh -c WRAPPER argv0 STATUS LABEL launchctl ditto ...
+shift 3
+err="$2"
+shift 3
+st="$5"
+case "$mode" in
+    complete)
+        /usr/bin/head -c 65536 /dev/zero > "$err"
+        printf '\ncopy failed: fixture disk full\n' >> "$err"
+        printf '1\n' > "$st"
+        ;;
+    malformed) printf 'not-an-exit-status\n' > "$st" ;;
+esac
+exit 0
+"##,
+        )
+        .unwrap();
+        std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o700)).unwrap();
+        script
+    }
+
+    #[test]
+    fn launchd_submit_and_remove_share_the_real_callers_deadline() {
+        for mode in ["submit-hangs", "remove-hangs", "both-hang"] {
+            let staging = Staging::scratch(&format!("launchd-bound-{mode}"));
+            let launchctl = fake_launchctl(&staging, mode);
+            let started = Instant::now();
+            let error = ditto_via_launchd_using(
+                &[],
+                "fixture unpack",
+                // Leave room for cold helper startup during parallel tests;
+                // the fake helper's 30 s hang still exceeds this by a wide margin.
+                Duration::from_secs(2),
+                &staging.root,
+                &launchctl,
+            )
+            .unwrap_err();
+            assert!(
+                started.elapsed() < Duration::from_secs(5),
+                "{mode} bypassed the deadline: {error}"
+            );
+            assert!(error.contains("did not finish"), "{mode}: {error}");
+            assert_eq!(
+                std::fs::read_to_string(staging.root.join("calls")).unwrap_or_else(|receipt| {
+                    panic!(
+                        "{mode}: missing helper receipt at {}: {receipt}; runner: {error}",
+                        staging.root.display()
+                    )
+                }),
+                "submit\nremove\n"
+            );
+            if mode != "submit-hangs" {
+                assert!(
+                    error.contains("cleanup not confirmed"),
+                    "a timed-out removal must be explicit: {error}"
+                );
+            }
+            let _ = std::fs::remove_dir_all(staging.root);
+        }
+    }
+
+    #[test]
+    fn launchd_completion_keeps_only_the_error_tail_and_rejects_malformed_status() {
+        let staging = Staging::scratch("launchd-result-tail");
+        let launchctl = fake_launchctl(&staging, "complete");
+        let (status, stderr) = ditto_via_launchd_using(
+            &[],
+            "fixture unpack",
+            Duration::from_secs(5),
+            &staging.root,
+            &launchctl,
+        )
+        .unwrap();
+        assert!(!status.success());
+        assert!(stderr.len() <= 512);
+        assert_eq!(
+            crate::verify::last_stderr_line(&stderr),
+            Some("copy failed: fixture disk full")
+        );
+        assert!(std::fs::read_dir(&staging.root).unwrap().all(|entry| {
+            !entry
+                .unwrap()
+                .file_name()
+                .to_string_lossy()
+                .starts_with(".systems.alab.")
+        }));
+        std::fs::write(staging.root.join("mode"), "malformed").unwrap();
+        let error = ditto_via_launchd_using(
+            &[],
+            "fixture unpack",
+            Duration::from_secs(5),
+            &staging.root,
+            &launchctl,
+        )
+        .unwrap_err();
+        assert!(error.contains("malformed exit status"), "{error}");
+        assert_eq!(
+            std::fs::read_to_string(staging.root.join("calls")).unwrap(),
+            "submit\nsubmit\nremove\n"
+        );
+        let _ = std::fs::remove_dir_all(staging.root);
     }
 }

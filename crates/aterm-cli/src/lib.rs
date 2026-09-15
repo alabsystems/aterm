@@ -178,6 +178,9 @@ pub enum Verb {
     Drive,
     /// `aterm link` — the fabric bridge (`serve`, `ls`, `hook`, `mirror`, …).
     Link,
+    /// `aterm fabric` — the fabric's state on one screen, its traffic live, and
+    /// `on|off|doctor`: the one command that turns it on and proves it.
+    Fabric,
     /// `aterm ship` — the release tool (publishing; source checkouts only).
     Ship,
     /// `aterm update` — the headless update lane (status/check, no window).
@@ -201,6 +204,7 @@ impl Verb {
         Verb::Fleet,
         Verb::Drive,
         Verb::Link,
+        Verb::Fabric,
         Verb::Ship,
         Verb::Update,
         Verb::Agents,
@@ -218,6 +222,7 @@ impl Verb {
             Verb::Fleet => "fleet",
             Verb::Drive => "drive",
             Verb::Link => "link",
+            Verb::Fabric => "fabric",
             Verb::Ship => "ship",
             Verb::Update => "update",
             Verb::Agents => "agents",
@@ -244,6 +249,10 @@ impl Verb {
             Verb::Fleet => Some("aterm-fleet"),
             Verb::Drive => Some("aterm-drive"),
             Verb::Link => Some("aterm-link"),
+            // `fabric` never was a sibling binary: it is a report over what
+            // `aterm link` and `aterm ctl` already reach, shipped only as a
+            // front-door word (and as `aterm-link fabric`, the same code).
+            Verb::Fabric => None,
             // The windowing verbs never were sibling binaries, and never should
             // be: `new-tab` on PATH would shadow nothing of aterm's but would be
             // a wildly generic name to install into a user's `$PATH`.
@@ -277,6 +286,7 @@ impl Verb {
             | Verb::Fleet
             | Verb::Drive
             | Verb::Link
+            | Verb::Fabric
             | Verb::Ship
             | Verb::Update
             | Verb::Agents => false,
@@ -292,6 +302,7 @@ impl Verb {
             Verb::Fleet => "aterm fleet <args>",
             Verb::Drive => "aterm drive <args>",
             Verb::Link => "aterm link <args>",
+            Verb::Fabric => "aterm fabric [<cmd>]",
             Verb::Ship => "aterm ship <args>",
             Verb::Update => "aterm update [<cmd>]",
             Verb::Agents => "aterm agents [<cmd>]",
@@ -322,6 +333,14 @@ impl Verb {
             Verb::Link => {
                 &["The fabric bridge: carry inbox/post between this instance and the bus."]
             }
+            Verb::Fabric => &[
+                "See the fabric on one screen: config, broker, every",
+                "instance's bridge, every session's inbox, the last 10 bus",
+                "records and what is wrong (status | tail); `on` turns it on",
+                "in one command and proves it, `off` turns it off, `doctor`",
+                "names the fix for each warning. No arguments: it reads the",
+                "[fabric] command aterm launches its bridge from.",
+            ],
             Verb::Drive => &["The agent drive CLI (prompt / read / await / shot)."],
             Verb::Ship => &[
                 "Publish aterm: provision a signing machine, cut and",
@@ -639,8 +658,35 @@ fn explain_config_report() -> String {
     );
     out.push_str("                          and 0/off/empty do not arm it.\n");
     out.push_str(PRIVACY_CONFIG_PARAGRAPH);
+    out.push_str(MACHINE_CONFIG_PARAGRAPH);
     out
 }
+
+/// The `[machine]` paragraph of `explain-config`. Hand-written like the rest.
+///
+/// Three things it must say, because each is otherwise guessed wrong: the
+/// settings are applied FIRST by every package pass and on the spot by
+/// `aterm pkg machine apply` (they used to run last, and only after a clean pass —
+/// so on a machine with one aborted program they never ran); `defaults` writes the
+/// ACCOUNT's per-host domain and ignores `$HOME`, so a redirected home is refused
+/// rather than written through; and every change is undoable by one printed line.
+const MACHINE_CONFIG_PARAGRAPH: &str = "\n\
+     [machine] — macOS host settings (aterm.toml; applied by the co-located atpkg):\n\
+     \x20 universal_control       \"off\" (default) | \"leave\". Off writes the two per-host keys\n\
+     \x20                         that stop the cursor and keyboard roaming to other Macs and\n\
+     \x20                         iPads on the same Apple account; leave never touches them.\n\
+     \x20 spotlight_noindex       true (default) renames every cargo target dir under $HOME to\n\
+     \x20                         target.noindex, with a `target` symlink left in place so cargo\n\
+     \x20                         keeps working, so Spotlight never indexes build output.\n\
+     \x20 Both are applied FIRST by every package pass (update, seed, install) and on the\n\
+     \x20 spot by `aterm pkg machine apply`; `aterm pkg machine` reads the measured state,\n\
+     \x20 and Settings ▸ Security shows it with the two switches and an Apply now button.\n\
+     \x20 A saved change lands on the next package pass, or on Apply now. `defaults` writes\n\
+     \x20 the ACCOUNT's per-host domain regardless of $HOME, so a pass under a redirected\n\
+     \x20 HOME is refused and says so. Undo Universal Control with the revert line the\n\
+     \x20 doctor prints (`defaults -currentHost delete com.apple.universalcontrol Disable`,\n\
+     \x20 then the same for DisableMagicEdges); undo a rename by removing the `target`\n\
+     \x20 symlink and renaming target.noindex back to target.\n";
 
 /// The `[privacy]` paragraph of `explain-config` (design §4). Hand-written, like
 /// the rest of this page.
@@ -1265,17 +1311,58 @@ fn decide_args<I: Iterator<Item = String>>(args: I) -> CliAction {
 /// (the `.app` on macOS, the executable elsewhere) and, per other `aterm.app` in the
 /// usual places, `another copy: <path> (<version>) — not the one running; the updater
 /// updates only this one` — the lines `aterm_update::which_copy` spells, so Settings ▸
-/// About says the same words. `None` (no executable path at all) prints identity only.
+/// About says the same words. `None` (no executable path at all) prints identity only
+/// — then `build: <N>`, the monotonic build number the updater orders by
+/// (2026-09-14, audit BA-8): the pre-swap start probe runs the candidate with
+/// `--version` and requires the text to name the build it is about to install,
+/// a clause that had been dead since versions moved to `MAJOR.MINOR.0` and the
+/// number left the identity line. Omitted (no line) when the launcher has not
+/// published one ([`set_running_build`]) — a `0` would be a claim. And last,
+/// WHAT THIS BUILD TRUSTS: `trusts: master=<sha256> channel=<sha256>`, the
+/// fingerprints of the paper master and the channel key compiled in, so a
+/// client stranded by a key or master rotation can be told from a healthy one
+/// by its own output (`empty` names an unarmed tier).
 #[must_use]
 pub fn version_text(copy: Option<&aterm_update::which_copy::WhichCopy>) -> String {
     let mut out = format!("aterm {}\n", aterm_types::version::APP_VERSION);
+    if let Some(build) = running_build() {
+        out.push_str(&format!("build: {build}\n"));
+    }
     if let Some(copy) = copy {
         for line in copy.lines() {
             out.push_str(&line);
             out.push('\n');
         }
     }
+    out.push_str(&trust_anchors_line());
     out
+}
+
+/// The running build number, published by the one-binary launcher before it
+/// dispatches (`crates/aterm/src/main.rs`): this crate has no build stamp of its
+/// own — the number is minted by aterm-gui's build script — so the launcher,
+/// which links both, hands it over. First call wins; `0` (an unstamped dev
+/// build) publishes nothing.
+static RUNNING_BUILD: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
+
+/// Publish the running build number for [`version_text`]. See [`RUNNING_BUILD`].
+pub fn set_running_build(build: u64) {
+    if build > 0 {
+        let _ = RUNNING_BUILD.set(build);
+    }
+}
+
+fn running_build() -> Option<u64> {
+    RUNNING_BUILD.get().copied()
+}
+
+/// The `trusts:` line of [`version_text`].
+fn trust_anchors_line() -> String {
+    format!(
+        "trusts: master={} channel={}\n",
+        aterm_update::compiled_master_pin_sha256(),
+        aterm_update::compiled_update_pin_sha256()
+    )
 }
 
 /// Dependency-free argument parser for the daily-driver CLI — the effectful shell
@@ -2063,6 +2150,39 @@ mod tests {
     /// The argv0 compat aliases the bundle symlinks onto the one binary. Every
     /// alias must be distinct and must not collide with a verb NAME, or argv0
     /// dispatch and operand dispatch would disagree about the same string.
+    /// `argv0_alias()` had no consumer, and that is how `aterm-link` shipped in
+    /// four alias lists and not the fifth (the release bundler): five copies of
+    /// one set, maintained by hand, and the roster that could have pinned them
+    /// read by nothing but its own distinctness test. This reads the two Rust
+    /// sites that spell the set — the macOS bundler's symlink loop and the front
+    /// door's `alias_route` — and asserts every alias the roster yields is in
+    /// both. `aterm-release` deliberately does not depend on this crate, so the
+    /// pin is a file read rather than an import; a hard-coded list checked
+    /// against a hard-coded list would prove only that one author typed it twice.
+    #[test]
+    fn every_argv0_alias_is_bundled_and_routed() {
+        let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .parent()
+            .expect("crates/aterm-cli sits under crates/");
+        let bundle = std::fs::read_to_string(root.join("aterm-release/src/bundle.rs"))
+            .expect("the release bundler");
+        let front_door =
+            std::fs::read_to_string(root.join("aterm/src/main.rs")).expect("the one binary's main");
+        for alias in Verb::ALL.iter().filter_map(|v| v.argv0_alias()) {
+            assert!(
+                bundle.contains(&format!("\"{alias}\"")),
+                "`{alias}` is a Verb argv0 alias and the macOS bundle does not symlink it: \
+                 the name works from a checkout and is dead in a release"
+            );
+            assert!(
+                front_door.contains(&format!("\"{alias}\" => AliasRoute::")),
+                "`{alias}` is a Verb argv0 alias and `alias_route` does not route it: \
+                 invoked by that name it falls through to the front door — for a \
+                 bridge spawned by name that meant opening a WINDOW"
+            );
+        }
+    }
+
     #[test]
     fn verb_argv0_aliases_are_distinct_and_unambiguous() {
         let aliases: Vec<&str> = Verb::ALL.iter().filter_map(|v| v.argv0_alias()).collect();
@@ -2337,6 +2457,38 @@ mod tests {
         // Nothing here may promise the grant ends consent dialogs: which
         // services it covers is unmeasured (design §7 S4).
         assert!(!r.contains("no more prompts"), "{r}");
+    }
+
+    /// The `[machine]` paragraph: the two keys with their defaults, WHEN they
+    /// apply (first on every package pass; now by `aterm pkg machine apply`), the
+    /// redirected-HOME refusal, and the undo for each — and, like every CLI
+    /// string, no ask for a fresh launch.
+    #[test]
+    fn explain_config_explains_the_machine_section() {
+        let r = explain_config_report();
+        for needle in [
+            "[machine]",
+            "universal_control",
+            "spotlight_noindex",
+            "\"off\" (default) | \"leave\"",
+            "true (default)",
+            "applied FIRST by every package pass",
+            "aterm pkg machine apply",
+            "aterm pkg machine",
+            "Settings ▸ Security",
+            "Apply now",
+            "regardless of $HOME",
+            "com.apple.universalcontrol Disable",
+            "target.noindex back to target",
+        ] {
+            assert!(r.contains(needle), "explain-config missing {needle:?}\n{r}");
+        }
+        for banned in ["restart", "relaunch", "reopen", "next launch"] {
+            assert!(
+                !r.to_ascii_lowercase().contains(banned),
+                "explain-config says {banned:?}\n{r}"
+            );
+        }
     }
 
     #[test]
@@ -2760,7 +2912,22 @@ mod tests {
     fn version_text_names_the_running_copy_and_any_other() {
         use aterm_update::which_copy::{OtherCopy, Running, WhichCopy};
         let identity = format!("aterm {}\n", aterm_types::version::APP_VERSION);
-        assert_eq!(version_text(None), identity);
+        let anchors = super::trust_anchors_line();
+        assert!(
+            anchors.starts_with("trusts: master=") && anchors.contains(" channel="),
+            "{anchors}"
+        );
+        // The build line follows the identity once the launcher publishes it
+        // (2026-09-14): the start probe greps the number out of this text. Set
+        // here for the whole binary — the other assertions carry it too.
+        super::set_running_build(1789432052);
+        super::set_running_build(7);
+        let build = "build: 1789432052\n";
+        assert_eq!(version_text(None), format!("{identity}{build}{anchors}"));
+        assert!(
+            version_text(None).contains("1789432052"),
+            "the first publication stands, and the probe finds it"
+        );
         let copy = WhichCopy {
             running: std::path::PathBuf::from("/Applications/aterm.app"),
             kind: Running::InstalledApp,
@@ -2772,9 +2939,9 @@ mod tests {
         assert_eq!(
             version_text(Some(&copy)),
             format!(
-                "{identity}running: /Applications/aterm.app\nanother copy: \
+                "{identity}{build}running: /Applications/aterm.app\nanother copy: \
                  /Users//ana/Applications/aterm.app (0.60.0) \u{2014} not the one running; the \
-                 updater updates only this one\n"
+                 updater updates only this one\n{anchors}"
             )
         );
         assert!(version_text(Some(&copy)).starts_with("aterm "));

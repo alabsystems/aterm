@@ -76,7 +76,8 @@
 //! ignores it, and the LINK is either caught by the same `.gitignore` entry that caught
 //! the directory or, when that entry is directory-only (`target/`, `/target-tippy/`,
 //! `**/target/` — the shape 20 of the 26 planned dirs on m21 carry, and the aterm
-//! checkout's own `/target-tippy/`), which matches a directory and NOT the symlink that
+//! checkout's own `/target-tippy/` until its .gitignore moved to a slashless
+//! `/target-*` on 2026-09-13), which matches a directory and NOT the symlink that
 //! replaces it, excluded the same way: the directory is probed with `git check-ignore`
 //! BEFORE the rename, and a link that git no longer ignores where the directory was gets
 //! its own `.git/info/exclude` line, read back through git. Status is exactly what it
@@ -2484,10 +2485,11 @@ mod tests {
     /// --porcelain` is EMPTY — the release cutter's own dirty test. A repo that does not
     /// ignore `target` still gets no config write and is told the link is untracked.
     /// Then the shape the first cut of this got WRONG: a repo whose ignore entries are
-    /// directory-only (`target/`, `/target-tippy/` — the aterm checkout's own
-    /// `.gitignore:55`, and 20 of the 26 planned dirs on m21). Those match the directory
-    /// and NOT the symlink, so without the link's own exclude line the pass turned an
-    /// ignored directory into a `?? target` row that `clean_tree` would refuse.
+    /// directory-only (`target/`, `/target-tippy/` — the entry the aterm checkout's
+    /// .gitignore carried before its slashless `/target-*`, and 20 of the 26 planned
+    /// dirs on m21). Those match the directory and NOT the symlink, so without the
+    /// link's own exclude line the pass turned an ignored directory into a `?? target`
+    /// row that `clean_tree` would refuse.
     #[cfg(unix)]
     #[test]
     fn a_git_checkout_gets_a_symlink_and_stays_clean_never_a_config_edit() {
@@ -3635,6 +3637,14 @@ mod tests {
     /// exists to consolidate. A root the user NAMES is still walked.
     #[test]
     fn the_home_walk_prunes_every_macos_protected_folder() {
+        // The walk is a Spotlight (`.metadata_never_index`) concern and `scan` answers
+        // `targets: []` on every other platform by design (`SUPPORTED`). Asserting the
+        // macOS prune list there fails on "src/ was not walked" — this test was the one
+        // red in `cargo test -p atpkg` on Linux (2026-09-14), for a feature that does not
+        // exist on Linux. Same guard the walker itself uses, so the two cannot drift.
+        if !SUPPORTED {
+            return;
+        }
         let tmp = std::env::temp_dir().join(format!("aterm-noindex-skip-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&tmp);
         for name in [

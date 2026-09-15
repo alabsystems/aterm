@@ -310,11 +310,21 @@ pub enum PetCell {
     Protected,
 }
 
+/// Glyph occupancy and locomotion obstruction are different observations.
+/// A single isolated Braille dot is still visible ink (and still participates
+/// in attention/contact), but does not displace a pet drawn beneath the text.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum PetGlyph {
+    Blank,
+    Speck,
+    Substantive,
+}
+
 /// A fixed-budget occupancy window and small, text-free observation set.
 #[derive(Clone, Debug)]
 pub struct PetWorld {
     cells: Vec<PetCell>,
-    glyphs: Vec<Option<bool>>,
+    glyphs: Vec<Option<PetGlyph>>,
     blocked_prefix: Vec<u16>,
     protected_prefix: Vec<u16>,
     coverage: PetPane,
@@ -555,8 +565,38 @@ impl PetWorld {
                 // Occupancy and protection are independent facts. Moving the
                 // caret/selection off a glyph must not look like arriving ink.
                 // Expanded rows lack a certified cell-to-pixel projection.
+                let speck = glyph
+                    && !cell.wide
+                    && !decorated
+                    && !compound
+                    && is_single_braille_dot(cell.ch)
+                    // Adjacent ink makes this a textual/graphical run, not
+                    // an isolated particle. Keep both probes inside this
+                    // bounded observation; an unseen neighbour at either
+                    // the pane or coverage edge cannot certify isolation.
+                    && c > 0
+                    && c + 1 < cols
+                    && [frame_c - 1, frame_c + 1].into_iter().all(|column| {
+                        // A present row's implicit tail is certified blank,
+                        // just like the cell being classified above.
+                        let neighbour = row.get(column).unwrap_or(&implicit);
+                        input.line_size_run_at(frame_r, column).0 == LineSize::SingleWidth
+                            && neighbour.ch == ' '
+                            && !neighbour.wide
+                            && neighbour.underline == UnderlineStyle::None
+                            && !neighbour.strikethrough
+                            && !neighbour.overline
+                            && input.cluster_at(frame_r, column).is_none()
+                            && input.combining_at(frame_r, column).is_none()
+                    });
                 self.glyphs[r * MAX_WORLD_COLS + c] =
-                    (line == LineSize::SingleWidth).then_some(glyph);
+                    (line == LineSize::SingleWidth).then_some(if !glyph {
+                        PetGlyph::Blank
+                    } else if speck {
+                        PetGlyph::Speck
+                    } else {
+                        PetGlyph::Substantive
+                    });
                 let others = selected
                     || excluded
                     || input.image_at(frame_r, frame_c).is_some()
@@ -647,7 +687,10 @@ impl PetWorld {
                         continue;
                     }
                     for c in 0..cols {
-                        if self.glyphs[r * MAX_WORLD_COLS + c] == Some(true) {
+                        if matches!(
+                            self.glyphs[r * MAX_WORLD_COLS + c],
+                            Some(PetGlyph::Speck | PetGlyph::Substantive)
+                        ) {
                             absolute_row = abs;
                             col = (self.coverage.col + c + 1) as f32;
                         }
@@ -688,6 +731,20 @@ impl PetWorld {
     /// protection. None means unobserved or unsupported geometry, never blank.
     #[must_use]
     pub fn ink_at(&self, row: usize, col: usize) -> Option<bool> {
+        self.glyph_at(row, col)
+            .map(|glyph| glyph != PetGlyph::Blank)
+    }
+
+    /// Ink substantial enough to displace a pet drawn beneath the glyphs.
+    /// Only an isolated, undecorated one-dot Braille cell is exempt; actual
+    /// glyph occupancy, protected surfaces and unknown coverage are unchanged.
+    #[must_use]
+    pub fn locomotion_ink_at(&self, row: usize, col: usize) -> Option<bool> {
+        self.glyph_at(row, col)
+            .map(|glyph| glyph == PetGlyph::Substantive)
+    }
+
+    fn glyph_at(&self, row: usize, col: usize) -> Option<PetGlyph> {
         self.stamp?;
         let r = row.checked_sub(self.coverage.row)?;
         let c = col.checked_sub(self.coverage.col)?;
@@ -1030,6 +1087,11 @@ impl PetWorld {
         }
         best
     }
+}
+
+fn is_single_braille_dot(ch: char) -> bool {
+    let code = u32::from(ch);
+    (0x2800..=0x28ff).contains(&code) && (code - 0x2800).count_ones() == 1
 }
 
 fn intersects_cell(rect: PetRect, row: usize, col: usize) -> bool {

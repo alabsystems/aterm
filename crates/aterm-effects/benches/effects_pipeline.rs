@@ -105,7 +105,15 @@
 //                     as keystrokes — that distinction is load-bearing: a
 //                     stream mis-armed as typing pins rain at CALM with its
 //                     material sampler frozen, and this workload measured
-//                     ZERO rain quads in that shape before it was fixed.
+//                     ZERO rain quads in that shape before it was fixed. And
+//                     since the licence laws (2026-08-30 on) it means the
+//                     glow and the trail are ENABLED BUT DARK here: a caret
+//                     a program moves with no key behind it is refused
+//                     (`no-fresh-hint` — program output cannot outspend the
+//                     keyboard), so their half of this frame prices the
+//                     refusal path every present pays under a streaming
+//                     agent, not a lit trail. The 2026-08-19 pins (glow 2 362
+//                     here) measured the engine before that law.
 //
 // EVERY WORKLOAD IS GUARDED BEFORE IT IS TIMED, with TWO-SIDED bounds. The
 // dark workloads' zeros are proven meaningful by CONTROLS (the identical
@@ -154,7 +162,9 @@
 //   apply_typing      19.98 µs   engine-dominated (peak 4 515 glow quads)
 //   apply_typing_pack 21.77 µs   the same frame carrying the resolved pack
 //   tick_all_on       27.05 µs   the headline frame (glow 2 362 + ink 96 +
-//                                 rain 177 peak items, rescan every frame)
+//                                 rain 177 peak items, rescan every frame;
+//                                 the glow half is dark since the licence
+//                                 laws — see the workload's bounds)
 //   typing_arm seam   10.9 µs    the UNTIMED host half (cell_frame_into);
 //   idle_arm seam    191.9 ns    excluded from every apply number above
 //
@@ -838,19 +848,23 @@ fn workloads() -> Vec<Workload> {
                 assert!(!f.p.sparkle_enabled() && !f.p.matrix_rain_enabled());
             },
             bounds: [
-                (69, 89),       // trail
-                (3_970, 5_060), // glow_add
-                (1, 3),         // glow_halo
-                (0, 0),         // fire_patch
-                (0, 0),         // glow_under
-                (0, 0),         // char_fg
-                (0, 0),         // fire_halo
-                (0, 0),         // decos
-                (0, 0),         // ink
-                (0, 0),         // free_sprites
-                (0, 0),         // nova_add
-                (0, 0),         // rain_quads
-                (0, 0),         // rain_add
+                // Re-pinned 2026-09-14 (38fd5de93): the lumen aurora and the
+                // comet trail under the licence laws and the v2-era engine
+                // peak at 117 trail / 1_037 glow quads (79 / 4_515 on the
+                // 2026-08-19 engine these bounds first measured).
+                (103, 131),   // trail
+                (915, 1_160), // glow_add
+                (1, 3),       // glow_halo
+                (0, 0),       // fire_patch
+                (0, 0),       // glow_under
+                (0, 0),       // char_fg
+                (0, 0),       // fire_halo
+                (0, 0),       // decos
+                (0, 0),       // ink
+                (0, 0),       // free_sprites
+                (0, 0),       // nova_add
+                (0, 0),       // rain_quads
+                (0, 0),       // rain_add
             ],
             lit_pct: (100, 100),
             // Saturated cadence: intensity exactly 1.0 at every apply instant,
@@ -869,8 +883,11 @@ fn workloads() -> Vec<Workload> {
                 assert!(!f.p.sparkle_enabled() && !f.p.matrix_rain_enabled());
             },
             bounds: [
-                (69, 89),       // trail
-                (2_330, 2_970), // glow_add
+                // Re-pinned 2026-09-14 (38fd5de93): 117 trail / 1_962 pack
+                // glow quads (the pack's own emitters keep this above the
+                // built-in lumen frame's 1_037).
+                (103, 131),     // trail
+                (1_730, 2_200), // glow_add
                 (1, 3),         // glow_halo
                 (0, 0),         // fire_patch
                 (0, 0),         // glow_under
@@ -900,13 +917,23 @@ fn workloads() -> Vec<Workload> {
                 );
             },
             bounds: [
-                (42, 54),       // trail
-                (2_080, 2_650), // glow_add
-                (1, 3),         // glow_halo
-                (0, 0),         // fire_patch
-                (0, 0),         // glow_under
-                (0, 0),         // char_fg
-                (0, 0),         // fire_halo
+                // ENABLED BUT DARK (re-pinned 2026-09-14, 38fd5de93): the
+                // stream moves the caret with no key behind it, and under the
+                // licence laws such a move is refused — the glow and the trail
+                // emit nothing, and what they cost here is the refusal path.
+                // The 2026-08-19 engine lit 47 trail / 2_362 glow quads on this
+                // script; a non-empty stream here now would mean program
+                // output has started lighting the trail again. The workload
+                // is NOT re-scripted to type: arming the stream as keystrokes
+                // is the mis-arming the header warns of (rain pinned at CALM),
+                // and a typed frame is priced by `apply_typing`.
+                (0, 0), // trail
+                (0, 0), // glow_add
+                (0, 0), // glow_halo
+                (0, 0), // fire_patch
+                (0, 0), // glow_under
+                (0, 0), // char_fg
+                (0, 0), // fire_halo
                 // The legacy decoration stream stays EMPTY in the rainbow-ink
                 // era: sparkle output rides `ink` (per-cell fg overrides) —
                 // a non-empty `decos` here would mean a routing change.

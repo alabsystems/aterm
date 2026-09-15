@@ -1007,6 +1007,53 @@ fn self_instance_sock(self_sid: Option<&str>) -> Option<String> {
     }
 }
 
+/// THE FLAGLESS RESOLUTION, AS A LIBRARY ENTRY — for the other clients in this
+/// one binary that must find aterm the way `aterm ctl` does.
+///
+/// `aterm link hook run` used to try `$ATERM_CONTROL_SOCK` and then
+/// `$XDG_RUNTIME_DIR/aterm/aterm.sock`, and nothing else. An aterm child on
+/// macOS has NEITHER: it has `$ATERM_PARENT_SESSION_ID`, and the instance that
+/// hosts it is found through that session's graph entry in the rendezvous
+/// directory — the step this client has always taken and the hooks never did,
+/// so every hook installed on 2026-09-14 answered "no aterm control socket"
+/// from inside a live aterm session. One resolver, called by both, so the two
+/// cannot disagree again.
+///
+/// The order is [`resolve_path`]'s: `$ATERM_CONTROL_SOCK` when it names a path
+/// (its `0`/`off` forms and `$ATERM_NO_CONTROL_SOCK` are a refusal, not a
+/// path), then the instance hosting `self_sid` (its `<dir>/graph/<sid>` entry,
+/// probed for a listener — [`self_instance_sock`]), then the `latest` alias
+/// `<dir>/aterm.sock`. Nothing is cached: a self-update relaunches aterm under
+/// a new pid and a new socket name, and a caller that resolves on every run
+/// follows it.
+///
+/// # Errors
+///
+/// The socket is disabled in this environment, or no rendezvous directory can
+/// be resolved (`$XDG_RUNTIME_DIR` and `$HOME` both unset).
+pub fn resolve_sock_for(self_sid: Option<&str>) -> io::Result<String> {
+    resolve_path(
+        None,
+        None,
+        env::var(SOCK_ENV).ok(),
+        env::var(NO_SOCK_ENV).ok(),
+        self_sid.map(str::to_string),
+    )
+}
+
+/// The instance token beside the socket at `sock` — the same file this
+/// client's own connections read ([`read_token_at`]), for a caller that
+/// resolved the socket with [`resolve_sock_for`].
+///
+/// # Errors
+///
+/// Names the token file that was looked for and why it could not be read
+/// (absent, another user's, empty, not a regular file).
+pub fn read_token_beside(sock: &str) -> io::Result<String> {
+    read_token_at(sock)
+        .map_err(|(path, e)| io::Error::new(e.kind(), format!("{}: {e}", path.display())))
+}
+
 // ---------------------------------------------------------------------------
 // THE MULTIPLEXER BOUNDARY (screen / tmux)
 //
@@ -2382,6 +2429,50 @@ pub fn fleet_sessions() -> Result<Vec<FleetSession>, FleetListError> {
         probes.push((pid, sock, probe));
     }
     fleet_listing(sessions, discovery_report(dir, &probes))
+}
+
+/// Every aterm instance that has published a control socket on this machine, as
+/// `(pid, socket path)` — the SAME rendezvous walk `instances`, `ls` and `windows`
+/// make, handed back as DATA and WITHOUT dialing any of them.
+///
+/// For a caller that asks each instance something `ls` does not (`aterm fabric`
+/// asks every instance for its `fabric status`): a second walk of the directory
+/// would be a second answer to "which instances are there", and the one this
+/// crate gives is the one the operator already trusts. Sorted by pid; the pid is
+/// `0` for an explicit-socket instance whose graph entry names none.
+///
+/// A listed socket is not a promise that something ACCEPTS on it — a crashed
+/// instance leaves its socket file behind. Dial it and classify the answer.
+///
+/// # Errors
+///
+/// [`FleetListError`] when the directory could NOT be looked in — unresolvable,
+/// missing, or unreadable — carrying the same reason and status `ls` reports. A
+/// readable directory with no instance in it is `Ok` and empty: that is an
+/// answer, not a failure to get one.
+pub fn local_instances() -> Result<Vec<(u32, String)>, FleetListError> {
+    let (dir, targets) = inspect_fleet();
+    match dir {
+        DirOutcome::Found { .. } | DirOutcome::Empty(_) | DirOutcome::Scoped => Ok(targets),
+        other => {
+            let (reason, code) = discovery_report(other, &[]);
+            Err(FleetListError { reason, code })
+        }
+    }
+}
+
+/// The Owner token for the instance whose control socket is `sock`, read the way
+/// every client path in this crate reads it: the per-socket token file beside the
+/// socket (through the `latest` alias), then — for an explicit socket only — the
+/// legacy shared file, never reaching past a per-socket file that exists but is
+/// malformed.
+///
+/// # Errors
+///
+/// The miss, naming the token file that was looked for.
+pub fn instance_token(sock: &str) -> io::Result<String> {
+    read_token_at(sock)
+        .map_err(|(path, e)| io::Error::new(e.kind(), format!("{}: {e}", path.display())))
 }
 
 /// The sessions one ANSWERED instance contributes to a listing — PURE, so the
@@ -3901,8 +3992,9 @@ const MAX_STREAM_LINES: usize = 200_000;
 /// before this the client printed only the `OK <nbytes>` header and DISCARDED
 /// the body — the exact invocations the CHANGELOG advertises produced nothing.
 fn bytes_payload(verb: &str, request: &str) -> bool {
-    // Single-sourced (see `streams_payload`): only the BARE `cast`/`temporal`
-    // bodies are byte-framed; `cast frames` is line-framed, handled by framing_of.
+    // Single-sourced (see `streams_payload`): the bare `cast`/`temporal` bodies,
+    // `inbox get` and `outbox` are byte-framed; the sub-forms that are not
+    // (`cast frames`, `temporal status`, `outbox sent`) are handled by framing_of.
     aterm_types::control_verbs::framing_of(verb, request)
         == aterm_types::control_verbs::Framing::Bytes
 }

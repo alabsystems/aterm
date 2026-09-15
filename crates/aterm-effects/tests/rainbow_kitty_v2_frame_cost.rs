@@ -55,7 +55,7 @@ use std::{
 
 use aterm_effects::cursor_glow::{CursorGlow, Geom, GlowConfig, GlowStyle, SoundCue, band_pos};
 use aterm_effects::rainbow_kitty::{
-    CaretSeam, Config, Dir, Engine, Event, Frame, Licence, TypedClass,
+    CaretSeam, Config, Dir, Engine, Event, Frame, Licence, TypedClass, witness::WITNESS_ROWS,
 };
 use aterm_render::{BeamVertex, GlowQuad, RainHalo};
 
@@ -495,6 +495,12 @@ trait Driver {
     fn idle_probe(&self, now: Instant) -> IdleProbe;
     /// The streams the last tick wrote: `(under, out, halos)`.
     fn streams(&self) -> (&[GlowQuad], &[GlowQuad], &[RainHalo]);
+    /// Rows handed to the CONTENT WITNESS over this driver's life — the
+    /// non-vacuity witness for the seam below (a driver that feeds none
+    /// prices none of it). Zero for a driver that has no host seam.
+    fn witness_feeds(&self) -> u64 {
+        0
+    }
 }
 
 /// A replica of `rainbow_kitty::fingerprint` (private to the engine): the
@@ -704,6 +710,17 @@ struct Host {
     geom: Geom,
     quads: Vec<GlowQuad>,
     last_fp: u64,
+    /// THE CONTENT WITNESS's row, as LOCK A hands it over (2026-09-13): one
+    /// resident per-column sample the host captures under its terminal lock
+    /// and feeds before the tick. Every column carries a glyph, which is the
+    /// witness's WORST case — every ribbon cell arms a record and every
+    /// record is walked each frame. The glyphs never move, so nothing is ever
+    /// retired and the picture this gate prices is unchanged: the retirement
+    /// paths themselves are proven in `tests/abandoned_ribbon.rs`, and what is
+    /// priced here is the per-frame cost of the seam being WIRED, which the
+    /// gate paid nothing for while no scenario fed it a single row.
+    witness_row: Vec<char>,
+    witness_feeds: u64,
 }
 
 impl Host {
@@ -714,6 +731,8 @@ impl Host {
             geom: geometry(),
             quads: Vec::with_capacity(MAX_QUADS),
             last_fp: 0,
+            witness_row: vec!['x'; geometry().cols],
+            witness_feeds: 0,
         }
     }
 }
@@ -741,6 +760,26 @@ impl Driver for Host {
     }
 
     fn tick(&mut self, now: Instant, caret: (u16, u16)) -> Wrote {
+        // LOCK A's witness feed, in LOCK A's order: the caret row rides the
+        // probe the host already holds, then the rows the resident ribbon
+        // names are read beside it. The engine consumes them inside the tick
+        // below and takes the count to zero.
+        {
+            let Self {
+                glow, witness_row, ..
+            } = self;
+            glow.observe_ribbon_row(caret.0, witness_row);
+            let mut rows = [0u16; WITNESS_ROWS];
+            let n = glow.ribbon_rows(&mut rows);
+            let mut fed = 1u64;
+            for &r in &rows[..n] {
+                if r != caret.0 && usize::from(r) < geometry().rows {
+                    glow.observe_ribbon_row(r, witness_row);
+                    fed += 1;
+                }
+            }
+            self.witness_feeds += fed;
+        }
         let fp = self
             .glow
             .tick(Some(caret), now, &self.cfg, self.geom, &mut self.quads);
@@ -767,6 +806,10 @@ impl Driver for Host {
 
     fn streams(&self) -> (&[GlowQuad], &[GlowQuad], &[RainHalo]) {
         (self.glow.under_quads(), &self.quads, self.glow.halos())
+    }
+
+    fn witness_feeds(&self) -> u64 {
+        self.witness_feeds
     }
 }
 
@@ -828,6 +871,8 @@ struct Report {
     /// Allocations per WARM-UP pass, cold pass first — the one-time pool
     /// growth a fixed pool would not pay (see `measure`).
     warmup_allocs: Vec<usize>,
+    /// Rows the driver handed the content witness over the pass.
+    witness_feeds: u64,
 }
 
 impl Report {
@@ -976,6 +1021,7 @@ fn run(d: &mut dyn Driver, sc: &Scenario, t0: Instant, measured: bool) -> (Repor
     rep.us.sort_unstable();
     rep.fp_us.sort_unstable();
     rep.out_px.sort_unstable();
+    rep.witness_feeds = d.witness_feeds();
     (rep, now)
 }
 
@@ -1155,6 +1201,13 @@ fn rainbow_kitty_v2_steady_frames_allocate_nothing_and_idle_to_exactly_zero() {
             reds.push(format!(
                 "[{}] v2 allocated {} time(s) while idling out",
                 sc.name, r2.idle_allocs
+            ));
+        }
+        if engine_selected("v2s") && rs.witness_feeds == 0 {
+            reds.push(format!(
+                "[{}] the seam fed the CONTENT WITNESS nothing: this gate prices \
+                 none of `observe_ribbon_row` / `Engine::witness_rows`",
+                sc.name
             ));
         }
         if rs.allocs + rs.idle_allocs > 0 {

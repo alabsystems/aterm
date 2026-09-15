@@ -123,41 +123,158 @@ impl Drop for ApplyBudget {
     }
 }
 
-/// Bounded status-only run of a child that produces no output worth collecting —
+/// How much of a child's stderr [`status_bounded_with_stderr`] keeps: the LAST
+/// bytes, because a diagnostic is the last thing a failing copy prints.
+const STDERR_KEEP: usize = 512;
+
+/// Bounded run of a child whose stdout is worth nothing but whose STDERR is —
 /// today `ditto`, whose copy can legitimately run for minutes and therefore gets
 /// its own explicit `limit` rather than [`HELPER_TIMEOUT`] or the apply budget.
 ///
-/// Fails CLOSED exactly like [`output_bounded`]: a timeout is an `Err`, the child
-/// is killed and reaped, and the caller unwinds the half-made swap.
-pub(crate) fn status_bounded(
+/// A timeout is an `Err`. Termination and reaping use only a short reserve from
+/// the original budget; the typed internal result distinguishes an observed exit
+/// from unconfirmed cleanup so callers do not reclaim a live writer's paths.
+///
+/// The tail of stderr rides back with the status so a failure can say WHY
+/// (2026-09-14). `ditto` used to inherit the process stderr, so every failed
+/// extract reached the ledger as the bare "ditto zip extract failed (exit status:
+/// 1)" — the same line for a full disk, a corrupt archive and a read-only volume —
+/// and the machine re-downloaded on the backoff schedule with nothing to act on.
+///
+/// The stream is drained on its own thread, so a child that writes more than the
+/// pipe holds cannot wedge against this poll loop; only the tail is kept. The
+/// returned string is empty when the child said nothing.
+pub(crate) fn status_bounded_with_stderr(
     cmd: &mut Command,
     what: &str,
     limit: Duration,
-) -> Result<std::process::ExitStatus, String> {
-    use std::process::Stdio;
-    let mut child = cmd
-        .stdin(Stdio::null())
-        .spawn()
-        .map_err(|e| format!("spawn {what}: {e}"))?;
-    let deadline = Instant::now() + limit;
+) -> Result<(std::process::ExitStatus, String), String> {
+    status_bounded_with_stderr_observed(cmd, what, limit).map_err(|failure| failure.message)
+}
+
+/// Failure of an owned helper, including whether its absence was actually
+/// observed. A kill request alone is not an exit/reap witness.
+#[derive(Debug)]
+pub(crate) struct HelperFailure {
+    pub message: String,
+    pub writer_stopped: bool,
+}
+
+trait HelperChild {
+    fn request_kill(&mut self) -> std::io::Result<()>;
+    fn observe_exit(&mut self) -> std::io::Result<Option<std::process::ExitStatus>>;
+}
+
+impl HelperChild for std::process::Child {
+    fn request_kill(&mut self) -> std::io::Result<()> {
+        self.kill()
+    }
+    fn observe_exit(&mut self) -> std::io::Result<Option<std::process::ExitStatus>> {
+        self.try_wait()
+    }
+}
+
+fn stop_helper_before(child: &mut impl HelperChild, deadline: Instant) -> bool {
+    let _ = child.request_kill();
     loop {
-        match child.try_wait() {
-            Ok(Some(status)) => return Ok(status),
+        match child.observe_exit() {
+            Ok(Some(_)) => return true,
+            Err(_) => return false,
             Ok(None) => {
-                if Instant::now() >= deadline {
-                    let _ = child.kill();
-                    let _ = child.wait();
-                    return Err(format!(
-                        "{what} did not finish within {}s; treating as a failure",
-                        limit.as_secs()
-                    ));
-                }
                 let remaining = deadline.saturating_duration_since(Instant::now());
-                std::thread::sleep(HELPER_POLL.min(remaining));
+                if remaining.is_zero() {
+                    return false;
+                }
+                std::thread::sleep(Duration::from_millis(5).min(remaining));
             }
-            Err(e) => return Err(format!("wait for {what}: {e}")),
         }
     }
+}
+
+pub(crate) fn status_bounded_with_stderr_observed(
+    cmd: &mut Command,
+    what: &str,
+    limit: Duration,
+) -> Result<(std::process::ExitStatus, String), HelperFailure> {
+    use std::io::Read;
+    use std::process::Stdio;
+    let deadline = Instant::now() + limit;
+    let cleanup_reserve = Duration::from_millis(250).min(limit / 4);
+    let work_deadline = deadline - cleanup_reserve;
+    let cleanup_deadline = || deadline.min(Instant::now() + cleanup_reserve);
+    let mut child = cmd
+        .stdin(Stdio::null())
+        .stderr(Stdio::piped())
+        .spawn()
+        .map_err(|error| HelperFailure {
+            message: format!("spawn {what}: {error}"),
+            writer_stopped: true,
+        })?;
+    let drain = if let Some(mut stream) = child.stderr.take() {
+        let (tx, rx) = std::sync::mpsc::sync_channel(1);
+        let spawned = std::thread::Builder::new()
+            .name("update-helper-stderr".to_string())
+            .spawn(move || {
+                let mut tail: Vec<u8> = Vec::new();
+                let mut chunk = [0u8; 4096];
+                while let Ok(n) = stream.read(&mut chunk) {
+                    if n == 0 {
+                        break;
+                    }
+                    tail.extend_from_slice(&chunk[..n]);
+                    if tail.len() > STDERR_KEEP {
+                        let cut = tail.len() - STDERR_KEEP;
+                        tail.drain(..cut);
+                    }
+                }
+                let _ = tx.send(String::from_utf8_lossy(&tail).trim().to_string());
+            });
+        if let Err(error) = spawned {
+            return Err(HelperFailure {
+                message: format!("spawn {what} stderr drain: {error}"),
+                writer_stopped: stop_helper_before(&mut child, cleanup_deadline()),
+            });
+        }
+        Some(rx)
+    } else {
+        None
+    };
+    let status = loop {
+        let message = match child.try_wait() {
+            Ok(Some(status)) => break status,
+            Ok(None) => {
+                if Instant::now() < work_deadline {
+                    let remaining = work_deadline.saturating_duration_since(Instant::now());
+                    std::thread::sleep(HELPER_POLL.min(remaining));
+                    continue;
+                }
+                format!(
+                    "{what} did not finish within {}s; treating as a failure",
+                    limit.as_secs()
+                )
+            }
+            Err(error) => format!("wait for {what}: {error}"),
+        };
+        return Err(HelperFailure {
+            message,
+            writer_stopped: stop_helper_before(&mut child, cleanup_deadline()),
+        });
+    };
+    let stderr = match drain {
+        Some(rx) => rx
+            .recv_timeout(deadline.saturating_duration_since(Instant::now()))
+            .map_err(|error| HelperFailure {
+                message: format!("{what}: stderr did not finish within the helper budget: {error}"),
+                writer_stopped: true,
+            })?,
+        None => String::new(),
+    };
+    Ok((status, stderr))
+}
+
+/// The last non-empty line of a child's stderr, for an error message.
+pub(crate) fn last_stderr_line(stderr: &str) -> Option<&str> {
+    stderr.lines().rev().map(str::trim).find(|l| !l.is_empty())
 }
 
 /// Run a verification helper with a bounded wall clock, killing it on timeout.
@@ -209,7 +326,13 @@ pub fn probe_bundle_starts(app: &Path, expected_build: u64) -> Result<(), String
         ));
     }
     // …and it must be the build we are installing. A probe that starts SOME binary
-    // proves nothing about this one.
+    // proves nothing about this one. Since 2026-09-14 the candidate prints
+    // `build: <N>` (audit BA-8 — the identity line lost its number when versions
+    // moved to MAJOR.MINOR.0 and this clause had been dead), so the text itself
+    // answers for a current build; the bundle's own `CFBundleVersion`, which the
+    // codesign seal verified above ties to the very binary that just ran, stays
+    // as the identity for a candidate older than that (a yank rolling the channel
+    // back, a rollback sibling) and as the belt under the text.
     let text = String::from_utf8_lossy(&out.stdout);
     if !text.contains(&expected_build.to_string())
         && bundle_build_number(app).ok() != Some(expected_build)
@@ -582,12 +705,126 @@ mod tests {
         assert!(after >= before + Duration::from_secs(29));
     }
 
+    #[test]
+    fn helper_cleanup_requires_an_observed_exit_and_never_renews_the_deadline() {
+        use std::os::unix::process::ExitStatusExt;
+        let model = aterm_spec::ty_model! {
+            BoundedHelperCleanup {
+                const Buggy = 0;
+                var killed = 0;
+                var observed = 0;
+                var stopped = 0;
+                action Kill when (killed == 0) {
+                    killed = 1;
+                    stopped = if Buggy == 1 { 1 } else { 0 };
+                }
+                action ObserveExit when (killed == 1 && observed == 0) {
+                    observed = 1;
+                    stopped = 1;
+                }
+                action LoseWait when (killed == 1 && observed == 0) { observed = 2; }
+                invariant StopRequiresExit: stopped == 0 || observed == 1;
+            }
+        };
+        aterm_spec::verify::prove_and_catch_scalar(&model, "bounded helper cleanup");
+        struct FakeChild {
+            exit: u8,
+            kill_error: bool,
+            kills: usize,
+        }
+        impl HelperChild for FakeChild {
+            fn request_kill(&mut self) -> std::io::Result<()> {
+                self.kills += 1;
+                if self.kill_error {
+                    Err(std::io::Error::other("kill refused"))
+                } else {
+                    Ok(())
+                }
+            }
+            fn observe_exit(&mut self) -> std::io::Result<Option<std::process::ExitStatus>> {
+                match self.exit {
+                    1 => Ok(Some(std::process::ExitStatus::from_raw(0))),
+                    2 => Err(std::io::Error::other("wait failed")),
+                    _ => Ok(None),
+                }
+            }
+        }
+        for exit in 0..=2 {
+            for kill_error in [false, true] {
+                let mut child = FakeChild {
+                    exit,
+                    kill_error,
+                    kills: 0,
+                };
+                let started = Instant::now();
+                let stopped = stop_helper_before(&mut child, started + Duration::from_millis(15));
+                assert_eq!(child.kills, 1);
+                assert!(
+                    started.elapsed() < Duration::from_secs(1),
+                    "cleanup must not wait unboundedly after a failed kill"
+                );
+                let mut state = model.successors("Kill", &model.init_state())[0].clone();
+                if exit > 0 {
+                    let action = if exit == 1 { "ObserveExit" } else { "LoseWait" };
+                    state = model.successors(action, &state)[0].clone();
+                }
+                assert_eq!(state["stopped"], i64::from(stopped));
+                assert!(model.check_invariant("StopRequiresExit", &state));
+                if exit != 1 {
+                    // Historical inference: calling kill/wait was treated as
+                    // cleanup, even when neither had established an exit.
+                    state.insert("stopped", 1);
+                    assert!(!model.check_invariant("StopRequiresExit", &state));
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn timed_out_owned_helper_is_reaped_before_its_copy_path_is_reclaimable() {
+        let staging = crate::paths::Staging::scratch("owned-helper-reap");
+        let receipt = staging.root.join("child.pid");
+        let started = Instant::now();
+        let failure = status_bounded_with_stderr_observed(
+            Command::new("/bin/sh")
+                .arg("-c")
+                .arg(r#"printf '%s\n' "$$" > "$1"; exec /bin/sleep 30"#)
+                .arg("owned-helper-fixture")
+                .arg(&receipt),
+            "owned copy fixture",
+            Duration::from_secs(2),
+        )
+        .unwrap_err();
+        assert!(started.elapsed() < Duration::from_secs(5));
+        assert!(failure.message.contains("did not finish"), "{failure:?}");
+        assert!(failure.writer_stopped, "{failure:?}");
+        let pid: i32 = std::fs::read_to_string(&receipt)
+            .unwrap()
+            .trim()
+            .parse()
+            .unwrap();
+        // Signal zero only queries this fixture's recorded process; it sends no signal.
+        assert_eq!(unsafe { libc::kill(pid, 0) }, -1);
+        assert_eq!(
+            std::io::Error::last_os_error().raw_os_error(),
+            Some(libc::ESRCH)
+        );
+        let absent = status_bounded_with_stderr_observed(
+            &mut Command::new(staging.root.join("no-such-helper")),
+            "absent helper",
+            Duration::from_secs(2),
+        )
+        .unwrap_err();
+        assert!(absent.writer_stopped, "a refused spawn created no writer");
+        let _ = std::fs::remove_dir_all(staging.root);
+    }
+
     /// `ditto` was the one child on the apply path with no ceiling at all.
     #[cfg(unix)]
     #[test]
     fn status_bounded_kills_a_child_that_overruns() {
         let started = Instant::now();
-        let error = status_bounded(
+        let error = status_bounded_with_stderr(
             Command::new("/bin/sleep").arg("30"),
             "a copy that never finishes",
             Duration::from_millis(150),
@@ -595,6 +832,57 @@ mod tests {
         .expect_err("an overrunning copy must fail, not hang");
         assert!(error.contains("did not finish"), "{error}");
         assert!(started.elapsed() < Duration::from_secs(5));
+    }
+
+    /// The TAIL of the child's stderr comes back with its status (2026-09-14, audit
+    /// SV-3): a failing `ditto` used to reach the ledger as its bare exit code. A
+    /// child that floods stderr is drained past the pipe's capacity rather than
+    /// wedged against the poll loop, and only its last bytes are kept.
+    #[cfg(unix)]
+    #[test]
+    fn status_bounded_keeps_the_tail_of_stderr_without_wedging_on_a_flood() {
+        let (status, stderr) = status_bounded_with_stderr(
+            Command::new("/bin/sh")
+                .arg("-c")
+                .arg("echo 'first line' >&2; echo 'ditto: No space left on device' >&2; exit 1"),
+            "a copy that fails",
+            Duration::from_secs(5),
+        )
+        .expect("the child ran");
+        assert!(!status.success());
+        assert_eq!(
+            last_stderr_line(&stderr),
+            Some("ditto: No space left on device"),
+            "{stderr:?}"
+        );
+
+        // A flood: 1 MiB of stderr, far past the 64 KiB pipe, then a clean exit.
+        let started = Instant::now();
+        let (status, stderr) = status_bounded_with_stderr(
+            Command::new("/bin/sh")
+                .arg("-c")
+                .arg("i=0; while [ $i -lt 16384 ]; do echo 'a line of stderr noise, sixty-four bytes long, give or take..' >&2; i=$((i+1)); done; echo 'the last line' >&2"),
+            "a chatty copy",
+            Duration::from_secs(20),
+        )
+        .expect("a chatty child must not wedge the poll loop");
+        assert!(status.success());
+        assert!(
+            stderr.len() <= STDERR_KEEP,
+            "only the tail is kept: {}",
+            stderr.len()
+        );
+        assert_eq!(last_stderr_line(&stderr), Some("the last line"));
+        assert!(started.elapsed() < Duration::from_secs(15));
+
+        // Silence is an empty tail, not a failure.
+        let (status, stderr) = status_bounded_with_stderr(
+            &mut Command::new("/usr/bin/true"),
+            "a quiet copy",
+            Duration::from_secs(5),
+        )
+        .expect("ran");
+        assert!(status.success() && stderr.is_empty() && last_stderr_line(&stderr).is_none());
     }
 
     #[test]

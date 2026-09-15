@@ -73,12 +73,12 @@ pub enum StageError {
     /// refusing the image. Names the field or tool, so a mis-authored row fails fast on
     /// the authoring machine.
     Payload(String),
-    /// This installer is provenance-tracked and the untracked staging lane could not run
-    /// (the string is [`crate::lay::tracked_refusal`]: why, what the tag breaks, and the
-    /// two ways out). Refused rather than laid: a bundle every executable of which carries
-    /// `com.apple.provenance` is the v0.83.0 shape, and nothing on disk would have said
-    /// so. `ATPKG_ALLOW_TRACKED_INSTALL=1` turns this into an in-process stage RECORDED
-    /// beside the build ([`crate::store::record_tracked_install`]).
+    /// This installer is provenance-tracked, the untracked staging lane could not run,
+    /// and `ATPKG_REFUSE_TRACKED_INSTALL=1` asked for a refusal instead of the default —
+    /// an in-process stage RECORDED beside the build
+    /// ([`crate::store::record_tracked_install`]). The string is
+    /// [`crate::lay::tracked_refusal`]: why the lane failed, what the tag breaks, and the
+    /// way out.
     TrackedInstaller(String),
 }
 
@@ -189,8 +189,8 @@ pub fn verify_and_stage(
 
 /// [`verify_and_stage`] with the untracked lane's three inputs explicit — whether this
 /// process is tracked, which binary would serve the lane, and the policy when it cannot
-/// — so the refusal, the escape hatch and the record beside the build are each provable
-/// from a test that is not itself in a position to be tracked.
+/// — so the recorded in-process stage, the opt-in refusal and the record beside the
+/// build are each provable from a test that is not itself in a position to be tracked.
 pub fn verify_and_stage_with(
     artifact: &Artifact,
     archive: &Path,
@@ -286,7 +286,7 @@ pub fn verify_and_stage_with(
         return Err(StageError::Io(e));
     }
 
-    // 4b. THE RECORD. A tree a tracked installer laid in-process under the escape hatch
+    // 4b. THE RECORD. A tree a tracked installer laid in-process because its lane could not run
     //     is written down beside the build (`<build>.tracked-install`, a sibling like
     //     `.ready`, outside the hashed tree) BEFORE the build is marked complete: a
     //     record that could not be written leaves the build unmarked — re-stageable, and
@@ -405,8 +405,8 @@ impl StageSpec {
 }
 
 /// What [`stage_for_store_with`] laid: the folded `tree_root`, and — when a tracked
-/// installer laid it in-process under `ATPKG_ALLOW_TRACKED_INSTALL=1`, or kept a lane's
-/// tree that came back tagged — the reason, to be recorded beside the build.
+/// installer laid it in-process because its lane could not run, or kept a lane's tree
+/// that came back tagged — the reason, to be recorded beside the build.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct StagedTree {
     /// The folded `tree_root`.
@@ -471,10 +471,10 @@ pub fn decide_tracked_stage(
 /// otherwise tag every executable it lays down, and a tagged `trustc` cannot cut a
 /// release (v0.83.0, 2026-09-12). An untracked installer takes exactly the path it always
 /// took, as does a binary with no lane ([`crate::lay::Lane::Unavailable`]: a test harness
-/// — a fact about the binary, not a failure). A tracked one whose lane fails is refused
-/// under [`crate::lay::TrackedPolicy::Refuse`] (the default) with
-/// [`StageError::TrackedInstaller`], or staged in-process and RECORDED under `Allow`
-/// (`ATPKG_ALLOW_TRACKED_INSTALL=1`). The decision table is [`decide_tracked_stage`].
+/// — a fact about the binary, not a failure). A tracked one whose lane fails is staged
+/// in-process and RECORDED under [`crate::lay::TrackedPolicy::Allow`] (the default), or
+/// refused with [`StageError::TrackedInstaller`] under `Refuse`
+/// (`ATPKG_REFUSE_TRACKED_INSTALL=1`). The decision table is [`decide_tracked_stage`].
 ///
 /// On `Err`, `incoming` is left empty for the caller to remove.
 pub fn stage_for_store_with(
@@ -516,10 +516,10 @@ pub fn stage_for_store_with(
         }),
         LaneDecision::InProcessRecorded(why) => {
             eprintln!(
-                "atpkg: note — this installer is provenance-tracked and {why}; \
-                 {} is set, so the bundle is staged in-process and WILL carry \
-                 com.apple.provenance — recorded beside the build for `aterm pkg doctor`",
-                crate::lay::ALLOW_TRACKED_ENV
+                "atpkg: note — this installer is provenance-tracked and {why}; the bundle \
+                 is staged in-process and WILL carry com.apple.provenance — recorded \
+                 beside the build for `aterm pkg doctor`; {}=1 refuses instead",
+                crate::lay::REFUSE_TRACKED_ENV
             );
             Ok(StagedTree {
                 root: stage_payload(artifact, archive, incoming)?,
@@ -1151,10 +1151,10 @@ mod tests {
     }
 
     /// The decision table behind a tracked installer's stage, every cell: a clean lane
-    /// keeps; a lane that could not run refuses by default and stages in-process
-    /// (recorded) under `Allow`; a lane whose tree came back tagged refuses by default
-    /// and keeps that tree (recorded) under `Allow` — never a second extraction that
-    /// would only produce another tagged tree.
+    /// keeps; a lane that could not run stages in-process (recorded) under `Allow`, the
+    /// default, and refuses under `Refuse`; a lane whose tree came back tagged keeps
+    /// that tree (recorded) under `Allow` — never a second extraction that would only
+    /// produce another tagged tree — and refuses under `Refuse`.
     #[test]
     fn the_tracked_stage_decision_table_is_complete() {
         use crate::lay::TrackedPolicy::{Allow, Refuse};
@@ -1188,7 +1188,7 @@ mod tests {
             LaneDecision::Refuse(msg) => {
                 assert!(msg.contains("could not stage the bundle"), "{msg}");
                 assert!(msg.contains("exited without a result"), "{msg}");
-                assert!(msg.contains(crate::lay::ALLOW_TRACKED_ENV), "{msg}");
+                assert!(msg.contains(crate::lay::REFUSE_TRACKED_ENV), "{msg}");
             }
             other => panic!("{other:?}"),
         }
@@ -1216,13 +1216,13 @@ mod tests {
 
     /// The failure path, with a helper BROKEN ON PURPOSE (`/usr/bin/true` under the name
     /// `atpkg`: spelled right, answers nothing) and the tracking measurement forced:
-    /// by default the stage is REFUSED — nothing installed, no marker, no record, the
-    /// refusal naming the cause and the escape hatch; under `Allow` it installs, marks
-    /// the build complete and RECORDS the cause beside it; and a later clean stage of the
-    /// same build number clears the record.
+    /// under `Refuse` the stage is REFUSED — nothing installed, no marker, no record, the
+    /// refusal naming the cause and the knob; under `Allow` (the default) it installs,
+    /// marks the build complete and RECORDS the cause beside it; and a later clean stage
+    /// of the same build number clears the record.
     #[cfg(target_os = "macos")]
     #[test]
-    fn a_tracked_installer_whose_lane_fails_refuses_by_default_and_records_under_allow() {
+    fn a_tracked_installer_whose_lane_fails_refuses_under_refuse_and_records_under_allow() {
         use crate::lay::{Lane, TrackedPolicy};
         let d = tmp("tracked-refuse");
         let archive = make_archive(&d);
@@ -1240,19 +1240,22 @@ mod tests {
         std::fs::copy("/usr/bin/true", &fake).unwrap();
         let broken = Lane::Helper(fake);
 
-        // Default: refused.
+        // `Refuse` opted into: refused.
         let err = verify_and_stage_with(&a, &archive, &build, true, &broken, TrackedPolicy::Refuse)
-            .expect_err("a tracked installer with a broken lane must refuse");
+            .expect_err("a tracked installer with a broken lane must refuse under Refuse");
         let msg = err.to_string();
         assert!(matches!(err, StageError::TrackedInstaller(_)), "{err:?}");
         assert!(msg.contains("provenance-tracked"), "{msg}");
         assert!(msg.contains("could not stage the bundle"), "{msg}");
         assert!(msg.contains("exited without a result"), "the cause: {msg}");
         assert!(
-            msg.contains("ATPKG_ALLOW_TRACKED_INSTALL=1"),
-            "the hatch: {msg}"
+            msg.contains("ATPKG_REFUSE_TRACKED_INSTALL"),
+            "the knob that refused: {msg}"
         );
-        assert!(msg.contains("launchctl submit"), "the other way out: {msg}");
+        assert!(
+            !msg.contains("launchctl submit"),
+            "the looping remedy is gone: {msg}"
+        );
         assert!(!build.exists(), "nothing installed");
         assert!(!crate::store::build_is_complete(&build));
         assert_eq!(crate::store::tracked_install_record(&build), None);
@@ -1266,9 +1269,10 @@ mod tests {
             "no incoming scratch left: {scratch_left:?}"
         );
 
-        // Escape hatch: installed, complete, RECORDED.
+        // The default: installed, complete, RECORDED.
+        assert_eq!(crate::lay::tracked_policy_of(None), TrackedPolicy::Allow);
         verify_and_stage_with(&a, &archive, &build, true, &broken, TrackedPolicy::Allow)
-            .expect("the escape hatch stages in-process");
+            .expect("the default stages in-process");
         assert!(build.join("bin/ay").is_file());
         assert!(crate::store::build_is_complete(&build));
         let why = crate::store::tracked_install_record(&build).expect("the cause is recorded");

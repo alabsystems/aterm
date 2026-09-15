@@ -119,6 +119,15 @@ mod bundle;
 #[cfg(target_os = "macos")]
 mod cadence;
 #[cfg(target_os = "macos")]
+mod check_lane;
+#[cfg(target_os = "macos")]
+mod check_receipt;
+/// The 2026-09-14 multi-process coordination audit's failing tests (checker gate
+/// vs. the apply lane's ledger writes, a future-dated stamp, cross-build streak
+/// expiry). Kept in their own file so the audit's laws read as one document.
+#[cfg(all(test, target_os = "macos"))]
+mod coordination_audit_tests;
+#[cfg(target_os = "macos")]
 mod github;
 #[cfg(target_os = "macos")]
 mod health;
@@ -141,6 +150,9 @@ mod status;
 mod sys;
 #[cfg(target_os = "macos")]
 mod verify;
+// Check-channel audit (2026-09-14): failing tests for the cross-process checker gate.
+#[cfg(all(test, target_os = "macos"))]
+mod check_channel_audit_tests;
 // Not macOS-only: every platform names the copy of aterm it is running (S12 of
 // `docs/DESIGN-which-copy-runs-2026-08-27.md`); only the other-copy probe is `.app`-shaped.
 pub mod which_copy;
@@ -186,12 +198,59 @@ fn read_ledger_text(path: &std::path::Path) -> Option<String> {
 /// The resolved GitHub release source plus the compiled-in default owner/repo, all
 /// re-exported VERBATIM from [`aterm_update_core`]. These are pure re-exports, not
 /// wrappers: the GUI calls `aterm_update::Source::resolve(cfg_owner, cfg_repo)` and
-/// threads the resulting `Source` into [`spawn_background_check`], so the type it
+/// supplies the resulting `Source` through [`spawn_background_check_with_source`], so the type it
 /// passes must be the very same `aterm_update_core::Source` the inherent `resolve`
 /// (carrying aterm's compiled-in `alabsystems`/`aterm` channel defaults + the
 /// `ATERM_UPDATE_OWNER`/`_REPO`
 /// env keys) is defined on. A newtype here would break that call site.
 pub use aterm_update_core::{DEFAULT_OWNER, DEFAULT_REPO, Source};
+
+/// Startup channel retained for callers of the legacy configured-source API.
+/// The GUI's live checks use their current config snapshot and its background
+/// checker samples [`SourceProvider`]; this fallback cannot override those.
+static CONFIGURED_SOURCE: std::sync::OnceLock<Source> = std::sync::OnceLock::new();
+
+/// Record the legacy startup source. First call wins; later calls are ignored.
+/// Hosts needing config reloads use [`SourceProvider`] instead.
+pub fn set_configured_source(source: Source) {
+    let _ = CONFIGURED_SOURCE.set(source);
+}
+
+/// The recorded startup source, or env-plus-default resolution when unset.
+/// This compatibility API does not query a running GUI's current config.
+#[must_use]
+pub fn configured_source() -> Source {
+    CONFIGURED_SOURCE
+        .get()
+        .cloned()
+        .unwrap_or_else(|| Source::resolve(None, None))
+}
+
+#[cfg(test)]
+mod configured_source_tests {
+    use super::{Source, configured_source, set_configured_source};
+
+    /// The compatibility startup source remains first-wins: unset, the
+    /// env-plus-default rule; set, the caller's initial source. The GUI's live
+    /// config provider is independent of this retained API.
+    /// (The only test in this binary that touches the process-global.)
+    #[test]
+    fn the_configured_source_is_the_loops_and_the_first_setting_stands() {
+        assert_eq!(configured_source(), Source::resolve(None, None));
+        let private = Source {
+            owner: "private-org".to_string(),
+            repo: "aterm-fork".to_string(),
+        };
+        set_configured_source(private.clone());
+        assert_eq!(configured_source(), private);
+        set_configured_source(Source::resolve(None, None));
+        assert_eq!(
+            configured_source(),
+            private,
+            "a later setting does not move the channel under a running loop"
+        );
+    }
+}
 pub use progress::{Progress, ProgressNotify, set_progress_observer};
 
 /// Re-exported for every OTHER lane that re-launches aterm forwarding its own
@@ -332,7 +391,31 @@ pub fn update_pubkey_sha256(encoded: &str) -> Result<Option<String>, String> {
 /// 64 lowercase hex, `empty`, or `invalid`.
 #[must_use]
 pub fn compiled_update_pin_sha256() -> String {
-    match update_pubkey_sha256(PINNED_UPDATE_PUBKEY) {
+    fingerprint_state(PINNED_UPDATE_PUBKEY)
+}
+
+/// The PAPER MASTER's fingerprint (2026-09-14): SHA-256 of the raw 32 bytes of
+/// `pins::PAPER_MASTER_PUBKEYS[0]`, the same shape as [`compiled_update_pin_sha256`]
+/// — `empty` when the roster tier is unarmed, `invalid` for a malformed pin.
+///
+/// With the master ARMED it is the anchor that authorizes every release
+/// (`github::fetch_authoritative_release`, branch B); `update_pin_sha256` names K1,
+/// which such a build never consults. After a master rotation a stranded client
+/// could not be told from a healthy one by anything it printed. This is the field
+/// that says which master a build trusts; `update_pin_sha256` is unchanged, since
+/// the cutter's Mach-O `__aterm_upin` proof depends on it.
+#[must_use]
+pub fn compiled_master_pin_sha256() -> String {
+    fingerprint_state(
+        aterm_update_core::pins::PAPER_MASTER_PUBKEYS
+            .first()
+            .copied()
+            .unwrap_or(""),
+    )
+}
+
+fn fingerprint_state(encoded: &str) -> String {
+    match update_pubkey_sha256(encoded) {
         Ok(Some(fingerprint)) => fingerprint,
         Ok(None) => "empty".to_string(),
         Err(_) => "invalid".to_string(),
@@ -443,6 +526,20 @@ pub fn apply_staged_if_ready_preserving_fds_exact(
 /// `install::preverify_installed_rollback_source` for why the second half is
 /// not optional.
 #[cfg(target_os = "macos")]
+/// The one law for "this refusal is a person's to clear": the INSTALLED bundle
+/// cannot be the swap's rollback source (`install::rollback_source_refusal`), so
+/// no lane can apply anything until the bundle is changed (2026-09-14).
+#[cfg(target_os = "macos")]
+pub fn refusal_needs_person(reason: &str) -> bool {
+    install::is_rollback_source_refusal(reason)
+        || reason.contains("does not run from an installed bundle")
+}
+
+#[cfg(not(target_os = "macos"))]
+pub fn refusal_needs_person(_reason: &str) -> bool {
+    false
+}
+
 pub fn preverify_staged_for_handoff(
     current_build: u64,
     current_commit: Option<&str>,
@@ -1007,8 +1104,8 @@ pub type StagedNotify = Box<dyn Fn(u64, String) + Send>;
 /// this seam; the mutex ensures older callers cannot create a second concurrent
 /// download/verify transaction underneath it.
 #[cfg(target_os = "macos")]
-fn check_lane() -> &'static std::sync::Mutex<()> {
-    static LANE: std::sync::Mutex<()> = std::sync::Mutex::new(());
+fn check_lane() -> &'static check_lane::Lane {
+    static LANE: check_lane::Lane = check_lane::Lane::new();
     &LANE
 }
 
@@ -1042,9 +1139,214 @@ fn persistent_notice_is_owed(announced: Option<&str>, class: Option<&str>) -> bo
     class.is_some_and(|class| persistent_notice_is_new(announced, class))
 }
 
+/// The `title` [`HealthNotify`] is called with when a persistent failure is first
+/// announced: the loud one, owed an OS notification and a standing row.
+pub const HEALTH_FAILING_TITLE: &str = "aterm auto-update is failing";
+
+/// The `title` [`HealthNotify`] is called with when the class this process ALREADY
+/// announced is still failing and its count has moved (2026-09-14): the standing row
+/// restates its number and no notification is owed — the person was told. The body
+/// is the same sentence the announcement carried, with the new count.
+///
+/// Before this the count a person read was frozen at the announcement for the life
+/// of the process: the bar said "3 consecutive checks since …" all day while
+/// `health.toml` climbed to 6 (it moved once, because a SECOND process announced).
+/// The row could always be rewritten in place; nothing ever asked it to.
+pub const HEALTH_RESTATED_TITLE: &str = "aterm auto-update still failing";
+
+/// What the check loop tells the GUI about the ledger's health, decided from the
+/// SHARED ledger on EVERY cycle (2026-09-14) — a cycle this process skipped
+/// because a sibling had already checked reads the same evidence as one it ran.
+///
+/// Before this the block lived after the network check only, so the skip path
+/// (`checker_skip_at`) bypassed it: on 2026-09-13 the apply streak crossed the
+/// 30-minute gate at 23:12:50, the GUI's next two cycles were skips, and the
+/// notice fired at 00:12:34 — an hour late on a one-process machine, and for as
+/// long as the GUI keeps losing the window's race with several sessions alive.
+/// The recovery line (the standing row leaving) was gated the same way.
+#[cfg(target_os = "macos")]
+struct HealthAnnouncer {
+    /// The clock at thread start: a streak whose latest failure predates this
+    /// process is history, not news, and never re-notifies on every launch.
+    started: String,
+    /// The class this process announced and the count it spoke; `None` = none yet.
+    /// Keyed on the class (not a bool) so a second stranded lane still speaks, and
+    /// carrying the count so a moved count restates without re-notifying.
+    announced: Option<(&'static str, u32)>,
+}
+
+#[cfg(target_os = "macos")]
+impl HealthAnnouncer {
+    fn new(started: String) -> Self {
+        Self {
+            started,
+            announced: None,
+        }
+    }
+
+    /// The `(title, body)` owed to the GUI for the ledger as it stands at `now`,
+    /// or `None`. Pure over the ledger so the law is testable without a thread.
+    fn tick(
+        &mut self,
+        h: &health::Health,
+        now: &str,
+        current_build: u64,
+    ) -> Option<(String, String)> {
+        let active = h.last_failure_at.as_str() >= self.started.as_str();
+        // DURATION gate beside the count gate: at the immediate-update cadence three
+        // consecutive failures span ~4 minutes — a blip, not the "pipeline is
+        // broken" signal the loud notice promises. Require the streak to have
+        // PERSISTED (>= 30 min of failing) like it inherently did at the old 6h
+        // cadence.
+        //
+        // MEASURED ON THE ESCALATING CLASS'S OWN CLOCK. `failing_since` is any-class:
+        // it is stamped by the FIRST class to break and is deliberately never cleared
+        // while an apply streak survives (`Health::record_success`). Reading the gate
+        // from it meant a single stale apply failure from days ago backdated every
+        // later streak, so a four-minute manifest blip cleared a thirty-minute gate
+        // the instant it crossed the count — firing the loud notice for exactly the
+        // transient this gate exists to swallow, and dating it days before the
+        // problem existed.
+        let escalated = h.persistent_class();
+        let long_lived = escalated.is_some_and(|(class, _)| {
+            install::rfc3339_delta_secs(h.class_since(class), now).is_some_and(|d| d >= 30 * 60)
+        });
+        if let Some((class, count)) = escalated
+            && active
+            && long_lived
+        {
+            let announced_class = self.announced.map(|(c, _)| c);
+            if persistent_notice_is_owed(announced_class, Some(class)) {
+                self.announced = Some((class, count));
+                return Some(persistent_failure_notice(class, count, h, current_build));
+            }
+            if self.announced != Some((class, count)) {
+                // The same class, a moved count: restate quietly.
+                self.announced = Some((class, count));
+                let (_, body) = persistent_failure_notice(class, count, h, current_build);
+                return Some((HEALTH_RESTATED_TITLE.to_string(), body));
+            }
+            return None;
+        }
+        if !h.is_persistent() && self.announced.take().is_some() {
+            // All healed → any class may speak again. A failure THIS process
+            // reported gets its recovery reported too, once, so the standing
+            // pull-down row can leave.
+            return Some((HEALTH_RECOVERED_TITLE.to_string(), String::new()));
+        }
+        None
+    }
+}
+
+/// The loud notice for the class that escalated, as `(title, body)` — the words the
+/// pull-down row, the OS notification and the app log all carry.
+///
+/// The COUNT and the sentence both come from the class that escalated. A single
+/// hardcoded pipeline story told an apply-stranded machine "0 consecutive checks …
+/// cannot be downloaded" — wrong number, wrong lane, and it sent the reader hunting
+/// a download fault that did not exist.
+#[cfg(target_os = "macos")]
+fn persistent_failure_notice(
+    class: &str,
+    count: u32,
+    h: &health::Health,
+    current_build: u64,
+) -> (String, String) {
+    let cause = match class {
+        // A stranded client (2026-09-14): the reason already names the anchor and
+        // the reinstall, and "until it is republished" would be false — no release
+        // the publisher cuts can be verified by this build.
+        "manifest" if github::is_stale_anchor_refusal(&h.last_error) => format!(
+            "{} — this machine stays on build {current_build} until it is reinstalled",
+            h.last_error
+        ),
+        "manifest" => format!(
+            "the newest release cannot be trusted ({}) — this machine stays on build \
+             {current_build} until it is republished",
+            h.last_error
+        ),
+        "stage" => format!(
+            "updates download but will not verify or install ({})",
+            h.last_error
+        ),
+        "apply" => format!(
+            "an update is downloaded and verified but will not start ({})",
+            h.last_apply_error
+        ),
+        // "pipeline", and any future class, keeps the original text.
+        _ => "release manifests exist but cannot be downloaded — this build's update \
+              pipeline is likely broken"
+            .to_string(),
+    };
+    // The noun names the lane the count came from (2026-09-14): an apply streak
+    // is failed APPLIES of a build every check fetched fine — "3 consecutive
+    // checks" sent the owner after a download fault that did not exist.
+    let counted = if class == "apply" {
+        "failed applies"
+    } else {
+        "checks"
+    };
+    (
+        HEALTH_FAILING_TITLE.to_string(),
+        format!(
+            "{count} consecutive {counted} since {}: {cause}. Run `aterm-ctl update status` \
+             for details.",
+            h.class_since(class)
+        ),
+    )
+}
+
 #[cfg(all(test, target_os = "macos"))]
 mod persistent_notice_tests {
     use super::persistent_notice_is_new;
+
+    /// THE OWNER'S PULL-DOWN ON 2026-09-14 (aterm.log 1789369954): "aterm auto-update
+    /// is failing — 3 consecutive checks since 2026-09-14T05:42:50Z: an update is
+    /// downloaded and verified but will not start (…)". Every CHECK that day
+    /// succeeded (health.toml: network/pipeline/manifest/stage streaks 0, kind =
+    /// "apply", failing_applies = 6). The count is the APPLY streak — three automatic
+    /// apply attempts — and the sentence calls them checks, which sends the reader
+    /// after a check fault that does not exist. The apply class must count what it
+    /// counts.
+    #[test]
+    fn observability_audit_an_apply_class_notice_counts_applies_not_checks() {
+        let ledger = super::health::Health {
+            apply_failures: 3,
+            apply_since: "2026-09-14T05:42:50Z".to_string(),
+            kind: "apply".to_string(),
+            last_apply_error: "installed bundle failed pre-park verification: the installed \
+                               bundle at /Applications/aterm.app cannot be the rollback \
+                               source the swap installs"
+                .to_string(),
+            ..super::health::Health::default()
+        };
+        let (title, body) = super::persistent_failure_notice("apply", 3, &ledger, 1789276245);
+        assert_eq!(title, "aterm auto-update is failing");
+        assert!(
+            !body.contains("consecutive checks"),
+            "an apply streak is not a run of failed checks — every check that day \
+             succeeded: {body}"
+        );
+        assert!(
+            body.contains("3 consecutive") && body.contains("appl"),
+            "the count must name the lane it counts (applies/attempts to apply): {body}"
+        );
+        assert!(
+            body.contains("2026-09-14T05:42:50Z"),
+            "dated by the apply class's own clock: {body}"
+        );
+        // The acquisition classes really are checks, and keep saying so.
+        let pipeline = super::health::Health {
+            pipeline_failures: 20,
+            pipeline_since: "2026-08-27T22:04:36Z".to_string(),
+            ..super::health::Health::default()
+        };
+        let (_, body) = super::persistent_failure_notice("pipeline", 20, &pipeline, 1);
+        assert!(
+            body.starts_with("20 consecutive checks since 2026-08-27T22:04:36Z"),
+            "{body}"
+        );
+    }
 
     #[test]
     fn a_second_persistent_class_still_speaks_while_the_announced_one_stays_quiet() {
@@ -1070,6 +1372,95 @@ mod persistent_notice_tests {
             "and a class that is escalating again after healing is a new episode"
         );
     }
+
+    /// THE STANDING ROW'S COUNT FOLLOWS THE LEDGER (2026-09-14, audit OBS-3): the
+    /// announced class restates its number through [`HEALTH_RESTATED_TITLE`] when the
+    /// count moves — no second loud notice — and speaks the loud title again only for
+    /// a different class or a new episode after healing. And the whole decision is a
+    /// pure function of the ledger, which is what lets the loop ask it on a skipped
+    /// cycle too (COORD-3).
+    #[test]
+    fn the_announcer_restates_a_moved_count_quietly_and_re_announces_only_a_new_class() {
+        use super::health::Health;
+        let started = "2026-09-13T22:00:00Z".to_string();
+        let mut announcer = super::HealthAnnouncer::new(started);
+        let ledger = |apply_failures: u32, last: &str| Health {
+            apply_failures,
+            apply_since: "2026-09-13T22:40:00Z".to_string(),
+            last_failure_at: last.to_string(),
+            kind: "apply".to_string(),
+            last_apply_error: "the successor died".to_string(),
+            ..Health::default()
+        };
+        // Not yet 30 minutes on the class's clock: nothing.
+        assert!(
+            announcer
+                .tick(
+                    &ledger(3, "2026-09-13T22:50:00Z"),
+                    "2026-09-13T23:00:00Z",
+                    7
+                )
+                .is_none()
+        );
+        // Past the gate: the loud announcement, once.
+        let (title, body) = announcer
+            .tick(
+                &ledger(3, "2026-09-13T23:12:50Z"),
+                "2026-09-13T23:13:44Z",
+                7,
+            )
+            .expect("the first escalation is announced");
+        assert_eq!(title, super::HEALTH_FAILING_TITLE);
+        assert!(body.starts_with("3 consecutive failed applies"), "{body}");
+        // Same class, same count: silence.
+        assert!(
+            announcer
+                .tick(
+                    &ledger(3, "2026-09-13T23:12:50Z"),
+                    "2026-09-13T23:37:45Z",
+                    7
+                )
+                .is_none()
+        );
+        // Same class, the count moved: a QUIET restate carrying the new number.
+        let (title, body) = announcer
+            .tick(
+                &ledger(6, "2026-09-14T00:10:00Z"),
+                "2026-09-14T00:12:34Z",
+                7,
+            )
+            .expect("a moved count is restated");
+        assert_eq!(title, super::HEALTH_RESTATED_TITLE);
+        assert!(body.starts_with("6 consecutive failed applies"), "{body}");
+        // A failure that predates this process is history: no restate for it.
+        let mut fresh = super::HealthAnnouncer::new("2026-09-14T01:00:00Z".to_string());
+        assert!(
+            fresh
+                .tick(
+                    &ledger(6, "2026-09-14T00:10:00Z"),
+                    "2026-09-14T01:05:00Z",
+                    7
+                )
+                .is_none()
+        );
+        // Healed: the recovery line, once, then nothing.
+        let healed = Health::default();
+        let (title, body) = announcer
+            .tick(&healed, "2026-09-14T02:00:00Z", 7)
+            .expect("a failure this process reported gets its recovery reported");
+        assert_eq!(title, super::HEALTH_RECOVERED_TITLE);
+        assert!(body.is_empty());
+        assert!(announcer.tick(&healed, "2026-09-14T02:01:00Z", 7).is_none());
+        // A new episode after healing speaks the loud title again.
+        let (title, _) = announcer
+            .tick(
+                &ledger(3, "2026-09-14T03:30:00Z"),
+                "2026-09-14T03:31:00Z",
+                7,
+            )
+            .expect("a new episode is news");
+        assert_eq!(title, super::HEALTH_FAILING_TITLE);
+    }
 }
 
 /// Spawn the background update check + stage on a detached thread. Returns
@@ -1088,6 +1479,29 @@ pub fn spawn_background_check(
     notify: Option<HealthNotify>,
     on_staged: Option<StagedNotify>,
 ) {
+    spawn_background_check_with_source(
+        current_build,
+        std::sync::Arc::new(move || Some(source.clone())),
+        notify,
+        on_staged,
+    );
+}
+
+/// Supplies the current configured channel at the start of each background cycle.
+/// The callback runs on the checker thread and must return within a bounded time.
+/// `None` skips network work and retries the provider in five seconds (once-only
+/// mode stops); a running check retains its source snapshot.
+pub type SourceProvider = std::sync::Arc<dyn Fn() -> Option<Source> + Send + Sync>;
+
+/// The same single background checker, sampling its source before each cycle so
+/// configuration reloads take effect without restarting the process.
+#[cfg(target_os = "macos")]
+pub fn spawn_background_check_with_source(
+    current_build: u64,
+    source_provider: SourceProvider,
+    notify: Option<HealthNotify>,
+    on_staged: Option<StagedNotify>,
+) {
     if !enabled() {
         return;
     }
@@ -1097,10 +1511,6 @@ pub fn spawn_background_check(
     if bundle::resolve().is_none() {
         return;
     }
-    log(&format!(
-        "checking github.com/{}/{} for updates",
-        source.owner, source.repo
-    ));
     std::thread::Builder::new()
         .name("aterm-update".into())
         .spawn(move || {
@@ -1142,14 +1552,27 @@ pub fn spawn_background_check(
             // requires the streak's latest failure to postdate this thread (RFC3339
             // strings compare chronologically), so a stale streak from a build that
             // isn't even checking any more (e.g. no token) stays quiet.
-            let started = install::now_rfc3339();
-            // KEYED on the class that was announced, not a bare bool. As a bool this
-            // latch swallowed every class after the first for the life of the process:
-            // a machine whose downloads broke (announced) and whose apply lane then
-            // stranded it heard about the download only. The two notices name
-            // different lanes and ask for different fixes, so dropping the second is
-            // losing a message, not deduping one. `None` = nothing announced yet.
-            let mut notified_failing: Option<&'static str> = None;
+            // KEYED on the class that was announced (see `HealthAnnouncer`), not a
+            // bare bool. As a bool the latch swallowed every class after the first
+            // for the life of the process: a machine whose downloads broke
+            // (announced) and whose apply lane then stranded it heard about the
+            // download only. The two notices name different lanes and ask for
+            // different fixes, so dropping the second is losing a message, not
+            // deduping one.
+            let mut announcer = HealthAnnouncer::new(install::now_rfc3339());
+            // The ledger's verdict, spoken to the GUI. Called on EVERY cycle — the
+            // skip path included (2026-09-14): the ledger is shared, so a cycle a
+            // sibling checked for us carries exactly the same evidence.
+            let speak_health = |announcer: &mut HealthAnnouncer| {
+                if let (Some(cb), Some(staging)) = (notify.as_ref(), paths::Staging::resolve()) {
+                    let h = health::Health::read(&staging.health());
+                    if let Some((title, body)) =
+                        announcer.tick(&h, &install::now_rfc3339(), current_build)
+                    {
+                        cb(title, body);
+                    }
+                }
+            };
             // The installed bundle we last told the GUI about (by build). Announced
             // once per build, re-announced when the bundle moves again. And the last
             // (build, error) we could NOT verify, so a permanently unverifiable bundle
@@ -1157,6 +1580,15 @@ pub fn spawn_background_check(
             let mut announced_installed: Option<u64> = None;
             let mut unverifiable_installed: Option<(u64, String)> = None;
             loop {
+                let Some(source) = source_provider() else {
+                    if interval == 0 {
+                        break;
+                    }
+                    // A failed bounded config query is not permission to use a
+                    // stale channel. Retry the provider without holding any lane.
+                    std::thread::sleep(std::time::Duration::from_secs(5));
+                    continue;
+                };
                 // THE BUNDLE UNDER OUR OWN EXECUTABLE MAY HAVE MOVED ON WITHOUT A STAGE.
                 // The release cutter rewrites the bundle it was launched from, a user
                 // drags a new `.app` over the running one, a sibling process swaps
@@ -1219,7 +1651,7 @@ pub fn spawn_background_check(
                     }
                 }
                 match check_lane().try_lock() {
-                    Ok(_lane) => {
+                    Ok(mut lane) => {
                         // CROSS-PROCESS DEDUP. The lane mutex above is process-local
                         // (the module docs say so), and since the one-binary era every
                         // terminal SESSION runs this same loop — round-11 found that
@@ -1265,18 +1697,24 @@ pub fn spawn_background_check(
                             schedule.base(),
                         );
                         let now_unix = unix_now_secs();
-                        if let Some((reason, held)) = checker_staging
-                            .as_ref()
-                            .and_then(|s| checker_skip_at(s, dedup_base, now_unix))
-                        {
+                        if let Some((reason, timer)) = checker_staging.as_ref().and_then(|s| {
+                            checker_skip_for(s, current_build, &source, dedup_base, now_unix)
+                        }) {
                             log(&reason);
                             // A HELD ledger names the epoch, so this sibling's own
                             // timer is pointed at it too: released exactly at the
                             // reset (the epoch carries the writer's jitter), not at
                             // the next tick of an unrelated base interval. One clock
                             // read and one parse decided both the skip and the epoch,
-                            // so the two cannot disagree across the reset.
-                            if let Some(until) = held {
+                            // so the two cannot disagree across the reset. A sibling's
+                            // ordinary fresh check points the timer at the WINDOW'S
+                            // END (scattered) for the same reason (2026-09-14): the
+                            // cadence is still on the 75 s token base until this
+                            // process's first completed check reveals the lane, so a
+                            // fresh process re-read and re-logged the same skip every
+                            // 61–90 s for the whole 21-minute web window — 17 lines
+                            // per launch, times the sessions alive.
+                            if let Some(until) = skip_timer_target(timer, cadence::entropy_byte()) {
                                 schedule.hold_until(
                                     std::time::Instant::now()
                                         + std::time::Duration::from_secs(
@@ -1284,17 +1722,22 @@ pub fn spawn_background_check(
                                         ),
                                 );
                             }
-                            // Release the flock BEFORE sleeping — holding it through
-                            // the wait would serialize every other process on OUR
-                            // timer — then take the same jittered wait the loop tail
+                            // Release the flock AND local lane BEFORE sleeping: the
+                            // former blocks sibling processes, the latter blocks
+                            // this process's manual checks — then take the same jittered wait the loop tail
                             // takes (a bare `continue` would skip the tail's sleep
                             // and spin hot). The wake subtleties (settle window,
                             // still-failing suppression) only matter ahead of a
                             // network check, which this cycle deliberately isn't.
-                            drop(_checker_gate);
-                            let (_delay, waited) = cadence::wait(&schedule);
-                            if matches!(waited, cadence::Waited::Woke(_)) {
-                                schedule.woke();
+                            check_lane::after_skip(_checker_gate, lane, interval, || {
+                                speak_health(&mut announcer);
+                                let (_delay, waited) = cadence::wait(&schedule);
+                                if matches!(waited, cadence::Waited::Woke(_)) {
+                                    schedule.woke();
+                                }
+                            });
+                            if interval == 0 {
+                                break;
                             }
                             continue;
                         }
@@ -1302,7 +1745,9 @@ pub fn spawn_background_check(
                         // it, whether THIS check recorded a failure (see the `Ok(None)`
                         // arm). RFC3339 strings compare chronologically.
                         let check_started = install::now_rfc3339();
-                        match github::check_and_stage(current_build, &source) {
+                        let result = github::check_and_stage(current_build, &source);
+                        check_lane().complete(&mut lane, current_build, &source);
+                        match result {
                             Ok(Some(v)) => {
                                 emit(failures.success());
                                 schedule.succeeded();
@@ -1310,9 +1755,45 @@ pub fn spawn_background_check(
                                 // answers `Some` for a build that was already published and
                                 // is only waiting to be applied (its re-download may be
                                 // backed off — a stage backoff never gates an apply).
-                                log(&format!(
-                                    "update {v} is staged — the GUI applies it in place (auto-apply); the next launch is the fallback"
-                                ));
+                                //
+                                // SAY WHAT THE LEDGER KNOWS ABOUT THIS BUILD (2026-09-14).
+                                // "the GUI applies it in place; the next launch is the
+                                // fallback" was logged twenty times across ~10 h while the
+                                // apply lane had failed that very build six times and stood
+                                // down, and on an unsigned install the promised fallback
+                                // refuses for the same reason. The stand-down itself lives
+                                // only in GUI memory; the failure count and its reason are
+                                // the ledger's, so those are what the line carries.
+                                let staged_build =
+                                    status(current_build).and_then(|s| s.staged_build);
+                                let lane = apply_lane_report(current_build).filter(|r| {
+                                    staged_build.is_some_and(|b| b == r.last_failure_target_build)
+                                        && r.failures_for_target > 0
+                                });
+                                match lane {
+                                    Some(r) if refusal_needs_person(&r.last_failure) => {
+                                        log(&format!(
+                                            "update {v} is staged but this install cannot apply \
+                                             it by any lane ({}× refused: {}); run `aterm-ctl \
+                                             update status`",
+                                            r.failures_for_target, r.last_failure
+                                        ));
+                                    }
+                                    Some(r) => {
+                                        log(&format!(
+                                            "update {v} is staged; the apply lane has failed it \
+                                             {}× ({}) — run `aterm-ctl update status`; the next \
+                                             launch is the fallback",
+                                            r.failures_for_target, r.last_failure
+                                        ));
+                                    }
+                                    None => {
+                                        log(&format!(
+                                            "update {v} is staged — the GUI applies it in place \
+                                             (auto-apply); the next launch is the fallback"
+                                        ));
+                                    }
+                                }
                                 // RFC Rung 2: surface the staged build to the GUI so it can arm
                                 // the in-session apply lane and show the update-ready nudge
                                 // (Version menu ⬆️ / tab-strip ↻). The staged build number comes
@@ -1380,13 +1861,10 @@ pub fn spawn_background_check(
                                 // Ask the ledger rather than trusting the return
                                 // value: a check that recorded a failure is not a
                                 // success, whatever it returned.
-                                let recorded_failure =
-                                    paths::Staging::resolve().is_some_and(|s| {
-                                        health::Health::read(&s.health())
-                                            .last_failure_at
-                                            .as_str()
-                                            >= check_started.as_str()
-                                    });
+                                let recorded_failure = paths::Staging::resolve().is_some_and(|s| {
+                                    health::Health::read(&s.health()).last_failure_at.as_str()
+                                        >= check_started.as_str()
+                                });
                                 if recorded_failure {
                                     emit(Some(failures.failure(
                                         "no usable release this check — run \
@@ -1426,79 +1904,7 @@ pub fn spawn_background_check(
                     let (title, body) = no_token::notification();
                     cb(title, body);
                 }
-                if let (Some(cb), Some(staging)) = (notify.as_ref(), paths::Staging::resolve()) {
-                    let h = health::Health::read(&staging.health());
-                    let active = h.last_failure_at.as_str() >= started.as_str();
-                    // DURATION gate beside the count gate: at the immediate-update
-                    // cadence three consecutive failures span ~4 minutes — a blip,
-                    // not the "pipeline is broken" signal the loud notice promises.
-                    // Require the streak to have PERSISTED (>= 30 min of failing)
-                    // like it inherently did at the old 6h cadence.
-                    //
-                    // MEASURED ON THE ESCALATING CLASS'S OWN CLOCK. `failing_since` is
-                    // any-class: it is stamped by the FIRST class to break and is
-                    // deliberately never cleared while an apply streak survives
-                    // (`Health::record_success`). Reading the gate from it meant a
-                    // single stale apply failure from days ago backdated every later
-                    // streak, so a four-minute manifest blip cleared a thirty-minute
-                    // gate the instant it crossed the count — firing the loud notice
-                    // for exactly the transient this gate exists to swallow, and
-                    // dating it days before the problem existed.
-                    let escalated = h.persistent_class();
-                    let long_lived = escalated.is_some_and(|(class, _)| {
-                        install::rfc3339_delta_secs(h.class_since(class), &install::now_rfc3339())
-                            .is_some_and(|d| d >= 30 * 60)
-                    });
-                    let notice_owed =
-                        persistent_notice_is_owed(notified_failing, escalated.map(|(c, _)| c));
-                    if let Some((class, count)) = escalated
-                        && active
-                        && long_lived
-                        && notice_owed
-                    {
-                        notified_failing = Some(class);
-                        // The COUNT and the sentence both come from the class that
-                        // escalated. A single hardcoded pipeline story told an
-                        // apply-stranded machine "0 consecutive checks … cannot be
-                        // downloaded" — wrong number, wrong lane, and it sent the
-                        // reader hunting a download fault that did not exist.
-                        let cause = match class {
-                            "manifest" => format!(
-                                "the newest release cannot be trusted ({}) — this machine \
-                                 stays on build {current_build} until it is republished",
-                                h.last_error
-                            ),
-                            "stage" => format!(
-                                "updates download but will not verify or install ({})",
-                                h.last_error
-                            ),
-                            "apply" => format!(
-                                "an update is downloaded and verified but will not start \
-                                 ({})",
-                                h.last_apply_error
-                            ),
-                            // "pipeline", and any future class, keeps the original text.
-                            _ => "release manifests exist but cannot be downloaded — \
-                                  this build's update pipeline is likely broken"
-                                .to_string(),
-                        };
-                        cb(
-                            "aterm auto-update is failing".to_string(),
-                            format!(
-                                "{count} consecutive checks since {}: {cause}. Run \
-                                 `aterm-ctl update status` for details.",
-                                h.class_since(class)
-                            ),
-                        );
-                    } else if !h.is_persistent() {
-                        // All healed → any class may speak again. A failure THIS
-                        // process reported gets its recovery reported too, once, so
-                        // the standing pull-down row can leave.
-                        if notified_failing.take().is_some() {
-                            cb(HEALTH_RECOVERED_TITLE.to_string(), String::new());
-                        }
-                    }
-                }
+                speak_health(&mut announcer);
                 if interval == 0 {
                     break;
                 }
@@ -1506,14 +1912,10 @@ pub fn spawn_background_check(
                 // a completed check has revealed it. An explicitly configured interval
                 // is never overridden — an operator who set one owns the consequence.
                 if configured.is_none() {
-                    schedule.set_base(std::time::Duration::from_secs(
-                        match github::lane() {
-                            github::Lane::Web => cadence::WEB_INTERVAL_SECS,
-                            github::Lane::Token | github::Lane::Unknown => {
-                                cadence::TOKEN_INTERVAL_SECS
-                            }
-                        },
-                    ));
+                    schedule.set_base(std::time::Duration::from_secs(match github::lane() {
+                        github::Lane::Web => cadence::WEB_INTERVAL_SECS,
+                        github::Lane::Token | github::Lane::Unknown => cadence::TOKEN_INTERVAL_SECS,
+                    }));
                 }
                 // Jittered, backed-off, wake-aware wait. A detected wake returns early
                 // and clears the backoff — the outage the backoff was about belonged
@@ -1556,6 +1958,16 @@ fn emit(action: Option<cadence::LogAction>) {
 pub fn spawn_background_check(
     _current_build: u64,
     _source: Source,
+    _notify: Option<HealthNotify>,
+    _on_staged: Option<StagedNotify>,
+) {
+}
+
+/// Non-macOS no-op.
+#[cfg(not(target_os = "macos"))]
+pub fn spawn_background_check_with_source(
+    _current_build: u64,
+    _source_provider: SourceProvider,
     _notify: Option<HealthNotify>,
     _on_staged: Option<StagedNotify>,
 ) {
@@ -1607,7 +2019,8 @@ pub struct UpdateStatus {
     pub changelog: Option<String>,
     /// The updater's last decision (e.g. `"up to date (latest release build 824)"`).
     pub outcome: String,
-    /// RFC3339 UTC time of the last check (empty if never).
+    /// RFC3339 UTC time of the last completed-check receipt (empty if absent).
+    /// Use [`last_check_at`] to require the current source and running build.
     pub updated_at: String,
     /// SELF-HEALING ledger snapshot: total consecutive failed checks across classes
     /// (0 = healthy).
@@ -1655,18 +2068,38 @@ impl UpdateStatus {
     /// A single-line human summary (for a menu title / `OK` status line).
     #[must_use]
     pub fn summary(&self) -> String {
-        match (&self.staged_version, self.staged_build) {
-            // NOT "applies on next launch": a relaunch is the FALLBACK, not the
-            // delivery mechanism. The staged build is verified and ready for the
-            // in-session apply lane right now, and telling the user to quit is
-            // exactly the advice this updater exists to make unnecessary.
-            (Some(v), Some(b)) => {
-                format!("update {v} (build {b}) staged and ready to apply")
-            }
-            _ if !self.outcome.is_empty() => self.outcome.clone(),
-            _ if !self.enabled => "auto-update is disabled on this build".to_string(),
-            _ => "no update check has run yet".to_string(),
+        // A Ready marker certifies staged bytes, not permission to apply them.
+        // Keep the recorded decision, including refusals with zero failures,
+        // instead of replacing it with a readiness claim. Health classes remain
+        // the ledger's decision; rendering must not infer one from this text.
+        let fallback;
+        let text = if !self.outcome.trim().is_empty() {
+            self.outcome.trim()
+        } else {
+            fallback = match (&self.staged_version, self.staged_build) {
+                (Some(v), Some(b)) => format!("update {v} (build {b}) staged"),
+                _ if !self.enabled => "auto-update is disabled on this build".to_string(),
+                _ => "no update check has run yet".to_string(),
+            };
+            &fallback
+        };
+        let mut chars = text.chars();
+        let mut line: String = chars
+            .by_ref()
+            .take(512)
+            .map(|c| {
+                if c.is_whitespace() || c.is_control() {
+                    ' '
+                } else {
+                    c
+                }
+            })
+            .collect();
+        if chars.next().is_some() {
+            line.pop();
+            line.push('…');
         }
+        line
     }
 
     /// Whether the ledger says update checks are PERSISTENTLY failing on the pipeline
@@ -1700,6 +2133,90 @@ impl UpdateStatus {
             failing_checks_kind: String::new(),
             channel_unreadable: false,
         }
+    }
+}
+
+#[cfg(test)]
+mod status_summary_tests {
+    use super::UpdateStatus;
+
+    fn staged(outcome: &str) -> UpdateStatus {
+        let mut status = UpdateStatus::empty(true, 81, outcome.to_string());
+        status.staged_build = Some(85);
+        status.staged_version = Some("0.85.0".to_string());
+        status
+    }
+
+    #[test]
+    fn a_staged_summary_preserves_refusals_and_independent_failure_classes() {
+        let refusal = "staged 0.85.0 (build 85) — NOT applied: seamless handoff unavailable because $ATERM_NO_SEAMLESS_UPDATE is set. Unset it to restore the default.";
+        let cases = [
+            (refusal, 0, 0, ""),
+            (
+                "staged build did not apply: child exited before Ready",
+                0,
+                1,
+                "apply",
+            ),
+            ("update check failed: network unavailable", 1, 0, "network"),
+            (
+                "staged 0.85.0 (build 85) — verified and ready to apply",
+                0,
+                0,
+                "",
+            ),
+        ];
+        for (outcome, checks, applies, kind) in cases {
+            let mut status = staged(outcome);
+            status.failing_checks = checks;
+            status.failing_applies = applies;
+            status.failing_kind = kind.to_string();
+            assert_eq!(status.summary(), outcome);
+            assert_eq!(
+                (status.failing_checks, status.failing_applies),
+                (checks, applies)
+            );
+            assert_eq!(status.failing_kind, kind);
+            assert!(!status.is_failing_persistently());
+            // Historical negative control: the stage-first branch concealed
+            // every one of these actual decisions behind the same ready line.
+            let old = format!(
+                "update {} (build {}) staged and ready to apply",
+                status.staged_version.as_deref().unwrap(),
+                status.staged_build.unwrap()
+            );
+            assert_ne!(old, outcome);
+        }
+    }
+
+    #[test]
+    fn a_stage_without_a_decision_makes_no_apply_readiness_claim() {
+        let mut status = staged(" \n\t");
+        status.failing_applies = 1;
+        assert_eq!(status.summary(), "update 0.85.0 (build 85) staged");
+        status.staged_build = None;
+        status.staged_version = None;
+        assert_eq!(status.summary(), "no update check has run yet");
+        status.enabled = false;
+        assert_eq!(status.summary(), "auto-update is disabled on this build");
+    }
+
+    #[test]
+    fn summary_is_one_bounded_unicode_line_for_outcomes_and_fallbacks() {
+        let status = staged(" apply refused:\nkeep\tthese sessions open\r\n");
+        assert_eq!(status.summary(), "apply refused: keep these sessions open");
+        let long = format!("apply refused: {}", "猫".repeat(600));
+        let line = staged(&long).summary();
+        assert!(line.starts_with("apply refused: "));
+        assert_eq!(line.chars().count(), 512);
+        assert!(line.ends_with('…'));
+        assert_eq!(staged(&"猫".repeat(512)).summary(), "猫".repeat(512));
+        let mut status = staged("");
+        status.staged_version = Some("猫\n".repeat(600));
+        let line = status.summary();
+        assert_eq!(line.chars().count(), 512);
+        assert!(!line.contains('\n'));
+        assert!(line.ends_with('…'));
     }
 }
 
@@ -1936,7 +2453,7 @@ fn dedup_window_base(
 const DEFERRED_WINDOW_INTERVALS: u32 = 2;
 
 /// Why this cycle must NOT spend a network check, if it must not — i.e. whether
-/// the shared ledger records a check completed WITHIN the freshness window, so
+/// the source/build-bound receipt records a check completed WITHIN the window, so
 /// another aterm process (the window, or a sibling session) has already spent
 /// this interval's network budget.
 ///
@@ -1944,7 +2461,7 @@ const DEFERRED_WINDOW_INTERVALS: u32 = 2;
 /// wait (80% of nominal), so a process can never mistake its OWN previous
 /// cycle's stamp for another checker's and starve itself.
 ///
-/// Deferrals (rate limit, stranded) also stamp the ledger, AND widen the window
+/// Rate-limit deferrals stamp the completed-check receipt and widen the window
 /// by [`DEFERRED_WINDOW_INTERVALS`]: a machine that was just told to slow down
 /// must not be re-poked by a sibling on the sibling's own faster timer. The
 /// widened window is still bounded — the next healthy check overwrites the
@@ -1963,7 +2480,7 @@ fn checker_skip(staging: &paths::Staging, base: std::time::Duration) -> Option<S
     checker_skip_at(staging, base, unix_now_secs()).map(|(reason, _)| reason)
 }
 
-/// [`checker_skip`] at an injected `now`, also returning the hold epoch when the skip
+/// [`checker_skip_for`] at an injected `now` returns the hold epoch when the skip
 /// IS a hold — the instant a skipping sibling points its own timer at. One clock read
 /// and one parse decide both, so "skip because held" and "hold until" cannot fall on
 /// different sides of the reset.
@@ -1979,19 +2496,77 @@ fn checker_skip(staging: &paths::Staging, base: std::time::Duration) -> Option<S
 /// self-heals. Without this bound, every background loop on the machine would skip on
 /// such a record forever, and — because every loop skipped — nothing would ever
 /// overwrite it.
+/// The timer component of [`checker_skip_for`]'s answer: the HOLD epoch
+/// when the skip is a server-named hold, and — since 2026-09-14 — the fresh
+/// window's EXPIRY when the skip is a sibling's ordinary completed check, so a
+/// skipping process can point its timer at the window's end instead of re-reading
+/// (and re-logging) the ledger on its own 75 s base until then. The two are
+/// separate slots on purpose: `a_malformed_or_far_future_hold_is_not_honoured`
+/// pins that a bogus hold hands a sibling NO epoch, and the window expiry is not
+/// a hold — it is derived from the completed-check receipt's timestamp, read
+/// identically, so the loop scatters it (`skip_timer_target`) before sleeping on it.
 #[cfg(target_os = "macos")]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct SkipTimer {
+    held: Option<u64>,
+    window_expiry: Option<u64>,
+}
+
+/// Where a skipping process points its timer (2026-09-14, audit COORD-5/CC-6):
+/// a hold is exact (the writer already scattered it); a window expiry is
+/// scattered here by the same 0–60 s the hold writer applies, because every
+/// fresh sibling derives the identical epoch from the same check receipt and
+/// would otherwise wake in the same second. `None` when there is nothing to aim
+/// at (the loop takes its ordinary jittered wait).
+#[cfg(target_os = "macos")]
+fn skip_timer_target(timer: SkipTimer, entropy: u8) -> Option<u64> {
+    if let Some(until) = timer.held {
+        return Some(until);
+    }
+    timer
+        .window_expiry
+        .map(|expiry| expiry.saturating_add(u64::from(entropy) * HOLD_JITTER_SECS / 256))
+}
+
+#[cfg(all(target_os = "macos", test))]
 fn checker_skip_at(
     staging: &paths::Staging,
     base: std::time::Duration,
     now: u64,
-) -> Option<(String, Option<u64>)> {
-    let text = read_ledger_text(&staging.status)?;
+) -> Option<(String, SkipTimer)> {
+    checker_skip_for(
+        staging,
+        42,
+        &Source {
+            owner: "fixture".into(),
+            repo: "channel".into(),
+        },
+        base,
+        now,
+    )
+}
+
+#[cfg(target_os = "macos")]
+fn checker_skip_for(
+    staging: &paths::Staging,
+    current_build: u64,
+    source: &Source,
+    base: std::time::Duration,
+    now: u64,
+) -> Option<(String, SkipTimer)> {
+    let text = read_ledger_text(&check_receipt::path(staging))?;
     let v = text.parse::<aterm_toml::Value>().ok()?;
+    if !check_receipt::matches(&v, current_build, source) {
+        return None;
+    }
     let updated = v.get("updated_at").and_then(aterm_toml::Value::as_str)?;
     if updated.is_empty() {
         return None;
     }
     let held = v.get("held_until").and_then(aterm_toml::Value::as_str);
+    // This file is written only after a completed check; status/apply writes
+    // cannot refresh its timestamp, deferral, source or server hold.
+    let checked = updated;
     match ledger_hold(held, updated, now) {
         LedgerHold::InForce(until) => {
             return Some((
@@ -2000,7 +2575,10 @@ fn checker_skip_at(
                      machine is holding off GitHub until its API budget renews",
                     aterm_types::rfc3339::format_rfc3339(until)
                 ),
-                Some(until),
+                SkipTimer {
+                    held: Some(until),
+                    window_expiry: None,
+                },
             ));
         }
         LedgerHold::Expired => {
@@ -2010,17 +2588,38 @@ fn checker_skip_at(
         }
         LedgerHold::Absent => {}
     }
+    // THE WIDENED WINDOW BELONGS TO GITHUB'S BACKOFF. The check receipt
+    // records a deferred result explicitly; older check-result spellings are
+    // accepted only in this check-owned file: the apply
+    // lane spells "deferred: install location not writable" and friends for
+    // deferrals that touched no network at all, and an admin-owned
+    // /Applications used to cost every launch a 42-minute check holiday
+    // blamed on a backoff that never happened (2026-09-14).
     let deferred = v
-        .get("outcome")
+        .get("delivery")
         .and_then(aterm_toml::Value::as_str)
-        .is_some_and(|outcome| outcome.contains("deferred"));
+        .is_some_and(|note| note == "deferred")
+        || v.get("outcome")
+            .and_then(aterm_toml::Value::as_str)
+            .is_some_and(|outcome| {
+                outcome == "deferred" || outcome.starts_with("update check deferred")
+            });
     let window = if deferred {
         base.saturating_mul(DEFERRED_WINDOW_INTERVALS)
     } else {
         base
     };
     let fresh_window = window.as_secs().saturating_mul(7) / 10;
-    if rfc3339_older_than(updated, fresh_window) {
+    // A stamp AHEAD of the clock is treated as absent (2026-09-14): a clock
+    // stepped backwards after the write (an NTP correction of a fast clock)
+    // used to hold every checker on the machine for the skew plus the window,
+    // and because every loop skipped, nothing overwrote it. The hold path
+    // already anchors at min(updated_at, now) for the same reason.
+    let checked_epoch = rfc3339_to_unix(checked)?;
+    if checked_epoch > now.saturating_add(HOLD_JITTER_SECS) {
+        return None;
+    }
+    if now.saturating_sub(checked_epoch) >= fresh_window {
         return None;
     }
     Some((
@@ -2030,7 +2629,10 @@ fn checker_skip_at(
         } else {
             "another aterm process completed this interval's update check"
         }),
-        None,
+        SkipTimer {
+            held: None,
+            window_expiry: Some(checked_epoch.saturating_add(fresh_window)),
+        },
     ))
 }
 
@@ -2056,7 +2658,7 @@ enum LedgerHold {
     Expired,
 }
 
-/// Parse and BOUND a ledger hold (see [`checker_skip_at`]): `held` must parse
+/// Parse and BOUND a ledger hold (see [`checker_skip_for`]): `held` must parse
 /// strictly, and must be no further past `min(updated_at, now)` (`now` alone, when
 /// `updated_at` does not parse) than the writer's clamp allows.
 ///
@@ -2244,9 +2846,10 @@ pub fn delivery() -> Option<Delivery> {
 #[must_use]
 pub fn status(current_build: u64) -> Option<UpdateStatus> {
     let staging = paths::Staging::resolve()?;
-    // Parse the status marker best-effort for the last outcome + timestamp.
-    let (mut checked_from_build, mut outcome, mut updated_at) =
-        (current_build, String::new(), String::new());
+    // Outcomes come from the any-writer status marker; only the completed-check
+    // receipt can supply the last-check timestamp.
+    let (mut checked_from_build, mut outcome) = (current_build, String::new());
+    let updated_at = check_receipt::completed_at(&staging).unwrap_or_default();
     if let Some(text) = read_ledger_text(&staging.status)
         && let Ok(v) = text.parse::<aterm_toml::Value>()
     {
@@ -2259,11 +2862,6 @@ pub fn status(current_build: u64) -> Option<UpdateStatus> {
             .unwrap_or(checked_from_build);
         outcome = v
             .get("outcome")
-            .and_then(aterm_toml::Value::as_str)
-            .unwrap_or("")
-            .to_string();
-        updated_at = v
-            .get("updated_at")
             .and_then(aterm_toml::Value::as_str)
             .unwrap_or("")
             .to_string();
@@ -2308,6 +2906,32 @@ pub fn status(current_build: u64) -> Option<UpdateStatus> {
         rescues: 0,
         channel_unreadable: no_token::is_stranded(),
     })
+}
+
+/// Timestamp of the last completed check for this source and running build.
+/// General status/apply writes cannot refresh it; absent/legacy receipts return
+/// `None` rather than advertising a check that has not run on this channel.
+#[cfg(target_os = "macos")]
+#[must_use]
+pub fn last_check_at(current_build: u64, source: &Source) -> Option<String> {
+    let staging = paths::Staging::resolve()?;
+    let text = read_ledger_text(&check_receipt::path(&staging))?;
+    let value: aterm_toml::Value = text.parse().ok()?;
+    if !check_receipt::matches(&value, current_build, source) {
+        return None;
+    }
+    value
+        .get("updated_at")
+        .and_then(aterm_toml::Value::as_str)
+        .filter(|stamp| !stamp.is_empty())
+        .map(str::to_owned)
+}
+
+/// Non-macOS stub: no updater check receipts.
+#[cfg(not(target_os = "macos"))]
+#[must_use]
+pub fn last_check_at(_current_build: u64, _source: &Source) -> Option<String> {
+    None
 }
 
 /// Non-macOS stub: no updater state to report.
@@ -2382,38 +3006,11 @@ pub fn rfc3339_to_unix(stamp: &str) -> Option<u64> {
 #[cfg(target_os = "macos")]
 pub fn check_now(current_build: u64, source: &Source) -> UpdateStatus {
     if enabled() {
-        // Take the lane if it is free (or poison-recover it) and run the check; if it is
-        // BUSY, remember that so we can join the in-flight transaction below. The
-        // try-lock guard is scoped to THIS match and is dropped before the join's
-        // blocking `lock()` — kept sequential (not lexically nested inside the match)
-        // so the lock-order census does not read a `check_lane`→`check_lane` self-edge.
-        let joined = match check_lane().try_lock() {
-            Ok(_lane) => {
-                if let Err(e) = github::check_and_stage(current_build, source) {
-                    warn(&format!("manual update check failed: {e}"));
-                }
-                false
+        check_lane().run_or_join(current_build, source, || {
+            if let Err(error) = github::check_and_stage(current_build, source) {
+                warn(&format!("manual update check failed: {error}"));
             }
-            Err(std::sync::TryLockError::Poisoned(poisoned)) => {
-                let _lane = poisoned.into_inner();
-                if let Err(e) = github::check_and_stage(current_build, source) {
-                    warn(&format!(
-                        "manual update check failed after lane recovery: {e}"
-                    ));
-                }
-                false
-            }
-            Err(std::sync::TryLockError::WouldBlock) => true,
-        };
-        if joined {
-            // Join the exact in-flight transaction and consume its durable status
-            // instead of immediately issuing the same request again.
-            drop(
-                check_lane()
-                    .lock()
-                    .unwrap_or_else(|poisoned| poisoned.into_inner()),
-            );
-        }
+        });
     }
     status(current_build).unwrap_or_else(|| {
         UpdateStatus::empty(
@@ -2555,7 +3152,10 @@ mod checker_gate_tests {
 mod checker_skip_tests {
     use std::time::Duration;
 
-    use super::{checker_skip, checker_skip_at, paths::Staging};
+    use super::{
+        HOLD_JITTER_SECS, SkipTimer, checker_skip, checker_skip_at, paths::Staging,
+        skip_timer_target,
+    };
 
     /// The hold epoch a sibling would point its timer at, as the loop reads it: the
     /// second half of `checker_skip_at`'s answer.
@@ -2564,7 +3164,7 @@ mod checker_skip_tests {
             .duration_since(std::time::UNIX_EPOCH)
             .expect("clock")
             .as_secs();
-        checker_skip_at(s, BASE, now).and_then(|(_, held)| held)
+        checker_skip_at(s, BASE, now).and_then(|(_, timer)| timer.held)
     }
 
     fn staging(name: &str) -> Staging {
@@ -2578,10 +3178,13 @@ mod checker_skip_tests {
             .as_secs();
         let stamp = aterm_types::rfc3339::format_rfc3339(now.saturating_sub(age_secs));
         std::fs::write(
-            &s.status,
+            super::check_receipt::path(s),
             format!(
                 "schema = 1
+current_build = 42
+source = \"fixture/channel\"
 updated_at = \"{stamp}\"
+checked_at = \"{stamp}\"
 outcome = \"{outcome}\"
 "
             ),
@@ -2590,6 +3193,60 @@ outcome = \"{outcome}\"
     }
 
     const BASE: Duration = Duration::from_secs(30 * 60);
+
+    /// A SKIPPING PROCESS SLEEPS TO THE WINDOW'S END (2026-09-14, audit COORD-5 /
+    /// CC-6): a sibling's fresh check hands the skipper the expiry of the window it
+    /// is honouring — `checked_at + 0.7 × base` — scattered by the hold writer's own
+    /// 0–60 s so N fresh siblings do not wake in the same second; a hold is exact
+    /// (already scattered by its writer) and wins; a bogus hold still hands no hold
+    /// epoch, but the window it fell through to is still where the timer points.
+    #[test]
+    fn a_skipping_process_points_its_timer_at_the_windows_end() {
+        let s = staging("window-end");
+        write_ledger(&s, 60, "up to date");
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .expect("clock")
+            .as_secs();
+        let (_, timer) = checker_skip_at(&s, BASE, now).expect("a fresh stamp skips");
+        assert_eq!(timer.held, None, "an ordinary check is not a hold");
+        let expiry = timer.window_expiry.expect("the window's end");
+        let fresh = BASE.as_secs() * 7 / 10;
+        assert!(
+            ((now - 60 + fresh - 1)..=(now - 60 + fresh + 1)).contains(&expiry),
+            "checked_at + 0.7 × base: {expiry} vs now={now}"
+        );
+        assert_eq!(
+            skip_timer_target(timer, 0),
+            Some(expiry),
+            "no entropy, no scatter"
+        );
+        let scattered = skip_timer_target(timer, 255).expect("target");
+        assert!(
+            (expiry..expiry + HOLD_JITTER_SECS).contains(&scattered),
+            "the scatter is under a minute: {scattered} vs {expiry}"
+        );
+        let held = SkipTimer {
+            held: Some(now + 900),
+            window_expiry: Some(now + 100),
+        };
+        assert_eq!(
+            skip_timer_target(held, 255),
+            Some(now + 900),
+            "a hold is exact and outranks the window"
+        );
+        assert_eq!(
+            skip_timer_target(
+                SkipTimer {
+                    held: None,
+                    window_expiry: None
+                },
+                7
+            ),
+            None
+        );
+        let _ = std::fs::remove_dir_all(&s.root);
+    }
 
     #[test]
     fn a_fresh_stamp_skips_and_a_stale_one_checks() {
@@ -2642,14 +3299,16 @@ outcome = \"{outcome}\"
         let s = staging("missing");
         assert!(checker_skip(&s, BASE).is_none(), "no ledger: check");
         std::fs::write(
-            &s.status,
+            super::check_receipt::path(&s),
             "schema = 1
+current_build = 42
+source = \"fixture/channel\"
 updated_at = \"\"
 ",
         )
         .expect("write");
         assert!(checker_skip(&s, BASE).is_none(), "empty stamp: check");
-        std::fs::write(&s.status, "not toml at all {{{").expect("write");
+        std::fs::write(super::check_receipt::path(&s), "not toml at all {{{").expect("write");
         assert!(checker_skip(&s, BASE).is_none(), "unparseable: check");
         let _ = std::fs::remove_dir_all(&s.root);
     }
@@ -2662,10 +3321,13 @@ updated_at = \"\"
         let stamp = aterm_types::rfc3339::format_rfc3339(now.saturating_sub(age_secs));
         let held = aterm_types::rfc3339::format_rfc3339(held_until);
         std::fs::write(
-            &s.status,
+            super::check_receipt::path(s),
             format!(
                 "schema = 1
+current_build = 42
+source = \"fixture/channel\"
 updated_at = \"{stamp}\"
+checked_at = \"{stamp}\"
 outcome = \"update check deferred: GitHub rate limit hit\"
 held_until = \"{held}\"
 lane = \"anonymous\"
@@ -2729,20 +3391,24 @@ lane = \"anonymous\"
         for bogus in ["3", "99", "2999-01-01T00:00:00Z", "not a stamp"] {
             let stamp = aterm_types::rfc3339::format_rfc3339(now - 60);
             std::fs::write(
-                &s.status,
+                super::check_receipt::path(&s),
                 format!(
-                    "schema = 1\nupdated_at = \"{stamp}\"\noutcome = \"update check \
+                    "schema = 1\ncurrent_build = 42\nsource = \"fixture/channel\"\nupdated_at = \"{stamp}\"\noutcome = \"update check \
                      deferred: GitHub rate limit hit\"\nheld_until = \"{bogus}\"\n"
                 ),
             )
             .expect("write ledger");
-            let (reason, held) = checker_skip_at(&s, BASE, now)
+            let (reason, timer) = checker_skip_at(&s, BASE, now)
                 .unwrap_or_else(|| panic!("{bogus:?}: the fresh deferred stamp still skips"));
             assert!(
                 reason.contains("deferred") && !reason.contains("hold until"),
                 "{bogus:?} fell through to the deferred rule: {reason}"
             );
-            assert_eq!(held, None, "{bogus:?} hands a sibling no epoch");
+            assert_eq!(timer.held, None, "{bogus:?} hands a sibling no epoch");
+            assert!(
+                timer.window_expiry.is_some_and(|expiry| expiry > now),
+                "{bogus:?}: the deferred window's end is still where the timer points"
+            );
         }
         // Every stamp below is written from the test's OWN `now`, so the boundary
         // cases cannot drift by a clock tick between the write and the read.
@@ -2750,9 +3416,9 @@ lane = \"anonymous\"
             let stamp = aterm_types::rfc3339::format_rfc3339(updated_at);
             let held = aterm_types::rfc3339::format_rfc3339(held_until);
             std::fs::write(
-                &s.status,
+                super::check_receipt::path(&s),
                 format!(
-                    "schema = 1\nupdated_at = \"{stamp}\"\noutcome = \"update check \
+                    "schema = 1\ncurrent_build = 42\nsource = \"fixture/channel\"\nupdated_at = \"{stamp}\"\noutcome = \"update check \
                      deferred: GitHub rate limit hit\"\nheld_until = \"{held}\"\n"
                 ),
             )
@@ -2769,14 +3435,14 @@ lane = \"anonymous\"
         // Exactly at the horizon is still believed (the writer can put it there).
         let horizon = now + super::HOLD_HORIZON_SECS + super::HOLD_JITTER_SECS;
         write_held_at(now, horizon);
-        let (reason, held) = checker_skip_at(&s, BASE, now).expect("a hold at the horizon");
+        let (reason, timer) = checker_skip_at(&s, BASE, now).expect("a hold at the horizon");
         assert!(reason.contains("hold until"), "{reason}");
-        assert_eq!(held, Some(horizon));
+        assert_eq!(timer.held, Some(horizon));
         // One second past it is not.
         write_held_at(now, horizon + 1);
-        let (reason, held) = checker_skip_at(&s, BASE, now).expect("fresh stamp: skip");
+        let (reason, timer) = checker_skip_at(&s, BASE, now).expect("fresh stamp: skip");
         assert!(reason.contains("deferred"), "{reason}");
-        assert_eq!(held, None);
+        assert_eq!(timer.held, None);
         // `Delivery::is_held` applies the same bound, anchored at now.
         for (held_until, expect) in [
             ("3", false),
@@ -2827,20 +3493,27 @@ lane = \"anonymous\"
             LedgerHold::InForce(now + 30 * 60)
         );
         // And the sibling gate agrees: the fast-stamped record with the unbelievable
-        // hold hands out NO epoch, only the deferred-window skip its outcome earns.
+        // hold hands out NO epoch — and (re-pinned 2026-09-14) no skip either: a
+        // `checked_at` ahead of the clock is a stamp no honest writer could have
+        // produced at this instant, so it is not evidence of a completed check,
+        // deferred or not. Under the old pin every loop on the machine skipped
+        // on such a record for the skew plus the window, and because every loop
+        // skipped nothing ever overwrote it.
         let s = staging("fast-clock");
         std::fs::write(
-            &s.status,
+            super::check_receipt::path(&s),
             format!(
-                "schema = 1\nupdated_at = \"{fast}\"\noutcome = \"update check deferred: \
+                "schema = 1\ncurrent_build = 42\nsource = \"fixture/channel\"\nupdated_at = \"{fast}\"\noutcome = \"update check deferred: \
                  GitHub rate limit hit\"\nheld_until = \"{}\"\n",
                 fmt(now + 2 * 3600 + 30 * 60)
             ),
         )
         .expect("write ledger");
-        let (reason, held) = checker_skip_at(&s, BASE, now).expect("a fresh deferred stamp skips");
-        assert!(reason.contains("deferred"), "{reason}");
-        assert_eq!(held, None, "no epoch is handed to a sibling");
+        assert_eq!(
+            checker_skip_at(&s, BASE, now),
+            None,
+            "a record stamped ahead of the clock neither holds nor skips"
+        );
         let _ = std::fs::remove_dir_all(&s.root);
     }
 
@@ -3105,6 +3778,19 @@ mod commit_match_tests {
         let short = aterm_codec::base64::encode(&[0_u8; 31]).unwrap();
         assert!(update_pubkey_sha256(&short).is_err());
 
+        // The master's fingerprint has the same three-state shape (2026-09-14):
+        // armed in this tree, so 64 hex — and never the channel key's.
+        let master = super::compiled_master_pin_sha256();
+        assert!(
+            master.len() == 64 && master.bytes().all(|b| b.is_ascii_hexdigit()),
+            "the armed master prints its fingerprint: {master}"
+        );
+        assert_eq!(
+            master,
+            update_pubkey_sha256(aterm_update_core::pins::PAPER_MASTER_PUBKEYS[0])
+                .unwrap()
+                .unwrap()
+        );
         let compiled = compiled_update_pin_sha256();
         assert!(
             compiled == "empty"

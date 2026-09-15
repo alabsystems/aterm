@@ -299,9 +299,12 @@ pub fn rasterize_master() -> RomMaster {
 /// master is identical either way, so atlas texels, baker versions, and emit
 /// fingerprints are unchanged.
 ///
-/// Process-wide rather than a per-engine resident field: aterm builds one rain
-/// engine per pane, `RomMaster` is `Vec<u32>` only (so `Send + Sync`, sound on
-/// native and wasm alike), and 12 KB is paid once for the whole process.
+/// Process-wide rather than a per-engine resident field: `RomMaster` is
+/// `Vec<u32>` only (so `Send + Sync`, sound on native and wasm alike), and 12 KB
+/// is paid once for the whole process instead of once per engine — aterm builds
+/// a rain engine per WINDOW (both `MatrixRain::new` sites in `app_render.rs`
+/// are `ws.matrix_rain.get_or_insert_with`) and the wasm pipeline one per
+/// surface, so several can be resident at once.
 pub(crate) fn decorative_master() -> &'static RomMaster {
     static DECORATIVE: OnceLock<RomMaster> = OnceLock::new();
     DECORATIVE.get_or_init(rasterize_master)

@@ -382,13 +382,15 @@ fn walk(
     // token on the default channel is opt-in via the explicit `$ATERM_UPDATE_TOKEN`
     // rung only, never something ambient we go looking for.
     //
-    // LIMIT, deliberate: "pointed somewhere else" means the ENV override only
-    // (`ATERM_UPDATE_OWNER`/`_REPO`). This crate cannot see the GUI's `[update]
-    // owner/repo`, which the GUI threads into `Source::resolve` itself
-    // (aterm-gui/src/lib.rs, app_native.rs) — reading it here would invert the
-    // crate dependency. A machine that repoints at a PRIVATE repo via the CONFIG
-    // FILE must therefore also export `$ATERM_UPDATE_TOKEN`; the ambient rungs
-    // will not be consulted for it. The env override needs nothing extra.
+    // "Pointed somewhere else" is judged on the `owner`/`repo` the CALLER resolved,
+    // not on this crate's view of the environment: the app updater passes the
+    // `Source` it got from `Source::resolve(cfg_owner, cfg_repo)` with the GUI's
+    // `[update] owner/repo` config threaded in (aterm-gui/src/lib.rs,
+    // app_native.rs), so a repoint through the CONFIG FILE walks the full chain
+    // — every rung, including the ambient `gh auth token` — exactly as an env
+    // repoint does. (This comment used to claim the opposite, that a config-file
+    // repoint would never reach the ambient rungs; it never worked that way, and
+    // atpkg's `engages_credential_chain` documents the true rule. 2026-09-14.)
     if !needs_ambient_credential(owner, repo) {
         // Record the one consulted rung either way, so `diagnose` still describes
         // the chain that actually ran rather than an empty one.
@@ -511,6 +513,21 @@ fn probe_file(path: &Path) -> Probe {
              (not a symlink or FIFO), no larger than 1 KiB, and mode 0600 (`chmod 600` it)",
         );
     };
+    if raw.trim().is_empty() {
+        // The file EXISTS and yields nothing. [`PROVISION_COMMAND`] is `gh auth token >
+        // file`: the shell creates the file before `gh` runs, so a `gh` that is not
+        // logged in leaves exactly this behind. `probe_raw` would fold it into Absent,
+        // and the diagnosis would then tell the operator to run the command that
+        // produced it (2026-09-14 audit).
+        crate::warn(&format!(
+            "{} exists but is empty; ignoring (run `gh auth login`, then re-provision)",
+            path.display()
+        ));
+        return Probe::Rejected(
+            "the update-token file exists but is EMPTY — `gh auth token` printed nothing \
+             (run `gh auth login` first), then re-run the provision command",
+        );
+    }
     probe_raw(&raw, &path.display().to_string())
 }
 
@@ -946,6 +963,50 @@ mod tests {
         assert!(
             matches!(probe_file(&path).outcome(), ProbeOutcome::Rejected(_)),
             "a malformed token file is REJECTED, not absent"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// THE REMEDY'S OWN FAILURE MODE (2026-09-14 audit). [`PROVISION_COMMAND`] is
+    /// `gh auth token > file` inside a `umask 077` subshell: the SHELL creates the
+    /// 0600 file before `gh` runs, and a `gh` that is installed but not logged in
+    /// prints its error to stderr and NOTHING to stdout — leaving an empty,
+    /// correctly-moded token file behind. That file is a provisioned-and-refused
+    /// source, and the Absent/Rejected split exists precisely so it is reported as
+    /// one: reported Absent, `no_token_explanation` says "none of the token sources
+    /// is configured — Run: <the very command that produced this file>", forever.
+    #[cfg(unix)]
+    #[test]
+    fn an_empty_token_file_is_rejected_not_absent() {
+        let dir = support("empty-file");
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = token_file(&dir);
+        for contents in ["", "\n", "  \n\t"] {
+            std::fs::write(&path, contents).unwrap();
+            std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600)).unwrap();
+            let outcome = probe_file(&path).outcome();
+            assert!(
+                matches!(outcome, ProbeOutcome::Rejected(_)),
+                "an existing but empty token file ({contents:?}) is REJECTED, not absent \
+                 (got {outcome:?}) — it is exactly what `gh auth token > file` leaves when \
+                 gh is not logged in, and Absent points the operator back at that command"
+            );
+        }
+        // …and the diagnosis built from it names the file as the actionable rejection
+        // rather than claiming nothing is configured.
+        std::fs::write(&path, "").unwrap();
+        let d = Diagnosis {
+            resolved: None,
+            probes: vec![SourceProbe {
+                source: "0600 update-token file",
+                outcome: probe_file(&path).outcome(),
+            }],
+        };
+        assert_eq!(d.rejections().len(), 1, "{:?}", d.probes);
+        assert!(
+            d.no_token_explanation().contains("present but refused"),
+            "{}",
+            d.no_token_explanation()
         );
         let _ = std::fs::remove_dir_all(&dir);
     }

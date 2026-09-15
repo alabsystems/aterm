@@ -37,6 +37,20 @@
 //!   ([`FAN_N_BASE`]); a `draw_splash` of the bed's ink at the transient
 //!   cap bursts along the landing row; and [`draw_sparks`] throws a shower
 //!   of coloured sparks that fall under gravity and fade.
+//! * **The impact, fourth round (2026-09-14, "ALIGNED WITH THE RAINBOW")**
+//!   — the owner, on v0.85.0: *"the color pallet of the landing splash is
+//!   not correct and aligned with the rainbow."* Measured
+//!   (`docs/measured/landing-palette-2026-09-14.md`): the starburst walked
+//!   two sweeps of the raw table ROUND itself from the landing stop — the
+//!   same fourteen stops whatever it landed on — and its jets walked `|dx|/6`
+//!   outward BOTH ways, sliding half a sweep over the life, while the band
+//!   under them sat at one stop. Every station of the burst, the jets and
+//!   the flash now reads ONE walk, the band's ([`landing_field`]): the field
+//!   latched at the spawn edge, folded once, walked `d/16` with the COLUMN
+//!   as the band walks, through the band's own hot ink ([`landing_ink`]).
+//!   The star is the colour of the light it lands on and the band's
+//!   gradient across itself; the crossing is the band's teal; nothing
+//!   slides.
 //! * **The impact, third round (2026-09-10, "A STARBURST, NOT BANDS")** —
 //!   the owner, on the second round's landing: *"I want more a starburst
 //!   versus the bands effect."* Measured
@@ -151,6 +165,7 @@
 //! [`Meteors::sow_into`]. The star's velocity units, its throw window, its
 //! sputter and its class envelope are stardust's, spelled once there.
 
+use std::sync::OnceLock;
 use std::{fmt, mem};
 
 use aterm_time::Instant;
@@ -162,12 +177,16 @@ use aterm_render::{
 };
 
 use crate::cursor_glow::{BandPx, Geom};
-use crate::effect_util::{push_fx_rect, push_twinkle_star};
+use crate::effect_util::{lerp_rgb, push_fx_rect, push_twinkle_star};
 use crate::spectrum::{
     SPECTRUM_STOPS, spectrum, spectrum_snap, spectrum_snap_index, spectrum_stop,
+    spectrum_with_min_saturation,
 };
 
-use super::ribbon::WALK_LAY_RATE;
+use super::ribbon::{
+    BED_INK_LUT_LEN, BED_SAT_FLOOR, SLABS_PER_CELL, WALK_FAST_CELLS, WALK_LAY_RATE, hot_edge_ink,
+    walk_t,
+};
 use super::stardust::{FAN_RISE_MAX_CH, FanSow, GlyphProbe, ShedSow, Stardust};
 use super::timing::{
     CHROMA_CULL_ALPHA, FLIGHT_ENTER_EXP, FLIGHT_MAX_LIVE, FLIGHT_OFF_GLASS_MS, FLIGHT_P0,
@@ -294,6 +313,167 @@ pub fn arc_gain(cells: f32) -> f32 {
         return 1.0;
     }
     (ARC_FRAME0_SWEEPS / (FLIGHT_P0 * cells * WALK_LAY_RATE)).max(1.0)
+}
+
+// ---- the landing's palette (2026-09-14) ------------------------------------
+
+/// **THE LANDING'S FIELD OFF ANY BAND** — the walk a landing on a dark row
+/// (or a party at the caret) continues through its cell: the folded arc
+/// position at `dx_cells` to the RIGHT of the landing, `tri(t_land +
+/// dx/16)` — `d/16` from the landing, which is exactly what a wake laid
+/// there walks (`Ribbon::wake_origin` anchors it at the landing on the fast
+/// leg). A landing ON a band reads the band's own walk from the band's own
+/// origin instead: [`LandingWalk`].
+///
+/// THE OWNER, 2026-09-14, on v0.85.0: *"the color pallet of the landing
+/// splash is not correct and aligned with the rainbow."* Measured
+/// (`docs/measured/landing-palette-2026-09-14.md`): the starburst walked its
+/// OWN spectrum — two full ROYGBIV sweeps round the star from the landing
+/// stop, every spike a different root colour — while the band it landed on
+/// sat at ONE stop; its jets walked `|dx|/6` outward on BOTH sides, so the
+/// tail-side jet ran against the band, and slid half a sweep over the life.
+/// Fourteen stops of star on a one-stop band, and never the same fourteen
+/// twice, is what "not aligned" looks like in a census.
+///
+/// * `t_land` is the caret's own field at the landing cell, latched RAW at
+///   the spawn edge (D4, [`Meteor::t_land`]) and folded ONCE here — so at
+///   `dx = 0` this is `tri(t_land)`, the very number the ribbon draws for
+///   that cell: the star is the colour of the light it lands on;
+/// * the walk runs with the COLUMN, as the band's does (`Cohort::t_at`:
+///   `t0 + walk_t(col − anchor_col)`), never with the flight — red toward
+///   the tail of a rightward flight because that is where the band is red,
+///   and on a leftward one the band's own way still, because the band is
+///   what is on the glass when the flight is over;
+/// * it REFLECTS through [`tri`], as the band does, so the walk never wraps
+///   violet into red.
+#[inline]
+#[must_use]
+pub fn landing_field(t_land: f32, dx_cells: f32) -> f32 {
+    if !dx_cells.is_finite() {
+        return tri(t_land);
+    }
+    tri(t_land + dx_cells / WALK_FAST_CELLS)
+}
+
+/// **THE LANDING'S WALK** (2026-09-14) — the one colour law every mark of a
+/// landing reads: the band's own walk, at a column relative to the landing
+/// cell.
+///
+/// [`LandingWalk::at`] is `tri(t0 + walk_t(d_land + dx))` when the landing
+/// is ON a laid band — `(d_land, t0)` being the landing column's distance
+/// from the band's walk origin and the origin's `t`, the pair
+/// `Cohort::t_at` reads (`Ribbon::walk_origin_at`, carried on the move's
+/// [`Ctx::caret_walk`] and latched at the spawn edge beside `t_land`). So
+/// at `dx = 0` it is `tri(t_land)` exactly, and away from the landing it is
+/// the band's own number at that column: **`d/16` on the run's first
+/// sixteen cells from ITS origin, `d/36` after**, reflected as the band
+/// reflects. The first cut of the palette round paced the landing `d/16`
+/// from the landing cell — the band's fast leg — and called it
+/// `Cohort::t_at`'s walk; on a scrub back into a typed line, the owner's
+/// case and the slow leg almost always, that ran 2.25× the band's pace:
+/// 30-53° off the band a few cells out, and folding through violet eight
+/// cells back where the band does not fold for another twenty-two
+/// (`the_burst_walks_at_the_band_s_own_pace_where_it_lands`). A pace of the
+/// mark's own beside the band's is the class of law this round discards;
+/// "aligned with the rainbow" means the band's pace where it lands.
+///
+/// Off any band ([`LandingWalk::band`] `None`: a landing on a dark row, a
+/// party at the caret) it is [`landing_field`], `d/16` from the landing —
+/// what a wake laid there would walk, so the fallback is exact too.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct LandingWalk {
+    /// The field at the landing cell, RAW (D4): folded once, at the read.
+    pub t_land: f32,
+    /// `Some((d_land, t0))` when the landing cell is on a laid band —
+    /// `d_land` the landing column's distance from the band's walk origin
+    /// (`col − anchor_col`, cells, signed) and `t0` the origin's `t` — so
+    /// `t0 + walk_t(d_land) == t_land`, the band's own equation for the
+    /// landing cell. `None` off any band.
+    pub band: Option<(f32, f32)>,
+}
+
+impl LandingWalk {
+    /// A walk off any band: `d/16` from the landing ([`landing_field`]).
+    #[must_use]
+    pub const fn free(t_land: f32) -> Self {
+        Self { t_land, band: None }
+    }
+
+    /// The folded arc position `dx_cells` to the RIGHT of the landing cell;
+    /// `0.0` is the landing cell's own stop, the pin's colour.
+    #[inline]
+    #[must_use]
+    pub fn at(&self, dx_cells: f32) -> f32 {
+        if !dx_cells.is_finite() {
+            return tri(self.t_land);
+        }
+        match self.band {
+            Some((d_land, t0)) => tri(t0 + walk_t(d_land + dx_cells)),
+            None => landing_field(self.t_land, dx_cells),
+        }
+    }
+}
+
+/// **THE LANDING'S INK** — the band's HOT ink ([`hot_edge_ink`]) at folded
+/// arc position `t`: the stop with the crossing's chroma given back
+/// ([`BED_SAT_FLOOR`], so the green→blue seam is the band's own teal and not
+/// the table's grey), lifted through its own hue to one heat.
+///
+/// The burst is `out` — additive light OVER the text — and that is the lane
+/// the band's hot edge lives in, so it takes the hot edge's table and not the
+/// bed's: the bed's ink is solved DOWN onto the legibility bar (yellow to an
+/// olive `(77, 77, 2)` on the owner's glass) because a letter sits on it;
+/// nothing sits on a spike, and a star at the bar's weight is not a star
+/// (measured at the owner's cell: through the bed's table a green landing
+/// composites at `(1, 51, 0)` where the hot table puts `(4, 118, 0)` — about
+/// half the lift, on every stop). The hot table lifts every stop to ONE heat
+/// (`HOT_EDGE_LUMA_FLOOR`): blue, indigo and violet, which the raw table
+/// composited at 8-20 levels of luma over the ground — the owner's "yes we
+/// need blue and violet" — and red, which it takes to a coral `(255, 94,
+/// 94)`; yellow, orange and green it carries pure.
+///
+/// A pure function of the arc position, so it is solved ONCE per process into
+/// [`BED_INK_LUT_LEN`] entries — exactly the entries `BedInkLut::hot` holds,
+/// generated by the same call at the same positions — and read with one lerp
+/// (section 18: nothing expensive on the frame path; `hot_edge_ink` is a
+/// bisection over `powf`). Pinned equal to the generator by
+/// `the_landing_s_ink_is_the_band_s_hot_ink_entry_for_entry`.
+#[must_use]
+pub fn landing_ink(t: f32) -> u32 {
+    static LUT: OnceLock<[u32; BED_INK_LUT_LEN]> = OnceLock::new();
+    let lut = LUT.get_or_init(|| {
+        let mut lut = [0_u32; BED_INK_LUT_LEN];
+        for (i, e) in lut.iter_mut().enumerate() {
+            *e = hot_edge_ink(spectrum(i as f32 / (BED_INK_LUT_LEN - 1) as f32));
+        }
+        lut
+    });
+    let x = clamp01(t) * (BED_INK_LUT_LEN - 1) as f32;
+    let i = (x as usize).min(BED_INK_LUT_LEN - 1);
+    let j = (i + 1).min(BED_INK_LUT_LEN - 1);
+    lerp_rgb(lut[i], lut[j], x - i as f32)
+}
+
+/// The landing's ink on a LIGHT theme (section 6.10): the same stop with the
+/// same crossing floor, as source-over ink ([`light_ink`]) — hue and
+/// saturation intact, scaled to ink weight. The light arm buys "bigger" as
+/// area, never as brightness, so there is no heat to equalize onto.
+#[must_use]
+fn landing_ink_light(t: f32) -> u32 {
+    light_ink(spectrum_with_min_saturation(spectrum(t), BED_SAT_FLOOR))
+}
+
+/// **THE LANDING'S INK AT A NAMED STOP** — [`hot_edge_ink`] of the anchor
+/// itself ([`spectrum_stop`]), for the landing's POINT marks (the sparks;
+/// C1: a point mark snaps): the same recipe [`landing_ink`] reads, at the
+/// anchor's exact bytes rather than a lerp between the two entries beside
+/// it. Seven entries, solved once per process. Out-of-range indices clamp
+/// to violet, as [`spectrum_stop`]'s do.
+#[must_use]
+pub fn landing_stop_ink(i: usize) -> u32 {
+    static LUT: OnceLock<[u32; SPECTRUM_STOPS]> = OnceLock::new();
+    LUT.get_or_init(|| std::array::from_fn(|i| hot_edge_ink(spectrum_stop(i))))
+        [i.min(SPECTRUM_STOPS - 1)]
 }
 
 // ---- §6.5 the train -------------------------------------------------------
@@ -1187,25 +1367,34 @@ pub const JET_FEATHER_SHARE: f32 = 0.30;
 /// into an arrow."*
 pub const JET_COV_SHARE: f32 = 0.62;
 
-/// Sweeps of the spectrum around the star — [`RING_SWEEPS`]'s own number, and
-/// for [`RING_SWEEPS`]'s own reason: `tri` REFLECTS the walk rather than
-/// wrapping it, so a single sweep starting at an arbitrary landing stop folds
-/// back and shows only part of the spectrum. Two sweeps show all seven stops
-/// from every starting phase.
-pub const BURST_SWEEPS: f32 = RING_SWEEPS;
-
-/// Cells of jet per full sweep of the spectrum — the splash's "the colours
-/// run away from the caret" dynamic, kept; its band geometry, dropped.
-pub const JET_SWEEP_CELLS: f32 = 6.0;
-
-/// How far the jets' spectrum walk slides outward over the life, in
-/// `t`-units. Static under reduced motion.
-pub const JET_DRIFT_T: f32 = 0.5;
+// THE BURST HAS NO WALK OF ITS OWN (2026-09-14). Until v0.85.0 it carried
+// three: `BURST_SWEEPS` (two full sweeps of the spectrum round the star,
+// spike `i` rooted at `t + 2i/n` — the retired ring's `RING_SWEEPS`, kept "for
+// the ring's own reason"), `JET_SWEEP_CELLS` (one sweep per 6 cells of jet,
+// walked on `|dx|` so BOTH jets ran the same way — the tail-side one against
+// the band) and `JET_DRIFT_T` (half a sweep of slide over the life — "the
+// splash's 'colours run away from the caret' dynamic, kept"). All three were
+// the mark's own colour law beside the band's, and the owner's verdict on the
+// pair was "not correct and aligned with the rainbow". Every station now
+// reads [`landing_field`] — the band's walk, at the band's pace, from the
+// band's stop, folded the band's way — through the band's own hot ink
+// ([`landing_ink`]). `docs/measured/landing-palette-2026-09-14.md`.
 
 /// Stations per cell along a jet — the gating grain (each station asks the
 /// sky's probe about the cell it is over) and the colour grain (C1: a LINEAR
-/// mark samples `spectrum` continuously).
-pub const JET_STATIONS_PER_CELL: usize = 2;
+/// mark samples the arc continuously). **The band's own slab grain**
+/// ([`SLABS_PER_CELL`], 3) since 2026-09-14: a jet wears the band's walk at
+/// the band's pace, and `comet_beam` lerps colour in RGB between stations,
+/// so a jet sampled coarser than the band would cut the corner off the
+/// crossing the band draws with three vertices a cell. Costs no slab: the
+/// beam tiles its major axis by `step`, not by vertex.
+/// A COUPLING, on purpose: a change to the ribbon's slab grain moves the
+/// jets' station grain with it (their quad count and, on light, their rect
+/// width `seg/(stations − 1)`), and so the light kitty goldens through the
+/// jets. The two are the same number because a jet is the band's own
+/// gradient continued: it must not draw the crossing the band draws with
+/// three vertices a cell as a chord between two.
+pub const JET_STATIONS_PER_CELL: usize = SLABS_PER_CELL;
 
 /// How many cells EACH SIDE of the caret the landing row is probed over — the
 /// jets' gate window, and the width of [`SkyMask::row`].
@@ -1244,13 +1433,14 @@ const _: () = assert!(
     "a jet must stay inside the landing row it is gated on"
 );
 
-/// **NO ROTATION IN v1.** Codex CLI caught the hazard in the design's first
-/// spiked geometry: *"It can sweep light through otherwise dark angular gaps
-/// over time. Remove it for the first comparison."* A rotating spike set
-/// fills its own wedges inside the eye's integration window;
-/// the ring's own half-turn (`RING_SPIN_TURNS`) was harmless on a continuous ring and is
-/// not harmless here.
-pub const BURST_SPIN_TURNS: f32 = 0.0;
+// NO ROTATION, and no spin of the colours either. Codex CLI caught the
+// hazard in the design's first spiked geometry: *"It can sweep light through
+// otherwise dark angular gaps over time. Remove it for the first comparison."*
+// A rotating spike set fills its own wedges inside the eye's integration
+// window; the ring's own half-turn (`RING_SPIN_TURNS`) was harmless on a
+// continuous ring and is not harmless here. `BURST_SPIN_TURNS 0.0` held the
+// colour wheel still until 2026-09-14; there is no wheel to hold now — a
+// station's colour is a function of its column ([`landing_field`]).
 
 /// **ENFORCED** cap on one landing's burst (`out`).
 ///
@@ -1508,6 +1698,15 @@ pub struct Meteor {
     /// applies the same `tri` once, so `arc_t(t_land, 0)` IS the ribbon's
     /// stop under the caret; a clamp at the lock made it violet.
     pub t_land: f32,
+    /// **THE BAND'S WALK AT THE LANDING** (2026-09-14), latched beside
+    /// [`Meteor::t_land`] from [`Ctx::caret_walk`]: `(d_land, t0)` — the
+    /// landing column's distance from the band's walk origin and the
+    /// origin's `t` — when the landing cell is on a laid band, `None` off
+    /// one. The seed of the landing's [`LandingWalk`]: the marks minted at
+    /// the arrival edge continue the band at the band's OWN pace where it
+    /// lands (`d/36` past a run's sixteenth cell), which `t_land` alone
+    /// cannot say. The train's own arc ([`Meteor::arc`]) does not read it.
+    pub band: Option<(f32, f32)>,
     /// Path length in cells, `L / cw` (§6.2) — the input to `flight_ms`,
     /// `shed_n` and the fan's count and reach.
     pub cells: f32,
@@ -1690,10 +1889,11 @@ pub struct Pin {
 /// plus [`JET_N_PER_SIDE`] jets per side along the flight axis carrying the
 /// distance grade. Everything non-silhouette about the ring is reused
 /// verbatim: the quartic expansion ([`RING_R_EXP`]), the graded life
-/// ([`ring_ms`]), the graded reach ([`ring_full_radius`], which the jets ride),
-/// the hold-then-spend coverage ([`RING_COV_HOLD_U`]) and the spectrum walk —
-/// so "something left the caret and ran outward" survives and the belt is
-/// gone.
+/// ([`ring_ms`]), the graded reach ([`ring_full_radius`], which the jets ride)
+/// and the hold-then-spend coverage ([`RING_COV_HOLD_U`]) — so "something
+/// left the caret and ran outward" survives and the belt is gone. NOT the
+/// ring's colour walk: since 2026-09-14 the colour is the band's own field
+/// at each station's column ([`landing_field`], [`Landing::field`]).
 ///
 /// Directions, lengths and the jets' tilt signs are hashed ONCE at the mint
 /// ([`mint_burst`]), exactly as [`Landing::spark`] precomputes its throws, so
@@ -1922,6 +2122,15 @@ pub struct Landing {
     pub x: f32,
     /// Window-absolute Y of the landing cell's centre, px.
     pub y: f32,
+    /// **THE LANDING'S WALK** ([`LandingWalk`]) — the caret's field at the
+    /// landing cell, latched RAW at the spawn edge (D4, [`Meteor::t_land`]),
+    /// with the band's walk origin there ([`Meteor::band`]): the seed of
+    /// [`Landing::field`], the ONE walk every mark of the landing — the
+    /// burst, the jets, the flash, the sparks, and the fan the sky sows —
+    /// reads its colour through. Raw, never folded: the fold happens once,
+    /// at the read, exactly as the ribbon's own does, so the station under
+    /// the caret IS the caret's stop.
+    pub walk: LandingWalk,
     /// How many of [`Landing::spark`] this impact throws ([`SPARK_N_BASE`]);
     /// zero for the small landing (D8: an Enter lands small).
     pub sparks: u8,
@@ -1938,6 +2147,16 @@ pub struct Landing {
 }
 
 impl Landing {
+    /// **THE BAND'S WALK THROUGH THIS LANDING** ([`LandingWalk::at`]) at
+    /// `dx_cells` to the right of the landing cell — the band's own number
+    /// at that column, at the band's own pace. `0.0` is the landing cell's
+    /// own stop, the pin's colour.
+    #[inline]
+    #[must_use]
+    pub fn field(&self, dx_cells: f32) -> f32 {
+        self.walk.at(dx_cells)
+    }
+
     /// When the last landing pixel leaves the glass: the pin closes at
     /// [`PIN_MS`], the flash's colour at [`FLASH_COLOUR_MS`], the starburst
     /// finishes at its own graded life ([`Burst::ms`], [`RING_MS`] at the
@@ -1978,7 +2197,12 @@ impl Landing {
     ) -> Self {
         let n = usize::from(n).clamp(1, super::timing::FAN_MAX_N) as u8;
         Self {
-            pin: Pin { at, t: tint_t },
+            // D4 at the party too: the caret's field is the RAW walk and
+            // the pin is its folded stop — `tri` once, at the read.
+            pin: Pin { at, t: tri(tint_t) },
+            // Off any band: a party has no landing cell on a laid run to
+            // read an origin from, so its walk is `d/16` from the caret.
+            walk: LandingWalk::free(tint_t),
             burst: ring.then(|| mint_burst(mix32(seed ^ 0xB0B5), at, f32::from(JUMP_MIN_CELLS))),
             flash: false,
             fan: Fan {
@@ -2140,6 +2364,8 @@ struct Minted {
     caret: (u16, u16),
     /// [`Ctx::caret_t`].
     caret_t: f32,
+    /// [`Ctx::caret_walk`].
+    caret_walk: Option<(u16, f32)>,
 }
 
 /// `Geom` carries no `Debug` of its own, so the frame's geometry is printed
@@ -2156,6 +2382,7 @@ impl fmt::Debug for Minted {
             .field("phase", &self.phase)
             .field("caret", &self.caret)
             .field("caret_t", &self.caret_t)
+            .field("caret_walk", &self.caret_walk)
             .finish()
     }
 }
@@ -2171,6 +2398,7 @@ impl Minted {
             phase: ctx.phase,
             caret: ctx.caret,
             caret_t: ctx.caret_t,
+            caret_walk: ctx.caret_walk,
         }
     }
 
@@ -2184,6 +2412,7 @@ impl Minted {
             phase: self.phase,
             caret: self.caret,
             caret_t: self.caret_t,
+            caret_walk: self.caret_walk,
             mend: None,
             surge: 0.0,
             flow: Default::default(),
@@ -2363,16 +2592,16 @@ impl Meteors {
                     continue;
                 }
                 let landing = mint_landing(m, ctx);
-                // §6.5 layer 11: the fan reads no field — its colour is
-                // ROYGBIV in order around the fan, and the walk STARTS at
-                // the landing cell's own stop (§6.4's `t_m(0)`, the pin's
-                // colour), so the fan and the pin read as one landing.
+                // §6.5 layer 11 (restated 2026-09-14): the fan wears the
+                // landing's walk — the band's own colour at each star's
+                // rest column, the pin's stop under the caret — so the
+                // fan, the pin and the band read as one landing.
                 sown.push(Sow::Fan {
                     at: landing.fan.at,
                     spec: FanSow {
                         at_px: (landing.x, landing.y),
                         reach: landing.fan.reach,
-                        tint_t: landing.pin.t,
+                        walk: landing.walk,
                         seed: landing.fan.seed,
                         n: landing.fan.n,
                         hero: landing.fan.hero,
@@ -2426,7 +2655,7 @@ impl Meteors {
             spec: FanSow {
                 at_px: (x, y),
                 reach: landing.fan.reach,
-                tint_t: landing.pin.t,
+                walk: landing.walk,
                 seed,
                 n: landing.fan.n,
                 hero: false,
@@ -2742,7 +2971,7 @@ impl Meteors {
         // §6.1: typed wraps never fly, and reflow licenses nothing. A typed
         // echo lays ribbon; it does not streak — and neither does a delivered
         // insert, whose span its own sweep laid.
-        if matches!(licence, Licence::Typed | Licence::Insert) {
+        if licence.is_echo() {
             return None;
         }
         let drow = i32::from(to.0) - i32::from(from.0);
@@ -2820,6 +3049,12 @@ impl Meteors {
             } else {
                 0.0
             },
+            // The band's walk origin at the landing, latched with `t_land`
+            // (2026-09-14): the landing's marks continue the band at the
+            // band's own pace where it lands. `None` off any band.
+            band: ctx
+                .caret_walk
+                .map(|(anchor_col, t0)| (f32::from(to.1) - f32::from(anchor_col), t0)),
             cells,
             dir,
             landing: to,
@@ -3691,7 +3926,6 @@ fn draw_flash(l: &Landing, ctx: &Ctx<'_>, frame: &mut Frame<'_>) {
     let light = !ctx.cfg.dark_theme;
     let geom = ctx.geom;
     let (cw, ch) = (geom.cw as i32, geom.ch as i32);
-    let stop0 = spectrum_snap_index(l.pin.t);
     // The landing cell's own box, from the caret's centre.
     let x0 = (l.x - geom.cw as f32 * 0.5).round() as i32;
     let y0 = (l.y - geom.ch as f32 * 0.5).round() as i32;
@@ -3703,7 +3937,11 @@ fn draw_flash(l: &Landing, ctx: &Ctx<'_>, frame: &mut Frame<'_>) {
             TRANSIENT_STAR_COV_CEIL
         };
         let x = x0 + k * cw;
-        let stop = spectrum_stop((stop0 + k.unsigned_abs() as usize) % SPECTRUM_STOPS);
+        // A point mark snaps (C1) — to the band's own stop at ITS column
+        // ([`Landing::field`]): the landing's stop under the caret, and to
+        // either side the stop the band has one cell over, never "the next
+        // name" both ways (2026-09-14).
+        let stop = spectrum_snap(l.field(k as f32));
         let colour_cov = cap * colour_share * intensity;
         if light {
             let ink = (colour_cov * LIGHT_INK_GAIN).min(LIGHT_ALPHA_CAP) as u8;
@@ -3761,10 +3999,29 @@ fn burst_rise_limit(dy: f32, rise_px: f32, half_thick_px: f32) -> f32 {
     }
 }
 
-/// ONE TAPERED LANCE — two collinear [`comet_beam`] sections of decreasing
-/// thickness from `root` to `tip` along `dir`, its colour ramping from
-/// `ends.0` to `ends.1` and its coverage falling to `1 − `[`BURST_TIP_FADE`]
-/// at the tip. A lance is brightest and fattest where it leaves the impact.
+/// **THE LANDING'S INK AT A COLUMN** — [`landing_ink`] (or its light-theme
+/// ink) at the band's walk through this landing at window `x`
+/// ([`Landing::field`]). Every station of every spike and every jet, and
+/// the flash's snapped cells, read the landing's colour through this one
+/// function: what a point of the mark wears is decided by where on the row
+/// it is, and by nothing else — not by which spike it is on, not by the
+/// mark's age.
+#[inline]
+#[must_use]
+fn landing_ink_at(l: &Landing, x: f32, cw: f32, light: bool) -> u32 {
+    let t = l.field((x - l.x) / cw);
+    if light {
+        landing_ink_light(t)
+    } else {
+        landing_ink(t)
+    }
+}
+
+/// ONE TAPERED LANCE — three collinear [`comet_beam`] sections of decreasing
+/// thickness from `root` to `tip` along `dir`, its colour the band's own at
+/// each station's column ([`landing_ink_at`]) and its coverage falling to
+/// `1 − `[`BURST_TIP_FADE`] at the tip. A lance is brightest and fattest
+/// where it leaves the impact.
 ///
 /// Light (section 6.10): the SAME silhouette in source-over ink — a run of
 /// overlapping ink squares of the section's own thickness — because additive
@@ -3774,28 +4031,28 @@ fn burst_rise_limit(dy: f32, rise_px: f32, half_thick_px: f32) -> f32 {
 fn burst_lance(
     frame: &mut Frame<'_>,
     ctx: &Ctx<'_>,
-    origin: (f32, f32),
+    l: &Landing,
     dir: (f32, f32),
     root: f32,
     tip: f32,
     sec_thick_px: [f32; 3],
-    walk: (f32, f32),
     cov: f32,
     step: usize,
     light: bool,
 ) {
-    let (ox, oy) = origin;
+    let (ox, oy) = (l.x, l.y);
     let span = tip - root;
     if span < 1.0 {
         return;
     }
     let clip = ctx.geom.beam_clip();
-    // The colour at `t` along the lance: the SPECTRUM ITSELF, sampled, never a
-    // straight RGB chord between two distant stops. A chord across a quarter
-    // of the walk cuts the corner off the spectrum's own curve and skips whole
-    // named stops — which is what `the_burst_walks_the_whole_spectrum_around_
-    // the_star` catches.
-    let hue = |t: f32| spectrum(tri(walk.0 + walk.1 * t));
+    let cw = (ctx.geom.cw as f32).max(1.0);
+    // The colour `s` px along the lance: the band's walk at that station's
+    // COLUMN, through the band's own table — never a chord between two
+    // distant stops (a chord cuts the corner off the arc and skips names),
+    // and never the mark's own walk. A near-vertical spike is one colour,
+    // the landing's; a near-horizontal one is the band's own gradient.
+    let hue = |s: f32| landing_ink_at(l, ox + dir.0 * s, cw, light);
     let mut s0 = root;
     let mut done = 0.0_f32;
     for (k, &thick_ch) in sec_thick_px.iter().enumerate() {
@@ -3824,7 +4081,7 @@ fn burst_lance(
                     side,
                     side,
                 );
-                push_ink_rect(frame.out, ctx.geom, rect, light_ink(hue(t)), a);
+                push_ink_rect(frame.out, ctx.geom, rect, hue(s), a);
                 s += stride;
             }
         } else {
@@ -3836,7 +4093,7 @@ fn burst_lance(
                 frame.beams.push(BeamVertex {
                     x: ox + dir.0 * s,
                     y: oy + dir.1 * s,
-                    color: hue(t),
+                    color: hue(s),
                     cov: (cov * (1.0 - BURST_TIP_FADE * t)).clamp(0.0, 255.0) as u8,
                 });
             }
@@ -3851,7 +4108,11 @@ fn burst_lance(
 /// A jet roots exactly where the core's own envelope ends and runs out to
 /// [`JET_LEN_SHARE`] of the ring's unchanged [`ring_full_radius`] on the same
 /// quartic, so the star and its extensions share an origin, an onset, a clock
-/// and a colour walk — which is what binds them into one impact.
+/// and a colour law — which is what binds them into one impact. The colour
+/// law is the band's ([`landing_ink_at`]): a station wears the band's walk
+/// at its own column, so the tail-side jet runs toward red and the far-side
+/// one toward violet on a rightward flight, exactly as the band under and
+/// beyond them does, and a column wears one hue for the whole life.
 ///
 /// **HOW A MARK THAT CROSSES THE TEXT HOLDS THE LEGIBILITY BAR.** Unlike the
 /// core, a jet runs the length of the landing ROW. Every station asks the
@@ -3871,7 +4132,6 @@ fn burst_jet(
     root: f32,
     tip: f32,
     cov: f32,
-    drift: f32,
     light: bool,
 ) {
     let Some(sky) = l.sky else {
@@ -3903,7 +4163,6 @@ fn burst_jet(
         for j in 0..stations {
             let share = j as f32 / (stations - 1) as f32;
             let d = s0 + seg * share;
-            let along = (dir.0 * d).abs();
             let cell = ((dir.0 * d) / cw).round() as i32;
             // The feather is measured over the WHOLE jet, not the section, so
             // the two sections meet at one coverage and the seam is invisible.
@@ -3917,10 +4176,9 @@ fn burst_jet(
                 }
                 continue;
             }
-            // The splash's dynamic, kept: one sweep of the spectrum per
-            // [`JET_SWEEP_CELLS`] outward from the landing's own stop, sliding
-            // outward as the mark spends.
-            let stop = spectrum(tri(l.pin.t + along / cw / JET_SWEEP_CELLS + drift));
+            // The band's walk at this station's column (signed: a jet to the
+            // left of the landing reads the band to the left of it).
+            let stop = landing_ink_at(l, l.x + dir.0 * d, cw, light);
             if light {
                 let w = ((seg / (stations - 1) as f32).round() as i32).max(1) + 1;
                 let h = (thick.round() as i32).max(1);
@@ -3930,7 +4188,7 @@ fn burst_jet(
                     w,
                     h,
                 );
-                push_ink_rect(frame.out, ctx.geom, rect, light_ink(stop), c as u8);
+                push_ink_rect(frame.out, ctx.geom, rect, stop, c as u8);
             } else {
                 frame.beams.push(BeamVertex {
                     x: l.x + dir.0 * d,
@@ -3954,22 +4212,36 @@ fn burst_jet(
 /// [`BURST_CORE_CH`], rooted at [`BURST_ROOT_CH`] so the caret keeps its own
 /// cell and the wedges between spikes are dark all the way in, plus
 /// [`JET_N_PER_SIDE`] jets per side carrying the distance grade along the
-/// line. One full ROYGBIV walk goes round the star — spike `i` ramps from
-/// `spectrum(tri(t + i/n))` at its root to `spectrum(tri(t + (i+1)/n))` at its
-/// tip, so every spike is its own little rainbow (C1: a LINEAR mark samples
-/// `spectrum` continuously) — and the jets continue that walk outward.
+/// line.
 ///
-/// Everything about the ring that was not its SILHOUETTE is reused byte for
-/// byte: the quartic ([`RING_R_EXP`]), the graded life ([`ring_ms`]), the
-/// graded reach ([`ring_full_radius`]), the hold-then-spend coverage
-/// ([`RING_COV_HOLD_U`], [`RING_COV_SHARE`]) and the transient ceiling. The
-/// 600 ms budget is therefore met by construction and the const assert that
-/// proves it is unchanged.
+/// **THE PALETTE IS THE BAND'S** (2026-09-14; before it the star walked two
+/// sweeps of its own spectrum round itself and the jets one per six cells
+/// outward both ways — the owner: *"not correct and aligned with the
+/// rainbow"*). Every station reads [`landing_ink_at`]: the band's walk
+/// through the landing cell at the station's own COLUMN, through the band's
+/// own hot ink. So the light over the landing cell is the landing cell's
+/// stop, the star is the band's gradient — redder on the red side, bluer on
+/// the blue side, at the band's own pace at that column (`d/16` on a run's
+/// first sixteen cells from its origin, `d/36` after: [`LandingWalk`]) — the
+/// jets continue it along the row in the band's direction, the crossing is
+/// the band's teal and no cyan
+/// appears that the band does not carry, and nothing slides: a column wears
+/// one hue for the whole life. A LINEAR mark still samples the arc
+/// continuously (C1); the flash's cells still snap. Measured in
+/// `docs/measured/landing-palette-2026-09-14.md`.
+///
+/// Everything about the ring that was not its SILHOUETTE or its colour walk
+/// is reused byte for byte: the quartic ([`RING_R_EXP`]), the graded life
+/// ([`ring_ms`]), the graded reach ([`ring_full_radius`]), the hold-then-spend
+/// coverage ([`RING_COV_HOLD_U`], [`RING_COV_SHARE`]) and the transient
+/// ceiling. The 600 ms budget is therefore met by construction and the const
+/// assert that proves it is unchanged.
 ///
 /// The frame path does NO trigonometry and NO hashing — every direction and
 /// length was resolved at the mint ([`mint_burst`]) — and allocates nothing:
 /// `frame.beams` is the host's existing scratch, cleared per section exactly
-/// as the shockwave ring it replaced cleared it.
+/// as the shockwave ring it replaced cleared it; the colour is one table
+/// lerp per station ([`landing_ink`]).
 ///
 /// Reduced motion (section 6.11): the full star and its jets drawn once at
 /// full reach, held, then the theme's ONE linear fade. The static form of a
@@ -3980,14 +4252,14 @@ fn draw_burst(l: &Landing, ctx: &Ctx<'_>, frame: &mut Frame<'_>) {
     };
     let ch = ctx.geom.ch as f32;
     let reduced = ctx.cfg.reduced_motion;
-    let (u, grow, alpha) = if reduced {
-        (0.0, 1.0, l.static_alpha(ctx.now))
+    let (grow, alpha) = if reduced {
+        (1.0, l.static_alpha(ctx.now))
     } else {
         let u = clamp01(ms_since(b.at, ctx.now) / b.ms);
         // Hold-then-fall, the ring's own: full while the star is small, spent
         // over the rest of its life as it opens.
         let u_spend = clamp01((u - RING_COV_HOLD_U) / (1.0 - RING_COV_HOLD_U));
-        (u, 1.0 - (1.0 - u).powi(RING_R_EXP), spend(u_spend))
+        (1.0 - (1.0 - u).powi(RING_R_EXP), spend(u_spend))
     };
     let cov = RING_COV_SHARE * TRANSIENT_STAR_COV_CEIL * alpha * clamp01(ctx.cfg.intensity);
     if cov < 1.0 || grow <= 0.0 {
@@ -4019,23 +4291,14 @@ fn draw_burst(l: &Landing, ctx: &Ctx<'_>, frame: &mut Frame<'_>) {
         if tip <= root + 1.0 {
             continue;
         }
-        // Spike `i` carries its own slice of ONE walk round the star: from
-        // `spectrum(tri(t + 2i/n))` at its root to `spectrum(tri(t + 2(i+1)/n))`
-        // at its tip, so every spike is its own little rainbow and the star as
-        // a whole is a full ROYGBIV wheel.
-        let walk = (
-            l.pin.t + BURST_SWEEPS * (i as f32) / (n as f32) + BURST_SPIN_TURNS * u,
-            BURST_SWEEPS / n as f32,
-        );
         burst_lance(
             frame,
             ctx,
-            (l.x, l.y),
+            l,
             dir,
             root,
             tip,
             sec_thick,
-            walk,
             cov,
             burst_step(ch, BURST_STEP_CH_SHARE, BURST_STEP_PX),
             light,
@@ -4044,7 +4307,6 @@ fn draw_burst(l: &Landing, ctx: &Ctx<'_>, frame: &mut Frame<'_>) {
 
     // The jets, longest first — the shed order's tail.
     let r_full = ring_full_radius(b.scale, ch);
-    let drift = if reduced { 0.0 } else { JET_DRIFT_T * u };
     let jet_half_thick = JET_SEC_THICK_CH[0] * ch * 0.5;
     // THE JETS ARE THE STAR'S EXTENSIONS, so they root exactly where its
     // envelope is and do not exist before it does — otherwise the first
@@ -4070,7 +4332,6 @@ fn draw_burst(l: &Landing, ctx: &Ctx<'_>, frame: &mut Frame<'_>) {
                 jet_root,
                 tip,
                 cov * JET_COV_SHARE,
-                drift,
                 light,
             );
         }
@@ -4163,10 +4424,10 @@ fn draw_sparks(l: &Landing, ctx: &Ctx<'_>, frame: &mut Frame<'_>, halo_cap: usiz
     }
     let geom = ctx.geom;
     let ch = geom.ch as f32;
+    let cw = (geom.cw as f32).max(1.0);
     let intensity = clamp01(ctx.cfg.intensity);
     let light = !ctx.cfg.dark_theme;
-    let stop0 = spectrum_snap_index(l.pin.t);
-    for (k, spark) in l.spark.iter().enumerate().take(usize::from(l.sparks)) {
+    for spark in l.spark.iter().take(usize::from(l.sparks)) {
         let Some(((dx, dy), alpha)) = spark_at(*spark, age, ch) else {
             continue;
         };
@@ -4174,7 +4435,15 @@ fn draw_sparks(l: &Landing, ctx: &Ctx<'_>, frame: &mut Frame<'_>, halo_cap: usiz
         if cov < 1.0 {
             continue;
         }
-        let rgb = spectrum_stop((stop0 + k) % SPECTRUM_STOPS);
+        // A point mark snaps (C1) — to the band's own stop at ITS column
+        // ([`Landing::field`]), in the band's hot ink ([`landing_stop_ink`]):
+        // the shower wears the band's colours where it flies. Until
+        // 2026-09-14 it was the seven anchors dealt in throw order from the
+        // landing's stop, raw — a wheel that wrapped violet into red on every
+        // landing past the arc's middle, and whose cool anchors composited
+        // at 9-22 levels: red and orange stars on a green landing.
+        let stop = spectrum_snap_index(l.field(dx / cw));
+        let rgb = landing_stop_ink(stop);
         let arm0 = i32::from(spark.arm).max(1);
         let arm = if alpha >= SPARK_SHRINK_ALPHA {
             arm0
@@ -4186,7 +4455,7 @@ fn draw_sparks(l: &Landing, ctx: &Ctx<'_>, frame: &mut Frame<'_>, halo_cap: usiz
         let (x, y) = ((l.x + dx).round() as i32, (l.y + dy).round() as i32);
         if light {
             let ink = (cov * LIGHT_INK_GAIN).min(LIGHT_ALPHA_CAP) as u8;
-            let c = light_ink(rgb);
+            let c = light_ink(spectrum_stop(stop));
             push_ink_rect(frame.out, geom, (x - arm, y, 2 * arm + 1, 1), c, ink);
             push_ink_rect(frame.out, geom, (x, y - arm, 1, 2 * arm + 1), c, ink);
             continue;
@@ -4331,6 +4600,10 @@ fn mint_landing(m: &Meteor, ctx: &Ctx<'_>) -> Landing {
 
     Landing {
         pin: Pin { at, t: m.arc(0.0) },
+        walk: LandingWalk {
+            t_land: m.t_land,
+            band: m.band,
+        },
         // The star is hashed off its own salt of the landing seed, so the
         // shower and the starburst are not correlated shapes. `m.ring` is
         // still the flag's name at the spawn edge — the ONE decision that
@@ -4734,13 +5007,12 @@ mod tests {
 
     use super::*;
     use crate::cursor_glow::SoundCue;
-    use crate::rainbow_kitty::ribbon::walk_t;
     use crate::rainbow_kitty::stardust::{
         FAN_RISE_MAX_CH, FAN_THROW_JITTER_MAX, FAN_THROW_JITTER_MIN, Star, StarClass, StarLane,
         TINT_GOLD_RGB,
     };
     use crate::rainbow_kitty::timing::FAN_HERO_N;
-    use crate::rainbow_kitty::{CaretSeam, Config};
+    use crate::rainbow_kitty::{CaretSeam, Config, Engine, TypedClass};
     use crate::spectrum::SPECTRUM_ANCHORS;
 
     fn geom() -> Geom {
@@ -4826,6 +5098,7 @@ mod tests {
             phase: 0.0,
             caret,
             caret_t,
+            caret_walk: None,
             mend: None,
             surge: 0.0,
             flow: Default::default(),
@@ -7686,11 +7959,32 @@ mod tests {
     /// probe latched over `blank` rows, drawn by whichever mark the caller
     /// hands back.
     fn landed(cells: u16, cfg: &Config, g: Geom, blank: bool) -> (Meteors, Landing, Instant) {
+        landed_with(cells, cfg, g, blank, 0.25, false)
+    }
+
+    /// [`landed`], with the field the caret latched at the spawn edge (D4's
+    /// RAW `t_land`) and the flight's direction chosen: rightward flies from
+    /// column 0 and lands on column `cells`; leftward (a Home-ward hop)
+    /// flies from column `cells + 20` and lands on column 20, so the glass
+    /// has room for a jet on both sides.
+    fn landed_with(
+        cells: u16,
+        cfg: &Config,
+        g: Geom,
+        blank: bool,
+        t_land: f32,
+        leftward: bool,
+    ) -> (Meteors, Landing, Instant) {
         let t0 = Instant::now();
         let mut m = Meteors::new();
-        let to = (5_u16, cells);
-        let ctx = ctx_on(t0, cfg, to, g);
-        let spawn = m.on_event(&mv((5, 0), to), t0, &ctx).expect("fly");
+        let (from, to) = if leftward {
+            ((5_u16, cells + 20), (5_u16, 20))
+        } else {
+            ((5_u16, 0), (5_u16, cells))
+        };
+        let mut ctx = ctx_on(t0, cfg, to, g);
+        ctx.caret_t = t_land;
+        let spawn = m.on_event(&mv(from, to), t0, &ctx).expect("fly");
         let arrival = t0 + spawn.t_flight;
         let mut sc = Scratch::default();
         {
@@ -7840,36 +8134,654 @@ mod tests {
         // PIXELS, which `the_star_emerges_as_the_flash_s_white_dies` does.
     }
 
-    /// **THE STARBURST IS A RAINBOW.** One full ROYGBIV walk goes round the
-    /// star (C1: a LINEAR mark samples `spectrum` continuously), so at least
-    /// six of the seven named stops are on glass at once — the shockwave's own
-    /// law, restated for the mark that replaced it.
-    #[test]
-    fn the_burst_walks_the_whole_spectrum_around_the_star() {
-        let cfg = config();
-        let g = owner_geom();
-        for cells in [8_u16, 40] {
-            let (_m, l, arrival) = landed(cells, &cfg, g, true);
-            let b = l.burst.expect("a nav landing bursts");
-            let mut sc = Scratch::default();
-            let mut seen = [false; 7];
-            let mut after = 8_u64;
-            while after <= b.ms as u64 {
-                burst_only(&mut sc, &l, &cfg, g, arrival, after);
-                for q in sc.out.iter().filter(|q| is_chromatic(q.color)) {
-                    let (r, gg, bb) = chan(q.color);
-                    if r.max(gg).max(bb) >= 24 {
-                        seen[stop_of(q.color)] = true;
-                    }
-                }
-                after += 8;
+    // ---- the landing's palette (2026-09-14) --------------------------------
+
+    /// HSV hue of a `0x00RRGGBB` (premultiplied or not — a uniform scale
+    /// leaves the hue alone), in degrees `[0, 360)`.
+    fn hue_deg(c: u32) -> f32 {
+        let (r, g, b) = chan(c);
+        let (r, g, b) = (r as f32, g as f32, b as f32);
+        let mx = r.max(g).max(b);
+        let mn = r.min(g).min(b);
+        let d = mx - mn;
+        if d <= 0.0 {
+            return 0.0;
+        }
+        let h = if mx == r {
+            60.0 * ((g - b) / d)
+        } else if mx == g {
+            60.0 * (2.0 + (b - r) / d)
+        } else {
+            60.0 * (4.0 + (r - g) / d)
+        };
+        h.rem_euclid(360.0)
+    }
+
+    /// HSV saturation, `0..=1`.
+    fn sat01(c: u32) -> f32 {
+        let (r, g, b) = chan(c);
+        let mx = r.max(g).max(b);
+        if mx == 0 {
+            return 0.0;
+        }
+        (mx - r.min(g).min(b)) as f32 / mx as f32
+    }
+
+    /// Circular distance between two hues, degrees.
+    fn hue_dist(a: f32, b: f32) -> f32 {
+        let d = (a - b).rem_euclid(360.0);
+        d.min(360.0 - d)
+    }
+
+    /// Which of the seven names a colour is, BY HUE — the nearest anchor's
+    /// hue on the circle. Fair to the raw table and to the hot ink alike,
+    /// because every ink this family applies (a uniform scale, a lerp toward
+    /// white, the chroma floor) leaves the hue where it was; the
+    /// anchor-nearest [`stop_of`] misfiles a hot-lifted indigo as violet.
+    fn hue_stop_of(c: u32) -> usize {
+        let h = hue_deg(c);
+        let mut best = 0;
+        let mut near = f32::INFINITY;
+        for (i, &a) in SPECTRUM_ANCHORS.iter().enumerate() {
+            let d = hue_dist(h, hue_deg(a));
+            if d < near {
+                near = d;
+                best = i;
             }
-            let n = seen.iter().filter(|s| **s).count();
-            assert!(
-                n >= 6,
-                "{cells} cells: the burst carried {n} stops: {seen:?}"
+        }
+        best
+    }
+
+    /// A quad's centre, window px.
+    fn quad_cx(q: &GlowQuad) -> (f32, f32) {
+        (
+            f32::from(q.x) + f32::from(q.w) * 0.5,
+            f32::from(q.y) + f32::from(q.h) * 0.5,
+        )
+    }
+
+    /// **THE FIELD'S HUE WINDOW AT A COLUMN.** A slab's colour is
+    /// `comet_beam`'s lerp between the two stations either side of it, so
+    /// the honest oracle for "this quad wears the band's walk at its column"
+    /// is the hue range the walk spans within half a station's reach
+    /// (`0.6` cells, the widest grain any lance section or jet uses) of the
+    /// quad's centre, plus a few degrees for the lerp's own drift through
+    /// RGB. `Err` carries the range for the assertion message.
+    fn hue_on_field(l: &Landing, dx_cells: f32, hue: f32) -> Result<(), (f32, f32)> {
+        let (mut lo, mut hi) = (f32::INFINITY, f32::NEG_INFINITY);
+        let mut hues = Vec::new();
+        for k in -6..=6 {
+            let h = hue_deg(landing_ink(l.field(dx_cells + k as f32 * 0.1)));
+            hues.push(h);
+        }
+        // The arc's hue climbs monotonically red -> violet and never wraps,
+        // so the window is a plain interval on the circle's cut at 0.
+        for h in &hues {
+            lo = lo.min(*h);
+            hi = hi.max(*h);
+        }
+        if hue >= lo - 6.0 && hue <= hi + 6.0 {
+            Ok(())
+        } else {
+            Err((lo, hi))
+        }
+    }
+
+    /// Lit enough to read a hue from without rounding noise.
+    fn lit(q: &GlowQuad) -> bool {
+        let (r, g, b) = chan(q.color);
+        is_chromatic(q.color) && r.max(g).max(b) >= 16
+    }
+
+    /// **THE LANDING'S INK IS THE BAND'S HOT INK, ENTRY FOR ENTRY.** The
+    /// table [`landing_ink`] reads is generated by the hot edge's own recipe
+    /// at the hot table's own positions, so the two can never disagree about
+    /// what a stop looks like over text — and between entries it is the same
+    /// one lerp `BedInkLut::sample` does.
+    #[test]
+    fn the_landing_s_ink_is_the_band_s_hot_ink_entry_for_entry() {
+        for i in 0..BED_INK_LUT_LEN {
+            let x = i as f32 / (BED_INK_LUT_LEN - 1) as f32;
+            assert_eq!(
+                landing_ink(x),
+                hot_edge_ink(spectrum(x)),
+                "entry {i}: the landing's table is not the hot edge's"
             );
         }
+        // Between entries: the band's own one lerp (`BedInkLut::sample`),
+        // so a read never leaves the segment between its two neighbours.
+        for k in 0..=200 {
+            let t = k as f32 / 200.0;
+            let x = t * (BED_INK_LUT_LEN - 1) as f32;
+            let (i, f) = (x.floor() as usize, x.fract());
+            let j = (i + 1).min(BED_INK_LUT_LEN - 1);
+            let want = lerp_rgb(
+                landing_ink(i as f32 / 128.0),
+                landing_ink(j as f32 / 128.0),
+                f,
+            );
+            let (ar, ag, ab) = chan(landing_ink(t));
+            let (br, bg, bb) = chan(want);
+            let off = ar.abs_diff(br).max(ag.abs_diff(bg)).max(ab.abs_diff(bb));
+            assert!(
+                off <= 2,
+                "t {t}: the read is {off} levels off the band's lerp"
+            );
+        }
+        // The crossing wears the band's own chroma floor, not the table's
+        // authored dip: at the seam the ink is as saturated as its flanks.
+        let seam = crate::spectrum::spectrum_crossing_position();
+        assert!(
+            sat01(landing_ink(seam)) >= 0.95,
+            "the crossing composites at S {:.2} — the table's grey, not the band's teal",
+            sat01(landing_ink(seam))
+        );
+        // The cool half is lifted to the hot edge's one heat — "yes we need
+        // blue and violet" — and the warm half is carried pure.
+        use super::super::ribbon::{HOT_EDGE_LUMA_FLOOR, relative_luminance};
+        for i in 0..SPECTRUM_STOPS {
+            let t = crate::spectrum::spectrum_stop_position(i);
+            let y = relative_luminance(landing_ink(t));
+            assert!(
+                y >= HOT_EDGE_LUMA_FLOOR - 0.01,
+                "stop {i} composites at Y {y:.3}, under the hot edge's floor"
+            );
+        }
+        let (r, g, b) = chan(landing_ink(crate::spectrum::spectrum_stop_position(2)));
+        assert!(
+            r >= 252 && g >= 252 && b <= 2,
+            "yellow is not carried pure: {r},{g},{b}"
+        );
+        // And the point marks' seven entries are the same recipe at the
+        // anchors' own bytes (the sparks, 2026-09-14).
+        for i in 0..SPECTRUM_STOPS {
+            assert_eq!(
+                landing_stop_ink(i),
+                hot_edge_ink(spectrum_stop(i)),
+                "stop {i}: the sparks' ink is not the hot edge's"
+            );
+        }
+        assert_eq!(landing_stop_ink(99), landing_stop_ink(SPECTRUM_STOPS - 1));
+    }
+
+    /// **THE STAR IS THE COLOUR OF THE LIGHT IT LANDS ON.** Every station of
+    /// the burst — spike or jet — wears the band's own walk at its own
+    /// COLUMN: the field latched at the spawn edge, folded once through
+    /// `tri`, walked `d/16` with the column as the band walks. So the light
+    /// over the landing cell is the landing cell's stop, whatever the phase
+    /// and whichever leg of the walk the line is on.
+    ///
+    /// FALSIFIED BY the 2026-09-10 burst (8f4cb252b): spike `i` rooted at
+    /// `t + 2i/n`, a full wheel round the star — one spike in twelve wore the
+    /// landing's stop and the vertical ones wore whatever the hash put there.
+    #[test]
+    fn the_star_is_the_colour_of_the_light_it_lands_on() {
+        let cfg = config();
+        for g in [owner_geom(), geom()] {
+            let cw = g.cw as f32;
+            for t_land in [0.12_f32, 0.5, 0.86, 1.31] {
+                let (_m, l, arrival) = landed_with(40, &cfg, g, true, t_land, false);
+                let b = l.burst.expect("a nav landing bursts");
+                let want = landing_ink(tri(t_land));
+                assert!((l.field(0.0) - tri(t_land)).abs() < 1e-6);
+                let mut sc = Scratch::default();
+                for after in [100_u64, (b.ms * 0.4) as u64, (b.ms * 0.7) as u64] {
+                    burst_only(&mut sc, &l, &cfg, g, arrival, after);
+                    let quads: Vec<&GlowQuad> = sc.out.iter().filter(|q| lit(q)).collect();
+                    assert!(!quads.is_empty(), "no burst at +{after} ms");
+                    let over = quads
+                        .iter()
+                        .filter(|q| (quad_cx(q).0 - l.x).abs() <= 0.5 * cw)
+                        .count();
+                    assert!(
+                        over > 0,
+                        "nothing of the star stands over the landing column"
+                    );
+                    for q in quads {
+                        let (x, _) = quad_cx(q);
+                        let dx = (x - l.x) / cw;
+                        if let Err((lo, hi)) = hue_on_field(&l, dx, hue_deg(q.color)) {
+                            panic!(
+                                "cw{} t_land {t_land} +{after} ms: a quad at dx {dx:.1} cells wears \
+                                 hue {:.0} where the band's walk is {lo:.0}..{hi:.0} (the landing \
+                                 stop is {want:06x})",
+                                g.cw,
+                                hue_deg(q.color)
+                            );
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    /// **NO CYAN THE BAND DOES NOT HAVE.** The burst walks the band's own arc
+    /// at the band's own pace from the band's own stop, so the green→blue
+    /// crossing appears in the burst exactly where the band would carry it
+    /// and nowhere else: a landing on the warm third of the arc throws no
+    /// cyan-window light at all, and where the burst does cross the seam it
+    /// wears the band's teal (the chroma floor), not the table's grey.
+    ///
+    /// FALSIFIED BY the 2026-09-10 burst: two sweeps round the star put the
+    /// crossing on every landing twice, at the raw table's `S 0.53`.
+    #[test]
+    fn a_warm_landing_throws_no_cyan_and_the_seam_is_the_band_s_teal() {
+        use crate::spectrum::{
+            SPECTRUM_CYAN_HI, SPECTRUM_CYAN_LO, SPECTRUM_CYAN_SAT_MIN, spectrum_crossing_position,
+            spectrum_crossing_width,
+        };
+        let cfg = config();
+        let g = owner_geom();
+        let cw = g.cw as f32;
+        let in_window = |c: u32| {
+            let h = hue_deg(c);
+            h >= SPECTRUM_CYAN_LO as f32
+                && h <= SPECTRUM_CYAN_HI as f32
+                && sat01(c) >= SPECTRUM_CYAN_SAT_MIN as f32
+        };
+        // A landing at the floor, on red: the whole mark — jets to 3 ch —
+        // spans under half a sweep and never reaches the seam. The guard
+        // says so in the walk's own units before the pixels are read.
+        let t_land = 0.05_f32;
+        let reach_cells = ring_full_radius(impact(8.0), g.ch as f32) / cw;
+        let seam = spectrum_crossing_position();
+        assert!(
+            t_land + reach_cells / WALK_FAST_CELLS < seam - spectrum_crossing_width(),
+            "the test's own landing reaches the seam: re-site it"
+        );
+        let (_m, l, arrival) = landed_with(8, &cfg, g, true, t_land, false);
+        let b = l.burst.expect("a nav landing bursts");
+        let mut sc = Scratch::default();
+        let mut after = 8_u64;
+        let mut cyan = 0_usize;
+        let mut all = 0_usize;
+        while after <= b.ms as u64 {
+            burst_only(&mut sc, &l, &cfg, g, arrival, after);
+            for q in sc.out.iter().filter(|q| lit(q)) {
+                all += 1;
+                if in_window(q.color) {
+                    cyan += 1;
+                }
+            }
+            after += 8;
+        }
+        assert!(all > 0);
+        assert_eq!(cyan, 0, "a landing on red threw {cyan} cyan quads of {all}");
+
+        // A landing ON the seam: the light over the landing column is the
+        // crossing, and it is as saturated as the band composites it.
+        let (_m, l, arrival) = landed_with(40, &cfg, g, true, seam, false);
+        burst_only(&mut sc, &l, &cfg, g, arrival, (b.ms * 0.4) as u64);
+        let over: Vec<&GlowQuad> = sc
+            .out
+            .iter()
+            .filter(|q| lit(q) && (quad_cx(q).0 - l.x).abs() <= 0.5 * cw)
+            .collect();
+        assert!(!over.is_empty());
+        for q in over {
+            // The band's own ink is the bar: the seam entry itself is at
+            // `S 1.0` (pinned above), and the blue flank the hot lift takes
+            // toward white sits near `S 0.8` — the burst may be no greyer
+            // than the band is at the same column.
+            let dx = (quad_cx(q).0 - l.x) / cw;
+            let floor = (-6..=6)
+                .map(|k| sat01(landing_ink(l.field(dx + k as f32 * 0.1))))
+                .fold(f32::INFINITY, f32::min);
+            assert!(
+                sat01(q.color) >= floor - 0.05,
+                "the seam composites at S {:.2} in the burst where the band's own ink is S {floor:.2} \
+                 — the table's grey, not the band's teal",
+                sat01(q.color)
+            );
+        }
+    }
+
+    /// **THE JETS CONTINUE THE BAND'S WALK — RED TOWARD THE TAIL — AND HOLD
+    /// STILL.** On a rightward flight the tail-side jet walks toward red and
+    /// the far-side jet toward violet, at the band's pace from the band's
+    /// stop, and a station's colour is a function of WHERE ON THE ROW it is
+    /// and of nothing else: the same column wears the same hue at +150 and
+    /// +300 ms.
+    ///
+    /// FALSIFIED BY the 2026-09-10 jets: `|dx|/6` outward on BOTH sides (the
+    /// tail-side jet ran against the band) plus `JET_DRIFT_T 0.5` sliding the
+    /// colours half a sweep over the life.
+    #[test]
+    fn the_jets_continue_the_band_s_walk_red_toward_the_tail_and_do_not_drift() {
+        let cfg = config();
+        let g = owner_geom();
+        let (cw, ch) = (g.cw as f32, g.ch as f32);
+        let t_land = 0.5_f32;
+        let (_m, l, arrival) = landed_with(40, &cfg, g, true, t_land, false);
+        let core = BURST_CORE_CH * ch;
+        let jets = |sc: &Scratch| -> Vec<(f32, f32)> {
+            sc.out
+                .iter()
+                .filter(|q| lit(q))
+                .map(|q| {
+                    let (x, y) = quad_cx(q);
+                    ((x - l.x) / cw, hue_deg(q.color), y - l.y)
+                })
+                .filter(|(dx, _, dy)| dy.abs() < 0.45 * ch && (dx * cw).abs() > core * 1.05)
+                .map(|(dx, h, _)| (dx, h))
+                .collect()
+        };
+        let mut sc = Scratch::default();
+        let mut by_cell = [Vec::<Vec<f32>>::new(), Vec::new()];
+        for (i, after) in [150_u64, 300].into_iter().enumerate() {
+            burst_only(&mut sc, &l, &cfg, g, arrival, after);
+            let js = jets(&sc);
+            assert!(js.len() > 20, "+{after} ms: only {} jet quads", js.len());
+            let mut cells = vec![Vec::new(); 64];
+            for (dx, h) in &js {
+                // Every station is the band's own colour at its column.
+                if let Err((lo, hi)) = hue_on_field(&l, *dx, *h) {
+                    panic!(
+                        "+{after} ms: a jet station at dx {dx:.1} wears hue {h:.0}, the band's \
+                         walk there is {lo:.0}..{hi:.0}"
+                    );
+                }
+                cells[(dx.round() as i32 + 32).clamp(0, 63) as usize].push(*h);
+            }
+            by_cell[i] = cells;
+        }
+        let mean = |v: &[f32]| v.iter().sum::<f32>() / v.len() as f32;
+        let at = hue_deg(landing_ink(tri(t_land)));
+        // Red toward the tail: three cells out on the tail side is redder
+        // than the landing; three cells out ahead is bluer. (Inside the
+        // reflection, which at t 0.5 is eight cells either way.)
+        let tail: Vec<f32> = (3..=6).flat_map(|k| by_cell[1][32 - k].clone()).collect();
+        let ahead: Vec<f32> = (3..=6).flat_map(|k| by_cell[1][32 + k].clone()).collect();
+        assert!(
+            !tail.is_empty() && !ahead.is_empty(),
+            "the flat jets left no cells to read"
+        );
+        assert!(
+            mean(&tail) < at && at < mean(&ahead),
+            "tail {:.0} / landing {at:.0} / ahead {:.0}: the jets do not walk red toward the tail",
+            mean(&tail),
+            mean(&ahead)
+        );
+        // And they hold still: a column wears one hue for the whole life.
+        let mut compared = 0;
+        for (k, (early, late)) in by_cell[0].iter().zip(&by_cell[1]).enumerate() {
+            if early.is_empty() || late.is_empty() {
+                continue;
+            }
+            compared += 1;
+            let (a, b) = (mean(early), mean(late));
+            assert!(
+                hue_dist(a, b) <= 6.0,
+                "cell {}: hue {a:.0} at +150 ms, {b:.0} at +300 ms — the jets drift",
+                k as i32 - 32
+            );
+        }
+        assert!(compared >= 4, "only {compared} cells to compare");
+    }
+
+    /// **A LEFTWARD LANDING WALKS THE BAND'S WAY TOO.** The band's walk runs
+    /// with the COLUMN, whichever way the caret arrived, and the band is
+    /// what is on the glass once the flight is over — so a Home's burst is
+    /// redder to its left and bluer to its right exactly as a Ctrl-E's is.
+    /// (The train's own walk runs red toward ITS tail — the two agree on a
+    /// rightward flight and disagree on a leftward one, and the landing is
+    /// the band's, not the train's.)
+    #[test]
+    fn a_leftward_landing_walks_the_band_s_way_too() {
+        let cfg = config();
+        let g = owner_geom();
+        let (cw, ch) = (g.cw as f32, g.ch as f32);
+        let t_land = 0.5_f32;
+        let (_m, l, arrival) = landed_with(40, &cfg, g, true, t_land, true);
+        assert_eq!(_m.landings[0].x, l.x);
+        let b = l.burst.expect("a Home bursts");
+        let mut sc = Scratch::default();
+        burst_only(&mut sc, &l, &cfg, g, arrival, (b.ms * 0.5) as u64);
+        let core = BURST_CORE_CH * ch;
+        let at = hue_deg(landing_ink(tri(t_land)));
+        let (mut left, mut right) = (Vec::new(), Vec::new());
+        for q in sc.out.iter().filter(|q| lit(q)) {
+            let (x, y) = quad_cx(q);
+            let dx = (x - l.x) / cw;
+            if (y - l.y).abs() >= 0.45 * ch || (dx * cw).abs() <= core * 1.05 {
+                continue;
+            }
+            if let Err((lo, hi)) = hue_on_field(&l, dx, hue_deg(q.color)) {
+                panic!(
+                    "a Home's jet station at dx {dx:.1} wears hue {:.0}, the band's walk there is \
+                     {lo:.0}..{hi:.0}",
+                    hue_deg(q.color)
+                );
+            }
+            if (3.0..=6.0).contains(&dx) {
+                right.push(hue_deg(q.color));
+            } else if (-6.0..=-3.0).contains(&dx) {
+                left.push(hue_deg(q.color));
+            }
+        }
+        let mean = |v: &[f32]| v.iter().sum::<f32>() / v.len() as f32;
+        assert!(!left.is_empty() && !right.is_empty());
+        assert!(
+            mean(&left) < at && at < mean(&right),
+            "left {:.0} / landing {at:.0} / right {:.0}: a Home's jets run against the band",
+            mean(&left),
+            mean(&right)
+        );
+    }
+
+    /// **THE FLASH WEARS THE FIELD'S OWN STOPS.** The three flash cells are
+    /// point marks (C1: they snap), and what they snap to is the band's walk
+    /// at their own column — the landing's stop under the caret, the stop the
+    /// band has one cell to either side — not "the next stop" on both sides.
+    #[test]
+    fn the_flash_wears_the_field_s_own_stops_on_all_three_cells() {
+        let cfg = config();
+        let g = owner_geom();
+        let (cw, ch) = (g.cw as f32, g.ch as f32);
+        for t_land in [0.5_f32, 0.93, 1.2] {
+            let (_m, l, arrival) = landed_with(40, &cfg, g, true, t_land, false);
+            let mut sc = Scratch::default();
+            sc.clear();
+            {
+                // Colour phase: the white has turned and the stop is out.
+                let at = ctx_on(arrival + ms(110), &cfg, (5, 40), g);
+                let mut fr = sc.frame();
+                draw_flash(&l, &at, &mut fr);
+            }
+            let mut seen = 0;
+            for q in sc.out.iter().filter(|q| lit(q)) {
+                if f32::from(q.w) != cw || f32::from(q.h) != ch {
+                    continue;
+                }
+                let k = ((quad_cx(q).0 - l.x) / cw).round();
+                let want = spectrum_snap(l.field(k));
+                seen += 1;
+                assert_eq!(
+                    hue_stop_of(q.color),
+                    spectrum_snap_index(l.field(k)),
+                    "t_land {t_land}: flash cell {k} wears {:06x}, the field's stop there is {want:06x}",
+                    q.color & 0x00FF_FFFF
+                );
+            }
+            assert_eq!(seen, 3, "the flash is three cells");
+        }
+    }
+
+    /// **THE STARBURST IS A RAINBOW — THE BAND'S.** The burst spans the
+    /// band's walk over its own LIT reach (the jets feather to nothing over
+    /// their last two thirds): at the floor (jets to `3 ch`, about `±3.7`
+    /// lit cells at the owner's cell, `0.46` of a sweep at `d/16`) a landing
+    /// shows its own third of the arc — three names from any phase: red,
+    /// orange and yellow on a red band, yellow, green and blue on a green
+    /// one; at the cap (`6 ch`, about `±8` lit cells, a sweep with the
+    /// reflection) at least four from any phase and all seven from the
+    /// middle of the arc. Measured 2026-09-14: `3/3/3` at the floor from
+    /// `t 0.1/0.5/0.9`, `4/7/5` at the cap. The shockwave's "whole spectrum"
+    /// law, restated for a walk that is the band's and not the mark's own —
+    /// the 2026-09-10 pin asked six at the floor of a wheel that walked two
+    /// sweeps round every landing, whatever it landed on, which is exactly
+    /// the palette the owner sent back.
+    #[test]
+    fn the_burst_walks_the_band_s_arc_across_its_own_reach() {
+        let cfg = config();
+        let g = owner_geom();
+        for (cells, floor) in [(8_u16, 3_usize), (60, 4)] {
+            for t_land in [0.1_f32, 0.5, 0.9] {
+                let (_m, l, arrival) = landed_with(cells, &cfg, g, true, t_land, false);
+                let b = l.burst.expect("a nav landing bursts");
+                let mut sc = Scratch::default();
+                let mut seen = [false; 7];
+                let mut after = 8_u64;
+                while after <= b.ms as u64 {
+                    burst_only(&mut sc, &l, &cfg, g, arrival, after);
+                    for q in sc.out.iter().filter(|q| lit(q)) {
+                        seen[hue_stop_of(q.color)] = true;
+                    }
+                    after += 8;
+                }
+                let n = seen.iter().filter(|s| **s).count();
+                println!("arc across reach: {cells} cells from t {t_land}: {n} stops {seen:?}");
+                assert!(
+                    n >= floor,
+                    "{cells} cells from t {t_land}: the burst carried {n} stops: {seen:?}"
+                );
+                if cells == 60 && (t_land - 0.5).abs() < 1e-6 {
+                    assert_eq!(
+                        n, 7,
+                        "a cap landing mid-arc carries the whole arc: {seen:?}"
+                    );
+                }
+            }
+        }
+    }
+
+    /// **THE 2026-09-14 CENSUS** (`docs/measured/landing-palette-2026-09-14.md`)
+    /// — the emitted `out` quads of one landing's burst and flash on the
+    /// owner's `30x56` device cell (`15x28` at scale 2), per stop, against the
+    /// band's stop at the landing cell. Prints; asserts only that there is a
+    /// burst to count. An instrument, not a law — ignored like the other
+    /// census instruments: run with `-- --ignored --nocapture`.
+    #[test]
+    #[ignore]
+    fn landing_palette_census_2026_09_14() {
+        use super::super::ribbon::{bed_ink, bed_luma_budget};
+        use crate::spectrum::{SPECTRUM_CYAN_HI, SPECTRUM_CYAN_LO, SPECTRUM_CYAN_SAT_MIN};
+        let cfg = config();
+        let g = Geom {
+            cw: 30,
+            ch: 56,
+            rows: 24,
+            cols: 80,
+            origin_x: 0,
+            origin_y: 0,
+            win_w: 2400,
+            win_h: 1344,
+            head: 0,
+        };
+        let cw = g.cw as f32;
+        let names = ["R", "O", "Y", "G", "B", "I", "V"];
+        let lum = |c: u32| {
+            let (r, gg, b) = chan(c);
+            0.2126 * r as f32 + 0.7152 * gg as f32 + 0.0722 * b as f32
+        };
+        println!(
+            "census 30x56: cells t_land age | band stop (hot ink / bed ink) | burst quads, light by stop (%), cyan-window %, over-landing-column hue vs band hue"
+        );
+        let budget = bed_luma_budget(cfg.theme_fg);
+        for (i, n) in names.iter().enumerate() {
+            let t = crate::spectrum::spectrum_stop_position(i);
+            let (raw, hot, bed) = (spectrum(t), landing_ink(t), bed_ink(spectrum(t), budget));
+            // The composited lift of one quad at the transient ceiling, in
+            // Rec.709 gamma luma levels — what the eye gets over the ground.
+            let lift = |c: u32| lum(c) * TRANSIENT_STAR_COV_CEIL / 255.0;
+            println!(
+                "stop {n}: raw {raw:06x} lift {:.0} | hot {hot:06x} lift {:.0} S {:.2} | bed {bed:06x} lift {:.0}",
+                lift(raw),
+                lift(hot),
+                sat01(hot),
+                lift(bed)
+            );
+        }
+        for cells in [8_u16, 12, 20, 40] {
+            for t_land in [0.15_f32, 0.5, 0.85] {
+                let (_m, l, arrival) = landed_with(cells, &cfg, g, true, t_land, false);
+                let stop = spectrum_snap_index(tri(t_land));
+                let hot = landing_ink(tri(t_land));
+                let bed = bed_ink(spectrum(tri(t_land)), budget);
+                let mut sc = Scratch::default();
+                for after in [0_u64, 50, 100, 150, 300] {
+                    burst_only(&mut sc, &l, &cfg, g, arrival, after);
+                    let mut by = [0.0_f32; 7];
+                    let mut cyan = 0.0_f32;
+                    let mut total = 0.0_f32;
+                    let mut over = Vec::new();
+                    for q in sc.out.iter().filter(|q| lit(q)) {
+                        let w = lum(q.color) * f32::from(q.w) * f32::from(q.h);
+                        by[hue_stop_of(q.color)] += w;
+                        total += w;
+                        let h = hue_deg(q.color);
+                        if h >= SPECTRUM_CYAN_LO as f32
+                            && h <= SPECTRUM_CYAN_HI as f32
+                            && sat01(q.color) >= SPECTRUM_CYAN_SAT_MIN as f32
+                        {
+                            cyan += w;
+                        }
+                        if (quad_cx(q).0 - l.x).abs() <= 0.5 * cw {
+                            over.push(h);
+                        }
+                    }
+                    let pct: Vec<String> = by
+                        .iter()
+                        .zip(names)
+                        .map(|(v, n)| format!("{n}{:.0}", 100.0 * v / total.max(1e-6)))
+                        .collect();
+                    let over_s = if over.is_empty() {
+                        "-".to_string()
+                    } else {
+                        let (mn, mx) = over
+                            .iter()
+                            .fold((f32::INFINITY, f32::NEG_INFINITY), |(a, b), h| {
+                                (a.min(*h), b.max(*h))
+                            });
+                        format!("{mn:.0}..{mx:.0}")
+                    };
+                    println!(
+                        "{cells:>2} {t_land:.2} +{after:>3}ms | {} {:06x}/{:06x} hue {:.0} | {:>4} quads {} cyan {:.0}% over-col {over_s}",
+                        names[stop],
+                        hot,
+                        bed,
+                        hue_deg(hot),
+                        sc.out.iter().filter(|q| lit(q)).count(),
+                        pct.join(" "),
+                        100.0 * cyan / total.max(1e-6)
+                    );
+                }
+                // The flash's three cells at +110 ms.
+                sc.clear();
+                {
+                    let at = ctx_on(arrival + ms(110), &cfg, (5, cells), g);
+                    let mut fr = sc.frame();
+                    draw_flash(&l, &at, &mut fr);
+                }
+                let flash: Vec<String> = sc
+                    .out
+                    .iter()
+                    .filter(|q| lit(q))
+                    .map(|q| {
+                        format!(
+                            "{}@{:+.0}",
+                            names[hue_stop_of(q.color)],
+                            (quad_cx(q).0 - l.x) / cw
+                        )
+                    })
+                    .collect();
+                println!("{cells:>2} {t_land:.2} flash +110ms | {}", flash.join(" "));
+            }
+        }
+        let (_m, l, arrival) = landed_with(40, &cfg, g, true, 0.5, false);
+        let mut sc = Scratch::default();
+        burst_only(&mut sc, &l, &cfg, g, arrival, 150);
+        assert!(sc.out.iter().any(lit), "no burst to count");
     }
 
     /// **THE DISTANCE GRADE.** The jets ride the ring's own unchanged
@@ -9280,5 +10192,457 @@ mod tests {
             off.sown.is_empty() && off.landings.is_empty(),
             "a caret off the glass mints nothing"
         );
+    }
+
+    // ---- the landing's pace, on a REAL band (2026-09-14, the fix-up) ------
+
+    /// The owner's device cell, `15x28` at scale 2 (`30x56`), 80 x 24.
+    fn owner_device_geom() -> Geom {
+        Geom {
+            cw: 30,
+            ch: 56,
+            rows: 24,
+            cols: 80,
+            origin_x: 0,
+            origin_y: 0,
+            win_w: 2400,
+            win_h: 1344,
+            head: 0,
+        }
+    }
+
+    fn stop_name(i: usize) -> &'static str {
+        [
+            "red", "orange", "yellow", "green", "blue", "indigo", "violet",
+        ][i.min(6)]
+    }
+
+    /// One frame of the ENGINE at `t`, into a cleared `sc`.
+    fn eng_tick(eng: &mut Engine, sc: &mut Scratch, t: Instant, g: Geom, cfg: &Config) {
+        sc.clear();
+        let mut fr = sc.frame();
+        eng.tick(t, g, cfg, &mut fr);
+    }
+
+    /// One key typed the ordinary way at `col` on row 3 — the shape
+    /// `mod.rs`'s own tests use: the press and its frame, then 8 ms later
+    /// the host's sweep of the glyph cell and the licensed one-cell move,
+    /// and their frame.
+    fn eng_type_at(
+        eng: &mut Engine,
+        sc: &mut Scratch,
+        t: Instant,
+        col: u16,
+        g: Geom,
+        cfg: &Config,
+    ) -> Instant {
+        eng.on_event(
+            Event::Typed {
+                cells: 1,
+                shifted: false,
+                class: TypedClass::Glyph,
+            },
+            t,
+        );
+        eng_tick(eng, sc, t, g, cfg);
+        let echo = t + ms(8);
+        eng.on_event(
+            Event::Sweep {
+                row: 3,
+                col0: col,
+                col1: col + 1,
+            },
+            t,
+        );
+        eng.on_event(mv_as((3, col), (3, col + 1), Licence::Typed), echo);
+        eng_tick(eng, sc, echo, g, cfg);
+        echo
+    }
+
+    /// An engaged engine on `g` with rows 2-4 proved blank and a
+    /// `cells`-cell run typed on row 3 from column 0 at a 100 ms cadence.
+    /// Returns the engine, the clock after the last echo, and THE BAND AS
+    /// THE EYE HAS READ IT — the raw field per column before any jump.
+    ///
+    /// The run is ONE cohort anchored at column 0 on `t0 = 0` — a cold
+    /// start, red at its origin. Until the hold law (2026-09-14, the third
+    /// audit: a `Typed` with no echo in its frame is held, not laid) the
+    /// first key here, replayed a frame before its echo at a mirror on
+    /// column 0, laid the fold's phantom on the PREVIOUS row's last cell,
+    /// and `join_cohort` continued that phantom's walk into the band: the
+    /// `(anchor_col 0, t0 1/16)` the palette round's census recorded was
+    /// the phantom's continuation. Every cell's `t` is positional
+    /// (`Cohort::t_at`) and every cell is laid by the sweep at the KEY's
+    /// clock on both sides of that law; only the origin's stop moved.
+    fn engine_with_typed_run(
+        cells: u16,
+        g: Geom,
+        cfg: &Config,
+    ) -> (Engine, Instant, Vec<Option<f32>>) {
+        let t0 = Instant::now();
+        let mut eng = Engine::new();
+        eng.set_engaged(true);
+        for r in 2..=4 {
+            eng.probe_mut().probe_row(r, &[false; 120]);
+        }
+        let mut sc = Scratch::default();
+        eng.on_event(mv_as((2, 0), (3, 0), Licence::Typed), t0);
+        eng_tick(&mut eng, &mut sc, t0, g, cfg);
+        let mut t = t0;
+        for col in 0..cells {
+            t += ms(100);
+            t = eng_type_at(&mut eng, &mut sc, t, col, g, cfg);
+        }
+        let band: Vec<Option<f32>> = (0..g.cols as u16).map(|c| eng.field_at(3, c)).collect();
+        (eng, t, band)
+    }
+
+    /// The band's RAW walk at a fractional column, read off the eye's
+    /// snapshot: the walk is linear inside a cell (its knee sits on a
+    /// column), so it is the lerp of the two columns either side; `None`
+    /// where either is dark.
+    fn band_at(band: &[Option<f32>], col: f32) -> Option<f32> {
+        let c0 = col.floor();
+        let f = col - c0;
+        let i0 = usize::try_from(c0 as i64).ok()?;
+        let a = (*band.get(i0)?)?;
+        let b = if f <= 1e-6 { a } else { (*band.get(i0 + 1)?)? };
+        Some(a + (b - a) * f)
+    }
+
+    /// **THE BURST WALKS AT THE BAND'S OWN PACE WHERE IT LANDS.** The band's
+    /// walk is `d/16` for the first sixteen cells from ITS ORIGIN and
+    /// `d/36` after (`walk_t`, `Cohort::t_at`), and a jump back into a
+    /// typed line lands, almost always, on the slow leg. So the landing's
+    /// walk is read from the band's origin, not paced from the landing: at
+    /// every column of the run the burst's field is the number the band
+    /// drew there — the field the eye read BEFORE the jump — and every lit
+    /// station of the burst at +150 and +300 ms wears that column's hue,
+    /// to within 6° of the hot ink's own chord across the slab. Three
+    /// landings on a real forty-cell run at the owner's cell: ten cells
+    /// back (the slow leg), twenty-eight back (across the knee), and
+    /// thirty-six back (the fast leg — exact under `d/16` as well, the
+    /// control).
+    ///
+    /// FALSIFIED BY bf5f7a502's `landing_field`, `tri(t_land + dx/16)` from
+    /// the landing — 2.25× the band's pace on the slow leg: on the ten-cell
+    /// landing the burst was 0.14 t (30°) off the band four cells out and
+    /// folded through violet eight cells back, where the band does not fold
+    /// for another twenty-two cells.
+    ///
+    /// RED AGAIN on the merge with the hold law (2026-09-14): *"ten cells
+    /// back into a forty-cell line (the slow leg) +150 ms: a station −0.5
+    /// cells from the landing wears hue 199 where the band's is 174 (10°
+    /// outside the hot ink's chord there)"*. Not the walk — (2) held at 0°
+    /// on every column — and not a clock: the band's origin had moved from
+    /// the phantom's `1/16` to a cold start's `0` (`engine_with_typed_run`),
+    /// which put the hot ink's green→blue seam (`t` 0.62 → 0.63, 31° of hue
+    /// in 0.36 cells of the slow leg) half a cell from this landing, under
+    /// the lances, where before it sat 5.5 cells out under the thin jets.
+    /// A lance's one-pixel anti-aliased edge quads sit a fifth of a cell
+    /// either side of their spine and wear the spine's hue; judged against
+    /// the band at their own pixel column, on the seam, that is 10°. The
+    /// oracle now reads an edge quad against the chord across its feather
+    /// (`worst_burst_station`); the first cut's law is still 37° outside it.
+    #[test]
+    fn the_burst_walks_at_the_band_s_own_pace_where_it_lands() {
+        let cfg = config();
+        let g = owner_device_geom();
+        for (to, case) in [
+            (
+                30_u16,
+                "ten cells back into a forty-cell line (the slow leg)",
+            ),
+            (12, "twenty-eight cells back, across the knee"),
+            (4, "thirty-six cells back, onto the fast leg"),
+        ] {
+            let (mut eng, mut t, band) = engine_with_typed_run(40, g, &cfg);
+            assert!(
+                band[..40].iter().all(Option::is_some),
+                "{case}: the run is lit"
+            );
+            assert!(
+                band[39].unwrap() > 1.0,
+                "{case}: a forty-cell run ends on the walk's second leg"
+            );
+            let mut sc = Scratch::default();
+            t += ms(120);
+            eng.on_event(mv_as((3, 40), (3, to), Licence::Nav), t);
+            eng_tick(&mut eng, &mut sc, t, g, &cfg);
+            // (1) Continuity: the field at the landing on the landing frame
+            // is the band's own stop there.
+            let t_land = eng.field_at(3, to).expect("the landing cell is lit");
+            assert!(
+                (t_land - band[usize::from(to)].unwrap()).abs() < 1e-6,
+                "{case}: the landing frame re-coloured the landing cell"
+            );
+            let mut landing = None;
+            for _ in 0..80 {
+                t += ms(16);
+                eng_tick(&mut eng, &mut sc, t, g, &cfg);
+                if let Some(l) = eng.meteor.landings.first() {
+                    landing = Some(*l);
+                    break;
+                }
+            }
+            let l = landing.unwrap_or_else(|| panic!("{case}: the scrub never landed"));
+            assert!(
+                (l.field(0.0) - tri(t_land)).abs() < 1e-6,
+                "{case}: the star is not the landing's stop"
+            );
+            // (2) The landing's walk IS the band's, column for column,
+            // across the burst's whole reach.
+            for k in -12..=12_i32 {
+                let Some(b) = band_at(&band, f32::from(to) + k as f32) else {
+                    continue;
+                };
+                let got = l.field(k as f32);
+                assert!(
+                    (got - tri(b)).abs() <= 0.01,
+                    "{case}: {k:+} cells from the landing the burst's walk is {got:.3} where \
+                     the band's is {:.3}",
+                    tri(b)
+                );
+            }
+            // (3) The emitted light: every lit station at +150 and +300 ms
+            // wears its own column's hue.
+            for after in [150_u64, 300] {
+                let at = l.pin.at + ms(after);
+                eng_tick(&mut eng, &mut sc, at, g, &cfg);
+                let l = eng.meteor.landings[0];
+                assert!(l.sky.is_some(), "{case}: the probe was not latched");
+                sc.clear();
+                {
+                    let ctx = ctx_on(at, &cfg, (3, to), g);
+                    let mut fr = sc.frame();
+                    draw_burst(&l, &ctx, &mut fr);
+                }
+                let (off, dx, h, want, compared) = worst_burst_station(&sc, &l, &band, to, g)
+                    .unwrap_or_else(|| panic!("{case} +{after} ms: no station over the run"));
+                assert!(
+                    compared >= 40,
+                    "{case} +{after} ms: only {compared} stations over the run"
+                );
+                assert!(
+                    off <= 6.0,
+                    "{case} +{after} ms: a station {dx:+.1} cells from the landing wears hue \
+                     {h:.0} where the band's is {want:.0} ({off:.0}° outside the hot ink's chord \
+                     there)"
+                );
+            }
+        }
+    }
+
+    /// **THE SHOWER WEARS THE BAND'S STOP AT EACH SPARK'S OWN COLUMN.** A
+    /// spark is a point mark (C1: it snaps), and what it snaps to is the
+    /// landing's walk at the column it is over — `spectrum_snap(field(dx))`
+    /// — in the band's hot ink; not the `k`-th anchor of a wheel that
+    /// starts at the landing's stop and wraps violet into red. So at
+    /// +150 ms, when the shower has climbed no further than a few cells, an
+    /// indigo landing's sparks are all cool and an orange landing's all
+    /// warm.
+    ///
+    /// FALSIFIED BY `draw_sparks`'s `spectrum_stop((stop0 + k) % 7)`
+    /// (2026-09-08): fifty-six sparks wore all seven anchors — red and
+    /// orange stars on a green landing.
+    #[test]
+    fn the_sparks_wear_the_band_s_stop_at_their_own_column() {
+        let cfg = config();
+        let g = owner_geom();
+        let cw = g.cw as f32;
+        for t_land in [0.15_f32, 0.5, 0.85] {
+            let (_m, l, arrival) = landed_with(40, &cfg, g, true, t_land, false);
+            assert!(l.sparks > 0, "a nav landing throws sparks");
+            let mut sc = Scratch::default();
+            for after in [150_u64, 300, 450] {
+                sc.clear();
+                {
+                    let at = ctx_on(arrival + ms(after), &cfg, (5, 40), g);
+                    let mut fr = sc.frame();
+                    draw_sparks(&l, &at, &mut fr, SPARK_HALO_CAP);
+                }
+                let quads: Vec<&GlowQuad> = sc.out.iter().filter(|q| lit(q)).collect();
+                assert!(!quads.is_empty(), "t {t_land} +{after} ms: no sparks");
+                for q in &quads {
+                    let (x, _) = quad_cx(q);
+                    let dx = (x - l.x) / cw;
+                    // The star is drawn at a rounded pixel and its taper
+                    // spans sit up to an arm's length along the bars: the
+                    // walk's stop anywhere within an arm and a pixel of the
+                    // quad is the star's.
+                    let got = hue_stop_of(q.color);
+                    let reach = SPARK_ARM_MAX_PX + 1;
+                    let ok = (-reach..=reach)
+                        .any(|px| got == spectrum_snap_index(l.field(dx + px as f32 / cw)));
+                    assert!(
+                        ok,
+                        "t {t_land} +{after} ms: a spark {dx:+.1} cells out wears {} where the \
+                         band's stop there is {}",
+                        stop_name(got),
+                        stop_name(spectrum_snap_index(l.field(dx)))
+                    );
+                }
+                if after == 150 {
+                    let (mn, mx) = quads
+                        .iter()
+                        .map(|q| hue_deg(q.color))
+                        .fold((f32::INFINITY, f32::NEG_INFINITY), |(a, b), h| {
+                            (a.min(h), b.max(h))
+                        });
+                    if t_land < 0.2 {
+                        assert!(
+                            mx <= 150.0,
+                            "an orange landing threw a cool spark at +150 ms: hue {mx:.0}"
+                        );
+                    } else if t_land > 0.8 {
+                        assert!(
+                            mn >= 150.0,
+                            "an indigo landing threw a warm spark at +150 ms: hue {mn:.0}"
+                        );
+                    }
+                }
+            }
+        }
+    }
+
+    /// The worst station of one drawn burst against the eye's snapshot of
+    /// the band: `(offset °, dx cells, hue, band hue, stations compared)` —
+    /// a station's offset is how far its hue sits outside the hot ink's own
+    /// chord across the quad's REACH, `0` inside it. The reach is half a
+    /// station either side of the quad's centre (three stations a cell, the
+    /// jets' grain) — and, for a one-pixel-wide quad, the widest beam's
+    /// feather across its spine as well: `comet_beam` tiles a steep slab
+    /// with a solid core and a one-pixel anti-aliased edge quad `half` px
+    /// either side of the spine (`thickness / 2`, up to `√2·half + 0.5` on
+    /// a diagonal), and both edges wear the SPINE's colour — the station's
+    /// at the spine's column — not the band's at their own pixel column.
+    /// A lance is [`BURST_SEC_THICK_CH`]`[0]` = 0.22 ch thick, 6.2 px of
+    /// half-thickness at the owner's `30 × 56` cell, a fifth of a cell;
+    /// the burst's core stride is [`BURST_STEP_PX`] or more, so a
+    /// one-pixel-wide quad in a dark-theme burst is always such an edge.
+    /// Everywhere on the arc the edge and its own column agree to a degree;
+    /// at the hot ink's green→blue seam — `t` 0.62 → 0.63 is 31° of hue,
+    /// 0.36 cells on the slow leg — the fifth of a cell is 10° (the hold
+    /// law's merge, 2026-09-14: see the test's doc).
+    fn worst_burst_station(
+        sc: &Scratch,
+        l: &Landing,
+        band: &[Option<f32>],
+        to: u16,
+        g: Geom,
+    ) -> Option<(f32, f32, f32, f32, usize)> {
+        let cw = g.cw as f32;
+        let ch = g.ch as f32;
+        let half_station = 0.5 / JET_STATIONS_PER_CELL as f32;
+        let feather = (BURST_SEC_THICK_CH[0] * ch * 0.5 * std::f32::consts::SQRT_2 + 0.5) / cw;
+        let mut compared = 0_usize;
+        let mut worst: Option<(f32, f32, f32, f32)> = None;
+        for q in sc.out.iter().filter(|q| lit(q)) {
+            let col = f32::from(to) + (quad_cx(q).0 - l.x) / cw;
+            let half = half_station + if q.w <= 1 { feather } else { 0.0 };
+            let (Some(t_lo), Some(t_hi), Some(t_c)) = (
+                band_at(band, col - half),
+                band_at(band, col + half),
+                band_at(band, col),
+            ) else {
+                continue;
+            };
+            let (mut lo, mut hi) = (f32::INFINITY, f32::NEG_INFINITY);
+            for i in 0..=6 {
+                let h = hue_deg(landing_ink(tri(t_lo + (t_hi - t_lo) * i as f32 / 6.0)));
+                lo = lo.min(h);
+                hi = hi.max(h);
+            }
+            compared += 1;
+            let h = hue_deg(q.color);
+            let off = if h < lo {
+                lo - h
+            } else if h > hi {
+                h - hi
+            } else {
+                0.0
+            };
+            if worst.is_none_or(|w| off > w.0) {
+                worst = Some((off, col - f32::from(to), h, hue_deg(landing_ink(tri(t_c)))));
+            }
+        }
+        worst.map(|(off, dx, h, want)| (off, dx, h, want, compared))
+    }
+
+    /// **THE PACE INSTRUMENT** (2026-09-14, the fix-up; §7 of
+    /// `docs/measured/landing-palette-2026-09-14.md`) — on a real forty-cell
+    /// run at the owner's cell, three scrubs back into it: the band's raw
+    /// walk per column against the landing's walk under the first cut's law
+    /// (`d/16` from the landing) and under the band's-origin law, in `t` and
+    /// in degrees of the hot ink's hue, plus the worst station offset of the
+    /// emitted burst at +150 and +300 ms under both laws (the old law's
+    /// burst is drawn from the same landing with its band origin removed).
+    /// Prints; run with `-- --ignored --nocapture`.
+    #[test]
+    #[ignore]
+    fn landing_pace_census_2026_09_14() {
+        let cfg = config();
+        let g = owner_device_geom();
+        println!(
+            "pace census 30x56: forty typed cells from column 0, scrub 40 -> to; per k cells \
+             from the landing: band t | d/16-from-landing t (hue off) | band's-origin t (hue off)"
+        );
+        for to in [30_u16, 12, 4] {
+            let (mut eng, mut t, band) = engine_with_typed_run(40, g, &cfg);
+            let mut sc = Scratch::default();
+            t += ms(120);
+            eng.on_event(mv_as((3, 40), (3, to), Licence::Nav), t);
+            eng_tick(&mut eng, &mut sc, t, g, &cfg);
+            let t_land = eng.field_at(3, to).unwrap();
+            let mut landing = None;
+            for _ in 0..80 {
+                t += ms(16);
+                eng_tick(&mut eng, &mut sc, t, g, &cfg);
+                if let Some(l) = eng.meteor.landings.first() {
+                    landing = Some(*l);
+                    break;
+                }
+            }
+            let l = landing.unwrap();
+            println!(
+                "landing at column {to}: t_land {t_land:.3}, band origin (d_land, t0) {:?}",
+                l.walk.band
+            );
+            for k in [-12_i32, -8, -6, -4, -2, -1, 0, 1, 2, 4, 6, 8, 12] {
+                let Some(b) = band_at(&band, f32::from(to) + k as f32) else {
+                    continue;
+                };
+                let want = hue_deg(landing_ink(tri(b)));
+                let old = tri(t_land + k as f32 / WALK_FAST_CELLS);
+                let new = l.field(k as f32);
+                println!(
+                    "  {k:+3}: band {:.3} | old {old:.3} ({:>3.0}°) | new {new:.3} ({:>3.0}°)",
+                    tri(b),
+                    hue_dist(hue_deg(landing_ink(old)), want),
+                    hue_dist(hue_deg(landing_ink(new)), want)
+                );
+            }
+            for after in [150_u64, 300] {
+                let at = l.pin.at + ms(after);
+                eng_tick(&mut eng, &mut sc, at, g, &cfg);
+                let l = eng.meteor.landings[0];
+                let mut old = l;
+                old.walk.band = None;
+                for (law, l) in [("old d/16-from-landing", &old), ("new band's-origin", &l)] {
+                    sc.clear();
+                    {
+                        let ctx = ctx_on(at, &cfg, (3, to), g);
+                        let mut fr = sc.frame();
+                        draw_burst(l, &ctx, &mut fr);
+                    }
+                    if let Some((off, dx, h, want, n)) = worst_burst_station(&sc, l, &band, to, g) {
+                        println!(
+                            "  +{after} ms {law}: {n} stations over the run, worst {off:.0}° \
+                             outside the chord at {dx:+.1} cells (hue {h:.0}, band {want:.0})"
+                        );
+                    }
+                }
+            }
+        }
     }
 }

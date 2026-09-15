@@ -281,8 +281,10 @@ pub fn config_path() -> Option<PathBuf> {
 #[serde(default)]
 pub struct MachineConfig {
     /// `[machine].spotlight_noindex`: rename every cargo target dir the doctor's scan
-    /// finds under `$HOME` to its `.noindex` form and point that repo's
-    /// `.cargo/config.toml` at it, at the end of each pass. Default `true`.
+    /// finds under `$HOME` to its `.noindex` form and keep that repo's cargo pointed at
+    /// it (a `target` symlink in a git checkout, a `.cargo/config.toml` edit elsewhere)
+    /// — at the top of every seed/update/install pass, and by `aterm pkg machine
+    /// apply`. Default `true`.
     pub spotlight_noindex: Option<bool>,
     /// `[machine].universal_control`: `"off"` (default) writes
     /// `com.apple.universalcontrol Disable`/`DisableMagicEdges` for the current host when

@@ -112,7 +112,8 @@ use transient_state::{TransientState, Vt52CursorState};
 
 pub use alt_archive::{
     ALT_ARCHIVE_DEFAULT_BUDGET, ALT_ARCHIVE_ENV, ALT_ARCHIVE_MAX_ROWS, ALT_ARCHIVE_ROW_OVERHEAD,
-    AltArchive, AltArchiveGap, AltArchiveGapKind, AltArchiveQuery, AltArchiveRead,
+    AltArchive, AltArchiveCarry, AltArchiveDiffer, AltArchiveFence, AltArchiveGap,
+    AltArchiveGapKind, AltArchiveImport, AltArchiveQuery, AltArchiveRead, alt_archive_row_charge,
 };
 pub(crate) use aterm_types::charset::CharacterSetState;
 pub use aterm_types::{ColorPalette, Rgb};

@@ -14,11 +14,11 @@
 //!
 //! ISOLATION (the smoke-stage `Sandbox` discipline, `aterm-verify`
 //! `smoke_stages.rs`): the instance runs under a per-run scratch
-//! `XDG_RUNTIME_DIR` (its socket, token, and discovery-graph entries all land
-//! inside it — never in the user's live socket dir) and a scratch, EMPTY
-//! `XDG_CONFIG_HOME` (a test instance must never read or WRITE the developer's
-//! real `aterm.toml` — the 2026-08-10 probe font incident), with
-//! `SHELL=/bin/sh` so no rc file leaks in. Every client call is pinned to the
+//! HOME and XDG roots, an explicit private control socket, and a private config
+//! disabling unrelated package, primer and machine maintenance. Reroute and
+//! native-update work are explicitly disabled too: private runtime/config roots
+//! alone still let a real window rewrite the user's default package prefix.
+//! `SHELL=/bin/sh` avoids shell rc files. Every client call is pinned to the
 //! instance with the explicit `--sock` flag and the same scratch environment.
 //!
 //! SHELL-LESS CALLER NOTE: the test process is not an aterm session, so the
@@ -33,6 +33,9 @@ use std::io::Read;
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Output, Stdio};
 use std::time::{Duration, Instant};
+
+#[path = "support/launch_isolation.rs"]
+mod launch_isolation;
 
 /// The socket-bind budget for the headless boot (matches the verify smoke's
 /// 100 x 100 ms), and the per-client-call exit bound. Both GENEROUS: a healthy
@@ -82,11 +85,6 @@ fn is_socket_or_symlink(path: &Path) -> bool {
         .unwrap_or(false)
 }
 
-fn chmod_700(path: &Path) {
-    use std::os::unix::fs::PermissionsExt;
-    let _ = std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o700));
-}
-
 /// Pick a scratch base whose socket path fits `sun_path`: `$TMPDIR` (via
 /// `temp_dir`), else `/tmp`. `None` when neither fits — an environment refusal,
 /// reported as a clean SKIP by the caller.
@@ -98,17 +96,10 @@ fn scratch_root() -> Option<PathBuf> {
         if sock.as_os_str().len() >= MAX_SOCK_PATH {
             continue;
         }
-        if std::fs::create_dir_all(tmp.join("run/aterm")).is_err() {
-            continue;
-        }
-        if std::fs::create_dir_all(tmp.join("cfg/aterm")).is_err() {
+        if launch_isolation::prepare(&tmp).is_err() {
             let _ = std::fs::remove_dir_all(&tmp);
             continue;
         }
-        chmod_700(&tmp);
-        chmod_700(&tmp.join("run"));
-        chmod_700(&tmp.join("run/aterm"));
-        chmod_700(&tmp.join("cfg"));
         return Some(tmp);
     }
     None
@@ -119,14 +110,105 @@ fn scratch_root() -> Option<PathBuf> {
 /// caller's own aterm session/socket context (the test may itself be running
 /// inside an aterm terminal — its env must never leak into the harness).
 fn hermetic_env(cmd: &mut Command, tmp: &Path) {
-    cmd.env("XDG_RUNTIME_DIR", tmp.join("run"))
-        .env("XDG_CONFIG_HOME", tmp.join("cfg"))
-        .env("SHELL", "/bin/sh")
-        .env_remove("ATERM_HEADLESS")
-        .env_remove("ATERM_CONTROL_SOCK")
-        .env_remove("ATERM_NO_CONTROL_SOCK")
-        .env_remove("ATERM_PARENT_SESSION_ID")
-        .env_remove("ATERM_CONTAINMENT_MODE");
+    launch_isolation::apply(cmd, tmp);
+}
+
+#[test]
+fn private_launch_environment_gates_host_maintenance() {
+    const OBSERVER: &str = "ATERM_FIXTURE_OBSERVER_ROOT";
+    if let Some(root) = std::env::var_os(OBSERVER) {
+        // Executed in a child process with the actual launch environment. Read
+        // the shipping config/store/policy APIs, but never perform maintenance.
+        let root = PathBuf::from(root);
+        for (name, relative) in [
+            ("HOME", "home"),
+            ("XDG_CONFIG_HOME", "cfg"),
+            ("XDG_RUNTIME_DIR", "run"),
+            ("XDG_CACHE_HOME", "cache"),
+            ("XDG_DATA_HOME", "data"),
+            ("XDG_STATE_HOME", "state"),
+            ("ATERM_UPDATE_ROOT", "updates"),
+            ("ATERM_CONTROL_SOCK", "run/aterm/aterm.sock"),
+        ] {
+            assert_eq!(std::env::var_os(name), Some(root.join(relative).into()));
+        }
+        assert!(std::env::var_os("ATERM_PARENT_SESSION_ID").is_none());
+        for name in [
+            "ATERM_NO_AUTO_UPDATE",
+            "ATERM_NO_AUTO_APPLY",
+            "ATPKG_DISABLE",
+        ] {
+            assert_eq!(std::env::var(name).as_deref(), Ok("1"));
+        }
+        let layout = atpkg::store::resolve_configured().expect("private store resolves");
+        assert!(layout.prefix.starts_with(root.join("home")));
+        assert_eq!(atpkg::config::load().enabled, Some(false));
+        let machine = atpkg::config::load_machine();
+        assert!(!machine.spotlight_noindex());
+        assert_eq!(
+            machine.universal_control(),
+            atpkg::config::UniversalControlPolicy::Leave
+        );
+        let disabled = atpkg::reroute::engaged(
+            std::env::var(atpkg::reroute::NO_REROUTE_ENV)
+                .ok()
+                .as_deref(),
+        );
+        // A fake writer records the real admission decision in private state.
+        // It does not call lay(), launchd, defaults, or any host maintenance.
+        std::fs::write(
+            root.join("observed"),
+            if disabled { "blocked" } else { "would-lay" },
+        )
+        .unwrap();
+        return;
+    }
+
+    let base = std::env::temp_dir().join(format!("atconn-isolation-{}", std::process::id()));
+    for (case, force_reroute, expected) in [
+        ("isolated", false, "blocked"),
+        ("negative-control", true, "would-lay"),
+    ] {
+        let root = base.join(case);
+        launch_isolation::prepare(&root).unwrap();
+        let log = root.join("observer.log");
+        let mut cmd = Command::new(std::env::current_exe().unwrap());
+        cmd.args([
+            "--exact",
+            "private_launch_environment_gates_host_maintenance",
+            "--nocapture",
+        ])
+        // Explicit foreign overrides must be removed as well as ambient ones.
+        .env("ATERM_PARENT_SESSION_ID", "foreign-session")
+        .env("ATERM_CONTROL_SOCK", base.join("foreign.sock"));
+        hermetic_env(&mut cmd, &root);
+        cmd.env(OBSERVER, &root)
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(std::fs::File::create(&log).unwrap());
+        if force_reroute {
+            cmd.env(atpkg::reroute::NO_REROUTE_ENV, "0");
+        }
+        let mut child = cmd.spawn().unwrap();
+        let deadline = Instant::now() + Duration::from_secs(20);
+        loop {
+            if let Some(status) = child.try_wait().unwrap() {
+                assert!(status.success(), "{case}: {}", log_tail(&log));
+                break;
+            }
+            if Instant::now() >= deadline {
+                let _ = child.kill();
+                let _ = child.wait();
+                panic!("{case}: isolation observer did not exit");
+            }
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        assert_eq!(
+            std::fs::read_to_string(root.join("observed")).unwrap(),
+            expected
+        );
+    }
+    std::fs::remove_dir_all(base).unwrap();
 }
 
 /// Boot one real headless instance under the scratch world. `None` means the
@@ -147,13 +229,13 @@ fn boot() -> Option<Instance> {
         }
     };
     let mut cmd = Command::new(env!("CARGO_BIN_EXE_aterm"));
+    hermetic_env(&mut cmd, &tmp);
     cmd.arg("--headless")
         .env("ATERM_LINES", "40")
         .env("ATERM_COLUMNS", "120")
         .stdin(Stdio::null())
         .stdout(out)
         .stderr(err);
-    hermetic_env(&mut cmd, &tmp);
     let child = match cmd.spawn() {
         Ok(c) => c,
         Err(e) => {

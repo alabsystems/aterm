@@ -1,0 +1,15 @@
+# Copyright 2026 Andrew Yates
+# SPDX-License-Identifier: Apache-2.0
+
+[package]
+name = "aterm-winres"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "Zero-dependency build-script step: compile a Win32 .rc and link it into the package's bins"
+
+[dependencies]
+
+[lints]
+workspace = true

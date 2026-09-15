@@ -8,6 +8,45 @@
 
 use super::*;
 
+/// A fixed control endpoint belongs to the outgoing process until exact Commit
+/// AND its exit. A candidate may be rejected before Commit without changing any
+/// socket/token bytes. Tier-1 drives the real GUI bind worker and reader gate.
+#[must_use]
+#[cfg_attr(trust_verify, trust::skip)]
+pub fn native_update_control_socket_handoff_model() -> Model {
+    crate::ty_model! {
+        NativeUpdateControlSocketHandoff {
+            const Buggy = 0;
+            var committed = 0;
+            var parent_live = 1;
+            var bound = 0;
+            var rejected = 0;
+            var foreign = 0;
+
+            action Commit when (committed == 0 && rejected == 0) {
+                committed = 1;
+            }
+            action Exit when (parent_live == 1) {
+                parent_live = 0;
+            }
+            action Reject when (committed == 0) {
+                rejected = 1;
+            }
+            action ForeignBind when (parent_live == 0 && bound == 0 && foreign == 0) {
+                foreign = 1;
+            }
+            action Bind when (
+                bound == 0 &&
+                ((committed == 1 && parent_live == 0 && rejected == 0 && foreign == 0) || Buggy == 1)
+            ) {
+                bound = 1;
+            }
+            invariant CommitBeforeSocketMutation:
+                bound == 0 || (committed == 1 && parent_live == 0 && rejected == 0 && foreign == 0);
+        }
+    }
+}
+
 /// Order-independent update-channel authority selection.
 ///
 /// GitHub does not document List Releases row order. The bounded catalog therefore

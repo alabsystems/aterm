@@ -543,6 +543,20 @@ impl SinkWriter {
         aterm_pty::tty_echo(self.master)
     }
 
+    /// Whether the line discipline will SWALLOW the next byte typed into
+    /// this sink — [`Self::tty_echo`] resolved to the one verdict the
+    /// rainbow's licence law reads: canonical no-echo (`read -s`, `sudo`,
+    /// an `ssh` passphrase) swallows, because the kernel owns the echo and
+    /// has said it will not do it; raw mode does not, because the program
+    /// at the slave draws its own echo. A master that is not a tty answers
+    /// `false`: the read can only WITHHOLD on positive evidence, and the
+    /// caller banks as ever.
+    #[must_use]
+    pub fn tty_swallows_input(&self) -> bool {
+        self.tty_echo()
+            .is_some_and(aterm_pty::TtyEcho::swallows_input)
+    }
+
     /// Declare whether this sink's master file DESCRIPTION carries `O_NONBLOCK`.
     ///
     /// The direct-read gather flips the master non-blocking once per session, and

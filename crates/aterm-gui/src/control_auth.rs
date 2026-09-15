@@ -67,6 +67,9 @@ pub use imp::our_uid;
 pub use imp::{
     ensure_private_dir, lock_socket_file, peer_check, provision_token, publish_latest_link,
 };
+// Whether a pid is alive: the stale sweeps' one test, shared with the handoff's
+// sweep of a dead sender's `seamless-<pid>-…` leftovers (`crate::seamless`).
+pub(crate) use imp::pid_alive;
 // `peer_uid`'s production callers are `peer_check` (inside the unix `imp`
 // module) and the handoff rendezvous DIALER (`handoff_rendezvous::dial_and_claim`
 // proves the listener is same-uid before it writes the claim secret); the
@@ -3374,6 +3377,56 @@ pub fn socket_is_live(path: &str) -> bool {
     }
 }
 
+/// A bounded connection attempt for the incoming handoff's teardown wait.
+/// A successful dial retains its kernel peer identity; the caller must refuse
+/// an unrelated owner before retrying (repeated dials can fill its backlog).
+#[cfg(unix)]
+pub(crate) fn connect_socket_nonblocking(path: &str) -> std::io::Result<CtlStream> {
+    use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
+    let mut address: libc::sockaddr_un = unsafe { std::mem::zeroed() };
+    let bytes = path.as_bytes();
+    if bytes.len() >= address.sun_path.len() || bytes.contains(&0) {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            "invalid socket path",
+        ));
+    }
+    address.sun_family = libc::AF_UNIX as libc::sa_family_t;
+    for (slot, byte) in address.sun_path.iter_mut().zip(bytes) {
+        *slot = *byte as libc::c_char;
+    }
+    // SAFETY: socket returns a fresh descriptor, owned immediately on success.
+    let raw = unsafe { libc::socket(libc::AF_UNIX, libc::SOCK_STREAM, 0) };
+    if raw < 0 {
+        return Err(std::io::Error::last_os_error());
+    }
+    let fd = unsafe { OwnedFd::from_raw_fd(raw) };
+    // SAFETY: both operations target this live, exclusively owned descriptor.
+    if unsafe { libc::fcntl(fd.as_raw_fd(), libc::F_SETFD, libc::FD_CLOEXEC) } < 0
+        || unsafe { libc::fcntl(fd.as_raw_fd(), libc::F_SETFL, libc::O_NONBLOCK) } < 0
+    {
+        return Err(std::io::Error::last_os_error());
+    }
+    // SAFETY: initialized sockaddr_un with a checked, NUL-terminated path.
+    let result = unsafe {
+        libc::connect(
+            fd.as_raw_fd(),
+            std::ptr::from_ref(&address).cast(),
+            std::mem::size_of_val(&address) as libc::socklen_t,
+        )
+    };
+    if result == 0 {
+        Ok(CtlStream::from(fd))
+    } else {
+        Err(std::io::Error::last_os_error())
+    }
+}
+
+#[cfg(not(unix))]
+pub(crate) fn connect_socket_nonblocking(path: &str) -> std::io::Result<CtlStream> {
+    CtlStream::connect(path)
+}
+
 /// [`socket_is_live`] for the PER-INSTANCE default plan (`aterm-<ourpid>.sock`).
 ///
 /// The fail-safe above INVERTS for this path: nobody else can legitimately own a
@@ -3840,6 +3893,39 @@ mod tests {
     fn decide_bind_refuses_live_keeps_stale() {
         assert_eq!(decide_bind(true), BindAction::RefuseLiveSocket);
         assert_eq!(decide_bind(false), BindAction::RemoveAndBind);
+    }
+
+    /// A liveness probe must remain bounded even when nobody drains accept().
+    /// A blocking connect can wait for this listener's queue to drain.
+    #[cfg(unix)]
+    #[test]
+    fn socket_teardown_wait_does_not_block_on_a_full_accept_backlog() {
+        use std::os::fd::AsRawFd;
+        let dir = aterm_tempfile::TempDir::new_in("/tmp").unwrap();
+        let path = dir.path().join("backlog.sock");
+        let listener = aterm_uds::CtlListener::bind(&path).unwrap();
+        // SAFETY: lower the backlog of this test's own live listener.
+        assert_eq!(unsafe { libc::listen(listener.as_raw_fd(), 1) }, 0);
+        let (tx, rx) = std::sync::mpsc::sync_channel(1);
+        let path = path.to_str().unwrap().to_string();
+        let probe = std::thread::spawn(move || {
+            let initially_live = connect_socket_nonblocking(&path).is_ok();
+            for _ in 0..128 {
+                // Only boundedness is promised here: a full backlog's errno
+                // is platform-dependent. The real binder still probes itself.
+                let _ = connect_socket_nonblocking(&path);
+            }
+            let _ = tx.send(initially_live);
+        });
+        let result = rx.recv_timeout(std::time::Duration::from_secs(2));
+        // Close before asserting: this also releases a regressed blocking dial.
+        drop(listener);
+        probe.join().unwrap();
+        assert_eq!(
+            result,
+            Ok(true),
+            "teardown hint blocked or missed the initial live listener"
+        );
     }
 
     #[test]

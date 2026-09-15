@@ -515,7 +515,7 @@ mod tests {
     /// `push_closed` was unconditional. So the notice landed in the fresh
     /// mailbox, the loop read it as "a broker subscription ended", and dropped a
     /// connection that had just come up — every churn re-running
-    /// `bring_presence_up`, `reconcile_halt` and `write_holds` over every hosted
+    /// `read_fleet_halts`, `bring_presence_up`, `apply_fleet_halts` and `write_holds` over every hosted
     /// session. Reachable whenever a subscription is still alive at reconnect
     /// time: a partial `attach_broker` failure (the broker's `MAX_CONNS` under a
     /// post-restart herd, which `attach_broker` explicitly anticipates), or one

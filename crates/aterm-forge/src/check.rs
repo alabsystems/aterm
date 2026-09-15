@@ -991,7 +991,9 @@ fn mode_label(mode: &VendoredMode) -> &'static str {
 /// system cannot (a path that does not exist compares by its spelling, which is
 /// the honest answer).
 fn canon(p: &Path) -> PathBuf {
-    std::fs::canonicalize(p).unwrap_or_else(|_| p.to_path_buf())
+    crate::resolve::strip_verbatim_prefix(
+        std::fs::canonicalize(p).unwrap_or_else(|_| p.to_path_buf()),
+    )
 }
 
 /// What the lock says about a patched package that is ALSO a differential

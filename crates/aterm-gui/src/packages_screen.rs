@@ -35,9 +35,23 @@ pub(crate) enum PackagesBusy {
     /// Line Tools through `softwareupdate`, Homebrew's signed `.pkg`). macOS shows
     /// its own administrator dialog; the GUI never sees a password.
     InstallAdmin,
+    /// `atpkg machine apply` — the `[machine]` host settings (Universal Control off,
+    /// build output hidden from Spotlight), applied now from the Security page's
+    /// "Apply now". A LOCAL verb: no store lock, no network, and it works with the
+    /// package manager switched off. macOS only.
+    MachineApply,
 }
 
 impl PackagesBusy {
+    /// Whether the verb runs atpkg's `apply_machine_settings` at the top of its pass
+    /// — mirrors atpkg's static list (`update`, `install --default-set`, `seed`, and
+    /// `machine apply` itself; NOT `install <name>` or `uninstall --all`), pinned on
+    /// the atpkg side by its source-scan test. The host re-reads the machine record
+    /// when such a verb finishes, so the card confirms rather than assumes.
+    pub(crate) fn applies_machine_settings(self) -> bool {
+        matches!(self, Self::Check | Self::Install | Self::MachineApply)
+    }
+
     fn completed_headline(self) -> &'static str {
         match self {
             Self::Check => "Package check completed",
@@ -45,6 +59,7 @@ impl PackagesBusy {
             Self::Uninstall => "ALab toolset removed",
             Self::InstallExtra => "Extra install completed",
             Self::InstallAdmin => "Admin install completed",
+            Self::MachineApply => "Machine settings applied",
         }
     }
 
@@ -55,6 +70,7 @@ impl PackagesBusy {
             Self::Uninstall => "ALab toolset removal failed",
             Self::InstallExtra => "Extra install failed",
             Self::InstallAdmin => "Admin install failed",
+            Self::MachineApply => "Machine settings not applied",
         }
     }
 }
@@ -106,6 +122,11 @@ impl PackagesCommandOutcome {
 pub(crate) struct PackagesWorkerCompletion {
     pub(crate) report: PackagesStatusReport,
     pub(crate) command: Option<PackagesCommandOutcome>,
+    /// The `atpkg machine: …` verdict sentence a [`PackagesBusy::MachineApply`]
+    /// worker read off the child's stdout (`applied — …` / `nothing changed — …`),
+    /// so the card and the feedback line can quote what the pass said rather than a
+    /// generic headline. `None` for every other worker.
+    pub(crate) machine_verdict: Option<String>,
 }
 
 impl PackagesWorkerCompletion {
@@ -113,11 +134,19 @@ impl PackagesWorkerCompletion {
         Self {
             report,
             command: None,
+            machine_verdict: None,
         }
+    }
+
+    /// Attach the machine-apply verdict sentence (see `machine_verdict`).
+    pub(crate) fn with_machine_verdict(mut self, verdict: Option<String>) -> Self {
+        self.machine_verdict = verdict;
+        self
     }
 
     pub(crate) fn command(report: PackagesStatusReport, command: PackagesCommandOutcome) -> Self {
         Self {
+            machine_verdict: None,
             report,
             command: Some(command),
         }
@@ -765,6 +794,35 @@ pub(crate) struct PackagesService {
     busy: Option<PackagesBusy>,
     report: Option<PackagesStatusReport>,
     last_command: Option<PackagesCommandOutcome>,
+    /// What bare `atpkg machine` last measured, plus this launch's memory of what
+    /// changed. Rides the same revision fan-out as the rest of the surface.
+    machine: MachinePosture,
+}
+
+/// The `[machine]` host settings as the window CONFIRMED them: the record bare
+/// `atpkg machine` printed (`machine-state:`), read by the host's machine worker —
+/// never re-derived in-process from `defaults` or a home walk — plus this launch's
+/// memory of the last `machine-settings:` change and the last apply verdict.
+/// Nothing is durable: a fresh launch starts unobserved and reads again.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub(crate) struct MachinePosture {
+    /// A read has completed at least once (a parsed state OR a read error).
+    pub(crate) observed: bool,
+    /// The parsed record, when the last read produced one.
+    pub(crate) state: Option<atpkg::machine::MachineState>,
+    /// Why the last read produced no record (the child could not be spawned, or
+    /// printed no `machine-state:` line — which is never "nothing to apply").
+    pub(crate) read_error: Option<String>,
+    /// The last `machine-settings:` body this process saw and when it arrived.
+    pub(crate) last_change: Option<(String, std::time::SystemTime)>,
+    /// The last `atpkg machine apply` verdict sentence this process saw.
+    pub(crate) last_verdict: Option<String>,
+    /// The machine read worker is running.
+    pub(crate) refreshing: bool,
+    /// A read was asked for while one was running: the running read may have
+    /// started before an apply and would land as a pre-apply record, so it is
+    /// followed by another read rather than joined.
+    pub(crate) rerun: bool,
 }
 
 /// Scalar projection used only by Tier-1 conformance. Every field is read from
@@ -791,6 +849,7 @@ impl PackagesService {
             busy: None,
             report: None,
             last_command: None,
+            machine: MachinePosture::default(),
         }
     }
 
@@ -800,6 +859,75 @@ impl PackagesService {
 
     pub(crate) fn busy(&self) -> Option<PackagesBusy> {
         self.busy
+    }
+
+    /// The machine posture as last reduced. Test-only: the host reaches the
+    /// posture through [`Self::request_machine_read`] / [`Self::replace_machine_state`]
+    /// and the projection, never by inspecting it.
+    #[cfg(test)]
+    pub(crate) fn machine(&self) -> &MachinePosture {
+        &self.machine
+    }
+
+    /// Mark a read as running without asking for one — test-only, to stage the
+    /// "read in flight" posture; the host uses [`Self::request_machine_read`].
+    #[cfg(test)]
+    pub(crate) fn set_machine_refreshing(&mut self, refreshing: bool) {
+        if self.machine.refreshing == refreshing {
+            return;
+        }
+        self.machine.refreshing = refreshing;
+        self.revision = self.revision.saturating_add(1);
+    }
+
+    /// Ask for a machine read. `true` ⇒ the caller spawns one (the posture is now
+    /// refreshing); `false` ⇒ one is already running and a rerun is queued behind
+    /// it — never joined, because the running read may predate an apply and would
+    /// land as the final "observed" record.
+    pub(crate) fn request_machine_read(&mut self) -> bool {
+        if self.machine.refreshing {
+            self.machine.rerun = true;
+            return false;
+        }
+        self.machine.refreshing = true;
+        self.revision = self.revision.saturating_add(1);
+        true
+    }
+
+    /// Reduce one machine read: a parsed `machine-state:` record, or the reason
+    /// there was none. Either way the posture is now OBSERVED — a read error is a
+    /// fact the card states, not a reason to keep saying "reading". Returns `true`
+    /// when a rerun was queued while this read ran: the posture then STAYS
+    /// refreshing (Apply disabled, the card still "Reading…") and the caller must
+    /// spawn the already-admitted read directly, without requesting admission again.
+    #[must_use = "a queued rerun must be spawned by the caller"]
+    pub(crate) fn replace_machine_state(
+        &mut self,
+        result: Result<atpkg::machine::MachineState, String>,
+    ) -> bool {
+        self.machine.observed = true;
+        let rerun = std::mem::take(&mut self.machine.rerun);
+        self.machine.refreshing = rerun;
+        match result {
+            Ok(state) => {
+                self.machine.state = Some(state);
+                self.machine.read_error = None;
+            }
+            Err(error) => {
+                // Keep the last good record beside the error: a transient read
+                // failure must not erase what was measured a moment ago.
+                self.machine.read_error = Some(error);
+            }
+        }
+        self.revision = self.revision.saturating_add(1);
+        rerun
+    }
+
+    /// Remember a `machine-settings:` change (the pull-down row's body) and when
+    /// this process saw it.
+    pub(crate) fn note_machine_change(&mut self, body: String, at: std::time::SystemTime) {
+        self.machine.last_change = Some((body, at));
+        self.revision = self.revision.saturating_add(1);
     }
 
     #[cfg(test)]
@@ -812,6 +940,7 @@ impl PackagesService {
             (true, Some(PackagesBusy::Uninstall)) => 4,
             (true, Some(PackagesBusy::InstallExtra)) => 5,
             (true, Some(PackagesBusy::InstallAdmin)) => 6,
+            (true, Some(PackagesBusy::MachineApply)) => 7,
         };
         let (last_operation, last_result) = match self.last_command.as_ref() {
             None => (0, 0),
@@ -822,6 +951,7 @@ impl PackagesService {
                     PackagesBusy::Uninstall => 4,
                     PackagesBusy::InstallExtra => 5,
                     PackagesBusy::InstallAdmin => 6,
+                    PackagesBusy::MachineApply => 7,
                 },
                 1,
             ),
@@ -832,6 +962,7 @@ impl PackagesService {
                     PackagesBusy::Uninstall => 4,
                     PackagesBusy::InstallExtra => 5,
                     PackagesBusy::InstallAdmin => 6,
+                    PackagesBusy::MachineApply => 7,
                 },
                 2,
             ),
@@ -899,6 +1030,9 @@ impl PackagesService {
         if completion.command.is_some() {
             self.last_command = completion.command;
         }
+        if completion.machine_verdict.is_some() {
+            self.machine.last_verdict = completion.machine_verdict;
+        }
         self.revision = self.revision.saturating_add(1);
         true
     }
@@ -943,6 +1077,9 @@ impl PackagesService {
             auto_update,
             auto_install,
             loop_running,
+            machine: self.machine.clone(),
+            saved_universal_control: atpkg::config::UniversalControlPolicy::Off,
+            saved_spotlight_noindex: true,
         }
     }
 }
@@ -974,9 +1111,26 @@ pub(crate) struct PackagesState {
     /// Immutable fact: the background updater thread actually started for this
     /// process. Saved config may differ until the next launch.
     loop_running: bool,
+    /// The `[machine]` host settings as confirmed by the machine read worker.
+    machine: MachinePosture,
+    /// The SAVED `[machine]` switches, resolved from the host's config — display
+    /// only, so the card can say when a saved switch has not been read yet.
+    saved_universal_control: atpkg::config::UniversalControlPolicy,
+    saved_spotlight_noindex: bool,
 }
 
 impl PackagesState {
+    /// Attach the host's saved `[machine]` switches (the config is host-owned; the
+    /// service holds only worker facts).
+    pub(crate) fn with_machine_config(
+        mut self,
+        universal_control: atpkg::config::UniversalControlPolicy,
+        spotlight_noindex: bool,
+    ) -> Self {
+        self.saved_universal_control = universal_control;
+        self.saved_spotlight_noindex = spotlight_noindex;
+        self
+    }
     /// The pre-observation default a freshly-created Settings controller holds
     /// until the host publishes a real snapshot.
     pub(crate) fn unobserved() -> Self {
@@ -991,11 +1145,20 @@ impl PackagesState {
             auto_update: true,
             auto_install: false,
             loop_running: false,
+            machine: MachinePosture::default(),
+            saved_universal_control: atpkg::config::UniversalControlPolicy::Off,
+            saved_spotlight_noindex: true,
         }
     }
 
     /// Snapshot the exact state the Packages page paints.
     pub(crate) fn projection(&self) -> PackagesProjection {
+        self.projection_at(std::time::SystemTime::now())
+    }
+
+    /// [`Self::projection`] with the clock injected — the "Last change … ago"
+    /// line is the only time-dependent word on the surface, and tests pin it.
+    pub(crate) fn projection_at(&self, now: std::time::SystemTime) -> PackagesProjection {
         let report = &self.report;
         let actions_enabled = self.observed
             && report.available
@@ -1013,6 +1176,7 @@ impl PackagesState {
                 PackagesBusy::InstallAdmin => {
                     "Installing through macOS — the administrator dialog is open…".to_string()
                 }
+                PackagesBusy::MachineApply => "Applying the machine settings…".to_string(),
             }
         } else if let Some(command) = self.last_command.as_ref() {
             command.headline().to_string()
@@ -1040,10 +1204,27 @@ impl PackagesState {
             }
             (!detail.is_empty()).then_some(detail)
         };
+        // A machine apply that succeeded quotes the pass's own verdict sentence
+        // (`applied — …` / `nothing changed — …`) instead of a bare headline.
+        let command_feedback = match (
+            self.last_command.as_ref(),
+            self.machine.last_verdict.as_deref(),
+        ) {
+            (
+                Some(PackagesCommandOutcome::Succeeded {
+                    operation: PackagesBusy::MachineApply,
+                }),
+                Some(verdict),
+            ) => Some(format!("Machine settings: {verdict}")),
+            (Some(command), _) => Some(command.feedback()),
+            (None, _) => None,
+        };
         let mut detail = if !self.observed {
             None
         } else if let Some(command) = self.last_command.as_ref() {
-            let mut detail = command.feedback();
+            let mut detail = command_feedback
+                .clone()
+                .unwrap_or_else(|| command.feedback());
             if let Some(recorded) = recorded_detail() {
                 match command {
                     PackagesCommandOutcome::Succeeded { .. } => {
@@ -1099,11 +1280,13 @@ impl PackagesState {
             (false, true, false) => "Not started · Auto-update Saved Off",
         }
         .to_string();
-        let command_feedback = self
-            .last_command
-            .as_ref()
-            .map(PackagesCommandOutcome::feedback);
+        // The machine verb is NOT manager-gated: `atpkg machine apply` is a local
+        // verb that works with the manager switched off, so its slice gets the
+        // page's idleness alone — observed, atpkg present, no worker inflight.
+        let machine_idle = self.observed && report.available && !self.inflight;
+        let machine = self.machine_projection(machine_idle, now);
         PackagesProjection {
+            machine,
             observed: self.observed,
             available: report.available,
             manager_enabled: report.manager_enabled,
@@ -1133,12 +1316,238 @@ impl PackagesState {
             command_feedback,
         }
     }
+
+    /// The "This Mac" card's words, derived HERE so pixels, accessibility and
+    /// `aterm ctl` introspection read one truth. `idle` is the page's idleness
+    /// (observed, atpkg present, no worker inflight) and deliberately NOT the
+    /// manager-gated `actions_enabled`: `atpkg machine apply` is a local verb that
+    /// works with the package manager switched off. The button additionally needs
+    /// a parsed record, nothing in the way, and a verdict — measured posture ×
+    /// the SAVED switches, which is what the apply child will read — that says
+    /// something is left to do.
+    fn machine_projection(&self, idle: bool, now: std::time::SystemTime) -> MachineProjection {
+        use atpkg::config::UniversalControlPolicy;
+        use atpkg::machine::{HomePosture, UcPosture};
+        let posture = &self.machine;
+        let supported = cfg!(target_os = "macos");
+        let state = posture.state.as_ref();
+        // A read that failed AFTER a good record keeps the record (a transient
+        // failure must not erase a measurement) but every measured sentence says
+        // it is prior — a stale record never reads as a fresh one.
+        let prior = if posture.read_error.is_some() && state.is_some() {
+            " (from the last successful read)"
+        } else {
+            ""
+        };
+        let universal_control = match state {
+            None => "Universal Control: not read yet".to_string(),
+            Some(s) => {
+                let word = match s.universal_control {
+                    UcPosture::Disabled => "disabled on this Mac",
+                    UcPosture::Default => {
+                        "at the OS default — the cursor roams to other Macs and iPads"
+                    }
+                    UcPosture::Partial => "partly disabled",
+                    UcPosture::Unknown => "unknown",
+                };
+                let policy = match (s.policy, s.universal_control) {
+                    (UniversalControlPolicy::Leave, UcPosture::Disabled)
+                    | (UniversalControlPolicy::Off, _) => "",
+                    (UniversalControlPolicy::Leave, _) => {
+                        " · left alone ([machine] universal_control = \"leave\")"
+                    }
+                };
+                format!("Universal Control: {word}{policy}{prior}")
+            }
+        };
+        let spotlight = match state {
+            None => "Build output: not read yet".to_string(),
+            Some(s) => {
+                let at_least = if s.scan_complete {
+                    ""
+                } else {
+                    " (at least — the scan hit its budget)"
+                };
+                let policy = if s.spotlight_noindex {
+                    ""
+                } else {
+                    " · switched off ([machine] spotlight_noindex = false)"
+                };
+                // What an apply CAN hide — the CLI's `can_hide`: nothing with the
+                // switch off, whatever the scan counted as migratable.
+                let can_hide = if s.spotlight_noindex {
+                    s.would_migrate
+                } else {
+                    0
+                };
+                format!(
+                    "Build output: {} target dirs hidden, {} open to Spotlight — {can_hide} a pass would hide{at_least}{policy}{prior}",
+                    s.hidden, s.exposed
+                )
+            }
+        };
+        let last_change = match posture.last_change.as_ref() {
+            None => "No change recorded this launch".to_string(),
+            Some((items, at)) => {
+                let age_ms = now
+                    .duration_since(*at)
+                    .map(|d| u64::try_from(d.as_millis()).unwrap_or(u64::MAX))
+                    .unwrap_or(0);
+                format!(
+                    "Last change: {items} · {}",
+                    crate::session_chrome::relative_age(age_ms)
+                )
+            }
+        };
+        let reason = if let Some(error) = posture.read_error.as_deref() {
+            Some(format!("Could not read the machine state: {error}"))
+        } else {
+            match state.map(|s| s.home) {
+                Some(HomePosture::Mismatch) => Some(
+                    "Not applied here: this window's HOME is not the account's home, and \
+                     `defaults` writes the account's per-host settings regardless."
+                        .to_string(),
+                ),
+                Some(HomePosture::Unresolved) => Some(
+                    "Not applied here: the account home could not be resolved, so HOME \
+                     cannot be proven to be it."
+                        .to_string(),
+                ),
+                Some(HomePosture::Account) | None => None,
+            }
+        };
+        // A switch saved in Settings after the last read: the record's `policy=` /
+        // `noindex=` came from the file as it was THEN, so say what the next read,
+        // pass or Apply now will use — the card must never look as if a flipped
+        // switch had already been measured.
+        let saved = state.and_then(|s| {
+            let mut changed: Vec<String> = Vec::new();
+            if s.policy != self.saved_universal_control {
+                changed.push(format!(
+                    "universal_control = \"{}\"",
+                    match self.saved_universal_control {
+                        UniversalControlPolicy::Off => "off",
+                        UniversalControlPolicy::Leave => "leave",
+                    }
+                ));
+            }
+            if s.spotlight_noindex != self.saved_spotlight_noindex {
+                changed.push(format!(
+                    "spotlight_noindex = {}",
+                    self.saved_spotlight_noindex
+                ));
+            }
+            (!changed.is_empty()).then(|| {
+                format!(
+                    "Saved since the last read: {} — the next package pass or Apply now uses it",
+                    changed.join(", ")
+                )
+            })
+        });
+        // THE verdict — the same `machine_next` table the CLI uses, over the
+        // measured posture and the SAVED switches (the apply child reads the file
+        // fresh, so a switch flipped after the read decides what it will do; the
+        // record's own `policy=`/`noindex=` only feed the measured sentences and
+        // the "Saved since the last read" line). None on any home but the
+        // account's, exactly as `MachineState::next`.
+        let next = state.and_then(|s| {
+            (s.home == HomePosture::Account)
+                .then(|| {
+                    atpkg::machine::machine_next(
+                        s.universal_control,
+                        self.saved_universal_control,
+                        self.saved_spotlight_noindex,
+                        s.would_migrate,
+                    )
+                })
+                .flatten()
+        });
+        let apply_enabled = idle
+            && supported
+            && posture.observed
+            && !posture.refreshing
+            && reason.is_none()
+            && next.is_some();
+        // `next()` is already None on a home mismatch, and the reason line says
+        // why — so "nothing to apply" is claimed only when nothing is in the way.
+        let nothing_to_apply = posture.observed && reason.is_none() && next.is_none();
+        let next = match next {
+            Some(n) if reason.is_none() => {
+                let mut what: Vec<String> = Vec::new();
+                if n.universal_control {
+                    what.push("Universal Control off for this host".to_string());
+                }
+                if n.spotlight > 0 {
+                    what.push(format!(
+                        "{} target dir(s) hidden from Spotlight",
+                        n.spotlight
+                    ));
+                }
+                format!("Apply now would set: {}", what.join("; "))
+            }
+            _ if nothing_to_apply => {
+                "Nothing to apply — Universal Control and Spotlight are where [machine] wants them"
+                    .to_string()
+            }
+            _ => String::new(),
+        };
+        MachineProjection {
+            supported,
+            observed: posture.observed,
+            refreshing: posture.refreshing,
+            universal_control,
+            spotlight,
+            last_change,
+            last_verdict: posture.last_verdict.clone(),
+            reason,
+            saved,
+            next,
+            apply_enabled,
+            nothing_to_apply,
+        }
+    }
+}
+
+/// The "This Mac" card on Settings ▸ Security, as words (the
+/// [`PackagesProjection`] slice for the `[machine]` host settings).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct MachineProjection {
+    /// These are macOS host settings; elsewhere the card is absent.
+    pub(crate) supported: bool,
+    /// A machine read has completed at least once.
+    pub(crate) observed: bool,
+    /// The machine read worker is running.
+    pub(crate) refreshing: bool,
+    /// `Universal Control: …` — the measured posture.
+    pub(crate) universal_control: String,
+    /// `Build output: …` — the Spotlight counts.
+    pub(crate) spotlight: String,
+    /// `Last change: … · <age>` or `No change recorded this launch`.
+    pub(crate) last_change: String,
+    /// The last `atpkg machine apply` verdict this launch, when there is one.
+    pub(crate) last_verdict: Option<String>,
+    /// Why an apply would do nothing here (home mismatch/unresolved) or why the
+    /// state could not be read. `None` when there is nothing in the way.
+    pub(crate) reason: Option<String>,
+    /// A `[machine]` switch saved after the last read, and what will use it.
+    pub(crate) saved: Option<String>,
+    /// What Apply now would do (`Apply now would set: …`), or the "nothing to
+    /// apply" sentence; empty while unobserved or when a reason is in the way.
+    pub(crate) next: String,
+    /// The Apply now button: page idle, macOS, observed, not refreshing, and the
+    /// verdict says something is left to do.
+    pub(crate) apply_enabled: bool,
+    /// Observed, readable, and the verdict is "nothing to apply" — the card says so
+    /// in place of an enabled button.
+    pub(crate) nothing_to_apply: bool,
 }
 
 /// Owned, structured read projection shared with the native Settings
 /// `/packages` route (the [`crate::update_screen::UpdateProjection`] analogue).
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) struct PackagesProjection {
+    /// The `[machine]` host settings slice (Settings ▸ Security's "This Mac" card).
+    pub(crate) machine: MachineProjection,
     pub(crate) observed: bool,
     pub(crate) available: bool,
     pub(crate) manager_enabled: bool,
@@ -2053,5 +2462,586 @@ mod tests {
         assert!(!projection.refreshing);
         assert!(!projection.headline.contains("Reading"));
         let _ = std::fs::remove_dir_all(prefix);
+    }
+
+    fn machine_state(
+        uc: atpkg::machine::UcPosture,
+        would_migrate: usize,
+        home: atpkg::machine::HomePosture,
+    ) -> atpkg::machine::MachineState {
+        atpkg::machine::MachineState {
+            universal_control: uc,
+            policy: atpkg::config::UniversalControlPolicy::Off,
+            spotlight_noindex: true,
+            exposed: would_migrate + 1,
+            hidden: 8,
+            would_migrate,
+            scan_complete: true,
+            home,
+        }
+    }
+
+    /// The "This Mac" card reads the machine posture through the packages
+    /// projection: unobserved says nothing and offers no button; a read bumps the
+    /// revision and renders the measured words; `Apply now` follows
+    /// `MachineState::next` (a home mismatch or nothing-left disables it); a
+    /// recorded change and an apply verdict are quoted with their age.
+    #[test]
+    fn projection_carries_the_machine_posture() {
+        use atpkg::machine::{HomePosture, UcPosture};
+        let mut service = PackagesService::new();
+        let base = service.revision();
+        let unobserved = service.state(true, true, true, false, true).projection();
+        assert!(!unobserved.machine.observed);
+        assert!(!unobserved.machine.apply_enabled);
+        assert!(!unobserved.machine.nothing_to_apply);
+        assert_eq!(
+            unobserved.machine.universal_control,
+            "Universal Control: not read yet"
+        );
+        assert_eq!(
+            unobserved.machine.last_change,
+            "No change recorded this launch"
+        );
+        assert_eq!(unobserved.machine.supported, cfg!(target_os = "macos"));
+
+        // The page must be observed and idle before any verb — the machine card
+        // shares that gate, so seed a live report first.
+        let report =
+            PackagesStatusReport::from_parts(true, true, "fp".into(), Some(&status("ok")), &[]);
+        let seq = service.begin(None).unwrap();
+        assert!(service.finish(seq, refresh(report)));
+
+        service.set_machine_refreshing(true);
+        let refreshing = service.state(true, true, true, false, true).projection();
+        assert!(refreshing.machine.refreshing);
+        assert!(!refreshing.machine.apply_enabled);
+
+        let before = service.revision();
+        let _ = service.replace_machine_state(Ok(machine_state(
+            UcPosture::Default,
+            2,
+            HomePosture::Account,
+        )));
+        assert!(service.revision() > before, "a read fans out");
+        assert!(!service.machine().refreshing, "a read ends the refresh");
+        let now = std::time::SystemTime::now();
+        let live = service
+            .state(true, true, true, false, true)
+            .projection_at(now);
+        assert!(live.machine.observed);
+        assert_eq!(
+            live.machine.universal_control,
+            "Universal Control: at the OS default — the cursor roams to other Macs and iPads"
+        );
+        assert_eq!(
+            live.machine.spotlight,
+            "Build output: 8 target dirs hidden, 3 open to Spotlight — 2 a pass would hide"
+        );
+        assert!(live.machine.reason.is_none());
+        assert_eq!(live.machine.apply_enabled, cfg!(target_os = "macos"));
+        assert!(!live.machine.nothing_to_apply);
+        assert_eq!(
+            live.machine.next,
+            "Apply now would set: Universal Control off for this host; 2 target dir(s) hidden from Spotlight"
+        );
+        assert!(live.machine.saved.is_none(), "saved == measured ⇒ no note");
+        // A switch flipped in Settings after the read is named, never shown as
+        // already measured.
+        let flipped = service
+            .state(true, true, true, false, true)
+            .with_machine_config(atpkg::config::UniversalControlPolicy::Leave, false)
+            .projection_at(now);
+        assert_eq!(
+            flipped.machine.saved.as_deref(),
+            Some(
+                "Saved since the last read: universal_control = \"leave\", spotlight_noindex = false — the next package pass or Apply now uses it"
+            )
+        );
+
+        // A recorded change carries its age; a verdict is quoted verbatim.
+        service.note_machine_change(
+            "universal-control disabled".to_string(),
+            now - std::time::Duration::from_secs(120),
+        );
+        let seq = service.begin(Some(PackagesBusy::MachineApply)).unwrap();
+        assert!(
+            service.finish(
+                seq,
+                succeeded(
+                    PackagesStatusReport::from_parts(
+                        true,
+                        true,
+                        "fp".into(),
+                        Some(&status("ok")),
+                        &[]
+                    ),
+                    PackagesBusy::MachineApply,
+                )
+                .with_machine_verdict(Some("applied — universal-control disabled".to_string())),
+            )
+        );
+        let changed = service
+            .state(true, true, true, false, true)
+            .projection_at(now);
+        assert_eq!(
+            changed.machine.last_change,
+            "Last change: universal-control disabled · 2m ago"
+        );
+        assert_eq!(
+            changed.machine.last_verdict.as_deref(),
+            Some("applied — universal-control disabled")
+        );
+        assert_eq!(changed.headline, "Machine settings applied");
+        assert_eq!(
+            changed.command_feedback.as_deref(),
+            Some("Machine settings: applied — universal-control disabled")
+        );
+
+        // Nothing left to do: the button is off and the card says so.
+        let _ = service.replace_machine_state(Ok(machine_state(
+            UcPosture::Disabled,
+            0,
+            HomePosture::Account,
+        )));
+        let done = service
+            .state(true, true, true, false, true)
+            .projection_at(now);
+        assert_eq!(
+            done.machine.universal_control,
+            "Universal Control: disabled on this Mac"
+        );
+        assert!(!done.machine.apply_enabled);
+        assert!(done.machine.nothing_to_apply);
+        assert!(
+            done.machine.next.starts_with("Nothing to apply"),
+            "{}",
+            done.machine.next
+        );
+
+        // A home mismatch disables the button and names the reason.
+        let _ = service.replace_machine_state(Ok(machine_state(
+            UcPosture::Default,
+            2,
+            HomePosture::Mismatch,
+        )));
+        let mismatch = service
+            .state(true, true, true, false, true)
+            .projection_at(now);
+        assert!(!mismatch.machine.apply_enabled);
+        assert!(
+            !mismatch.machine.nothing_to_apply,
+            "a mismatch is not \"nothing to apply\""
+        );
+        assert!(mismatch.machine.next.is_empty());
+        assert!(
+            mismatch
+                .machine
+                .reason
+                .as_deref()
+                .is_some_and(|r| r.starts_with("Not applied here")),
+            "{:?}",
+            mismatch.machine.reason
+        );
+
+        // With the switch OFF a pass hides nothing, whatever the scan counted: the
+        // sentence prints what an apply CAN hide (the CLI's `can_hide`), and with
+        // the saved switch off too there is nothing left to apply.
+        let _ = service.replace_machine_state(Ok(atpkg::machine::MachineState {
+            spotlight_noindex: false,
+            ..machine_state(UcPosture::Disabled, 2, HomePosture::Account)
+        }));
+        let switched_off = service
+            .state(true, true, true, false, true)
+            .with_machine_config(atpkg::config::UniversalControlPolicy::Off, false)
+            .projection_at(now);
+        assert_eq!(
+            switched_off.machine.spotlight,
+            "Build output: 8 target dirs hidden, 3 open to Spotlight — 0 a pass would hide · switched off ([machine] spotlight_noindex = false)"
+        );
+        assert!(switched_off.machine.nothing_to_apply);
+        assert!(
+            switched_off.machine.next.starts_with("Nothing to apply"),
+            "{}",
+            switched_off.machine.next
+        );
+        assert!(switched_off.machine.saved.is_none());
+
+        // A read error AFTER a good record: observed, the last record is kept but
+        // every measured sentence says it is prior, the verdict line is silent and
+        // the button is off — a stale record never stands in for a measured one.
+        let _ = service.replace_machine_state(Ok(machine_state(
+            UcPosture::Default,
+            2,
+            HomePosture::Account,
+        )));
+        let _ = service.replace_machine_state(Err("atpkg machine printed no state".to_string()));
+        let errored = service
+            .state(true, true, true, false, true)
+            .projection_at(now);
+        assert!(errored.machine.observed);
+        assert!(!errored.machine.apply_enabled);
+        assert!(!errored.machine.nothing_to_apply);
+        assert!(errored.machine.next.is_empty(), "{}", errored.machine.next);
+        assert_eq!(
+            errored.machine.reason.as_deref(),
+            Some("Could not read the machine state: atpkg machine printed no state")
+        );
+        assert!(
+            errored
+                .machine
+                .universal_control
+                .ends_with("(from the last successful read)"),
+            "{}",
+            errored.machine.universal_control
+        );
+        assert!(
+            errored
+                .machine
+                .spotlight
+                .ends_with("(from the last successful read)"),
+            "{}",
+            errored.machine.spotlight
+        );
+        assert!(
+            service.machine().state.is_some(),
+            "a failed read never erases the last measurement"
+        );
+        let _ = base;
+    }
+
+    /// `atpkg machine apply` is a LOCAL verb: the card's Apply now must not inherit
+    /// the package page's manager gate. With the manager switched off
+    /// (ATPKG_DISABLE / no pinned root key) or the status collection torn, the
+    /// package verbs are off but the machine verdict and its button stay live.
+    #[test]
+    fn machine_apply_ignores_the_manager_gate() {
+        use atpkg::machine::{HomePosture, UcPosture};
+        let manager_off =
+            PackagesStatusReport::from_parts(true, false, "fp".into(), Some(&status("ok")), &[]);
+        let mut torn =
+            PackagesStatusReport::from_parts(true, true, "fp".into(), Some(&status("ok")), &[]);
+        torn.collection_error = Some("status.toml: torn record".to_string());
+        for (report, why) in [(manager_off, "manager off"), (torn, "collection error")] {
+            let mut service = PackagesService::new();
+            let seq = service.begin(None).unwrap();
+            assert!(service.finish(seq, refresh(report)));
+            let _ = service.replace_machine_state(Ok(machine_state(
+                UcPosture::Default,
+                2,
+                HomePosture::Account,
+            )));
+            let p = service.state(true, true, true, false, true).projection();
+            assert!(!p.actions_enabled, "{why}: the package verbs are gated");
+            assert_eq!(
+                p.machine.apply_enabled,
+                cfg!(target_os = "macos"),
+                "{why}: the machine verb is not"
+            );
+            assert!(!p.machine.nothing_to_apply, "{why}");
+            assert!(
+                p.machine.next.starts_with("Apply now would set"),
+                "{why}: {}",
+                p.machine.next
+            );
+        }
+    }
+
+    /// The apply child reads the SAVED `[machine]` switches, so the verdict and the
+    /// button follow measured posture × saved switches — never the record's stale
+    /// `policy=`/`noindex=` — in both directions.
+    #[test]
+    fn flipped_machine_switch_drives_the_apply_verdict_not_the_stale_record() {
+        use atpkg::config::UniversalControlPolicy;
+        use atpkg::machine::{HomePosture, UcPosture};
+        let mut service = PackagesService::new();
+        let seq = service.begin(None).unwrap();
+        assert!(service.finish(
+            seq,
+            refresh(PackagesStatusReport::from_parts(
+                true,
+                true,
+                "fp".into(),
+                Some(&status("ok")),
+                &[]
+            )),
+        ));
+        // Direction B: the record says the pass would act; the user then saved
+        // "leave" and switched Spotlight off — an apply would now do nothing.
+        let _ = service.replace_machine_state(Ok(machine_state(
+            UcPosture::Default,
+            2,
+            HomePosture::Account,
+        )));
+        let b = service
+            .state(true, true, true, false, true)
+            .with_machine_config(UniversalControlPolicy::Leave, false)
+            .projection();
+        assert!(!b.machine.apply_enabled);
+        assert!(b.machine.nothing_to_apply);
+        assert!(
+            b.machine.next.starts_with("Nothing to apply"),
+            "{}",
+            b.machine.next
+        );
+        assert!(
+            b.machine
+                .saved
+                .as_deref()
+                .is_some_and(|s| s.contains("universal_control = \"leave\"")
+                    && s.contains("spotlight_noindex = false")),
+            "{:?}",
+            b.machine.saved
+        );
+        // Direction A: the record was read under leave/off; the user then saved
+        // "off" and switched Spotlight on — an apply WOULD act, so say so.
+        let _ = service.replace_machine_state(Ok(atpkg::machine::MachineState {
+            policy: UniversalControlPolicy::Leave,
+            spotlight_noindex: false,
+            ..machine_state(UcPosture::Default, 2, HomePosture::Account)
+        }));
+        let a = service
+            .state(true, true, true, false, true)
+            .with_machine_config(UniversalControlPolicy::Off, true)
+            .projection();
+        assert_eq!(a.machine.apply_enabled, cfg!(target_os = "macos"));
+        assert!(!a.machine.nothing_to_apply);
+        assert_eq!(
+            a.machine.next,
+            "Apply now would set: Universal Control off for this host; 2 target dir(s) hidden from Spotlight"
+        );
+        assert!(
+            a.machine
+                .saved
+                .as_deref()
+                .is_some_and(|s| s.contains("universal_control = \"off\"")
+                    && s.contains("spotlight_noindex = true")),
+            "{:?}",
+            a.machine.saved
+        );
+    }
+
+    /// A read asked for while one is running is QUEUED behind it, never joined:
+    /// the running read may have started before an apply and would land as a
+    /// pre-apply record. The posture stays refreshing (Apply off, "Reading…")
+    /// until the rerun lands.
+    #[test]
+    fn a_read_in_flight_when_the_apply_finishes_is_rerun_not_joined() {
+        use atpkg::machine::{HomePosture, UcPosture};
+        let report =
+            || PackagesStatusReport::from_parts(true, true, "fp".into(), Some(&status("ok")), &[]);
+        let mut service = PackagesService::new();
+        let seq = service.begin(None).unwrap();
+        assert!(service.finish(seq, refresh(report())));
+        assert!(service.request_machine_read(), "idle ⇒ the caller spawns");
+        assert!(service.machine().refreshing);
+        assert!(!service.machine().rerun);
+
+        // An apply runs and finishes while that read is still out.
+        let seq = service.begin(Some(PackagesBusy::MachineApply)).unwrap();
+        assert!(
+            service.finish(
+                seq,
+                succeeded(report(), PackagesBusy::MachineApply)
+                    .with_machine_verdict(Some("applied — universal-control disabled".to_string())),
+            )
+        );
+        assert!(
+            !service.request_machine_read(),
+            "a read in flight is queued, not joined"
+        );
+        assert!(service.machine().refreshing);
+        assert!(service.machine().rerun);
+
+        // The STALE read lands: the rerun is handed back to the caller, and the
+        // card keeps reading — the stale record never enables Apply.
+        assert!(service.replace_machine_state(Ok(machine_state(
+            UcPosture::Default,
+            2,
+            HomePosture::Account,
+        ))));
+        assert!(!service.machine().rerun, "handed back exactly once");
+        let stale = service.state(true, true, true, false, true).projection();
+        assert!(stale.machine.observed);
+        assert!(stale.machine.refreshing);
+        assert!(!stale.machine.apply_enabled);
+
+        // The rerun lands: fresh record, nothing pending, the verdict is final.
+        assert!(!service.replace_machine_state(Ok(machine_state(
+            UcPosture::Disabled,
+            0,
+            HomePosture::Account,
+        ))));
+        let fresh = service.state(true, true, true, false, true).projection();
+        assert!(!fresh.machine.refreshing);
+        assert!(fresh.machine.nothing_to_apply);
+        assert!(!fresh.machine.apply_enabled);
+    }
+
+    /// Every posture word the card can say, pinned from the record: the two
+    /// half/unknown Universal Control states, the `leave` suffix (and its absence
+    /// once disabled), the scan-budget suffix, the switched-off Spotlight sentence
+    /// and the unresolved-home reason — with the verdict each one yields.
+    #[test]
+    fn machine_projection_words_cover_every_posture() {
+        use atpkg::config::UniversalControlPolicy::{self, Leave, Off};
+        use atpkg::machine::{HomePosture, MachineState, UcPosture};
+        struct Row {
+            name: &'static str,
+            state: MachineState,
+            saved: (UniversalControlPolicy, bool),
+            universal_control: &'static str,
+            spotlight: &'static str,
+            next: &'static str,
+            reason_starts: Option<&'static str>,
+            nothing_to_apply: bool,
+            apply_on_macos: bool,
+        }
+        let rows = [
+            Row {
+                name: "partial",
+                state: machine_state(UcPosture::Partial, 2, HomePosture::Account),
+                saved: (Off, true),
+                universal_control: "Universal Control: partly disabled",
+                spotlight: "Build output: 8 target dirs hidden, 3 open to Spotlight — 2 a pass would hide",
+                next: "Apply now would set: Universal Control off for this host; 2 target dir(s) hidden from Spotlight",
+                reason_starts: None,
+                nothing_to_apply: false,
+                apply_on_macos: true,
+            },
+            Row {
+                name: "unknown",
+                state: machine_state(UcPosture::Unknown, 0, HomePosture::Account),
+                saved: (Off, true),
+                universal_control: "Universal Control: unknown",
+                spotlight: "Build output: 8 target dirs hidden, 1 open to Spotlight — 0 a pass would hide",
+                next: "Apply now would set: Universal Control off for this host",
+                reason_starts: None,
+                nothing_to_apply: false,
+                apply_on_macos: true,
+            },
+            Row {
+                name: "default, left alone",
+                state: MachineState {
+                    policy: Leave,
+                    ..machine_state(UcPosture::Default, 0, HomePosture::Account)
+                },
+                saved: (Leave, true),
+                universal_control: "Universal Control: at the OS default — the cursor roams to other Macs and iPads · left alone ([machine] universal_control = \"leave\")",
+                spotlight: "Build output: 8 target dirs hidden, 1 open to Spotlight — 0 a pass would hide",
+                next: "Nothing to apply — Universal Control and Spotlight are where [machine] wants them",
+                reason_starts: None,
+                nothing_to_apply: true,
+                apply_on_macos: false,
+            },
+            Row {
+                name: "disabled, leave says nothing extra",
+                state: MachineState {
+                    policy: Leave,
+                    ..machine_state(UcPosture::Disabled, 0, HomePosture::Account)
+                },
+                saved: (Leave, true),
+                universal_control: "Universal Control: disabled on this Mac",
+                spotlight: "Build output: 8 target dirs hidden, 1 open to Spotlight — 0 a pass would hide",
+                next: "Nothing to apply — Universal Control and Spotlight are where [machine] wants them",
+                reason_starts: None,
+                nothing_to_apply: true,
+                apply_on_macos: false,
+            },
+            Row {
+                name: "scan hit its budget",
+                state: MachineState {
+                    scan_complete: false,
+                    ..machine_state(UcPosture::Disabled, 1, HomePosture::Account)
+                },
+                saved: (Off, true),
+                universal_control: "Universal Control: disabled on this Mac",
+                spotlight: "Build output: 8 target dirs hidden, 2 open to Spotlight — 1 a pass would hide (at least — the scan hit its budget)",
+                next: "Apply now would set: 1 target dir(s) hidden from Spotlight",
+                reason_starts: None,
+                nothing_to_apply: false,
+                apply_on_macos: true,
+            },
+            Row {
+                name: "spotlight switched off",
+                state: MachineState {
+                    spotlight_noindex: false,
+                    ..machine_state(UcPosture::Disabled, 2, HomePosture::Account)
+                },
+                saved: (Off, false),
+                universal_control: "Universal Control: disabled on this Mac",
+                spotlight: "Build output: 8 target dirs hidden, 3 open to Spotlight — 0 a pass would hide · switched off ([machine] spotlight_noindex = false)",
+                next: "Nothing to apply — Universal Control and Spotlight are where [machine] wants them",
+                reason_starts: None,
+                nothing_to_apply: true,
+                apply_on_macos: false,
+            },
+            Row {
+                name: "home unresolved",
+                state: machine_state(UcPosture::Default, 2, HomePosture::Unresolved),
+                saved: (Off, true),
+                universal_control: "Universal Control: at the OS default — the cursor roams to other Macs and iPads",
+                spotlight: "Build output: 8 target dirs hidden, 3 open to Spotlight — 2 a pass would hide",
+                next: "",
+                reason_starts: Some("Not applied here: the account home could not be resolved"),
+                nothing_to_apply: false,
+                apply_on_macos: false,
+            },
+        ];
+        for row in rows {
+            let mut service = PackagesService::new();
+            let seq = service.begin(None).unwrap();
+            assert!(service.finish(
+                seq,
+                refresh(PackagesStatusReport::from_parts(
+                    true,
+                    true,
+                    "fp".into(),
+                    Some(&status("ok")),
+                    &[]
+                )),
+            ));
+            let _ = service.replace_machine_state(Ok(row.state));
+            let p = service
+                .state(true, true, true, false, true)
+                .with_machine_config(row.saved.0, row.saved.1)
+                .projection();
+            assert_eq!(
+                p.machine.universal_control, row.universal_control,
+                "{}",
+                row.name
+            );
+            assert_eq!(p.machine.spotlight, row.spotlight, "{}", row.name);
+            assert_eq!(p.machine.next, row.next, "{}", row.name);
+            match row.reason_starts {
+                Some(prefix) => assert!(
+                    p.machine
+                        .reason
+                        .as_deref()
+                        .is_some_and(|r| r.starts_with(prefix)),
+                    "{}: {:?}",
+                    row.name,
+                    p.machine.reason
+                ),
+                None => assert!(
+                    p.machine.reason.is_none(),
+                    "{}: {:?}",
+                    row.name,
+                    p.machine.reason
+                ),
+            }
+            assert_eq!(
+                p.machine.nothing_to_apply, row.nothing_to_apply,
+                "{}",
+                row.name
+            );
+            assert_eq!(
+                p.machine.apply_enabled,
+                cfg!(target_os = "macos") && row.apply_on_macos,
+                "{}",
+                row.name
+            );
+            assert!(p.machine.saved.is_none(), "{}: saved == record", row.name);
+        }
     }
 }

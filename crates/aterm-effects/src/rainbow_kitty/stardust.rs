@@ -84,8 +84,9 @@ use aterm_time::Instant;
 
 use super::timing::{
     CHROMA_CULL_ALPHA, EDGE_IN_S, FIELD_STAR_COV_CEIL, GLINT_CAP, GLINT_REFILL_PER_S,
-    REDUCED_MOTION_FADE_MS, STAR_CULL_ALPHA, STAR_STACK_ADD, TRANSIENT_STAR_COV_CEIL, clamp01,
-    edge_in, half_life, half_life_life_s, smoothstep01, spend,
+    KILL_RETRACT_BASE_MS, REDUCED_MOTION_FADE_MS, STAR_CULL_ALPHA, STAR_STACK_ADD,
+    TRANSIENT_STAR_COV_CEIL, clamp01, edge_in, half_life, half_life_life_s, kill_span_ms,
+    smoothstep01, spend,
 };
 use super::{Cadence, Config, Ctx, Event, Frame, TypedClass};
 use crate::color_math::relative_luminance;
@@ -99,13 +100,13 @@ use crate::effect_util::{
     TWINKLE_GLINT_FRAC, TWINKLE_OMEGA, push_fx_rect, push_twinkle_star, star_arm, star_body_px,
     twinkle_env, twinkle_peak,
 };
-use crate::rainbow_kitty::meteor::tri;
+use crate::rainbow_kitty::meteor::{LandingWalk, tri};
 use crate::rainbow_kitty::ribbon::{
     BIRTH_EDGE_FLOOR, EXPIRY_MELT_SHARE, Ribbon, SWOOSH_TOTAL_S, expiry_melt, reduced_fade,
 };
 use crate::spectrum::{
     SPECTRUM_ANCHOR_AT, SPECTRUM_LUT, SPECTRUM_LUT_LEN, SPECTRUM_STOPS, spectrum, spectrum_snap,
-    spectrum_snap_index, spectrum_stop,
+    spectrum_stop,
 };
 use crate::trail_sound::SoundKind;
 
@@ -1213,16 +1214,6 @@ pub const FAN_RISE_JITTER_MIN: f32 = 0.80;
 /// 300 | spend"). Every live star is put on a 300 ms `spend` finish beside the
 /// ribbon's own ember — a fade beside a fade, never a pop beside a fade.
 pub const FOCUS_EMBER_MS: f32 = 300.0;
-
-/// A retracted cell's field star finishes over the cell's own retract: `240`
-/// ms for a Backspace and `12·n + 240` for a kill of `n` cells (§8.2, §5.6:
-/// "its field stars die with their cells"). These mirror the ribbon's retract
-/// schedule; the ribbon owns the cell, stardust owns the star, and the two
-/// meet on the event edge because the star cannot read the cell per frame.
-pub const FIELD_RETRACT_BASE_MS: f32 = 240.0;
-
-/// Per-cell term of a kill's retract span (§8.2: "12·n + 240").
-pub const FIELD_RETRACT_PER_CELL_MS: f32 = 12.0;
 
 /// Minimum radial reach of an erase throw, px at the 1× cell (§5.6; scaled
 /// by [`px_scale`] where thrown, like every reach and sputter below).
@@ -2618,10 +2609,15 @@ pub struct ShedSow {
 /// The composition is fixed by D6 and not by taste: **1 gold m1 + 4 m2 + rest
 /// m3**, in throw order, so the fan's heroes pair 1:1 with the five rain
 /// glints. An Enter lands small and carries no hero ([`Self::hero`] false,
-/// D8: one m2 + 5-7 m3). Colour is **ROYGBIV in order around the fan** (§6.5
-/// layer 11), walked from the landing's own stop ([`Self::tint_t`], the pin's
-/// colour) so the fan and the pin read as one landing, the hero gold; the fan
-/// reads no field.
+/// D8: one m2 + 5-7 m3). Colour is **the band's own at each star's rest
+/// column** (§6.5 layer 11, restated 2026-09-14): a star snaps to the
+/// landing's walk ([`Self::walk`]) where its throw comes to rest — the pin's
+/// stop under the caret, the band's neighbouring names either side — so the
+/// fan, the pin and the band read as one landing, the hero gold. Until
+/// 2026-09-14 it was "ROYGBIV in order around the fan", the seven anchors
+/// dealt in throw order from the landing's stop, which wrapped violet into
+/// red on every landing past the arc's middle: a wheel of the mark's own
+/// beside the band's, the palette the owner sent back.
 ///
 /// **Units.** `at_px` is window px; `reach` is px — the length of the
 /// outermost star's throw once [`FAN_THROW_MS`] has elapsed (each star at
@@ -2638,12 +2634,13 @@ pub struct FanSow {
     /// [`Motion::Throw`]'s ease-out over [`FAN_THROW_MS`], along the line;
     /// its rise is the sky's ([`fan_rise`]).
     pub reach: f32,
-    /// The landing cell's own arc position — §6.4's `t_m(0)`, the pin's
-    /// colour. The fan's ROYGBIV walk STARTS at this stop, so the fan and the
-    /// pin read as one landing (§6.5 layer 11: "ROYGBIV in order around the
-    /// fan"). An arc position, not a field read: the meteor resolves it on
-    /// its own arc (D4).
-    pub tint_t: f32,
+    /// **THE LANDING'S WALK** ([`LandingWalk`]) — the band's own walk
+    /// through the landing cell, at the band's own pace: `walk.at(0.0)` is
+    /// the pin's stop, and a star thrown `dx` px along the row snaps to
+    /// `walk.at(dx / cw)`, the band's colour at its rest column (C1: point
+    /// marks snap). Latched by the meteor at the spawn edge (D4), never a
+    /// field read here.
+    pub walk: LandingWalk,
     /// The landing's seed — the whole of the party's variance (§6.5).
     pub seed: u32,
     /// How many stars, `min(5 + cells/1.8, 14) + party·4` capped at
@@ -2881,8 +2878,11 @@ impl Stardust {
                 self.relight_field(ctx.caret, at, ctx.geom);
                 self.deal_typed(cells, class, at, ctx, ribbon);
             }
+            // A retracted cell's field star finishes over the cell's own
+            // retract (§5.6: "its field stars die with their cells") — the
+            // ribbon's schedule, `timing::KILL_RETRACT_BASE_MS`.
             Event::Erase => {
-                self.finish_field(ctx.caret, FIELD_RETRACT_BASE_MS, at, ctx.geom);
+                self.finish_field(ctx.caret, KILL_RETRACT_BASE_MS, at, ctx.geom);
                 self.deal_backspace(at, ctx);
             }
             // Both kill scales throw the SAME population: §5.6 prices it per
@@ -2891,8 +2891,7 @@ impl Stardust {
             // `KillScope` separates the two at the synth (`KillWord`'s poof vs
             // `Kill`'s swoosh), not here.
             Event::Kill { cells, .. } => {
-                let span = FIELD_RETRACT_BASE_MS + FIELD_RETRACT_PER_CELL_MS * f32::from(cells);
-                self.finish_field(ctx.caret, span, at, ctx.geom);
+                self.finish_field(ctx.caret, kill_span_ms(cells), at, ctx.geom);
                 self.deal_kill(cells, at, ctx);
             }
             // A move mints no star here: §6.12's mini-fan and §6.5's fan and
@@ -2901,8 +2900,7 @@ impl Stardust {
             // finish on the ribbon's own retract span (the kill arm minus
             // its thrown stars — nothing is born for a program rewrite).
             Event::Rewrite { row, col, cells } => {
-                let span = FIELD_RETRACT_BASE_MS + FIELD_RETRACT_PER_CELL_MS * f32::from(cells);
-                self.finish_field((row, col), span, at, ctx.geom);
+                self.finish_field((row, col), kill_span_ms(cells), at, ctx.geom);
             }
             Event::Move { .. } | Event::Return | Event::Sweep { .. } => {}
             Event::Focus(false) => self.ember(at),
@@ -3040,7 +3038,7 @@ impl Stardust {
     /// The grains are dropped where they cannot clear (§5.4).
     pub fn sow_fan(&mut self, at: Instant, spec: FanSow, ctx: &Ctx<'_>) {
         let n = usize::from(spec.n).max(1);
-        let stop0 = spectrum_snap_index(spec.tint_t);
+        let cw = (ctx.geom.cw as f32).max(1.0);
         // THE VERTICAL REACH LAW: the landing's rise caps, once per fan.
         let (rise_up, rise_down) = fan_rise(spec.reach, spec.at_px, ctx.geom);
         for k in 0..n {
@@ -3066,7 +3064,11 @@ impl Stardust {
                 // five rain glints are counted against.
                 TINT_GOLD_RGB
             } else {
-                spectrum_stop((stop0 + k) % SPECTRUM_STOPS)
+                // A point mark snaps (C1) — to the band's own stop at the
+                // column the throw comes to rest on ([`FanSow::walk`]): the
+                // fan is the band's colours where its stars fall, not the
+                // seven anchors dealt round in throw order (2026-09-14).
+                spectrum_snap(spec.walk.at(dx / cw))
             };
             self.throw(
                 Throw {
@@ -6001,6 +6003,7 @@ mod tests {
     use super::*;
     use crate::rainbow_kitty::ribbon::RETRACT_START_S;
     use crate::rainbow_kitty::{KillScope, Mend};
+    use crate::spectrum::spectrum_snap_index;
     use aterm_render::add_sat;
     use std::time::Duration;
 
@@ -6062,6 +6065,7 @@ mod tests {
             phase: 0.0,
             caret,
             caret_t: 0.5,
+            caret_walk: None,
             mend: None,
             surge: 0.0,
             flow: Default::default(),
@@ -7026,7 +7030,7 @@ mod tests {
             FanSow {
                 at_px: (ox, oy),
                 reach: 23.0,
-                tint_t: 0.25,
+                walk: LandingWalk::free(0.25),
                 seed: 7,
                 n: 14,
                 hero: true,
@@ -7890,18 +7894,28 @@ mod tests {
             0,
             "a strike grain outlived its 225 ms"
         );
-        type_until(&mut sky, 1100);
-        let a1100 = field_alpha(&sky, 1100);
-        type_until(&mut sky, 1300);
-        let a1300 = field_alpha(&sky, 1300);
+        // The cell's melt runs over the last `EXPIRY_MELT_SHARE` of the
+        // horizon — from 1.078 s of a 1.54 s life until 2026-09-13, from
+        // 1.183 s of the 1.69 s the phrase rest makes it since.
+        let melt_from = ((1.0 - EXPIRY_MELT_SHARE) * FIELD_LIFE_S * 1000.0).round() as u64;
+        type_until(&mut sky, melt_from + 20);
+        let a_early = field_alpha(&sky, melt_from + 20);
+        type_until(&mut sky, melt_from + 220);
+        let a_late = field_alpha(&sky, melt_from + 220);
         assert!(
-            a1100 < 1.0 && a1300 < a1100 && a1300 > STAR_CULL_ALPHA,
-            "the field grain does not melt on the cell's curve: {a1100} → {a1300}"
+            a_early < 1.0 && a_late < a_early && a_late > STAR_CULL_ALPHA,
+            "the field grain does not melt on the cell's curve: {a_early} → {a_late}"
         );
-        let sc = frame_at(&mut sky, at(1300), &c);
+        let sc = frame_at(&mut sky, at(melt_from + 220), &c);
         assert!(lum(px(&sc.out, 150, 100)) > 0, "gone before its melt");
         let horizon = (FIELD_LIFE_S * 1000.0).round() as u64;
-        assert_eq!(horizon, 1540, "the swoosh horizon is §4's 1.54 s");
+        // §4's 1.54 s until 2026-09-13; the ribbon's grace is the phrase
+        // rest since (Rainbow Path v3 §2.6: 0.90 s + 0.79 s), and the field
+        // rides the same horizon.
+        assert_eq!(
+            horizon, 1690,
+            "the swoosh horizon is the rest plus the swoosh"
+        );
         type_until(&mut sky, horizon);
         let sc = frame_at(&mut sky, at(horizon + 1), &c);
         // The STARS are gone; the aurora the same keys laid is the ribbon's
@@ -8420,7 +8434,7 @@ mod tests {
                 FanSow {
                     at_px: (300.0, 120.0),
                     reach: 12.0,
-                    tint_t: 0.4,
+                    walk: LandingWalk::free(0.4),
                     seed: 11,
                     n: 18,
                     hero: true,
@@ -8493,7 +8507,7 @@ mod tests {
                 FanSow {
                     at_px: (300.0, 120.0),
                     reach: 12.0,
-                    tint_t: 0.4,
+                    walk: LandingWalk::free(0.4),
                     seed: 11,
                     n,
                     hero,
@@ -8511,22 +8525,29 @@ mod tests {
                 .any(|s| s.class == StarClass::M1 && s.tint == TINT_GOLD_RGB && s.gold),
             "the fan's own hero is not gold"
         );
-        // ROYGBIV in order: the non-hero tints walk the seven stops from the
-        // landing's own stop, one stop per throw slot, in the arc's order.
-        let start = spectrum_snap_index(0.4);
+        // The band's own colours (2026-09-14): every non-hero tint is a stop
+        // the landing's walk carries within the fan's reach — the pin's own
+        // name and its neighbours, never a wheel round the seven — and the
+        // fan is still a full party of coloured stars.
+        // (`the_fan_wears_the_band_s_stop_at_each_star_s_own_column` pins
+        // each star to its own rest column.)
+        let walk = LandingWalk::free(0.4);
+        let cw = cx.geom.cw as f32;
+        let carried: std::collections::BTreeSet<u32> = (-24..=24)
+            .map(|i| spectrum_snap(walk.at(i as f32 * 12.0 * FAN_THROW_JITTER_MAX / 24.0 / cw)))
+            .collect();
         let tints: Vec<u32> = sky
             .live_iter()
             .filter(|s| !s.gold)
             .map(|s| s.tint)
             .collect();
         for (k, t) in tints.iter().enumerate() {
-            assert_eq!(
-                *t,
-                spectrum_stop((start + 1 + k) % SPECTRUM_STOPS),
-                "slot {k} is off the walk"
+            assert!(
+                carried.contains(t),
+                "slot {k} wears {t:06x}, a stop the band does not carry within the fan's reach"
             );
         }
-        assert!(tints.len() >= 6, "the fan does not walk the arc: {tints:?}");
+        assert!(tints.len() >= 6, "the fan is not a party: {tints:?}");
 
         let mut sky = fan(true, 12);
         assert_eq!(sky.take_glints().count(), 0, "the fan spent a typing token");
@@ -8588,7 +8609,7 @@ mod tests {
             FanSow {
                 at_px: (300.0, 120.0),
                 reach: 12.0,
-                tint_t: 0.4,
+                walk: LandingWalk::free(0.4),
                 seed: 11,
                 n: 12,
                 hero: true,
@@ -8753,7 +8774,7 @@ mod tests {
                 FanSow {
                     at_px: (ox, oy),
                     reach,
-                    tint_t: 0.3,
+                    walk: LandingWalk::free(0.3),
                     seed: seed.wrapping_mul(0x9E37_79B9),
                     n: 9,
                     hero: true,
@@ -11813,6 +11834,70 @@ mod tests {
             eprintln!(
                 "| {shape:?} (seated after {seated} rally rounds) | {cps} | {} | {} | {} | {} | {} | {} |",
                 c.keys, c.gold, c.in_reach, c.settled, c.purring, c.caught
+            );
+        }
+    }
+
+    /// **THE FAN WEARS THE BAND'S STOP AT EACH STAR'S OWN COLUMN**
+    /// (2026-09-14). A fan star is a point mark: it snaps to the landing's
+    /// walk at the column its throw comes to rest on — the band's own
+    /// colour there — so the fan is the band's two or three neighbouring
+    /// names around the pin, never the seven anchors dealt round in throw
+    /// order (which wrapped violet into red on every landing past the arc's
+    /// middle). The hero stays gold (D6).
+    ///
+    /// FALSIFIED BY `sow_fan`'s `spectrum_stop((stop0 + k) % 7)`: twelve
+    /// stars on a 12 px fan wore all seven anchors.
+    #[test]
+    fn the_fan_wears_the_band_s_stop_at_each_star_s_own_column() {
+        use crate::rainbow_kitty::meteor::landing_field;
+        let c = cfg(true);
+        let t0 = Instant::now();
+        let cx = ctx(t0, &c, (5, 40));
+        let cw = cx.geom.cw as f32;
+        let origin = (300.0_f32, 120.0_f32);
+        let t_rest = t0 + Duration::from_millis(FAN_THROW_MS as u64 + 1);
+        for t_land in [0.15_f32, 0.5, 0.85] {
+            let mut sky = Stardust::new();
+            sky.sow_fan(
+                t0,
+                FanSow {
+                    at_px: origin,
+                    reach: 12.0,
+                    walk: LandingWalk::free(t_land),
+                    seed: 11,
+                    n: 12,
+                    hero: true,
+                },
+                &cx,
+            );
+            let mut seen = std::collections::BTreeSet::new();
+            let mut stars = 0;
+            for s in sky.live_iter().filter(|s| !s.gold) {
+                stars += 1;
+                let (x, _) = s.pos(t_rest, false);
+                let dx = (x as f32 - origin.0) / cw;
+                // The rest pixel is rounded: the walk's stop anywhere within
+                // a pixel of it is the star's.
+                let ok = [-1.0_f32, 0.0, 1.0]
+                    .iter()
+                    .any(|px| s.tint == spectrum_snap(landing_field(t_land, dx + px / cw)));
+                assert!(
+                    ok,
+                    "t {t_land}: a fan star {dx:+.2} cells out wears {:06x}, the band's stop \
+                     there is {:06x}",
+                    s.tint,
+                    spectrum_snap(landing_field(t_land, dx))
+                );
+                seen.insert(s.tint);
+            }
+            assert!(stars >= 6, "the fan threw only {stars} coloured stars");
+            // A 12 px fan spans under a fifth of a sweep at the band's pace:
+            // two or three names, not seven.
+            assert!(
+                seen.len() <= 3,
+                "t {t_land}: a 12 px fan wore {} names",
+                seen.len()
             );
         }
     }

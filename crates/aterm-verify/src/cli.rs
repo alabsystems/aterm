@@ -12,6 +12,13 @@
 //! (the shim already resolved the repo root from its own path, and a compiled
 //! binary cannot) and the `ATERM_VERIFY_ROOT` environment variable behind it.
 //! Neither changes any stage's decision.
+//!
+//! And one opt-out, `--in-place` (2026-09-13): a run in a git checkout verifies
+//! a pinned SNAPSHOT of the caller's HEAD and uncommitted change by default
+//! ([`crate::snapshot`]), and `--in-place` runs in the caller's own checkout as
+//! every run did before. `--selftest`, and a root that is not a git checkout,
+//! run in place.
+//! It changes where the stages run, never which stages run.
 
 use std::path::PathBuf;
 
@@ -48,6 +55,8 @@ pub struct Args {
     pub base: Option<String>,
     pub selftest: bool,
     pub root: Option<PathBuf>,
+    /// `--in-place`: run in the caller's checkout instead of the snapshot.
+    pub in_place: bool,
     pub help: bool,
 }
 
@@ -112,6 +121,7 @@ where
             "--full" => out.mode = Mode::Full,
             "--selftest" => out.selftest = true,
             "--changed" => out.changed = true,
+            "--in-place" => out.in_place = true,
             "-h" | "--help" => out.help = true,
             "--scope" => {
                 let v = it.next().unwrap_or_default();
@@ -194,6 +204,7 @@ way for a reviewer (human or AI) to be wrong about it: run this.
   tools/verify.sh --changed         # change-scoped tier (NOT the merge contract)
   tools/verify.sh --scope <crate>   # narrow build/test to one crate (+ guards)
   tools/verify.sh --fast --scope aterm-grid
+  tools/verify.sh --fast --in-place # run in this checkout, not the snapshot
 
 --fast    : targo build + targo test --workspace + the zero-tolerance grep
             guards + bootstrap update-channel arbitration/identity checks + a
@@ -221,6 +232,20 @@ way for a reviewer (human or AI) to be wrong about it: run this.
             left out — and if the scope cannot be computed honestly the run
             WIDENS to the whole workspace, because a broken narrower must do
             MORE work, never less.
+
+--in-place: in a git checkout every run except --selftest verifies a
+            SNAPSHOT — a git worktree at <root>-verify.noindex (or
+            $ATERM_VERIFY_SNAPSHOT) synced to this checkout's HEAD,
+            uncommitted diff and untracked files — so a pull, an edit or
+            another build in this checkout cannot change what the run is
+            verifying. --in-place runs here instead, as a root that is not a
+            git checkout always does. A compiler (or, in a git checkout, the
+            source tree) that moves mid-run stops every stage not yet started
+            and adds a source identity COULD NOT RUN row, so a run with nothing
+            failed ends COULD NOT RUN (exit 3) and a stage that already FAILED
+            keeps FAIL (exit 1). $ATERM_VERIFY_TIMINGS=<file> rewrites that
+            file each run with a TSV row per child and per stage, without
+            changing a byte of the ladder.
 
 A skip is an honest \"tool absent\", never a silent pass: skips are counted and
 NAMED, and any run that skipped a stage or narrowed its scope is refused the
@@ -417,6 +442,34 @@ mod tests {
             (a.mode, a.scope, a.selftest, a.changed),
             (Mode::Fast, None, false, false)
         );
+    }
+
+    /// `--in-place` is the one way back to the old behaviour, so it has to
+    /// parse on its own, compose with every mode and narrowing, and change
+    /// nothing else about the run.
+    #[test]
+    fn in_place_is_the_opt_out_from_the_snapshot_and_changes_nothing_else() {
+        assert!(!ok(&[]).in_place, "the snapshot is the default");
+        assert!(ok(&["--in-place"]).in_place);
+        let a = ok(&["--full", "--in-place", "--scope", "aterm-grid"]);
+        assert_eq!(
+            (
+                a.mode,
+                a.scope.as_deref(),
+                a.in_place,
+                a.selftest,
+                a.changed
+            ),
+            (Mode::Full, Some("aterm-grid"), true, false, false)
+        );
+        let b = ok(&["--changed", "--in-place", "--base", "origin/main"]);
+        assert!(b.in_place && b.changed);
+        assert_eq!(
+            parse(["--in-place=yes"]),
+            Err(ParseError::Unknown("--in-place=yes".into())),
+            "a flag, not an option: a value is a typo and says so"
+        );
+        assert!(usage().contains("--in-place"));
     }
 
     #[test]

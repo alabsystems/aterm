@@ -206,10 +206,28 @@ fn options_in(rows: &[String]) -> Vec<(u8, String)> {
     rows.iter().filter_map(|r| option_row(r)).collect()
 }
 
-#[cfg(test)]
-pub(crate) mod fixtures {
+/// Screens measured on Claude Code 2.1.x, as rows — the fixtures this crate's
+/// own tests and `aterm-agent`'s supervisor tests read phases and prompts from.
+/// Always compiled (they are a few `Vec<String>` builders) so a dependent
+/// crate's `#[cfg(test)]` code can reach them without a feature; not part of
+/// the documented API.
+#[doc(hidden)]
+pub mod fixtures {
+    /// A saved `text --json` capture of a worker mid-turn (`✶ Deliberating…`,
+    /// nothing archived yet). The report tests in `aterm-agent` read it too.
+    pub const WAIT_BG2: &str = include_str!("fixtures/wait_bg2.out");
+    /// A saved capture whose head has scrolled off.
+    pub const WAIT_BG3: &str = include_str!("fixtures/wait_bg3.out");
+    /// A saved capture with the session survey parked under the done row.
+    pub const WAIT_BG7: &str = include_str!("fixtures/wait_bg7.out");
+    /// A saved capture of a worker idle at its composer after a limit notice
+    /// and a `/model` switch.
+    pub const IDLE_AFTER_LIMIT_AND_MODEL_SWITCH: &str =
+        include_str!("fixtures/idle-after-limit-and-model-switch.txt");
+
     /// The composer + footer every idle-or-prompt screen ends with (auto mode
     /// off): the separator, the caret row, the separator, the hint row.
+    #[must_use]
     pub fn composer(footer: &str) -> Vec<String> {
         vec![
             "─".repeat(120),
@@ -219,11 +237,13 @@ pub(crate) mod fixtures {
         ]
     }
 
+    #[must_use]
     pub fn rows(lines: &[&str]) -> Vec<String> {
         lines.iter().map(|s| s.to_string()).collect()
     }
 
     /// A one-row Bash box, permission mode (four options).
+    #[must_use]
     pub fn bash_one_row() -> Vec<String> {
         let mut r = rows(&[
             "⏺ Let me look at the recent history.",
@@ -247,6 +267,7 @@ pub(crate) mod fixtures {
 
     /// A multi-row Bash box from a workflow, auto mode (three options), with a
     /// note row and a tip row.
+    #[must_use]
     pub fn bash_multi_row() -> Vec<String> {
         let mut r = rows(&[
             " Bash command · from the \"verify-merge\" workflow",
@@ -268,6 +289,7 @@ pub(crate) mod fixtures {
         r
     }
 
+    #[must_use]
     pub fn workflow_box() -> Vec<String> {
         let mut r = rows(&[
             " Run a dynamic workflow?",
@@ -284,6 +306,7 @@ pub(crate) mod fixtures {
         r
     }
 
+    #[must_use]
     pub fn edit_box() -> Vec<String> {
         let mut r = rows(&[
             " Edit file",

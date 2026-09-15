@@ -624,6 +624,14 @@ const STARTER_CONFIG: &str = "\
 # orc = \"alabsystems/orc\"        #   owner/repo → private fetch override
 #                                  #   (signature verification unchanged either way)
 
+# --- this Mac: every package pass applies these host settings FIRST.
+# `aterm pkg machine apply` applies now; `aterm pkg machine` reads them.
+# Settings ▸ Security shows the measured state and has Apply now. macOS only.
+# [machine]
+# universal_control = \"off\"        # \"off\" (default: disable it for this host) | \"leave\"
+# spotlight_noindex = true         # rename cargo target dirs under $HOME to .noindex
+#                                  #   (a `target` symlink keeps cargo working)
+
 # --- input policy: map a chord to RAW BYTES sent to the program, overriding the
 # default key encoding + non-menu hardcoded chords (NOT macOS menu keys like Cmd-C,
 # which the menu claims first). Put a value with \\e / \\xNN
@@ -1398,6 +1406,40 @@ mod tests {
         assert!(cursor_break.contains("= true"), "{cursor_break}");
         assert!(cursor_break.contains("default false"), "{cursor_break}");
 
+        // The [machine] host settings are disclosed with their defaults and the
+        // two ways they apply (every package pass first; `aterm pkg machine apply`
+        // now) — and the block sits ABOVE `[key_sequences]`/`[keybindings]`.
+        let universal_control = line_for("universal_control");
+        assert!(
+            universal_control.contains("= \"off\""),
+            "{universal_control}"
+        );
+        assert!(
+            universal_control.contains("\"leave\""),
+            "{universal_control}"
+        );
+        let noindex = line_for("spotlight_noindex");
+        assert!(noindex.contains("= true"), "{noindex}");
+        assert!(noindex.contains(".noindex"), "{noindex}");
+        let machine_at = super::STARTER_CONFIG.find("# [machine]").unwrap();
+        let sequences_at = super::STARTER_CONFIG.find("# [key_sequences]").unwrap();
+        assert!(
+            machine_at < sequences_at,
+            "[machine] must precede the tail tables"
+        );
+        // THE COMMAND IS SPLIT BY THE COMMENT'S OWN WRAP, and the wrap is not free
+        // to change: `settings.rs` derives its category list from these `# --- <label>`
+        // headers, so reflowing this block to keep the command on one line adds a
+        // category and turns `category_layout_matches_grouping_table` red (measured
+        // 2026-09-14). Assert the command the way the file can actually carry it.
+        let machine_block = &super::STARTER_CONFIG[machine_at.saturating_sub(400)..machine_at];
+        assert!(
+            machine_block.contains("aterm pkg")
+                && machine_block.contains("machine apply` applies now"),
+            "the starter config must tell the reader that `aterm pkg machine apply` \
+             applies these now, even though the comment wrap splits the command"
+        );
+
         let colorspace = line_for("window_colorspace");
         assert!(
             colorspace.contains("macOS GPU CAMetalLayer"),
@@ -1544,6 +1586,48 @@ mod tests {
                 "new starter configs must not advertise compatibility-only `{inert}`"
             );
         }
+    }
+
+    /// `aterm help config` tells the reader HOW MANY keys the starter ships, and
+    /// that count lives in another crate (`aterm-cli`'s manual) that cannot read
+    /// this private const. So the number is pinned HERE, where the starter is
+    /// edited: growing the starter reds this test, and the message names the one
+    /// other copy to move. The count is of DISTINCT key names over every
+    /// commented `key = …` line, table-scoped ones included — the same thing a
+    /// reader counts in the written file.
+    #[test]
+    fn starter_config_key_count_matches_the_manual() {
+        let mut keys: Vec<&str> = Vec::new();
+        for raw in super::STARTER_CONFIG.lines() {
+            let line = raw.trim_start();
+            let Some(rest) = line.strip_prefix('#') else {
+                continue;
+            };
+            let rest = rest.trim_start();
+            if rest.starts_with('[') {
+                continue;
+            }
+            let Some((key, _)) = rest.split_once('=') else {
+                continue;
+            };
+            let key = key.trim();
+            if !key.is_empty()
+                && key
+                    .chars()
+                    .all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '.')
+            {
+                keys.push(key);
+            }
+        }
+        keys.sort_unstable();
+        keys.dedup();
+        assert_eq!(
+            keys.len(),
+            161,
+            "the starter config's key count moved — update the `161 keys` line in \
+             `aterm help config` (crates/aterm-cli/src/manual.rs, CONFIG_PAGE) and \
+             this number together"
+        );
     }
 
     /// The `[matrix_rain]` starter block is TABLE-scoped, which the `in_table`

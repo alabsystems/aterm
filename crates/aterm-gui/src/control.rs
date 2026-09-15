@@ -185,6 +185,13 @@ pub(crate) use control_media::image_payload;
 /// `src/control_session.rs` (sibling of `control.rs`), so `#[path]` points at it.
 #[path = "control_session.rs"]
 mod control_session;
+// The turn-id counter a self-update handoff carries (`crate::seamless`).
+pub(crate) use control_session::{raise_turn_ids, turn_ids_minted};
+// The two reads a handoff's end-to-end test drives `aterm drive report` through.
+#[cfg(test)]
+pub(crate) use control_query::cmd_offscreen;
+#[cfg(test)]
+pub(crate) use control_session::cmd_history;
 
 /// The containment subsystem name used in audit denials from this socket.
 const AUDIT_SUBSYSTEM: &str = "control_socket";
@@ -1256,8 +1263,9 @@ fn cached_installed_update_facts() -> Option<aterm_update::InstalledUpdateFacts>
 /// reducer validates the stage and preflight asynchronously. `check` and `apply`
 /// are owner-only ([`update_is_owner_only_subcmd`]); `status` answers any scope.
 /// Cross-platform: off macOS the updater API is inert, so this reports
-/// `enabled=false`. The source is `Source::resolve(None, None)` (env + compiled
-/// default); a GUI `[update]` owner/repo override is not applied to a manual check.
+/// `enabled=false`. Manual checks resolve the current GUI configuration, with
+/// the same environment precedence as menu/background checks, then notify the
+/// GUI reducer after every completed check, including failures and retirement.
 fn cmd_update(rest: &str, scope: Scope, proxy: &EventLoopProxy<Wake>) -> String {
     let build = crate::build_info::BUILD_NUMBER.parse::<u64>().unwrap_or(0);
     // `update` is AnyScopeMeta so `""`/`status` (a pure read of updater state) answers
@@ -1279,10 +1287,22 @@ fn cmd_update(rest: &str, scope: Scope, proxy: &EventLoopProxy<Wake>) -> String 
     }
     let st = match rest.trim() {
         "" | "status" => aterm_update::status(build),
-        "check" => Some(aterm_update::check_now(
-            build,
-            &aterm_update::Source::resolve(None, None),
-        )),
+        "check" => {
+            let live = match crate::control::control_media::call_main_within(
+                proxy,
+                std::time::Duration::from_secs(2),
+                |reply| Wake::ReadUpdateControl { reply },
+            ) {
+                Ok(live) => live,
+                Err(reason) => return format!("ERR cannot read current update source: {reason}\n"),
+            };
+            let source = aterm_update::Source::resolve(live.owner.as_deref(), live.repo.as_deref());
+            let status = aterm_update::check_now(build, &source);
+            crate::update_control::announce_stage(&status, |wake| {
+                let _ = proxy.send_event(wake);
+            });
+            Some(status)
+        }
         // PROOF-CARRYING DSU (RFC Rung 1): PRESS the button — apply a staged update
         // now. Introspectable by design, so an AI running IN the session (Claude Code)
         // can `update status` to SEE a staged build and `update apply` to apply it.
@@ -1330,7 +1350,7 @@ fn cmd_update(rest: &str, scope: Scope, proxy: &EventLoopProxy<Wake>) -> String 
         st.staged_dmg_sha256 = None;
         st.changelog = None;
         st.outcome = format!(
-            "build {} is already installed on disk; activating it in place (ledger: {})",
+            "build {} is already installed on disk; activation is pending (ledger: {})",
             installed.build_number, st.outcome
         );
     }
@@ -1340,11 +1360,21 @@ fn cmd_update(rest: &str, scope: Scope, proxy: &EventLoopProxy<Wake>) -> String 
         .unwrap_or_else(|| "-".to_string());
     let staged_version = st.staged_version.as_deref().unwrap_or("-");
     let staged_commit = st.staged_commit.as_deref().unwrap_or("-");
-    // relaunch_ready: a strictly-newer build is staged and can be applied in place
-    // now (automatically by the in-session lane, or via `update apply`). The
-    // one-glance SEE for a controller. The key NAME is historical and kept for wire
-    // compatibility — agents and docs/RFC-proof-carrying-dsu.md parse it.
+    // Historical wire key: a newer stage EXISTS. Apply permission and scheduling
+    // are separate facts; a stage can be blocked or require manual action.
     let relaunch_ready = st.staged_build.is_some_and(|b| b > st.current_build);
+    let apply_snapshot = crate::control::control_media::call_main_within(
+        proxy,
+        std::time::Duration::from_secs(2),
+        |reply| Wake::ReadUpdateControl { reply },
+    )
+    .ok();
+    let apply_posture = apply_snapshot
+        .as_ref()
+        .map_or("unknown", |live| live.apply_posture(&st));
+    let apply_policy_reason = apply_snapshot
+        .as_ref()
+        .and_then(|live| live.apply_policy_reason(&st));
     // Self-healing ledger fields: failing=<consecutive>:<kind> (0 when healthy) and
     // the lifetime rescue-path count — so a driver can see a broken pipeline (or a
     // limping primary path) from one line, without parsing health.toml.
@@ -1370,11 +1400,16 @@ fn cmd_update(rest: &str, scope: Scope, proxy: &EventLoopProxy<Wake>) -> String 
     // it with margin). Healthy lines stay byte-identical — the token appears
     // only in the stale state, per the installable=/apply_refusal= precedent.
     const STALE_CHECK_AFTER_SECS: u64 = 4 * 3600;
-    let stale_check = if aterm_update::rfc3339_older_than(&st.updated_at, STALE_CHECK_AFTER_SECS) {
-        format!(" stale_check={}", st.updated_at)
-    } else {
-        String::new()
-    };
+    let stale_check = apply_snapshot.as_ref().map_or_else(String::new, |live| {
+        let source = aterm_update::Source::resolve(live.owner.as_deref(), live.repo.as_deref());
+        match aterm_update::last_check_at(st.current_build, &source) {
+            Some(stamp) if aterm_update::rfc3339_older_than(&stamp, STALE_CHECK_AFTER_SECS) => {
+                format!(" stale_check={}", pct_encode(&stamp))
+            }
+            None if st.enabled && st.installable => " check_unrecorded=true".to_string(),
+            _ => String::new(),
+        }
+    });
     // commit= is the RUNNING binary's source commit (compile-time stamp);
     // staged_commit= is the staged build's (from its release manifest). Together a
     // controller can bind both sides of an update to exact repo commits. The two use
@@ -1387,7 +1422,7 @@ fn cmd_update(rest: &str, scope: Scope, proxy: &EventLoopProxy<Wake>) -> String 
         aterm_update::commit_matches(crate::build_info::GIT_COMMIT, staged_commit);
     let mut out = format!(
         "OK enabled={} current_build={} commit={} staged_build={} staged_version={} \
-         staged_commit={} staged_is_same_commit={} relaunch_ready={} failing={} \
+         staged_commit={} staged_is_same_commit={} relaunch_ready={} apply_posture={} failing={} \
          failing_applies={} rescues={} persistent={}{stale_check} outcome={:?}\n",
         st.enabled,
         st.current_build,
@@ -1397,6 +1432,7 @@ fn cmd_update(rest: &str, scope: Scope, proxy: &EventLoopProxy<Wake>) -> String 
         staged_commit,
         staged_is_same_commit,
         relaunch_ready,
+        apply_posture,
         failing,
         // Broken out of `failing=` on purpose: the acquisition streaks and the
         // apply streak answer different questions, and a line reading
@@ -1407,6 +1443,13 @@ fn cmd_update(rest: &str, scope: Scope, proxy: &EventLoopProxy<Wake>) -> String 
         st.is_failing_persistently(),
         st.outcome
     );
+    if let Some(reason) = apply_policy_reason {
+        out = format!(
+            "{} apply_policy_reason={}\n",
+            out.trim_end_matches('\n'),
+            pct_encode(reason)
+        );
+    }
     // HOW UPDATES REACH THIS MACHINE, in the same one-glance line: `lane=` (`web` — the
     // unmetered download host, no credential, no API request — or `token:<rung id>`,
     // the rung's fixed whitespace-free id: env/keychain/file/github-env/gh-env/gh-cli),
@@ -2707,6 +2750,65 @@ struct ControlWorkerContext {
     operator: Option<crate::operator_host::ControlHandle>,
 }
 
+/// Local resource preparation, not Commit authority. Fixed-path candidates must
+/// reserve both service lanes before proving adoption; their empty private
+/// queues cannot receive work until the existing Commit gate permits binding.
+#[derive(Clone, Default)]
+pub(crate) struct ControlPreparation(Arc<std::sync::atomic::AtomicU8>);
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum ControlPreparationState {
+    Pending,
+    Ready,
+    Failed,
+}
+
+impl ControlPreparation {
+    pub(crate) fn state(&self) -> ControlPreparationState {
+        match self.0.load(Ordering::Acquire) {
+            0 => ControlPreparationState::Pending,
+            1 => ControlPreparationState::Ready,
+            _ => ControlPreparationState::Failed,
+        }
+    }
+
+    pub(crate) fn finish(&self, ready: bool) {
+        // Preparation is one-shot. A post-Commit bind failure does not rewrite
+        // the historical fact that the service resources were reserved.
+        let _ = self.0.compare_exchange(
+            0,
+            if ready { 1 } else { 2 },
+            Ordering::AcqRel,
+            Ordering::Acquire,
+        );
+    }
+}
+
+fn control_lanes_prepared(rpc: usize, subscriptions: usize) -> bool {
+    rpc > 0 && subscriptions > 0
+}
+
+struct ControlPreparationGuard {
+    preparation: ControlPreparation,
+    proxy: EventLoopProxy<Wake>,
+}
+
+impl ControlPreparationGuard {
+    fn ready(&self) {
+        self.preparation.finish(true);
+        let _ = self.proxy.send_event(Wake::ControlPrepared);
+    }
+}
+
+impl Drop for ControlPreparationGuard {
+    fn drop(&mut self) {
+        if self.preparation.state() == ControlPreparationState::Pending {
+            self.preparation.finish(false);
+            let _ = self.proxy.send_event(Wake::ControlPrepared);
+        }
+    }
+}
+
 impl ControlWorkerContext {
     fn serve(&self, stream: CtlStream) {
         serve(
@@ -2727,6 +2829,10 @@ impl ControlWorkerContext {
     /// instance `fabric=connected` while it is served; the [`BridgeLostGuard`]
     /// applies the fabric-lost halt when the connection ends, however it ends.
     fn serve_bridge(&self, mut stream: CtlStream, generation: crate::fabric::BridgeGeneration) {
+        // THIS THREAD IS ONE LANE OF ONE INCARNATION, for as long as it serves.
+        // A `link` report is accepted only for the generation that owns the
+        // link, and the dispatch reads the lane's generation from here.
+        crate::fabric::set_lane_generation(generation);
         crate::fabric::bridge_attached(generation);
         let _lost = BridgeLostGuard {
             store: self.store.clone(),
@@ -2825,7 +2931,7 @@ pub(crate) fn attach_fabric_bridge(
 
 fn spawn_control_workers(
     dispatch: &Arc<BoundedDispatch<CtlStream>>,
-    context: &Arc<ControlWorkerContext>,
+    context: &Arc<std::sync::OnceLock<Arc<ControlWorkerContext>>>,
 ) -> usize {
     let mut started = 0;
     for index in 0..CONTROL_WORKERS {
@@ -2837,7 +2943,10 @@ fn spawn_control_workers(
                 let stream = dispatch.pop();
                 let _completion = dispatch.completion_guard();
                 if std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                    context.serve(stream);
+                    context
+                        .get()
+                        .expect("context published before dispatch")
+                        .serve(stream);
                 }))
                 .is_err()
                 {
@@ -2856,7 +2965,7 @@ fn spawn_control_workers(
 
 fn spawn_subscription_workers(
     dispatch: &Arc<SubscriptionDispatch>,
-    context: &Arc<ControlWorkerContext>,
+    context: &Arc<std::sync::OnceLock<Arc<ControlWorkerContext>>>,
 ) -> usize {
     let mut started = 0;
     for index in 0..CONTROL_SUBSCRIPTION_WORKERS {
@@ -2868,7 +2977,10 @@ fn spawn_subscription_workers(
                 let job = dispatch.jobs.pop();
                 let _completion = dispatch.jobs.completion_guard();
                 if std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                    context.serve_subscription(job);
+                    context
+                        .get()
+                        .expect("context published before dispatch")
+                        .serve_subscription(job);
                 }))
                 .is_err()
                 {
@@ -2886,6 +2998,299 @@ fn spawn_subscription_workers(
     started
 }
 
+/// The same admitted Commit gate and process witness that protect PTY adoption.
+/// No raw environment flag or PID can grant control-socket takeover authority.
+#[cfg(unix)]
+pub(crate) struct IncomingControlHandoff {
+    pub(crate) gate: crate::spawn::DeferredReaderGate,
+    pub(crate) parent: crate::seamless::AttestedParent,
+    pub(crate) identity: crate::control_socket_identity::SocketIdentity,
+}
+
+#[cfg(not(unix))]
+pub(crate) enum IncomingControlHandoff {}
+
+impl IncomingControlHandoff {
+    fn bind(&self, _plan: &control_auth::SocketPlan) -> Option<(CtlListener, Arc<String>)> {
+        #[cfg(unix)]
+        {
+            bind_control_listener(
+                _plan,
+                Some(&self.gate),
+                || self.parent.still_alive(),
+                |pid| self.parent.owns_retiring_socket(pid),
+                Some(&self.identity),
+            )
+        }
+        #[cfg(not(unix))]
+        match *self {}
+    }
+}
+
+/// For an incoming handoff, bind only after the predecessor has committed and
+/// stopped listening. The authenticated reader gate is shared with the control worker: a
+/// rejected candidate cannot touch the parent's socket, token, or discovery.
+/// This runs entirely on the control worker, never on the event-loop thread.
+fn bind_control_listener(
+    plan: &control_auth::SocketPlan,
+    handoff_gate: Option<&crate::spawn::DeferredReaderGate>,
+    parent_alive: impl Fn() -> bool,
+    parent_owns_peer: impl Fn(u32) -> bool,
+    identity: Option<&crate::control_socket_identity::SocketIdentity>,
+) -> Option<(CtlListener, Arc<String>)> {
+    let sock_path = plan.sock_path.clone();
+    let sock_dir = control_auth::dir_of_socket(&sock_path);
+    if let Some(gate) = handoff_gate {
+        let identity = identity.filter(|identity| identity.matches_current(plan))?;
+        if !gate.wait_until_released(&AtomicBool::new(false)) {
+            return None;
+        }
+        // Commit's write precedes the parent's _exit by a few instructions.
+        // Wait on the attested process, not repeated socket connects: a live
+        // listener with a full backlog can block connect beyond any deadline.
+        // The ordinary strict socket probe below still refuses unrelated owners.
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
+        while parent_alive() {
+            if std::time::Instant::now() >= deadline {
+                aterm_log::warn!(
+                    "control socket {sock_path}: predecessor still alive after handoff Commit; \
+                     preserving its socket and token"
+                );
+                return None;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+        // Darwin can publish process death before its final socket teardown.
+        // Never fill an unrelated listener's backlog: a successful connect must
+        // identify the attested predecessor before any retry is permitted.
+        loop {
+            // ECONNREFUSED alone is not ownership evidence: a foreign full
+            // backlog can return it too. Revalidate the parent's independently
+            // captured socket inode and token digest before every probe.
+            if !identity.matches_current(plan) {
+                aterm_log::warn!(
+                    "control socket {sock_path}: endpoint identity no longer verifies during handoff; preserving it"
+                );
+                return None;
+            }
+            match control_auth::connect_socket_nonblocking(&sock_path) {
+                Ok(stream) => {
+                    if !aterm_uds::fdpass::peer_pid(&stream)
+                        .ok()
+                        .is_some_and(&parent_owns_peer)
+                    {
+                        aterm_log::warn!(
+                            "control socket {sock_path}: listener ownership does not verify as the predecessor; preserving its socket and token"
+                        );
+                        return None;
+                    }
+                }
+                Err(error)
+                    if matches!(
+                        error.kind(),
+                        std::io::ErrorKind::ConnectionRefused | std::io::ErrorKind::NotFound
+                    ) =>
+                {
+                    break;
+                }
+                Err(_) => {}
+            }
+            if std::time::Instant::now() >= deadline {
+                aterm_log::warn!(
+                    "control socket {sock_path}: endpoint did not become safely reusable after predecessor exit; preserving its socket and token"
+                );
+                return None;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+    }
+    if control_auth::ensure_private_dir(&sock_dir).is_err() {
+        // Every bind outcome ALSO goes to the file log: a Finder/`open` launch
+        // discards stderr, and a silently dead control socket takes the whole
+        // introspection plane down with it (2026-07-05 incident).
+        aterm_log::warn!(
+            "control socket dir {} not creatable; socket disabled",
+            sock_dir.display()
+        );
+        crate::logging::stderr_line!(
+            "aterm-gui: control socket dir {} not creatable; socket disabled",
+            sock_dir.display()
+        );
+        return None;
+    }
+    // Crashed instances cannot clean up after themselves: sweep dead pids'
+    // per-instance socket/token leftovers. Only in the shared default dir —
+    // an explicit override path owns its directory.
+    if plan.latest_link.is_some() {
+        control_auth::sweep_stale_instances(&sock_dir);
+        // Also sweep dead recursion discovery entries (Item 5b) left by crashed
+        // sessions that never ran their graceful `remove_graph_entry`.
+        crate::proxy::sweep_stale_graph(&sock_dir);
+    }
+    // Never unlink a LIVE socket: a nested aterm that still saw an explicit
+    // socket path must not unlink+rebind (and thus HIJACK) its parent's live
+    // listener (Item 5 GAP-5, the belt to the env deny-list's suspenders). A
+    // stale file from a crashed prior run (no live listener) is removed so
+    // bind() does not fail with EADDRINUSE.
+    //
+    // This runs BEFORE `provision_token` on purpose: with an explicit (shared)
+    // `ATERM_CONTROL_SOCK`, `plan.token_path` is a sibling shared with any live
+    // instance, and `provision_token` unlinks+rewrites it unconditionally. If we
+    // provisioned first and then refused a live socket, we would have clobbered
+    // the live instance's token file — bricking its auth channel (every later
+    // `aterm-ctl` would read our token and get `ERR auth`) without ever taking
+    // over its listener. Detect+refuse the live listener first; touch nothing.
+    // Per-instance default paths (`aterm-<ourpid>.sock`, latest_link present)
+    // use the inverted probe: only a listener that actually ANSWERS refuses
+    // the bind — an odd connect errno there is stale junk, and refusing on it
+    // would strand this instance socketless for its lifetime (2026-07-05).
+    // Explicit `$ATERM_CONTROL_SOCK` paths keep the strict never-hijack probe.
+    let is_live = if plan.latest_link.is_some() {
+        control_auth::socket_is_live_per_instance(&sock_path)
+    } else {
+        control_auth::socket_is_live(&sock_path)
+    };
+    if control_auth::decide_bind(is_live) == control_auth::BindAction::RefuseLiveSocket {
+        aterm_log::warn!(
+            "control socket {sock_path} already has a live listener; running without \
+             a control socket rather than hijacking it"
+        );
+        crate::logging::stderr_line!(
+            "aterm-gui: control socket {sock_path} already has a live listener; \
+             running without a control socket rather than hijacking it"
+        );
+        return None;
+    }
+    if identity.is_some_and(|identity| !identity.matches_current(plan)) {
+        return None;
+    }
+    // Provision the per-launch capability token. FAIL CLOSED: no token =>
+    // no socket (better to lose introspection than serve it unauthed).
+    let token = match control_auth::provision_token(&plan.token_path) {
+        Some(t) => Arc::new(t),
+        None => {
+            aterm_log::warn!("could not provision control-socket token; socket disabled");
+            crate::logging::stderr_line!(
+                "aterm-gui: could not provision control-socket token; socket disabled"
+            );
+            return None;
+        }
+    };
+    let _ = std::fs::remove_file(&sock_path);
+    let listener = bind_prepared_control_listener(plan, handoff_gate.is_some())?;
+    Some((listener, token))
+}
+
+const HANDOFF_BIND_ATTEMPTS: u32 = 3;
+
+/// A consumed handoff witness never authorizes another unlink. A failed bind
+/// may try again only while the path is demonstrably absent, within its budget.
+fn handoff_bind_retry_allowed(failed_attempt: u32, path_missing: bool) -> bool {
+    path_missing && failed_attempt < HANDOFF_BIND_ATTEMPTS
+}
+
+/// The production handoff retry loop, with the two OS effects passed directly
+/// by its caller. Tests can fail the first bind, then exercise a real listener,
+/// or place a foreign listener during backoff without relying on timing races.
+fn bind_handoff_control_listener(
+    plan: &control_auth::SocketPlan,
+    mut bind: impl FnMut(&str) -> std::io::Result<CtlListener>,
+    mut pause: impl FnMut(std::time::Duration),
+) -> Option<CtlListener> {
+    for attempt in 1..=HANDOFF_BIND_ATTEMPTS {
+        match bind(&plan.sock_path) {
+            Ok(listener) => return Some(listener),
+            Err(error) => {
+                aterm_log::warn!(
+                    "control socket handoff bind failed at {} (attempt {attempt}/{HANDOFF_BIND_ATTEMPTS}): {error}",
+                    plan.sock_path
+                );
+                // symlink_metadata treats a dangling symlink as occupied too.
+                // No connect probe: a full foreign backlog can look stale.
+                let missing = std::fs::symlink_metadata(&plan.sock_path)
+                    .is_err_and(|error| error.kind() == std::io::ErrorKind::NotFound);
+                if !handoff_bind_retry_allowed(attempt, missing) {
+                    crate::logging::stderr_line!(
+                        "aterm-gui: control socket handoff bind could not complete at {}; preserving any replacement endpoint",
+                        plan.sock_path
+                    );
+                    return None;
+                }
+                pause(std::time::Duration::from_millis(50 * u64::from(attempt)));
+            }
+        }
+    }
+    None
+}
+
+/// Bind after the caller's one authorized token rotation and path removal.
+/// Handoff retries bind only, never startup's stale-path unlink policy.
+fn bind_prepared_control_listener(
+    plan: &control_auth::SocketPlan,
+    handoff: bool,
+) -> Option<CtlListener> {
+    if handoff {
+        return bind_handoff_control_listener(
+            plan,
+            |path| CtlListener::bind(path),
+            std::thread::sleep,
+        );
+    }
+    let sock_path = plan.sock_path.as_str();
+    // Ordinary startup retries: a transient fs/errno hiccup (AV scan, racing
+    // cleanup of a predecessor) must degrade to a short delay, not a
+    // process-lifetime loss of the whole introspection plane.
+    let mut listener = None;
+    let max_attempts = 3u32;
+    for attempt in 1..=max_attempts {
+        match CtlListener::bind(sock_path) {
+            Ok(l) => {
+                if attempt > 1 {
+                    aterm_log::info!(
+                        "control socket bind succeeded on retry {attempt} at {sock_path}"
+                    );
+                }
+                listener = Some(l);
+                break;
+            }
+            Err(e) => {
+                aterm_log::warn!(
+                    "control socket bind failed at {sock_path} (attempt {attempt}/{max_attempts}): {e}"
+                );
+                crate::logging::stderr_line!(
+                    "aterm-gui: control socket bind failed at {sock_path} \
+                     (attempt {attempt}/{max_attempts}): {e}"
+                );
+                if attempt < 3 {
+                    std::thread::sleep(std::time::Duration::from_millis(750));
+                    // Shared explicit paths: RE-PROBE before unlinking — a
+                    // sibling may have bound while we slept, and unlinking its
+                    // LIVE socket would be exactly the hijack RefuseLiveSocket
+                    // exists to prevent. Per-instance paths stay retry-happy
+                    // (nobody else can own our pid's name).
+                    if plan.latest_link.is_none() && control_auth::socket_is_live(sock_path) {
+                        aterm_log::warn!(
+                            "control socket {sock_path} became live during retry; \
+                             running socketless rather than hijacking it"
+                        );
+                        crate::logging::stderr_line!(
+                            "aterm-gui: control socket {sock_path} became live during \
+                             retry; running socketless rather than hijacking it"
+                        );
+                        return None;
+                    }
+                    let _ = std::fs::remove_file(sock_path);
+                }
+            }
+        }
+    }
+    let Some(listener) = listener else {
+        aterm_log::warn!("control socket disabled: bind failed after 3 attempts");
+        return None;
+    };
+    Some(listener)
+}
+
 /// Spawn the control-listener thread: provision the capability token, bind
 /// the plan's socket (sweeping crashed instances' stale files first), lock it
 /// to `0600`, publish the `latest` symlink, then accept connections and serve
@@ -2900,7 +3305,7 @@ fn spawn_subscription_workers(
     clippy::too_many_arguments,
     reason = "the control server's full set of independent collaborators (active handle, store, subscribers, proxy, image queue, socket plan); a config struct would only move the list"
 )]
-pub fn spawn(
+pub(crate) fn spawn(
     active: ActiveHandle,
     store: Store,
     subscribers: Subscribers,
@@ -2920,138 +3325,63 @@ pub fn spawn(
     // failed to bind) would still delete another live instance's shared files on exit.
     bound: Arc<AtomicBool>,
     operator: Option<crate::operator_host::ControlHandle>,
-) {
-    std::thread::spawn(move || {
+    // Only fixed-path incoming candidates wait: per-process sockets cannot collide.
+    handoff: Option<IncomingControlHandoff>,
+) -> ControlPreparation {
+    let preparation = ControlPreparation::default();
+    let preparation_guard = ControlPreparationGuard {
+        preparation: preparation.clone(),
+        proxy: proxy.clone(),
+    };
+    let _ = std::thread::Builder::new().name("aterm-control-listener".into()).spawn(move || {
+        // This guard also publishes failure if thread creation fails (the
+        // unstarted closure is dropped), or startup unwinds before preparation.
+        let preparation_guard = preparation_guard;
         let sock_path = plan.sock_path.clone();
         // The token + image-confinement subdir live alongside the socket file.
         let sock_dir = control_auth::dir_of_socket(&sock_path);
-        if control_auth::ensure_private_dir(&sock_dir).is_err() {
-            // Every bind outcome ALSO goes to the file log: a Finder/`open` launch
-            // discards stderr, and a silently dead control socket takes the whole
-            // introspection plane down with it (2026-07-05 incident).
-            aterm_log::warn!(
-                "control socket dir {} not creatable; socket disabled",
-                sock_dir.display()
-            );
-            crate::logging::stderr_line!(
-                "aterm-gui: control socket dir {} not creatable; socket disabled",
-                sock_dir.display()
-            );
-            return;
-        }
-        // Crashed instances cannot clean up after themselves: sweep dead pids'
-        // per-instance socket/token leftovers. Only in the shared default dir —
-        // an explicit override path owns its directory.
-        if plan.latest_link.is_some() {
-            control_auth::sweep_stale_instances(&sock_dir);
-            // Also sweep dead recursion discovery entries (Item 5b) left by crashed
-            // sessions that never ran their graceful `remove_graph_entry`.
-            crate::proxy::sweep_stale_graph(&sock_dir);
-        }
-        // Never unlink a LIVE socket: a nested aterm that still saw an explicit
-        // socket path must not unlink+rebind (and thus HIJACK) its parent's live
-        // listener (Item 5 GAP-5, the belt to the env deny-list's suspenders). A
-        // stale file from a crashed prior run (no live listener) is removed so
-        // bind() does not fail with EADDRINUSE.
-        //
-        // This runs BEFORE `provision_token` on purpose: with an explicit (shared)
-        // `ATERM_CONTROL_SOCK`, `plan.token_path` is a sibling shared with any live
-        // instance, and `provision_token` unlinks+rewrites it unconditionally. If we
-        // provisioned first and then refused a live socket, we would have clobbered
-        // the live instance's token file — bricking its auth channel (every later
-        // `aterm-ctl` would read our token and get `ERR auth`) without ever taking
-        // over its listener. Detect+refuse the live listener first; touch nothing.
-        // Per-instance default paths (`aterm-<ourpid>.sock`, latest_link present)
-        // use the inverted probe: only a listener that actually ANSWERS refuses
-        // the bind — an odd connect errno there is stale junk, and refusing on it
-        // would strand this instance socketless for its lifetime (2026-07-05).
-        // Explicit `$ATERM_CONTROL_SOCK` paths keep the strict never-hijack probe.
-        let is_live = if plan.latest_link.is_some() {
-            control_auth::socket_is_live_per_instance(&sock_path)
-        } else {
-            control_auth::socket_is_live(&sock_path)
-        };
-        if control_auth::decide_bind(is_live) == control_auth::BindAction::RefuseLiveSocket {
-            aterm_log::warn!(
-                "control socket {sock_path} already has a live listener; running without \
-                 a control socket rather than hijacking it"
-            );
-            crate::logging::stderr_line!(
-                "aterm-gui: control socket {sock_path} already has a live listener; \
-                 running without a control socket rather than hijacking it"
-            );
-            return;
-        }
-        // Provision the per-launch capability token. FAIL CLOSED: no token =>
-        // no socket (better to lose introspection than serve it unauthed).
-        let token = match control_auth::provision_token(&plan.token_path) {
-            Some(t) => Arc::new(t),
-            None => {
-                aterm_log::warn!("could not provision control-socket token; socket disabled");
-                crate::logging::stderr_line!(
-                    "aterm-gui: could not provision control-socket token; socket disabled"
-                );
+        // Ordinary startup can refuse an occupied path without allocating idle
+        // service threads. Only the incoming fixed endpoint needs reservation
+        // before the irreversible Commit gate permits a bind.
+        let ordinary_binding = if handoff.is_none() {
+            let Some(binding) = bind_control_listener(&plan, None, || false, |_| false, None) else {
                 return;
-            }
+            };
+            Some(binding)
+        } else {
+            None
         };
-        let _ = std::fs::remove_file(&sock_path);
-        // Bounded retry: a transient fs/errno hiccup at startup (AV scan, racing
-        // cleanup of a predecessor) must degrade to a short delay, not a
-        // process-lifetime loss of the whole introspection plane.
-        let mut listener = None;
-        for attempt in 1..=3u32 {
-            match CtlListener::bind(&sock_path) {
-                Ok(l) => {
-                    if attempt > 1 {
-                        aterm_log::info!(
-                            "control socket bind succeeded on retry {attempt} at {sock_path}"
-                        );
-                    }
-                    listener = Some(l);
-                    break;
-                }
-                Err(e) => {
-                    aterm_log::warn!(
-                        "control socket bind failed at {sock_path} (attempt {attempt}/3): {e}"
-                    );
-                    crate::logging::stderr_line!(
-                        "aterm-gui: control socket bind failed at {sock_path} \
-                         (attempt {attempt}/3): {e}"
-                    );
-                    if attempt < 3 {
-                        std::thread::sleep(std::time::Duration::from_millis(750));
-                        // Shared explicit paths: RE-PROBE before unlinking — a
-                        // sibling may have bound while we slept, and unlinking its
-                        // LIVE socket would be exactly the hijack RefuseLiveSocket
-                        // exists to prevent. Per-instance paths stay retry-happy
-                        // (nobody else can own our pid's name).
-                        if plan.latest_link.is_none() && control_auth::socket_is_live(&sock_path) {
-                            aterm_log::warn!(
-                                "control socket {sock_path} became live during retry; \
-                                 running socketless rather than hijacking it"
-                            );
-                            crate::logging::stderr_line!(
-                                "aterm-gui: control socket {sock_path} became live during \
-                                 retry; running socketless rather than hijacking it"
-                            );
-                            return;
-                        }
-                        let _ = std::fs::remove_file(&sock_path);
-                    }
-                }
-            }
-        }
-        let Some(listener) = listener else {
-            aterm_log::warn!("control socket disabled: bind failed after 3 attempts");
-            return;
-        };
-        // Start fixed reusable lanes BEFORE setting the externally observed
-        // `bound` flag or publishing the latest-instance pointer. The accept loop
-        // never calls pthread_create, so connection churn cannot stall admission.
-        // At least one worker is required; a partial pool remains useful and is
-        // reported honestly in the log.
         let connection_dispatch = Arc::new(BoundedDispatch::new(CONTROL_WORKERS));
         let subscription_dispatch = Arc::new(SubscriptionDispatch::new());
+        let context_slot = Arc::new(std::sync::OnceLock::new());
+        let workers = spawn_control_workers(&connection_dispatch, &context_slot);
+        connection_dispatch.set_capacity(workers);
+        let subscription_workers = spawn_subscription_workers(&subscription_dispatch, &context_slot);
+        subscription_dispatch.jobs.set_capacity(subscription_workers);
+        if !control_lanes_prepared(workers, subscription_workers) {
+            aterm_log::warn!("control startup refused: no runnable RPC or subscription lane");
+            crate::logging::stderr_line!(
+                "aterm-gui: control startup refused: no runnable RPC or subscription lane"
+            );
+            if let Some((listener, _)) = ordinary_binding {
+                drop(listener);
+                let _ = std::fs::remove_file(&sock_path);
+                let _ = std::fs::remove_file(&plan.token_path);
+            }
+            return;
+        }
+        if handoff.is_some() {
+            // The parent still owns the exact endpoint and credential here.
+            // Empty queues park these already allocated workers through Commit.
+            preparation_guard.ready();
+        }
+        let binding = match handoff.as_ref() {
+            Some(handoff) => handoff.bind(&plan),
+            None => ordinary_binding,
+        };
+        let Some((listener, token)) = binding else {
+            return;
+        };
         let worker_context = Arc::new(ControlWorkerContext {
             active: active.clone(),
             store: store.clone(),
@@ -3063,23 +3393,10 @@ pub fn spawn(
             subscriptions: subscription_dispatch.clone(),
             operator: operator.clone(),
         });
-        // Publish the context for the fabric-bridge seam BEFORE the lanes start
-        // accepting: a bridge attached later must never find a half-built process.
+        // No stream enters either queue before this context is available.
+        let _ = context_slot.set(worker_context.clone());
+        // A bridge attached later must never find a half-built process.
         let _ = BRIDGE_CONTEXT.set(worker_context.clone());
-        let workers = spawn_control_workers(&connection_dispatch, &worker_context);
-        connection_dispatch.set_capacity(workers);
-        if workers == 0 {
-            aterm_log::warn!("control socket disabled: no connection worker could start");
-            crate::logging::stderr_line!(
-                "aterm-gui: control socket disabled: no connection worker could start"
-            );
-            drop(listener);
-            let _ = std::fs::remove_file(&sock_path);
-            let _ = std::fs::remove_file(&plan.token_path);
-            return;
-        }
-        let subscription_workers =
-            spawn_subscription_workers(&subscription_dispatch, &worker_context);
         if workers != CONTROL_WORKERS {
             aterm_log::warn!(
                 "control socket started with {workers}/{CONTROL_WORKERS} connection workers"
@@ -3092,8 +3409,18 @@ pub fn spawn(
         }
         // The service is actually runnable. Only now authorize exit cleanup,
         // harden the socket, and advertise it as the newest instance.
+        if let Some(identity) = crate::control_socket_identity::SocketIdentity::capture(
+            &plan,
+            &listener,
+            token.as_str(),
+        ) {
+            let _ = crate::control_socket_identity::publish(identity);
+        }
         bound.store(true, Ordering::SeqCst);
         control_auth::lock_socket_file(&sock_path);
+        if handoff.is_none() {
+            preparation_guard.ready();
+        }
         if let Some(link) = &plan.latest_link {
             control_auth::publish_latest_link(link, &sock_path);
         }
@@ -3204,6 +3531,7 @@ pub fn spawn(
             }
         }
     });
+    preparation
 }
 
 /// Resolve a stable-id selector to a child this aterm holds authority over plus
@@ -3836,12 +4164,17 @@ fn cmd_fabric(rest: &str) -> String {
     }
 }
 
-/// `OK state=<absent|connected|disconnected> supervised=<0|1> command=<pct|->`.
+/// `OK state=<absent|connected|stalled|disconnected> supervised=<0|1>
+/// command=<pct|-> reason=<token|-> rtt_ms=<n|-> link_age_ms=<n|->`.
 ///
 /// `state=` is the link token `status` carries; `supervised=` is the endpoint's
 /// own latch — the bit `post` reads to choose `queued=1` over `no-bridge=1` — so
 /// the two verbs cannot disagree; `command=` is the argv the supervisor runs, or,
-/// unarmed, the one the instance was launched with.
+/// unarmed, the one the instance was launched with. The last three are the
+/// bridge's own report of its broker link (`fabric::link_report`): why it is
+/// down, the last acknowledged round trip, and how old that ack is — the same
+/// numbers `status` carries as `fabric_rtt_ms=` / `fabric_link_age_ms=`, plus
+/// the reason `status` does not.
 #[cfg(unix)]
 fn fabric_status_line() -> String {
     let s = crate::fabric_launch::status();
@@ -3849,10 +4182,14 @@ fn fabric_status_line() -> String {
         .armed
         .or(s.configured)
         .map_or_else(|| "-".to_string(), |argv| pct_encode(&argv.join(" ")));
+    let (reason, rtt, age) = crate::fabric::fabric_link_facts();
+    let n = |v: Option<u64>| v.map_or_else(|| "-".to_string(), |n| n.to_string());
     format!(
-        "OK state={} supervised={} command={command}\n",
+        "OK state={} supervised={} command={command} reason={reason} rtt_ms={} link_age_ms={}\n",
         crate::fabric::fabric_state(),
-        u8::from(crate::fabric::bridge_supervised())
+        u8::from(crate::fabric::bridge_supervised()),
+        n(rtt),
+        n(age)
     )
 }
 
@@ -3913,7 +4250,7 @@ fn cmd_fabric(rest: &str) -> String {
     let mut words = rest.split_whitespace();
     match words.next() {
         Some("status") if words.next().is_none() => format!(
-            "OK state={} supervised=0 command=-\n",
+            "OK state={} supervised=0 command=- reason=- rtt_ms=- link_age_ms=-\n",
             crate::fabric::fabric_state()
         ),
         Some("attach") => "ERR fabric unavailable on this platform\n".to_string(),
@@ -3921,8 +4258,8 @@ fn cmd_fabric(rest: &str) -> String {
     }
 }
 
-/// THE BRIDGE PLANE — the THREE `Access::BridgeOnly` verbs: `deliver`, `outbox`
-/// and `outbox sent`.
+/// THE BRIDGE PLANE — the FOUR `Access::BridgeOnly` verbs: `deliver`, `link`,
+/// `outbox` and `outbox sent`.
 ///
 /// `None` = not a bridge verb, carry on. Answered BEFORE session resolution
 /// because each names its target session as an ARGUMENT (the `raise <sid>`
@@ -3971,6 +4308,8 @@ fn dispatch_bridge_verb(
     }
     Some(match verb {
         "deliver" => crate::fabric::cmd_deliver(store, rest),
+        // The bridge's own broker link, gated to the lane's incarnation.
+        "link" => crate::fabric::cmd_link(store, rest, crate::fabric::lane_generation()),
         // `spec()` keys on the KEYWORD, so `outbox sent` reaches here as
         // `verb == "outbox"`; the sub-form splits inside the handler exactly as
         // `inbox get`/`inbox seen` do.
@@ -14778,6 +15117,7 @@ mod tests {
                 "inbox seen",
                 "post",
                 "deliver",
+                "link",
                 "hold",
                 "outbox sent",
                 // `appnotice` MUTATES the pull-down (a row appears), so it takes the
@@ -19016,9 +19356,37 @@ mod tests {
         store.write().unwrap().register(front.clone());
         store.write().unwrap().register(background.clone());
         let active = active_for_handle(&front);
-        // The background peer is gone: its pipe's read end is closed, so the
-        // sink's direct write fails (EPIPE) instead of landing.
+        // The background peer is gone, and must STAY gone. Closing our copy of
+        // the pipe's read end is not enough: `pipe_session`'s pipe is not
+        // CLOEXEC, so a child any concurrent test spawns in that window
+        // inherits the read end and keeps the peer alive — the write then
+        // lands and `OK 3 bytes` is a true answer, not the bug under test.
+        // Kill the peer in the kernel instead: swap the sink's fd for a socket
+        // shut for writing, whose EPIPE no descriptor held elsewhere revives.
         drop(background_rx);
+        let mut pair = [0i32; 2];
+        assert_eq!(
+            unsafe { libc::socketpair(libc::AF_UNIX, libc::SOCK_STREAM, 0, pair.as_mut_ptr()) },
+            0,
+            "socketpair(2)"
+        );
+        assert_eq!(unsafe { libc::shutdown(pair[0], libc::SHUT_WR) }, 0);
+        assert_eq!(
+            unsafe { libc::dup2(pair[0], background.master) },
+            background.master,
+            "dup2(2) the dead socket over the sink's fd"
+        );
+        unsafe {
+            libc::close(pair[0]);
+            libc::close(pair[1]);
+        }
+        // Observably dead before any frame: a direct write is refused (EPIPE).
+        let probe = unsafe { libc::write(background.master, b"x".as_ptr().cast(), 1) };
+        assert_eq!(
+            (probe, std::io::Error::last_os_error().raw_os_error()),
+            (-1, Some(libc::EPIPE)),
+            "the background peer is dead before the frames are sent"
+        );
 
         for (verb, frame) in [
             ("paste-bin", &b"@2 paste-bin 3\nabcafter\n"[..]),
@@ -21148,7 +21516,7 @@ mod tests {
         // nothing will ever drain the outbox.
         assert_eq!(
             run(Scope::Owner, "fabric status"),
-            "OK state=absent supervised=0 command=-\n"
+            "OK state=absent supervised=0 command=- reason=- rtt_ms=- link_age_ms=-\n"
         );
         assert_eq!(post(), "ERR fabric absent id=1 no-bridge=1\n");
         assert_eq!(
@@ -21194,7 +21562,7 @@ mod tests {
         );
         assert_eq!(
             run(Scope::Owner, "fabric status"),
-            "OK state=absent supervised=0 command=-\n",
+            "OK state=absent supervised=0 command=- reason=- rtt_ms=- link_age_ms=-\n",
             "a refused attach records nothing"
         );
         assert_eq!(post(), "ERR fabric absent id=2 no-bridge=1\n");
@@ -21214,7 +21582,9 @@ mod tests {
         );
         assert_eq!(
             run(Scope::Owner, "fabric status"),
-            format!("OK state=absent supervised=1 command={command}\n"),
+            format!(
+                "OK state=absent supervised=1 command={command} reason=- rtt_ms=- link_age_ms=-\n"
+            ),
             "the bridge connects asynchronously; the SUPERVISOR is what attached"
         );
         // ...and the endpoint's advice flipped at the same moment.
@@ -21232,7 +21602,9 @@ mod tests {
         );
         assert_eq!(
             run(Scope::Owner, "fabric status"),
-            format!("OK state=absent supervised=1 command={command}\n")
+            format!(
+                "OK state=absent supervised=1 command={command} reason=- rtt_ms=- link_age_ms=-\n"
+            )
         );
     }
 
@@ -21240,7 +21612,7 @@ mod tests {
     fn fabric_attach_body() {
         assert_eq!(
             dispatch_fabric_verb("status", None, Scope::Owner),
-            "OK state=absent supervised=0 command=-\n"
+            "OK state=absent supervised=0 command=- reason=- rtt_ms=- link_age_ms=-\n"
         );
         assert_eq!(
             dispatch_fabric_verb("attach x", None, Scope::Owner),
@@ -21775,7 +22147,7 @@ mod tests {
                     .map(|at| before[at..].to_string())
             })
             .expect("dispatch_bridge_verb keeps its heading");
-        for verb in ["`deliver`", "`outbox`", "`outbox sent`"] {
+        for verb in ["`deliver`", "`link`", "`outbox`", "`outbox sent`"] {
             assert!(
                 heading.contains(verb),
                 "the bridge-plane heading omits {verb}"
@@ -21783,7 +22155,7 @@ mod tests {
         }
         // Every one of them really is fenced, whatever the prose says — and
         // `hold`, which the heading names only to say it left, is not.
-        for verb in ["deliver", "outbox", "outbox sent"] {
+        for verb in ["deliver", "link", "outbox", "outbox sent"] {
             assert!(aterm_types::control_verbs::is_bridge_only(verb), "{verb}");
         }
         assert!(
@@ -22806,6 +23178,8 @@ mod tests {
             ribbon_look: "underline",
             ribbon_segments: 4,
             ribbon_hue_bands: 4,
+            ribbon_drawn: 4,
+            ribbon_curtain_ms: None,
             field: 1.0,
             sparks: 4,
             momentum: 0.5,
@@ -22893,3 +23267,7 @@ mod tests {
         );
     }
 }
+
+#[cfg(all(test, unix))]
+#[path = "control_socket_handoff_tests.rs"]
+mod control_socket_handoff_tests;

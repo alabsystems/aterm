@@ -146,6 +146,17 @@ pub struct Health {
     /// when it clears the acquisition streaks and the apply streak survives.
     #[serde(default)]
     pub last_apply_error: String,
+    /// The most recent DIAGNOSIS-class failure's reason (`pipeline`,
+    /// `manifest`, `stage`), kept apart from [`Self::last_error`] for the same
+    /// reason `last_apply_error` is (2026-09-14): a network blip landing on a
+    /// standing stage streak overwrote the one `last_error`, and every reader
+    /// that pairs the STANDING class with it — `update status`'s
+    /// `failing_checks_kind`, the loud notice's "updates download but will
+    /// not verify or install (…)" — described a bundle that will not verify
+    /// with a DNS error, for the life of the memo. Whenever the ledger
+    /// re-labels itself to a standing diagnosis class it restores this.
+    #[serde(default)]
+    pub last_diagnosis_error: String,
     /// RFC3339 UTC of [`Self::last_apply_error`] (empty when there is none).
     ///
     /// [`Self::last_failure_at`] is any-class: a DNS blip at 21:53 re-dates a
@@ -435,6 +446,42 @@ impl Health {
         h.last_failure_at = now;
         // Cap the stored error so a pathological message can't bloat the ledger.
         h.last_error = error.chars().take(400).collect();
+        if matches!(kind, "pipeline" | "manifest" | "stage") {
+            h.last_diagnosis_error = h.last_error.clone();
+        }
+    }
+
+    /// Re-describe the ledger by the class that still stands, with THAT
+    /// class's own reason: the apply lane's for `apply`, the diagnosis lane's
+    /// for `pipeline`/`manifest`/`stage`, nothing for a bare network blip
+    /// (weather has no diagnosis). Every writer that clears some streaks and
+    /// leaves others goes through here (2026-09-14).
+    fn relabel_by_standing(h: &mut Self) {
+        if h.total_failures() == 0 {
+            h.kind = String::new();
+            h.failing_since = String::new();
+            h.last_failure_at = String::new();
+            h.last_error = String::new();
+            h.last_diagnosis_error = String::new();
+            return;
+        }
+        match h.standing_acquisition_class() {
+            Some(standing @ ("pipeline" | "manifest" | "stage")) => {
+                h.kind = standing.to_string();
+                if !h.last_diagnosis_error.is_empty() {
+                    h.last_error = h.last_diagnosis_error.clone();
+                }
+            }
+            Some(standing) => {
+                // `network` alone: weather, described by whatever it said.
+                h.kind = standing.to_string();
+            }
+            None => {
+                // Only the apply streak survived; describe the ledger by IT.
+                h.kind = "apply".to_string();
+                h.last_error = h.last_apply_error.clone();
+            }
+        }
     }
 
     /// Record a fully-healthy CHECK: every ACQUISITION streak clears.
@@ -470,18 +517,12 @@ impl Health {
         h.apply_failures = apply_streak_survives;
         if apply_streak_survives == 0 {
             h.apply_since = String::new();
-            h.kind = String::new();
-            h.failing_since = String::new();
-            h.last_failure_at = String::new();
-            h.last_error = String::new();
-        } else {
-            // The acquisition streaks cleared but the machine still cannot APPLY.
-            // Re-describe the ledger in terms of the failure that is actually
-            // still standing, or `update status` would report the apply streak
-            // under whatever transient network message happened to land last.
-            h.kind = "apply".to_string();
-            h.last_error = h.last_apply_error.clone();
         }
+        // Re-describe the ledger by what still stands — the apply streak, with
+        // ITS reason, or nothing — or `update status` would report the apply
+        // streak under whatever transient network message happened to land last.
+        h.last_diagnosis_error = String::new();
+        Self::relabel_by_standing(&mut h);
         h.write(path);
         h
     }
@@ -531,20 +572,7 @@ impl Health {
         h.network_since = String::new();
         h.pipeline_since = String::new();
         h.manifest_since = String::new();
-        if h.total_failures() == 0 {
-            h.kind = String::new();
-            h.failing_since = String::new();
-            h.last_failure_at = String::new();
-            h.last_error = String::new();
-        } else if let Some(standing) = h.standing_acquisition_class() {
-            h.kind = standing.to_string();
-        } else {
-            // Only the apply streak survived; describe the ledger by IT, exactly as
-            // `record_success` does, or status would explain a standing apply failure
-            // with whatever acquisition message happened to land last.
-            h.kind = "apply".to_string();
-            h.last_error = h.last_apply_error.clone();
-        }
+        Self::relabel_by_standing(&mut h);
         h.write(path);
         h
     }
@@ -612,6 +640,18 @@ impl Health {
         if h.apply_failures == 0 || h.last_apply_failure_build == current_build {
             return h;
         }
+        // ONLY A NEWER BUILD PROVES THE MACHINE MOVED (2026-09-14). A process
+        // whose image is OLDER than the recorder — a terminal session launched
+        // before a seamless self-update, running the old build for as long as
+        // its tab lives, its checker loop still ticking — knows nothing about
+        // the apply lane the window is failing on, and its half-hourly check
+        // used to zero the window's live streak: `failing_applies` never
+        // reached the persistent threshold, the notice never fired, and the
+        // freeze budget's per-artifact count restarted from zero. A pre-field
+        // ledger (recorder 0) still expires, as documented above.
+        if h.last_apply_failure_build != 0 && current_build < h.last_apply_failure_build {
+            return h;
+        }
         h.apply_failures = 0;
         h.apply_since = String::new();
         h.last_apply_error = String::new();
@@ -619,21 +659,13 @@ impl Health {
         h.last_apply_failure_build = 0;
         h.apply_failures_for_target = 0;
         h.last_apply_failure_target_build = 0;
-        if h.total_failures() == 0 {
-            h.kind = String::new();
-            h.failing_since = String::new();
-            h.last_failure_at = String::new();
-            h.last_error = String::new();
-        } else if h.kind == "apply" {
-            // Some acquisition streak still stands; let it own the headline. NAMING it
-            // matters: `kind == ""` is the documented HEALTHY sentinel, so blanking it
-            // here reported a healthy class on a machine with a live streak, and
-            // `update status` printed a non-zero `failing=` beside no class at all.
-            h.kind = h
-                .standing_acquisition_class()
-                .unwrap_or_default()
-                .to_string();
-            h.last_error = String::new();
+        if h.total_failures() == 0 || h.kind == "apply" {
+            // Some acquisition streak may still stand; let it own the headline
+            // WITH ITS OWN REASON. NAMING it matters: `kind == ""` is the
+            // documented HEALTHY sentinel, so blanking it here reported a healthy
+            // class on a machine with a live streak; blanking `last_error`
+            // printed `failing=N:stage` beside no reason at all.
+            Self::relabel_by_standing(&mut h);
         }
         h.write(path);
         h
@@ -696,19 +728,19 @@ impl Health {
             h.apply_failures = 0;
             h.apply_since = String::new();
             h.last_apply_error = String::new();
-            if h.total_failures() == 0 {
-                h.kind = String::new();
-                h.failing_since = String::new();
-                h.last_failure_at = String::new();
-                h.last_error = String::new();
-            } else if h.kind == "apply" {
-                // Acquisition failures are still standing; stop describing the ledger
-                // by the apply failure that just resolved — and NAME the one that is
-                // still standing, because `kind == ""` means healthy.
-                h.kind = h
-                    .standing_acquisition_class()
-                    .unwrap_or_default()
-                    .to_string();
+            // The dated stamp and its build go with the streak they dated
+            // (2026-09-14): a ledger reading `apply_failures = 0` beside
+            // `last_apply_failure_at = <today>` described a failure that no longer
+            // stands, and `expire_stale_apply_streak` was the only thing that ever
+            // cleared them.
+            h.last_apply_failure_at = String::new();
+            h.last_apply_failure_build = 0;
+            if h.total_failures() == 0 || h.kind == "apply" {
+                // Acquisition failures may still stand; stop describing the ledger
+                // by the apply failure that just resolved — and NAME the one that
+                // is still standing, with its own reason, because `kind == ""`
+                // means healthy.
+                Self::relabel_by_standing(&mut h);
             }
         }
         h.write(path);
@@ -1341,6 +1373,65 @@ mod tests {
         assert_eq!(
             h.network_failures, 1,
             "weather is neither reset nor summed in"
+        );
+        let _ = std::fs::remove_dir_all(p.parent().unwrap());
+    }
+
+    /// THE REASON-TEXT SPLICE THE 2026-09-10 FIX LEFT BEHIND (stage-verify audit,
+    /// 2026-09-14). Counts and clocks are per class now, but there is ONE
+    /// `last_error`, and it belongs to whichever failure landed LAST. Every reader
+    /// pairs the STANDING class with it: `UpdateStatus` prints `failing_checks_kind`
+    /// beside `last_error`, and the loud notice says "updates download but will not
+    /// verify or install (<last_error>)". A network blip on top of a standing stage
+    /// streak therefore describes a bundle that will not verify with a DNS error —
+    /// and the acquisition-only success the backoff path records EVERY cycle after
+    /// it (`stage_backoff` → `record_acquisition_success`) re-labels the ledger
+    /// `stage` while leaving the blip's text in place, so the splice becomes the
+    /// standing description for the life of the memo (up to 24 h).
+    #[test]
+    fn a_standing_diagnosis_keeps_its_own_reason_across_a_blip() {
+        let p = tmp("diagnosis-reason");
+        let stage_reason =
+            "staged bundle failed verification: codesign --verify (team-pinned requirement) failed";
+        Health::record_failure(&p, "stage", stage_reason);
+        Health::record_failure(&p, "stage", stage_reason);
+        Health::record_failure(&p, "stage", stage_reason);
+        let h = Health::record_failure(&p, "network", "curl: (6) could not resolve host");
+        assert_eq!(h.standing_acquisition_class(), Some("stage"));
+        assert_eq!(h.persistent_class(), Some(("stage", 3)));
+
+        // The backed-off check that follows: acquisition worked, the memo skipped the
+        // download. The ledger is re-described by the standing class …
+        let h = Health::record_acquisition_success(&p);
+        assert_eq!(h.kind, "stage");
+        assert_eq!(h.stage_failures, 3);
+        // … and the reason printed beside that class must be the stage lane's own,
+        // not the blip that happened to land last.
+        assert!(
+            h.last_error.contains("codesign"),
+            "the standing stage diagnosis is described by a network blip: {:?}",
+            h.last_error
+        );
+        let _ = std::fs::remove_dir_all(p.parent().unwrap());
+    }
+
+    /// The same splice from the apply-expiry side: `expire_stale_apply_streak` blanks
+    /// `last_error` while NAMING a standing acquisition class, so the status line
+    /// reads `failing=1:stage` with no reason at all (stage-verify audit, 2026-09-14).
+    #[test]
+    fn expiring_a_stale_apply_streak_leaves_the_standing_diagnosis_its_reason() {
+        let p = tmp("expire-keeps-reason");
+        let stage_reason = "ditto zip extract failed (exit status: 1)";
+        Health::record_failure(&p, "stage", stage_reason);
+        Health::record_apply_failure(&p, 11, 900 + 11, "ChildDied");
+        assert_eq!(Health::read(&p).kind, "apply");
+        let h = Health::expire_stale_apply_streak(&p, 12);
+        assert_eq!(h.apply_failures, 0);
+        assert_eq!(h.kind, "stage", "named, not blanked");
+        assert!(
+            h.last_error.contains("ditto"),
+            "a named standing class must carry its reason, not an empty string: {:?}",
+            h.last_error
         );
         let _ = std::fs::remove_dir_all(p.parent().unwrap());
     }

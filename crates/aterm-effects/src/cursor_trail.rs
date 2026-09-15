@@ -24,7 +24,7 @@ use std::time::Duration;
 
 use aterm_render::TrailCell;
 
-use crate::cursor_glow::{TypedStamps, band_row};
+use crate::cursor_glow::{TypedStamps, band_row, hint_fresh, take_hint_fresh};
 
 /// Coverage of the comet HEAD (the cell nearest the cursor) at a GENTLE move — the
 /// "just a few keys / slow typing" baseline the user asked to keep subtle.
@@ -96,23 +96,50 @@ pub const HIDE_BRIDGE_MAX_DIST: u16 = 2;
 /// bridge law): an app repositioning its cursor mid-repaint still spawns
 /// nothing.
 pub const HIDE_BRIDGE_TYPED_MAX_DIST: u16 = 8;
-/// The bridge's reach while a NAVIGATION hint is fresh (2026-09-13, the silent
-/// word hop): UNBOUNDED. The typed reach is 8 because a typed echo is bounded
-/// by how many keys can batch inside one hide window; a navigation key carries
-/// no such bound — Option+Left crosses a word, `Home` crosses a line — so a
-/// distance cap on a nav-witnessed landing is a cap on the gesture itself.
+/// Rows a NAV-witnessed landing may cross (2026-09-13, the stray relocation).
 ///
-/// This is not a widening of the anti-stray law. [`CursorTrail::spawn`] and
-/// `CursorGlow::spawn` still own the licence and still consume the hint
-/// exactly once; a STALE nav hint bridges nothing, so an app repositioning
-/// its cursor mid-repaint with no key behind it spawns exactly what it
-/// spawned before. What changes is only which SOURCE CELL a licensed move is
-/// measured from — and the source's AGE is still bounded, by
-/// [`nav_bridge_source_ok`]: it must have been visible within one
-/// [`HIDE_BRIDGE_MS`] window OF THE KEY, so a caret the engine last saw
-/// minutes ago (a viewport parked in history) can never become the origin of
-/// a screen-crossing gesture on one word key.
-pub const HIDE_BRIDGE_NAV_MAX_DIST: u16 = u16::MAX;
+/// A navigation gesture is shaped like a LINE OF TEXT, not like a grid: `Home`
+/// and Option+Left move along the logical line the hand is editing, and that
+/// line occupies one row unless the input box has WRAPPED. So rows are capped
+/// at the wrapped box, not at 1 and not at the screen: a `dr <= 1` cap was
+/// measured to refuse Ctrl-A/Home on a 2+-row wrapped Ink composer, which is
+/// the exact shape the nav bridge exists to carry, while the stray this
+/// constant refuses — the owner's measured `(2,42)->(9,3)`, a spinner repaint
+/// relocating the caret seven rows up with no key behind it — is far outside
+/// any composer.
+pub const HIDE_BRIDGE_NAV_MAX_ROWS: u16 = 4;
+
+/// Columns a NAV-witnessed landing may cross when the host never named a pane.
+/// Every shipped path names one (`note_pane_columns`, at LOCK A and at the
+/// composed splice alike), so this is the reach for a caller that never said
+/// how wide its pane is — the classic terminal width, never the whole grid.
+pub const HIDE_BRIDGE_NAV_UNPANED_COLS: u16 = 80;
+
+/// The window, after a NAVIGATION press, in which the caret may still be seen
+/// sitting at rest without that sighting PROVING the key moved nothing.
+///
+/// A key's echo is a PTY round trip: the pinned laws measure 12-40 ms, and the
+/// engine's own echo window ([`HIDE_BRIDGE_MS`]) is 150. Once a presented frame
+/// observes the caret still VISIBLE this long after the press, the press did
+/// not move it — Ctrl-E at the end of the line, design ruling D11's own named
+/// case — and the hidden relocation that follows belongs to the program. The
+/// hint keeps licensing ordinary visible moves for its full window; only the
+/// BRIDGE, which is the lane that reaches across a repaint, is closed.
+pub const NAV_NOOP_SETTLE_MS: u64 = 80;
+
+/// How long after a NAVIGATION press a hidden→visible landing may still be
+/// that press's ECHO.
+///
+/// The nav HINT lives [`CursorTrail::NAV_HINT_FRESH`] = 250 ms, because that
+/// is the window in which a second press must get its own licence. The BRIDGE
+/// — the lane that reaches across a repaint which hid the caret — is a
+/// different claim: it says "this landing is the echo of that key". An echo is
+/// a PTY round trip (12-40 ms in the pinned laws) plus one repaint, chunked
+/// across at most a present or two. 150 ms is four times the slowest landing
+/// any pinned law needs (`key + 40`), and it takes the window in which a
+/// program's own relocation can wear the key's licence from 250 ms down to
+/// 150 — for nothing, on every law measured.
+pub const NAV_BRIDGE_LANDING_MS: u64 = 150;
 
 /// May a NAV-witnessed hidden→visible landing use `seen` as its source cell?
 ///
@@ -123,28 +150,154 @@ pub const HIDE_BRIDGE_NAV_MAX_DIST: u16 = u16::MAX;
 /// cell it moved FROM. A sample older than that belongs to some earlier state
 /// (the caret parked off-viewport, a different screen) and bridges nothing.
 ///
+/// BOTH SIDES OF THE PRESS ARE BOUNDED (2026-09-13, the stray relocation).
+/// This once asked only `key - seen`, which SATURATES to zero whenever the
+/// sample is NEWER than the key — so the exact no-op case was unbounded: a
+/// caret observed still sitting at its own cell any time after the press
+/// answered "yes, that is the cell this key moved from". It is not; it is
+/// proof the key moved NOTHING ([`NAV_NOOP_SETTLE_MS`]).
+///
 /// With the nav hint itself capped at `NAV_HINT_FRESH`, the source can be at
 /// most `NAV_HINT_FRESH + HIDE_BRIDGE_MS` old — bounded, and shared by both
 /// engines so the bed and the light cannot disagree on one move.
 #[must_use]
 pub fn nav_bridge_source_ok(key: Instant, seen: Instant) -> bool {
     key.saturating_duration_since(seen).as_millis() as u64 <= HIDE_BRIDGE_MS
+        && seen.saturating_duration_since(key).as_millis() as u64 <= NAV_NOOP_SETTLE_MS
 }
 
-/// The bridge reach for one reappear: UNBOUNDED while a navigation hint is
-/// fresh, widened while a typed/backspace echo hint is fresh, classic
+/// The WHOLE nav-bridge admission, as one decision both engines call: the
+/// source cell must be one this key could have moved from
+/// ([`nav_bridge_source_ok`]) **and** the landing must arrive while the key's
+/// echo could still be outstanding ([`NAV_BRIDGE_LANDING_MS`]).
+///
+/// Two bounds, two different claims, deliberately not folded into one
+/// constant: `seen` is about the cell the gesture STARTED from, `now` about
+/// whether what just appeared can still be that gesture's ARRIVAL. Keeping
+/// them apart is what let the sweep in `cursor_glow`'s stray law measure them
+/// separately.
+#[must_use]
+pub fn nav_bridge_admits(key: Instant, seen: Instant, now: Instant) -> bool {
+    nav_bridge_source_ok(key, seen)
+        && now.saturating_duration_since(key).as_millis() as u64 <= NAV_BRIDGE_LANDING_MS
+}
+
+/// How far one hidden→visible reappear may sit from its source cell, in cells
+/// — and, on the nav lane, what SHAPE a landing that crosses rows must have.
+///
+/// Rows and columns are judged SEPARATELY, because the shapes that earn a
+/// bridge are text-shaped: the typed and classic lanes keep the Chebyshev ball
+/// they always had (`rows == cols`), and only the nav lane is wide across and
+/// short down.
+///
+/// THE LINE-GESTURE SHAPE (2026-09-14, the fix-up round). A nav landing ONE
+/// row off its source is a wrap hop or an arrow and may sit at any column of
+/// the pane. A landing TWO OR MORE rows off can only be a LINE gesture on a
+/// wrapped input box — and of those only Home/Ctrl-A lands at a column the
+/// engines can know: the box's own start, UP from wherever the hand was.
+/// End/Ctrl-E lands wherever the text ends — any column of any row — which is
+/// exactly the shape of a program re-laying its input box a few rows down, and
+/// no frame can tell the two apart. So across two or more rows End is not
+/// bridged (it is licensed as every other move is whenever the caret was
+/// visible, i.e. every landing a present did not catch mid-hide). Measured
+/// on the fix-up's sweep: with rows and columns alone, a nav key that moved
+/// nothing licensed `(2,42)->(4,90)`, `(5,88)` and `(6,3)` at every repaint
+/// phase inside the settle window; with the shape, none, at any phase.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct BridgeReach {
+    /// Columns the landing may sit from the source.
+    pub cols: u16,
+    /// Rows the landing may sit from the source.
+    pub rows: u16,
+    /// `Some(first column of the focused pane)` while the NAV lane is open: a
+    /// landing two or more rows from its source must be Home/Ctrl-A's —
+    /// upward, and within [`HIDE_BRIDGE_TYPED_MAX_DIST`] of that column.
+    /// `None` on the typed and classic balls, which carry no line gesture.
+    pub line_start: Option<u16>,
+}
+
+impl BridgeReach {
+    /// Does this reach admit a hidden→visible landing at `to` from `from`
+    /// (`(row, col)` each)?
+    #[must_use]
+    pub fn admits(self, from: (u16, u16), to: (u16, u16)) -> bool {
+        let dr = to.0.abs_diff(from.0);
+        let dc = to.1.abs_diff(from.1);
+        if dr > self.rows || dc > self.cols {
+            return false;
+        }
+        match self.line_start {
+            // Two or more rows: Home/Ctrl-A, up to the box's first column.
+            Some(col0) if dr >= 2 => {
+                to.0 < from.0 && to.1.saturating_sub(col0) <= HIDE_BRIDGE_TYPED_MAX_DIST
+            }
+            _ => true,
+        }
+    }
+
+    const fn ball(d: u16) -> Self {
+        Self {
+            cols: d,
+            rows: d,
+            line_start: None,
+        }
+    }
+}
+
+/// The bridge reach for one reappear: the FOCUSED PANE's width and a wrapped
+/// input box's height while a navigation hint is fresh, the Chebyshev typed
+/// ball while a typed/backspace echo hint is fresh, the classic ball
 /// otherwise. The single decision both the trail and glow engines share (they
 /// must agree, or the opaque bed and the additive light desynchronize on the
 /// same move).
+///
+/// `pane` is the focused pane's own `(first column, width)`
+/// (`note_pane_columns`). It is what makes the nav lane a GESTURE ceiling
+/// rather than a grid one: a word or line motion cannot leave the pane the
+/// hand is typing in, so a landing farther across than the pane is wide was
+/// never that gesture — and a landing two or more rows off must be Home's,
+/// at the pane's own first column ([`BridgeReach::line_start`]). This
+/// replaced a `u16::MAX` nav reach (2026-09-13) under which the plausibility
+/// test was vacuous and a program's own caret relocation wore the key's
+/// licence. Note that in a single full-window pane the column ceiling IS the
+/// window's width; there the rows and the line-gesture shape are what bite.
 #[must_use]
-pub fn hide_bridge_reach(typed_hint_fresh: bool, nav_hint_fresh: bool) -> u16 {
+pub fn hide_bridge_reach(
+    typed_hint_fresh: bool,
+    nav_hint_fresh: bool,
+    pane: Option<(u16, u16)>,
+) -> BridgeReach {
     if nav_hint_fresh {
-        HIDE_BRIDGE_NAV_MAX_DIST
+        let (col0, cols) = pane
+            .filter(|(_, cols)| *cols > 0)
+            .unwrap_or((0, HIDE_BRIDGE_NAV_UNPANED_COLS));
+        BridgeReach {
+            cols: cols.max(HIDE_BRIDGE_TYPED_MAX_DIST),
+            rows: HIDE_BRIDGE_NAV_MAX_ROWS,
+            line_start: Some(col0),
+        }
     } else if typed_hint_fresh {
-        HIDE_BRIDGE_TYPED_MAX_DIST
+        BridgeReach::ball(HIDE_BRIDGE_TYPED_MAX_DIST)
     } else {
-        HIDE_BRIDGE_MAX_DIST
+        BridgeReach::ball(HIDE_BRIDGE_MAX_DIST)
     }
+}
+
+/// Hidden→visible RELOCATIONS the trail's hide bridge has judged over the
+/// engine's life, each exactly once: `bridged + declined` is the number of
+/// reappearances at a cell other than the one the caret was last seen at.
+///
+/// This is the trail's only observable of the bridge decision for a NAV
+/// landing — a nav-paired move lays no comet by design (`spawn`), so a
+/// pixel count reads 0 whether the bridge admitted the landing or refused it.
+/// The two engines must make the SAME source decision on the same frames
+/// (the lockstep contract), and this is what lets a law say the trail did.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct BridgeTally {
+    /// Relocations the bridge admitted a source cell for.
+    pub bridged: u64,
+    /// Relocations the bridge declined (no source cell: `spawn` never ran).
+    pub declined: u64,
 }
 
 /// Identity of one terminal content generation, as the HOST reads it.
@@ -338,6 +491,9 @@ pub struct CursorTrail {
     /// without physical-margin authority, a large one-row move remains a dark
     /// repaint re-anchor rather than guessing a fold.
     pane_columns: Option<(u16, u16)>,
+    /// Hidden→visible relocations the hide bridge admitted or declined, for
+    /// the engine's life — see [`BridgeTally`]. Never reset.
+    bridge_tally: BridgeTally,
     /// The resident cell→`out`-slot probe table behind [`Self::tick`]'s
     /// overlap merge (see the emit loop there for the WHY): allocated lazily
     /// on the first lit tick — an idle or disabled window never pays the
@@ -384,6 +540,13 @@ impl CursorTrail {
     /// Last honest visible source owned by this engine. Hosts compare this
     /// with CursorGlow before arming a candidate; an unseeded/reset pair must
     /// fail closed because no swept path can be reconstructed.
+    /// Hidden→visible relocations this engine's hide bridge has admitted or
+    /// declined — see [`BridgeTally`].
+    #[must_use]
+    pub fn bridge_tally(&self) -> BridgeTally {
+        self.bridge_tally
+    }
+
     #[must_use]
     pub fn cursor_anchor(&self) -> Option<(u16, u16)> {
         self.last
@@ -393,9 +556,17 @@ impl CursorTrail {
     /// HOST KEY-HINT: one PLAIN typed-glyph or Backspace echo keypress (never
     /// Enter/Tab/nav/modified chords). Arms only the [`Self::type_hint`]
     /// re-anchor classifier; see the field doc. It cannot admit a comet.
+    ///
+    /// A typed press closes nothing on this engine — the nav and
+    /// generic-move one-shots survive it, their echoes still owed (a glyph
+    /// typed before the Enter's response or the arrow's hop lands is
+    /// type-ahead; closing them here licensed the response under the
+    /// glyph's stamp and spent it, and the glyph's own echo went dark).
+    /// What the glow's `supersede_typed_press` closes (the gesture and
+    /// reflow classes) lives in this engine's single [`Self::move_hint`]
+    /// slot beside the Return it must keep, so the host has nothing to call
+    /// here in lockstep.
     pub fn note_typed(&mut self, now: Instant) {
-        self.move_hint = None;
-        self.nav_hint = None;
         self.type_hint.stamp(now);
     }
 
@@ -458,15 +629,6 @@ impl CursorTrail {
         self.move_hint = None;
     }
 
-    /// The typed-press supersede — `CursorGlow::supersede_typed_press`'s trail
-    /// twin (lockstep): a press that is itself a typed glyph closes the nav and
-    /// generic-move classes but KEEPS the banked typed stamps, each of which is
-    /// a real key whose echo is still in flight.
-    pub fn supersede_typed_press(&mut self) {
-        self.nav_hint = None;
-        self.move_hint = None;
-    }
-
     /// Arm the navigation veto — see `CursorGlow::note_navigation`. It licenses
     /// the following move (a key was pressed) and classifies it as scrubbing,
     /// which the comet deliberately does not paint.
@@ -483,20 +645,24 @@ impl CursorTrail {
     }
 
     /// Classify a Tab completion or non-empty paste. The SUPERSEDE shape, in
-    /// lockstep with `CursorGlow::note_user_gesture` (2026-08-30): the banked
-    /// typed stamps are real keys whose echoes are still in flight, so a Tab
-    /// mid-burst closes the nav/generic classes but keeps the bank — wiping
-    /// it here orphaned those echoes on the trail engine's side of the pair.
+    /// lockstep with `CursorGlow::note_user_gesture`: the banked typed
+    /// stamps are real keys whose echoes are still in flight, so a Tab
+    /// mid-burst keeps the bank — wiping it here orphaned those echoes on
+    /// the trail engine's side of the pair. It closes the nav class (the
+    /// Tier-1 binding of a gesture press disposing of the live classes,
+    /// `a_user_gesture_establishes_one_class_and_licenses_its_landing`)
+    /// where the glow's gesture keeps its nav one-shot — a divergence
+    /// confined to an arrow whose hop is still in flight when the Tab is
+    /// pressed.
     pub fn note_user_gesture(&mut self, now: Instant) {
-        self.supersede_typed_press();
+        self.nav_hint = None;
         self.move_hint = Some(now);
     }
 
     /// Classify a plain Return — bank-preserving exactly like
     /// [`Self::note_user_gesture`], in lockstep with `CursorGlow::note_return`
-    /// (which never wiped the bank).
+    /// (which never wiped the bank, and keeps the nav one-shot).
     pub fn note_return(&mut self, now: Instant) {
-        self.supersede_typed_press();
         self.move_hint = Some(now);
     }
 
@@ -516,6 +682,22 @@ impl CursorTrail {
     #[doc(hidden)]
     pub fn note_synthetic_typed(&mut self, now: Instant) {
         self.note_typed(now);
+    }
+
+    /// The delivery re-stamp for every class whose dispatch stamp is this
+    /// engine's generic move slot — a queued Enter's [`Self::note_return`],
+    /// a queued Tab's / ⌃V's [`Self::note_user_gesture`]: the licence,
+    /// revoked at enqueue, put back at the writer's completed write
+    /// (`CursorGlow::note_delivered`'s lockstep twin) — a pure stamp, no
+    /// supersede.
+    pub fn note_move_delivered(&mut self, at: Instant) {
+        self.move_hint = Some(at);
+    }
+
+    /// The nav-slot twin of [`Self::note_move_delivered`]: a queued
+    /// navigation key's licence, put back at delivery.
+    pub fn note_motion_delivered(&mut self, at: Instant) {
+        self.nav_hint = Some(at);
     }
 
     /// Cancel only the license written by one not-yet-egressed dispatch. See
@@ -644,28 +826,38 @@ impl CursorTrail {
             // batched echoes hop farther than 2 cells inside one hide window;
             // unhinted moves keep the classic source law.
             let typed_fresh = self.type_hint.any_fresh(now, Self::TYPE_HINT_FRESH);
-            // A fresh NAVIGATION hint outranks the hide window entirely
-            // (2026-09-13, the silent word hop; lockstep with
-            // `CursorGlow::tick`): the key was pressed, and this landing is
-            // its echo however long the caret was unobservable (a TUI that
-            // repaints inside DECTCEM-hide) and however far it hopped.
-            // `spawn` still owns the license, still consumes the hint once,
-            // and still refuses a stale one — so an unhinted program
-            // relocation keeps the pinned 2-cell law — and the SOURCE's age is
-            // still bounded, by `nav_bridge_source_ok`.
-            let nav_bridge = self
-                .nav_hint
-                .filter(|t| now.saturating_duration_since(*t).as_secs_f32() <= Self::NAV_HINT_FRESH)
-                .is_some_and(|key| nav_bridge_source_ok(key, seen));
-            let reach = hide_bridge_reach(typed_fresh, nav_bridge);
-            let plausible = cur.is_some_and(|(cr, cc)| cr.abs_diff(r).max(cc.abs_diff(c)) <= reach);
+            // A fresh NAVIGATION hint outranks the hide window (2026-09-13,
+            // the silent word hop; lockstep with `CursorGlow::tick`): the key
+            // was pressed, and this landing is its echo however long the caret
+            // was unobservable (a TUI that repaints inside DECTCEM-hide). It
+            // is not unbounded in SPACE: the reach is the focused pane's width
+            // and a wrapped box's height, never the grid. `spawn` still owns
+            // the license, still consumes the hint once, and still refuses a
+            // stale one — so an unhinted program relocation keeps the pinned
+            // 2-cell law — and the SOURCE is bounded on BOTH sides of the
+            // press by `nav_bridge_source_ok`: too old to be the cell this key
+            // moved from, or so much newer that it PROVES the key moved
+            // nothing, and the nav lane closes.
+            let nav_bridge = hint_fresh(self.nav_hint, now, Self::NAV_HINT_FRESH)
+                && self
+                    .nav_hint
+                    .is_some_and(|key| nav_bridge_admits(key, seen, now));
+            let reach = hide_bridge_reach(typed_fresh, nav_bridge, self.pane_columns);
+            let plausible = cur.is_some_and(|to| reach.admits((r, c), to));
             ((fresh || nav_bridge) && plausible).then_some((r, c))
         });
-        let declined_hidden_relocation = spawn_from.is_none()
-            && self.last.is_none()
+        let hidden_relocation = self.last.is_none()
             && cur
                 .zip(self.last_visible.map(|(cell, _)| cell))
                 .is_some_and(|(current, previous)| current != previous);
+        let declined_hidden_relocation = spawn_from.is_none() && hidden_relocation;
+        if hidden_relocation {
+            if spawn_from.is_some() {
+                self.bridge_tally.bridged += 1;
+            } else {
+                self.bridge_tally.declined += 1;
+            }
+        }
         let completed_hidden_reappearance =
             self.last.is_none() && cur.is_some() && self.last_visible.is_some();
         let unseeded_visible = self.last.is_none() && self.last_visible.is_none() && cur.is_some();
@@ -813,12 +1005,9 @@ impl CursorTrail {
     /// one echo).
     #[must_use]
     pub fn move_licensed(&self, now: Instant) -> bool {
-        let fresh = |hint: Option<Instant>, window: f32| {
-            hint.is_some_and(|t| now.saturating_duration_since(t).as_secs_f32() <= window)
-        };
         self.type_hint.any_fresh(now, Self::TYPE_HINT_FRESH)
-            || fresh(self.nav_hint, Self::NAV_HINT_FRESH)
-            || fresh(self.move_hint, Self::MOVE_HINT_FRESH)
+            || hint_fresh(self.nav_hint, now, Self::NAV_HINT_FRESH)
+            || hint_fresh(self.move_hint, now, Self::MOVE_HINT_FRESH)
     }
 
     /// Try to spawn a comet for a LICENSED move from `(pr,pc)` to
@@ -863,21 +1052,27 @@ impl CursorTrail {
         let physical_fold = self.pane_columns.is_some_and(|(col0, cols)| {
             crate::trail_sweep::physical_margin_fold((pr, pc), (cr, cc), col0, cols)
         });
-        let paired = self
-            .type_hint
-            .take_fresh(now, Self::TYPE_HINT_FRESH)
-            .is_some();
+        // A ONE-SHOT'S OWN MOVE IS NEVER THE GLYPH'S (the final review,
+        // 2026-09-14 — `CursorGlow`'s `return_paired`, in lockstep): with
+        // the generic licence surviving a typed press, the Enter's late
+        // response arrives beside a type-ahead glyph's stamp. Any shape but
+        // a same-row forward hop (a key's echo, never a Return's) is the
+        // licence's own move: it takes the licence below and leaves the
+        // stamp for the glyph's echo, instead of spending the stamp as a
+        // re-anchor and refusing the echo dark.
+        let move_paired =
+            !(cr == pr && cc > pc) && hint_fresh(self.move_hint, now, Self::MOVE_HINT_FRESH);
+        let paired = !move_paired
+            && self
+                .type_hint
+                .take_fresh(now, Self::TYPE_HINT_FRESH)
+                .is_some();
         // ALT-SCREEN blink requirement (the glow classifier's twin): on the
         // alt screen only a repaint-BLINKING app (Claude Code's
         // hide-inside-sync bracket) re-anchors — vim's hinted one-row motions
         // keep their comet. Main screen (`!ctx_alt`) stays byte-identical.
-        let blink_fresh = self.blink_hint.is_some_and(|t| {
-            now.saturating_duration_since(t).as_secs_f32() <= Self::BLINK_HINT_FRESH
-        });
-        let nav_paired = self
-            .nav_hint
-            .take_if(|t| now.saturating_duration_since(*t).as_secs_f32() <= Self::NAV_HINT_FRESH)
-            .is_some();
+        let blink_fresh = hint_fresh(self.blink_hint, now, Self::BLINK_HINT_FRESH);
+        let nav_paired = take_hint_fresh(&mut self.nav_hint, now, Self::NAV_HINT_FRESH).is_some();
         // The generic move license is consumed here too — one stamp, one echo.
         let _ = self.move_hint.take();
         // NAVIGATION (Ctrl-A/E, Home/End, arrows, word/line motions): a move
@@ -2111,6 +2306,93 @@ mod tests {
         assert!(!out.is_empty());
     }
 
+    /// THE ENTER-THEN-TYPE-AHEAD SHAPE, IN LOCKSTEP WITH THE GLOW (the final
+    /// review, 2026-09-14). `note_typed` closed the nav and generic-move
+    /// classes on every glyph, and `spawn` took a
+    /// typed stamp on every licensed move, so a glyph typed before the
+    /// Enter's response landed (SSH, a slow prompt) LENT the response its
+    /// stamp: the response drew as the glyph's re-anchor, and the glyph's
+    /// own +1 was unlicensed and dark — the shape `CursorGlow` closed on
+    /// 2026-09-14 (b434123cc), still open in this engine. A glyph now keeps
+    /// the one-shots (their echoes are still owed), and a fresh generic
+    /// licence paired with any move but a same-row forward hop takes that
+    /// move and leaves the stamp for the glyph's echo.
+    ///
+    /// RED before: the response spent the stamp, the +1 drew nothing.
+    #[test]
+    fn a_glyph_typed_before_the_enters_response_lands_keeps_its_stamp_for_its_own_echo() {
+        let c = cfg(true);
+        let ms = Duration::from_millis;
+        let t0 = Instant::now();
+        let mut out = Vec::new();
+        let mut trail = CursorTrail::default();
+        trail.tick(Some((2, 20)), t0, &c, &mut out);
+        // Enter — the host: the Return class (a typed press supersedes
+        // nothing in this engine: what the glow's supersede closes lives in
+        // the one generic slot beside the Return it keeps).
+        let enter = t0 + ms(100);
+        trail.note_return(enter);
+        // The next command's first glyph, before the prompt came back.
+        let k = enter + ms(120);
+        trail.note_typed(k);
+        assert_eq!(
+            trail.move_hint,
+            Some(enter),
+            "the glyph keeps the Enter's licence: its response is still owed"
+        );
+        // The response — a row down, back to the prompt — is the Enter's
+        // move and spends the Enter's licence, not the glyph's stamp.
+        let resp = k + ms(30);
+        let fp = trail.tick(Some((3, 2)), resp, &c, &mut out);
+        assert_ne!(fp, 0, "the Enter's response is licensed");
+        assert!(trail.move_hint.is_none(), "…and spends the Enter's licence");
+        assert!(
+            trail
+                .type_hint
+                .any_fresh(resp, CursorTrail::TYPE_HINT_FRESH),
+            "…leaving the glyph's stamp for the glyph's own echo"
+        );
+        // The glyph's own echo.
+        let echo = resp + ms(20);
+        let fp = trail.tick(Some((3, 3)), echo, &c, &mut out);
+        assert_ne!(fp, 0, "the glyph's +1 is licensed by its own stamp");
+        assert!(
+            out.iter().any(|cell| cell.row == 3 && cell.col == 2),
+            "…and lights its cell: {:?}",
+            out.iter()
+                .map(|cell| (cell.row, cell.col))
+                .collect::<Vec<_>>()
+        );
+        assert!(
+            !trail
+                .type_hint
+                .any_fresh(echo, CursorTrail::TYPE_HINT_FRESH),
+            "one stamp, one echo"
+        );
+        // A keyless program +1 after that is refused: the stamp is spent and
+        // the Enter's licence went with its response.
+        assert!(!trail.move_licensed(echo + ms(50)));
+
+        // CONTROL — the same response with NO glyph behind it draws exactly
+        // the same: the Enter's move is the Enter's, glyph or no glyph.
+        let mut bare = CursorTrail::default();
+        bare.tick(Some((2, 20)), t0, &c, &mut out);
+        bare.note_return(enter);
+        let mut bare_out = Vec::new();
+        let bare_fp = bare.tick(Some((3, 2)), resp, &c, &mut bare_out);
+        let mut with_glyph = CursorTrail::default();
+        with_glyph.tick(Some((2, 20)), t0, &c, &mut out);
+        with_glyph.note_return(enter);
+        with_glyph.note_typed(k);
+        let mut glyph_out = Vec::new();
+        let glyph_fp = with_glyph.tick(Some((3, 2)), resp, &c, &mut glyph_out);
+        assert_eq!(
+            (bare_fp, bare_out),
+            (glyph_fp, glyph_out),
+            "the Enter's response draws the same with a type-ahead glyph behind it"
+        );
+    }
+
     /// THE KITTY→BLINK SWAP (trail twin of the glow law): on the ALT screen a
     /// typed classifier alone no longer re-anchors — for a candidate-backed
     /// typed move without a fresh REPAINT BLINK (vim never hides inside
@@ -2537,5 +2819,156 @@ mod tests {
             assert_eq!(out, want, "frame {f}: emitted cells diverged");
             assert_eq!(fp == 0, out.is_empty(), "frame {f}: fp/emptiness law");
         }
+    }
+
+    // ---- THE NAV BRIDGE IS GESTURE-SHAPED (2026-09-13) --------------------
+
+    /// The reach a fresh NAV hint opens is the FOCUSED PANE's, never the
+    /// grid's. For one round it was `u16::MAX` in both axes, which made the
+    /// plausibility test vacuous: any landing anywhere on the screen was "a
+    /// plausible word hop", and the program's own caret relocation wore the
+    /// key's licence. Measured before this law: `hide_bridge_reach(false,
+    /// true) == 65535`; the typed and classic lanes were 8 and 2 and are
+    /// unchanged, byte for byte, in both axes.
+    #[test]
+    fn the_nav_bridge_reaches_one_pane_across_and_a_wrapped_box_down() {
+        let pane = Some((0u16, 100u16));
+        let ball = |d| BridgeReach {
+            cols: d,
+            rows: d,
+            line_start: None,
+        };
+        assert_eq!(
+            hide_bridge_reach(false, false, pane),
+            ball(2),
+            "an unhinted reappear keeps the pinned classic ball"
+        );
+        assert_eq!(
+            hide_bridge_reach(true, false, pane),
+            ball(8),
+            "a typed echo keeps the pinned batched-echo ball"
+        );
+        let nav = hide_bridge_reach(false, true, pane);
+        assert_eq!(
+            nav,
+            BridgeReach {
+                cols: 100,
+                rows: HIDE_BRIDGE_NAV_MAX_ROWS,
+                line_start: Some(0),
+            },
+            "a nav hint reaches one pane across and a wrapped box down"
+        );
+        // The shapes this bound exists to separate, measured on the owner's
+        // machine and on the fix-up's sweep. From `(4,42)`, the second row of
+        // a wrapped Ink composer whose box starts at column 1:
+        let from = (4u16, 42u16);
+        assert!(
+            nav.admits(from, (2, 1)),
+            "Ctrl-A: up two rows to the box's start"
+        );
+        assert!(nav.admits(from, (3, 90)), "Option+Left wrapping up one row");
+        assert!(
+            nav.admits(from, (5, 3)),
+            "Option+Right wrapping down one row"
+        );
+        assert!(nav.admits(from, (5, 42)), "Down: one row, the same column");
+        assert!(nav.admits(from, (4, 1)), "Ctrl-A along the caret's own row");
+        assert!(
+            !nav.admits(from, (11, 3)),
+            "the measured stray, seven rows down"
+        );
+        assert!(
+            !nav.admits(from, (6, 90)),
+            "two rows DOWN to an arbitrary column: a re-laid input box, or End \
+             — the two are one shape, and neither is bridged"
+        );
+        assert!(
+            !nav.admits(from, (8, 3)),
+            "four rows DOWN to the box's start is not Home either (Home goes up)"
+        );
+        assert!(
+            !nav.admits(from, (2, 42)),
+            "two rows UP at the same column: a box that moved, not a line gesture"
+        );
+        assert!(
+            !nav.admits(from, (2, 30)),
+            "two rows up to an interior column is not Home"
+        );
+        // The typed and classic balls carry no line gesture: a two-row typed
+        // echo inside its ball is admitted whatever its column.
+        assert!(hide_bridge_reach(true, false, pane).admits(from, (6, 44)));
+        // A narrower pane narrows the gesture with it — and a pane that starts
+        // at column 50 puts Home's landing at column 50, not at 0.
+        assert_eq!(hide_bridge_reach(false, true, Some((0, 40))).cols, 40);
+        let right = hide_bridge_reach(false, true, Some((50, 50)));
+        assert!(
+            right.admits((4, 80), (2, 52)),
+            "Home in the right-hand pane"
+        );
+        assert!(
+            !right.admits((4, 80), (2, 2)),
+            "…and column 2 is the LEFT pane's start, not this pane's"
+        );
+        // A pane nobody named still never reaches the grid.
+        assert_eq!(
+            hide_bridge_reach(false, true, None),
+            BridgeReach {
+                cols: HIDE_BRIDGE_NAV_UNPANED_COLS,
+                rows: HIDE_BRIDGE_NAV_MAX_ROWS,
+                line_start: Some(0),
+            }
+        );
+        // A one-column pane must not be TIGHTER than the typed lane.
+        assert_eq!(
+            hide_bridge_reach(false, true, Some((0, 1))).cols,
+            HIDE_BRIDGE_TYPED_MAX_DIST
+        );
+    }
+
+    /// The source a nav key may reach back to is bounded on BOTH sides of the
+    /// press. Older than one hide window: a cell some earlier state left
+    /// behind. Newer by more than the echo settle window: PROOF the key moved
+    /// nothing, because a presented frame saw the caret still sitting there
+    /// long after the press. The second arm was unbounded — `key -
+    /// seen` saturates to zero — and that is the no-op Ctrl-E case D11 names.
+    #[test]
+    fn a_caret_seen_still_at_rest_after_the_press_proves_the_key_moved_nothing() {
+        let key = Instant::now();
+        let ms = Duration::from_millis;
+        assert!(
+            nav_bridge_source_ok(key, key - ms(HIDE_BRIDGE_MS)),
+            "one hide window before the press is the cell it moved from"
+        );
+        assert!(
+            !nav_bridge_source_ok(key, key - ms(HIDE_BRIDGE_MS + 1)),
+            "older than that belongs to an earlier state"
+        );
+        assert!(
+            nav_bridge_source_ok(key, key + ms(NAV_NOOP_SETTLE_MS)),
+            "a sighting inside the echo window is the key's own in-flight echo"
+        );
+        assert!(
+            !nav_bridge_source_ok(key, key + ms(NAV_NOOP_SETTLE_MS + 1)),
+            "a caret still at rest past the echo window: the key moved nothing"
+        );
+        // …and the LANDING is bounded too: a hidden→visible landing later
+        // than `NAV_BRIDGE_LANDING_MS` after the press is not its echo. The
+        // nav hint itself lives `NAV_HINT_FRESH` = 250 ms so that a second
+        // press gets its own licence; the bridge is a narrower claim.
+        let seen = key - ms(20);
+        assert!(nav_bridge_admits(
+            key,
+            seen,
+            key + ms(NAV_BRIDGE_LANDING_MS)
+        ));
+        assert!(!nav_bridge_admits(
+            key,
+            seen,
+            key + ms(NAV_BRIDGE_LANDING_MS + 1)
+        ));
+        assert!(
+            !nav_bridge_admits(key, key + ms(NAV_NOOP_SETTLE_MS + 1), key + ms(100)),
+            "the source bound still applies inside the landing window"
+        );
     }
 }

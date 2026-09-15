@@ -1064,6 +1064,12 @@ pub(crate) struct Config {
     /// Containment. Absent ⇒ today's behavior (report the posture, probe silently,
     /// offer the warm-up only on an explicit gesture). See [`PrivacyConfig`].
     pub(crate) privacy: Option<PrivacyConfig>,
+    /// macOS host settings (`[machine]`): Universal Control off for this host and
+    /// cargo build output hidden from Spotlight. The CO-LOCATED `atpkg` reads the
+    /// SAME table out of this file and applies it at the top of every package pass
+    /// (and on `aterm pkg machine apply`); the GUI only displays and edits it.
+    /// Absent ⇒ both on. See [`MachineConfig`].
+    pub(crate) machine: Option<MachineConfig>,
 }
 
 /// Source used to produce a terminal's live, human-readable description.
@@ -2676,6 +2682,30 @@ pub(crate) struct PrivacyConfig {
     /// `--validate-config` instead of the key reading as unknown; deliberately
     /// NOT given a resolver, so no consumer can grow one by accident.
     pub(crate) auto_accept: Option<bool>,
+}
+
+/// `[machine]` — the macOS host settings the CO-LOCATED `atpkg` applies FIRST on every
+/// package pass and on `aterm pkg machine apply`, mirrored here so Settings ▸ Security
+/// can show the switches and confirm the measured state:
+///
+/// ```toml
+/// [machine]
+/// universal_control = "off"   # "off" (default: disable it for this host) | "leave"
+/// spotlight_noindex = true    # rename cargo target dirs under $HOME to .noindex
+/// ```
+///
+/// Both readers of this table — this struct and `atpkg::config::MachineConfig` — must
+/// resolve the same defaults; `machine_defaults_agree_across_the_two_config_readers`
+/// pins that.
+#[derive(Default, Clone, PartialEq, serde::Deserialize)]
+#[serde(default)]
+pub(crate) struct MachineConfig {
+    /// `"off"` (default) writes `com.apple.universalcontrol Disable`/`DisableMagicEdges`
+    /// for the current host when they are not already set; `"leave"` never touches them.
+    pub(crate) universal_control: Option<String>,
+    /// Rename every cargo target dir the doctor's scan finds under `$HOME` to its
+    /// `.noindex` form, leaving a `target` symlink so cargo keeps working. Default `true`.
+    pub(crate) spotlight_noindex: Option<bool>,
 }
 
 /// The `[net]` table: the inbound listener settings (persisting what was
@@ -4493,6 +4523,31 @@ impl Config {
         self.packages_enabled() && p.auto_update.unwrap_or(true)
     }
 
+    /// `[machine] universal_control`, resolved with the SAME table as
+    /// `atpkg::config::MachineConfig::universal_control` (absent, empty and `"off"`
+    /// ⇒ `Off`; `"leave"` ⇒ `Leave`; any other spelling ⇒ the inert `Leave`). The
+    /// GUI does not print about a bad spelling — the config language service names
+    /// it, and atpkg says so once on its own stderr.
+    pub(crate) fn machine_universal_control(&self) -> atpkg::config::UniversalControlPolicy {
+        match self
+            .machine
+            .as_ref()
+            .and_then(|m| m.universal_control.as_deref())
+            .map(str::trim)
+        {
+            None | Some("") | Some("off") => atpkg::config::UniversalControlPolicy::Off,
+            Some(_) => atpkg::config::UniversalControlPolicy::Leave,
+        }
+    }
+
+    /// `[machine] spotlight_noindex`, resolved (default TRUE).
+    pub(crate) fn machine_spotlight_noindex(&self) -> bool {
+        self.machine
+            .as_ref()
+            .and_then(|m| m.spotlight_noindex)
+            .unwrap_or(true)
+    }
+
     /// The `[privacy]` master bit (default TRUE). With it off every consent
     /// field reads `unknown` — the honest word for "aterm stopped looking",
     /// which is a different claim from `denied`.
@@ -4841,10 +4896,20 @@ impl Config {
     /// The floor is 1, not 0: "no comets" is spelled `enabled = false`, and a
     /// zero here would be a second, silent off switch that no disclosure
     /// ladder names. The ceiling is the engine's own `MAX_COMETS`, read rather
-    /// than re-typed. Note that this cap is the WEAKEST of the seven governors
-    /// in design §5 — the ≤2/s window-wide ignition limiter, the ~700 ms engine
-    /// spawn min-gap and the flood ribbon all bind long before it does — so
-    /// raising it to 4 buys density in a burst, never a faster rate.
+    /// than re-typed. Note that this cap is the WEAKEST of the governors in
+    /// design §5 — the ~700 ms engine ignition floor
+    /// (`aterm_effects::output_streak::SPAWN_MIN_GAP_MS`) and the flood ribbon
+    /// both bind long before it does — so raising it to 4 buys density in a
+    /// burst, never a faster rate.
+    ///
+    /// AND NOT THE ONE THIS SENTENCE USED TO NAME FIRST. Design §5 listed the
+    /// word-nova's ≤2/s window-wide ignition limiter among PRISM WAKE's
+    /// governors, and this doc repeated it; the engine as shipped never charges
+    /// that limiter (no `FlashLimiter` reservation exists in `output_streak.rs`,
+    /// and nothing here makes one on its behalf). The rate this cap sits under
+    /// is the engine's own per-pane floor, and what keeps a per-pane floor safe
+    /// is that WCAG 2.3.1's rate arm is measured per cell and a cell belongs to
+    /// exactly one pane — see the engine's module docs.
     pub(crate) fn output_streak_max_streaks_or_default(&self) -> u8 {
         use aterm_effects::output_streak::MAX_COMETS;
         let raw = self
@@ -7440,6 +7505,36 @@ pub(crate) fn agents_auto_prime_setting() -> bool {
     match crate::native_config_service::VersionedConfigService::observe_path(&path, true) {
         Ok(observation) => agents_auto_prime_from_text(&observation.text),
         Err(_) => true,
+    }
+}
+
+/// The `[update] owner`/`repo` repoint alone, read WITHOUT [`load_config`]'s
+/// user-visible side effects (2026-09-14, audit LT-4/LT-7): the front door's
+/// headless `aterm update check` and its session-mode background check need the
+/// same channel the window checks, and they run with a terminal attached where
+/// a stray stderr line would land in the user's shell. Same file, same parse;
+/// an unreadable, missing or malformed file resolves to no repoint, exactly as
+/// [`load_config`] resolves it.
+pub(crate) fn update_repoint_setting() -> (Option<String>, Option<String>) {
+    let Some(path) = config_path() else {
+        return (None, None);
+    };
+    match crate::native_config_service::VersionedConfigService::observe_path(&path, true) {
+        Ok(observation) => update_repoint_from_text(&observation.text),
+        Err(_) => (None, None),
+    }
+}
+
+/// Pure core of [`update_repoint_setting`]: the `[update]` owner and repo in
+/// `text`, or none when the text does not parse as a config.
+pub(crate) fn update_repoint_from_text(text: &str) -> (Option<String>, Option<String>) {
+    match aterm_toml::from_str::<Config>(text) {
+        Ok(config) => config
+            .update
+            .as_ref()
+            .map(|update| (update.owner.clone(), update.repo.clone()))
+            .unwrap_or((None, None)),
+        Err(_) => (None, None),
     }
 }
 
@@ -15857,6 +15952,99 @@ mod matrix_rain_cfg_tests {
         assert!(!gui.packages_auto_update());
     }
 
+    /// The `[machine]` defaults, stated once: an ABSENT table is the shipping
+    /// behavior — Universal Control is switched off for this host and cargo build
+    /// output is hidden from Spotlight.
+    #[test]
+    fn machine_absent_section_resolves_documented_defaults() {
+        let c = Config::default();
+        assert_eq!(
+            c.machine_universal_control(),
+            atpkg::config::UniversalControlPolicy::Off
+        );
+        assert!(c.machine_spotlight_noindex());
+        assert!(c.machine.is_none());
+    }
+
+    /// An EMPTY `[machine]` table is exactly the absent one (every field is
+    /// `Option`, so the table's presence alone changes nothing).
+    #[test]
+    fn machine_empty_table_resolves_the_same_as_an_absent_one() {
+        let empty = aterm_toml::from_str::<Config>("[machine]").expect("empty table parses");
+        let absent = Config::default();
+        assert!(empty.machine.is_some(), "the table itself parsed");
+        assert_eq!(
+            empty.machine_universal_control(),
+            absent.machine_universal_control()
+        );
+        assert_eq!(
+            empty.machine_spotlight_noindex(),
+            absent.machine_spotlight_noindex()
+        );
+    }
+
+    /// Explicit values win over the defaults; an unrecognised policy spelling
+    /// resolves to the inert `Leave`, never to a write on the machine.
+    #[test]
+    fn machine_explicit_values_win_over_the_defaults() {
+        let c = aterm_toml::from_str::<Config>(concat!(
+            "[machine]\n",
+            "universal_control = \"leave\"\n",
+            "spotlight_noindex = false\n",
+        ))
+        .unwrap();
+        assert_eq!(
+            c.machine_universal_control(),
+            atpkg::config::UniversalControlPolicy::Leave
+        );
+        assert!(!c.machine_spotlight_noindex());
+        let off =
+            aterm_toml::from_str::<Config>("[machine]\nuniversal_control = \"off\"\n").unwrap();
+        assert_eq!(
+            off.machine_universal_control(),
+            atpkg::config::UniversalControlPolicy::Off
+        );
+        let bogus =
+            aterm_toml::from_str::<Config>("[machine]\nuniversal_control = \"bogus\"\n").unwrap();
+        assert_eq!(
+            bogus.machine_universal_control(),
+            atpkg::config::UniversalControlPolicy::Leave,
+            "an unknown spelling is the inert reading"
+        );
+    }
+
+    /// TRUTH-TRIANGLE cross-pin for the shared `[machine]` keys: this GUI `Config`
+    /// (what the Security page shows and edits) and the co-located atpkg's own
+    /// `MachineConfig` (what the pass actually applies) must resolve identical
+    /// defaults AND identical explicit values.
+    #[test]
+    fn machine_defaults_agree_across_the_two_config_readers() {
+        let gui = Config::default();
+        let pkg = atpkg::config::MachineConfig::default();
+        assert_eq!(gui.machine_universal_control(), pkg.universal_control());
+        assert_eq!(gui.machine_spotlight_noindex(), pkg.spotlight_noindex());
+        for text in [
+            "[machine]\nuniversal_control = \"leave\"\nspotlight_noindex = false\n",
+            "[machine]\nuniversal_control = \"off\"\nspotlight_noindex = true\n",
+            "[machine]\nuniversal_control = \"\"\n",
+            "[machine]\n",
+            "",
+        ] {
+            let gui = aterm_toml::from_str::<Config>(text).unwrap();
+            let pkg = atpkg::config::parse_machine(text);
+            assert_eq!(
+                gui.machine_universal_control(),
+                pkg.universal_control(),
+                "{text:?}"
+            );
+            assert_eq!(
+                gui.machine_spotlight_noindex(),
+                pkg.spotlight_noindex(),
+                "{text:?}"
+            );
+        }
+    }
+
     /// The `[privacy]` defaults, stated once: an ABSENT table is the shipping
     /// behavior — the lane is on, the probe is on, the notice is on,
     /// attribution corroboration is on, the warm-up is offered but never
@@ -16607,6 +16795,46 @@ mod agents_auto_prime_tests {
         // A malformed file resolves the way `load_config` resolves it: defaults.
         assert!(agents_auto_prime_from_text("agents_auto_prime = "));
         assert!(agents_auto_prime_from_text("agents_auto_prime = \"no\""));
+    }
+}
+
+/// The `[update]` repoint, readable without a full config load (2026-09-14):
+/// the front door's headless update lanes read the same channel the window
+/// checks, and a nested instance whose env repoint was stripped at the shell
+/// hop still lands on the configured one.
+#[cfg(test)]
+mod update_repoint_tests {
+    use super::update_repoint_from_text;
+
+    #[test]
+    fn the_repoint_reads_without_a_full_config_load() {
+        assert_eq!(
+            update_repoint_from_text(""),
+            (None, None),
+            "empty file: none"
+        );
+        assert_eq!(
+            update_repoint_from_text("tab_status = false"),
+            (None, None),
+            "unrelated key: none"
+        );
+        assert_eq!(
+            update_repoint_from_text("[update]\nowner = \"private-org\"\nrepo = \"aterm-fork\"\n"),
+            (
+                Some("private-org".to_string()),
+                Some("aterm-fork".to_string())
+            )
+        );
+        assert_eq!(
+            update_repoint_from_text("[update]\nowner = \"private-org\"\n"),
+            (Some("private-org".to_string()), None),
+            "half a repoint is carried as written; `Source::resolve` fills the rest"
+        );
+        // A malformed file resolves the way `load_config` resolves it: defaults.
+        assert_eq!(
+            update_repoint_from_text("[update]\nowner = \n"),
+            (None, None)
+        );
     }
 }
 

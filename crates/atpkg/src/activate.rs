@@ -280,8 +280,14 @@ pub fn reconcile_agents(layout: &Layout) {
         };
         let env = platform::shim_env_of(&primary);
         let twin = layout.agent_shim(&tool);
+        // Left alone only when it resolves where the primary does, exports the same
+        // environment AND is untagged: a twin laid in-process by a lane that could not
+        // run carries `com.apple.provenance` and tracks every `claude` run from every
+        // shell, and this predicate used to keep it forever — `repair` re-lays each
+        // `bin/` shim unconditionally and then skipped the twin (audit 2026-09-14).
         if platform::resolve_shim(&twin).is_some_and(|t| t == target)
             && platform::shim_env_of(&twin) == env
+            && !crate::provenance::carries_provenance(&twin)
         {
             continue;
         }
