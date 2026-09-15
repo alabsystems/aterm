@@ -1964,11 +1964,16 @@ LINUX_APP_INSTALLED=0
 # block (which carries $BIN_DIR) exists, and the final dispatch prints the
 # hint only when no block does — two messages telling the user to edit the
 # same file, one of them by hand, is how a fresh install ended with `aterm`
-# off PATH. install_toolchain records a completed seed so a toolchain-only
-# repair run can exit 0 without touching INSTALLED_ANY's meaning.
+# off PATH. install_toolchain records a completed seed, or one the app is
+# completing (`pkg seed` exited ATPKG_CONTENDED_EXIT: the app's own pass holds
+# the store lock), so a toolchain-only repair run can exit 0 without touching
+# INSTALLED_ANY's meaning.
 CLI_PATH_HINT_WANTED=0
 PATH_BLOCK_WROTE=0
 TOOLCHAIN_RAN=0
+# atpkg's EX_TEMPFAIL contention code (crates/atpkg/src/lock.rs CONTENDED_EXIT):
+# the app's own pass holds the store lock, so this script stands aside.
+ATPKG_CONTENDED_EXIT=75
 
 # --- the app half: released aterm.app, verified, swapped into place ------------
 install_app() {
@@ -2944,11 +2949,10 @@ cli_path_hint() {
 # publishes nothing for, or a lapsed horizon, `seed-pending:` for
 # [packages].seed_install = false, and a plain note when a previous
 # `uninstall --all` declined the set). So a non-zero exit here is a REAL
-# failure — with ONE exception, exit 75 (atpkg's contention code, 2026-09-10):
-# the app is already open and its own launch-time pass holds the store lock,
-# which is the app doing this function's job; the script stands down and says
-# so — and the config knobs keep their meaning instead of being second-guessed
-# in shell.
+# failure — with ONE exception, ATPKG_CONTENDED_EXIT: the app is already open
+# and its own launch-time pass holds the store lock, which is the app doing
+# this function's job; the script stands aside and says so — and the config
+# knobs keep their meaning instead of being second-guessed in shell.
 install_toolchain() {
 	local aterm_bin
 	aterm_bin="$BIN_DIR/aterm"
@@ -2980,11 +2984,12 @@ install_toolchain() {
 	fi
 	local rc=0
 	"$aterm_bin" pkg seed || rc=$?
-	if [[ $rc -eq 75 ]]; then
-		# The app's own pass holds the store lock (the window opened during
-		# this script and started installing): not a failure, and nothing
-		# for this script to retry — that pass finishes the job.
+	if [[ $rc -eq $ATPKG_CONTENDED_EXIT ]]; then
+		# Stood aside: the app's pass finishes the job, and that IS this run's
+		# success, not "nothing was installed" — a wrapper keyed on the exit
+		# code must not read a deliberate stand-down as a failed install.
 		echo "install.sh: the app is already installing the ALab toolset (another atpkg process holds the store lock) — nothing to do here; it finishes on its own" >&2
+		TOOLCHAIN_RAN=1
 		return 0
 	elif [[ $rc -ne 0 ]]; then
 		# NON-FATAL, and say why that is the right call: the terminal is
@@ -3008,7 +3013,8 @@ install_toolchain() {
 	echo "  only out-of-date programs are downloaded; the rest are already current."
 	rc=0
 	"$aterm_bin" pkg update || rc=$?
-	if [[ $rc -eq 75 ]]; then
+	if [[ $rc -eq $ATPKG_CONTENDED_EXIT ]]; then
+		# Stood aside: the app's pass brings the toolset current.
 		echo "install.sh: the app's own update pass is running (another atpkg process holds the store lock) — it brings the toolset current" >&2
 	elif [[ $rc -ne 0 ]]; then
 		echo "install.sh: NOTE: could not reach the index to check for newer builds." >&2
