@@ -1270,7 +1270,7 @@ impl Grid {
                 // SGR 58 underline colour: capture the PACKED form (indexed or
                 // RGB) so it survives into scrollback and re-resolves against the
                 // live palette on restore, exactly like the live cell (#7445).
-                if let Some(packed) = packed_underline_color(extra) {
+                if let Some(packed) = extra.underline_color_u32() {
                     result.underline_colors.push((col_u16, packed));
                 }
 
@@ -1707,20 +1707,6 @@ fn push_combining_marks(
         text.push(c);
         attrs_rle.push(attrs);
     }
-}
-
-/// Pack a cell's SGR 58 underline colour into the `0xTT_XXXXXX` form used by
-/// [`CellExtra::set_underline_color_u32`](crate::CellExtra::set_underline_color_u32),
-/// preserving the RGB (`0x01`) vs indexed (`0x02`) distinction so a restored
-/// indexed colour re-resolves against the live palette. Indexed and explicit RGB
-/// are mutually exclusive on a `CellExtra`; the index is checked first because it
-/// carries the palette-resolution semantics.
-fn packed_underline_color(extra: &crate::CellExtra) -> Option<u32> {
-    if let Some(index) = extra.underline_color_index() {
-        return Some(0x02_00_00_00 | u32::from(index));
-    }
-    let [r, g, b] = extra.underline_color()?;
-    Some(0x01_00_00_00 | (u32::from(r) << 16) | (u32::from(g) << 8) | u32::from(b))
 }
 
 /// Coalesce per-column packed underline colours (ascending by physical column)

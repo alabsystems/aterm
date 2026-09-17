@@ -11,9 +11,35 @@
 //! - Selective erase (DECSEL/DECSED): erase only unprotected cells
 //! - Screen alignment pattern (DECALN): fill screen with 'E' for testing
 //!
-//! All public erase methods clear the `pending_wrap` flag. This matches
-//! xterm behavior where erase operations cancel the deferred wrap state
-//! set by writing to the last column.
+//! # The deferred wrap (`pending_wrap`) follows xterm
+//!
+//! A printable written to the last column parks the cursor ON that column and
+//! arms a deferred wrap (xterm `charproc.c` `dotext`: `do_wrap` is set while
+//! `cur_col` stays on the last column). Which erases cancel it is read off
+//! xterm's `util.c`, where `ResetWrap(screen)` clears `do_wrap`:
+//! - ED 0/1/2, EL 0/1/2 and DECALN always reset it. EL 0 and ED 0 go through
+//!   `ClearRight`, which clears from `cur_col` INCLUSIVE (the parked glyph) and
+//!   ends with `ResetWrap`; EL 1, EL 2 and ED 1 reach `ClearInLine2`'s
+//!   `ResetWrap`; ED 2 is `ClearScreen`, which calls `ResetWrap`; DECALN is
+//!   `charproc.c` `CASE_DECALN`.
+//! - DECSEL 0 always resets it (`ClearRight`'s trailing `ResetWrap` ignores
+//!   protection). DECSED 0 resets it the same way except at the origin, which a
+//!   pending wrap reaches only on a line one character wide: there
+//!   `do_erase_display` case 0 reduces to case 2, so DECSED 0 acts as DECSED 2
+//!   and the all-protected exception below applies. DECSEL 1/2 and DECSED 1/2
+//!   reset it unless EVERY cell of xterm's span is protected: `ClearInLine2`
+//!   returns before its `ResetWrap` when its protected-segment loop leaves no
+//!   unprotected cell.
+//! - ECH resets it (`do_erase_char` -> `ClearRight`; see `line_ops.rs`).
+//! - ED 3 and the rectangle / attribute / copy ops (DECERA, DECFRA, DECSERA,
+//!   DECCARA, DECRARA, DECCRA) keep it: `do_erase_display` case 3 only drops
+//!   saved lines, and `screen.c` (`ScrnFillRectangle`, `ScrnWipeRectangle`,
+//!   `ScrnMarkRectangle`, `ScrnCopyRectangle`) never calls `ResetWrap` or
+//!   writes `do_wrap`.
+//!
+//! An earlier rule here kept the parked glyph and the wrap on every erase. It
+//! was modelled on xterm.js, which stores a pending wrap as `x == cols` and so
+//! erases the empty range `[cols, cols)`; real xterm (and Ghostty) do not.
 
 use super::{Cursor, Grid, ScrollRegion};
 use crate::PageStore;
@@ -234,6 +260,13 @@ impl Grid {
             } else {
                 // Use erase_with() to preserve DECDWL/DECDHL line attributes (#7497)
                 // while applying BCE background (#7522).
+                //
+                // EL KEEPS THE ATTRIBUTE where ED 2 drops it, and that asymmetry is
+                // xterm's, not an oversight: `do_erase_line` case 2 -> `ClearLine`
+                // -> `ClearInLine` -> `ClearInLine2` never calls `ClearBufRows` and
+                // never writes `DblCS`, and the VT510 EL page carries none of the
+                // "they become single-height, single-width lines" language the ED
+                // page does. A DECDWL row erased by `ESC[2K` is still a DECDWL row.
                 row.erase_with(fill);
             }
         }
@@ -249,6 +282,9 @@ impl Grid {
     /// When `selective`, only unprotected cells are cleared and extras are preserved.
     /// Non-selective erase uses the BCE cursor template for fill.
     /// Uses batch `clear_rows()` on extras for O(E) instead of O(R * E).
+    ///
+    /// This is xterm's `ClearBufRows`, and it carries that function's line-attribute
+    /// reset: see `erase_screen`'s note for the law and the measurement.
     fn clear_rows(&mut self, range: core::ops::Range<u16>, selective: bool) {
         let fill = self.storage.cursor_template;
         for row in range.clone() {
@@ -256,16 +292,48 @@ impl Grid {
                 if selective {
                     r.selective_clear();
                 } else {
-                    // Use erase_with() to preserve DECDWL/DECDHL line attributes (#7497)
-                    // while applying BCE background (#7522).
-                    r.erase_with(fill);
+                    // A COMPLETE row erased by a plain ED comes back single-width
+                    // and single-height. These are exactly the whole rows xterm
+                    // hands to `ClearBufRows` — `ClearBelow` (ED 0) passes
+                    // `cur_row + 1 .. max_row`, `ClearAbove` (ED 1) passes
+                    // `0 .. cur_row - 1` — and `ClearBufRows` states the law in its
+                    // own comment, "clearing the whole row resets the doublesize
+                    // characters", immediately before `SetLineDblCS(ld, CSET_SWL)`.
+                    // `reset_with()` is `erase_with()` with that reset folded into
+                    // the same single pass, BCE fill intact (#7522).
+                    //
+                    // A DECSED (`selective`) must NOT do it: xterm's
+                    // `protected_mode != OFF_PROTECT` branch of `ClearAbove` /
+                    // `ClearBelow` loops over `ClearInLine` and never reaches
+                    // `ClearBufRows`.
+                    r.reset_with(fill);
                 }
             }
         }
         if !selective {
             self.storage.extras.clear_rows(range.clone());
             self.fill_bce_rgb_rows(range);
+            // ED 0 and ED 1 leave the CURSOR row's attribute alone — that row is a
+            // partial erase, and xterm's `ClearRight` / `ClearLeft` never touch
+            // `DblCS` — so the grid-level flag can only be rescanned here, never
+            // assumed false.
+            self.resync_any_double_width();
         }
+    }
+
+    /// Recompute the `any_double_width` fast path from the visible rows.
+    ///
+    /// The flag is an optimization, and it is asymmetric: left `true` with no
+    /// double row remaining it only costs the cursor ops a per-row `line_size()`
+    /// lookup, but left `false` while a row IS double it deletes the half-width
+    /// column clamp, which is a correctness bug. So it is only ever lowered by a
+    /// rescan, and a rescan is only worth running when it is currently raised.
+    fn resync_any_double_width(&mut self) {
+        if !self.storage.any_double_width {
+            return;
+        }
+        self.storage.any_double_width =
+            (0..self.storage.visible_rows).any(|row| self.storage.row_is_double_width(row));
     }
 
     // ========================================================================
@@ -277,15 +345,17 @@ impl Grid {
     /// REQUIRES: self.storage.cursor.row < self.storage.visible_rows
     #[inline]
     pub fn erase_to_end_of_line(&mut self) {
-        // VT100 deferred wrap: a pending wrap puts the cursor logically one column
-        // past the last cell, so erase-to-end clears nothing — the parked glyph and
-        // the pending wrap both survive. xterm.js encodes pending-wrap as x==cols,
-        // so its EL-0 erases an empty range; clearing+erasing here would drop the
-        // last cell (conformance: el-pending-wrap).
-        if self.storage.pending_wrap() {
-            return;
-        }
+        // xterm path: charproc.c `CASE_EL` -> util.c `do_erase_line` case 0 ->
+        // util.c `ClearRight(xw, -1)`. ClearRight clears from `cur_col` INCLUSIVE,
+        // and while a wrap is pending `cur_col` is the parked last column, so the
+        // parked glyph is erased (a wide glyph parked on its continuation loses its
+        // head too, through `clear_range_with`'s left-boundary fixup). ClearRight
+        // then ends with `ResetWrap` unconditionally ("with the right part cleared,
+        // we can't be wrapping"), even when nothing was cleared. The reset lives
+        // here rather than in a handler so both callers get it: CSI K and VT52
+        // ESC K (VTPrsTbl.c maps VT52 'K' to `CASE_EL`).
         self.erase_to_end_of_line_impl(false);
+        self.storage.clear_pending_wrap();
     }
 
     /// Erase from start of line to cursor.
@@ -293,9 +363,13 @@ impl Grid {
     /// REQUIRES: self.storage.cursor.row < self.storage.visible_rows
     #[inline]
     pub fn erase_from_start_of_line(&mut self) {
-        // Erasing cells never resets the deferred wrap (xterm: only ECH and
-        // cursor moves do) — a later glyph still wraps. See erase_to_end_of_line.
+        // xterm path: charproc.c `CASE_EL` -> util.c `do_erase_line` case 1 ->
+        // util.c `ClearLeft` -> `ClearInLine` over `[0, cur_col]` ->
+        // `ClearInLine2`, which calls `ResetWrap` before painting. The cells already
+        // matched; the deferred wrap now resets as well, so a later glyph
+        // overwrites the last column instead of wrapping.
         self.erase_from_start_of_line_impl(false);
+        self.storage.clear_pending_wrap();
     }
 
     /// Erase entire line.
@@ -304,8 +378,12 @@ impl Grid {
     #[doc(hidden)] // pub for crate benchmarks; not part of stable API
     #[inline]
     pub fn erase_line(&mut self) {
-        // Deferred wrap survives a cell erase (see erase_to_end_of_line).
+        // xterm path: charproc.c `CASE_EL` -> util.c `do_erase_line` case 2 ->
+        // util.c `ClearLine` -> `ClearInLine` over the whole row -> `ClearInLine2`,
+        // which calls `ResetWrap`. (The DECLRMM clamp below is a separate, known
+        // cell divergence from xterm and does not affect the reset.)
         self.erase_line_impl(false);
+        self.storage.clear_pending_wrap();
     }
 
     // ========================================================================
@@ -318,15 +396,19 @@ impl Grid {
     #[doc(hidden)] // pub for crate benchmarks; not part of stable API
     #[inline]
     pub fn erase_to_end_of_screen(&mut self) {
-        // VT100 deferred wrap: when a wrap is pending the cursor is logically past
-        // the last cell, so the current row's erase-to-end clears nothing and the
-        // parked glyph + pending wrap survive (matches xterm.js). Rows below the
-        // cursor are still cleared (conformance: ed-pending-wrap).
-        if !self.storage.pending_wrap() {
-            // ED is NOT affected by DECLRMM horizontal margins per VT420 spec.
-            // Use _core with respect_margins=false to bypass margin clamping.
-            self.erase_to_end_of_line_core(false, false);
-        }
+        // xterm path: charproc.c `CASE_ED` -> util.c `do_erase_display` case 0.
+        // Away from the origin that is util.c `ClearBelow`, which starts with
+        // `ClearRight(xw, -1)`: the cursor row is cleared from `cur_col` INCLUSIVE
+        // (the parked glyph of a pending wrap included) and ClearRight ends with
+        // `ResetWrap`. At the origin xterm reduces to `do_erase_display(2)` ->
+        // `ClearScreen`, which also resets; a wrap pending at (0,0) needs a
+        // one-column line, where clearing from (0,0) already IS the whole screen,
+        // so no separate branch is needed. `do_cd_xtra_scroll` cannot change the
+        // wrap (xtermScroll saves and restores `do_wrap`). VT52 ESC J shares this
+        // path (VTPrsTbl.c maps VT52 'J' to `CASE_ED`).
+        // ED is NOT affected by DECLRMM horizontal margins per VT420 spec.
+        // Use _core with respect_margins=false to bypass margin clamping.
+        self.erase_to_end_of_line_core(false, false);
         let cursor_row = self.storage.cursor.row;
         let visible_rows = self.storage.visible_rows;
         self.clear_rows(cursor_row.saturating_add(1)..visible_rows, false);
@@ -348,13 +430,20 @@ impl Grid {
         // cursor row already marked by erase_to_end_of_line_impl; mark remaining rows.
         self.storage
             .mark_content_rows(cursor_row.saturating_add(1), visible_rows);
+        self.storage.clear_pending_wrap();
     }
 
     /// Erase from start of screen to cursor.
     ///
     /// REQUIRES: self.storage.cursor.row < self.storage.visible_rows
     pub fn erase_from_start_of_screen(&mut self) {
-        // Deferred wrap survives a cell erase (see erase_to_end_of_line).
+        // xterm path: charproc.c `CASE_ED` -> util.c `do_erase_display` case 1.
+        // With the cursor on the bottom-right cell (where a glyph printed into the
+        // last cell parks it) xterm reduces to `do_erase_display(2)` ->
+        // `ClearScreen`, which calls `ResetWrap`; anywhere else util.c `ClearAbove`
+        // clears the rows above and ends with `ClearLeft` -> `ClearInLine` ->
+        // `ClearInLine2`, which calls `ResetWrap`. Both clear the rows above plus
+        // `[0, cursor_col]` of the cursor row, so only the wrap reset is new.
         let cursor_row = self.storage.cursor.row;
         self.clear_rows(0..cursor_row, false);
         // ED is NOT affected by DECLRMM horizontal margins per VT420 spec.
@@ -374,6 +463,7 @@ impl Grid {
         self.damage_selection_visible_rows_ext(0, cursor_row, false);
         // cursor row already marked by erase_from_start_of_line_impl; mark rows above.
         self.storage.mark_content_rows(0, cursor_row);
+        self.storage.clear_pending_wrap();
     }
 
     /// Erase entire screen.
@@ -382,24 +472,55 @@ impl Grid {
     /// current SGR background color per VT420/xterm spec (#7522).
     /// Resets display_offset to 0 so the viewport snaps to the live terminal.
     pub fn erase_screen(&mut self) {
-        // Deferred wrap survives a cell erase (see erase_to_end_of_line).
+        // xterm path: charproc.c `CASE_ED` -> util.c `do_erase_display` case 2
+        // (DEC protection is lowered for plain ED) -> util.c `ClearScreen`, which
+        // calls `ResetWrap` unconditionally. Every caller inherits the reset, as in
+        // xterm where each of them runs `ClearScreen`: CSI 2 J; the 1047 exit
+        // (charproc.c `srm_OPT_ALTBUF` reset clears before `FromAlternate`, so the
+        // main screen comes back with no pending wrap); the 1049 enter
+        // (`CursorSave; ToAlternate; ClearScreen`); DECCOLM and RIS, which home the
+        // cursor afterwards anyway.
+        self.storage.clear_pending_wrap();
         // Snap viewport to live terminal — ED 2 should show the freshly
         // erased screen, not stale scrollback position.
         self.storage.display_offset = 0;
         let fill = self.storage.cursor_template;
         for row in 0..self.storage.visible_rows {
             if let Some(r) = self.row_mut(row) {
-                // Use erase_with() to preserve DECDWL/DECDHL line attributes (#7497)
-                // while applying BCE background (#7522).
-                r.erase_with(fill);
+                // ED 2 ERASES COMPLETE LINES, so every row comes back
+                // single-width and single-height. VT510 Programmer Information,
+                // Erase in Display: "When you erase complete lines, they become
+                // single-height, single-width lines, with all visual character
+                // attributes cleared." xterm does it in `ClearBufRows`, which
+                // `ClearScreen` calls unconditionally over `0 .. max_row`:
+                // "clearing the whole row resets the doublesize characters",
+                // then `SetLineDblCS(ld, CSET_SWL)`.
+                //
+                // This used to call `erase_with()`, which keeps the DECDWL/DECDHL
+                // bits (#7497). Measured on glass at 40x200, cell 9x17: a bare
+                // `ESC#6` anywhere on row 0, then `ESC[2J ESC[H`, then the same
+                // ten characters, drew 180 inked device columns where the
+                // un-poisoned row drew 90 — byte-identical grid text at exactly
+                // 2x, with half the row's 200 columns no longer reachable. No
+                // erase, no `clear`, no DECSTR and no resize recovered it; only
+                // RIS or an explicit `ESC#5` did. `reset_with()` is `erase_with()`
+                // with the attribute reset folded into the same single pass, BCE
+                // fill intact (#7522).
+                //
+                // A PARTIAL erase still keeps the attribute — EL, ECH, DECERA and
+                // the ED cursor row all match xterm, whose `ClearInLine` /
+                // `ClearRight` / `ClearLeft` never touch `DblCS` — and so does a
+                // DECSED, whose protected branch never reaches `ClearBufRows`.
+                r.reset_with(fill);
             }
         }
         self.storage.extras.clear();
         self.fill_bce_rgb_rows(0..self.storage.visible_rows);
-        // Per-row HAS_STYLE_ID flags are cleared implicitly by `erase_with`
-        // above, which resets row flags to LINE_ATTRIBUTES | DIRTY (#7872).
-        // Note: any_double_width is NOT cleared because erase preserves
-        // DECDWL/DECDHL line attributes per VT spec (#7497).
+        // Per-row HAS_STYLE_ID flags are cleared implicitly by `reset_with`
+        // above, which resets row flags to DIRTY alone (#7872).
+        // Every visible row is single-width again, so the grid-level fast-path
+        // flag goes with them; no rescan is needed when the loop covered them all.
+        self.storage.any_double_width = false;
         // SELECTION CUSTODY Phase 4: an ED/DECSED erases VISIBLE rows. It does not
         // touch history, so a selection anchored in scrollback survives it — the
         // sentinel used to kill that too.
@@ -421,9 +542,12 @@ impl Grid {
 
     /// Clear all DEC line attributes (DECDWL/DECDHL) on every visible row.
     ///
-    /// Used by RIS and DECCOLM toggle which must reset line attributes.
-    /// Erase operations preserve line attributes per VT spec, so this
-    /// must be called explicitly when a full reset is needed (#7497).
+    /// Used by RIS and DECCOLM toggle, which owe the reset by their own spec
+    /// text rather than by borrowing it from whatever erase they route through.
+    /// ED 2 now resets the rows it erases (see `erase_screen`), so for a caller
+    /// that has just run one this is a no-op that costs a 40-row scan; it stays
+    /// because a PARTIAL erase still preserves the attributes (#7497) and a
+    /// full reset must not depend on which erase it happened to call.
     pub fn clear_line_attributes(&mut self) {
         for row_idx in 0..self.storage.visible_rows {
             if let Some(r) = self.row_mut(row_idx) {
@@ -470,8 +594,9 @@ impl Grid {
             // see `discard_history_selection` and
             // `discarding_scrollback_evicts_history_and_moves_no_live_coordinate`).
             self.discard_history_selection();
-            // ED 3 touches only scrollback, not the active line — deferred wrap
-            // survives (xterm preserves it; see erase_to_end_of_line).
+            // ED 3 touches only scrollback, not the active line, so the deferred
+            // wrap survives: xterm util.c `do_erase_display` case 3 only drops the
+            // saved lines and never calls `ResetWrap`.
             debug_assert_eq!(self.storage.display_offset, 0);
             debug_assert_eq!(self.storage.total_lines, self.storage.visible_rows as usize);
             return;
@@ -514,8 +639,9 @@ impl Grid {
         // the damage is `All`, not a band. And as above, evicting history moves no
         // live coordinate: see `discard_history_selection`.
         self.discard_history_selection();
-        // ED 3 touches only scrollback, not the active line — deferred wrap
-        // survives (xterm preserves it; see erase_to_end_of_line).
+        // ED 3 touches only scrollback, not the active line, so the deferred
+        // wrap survives: xterm util.c `do_erase_display` case 3 only drops the
+        // saved lines and never calls `ResetWrap`.
         debug_assert_eq!(self.storage.display_offset, 0);
         debug_assert_eq!(self.storage.total_lines, self.storage.visible_rows as usize);
     }
@@ -530,8 +656,13 @@ impl Grid {
     ///
     /// REQUIRES: self.storage.cursor.row < self.storage.visible_rows
     pub fn selective_erase_to_end_of_line(&mut self) {
-        // Deferred wrap survives a cell erase (see erase_to_end_of_line).
+        // xterm path: charproc.c `CASE_DECSEL` -> util.c `do_erase_line` case 0
+        // with DEC_PROTECT -> util.c `ClearRight(xw, -1)`. The protected-segment
+        // split happens inside `ClearInLine2`, but ClearRight's own trailing
+        // `ResetWrap` ignores ClearInLine's result, so the wrap resets even when a
+        // protected parked cell survives the erase.
         self.erase_to_end_of_line_impl(true);
+        self.storage.clear_pending_wrap();
     }
 
     /// Selectively erase from start of line to cursor (DECSEL mode 1).
@@ -540,8 +671,16 @@ impl Grid {
     ///
     /// REQUIRES: self.storage.cursor.row < self.storage.visible_rows
     pub fn selective_erase_from_start_of_line(&mut self) {
-        // Deferred wrap survives a cell erase (see erase_to_end_of_line).
+        // xterm path: charproc.c `CASE_DECSEL` -> util.c `do_erase_line` case 1
+        // with DEC_PROTECT -> util.c `ClearLeft` -> `ClearInLine` over
+        // `[0, cur_col]` -> `ClearInLine2`, which resets the wrap only if that span
+        // holds an unprotected cell (see `reset_wrap_unless_span_protected`). The
+        // span is xterm's, which ignores DECLRMM even though the cell clear here
+        // is clamped to the margins.
         self.erase_from_start_of_line_impl(true);
+        let cursor_row = self.storage.cursor.row;
+        let span_end = self.storage.cursor.col.saturating_add(1);
+        self.reset_wrap_unless_span_protected(0..0, Some((cursor_row, span_end)));
     }
 
     /// Selectively erase entire line (DECSEL mode 2).
@@ -550,8 +689,14 @@ impl Grid {
     ///
     /// REQUIRES: self.storage.cursor.row < self.storage.visible_rows
     pub fn selective_erase_line(&mut self) {
-        // Deferred wrap survives a cell erase (see erase_to_end_of_line).
+        // xterm path: charproc.c `CASE_DECSEL` -> util.c `do_erase_line` case 2
+        // with DEC_PROTECT -> util.c `ClearLine` -> `ClearInLine` over the whole
+        // row -> `ClearInLine2`, which keeps the wrap for a fully protected row and
+        // resets it otherwise (see `reset_wrap_unless_span_protected`). xterm's
+        // span ignores DECLRMM.
         self.erase_line_impl(true);
+        let cursor_row = self.storage.cursor.row;
+        self.reset_wrap_unless_span_protected(cursor_row..cursor_row.saturating_add(1), None);
     }
 
     /// Selectively erase from cursor to end of screen (DECSED mode 0).
@@ -560,7 +705,13 @@ impl Grid {
     ///
     /// REQUIRES: self.storage.cursor.row < self.storage.visible_rows
     pub fn selective_erase_to_end_of_screen(&mut self) {
-        // Deferred wrap survives a cell erase (see erase_to_end_of_line).
+        // xterm path: charproc.c `CASE_DECSED` -> util.c `do_erase_display` case 0
+        // with DEC_PROTECT. Away from the origin that is util.c `ClearBelow` ->
+        // `ClearRight(xw, -1)`, whose trailing `ResetWrap` is unconditional. At the
+        // origin (a wrap pending there needs a one-column line) xterm reduces to
+        // `do_erase_display(2, DEC_PROTECT)`, the per-row `ClearInLine` loop, which
+        // resets only if some visible cell is unprotected.
+        let at_origin = self.storage.cursor.row == 0 && self.storage.cursor.col == 0;
         // DECSED is NOT affected by DECLRMM horizontal margins per VT420 spec.
         self.erase_to_end_of_line_core(true, false);
         let cursor_row = self.storage.cursor.row;
@@ -584,6 +735,11 @@ impl Grid {
         // cursor row already marked by erase_to_end_of_line_impl; mark remaining rows.
         self.storage
             .mark_content_rows(cursor_row.saturating_add(1), visible_rows);
+        if at_origin {
+            self.reset_wrap_unless_span_protected(0..visible_rows, None);
+        } else {
+            self.storage.clear_pending_wrap();
+        }
     }
 
     /// Selectively erase from start of screen to cursor (DECSED mode 1).
@@ -592,8 +748,16 @@ impl Grid {
     ///
     /// REQUIRES: self.storage.cursor.row < self.storage.visible_rows
     pub fn selective_erase_from_start_of_screen(&mut self) {
-        // Deferred wrap survives a cell erase (see erase_to_end_of_line).
+        // xterm path: charproc.c `CASE_DECSED` -> util.c `do_erase_display` case 1
+        // with DEC_PROTECT. Away from the bottom-right cell, util.c `ClearAbove`'s
+        // protected branch runs `ClearInLine` over each row above and over the
+        // cursor row, then `ClearLeft` -> `ClearInLine` over `[0, cur_col]`; at the
+        // bottom-right cell it reduces to the DECSED 2 loop over the whole screen.
+        // Each `ClearInLine2` resets only if its span holds an unprotected cell,
+        // and in both cases the spans cover the rows above plus `[0, cursor_col]`
+        // of the cursor row.
         let cursor_row = self.storage.cursor.row;
+        let span_end = self.storage.cursor.col.saturating_add(1);
         self.clear_rows(0..cursor_row, true);
         // DECSED is NOT affected by DECLRMM horizontal margins per VT420 spec.
         self.erase_from_start_of_line_core(true, false);
@@ -611,13 +775,20 @@ impl Grid {
         self.damage_selection_visible_rows_ext(0, cursor_row, false);
         // cursor row already marked by erase_from_start_of_line_impl; mark rows above.
         self.storage.mark_content_rows(0, cursor_row);
+        self.reset_wrap_unless_span_protected(0..cursor_row, Some((cursor_row, span_end)));
     }
 
     /// Selectively erase entire screen (DECSED mode 2).
     ///
     /// Only erases cells that are NOT protected (DECSCA).
     pub fn selective_erase_screen(&mut self) {
-        // Deferred wrap survives a cell erase (see erase_to_end_of_line).
+        // xterm path: charproc.c `CASE_DECSED` -> util.c `do_erase_display` case 2
+        // with DEC_PROTECT. With `protected_mode` on, that is the per-row
+        // `ClearInLine` loop, which resets only if some visible cell is
+        // unprotected; with it off it is `ClearScreen`, which always resets. xterm's
+        // `protected_mode` is off only when no DECSCA was ever sent, which in aterm
+        // means no cell is protected, so the any-unprotected rule covers both.
+        let visible_rows = self.storage.visible_rows;
         self.clear_rows(0..self.storage.visible_rows, true);
         // Same debt invalidation as ED 2: the cleared screen's blanks are
         // genuine, never deficit-fill them from pre-erase history (fixwave5).
@@ -636,6 +807,43 @@ impl Grid {
         let last = self.storage.visible_rows.saturating_sub(1);
         self.damage_selection_visible_rows_ext(0, last, false);
         self.storage.mark_content_full();
+        self.reset_wrap_unless_span_protected(0..visible_rows, None);
+    }
+
+    /// Reset the deferred wrap the way xterm's protected erase does: only when
+    /// some cell of the erase's span is unprotected.
+    ///
+    /// xterm path: util.c `ClearInLine2`, protected branch. Each unprotected run
+    /// is cleared by a recursive `ClearInLine` that reaches `ResetWrap`, and a
+    /// span whose cells are all protected returns before `ResetWrap`. The span
+    /// is every column of `full_rows` plus, when given, columns `[0, end)` of
+    /// row `partial.0`. Columns run to the full width and ignore DECLRMM, like
+    /// xterm's `ClearLeft` / `ClearLine` / `ClearScreen` spans. A selective clear
+    /// never changes a protection flag, so asking after the clear gives the same
+    /// answer as asking before it.
+    fn reset_wrap_unless_span_protected(
+        &mut self,
+        full_rows: core::ops::Range<u16>,
+        partial: Option<(u16, u16)>,
+    ) {
+        if !self.storage.pending_wrap() {
+            return;
+        }
+        let cols = self.storage.cols;
+        // `Row::is_cell_protected` untangles the PROTECTED / WIDE_CONTINUATION
+        // bit alias. A row that is not materialized holds no protected cell.
+        let span_has_unprotected = |grid: &Self, row: u16, end: u16| {
+            let end = end.min(cols);
+            grid.row(row)
+                .map_or(end > 0, |r| (0..end).any(|col| !r.is_cell_protected(col)))
+        };
+        let any_unprotected = full_rows
+            .into_iter()
+            .any(|row| span_has_unprotected(self, row, cols))
+            || partial.is_some_and(|(row, end)| span_has_unprotected(self, row, end));
+        if any_unprotected {
+            self.storage.clear_pending_wrap();
+        }
     }
 
     /// Fill screen with 'E' for alignment test (DECALN - ESC # 8).
@@ -711,7 +919,9 @@ impl Grid {
     /// REQUIRES: self.storage.visible_rows > 0
     /// REQUIRES: self.storage.cols > 0
     pub fn erase_rect(&mut self, top: u16, left: u16, bottom: u16, right: u16) {
-        // Deferred wrap survives a cell erase (see erase_to_end_of_line).
+        // The deferred wrap survives: xterm charproc.c `CASE_DECERA` -> screen.c
+        // `ScrnFillRectangle`, and screen.c never calls `ResetWrap` or writes
+        // `do_wrap`.
         // Clamp to visible area
         let top = top.min(self.storage.visible_rows.saturating_sub(1));
         let bottom = bottom.min(self.storage.visible_rows.saturating_sub(1));
@@ -779,7 +989,9 @@ impl Grid {
         fg_rgb: Option<[u8; 3]>,
         bg_rgb: Option<[u8; 3]>,
     ) {
-        // Deferred wrap survives a cell fill/erase (see erase_to_end_of_line).
+        // The deferred wrap survives: xterm charproc.c `CASE_DECFRA` -> screen.c
+        // `ScrnFillRectangle`, and screen.c never calls `ResetWrap` or writes
+        // `do_wrap`.
         // Clamp to visible area
         let top = top.min(self.storage.visible_rows.saturating_sub(1));
         let bottom = bottom.min(self.storage.visible_rows.saturating_sub(1));
@@ -849,7 +1061,9 @@ impl Grid {
     /// REQUIRES: self.storage.visible_rows > 0
     /// REQUIRES: self.storage.cols > 0
     pub fn selective_erase_rect(&mut self, top: u16, left: u16, bottom: u16, right: u16) {
-        // Deferred wrap survives a cell erase (see erase_to_end_of_line).
+        // The deferred wrap survives: xterm charproc.c `CASE_DECSERA` -> screen.c
+        // `ScrnWipeRectangle`, and screen.c never calls `ResetWrap` or writes
+        // `do_wrap`.
         // Clamp to visible area
         let top = top.min(self.storage.visible_rows.saturating_sub(1));
         let bottom = bottom.min(self.storage.visible_rows.saturating_sub(1));
@@ -1465,6 +1679,52 @@ mod tests {
         }
     }
 
+    /// Helper: arm a REAL deferred wrap — print row `row` to its last column with
+    /// deferred autowrap, exactly as a printable filling a line does. The cursor
+    /// ends parked ON the last column with `pending_wrap` set.
+    fn arm_wrap_on_row(grid: &mut Grid, row: u16, cols: u16) {
+        grid.move_cursor_to(row, 0);
+        for col in 0..cols {
+            grid.write_char_wrap((b'A' + (col % 26) as u8) as char);
+        }
+        assert!(
+            grid.pending_wrap(),
+            "precondition: a filled row arms the wrap"
+        );
+        assert_eq!(
+            grid.cursor_row(),
+            row,
+            "precondition: cursor stays on the row"
+        );
+        assert_eq!(
+            grid.cursor_col(),
+            cols - 1,
+            "precondition: cursor parked on the last column"
+        );
+    }
+
+    /// Helper: protect every cell of the given rows (DECSCA 1 content).
+    fn protect_rows(grid: &mut Grid, rows: core::ops::Range<u16>, cols: u16) {
+        for row in rows {
+            for col in 0..cols {
+                protect_cell(grid, row, col);
+            }
+        }
+    }
+
+    /// Helper: after an erase reset the wrap, the next printable must overwrite
+    /// the parked last column of `row` — not wrap to the next row.
+    fn assert_next_glyph_overwrites_last_col(grid: &mut Grid, row: u16, cols: u16) {
+        grid.write_char_wrap('?');
+        assert_eq!(
+            char_at(grid, row, cols - 1),
+            '?',
+            "the glyph after the erase lands on the parked column (xterm)"
+        );
+        assert_eq!(grid.cursor_row(), row, "nothing wrapped");
+        assert!(grid.pending_wrap(), "the new glyph re-arms the wrap");
+    }
+
     // =========================================================================
     // erase_to_end_of_line (EL 0)
     // =========================================================================
@@ -1514,18 +1774,60 @@ mod tests {
     }
 
     #[test]
-    fn test_el0_keeps_pending_wrap() {
-        // EL-0 at a pending wrap erases nothing and preserves the wrap: the
-        // cursor is logically past the last cell (xterm.js EL-0 over [cols,cols)).
+    fn test_el0_at_pending_wrap_clears_parked_glyph_and_wrap() {
+        // xterm util.c `ClearRight` clears from `cur_col` INCLUSIVE — the parked
+        // last column — and ends with `ResetWrap`. (This test used to assert the
+        // xterm.js rule: nothing erased, wrap kept.)
         let mut grid = Grid::new(4, 5);
-        write_text(&mut grid, "ABCD");
-        grid.set_pending_wrap(true);
-        assert!(grid.pending_wrap(), "pending_wrap should be set");
+        arm_wrap_on_row(&mut grid, 0, 5);
         grid.erase_to_end_of_line();
+        assert_eq!(char_at(&grid, 0, 4), ' ', "the parked glyph is erased");
+        assert_eq!(
+            char_at(&grid, 0, 3),
+            'D',
+            "cells left of the cursor survive"
+        );
+        assert!(!grid.pending_wrap(), "EL 0 resets the deferred wrap");
+        // Ghostty golden 'eraseLine resets pending wrap': ABCDE, EL 0, B -> ABCDB.
+        assert_next_glyph_overwrites_last_col(&mut grid, 0, 5);
+        assert_eq!(char_at(&grid, 0, 3), 'D');
+        assert!(is_empty_at(&grid, 1, 0), "row 1 untouched");
+    }
+
+    #[test]
+    fn test_el0_wide_glyph_parked_on_continuation_clears_both_halves_and_wrap() {
+        let mut grid = Grid::new(4, 5);
+        write_text(&mut grid, "ABC");
+        // The production wide write parks the cursor on the continuation cell
+        // (col 4) with the wrap armed.
+        assert!(grid.write_wide_autowrap_fast(
+            '中',
+            crate::PackedColors::DEFAULT,
+            CellFlags::empty()
+        ));
         assert!(
             grid.pending_wrap(),
-            "erase_to_end_of_line must preserve pending_wrap"
+            "precondition: wide glyph arms the wrap"
         );
+        assert_eq!(
+            grid.cursor_col(),
+            4,
+            "precondition: parked on the continuation"
+        );
+        assert!(grid.cell(0, 3).unwrap().flags().contains(CellFlags::WIDE));
+
+        grid.erase_to_end_of_line();
+
+        for col in 3..5 {
+            let cell = grid.cell(0, col).unwrap();
+            assert_eq!(cell.char(), ' ', "col {col} of the wide glyph is blank");
+            assert!(
+                !cell.flags().contains(CellFlags::WIDE),
+                "col {col} keeps no WIDE half"
+            );
+        }
+        assert_eq!(char_at(&grid, 0, 2), 'C', "cells left of the glyph survive");
+        assert!(!grid.pending_wrap(), "EL 0 resets the deferred wrap");
     }
 
     #[test]
@@ -1593,15 +1895,19 @@ mod tests {
     }
 
     #[test]
-    fn test_el1_keeps_pending_wrap() {
-        // Erasing cells preserves the deferred wrap (xterm); only ECH/cursor
-        // moves reset it. A later glyph still wraps.
+    fn test_el1_clears_pending_wrap() {
+        // xterm util.c `ClearLeft` -> `ClearInLine` -> `ClearInLine2`, which calls
+        // `ResetWrap`. (This test used to assert the wrap was kept.)
         let mut grid = Grid::new(4, 5);
-        write_text(&mut grid, "ABCD");
-        grid.set_pending_wrap(true);
-        assert!(grid.pending_wrap());
+        arm_wrap_on_row(&mut grid, 0, 5);
         grid.erase_from_start_of_line();
-        assert!(grid.pending_wrap());
+        for col in 0..5 {
+            assert_eq!(char_at(&grid, 0, col), ' ', "col {col} erased");
+        }
+        assert!(!grid.pending_wrap(), "EL 1 resets the deferred wrap");
+        // Ghostty golden 'eraseLine left resets wrap': ABCDE, EL 1, B -> '    B'.
+        assert_next_glyph_overwrites_last_col(&mut grid, 0, 5);
+        assert!(is_empty_at(&grid, 1, 0), "nothing wrapped to row 1");
     }
 
     // =========================================================================
@@ -1641,13 +1947,38 @@ mod tests {
     }
 
     #[test]
-    fn test_el2_keeps_pending_wrap() {
-        // Erasing cells preserves the deferred wrap (xterm).
+    fn test_el2_clears_pending_wrap() {
+        // xterm util.c `ClearLine` -> `ClearInLine` -> `ClearInLine2`, which calls
+        // `ResetWrap`. (This test used to assert the wrap was kept.)
         let mut grid = Grid::new(4, 5);
-        grid.set_pending_wrap(true);
-        assert!(grid.pending_wrap());
+        arm_wrap_on_row(&mut grid, 0, 5);
         grid.erase_line();
-        assert!(grid.pending_wrap());
+        for col in 0..5 {
+            assert_eq!(char_at(&grid, 0, col), ' ', "col {col} erased");
+        }
+        assert!(!grid.pending_wrap(), "EL 2 resets the deferred wrap");
+        assert_next_glyph_overwrites_last_col(&mut grid, 0, 5);
+        assert!(is_empty_at(&grid, 1, 0), "nothing wrapped to row 1");
+    }
+
+    #[test]
+    fn test_el2_at_pending_wrap_leaves_the_row_below_intact() {
+        // xterm util.c `ClearLine` spans the cursor row only. The test above
+        // cannot see an over-clear of the row below (that row starts empty), so
+        // this one gives row 1 content before arming the wrap on row 0.
+        let mut grid = Grid::new(4, 5);
+        fill_row(&mut grid, 1, 5);
+        arm_wrap_on_row(&mut grid, 0, 5);
+        grid.erase_line();
+        for col in 0..5 {
+            assert_eq!(char_at(&grid, 0, col), ' ', "row 0 col {col} erased");
+            assert_eq!(
+                char_at(&grid, 1, col),
+                (b'A' + col as u8) as char,
+                "row 1 col {col} survives EL 2 on row 0"
+            );
+        }
+        assert!(!grid.pending_wrap(), "EL 2 resets the deferred wrap");
     }
 
     // =========================================================================
@@ -1725,14 +2056,50 @@ mod tests {
     }
 
     #[test]
-    fn test_ed0_keeps_pending_wrap() {
-        // ED-0 at a pending wrap preserves the wrap (current row's erase-to-end
-        // clears nothing); only rows below the cursor are cleared.
+    fn test_ed0_at_pending_wrap_clears_parked_glyph_and_wrap() {
+        // xterm util.c `ClearBelow` starts with `ClearRight(xw, -1)`: the cursor
+        // row is cleared from the parked column inclusive, and the wrap resets.
+        // (This test used to assert the xterm.js rule: parked glyph and wrap kept.)
         let mut grid = Grid::new(4, 5);
-        grid.set_pending_wrap(true);
-        assert!(grid.pending_wrap());
+        fill_row(&mut grid, 1, 5);
+        arm_wrap_on_row(&mut grid, 0, 5);
         grid.erase_to_end_of_screen();
-        assert!(grid.pending_wrap());
+        assert_eq!(char_at(&grid, 0, 4), ' ', "the parked glyph is erased");
+        assert_eq!(
+            char_at(&grid, 0, 3),
+            'D',
+            "cells left of the cursor survive"
+        );
+        for col in 0..5 {
+            assert!(is_empty_at(&grid, 1, col), "row 1 col {col} erased");
+        }
+        assert!(!grid.pending_wrap(), "ED 0 resets the deferred wrap");
+        assert_next_glyph_overwrites_last_col(&mut grid, 0, 5);
+        assert!(is_empty_at(&grid, 1, 0), "nothing wrapped to row 1");
+    }
+
+    #[test]
+    fn test_ed0_one_column_grid_pending_wrap_at_origin_clears_screen_and_wrap() {
+        // A wrap pending at (0,0) needs a one-column line. xterm reduces ED 0 at
+        // the origin to ED 2 (`ClearScreen` -> `ResetWrap`); clearing from (0,0)
+        // is the same cell set.
+        let mut grid = Grid::new(3, 1);
+        for row in 1..3 {
+            grid.move_cursor_to(row, 0);
+            grid.write_char('x');
+        }
+        grid.move_cursor_to(0, 0);
+        grid.write_char_wrap('A');
+        assert!(
+            grid.pending_wrap(),
+            "precondition: 1-col line arms the wrap"
+        );
+        assert_eq!((grid.cursor_row(), grid.cursor_col()), (0, 0));
+        grid.erase_to_end_of_screen();
+        for row in 0..3 {
+            assert!(is_empty_at(&grid, row, 0), "row {row} erased");
+        }
+        assert!(!grid.pending_wrap(), "ED 0 at the origin resets the wrap");
     }
 
     // =========================================================================
@@ -1799,13 +2166,41 @@ mod tests {
     }
 
     #[test]
-    fn test_ed1_keeps_pending_wrap() {
-        // Erasing cells preserves the deferred wrap (xterm).
+    fn test_ed1_clears_pending_wrap() {
+        // xterm util.c `ClearAbove` ends with `ClearLeft` -> `ClearInLine2`
+        // `ResetWrap`. (This test used to assert the wrap was kept.)
         let mut grid = Grid::new(4, 5);
-        grid.set_pending_wrap(true);
-        assert!(grid.pending_wrap());
+        fill_row(&mut grid, 0, 5);
+        fill_row(&mut grid, 2, 5);
+        arm_wrap_on_row(&mut grid, 1, 5);
         grid.erase_from_start_of_screen();
-        assert!(grid.pending_wrap());
+        for row in 0..2 {
+            for col in 0..5 {
+                assert!(is_empty_at(&grid, row, col), "({row},{col}) erased");
+            }
+        }
+        assert_eq!(char_at(&grid, 2, 0), 'A', "row below the cursor survives");
+        assert!(!grid.pending_wrap(), "ED 1 resets the deferred wrap");
+        assert_next_glyph_overwrites_last_col(&mut grid, 1, 5);
+        assert_eq!(char_at(&grid, 2, 0), 'A', "nothing wrapped onto row 2");
+    }
+
+    #[test]
+    fn test_ed1_bottom_right_pending_wrap_clears_screen_and_wrap() {
+        // A glyph printed into the last cell parks the cursor at bottom-right,
+        // where xterm reduces ED 1 to ED 2 (`ClearScreen` -> `ResetWrap`).
+        let mut grid = Grid::new(3, 5);
+        fill_row(&mut grid, 0, 5);
+        fill_row(&mut grid, 1, 5);
+        arm_wrap_on_row(&mut grid, 2, 5);
+        grid.erase_from_start_of_screen();
+        for row in 0..3 {
+            for col in 0..5 {
+                assert!(is_empty_at(&grid, row, col), "({row},{col}) erased");
+            }
+        }
+        assert!(!grid.pending_wrap(), "ED 1 at bottom-right resets the wrap");
+        assert_next_glyph_overwrites_last_col(&mut grid, 2, 5);
     }
 
     // =========================================================================
@@ -1839,13 +2234,21 @@ mod tests {
     }
 
     #[test]
-    fn test_ed2_keeps_pending_wrap() {
-        // Erasing cells preserves the deferred wrap (xterm).
+    fn test_ed2_clears_pending_wrap() {
+        // xterm util.c `ClearScreen` calls `ResetWrap`. (This test used to assert
+        // the wrap was kept.)
         let mut grid = Grid::new(4, 5);
-        grid.set_pending_wrap(true);
-        assert!(grid.pending_wrap());
+        fill_row(&mut grid, 3, 5);
+        arm_wrap_on_row(&mut grid, 1, 5);
         grid.erase_screen();
-        assert!(grid.pending_wrap());
+        for row in 0..4 {
+            for col in 0..5 {
+                assert!(is_empty_at(&grid, row, col), "({row},{col}) erased");
+            }
+        }
+        assert!(!grid.pending_wrap(), "ED 2 resets the deferred wrap");
+        assert_next_glyph_overwrites_last_col(&mut grid, 1, 5);
+        assert!(is_empty_at(&grid, 2, 0), "nothing wrapped to row 2");
     }
 
     // =========================================================================
@@ -1864,7 +2267,8 @@ mod tests {
 
     #[test]
     fn test_erase_scrollback_keeps_pending_wrap() {
-        // ED 3 touches only scrollback, not the active line — wrap survives (xterm).
+        // ED 3 touches only scrollback, not the active line — the wrap survives
+        // (xterm util.c `do_erase_display` case 3 never calls `ResetWrap`).
         let mut grid = Grid::new(4, 5);
         grid.set_pending_wrap(true);
         assert!(grid.pending_wrap());
@@ -1929,13 +2333,29 @@ mod tests {
     }
 
     #[test]
-    fn test_sel0_keeps_pending_wrap() {
-        // Selective erase preserves the deferred wrap too (xterm: DECSEL ?K).
+    fn test_sel0_clears_pending_wrap() {
+        // xterm `CASE_DECSEL` -> util.c `ClearRight`, which ends with `ResetWrap`.
+        // (This test used to assert the wrap was kept.)
         let mut grid = Grid::new(4, 5);
-        grid.set_pending_wrap(true);
-        assert!(grid.pending_wrap());
+        arm_wrap_on_row(&mut grid, 0, 5);
         grid.selective_erase_to_end_of_line();
-        assert!(grid.pending_wrap());
+        assert_eq!(char_at(&grid, 0, 4), ' ', "unprotected parked glyph erased");
+        assert_eq!(char_at(&grid, 0, 3), 'D');
+        assert!(!grid.pending_wrap(), "DECSEL 0 resets the deferred wrap");
+        assert_next_glyph_overwrites_last_col(&mut grid, 0, 5);
+    }
+
+    #[test]
+    fn test_sel0_protected_parked_cell_survives_but_wrap_resets() {
+        // ClearRight's trailing `ResetWrap` ignores ClearInLine's protected-cell
+        // result, so the wrap resets even though nothing was erased.
+        let mut grid = Grid::new(4, 5);
+        arm_wrap_on_row(&mut grid, 0, 5);
+        protect_cell(&mut grid, 0, 4);
+        grid.selective_erase_to_end_of_line();
+        assert_eq!(char_at(&grid, 0, 4), 'E', "protected parked glyph survives");
+        assert!(!grid.pending_wrap(), "DECSEL 0 resets the wrap regardless");
+        assert_next_glyph_overwrites_last_col(&mut grid, 0, 5);
     }
 
     // =========================================================================
@@ -1972,13 +2392,52 @@ mod tests {
     }
 
     #[test]
-    fn test_sel1_keeps_pending_wrap() {
-        // Selective erase preserves the deferred wrap (xterm).
+    fn test_sel1_clears_pending_wrap() {
+        // xterm `CASE_DECSEL` -> util.c `ClearLeft` -> `ClearInLine2` reaches
+        // `ResetWrap` over an unprotected span. (This test used to assert the wrap
+        // was kept.)
         let mut grid = Grid::new(4, 5);
-        grid.set_pending_wrap(true);
-        assert!(grid.pending_wrap());
+        arm_wrap_on_row(&mut grid, 0, 5);
         grid.selective_erase_from_start_of_line();
-        assert!(grid.pending_wrap());
+        for col in 0..5 {
+            assert_eq!(char_at(&grid, 0, col), ' ', "col {col} erased");
+        }
+        assert!(!grid.pending_wrap(), "DECSEL 1 resets the deferred wrap");
+        assert_next_glyph_overwrites_last_col(&mut grid, 0, 5);
+    }
+
+    #[test]
+    fn test_sel1_all_protected_span_keeps_pending_wrap() {
+        // ClearInLine2 returns before `ResetWrap` when every cell of its span is
+        // protected.
+        let mut grid = Grid::new(4, 5);
+        arm_wrap_on_row(&mut grid, 0, 5);
+        protect_rows(&mut grid, 0..1, 5);
+        grid.selective_erase_from_start_of_line();
+        for col in 0..5 {
+            assert_ne!(char_at(&grid, 0, col), ' ', "protected col {col} kept");
+        }
+        assert!(grid.pending_wrap(), "an all-protected span keeps the wrap");
+    }
+
+    #[test]
+    fn test_sel1_one_unprotected_cell_resets_pending_wrap() {
+        let mut grid = Grid::new(4, 5);
+        arm_wrap_on_row(&mut grid, 0, 5);
+        for col in [0, 1, 3, 4] {
+            protect_cell(&mut grid, 0, col);
+        }
+        grid.selective_erase_from_start_of_line();
+        assert_eq!(
+            char_at(&grid, 0, 2),
+            ' ',
+            "the one unprotected cell is erased"
+        );
+        assert_eq!(char_at(&grid, 0, 4), 'E', "protected parked glyph kept");
+        assert!(
+            !grid.pending_wrap(),
+            "one unprotected cell in the span resets the wrap (recursive ClearInLine)"
+        );
     }
 
     // =========================================================================
@@ -2009,13 +2468,29 @@ mod tests {
     }
 
     #[test]
-    fn test_sel2_keeps_pending_wrap() {
-        // Selective erase preserves the deferred wrap (xterm).
+    fn test_sel2_clears_pending_wrap() {
+        // xterm `CASE_DECSEL` -> util.c `ClearLine` -> `ClearInLine2` reaches
+        // `ResetWrap` over an unprotected row. (This test used to assert the wrap
+        // was kept.)
         let mut grid = Grid::new(4, 5);
-        grid.set_pending_wrap(true);
-        assert!(grid.pending_wrap());
+        arm_wrap_on_row(&mut grid, 0, 5);
+        protect_cell(&mut grid, 0, 4);
         grid.selective_erase_line();
-        assert!(grid.pending_wrap());
+        assert_eq!(char_at(&grid, 0, 0), ' ', "unprotected cells erased");
+        assert_eq!(char_at(&grid, 0, 4), 'E', "protected parked glyph kept");
+        assert!(!grid.pending_wrap(), "DECSEL 2 resets the deferred wrap");
+        assert_next_glyph_overwrites_last_col(&mut grid, 0, 5);
+    }
+
+    #[test]
+    fn test_sel2_all_protected_row_keeps_pending_wrap() {
+        let mut grid = Grid::new(4, 5);
+        fill_row(&mut grid, 1, 5);
+        arm_wrap_on_row(&mut grid, 0, 5);
+        protect_rows(&mut grid, 0..1, 5);
+        grid.selective_erase_line();
+        assert_eq!(char_at(&grid, 0, 0), 'A', "protected row kept");
+        assert!(grid.pending_wrap(), "a fully protected row keeps the wrap");
     }
 
     // =========================================================================
@@ -2056,13 +2531,71 @@ mod tests {
     }
 
     #[test]
-    fn test_decsed0_keeps_pending_wrap() {
-        // Selective screen erase preserves the deferred wrap (xterm: DECSED ?J).
+    fn test_decsed0_clears_pending_wrap() {
+        // xterm `CASE_DECSED` -> util.c `ClearBelow` -> `ClearRight`, whose
+        // trailing `ResetWrap` is unconditional. (This test used to assert the
+        // wrap was kept.)
         let mut grid = Grid::new(4, 5);
-        grid.set_pending_wrap(true);
-        assert!(grid.pending_wrap());
+        fill_row(&mut grid, 2, 5);
+        arm_wrap_on_row(&mut grid, 1, 5);
         grid.selective_erase_to_end_of_screen();
-        assert!(grid.pending_wrap());
+        assert_eq!(char_at(&grid, 1, 4), ' ', "unprotected parked glyph erased");
+        assert!(is_empty_at(&grid, 2, 0), "row below erased");
+        assert!(!grid.pending_wrap(), "DECSED 0 resets the deferred wrap");
+        assert_next_glyph_overwrites_last_col(&mut grid, 1, 5);
+    }
+
+    #[test]
+    fn test_decsed0_protected_parked_cell_survives_but_wrap_resets() {
+        let mut grid = Grid::new(4, 5);
+        arm_wrap_on_row(&mut grid, 1, 5);
+        protect_cell(&mut grid, 1, 4);
+        grid.selective_erase_to_end_of_screen();
+        assert_eq!(char_at(&grid, 1, 4), 'E', "protected parked glyph survives");
+        assert!(!grid.pending_wrap(), "DECSED 0 away from the origin resets");
+    }
+
+    #[test]
+    fn test_decsed0_one_column_all_protected_at_origin_keeps_pending_wrap() {
+        // At the origin xterm reduces DECSED 0 to the DECSED 2 loop, whose
+        // `ClearInLine2` calls return before `ResetWrap` on protected rows.
+        let mut grid = Grid::new(3, 1);
+        for row in 1..3 {
+            grid.move_cursor_to(row, 0);
+            grid.write_char('x');
+        }
+        grid.move_cursor_to(0, 0);
+        grid.write_char_wrap('A');
+        assert!(
+            grid.pending_wrap(),
+            "precondition: wrap armed at the origin"
+        );
+        protect_rows(&mut grid, 0..3, 1);
+        grid.selective_erase_to_end_of_screen();
+        assert_eq!(char_at(&grid, 0, 0), 'A');
+        assert!(
+            grid.pending_wrap(),
+            "a fully protected screen keeps the wrap"
+        );
+    }
+
+    #[test]
+    fn test_decsed0_one_column_one_unprotected_cell_at_origin_resets_pending_wrap() {
+        let mut grid = Grid::new(3, 1);
+        for row in 1..3 {
+            grid.move_cursor_to(row, 0);
+            grid.write_char('x');
+        }
+        grid.move_cursor_to(0, 0);
+        grid.write_char_wrap('A');
+        assert!(
+            grid.pending_wrap(),
+            "precondition: wrap armed at the origin"
+        );
+        protect_rows(&mut grid, 0..2, 1);
+        grid.selective_erase_to_end_of_screen();
+        assert!(is_empty_at(&grid, 2, 0), "the unprotected cell is erased");
+        assert!(!grid.pending_wrap(), "one unprotected cell resets the wrap");
     }
 
     // =========================================================================
@@ -2103,13 +2636,48 @@ mod tests {
     }
 
     #[test]
-    fn test_decsed1_keeps_pending_wrap() {
-        // Selective screen erase preserves the deferred wrap (xterm).
+    fn test_decsed1_clears_pending_wrap() {
+        // xterm `CASE_DECSED` -> util.c `ClearAbove` (protected branch) ->
+        // `ClearInLine2` reaches `ResetWrap` over unprotected spans. (This test
+        // used to assert the wrap was kept.)
         let mut grid = Grid::new(4, 5);
-        grid.set_pending_wrap(true);
-        assert!(grid.pending_wrap());
+        fill_row(&mut grid, 0, 5);
+        arm_wrap_on_row(&mut grid, 1, 5);
         grid.selective_erase_from_start_of_screen();
-        assert!(grid.pending_wrap());
+        assert!(is_empty_at(&grid, 0, 0), "row above erased");
+        assert_eq!(char_at(&grid, 1, 4), ' ', "parked glyph erased");
+        assert!(!grid.pending_wrap(), "DECSED 1 resets the deferred wrap");
+        assert_next_glyph_overwrites_last_col(&mut grid, 1, 5);
+    }
+
+    #[test]
+    fn test_decsed1_all_protected_span_keeps_pending_wrap() {
+        // The span is the rows above plus [0, cursor_col] of the cursor row; an
+        // unprotected row BELOW the cursor is outside it and must not count.
+        let mut grid = Grid::new(4, 5);
+        fill_row(&mut grid, 0, 5);
+        fill_row(&mut grid, 2, 5);
+        arm_wrap_on_row(&mut grid, 1, 5);
+        protect_rows(&mut grid, 0..2, 5);
+        grid.selective_erase_from_start_of_screen();
+        assert_eq!(char_at(&grid, 0, 0), 'A', "protected row above kept");
+        assert_eq!(char_at(&grid, 2, 0), 'A', "row below untouched");
+        assert!(grid.pending_wrap(), "an all-protected span keeps the wrap");
+    }
+
+    #[test]
+    fn test_decsed1_bottom_right_fully_protected_screen_keeps_pending_wrap() {
+        // At bottom-right xterm reduces DECSED 1 to the DECSED 2 loop.
+        let mut grid = Grid::new(2, 3);
+        fill_row(&mut grid, 0, 3);
+        arm_wrap_on_row(&mut grid, 1, 3);
+        protect_rows(&mut grid, 0..2, 3);
+        grid.selective_erase_from_start_of_screen();
+        assert_eq!(char_at(&grid, 1, 2), 'C', "protected parked glyph kept");
+        assert!(
+            grid.pending_wrap(),
+            "a fully protected screen keeps the wrap"
+        );
     }
 
     // =========================================================================
@@ -2146,13 +2714,33 @@ mod tests {
     }
 
     #[test]
-    fn test_decsed2_keeps_pending_wrap() {
-        // Selective screen erase preserves the deferred wrap (xterm).
+    fn test_decsed2_clears_pending_wrap() {
+        // xterm `CASE_DECSED` -> util.c `do_erase_display` case 2: the protected
+        // `ClearInLine` loop reaches `ResetWrap` on any unprotected row. (This test
+        // used to assert the wrap was kept.)
         let mut grid = Grid::new(4, 5);
-        grid.set_pending_wrap(true);
-        assert!(grid.pending_wrap());
+        arm_wrap_on_row(&mut grid, 1, 5);
+        protect_cell(&mut grid, 1, 4);
         grid.selective_erase_screen();
-        assert!(grid.pending_wrap());
+        assert_eq!(char_at(&grid, 1, 4), 'E', "protected parked glyph kept");
+        assert_eq!(char_at(&grid, 1, 0), ' ', "unprotected cells erased");
+        assert!(!grid.pending_wrap(), "DECSED 2 resets the deferred wrap");
+        assert_next_glyph_overwrites_last_col(&mut grid, 1, 5);
+    }
+
+    #[test]
+    fn test_decsed2_fully_protected_screen_keeps_pending_wrap() {
+        let mut grid = Grid::new(3, 4);
+        fill_row(&mut grid, 0, 4);
+        fill_row(&mut grid, 2, 4);
+        arm_wrap_on_row(&mut grid, 1, 4);
+        protect_rows(&mut grid, 0..3, 4);
+        grid.selective_erase_screen();
+        assert_eq!(char_at(&grid, 1, 3), 'D', "protected parked glyph kept");
+        assert!(
+            grid.pending_wrap(),
+            "a fully protected screen keeps the wrap"
+        );
     }
 
     // =========================================================================
@@ -3224,5 +3812,205 @@ mod tests {
             None,
             "stale dst complex codepoint must be cleared by copy_rect"
         );
+    }
+
+    // ========================================================================
+    // ED erases COMPLETE lines back to single-width (DECDWL/DECDHL)
+    //
+    // VT510 Programmer Information, Erase in Display: "When you erase complete
+    // lines, they become single-height, single-width lines, with all visual
+    // character attributes cleared." xterm's `ClearBufRows` — reached from
+    // `ClearScreen` (ED 2), `ClearBelow` (ED 0) and `ClearAbove` (ED 1) — says
+    // the same in its own comment before `SetLineDblCS(ld, CSET_SWL)`.
+    //
+    // Before this, a single stray `ESC#6` poisoned a screen row that no erase,
+    // no `clear`, no soft reset and no resize could recover: measured on glass
+    // at 40x200 with a 9x17 cell, ten characters drew 180 inked device columns
+    // after the trigger against 90 before, byte-identical grid text.
+    // ========================================================================
+
+    /// Set a row's DEC line attribute the way `ESC#3` / `ESC#4` / `ESC#6` does:
+    /// the row flag plus the grid-level fast-path flag.
+    fn poison_row(grid: &mut Grid, row: u16, size: crate::LineSize) {
+        if let Some(r) = grid.row_mut(row) {
+            r.set_line_size(size);
+        }
+        grid.mark_has_double_width();
+    }
+
+    fn line_size_of(grid: &Grid, row: u16) -> crate::LineSize {
+        grid.row(row)
+            .map_or(crate::LineSize::SingleWidth, |r| r.line_size())
+    }
+
+    #[test]
+    fn ed2_returns_every_erased_row_to_single_width() {
+        let mut grid = Grid::new(4, 20);
+        poison_row(&mut grid, 0, crate::LineSize::DoubleWidth);
+        poison_row(&mut grid, 1, crate::LineSize::DoubleHeightTop);
+        poison_row(&mut grid, 2, crate::LineSize::DoubleHeightBottom);
+
+        grid.erase_screen();
+
+        for row in 0..4 {
+            assert_eq!(
+                line_size_of(&grid, row),
+                crate::LineSize::SingleWidth,
+                "ED 2 erases complete lines, so row {row} is single-width again"
+            );
+        }
+        assert!(
+            !grid.has_any_double_width(),
+            "no visible row is double any more, so the fast-path flag goes with them"
+        );
+    }
+
+    #[test]
+    fn ed2_gives_back_the_columns_a_double_width_row_had_halved() {
+        // The user-visible sting: on a poisoned row only half the columns are
+        // reachable, so the prompt and the next command's output run out of
+        // room. After ED 2 the whole row is addressable again.
+        let mut grid = Grid::new(4, 20);
+        poison_row(&mut grid, 0, crate::LineSize::DoubleWidth);
+        grid.set_cursor(0, 19);
+        assert_eq!(
+            grid.cursor().col,
+            9,
+            "while double-width, column 19 of a 20-column row clamps to the halfway mark"
+        );
+
+        grid.erase_screen();
+        grid.set_cursor(0, 19);
+
+        assert_eq!(
+            grid.cursor().col,
+            19,
+            "after ED 2 the erased row is single-width, so all 20 columns are usable"
+        );
+    }
+
+    #[test]
+    fn ed0_resets_the_complete_rows_below_and_leaves_the_cursor_row_alone() {
+        // xterm `ClearBelow`: `ClearRight` over the cursor row (a PARTIAL erase,
+        // which never touches DblCS) then `ClearBufRows(cur_row + 1, max_row)`.
+        let mut grid = Grid::new(4, 20);
+        for row in 0..4 {
+            poison_row(&mut grid, row, crate::LineSize::DoubleWidth);
+        }
+        grid.set_cursor(1, 2);
+
+        grid.erase_to_end_of_screen();
+
+        assert_eq!(
+            line_size_of(&grid, 0),
+            crate::LineSize::DoubleWidth,
+            "ED 0 does not reach the rows above the cursor"
+        );
+        assert_eq!(
+            line_size_of(&grid, 1),
+            crate::LineSize::DoubleWidth,
+            "the cursor row is a partial erase and keeps its attribute"
+        );
+        for row in 2..4 {
+            assert_eq!(
+                line_size_of(&grid, row),
+                crate::LineSize::SingleWidth,
+                "row {row} was erased as a complete line"
+            );
+        }
+        assert!(
+            grid.has_any_double_width(),
+            "rows 0 and 1 are still double, so the fast-path flag must stay raised"
+        );
+    }
+
+    #[test]
+    fn ed1_resets_the_complete_rows_above_and_leaves_the_cursor_row_alone() {
+        // xterm `ClearAbove`: `ClearBufRows(0, cur_row - 1)` then `ClearLeft`
+        // over the cursor row, which never touches DblCS.
+        let mut grid = Grid::new(4, 20);
+        for row in 0..4 {
+            poison_row(&mut grid, row, crate::LineSize::DoubleWidth);
+        }
+        grid.set_cursor(2, 2);
+
+        grid.erase_from_start_of_screen();
+
+        for row in 0..2 {
+            assert_eq!(
+                line_size_of(&grid, row),
+                crate::LineSize::SingleWidth,
+                "row {row} was erased as a complete line"
+            );
+        }
+        assert_eq!(
+            line_size_of(&grid, 2),
+            crate::LineSize::DoubleWidth,
+            "the cursor row is a partial erase and keeps its attribute"
+        );
+        assert_eq!(
+            line_size_of(&grid, 3),
+            crate::LineSize::DoubleWidth,
+            "ED 1 does not reach the rows below the cursor"
+        );
+    }
+
+    #[test]
+    fn an_ed0_that_clears_the_last_double_row_lowers_the_fast_path_flag() {
+        // The flag may only be lowered by a rescan: ED 0 resets a SUBSET of the
+        // rows, so clearing it outright would be wrong wherever a double row
+        // survives above the cursor (pinned by the ED 0 test above), and leaving
+        // it raised forever is the stale-flag cost the reflow rescan exists for.
+        let mut grid = Grid::new(4, 20);
+        poison_row(&mut grid, 3, crate::LineSize::DoubleWidth);
+        grid.set_cursor(0, 0);
+
+        grid.erase_to_end_of_screen();
+
+        assert_eq!(line_size_of(&grid, 3), crate::LineSize::SingleWidth);
+        assert!(
+            !grid.has_any_double_width(),
+            "the last double row is gone, so the rescan lowers the flag"
+        );
+    }
+
+    #[test]
+    fn el2_keeps_the_line_attribute_because_xterm_does() {
+        // The deliberate asymmetry: `do_erase_line` case 2 -> `ClearLine` ->
+        // `ClearInLine` -> `ClearInLine2` never calls `ClearBufRows`, and the
+        // VT510 EL page carries none of the ED page's single-width language.
+        let mut grid = Grid::new(4, 20);
+        poison_row(&mut grid, 1, crate::LineSize::DoubleWidth);
+        grid.set_cursor(1, 0);
+
+        grid.erase_line();
+
+        assert_eq!(
+            line_size_of(&grid, 1),
+            crate::LineSize::DoubleWidth,
+            "EL 2 clears the characters, not the line attribute"
+        );
+    }
+
+    #[test]
+    fn decsed_preserves_line_attributes_on_every_row_it_erases() {
+        // xterm's `protected_mode != OFF_PROTECT` branch of `ClearAbove` /
+        // `ClearBelow` / `do_erase_display` case 2 loops over `ClearInLine` and
+        // never reaches `ClearBufRows`, so a selective erase keeps the attribute
+        // even over complete lines.
+        let mut grid = Grid::new(4, 20);
+        for row in 0..4 {
+            poison_row(&mut grid, row, crate::LineSize::DoubleWidth);
+        }
+
+        grid.selective_erase_screen();
+
+        for row in 0..4 {
+            assert_eq!(
+                line_size_of(&grid, row),
+                crate::LineSize::DoubleWidth,
+                "DECSED keeps row {row}'s line attribute"
+            );
+        }
     }
 }

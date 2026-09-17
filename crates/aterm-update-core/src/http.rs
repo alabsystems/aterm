@@ -1090,6 +1090,33 @@ fn keep_partial(before: u64, after: u64) -> bool {
     after > before
 }
 
+/// Whether a FAILED attempt's prefix survives — [`keep_partial`]'s anti-wedge rule plus
+/// the ONE exemption it must not cover: a failure that answered about the URL rather
+/// than about the bytes on disk.
+///
+/// A web-host 403/404 is the download host saying it does not serve THIS URL: a blocked
+/// host or filtering proxy, or an asset the release does not carry — unpublished, draft,
+/// or (the routine case) in a PRIVATE repo, which answers 404 on the derived download
+/// URL shape by construction, as does any asset whose name stem is not its release tag.
+/// `--fail` wrote no body, no range was consulted, and the prefix is not what was
+/// refused, so the anti-wedge discard has nothing to protect against here — and it costs
+/// real bytes, because two HOSTS serve the SAME signed object through this same `.part`:
+/// atpkg (`net.rs` `download` / `download_for`) probes the derived `github.com` URL
+/// FIRST and falls back to the credential-bearing API URL. Discarding on the probe's 404
+/// deleted the API lane's progress on every pass, so a 630 MB artifact from a private
+/// `[packages.links]` repo restarted from byte 0 forever and resume could never take
+/// hold for it.
+///
+/// Every other failure keeps the anti-wedge rule byte for byte: a 416 or curl 33 (there
+/// the prefix IS what was refused), a stall, a transport error, and every status on the
+/// API host — whose 404 is the historical retry path, not a verdict.
+fn keep_partial_after_failure(url: &str, stderr: &str, before: u64, after: u64) -> bool {
+    if keep_partial(before, after) {
+        return true;
+    }
+    !crate::cdn::is_api_host(url) && matches!(curl_http_error_code(stderr), Some(403 | 404))
+}
+
 /// Whether a FAILED attempt died on the RANGE itself — a server (or upstream object)
 /// that refused to serve the requested offset — as opposed to a transport or HTTP
 /// failure that would recur from offset 0 too.
@@ -1184,6 +1211,16 @@ fn download_resume_args_https_only<'a>(
 /// from the FULL `max_filesize` and a fresh curl process (hence a fresh wall clock) for
 /// the fresh attempt. Any other failure keeps today's semantics exactly, and the sha256
 /// gate downstream is untouched either way.
+///
+/// # A verdict about the URL does not discard the prefix
+///
+/// The big-artifact caller fetches through TWO hosts for the SAME signed object — the
+/// derived `github.com` download URL first, the credential-bearing API URL second — and
+/// both write this one `.part`. A web-host 403/404 is the first host answering about the
+/// URL, not about the bytes, so the prefix is LEFT for the lane that follows
+/// ([`keep_partial_after_failure`]). Without that, a private release repo (which answers
+/// 404 on the derived URL shape) had the API lane's progress deleted by the next pass's
+/// doomed probe, and resume never took hold for it.
 // Skip: same audited display-lossy Err-path class as `api_get`.
 #[cfg_attr(trust_verify, trust::skip)]
 pub fn download_to_resumable(
@@ -1274,7 +1311,10 @@ fn download_to_resumable_with(
                 continue;
             }
             let after = std::fs::metadata(&part).map(|m| m.len()).unwrap_or(0);
-            if !keep_partial(existing, after) {
+            // The anti-wedge discard, EXCEPT when the failure was an answer about the
+            // URL (a web-host 403/404): that prefix is still a valid prefix for the
+            // other host serving the same signed object, and the caller tries it next.
+            if !keep_partial_after_failure(asset_url, &stderr, existing, after) {
                 let _ = std::fs::remove_file(&part);
             }
             // Same per-host classification as `download_to`: a rate limit is named so
@@ -1465,8 +1505,8 @@ x-ratelimit-limit: 60
         curl_bin, curl_fetch, curl_prepared, download_bytes_args, download_max_time_secs,
         download_resume_args, download_resume_args_https_only, download_to_args,
         download_to_resumable, download_to_resumable_https_only, head_args, keep_partial,
-        location_header, part_path, range_refused, resume_plan, token_config_safe,
-        transient_api_status,
+        keep_partial_after_failure, location_header, part_path, range_refused, resume_plan,
+        token_config_safe, transient_api_status,
     };
     use std::process::Command;
 
@@ -2125,6 +2165,62 @@ x-ratelimit-limit: 60
             !keep_partial(600_000_000, 4),
             "a truncated/clobbered prefix"
         );
+    }
+
+    /// …and the one exemption from it. The artifact lane probes the DERIVED web URL
+    /// first and the credential-bearing API URL second — two hosts, one signed object,
+    /// one `.part`. A private release repo answers 404 on that derived URL shape, so the
+    /// probe fails having read nothing: the anti-wedge rule alone then discarded the
+    /// prefix the API lane had left, and a 630 MB artifact restarted from byte 0 on
+    /// every pass, forever. A verdict about the URL must spare the prefix the other lane
+    /// resumes.
+    #[test]
+    fn a_web_host_url_verdict_spares_the_prefix_the_other_lane_resumes() {
+        // What a stalled API-lane attempt left in `<dest>.part`.
+        const STALLED: u64 = 500_000_000;
+        const WEB: &str = "https://github.com/alabsystems/orc-private/releases/download/\
+                           atpkg-orc-77/orc-77.tar.zst";
+        const API: &str = "https://api.github.com/repos/alabsystems/orc-private/releases/assets/1";
+
+        // NON-VACUITY: the progress rule alone discards it — the probe moved nothing.
+        assert!(!keep_partial(STALLED, STALLED));
+        for code in [403, 404] {
+            assert!(
+                keep_partial_after_failure(WEB, &curl_err(code), STALLED, STALLED),
+                "a web-host {code} answers about the URL, not about the prefix"
+            );
+        }
+
+        // Everything else keeps the anti-wedge rule exactly.
+        assert!(
+            !keep_partial_after_failure(WEB, &curl_err(416), STALLED, STALLED),
+            "416: the prefix IS what was refused"
+        );
+        assert!(
+            !keep_partial_after_failure(WEB, &curl_err(429), STALLED, STALLED),
+            "a rate limit is the same URL again in a minute, not the other lane"
+        );
+        assert!(
+            !keep_partial_after_failure(WEB, &curl_err(502), STALLED, STALLED),
+            "a 5xx is the retry path, not a verdict"
+        );
+        assert!(
+            !keep_partial_after_failure(WEB, "curl: (28) Operation too slow", STALLED, STALLED),
+            "a stall that moved nothing still discards"
+        );
+        assert!(
+            !keep_partial_after_failure(API, &curl_err(404), STALLED, STALLED),
+            "an API-host 404 is the historical retry path, not a URL verdict"
+        );
+        // …and an attempt that MOVED keeps its prefix on any host, as it always did.
+        for url in [WEB, API] {
+            assert!(keep_partial_after_failure(
+                url,
+                &curl_err(404),
+                STALLED,
+                STALLED + 1
+            ));
+        }
     }
 
     /// The in-call fresh-retry trigger: exactly the failures that name the RANGE (curl

@@ -331,8 +331,18 @@ fn resolve_release_target_root(repo_root: &Path, expected_uid: u32) -> Result<Pa
 
     let target_root = repo_root.join("target");
     // mkdir(2) answers EEXIST for a symlink at the path (dangling or not), so a link is
-    // never followed to create its referent here.
-    match std::fs::create_dir(&target_root) {
+    // never followed to create its referent here. The mode is spelled, not left to
+    // the umask: a root this lane creates is judged by the guard below, and under
+    // the user-private-group default of a Linux host (umask 002) a bare create_dir
+    // answers 775 — group-writable — and the lane refused the directory it had
+    // just made (measured on m17-tower, 2026-09-14). A root that already exists is
+    // judged as found, umask and all.
+    let mut builder = std::fs::DirBuilder::new();
+    {
+        use std::os::unix::fs::DirBuilderExt as _;
+        builder.mode(0o755);
+    }
+    match builder.create(&target_root) {
         Ok(()) => {}
         Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {}
         Err(error) => {
@@ -1513,10 +1523,11 @@ fn run_with_take(
     // --- compiler provenance HARD GATE ---------------------------------------
     // Ask the BUILT binary which compiler produced it: build.rs bakes the
     // `$RUSTC -vV` probe into `build_info::compiler_summary()`, and
-    // `--diagnose` prints it as the `compiler:` line (`rustc <release>
-    // (<slug>) · trust|rust · <profile> · trust_verify on|off`) — ground
+    // `--diagnose` prints it as the `compiler:` line (`Trust <own version> ·
+    // trustc <slug> · compatible with Rust <release> · <profile> · trust_verify
+    // on|off`, or `Rust <release> · rustc <slug> · …` for upstream) — ground
     // truth for the shipped bytes. Single-lane invariant: the native slice
-    // MUST be a Trust build (`· trust ·`). Anything else means the toolchain
+    // MUST be a Trust build (the row leads with `Trust`). Anything else means the toolchain
     // file was bypassed (broken rustup link, stale env) — that is a broken
     // toolchain, not a fallback, so the cut refuses to continue.
     let diagnose = match Command::new(&shipped[0])
@@ -1563,7 +1574,10 @@ fn run_with_take(
         .map(str::trim)
         .unwrap_or_default()
         .to_string();
-    if !compiler_line.contains("\u{00b7} trust \u{00b7}") {
+    // The row LEADS with the toolchain's own name: `Trust <own version> · trustc
+    // <slug> · compatible with Rust <release> · …` for a Trust build, `Rust
+    // <release> · rustc <slug> · …` for upstream (build_info::compiler_summary).
+    if !compiler_line.starts_with("Trust") {
         return Err(format!(
             "compiler provenance gate: the native slice reports {compiler_line:?} — not a \
              Trust-flavor build. The repo compiles with Trust always; the native lane must \
@@ -1625,6 +1639,75 @@ fn cargo_build_args(
     args
 }
 
+/// macOS's QoS launcher, the same one the verify gate's compile-only children
+/// run behind (`aterm_verify::exec::TASKPOLICY`). Absent elsewhere, where the
+/// build driver is spawned as is.
+const TASKPOLICY: &str = "/usr/sbin/taskpolicy";
+
+/// The build driver's `Command`, at UTILITY QoS where macOS has `taskpolicy`.
+///
+/// WHY (2026-09-15). This is the longest compile anything in this repo
+/// launches — the whole workspace, once per architecture slice, for minutes —
+/// and it started at the DEFAULT scheduling band. That is the band a person's
+/// shell and its programs run in: a `trustc` and the editor being typed into
+/// both read `pri 31` in `ps`, so the cutter's compiles competed with the
+/// foreground program as equals. The verify gate measured the cost on
+/// 2026-09-15 (`aterm_verify::exec::Cmd::demoted`): while its children ran at
+/// the inherited tier, a program's own share of a keystroke — write to first
+/// byte back — stretched to `echo_p95_ms=75.69 echo_p99_ms=150.04
+/// echo_max_ms=367.85` over 499 samples. The gate demoted its compile-only
+/// children then; the cutter's builds were left at the default band. Measured:
+/// under `taskpolicy -c utility` a child reads `pri 20`, against `31`
+/// inherited.
+///
+/// Utility, not background (`-b`, `pri 4`): background also throttles disk I/O
+/// hard, and a release build is already the longest step of the cut.
+///
+/// ONLY THE COMPILE, and this is the law it must not break. A QoS clamp is
+/// inherited by everything the child starts, and docs/RELEASING.md
+/// ("The cut's paint smoke must run at interactive QoS") measured what that
+/// does to a step which MEASURES a launch: under `QOS_CLASS_UTILITY` the
+/// smoke's 50 ms timer fired 75.0 ms late on the first tick, and 30 takes went
+/// red 11 times against 0 from a shell. So the cut must still be made at
+/// interactive QoS, and the cutter process, its self-check, its paint smoke,
+/// `lipo`, `strip`, `dsymutil`, `ditto` and every signing and notarization
+/// step keep the tier they inherit. This wraps ONE child: the `cargo`/`targo
+/// build --release` that only compiles.
+///
+/// Wrapped only when both ends are real, the same rule the gate uses: a
+/// `taskpolicy` that exists, and a driver that can actually be executed. If the
+/// driver is missing, `taskpolicy` exits 66 on its own and [`build_one`] would
+/// report an ordinary build failure instead of the spawn error that names the
+/// driver it could not run. So an unrunnable driver is spawned bare and fails
+/// exactly as it always did.
+fn release_build_command(taskpolicy: &Path, driver: &Path) -> Command {
+    if is_executable_file(taskpolicy) && is_executable_file(driver) {
+        let mut cmd = Command::new(taskpolicy);
+        cmd.arg("-c").arg("utility").arg(driver);
+        return cmd;
+    }
+    Command::new(driver)
+}
+
+/// Whether `execve` would run `path`: a non-directory carrying an execute bit.
+#[cfg(unix)]
+fn is_executable_file(path: &Path) -> bool {
+    use std::os::unix::fs::PermissionsExt as _;
+    std::fs::metadata(path)
+        .map(|m| !m.is_dir() && m.permissions().mode() & 0o111 != 0)
+        .unwrap_or(false)
+}
+
+/// Windows has no execute bit — a file is runnable by extension, not by mode —
+/// so "exists and is not a directory" is the whole of the test there. Matches
+/// `make_executable`'s split of the same platform question.
+#[cfg(not(unix))]
+fn is_executable_file(path: &Path) -> bool {
+    std::fs::metadata(path)
+        .map(|m| !m.is_dir())
+        .unwrap_or(false)
+}
+
 /// One `cargo build --release -p <pkg>` invocation. `target` = None for the
 /// native Trust slice (the toolchain file supplies the compiler);
 /// `target` = Some(triple) for the upstream-stable compat slice.
@@ -1668,7 +1751,11 @@ fn build_one(
         (stage2.join("targo"), "targo")
     };
     let (driver_path, driver_name) = driver;
-    let mut cmd = Command::new(&driver_path);
+    // AT UTILITY QoS, where macOS has taskpolicy: this child only compiles, and
+    // at the default band it out-scheduled the program the operator was typing
+    // into. Every step that RUNS a build product keeps the inherited tier — see
+    // `release_build_command`.
+    let mut cmd = release_build_command(Path::new(TASKPOLICY), &driver_path);
     cmd.current_dir("/");
     // Targo's explicit unverified lane, the exact sealed dependency source,
     // and offline resolution are one tested argument vector for both arches.
@@ -2239,6 +2326,12 @@ pub fn validate_named_cli_app_version(
             "{name} --version output {observed:?} does not open with {wanted:?}"
         ));
     };
+    // The origin line (`by Andrew Yates · ALab · alab.systems`) may sit right
+    // under the identity line — exactly the shared constant, nothing else.
+    let rest = rest
+        .strip_prefix(aterm_types::identity::ORIGIN_LINE)
+        .and_then(|r| r.strip_prefix('\n'))
+        .unwrap_or(rest);
     if !rest.is_empty() && !rest.ends_with('\n') {
         return Err(format!(
             "{name} --version output {observed:?} does not end with a newline"
@@ -2259,9 +2352,20 @@ pub fn validate_named_cli_app_version(
     Ok(())
 }
 
-/// The only lines `aterm --version` may print after its identity line — the S12
-/// "which copy runs" report, spelled by `aterm_update::which_copy::WhichCopy::lines`.
-const WHICH_COPY_LINE_PREFIXES: &[&str] = &["running: ", "another copy: "];
+/// The only lines `aterm --version` may print after its identity line (and the
+/// optional origin line right under it, admitted verbatim above): the S12
+/// "which copy runs" report (`aterm_update::which_copy::WhichCopy::lines`), the
+/// build number, and the trust roots this binary was built against.
+///
+/// `build:` and `trusts:` were added to `--version` after this gate was written,
+/// so the v0.86.0 cut failed here on its own correct output — the gate was
+/// refusing a line it had never been told about, which is the shape it exists to
+/// catch and also the shape that makes it wrong when the report grows honestly.
+/// Each is path- and machine-independent and carries no secret: `build:` is the
+/// build number the identity already implies, and `trusts:` is the pair of
+/// fingerprints (`master=`, `channel=`) the updater pin gate checks separately.
+/// Anything ELSE after the identity line still fails.
+const WHICH_COPY_LINE_PREFIXES: &[&str] = &["running: ", "another copy: ", "build: ", "trusts: "];
 
 /// Pure report validator used by the native-slice and final-universal runtime
 /// cross-checks. Each report must contain exactly one stable diagnostics field
@@ -2525,11 +2629,11 @@ mod tests {
         BuildOutput, LC_SEGMENT_64, MACH_HEADER_64_LEN, MACH_MAGIC_64, MH_EXECUTE, PrivateSliceDir,
         RELEASE_SYSTEM_PATH, SECTION_64_LEN, SEGMENT_COMMAND_64_LEN, cargo_build_args,
         cleanup_release_target_residue_with, create_private_release_directory, current_release_uid,
-        fresh_lease_token, is_lower_hex, parse_thin_macho_update_pin,
+        fresh_lease_token, is_lower_hex, make_executable, parse_thin_macho_update_pin,
         prepare_release_target_parent, publish_verified_binary, publish_verified_symbols,
-        release_tool_path, resolve_release_rustup_shim_dir, validate_app_version_reports,
-        validate_cli_app_version, validate_embedded_update_pin, validate_final_slice_records,
-        validate_lipo_architectures, validate_named_cli_app_version,
+        release_build_command, release_tool_path, resolve_release_rustup_shim_dir,
+        validate_app_version_reports, validate_cli_app_version, validate_embedded_update_pin,
+        validate_final_slice_records, validate_lipo_architectures, validate_named_cli_app_version,
         validate_slice_update_pin_reports, write_release_target_owner,
     };
 
@@ -2626,6 +2730,61 @@ mod tests {
             resolve_release_rustup_shim_dir(&home, &fallback, current_release_uid().unwrap())
                 .unwrap_err();
         assert!(error.contains("not a real regular file"), "{error}");
+    }
+
+    /// The cut's compile child yields the CPU to the program a person is typing
+    /// into: where macOS has `taskpolicy`, the release build is spawned at
+    /// UTILITY QoS (measured `pri 20`, against `31` inherited). Before this,
+    /// the longest compile in the repo ran at the same band as the editor.
+    ///
+    /// A stand-in `taskpolicy` keeps the assertion identical on every Unix, and
+    /// the decision is asserted on the BUILD child alone — docs/RELEASING.md
+    /// measured UTILITY starving the cut's paint smoke, so no step that runs a
+    /// build product may be wrapped.
+    #[cfg(unix)]
+    #[test]
+    fn the_cuts_compile_child_is_spawned_at_utility_qos() {
+        let scratch = PrivateSliceDir::create().unwrap();
+        let taskpolicy = scratch.0.join("taskpolicy");
+        let driver = scratch.0.join("targo");
+        for tool in [&taskpolicy, &driver] {
+            std::fs::write(tool, "#!/bin/sh\nexit 0\n").unwrap();
+            make_executable(tool).unwrap();
+        }
+        let argv = |cmd: std::process::Command| -> Vec<String> {
+            std::iter::once(cmd.get_program().to_owned())
+                .chain(cmd.get_args().map(std::ffi::OsStr::to_owned))
+                .map(|a| a.to_string_lossy().into_owned())
+                .collect()
+        };
+        let text = |p: &std::path::Path| p.to_string_lossy().into_owned();
+
+        assert_eq!(
+            argv(release_build_command(&taskpolicy, &driver)),
+            [
+                text(&taskpolicy),
+                "-c".to_owned(),
+                "utility".to_owned(),
+                text(&driver)
+            ],
+            "the release build is the one child the cutter demotes"
+        );
+        assert_eq!(
+            argv(release_build_command(&scratch.0.join("absent"), &driver)),
+            [text(&driver)],
+            "no taskpolicy on this machine: the driver alone"
+        );
+        let missing = scratch.0.join("no-such-driver");
+        assert_eq!(
+            argv(release_build_command(&taskpolicy, &missing)),
+            [text(&missing)],
+            "an unrunnable driver is spawned bare, so the spawn error still names it"
+        );
+        assert_eq!(
+            argv(release_build_command(&taskpolicy, &scratch.0)),
+            [text(&scratch.0)],
+            "a directory is not a driver"
+        );
     }
 
     #[test]
@@ -2789,7 +2948,16 @@ mod tests {
         let repo = scratch.0.join("repo");
         let twin = repo.join("target.noindex");
         std::fs::create_dir(&repo).unwrap();
-        std::fs::create_dir(&twin).unwrap();
+        // The twin stands in for a directory `aterm pkg noindex apply` made and the
+        // guard will judge; its mode is spelled so the test does not inherit the
+        // host's umask (002 on a user-private-group Linux host answers 775, which
+        // the guard rightly refuses as group-writable).
+        let mut builder = std::fs::DirBuilder::new();
+        {
+            use std::os::unix::fs::DirBuilderExt as _;
+            builder.mode(0o755);
+        }
+        builder.create(&twin).unwrap();
         (repo, twin)
     }
 
@@ -3285,6 +3453,32 @@ mod tests {
             .is_ok()
         );
         assert!(validate_cli_app_version("0.2.0", b"aterm 0.2.0\nrunning: /x/aterm\n").is_ok());
+        // The origin line may follow the identity line, exactly as shared, then
+        // the which-copy lines; a paraphrase of it is still "anything else".
+        let origin = aterm_types::identity::ORIGIN_LINE;
+        assert!(
+            validate_cli_app_version(
+                "0.2.0",
+                format!("aterm 0.2.0\n{origin}\nrunning: /x/aterm\n").as_bytes()
+            )
+            .is_ok()
+        );
+        assert!(
+            validate_cli_app_version("0.2.0", format!("aterm 0.2.0\n{origin}\n").as_bytes())
+                .is_ok()
+        );
+        assert!(
+            validate_cli_app_version("0.2.0", b"aterm 0.2.0\nby somebody else\n").is_err(),
+            "only the shared origin line, verbatim"
+        );
+        assert!(
+            validate_cli_app_version(
+                "0.2.0",
+                format!("aterm 0.2.0\nrunning: /x/aterm\n{origin}\n").as_bytes()
+            )
+            .is_err(),
+            "the origin line sits under the identity line, not after the copies"
+        );
         assert!(
             validate_cli_app_version("0.2.1", b"aterm 0.2.0\nrunning: /x/aterm\n").is_err(),
             "the identity line is still exact"

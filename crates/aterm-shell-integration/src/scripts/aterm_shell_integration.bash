@@ -11,6 +11,9 @@
 # Features enabled:
 # - Directory tracking (OSC 7): tab title updates, "Open Terminal Here" support
 # - Command tracking (OSC 133): command history indexing, timing, notifications
+# - The managed dirs, LIVE: an already-running session shell resolves `claude`/`codex`
+#   to atpkg's <prefix>/agents twins (and cargo/rustc to <prefix>/reroute) the moment
+#   atpkg lays them — no new tab, no `exec bash` (owner ask 2026-09-16; see "LIVE" below)
 #
 # Compatible with: bash 3.2+
 
@@ -85,7 +88,7 @@ fi
 
 # Skip if already loaded — marking the boundary on the way out when the
 # inherited guard means we crossed one.
-if [[ -n "$ATERM_SHELL_INTEGRATION_INSTALLED" ]]; then
+if [[ -n "${ATERM_SHELL_INTEGRATION_INSTALLED:-}" ]]; then
     if [[ -n "$__aterm_mux" ]]; then
         export ATERM_MUX="$__aterm_mux"
         if [[ -n "${ATERM_PARENT_SESSION_ID:-}" ]]; then
@@ -198,15 +201,214 @@ __aterm_path_front() {
             ;;
     esac
 }
+#
+# It also records, in $__aterm_managed_want (colon-joined, in order), the dirs it
+# put in front, which is what the per-prompt hot path below compares the head of
+# PATH against, and in $__aterm_managed_agents_on / $__aterm_managed_reroute_on
+# whether each dir WAS there to front. A dir that was absent is re-probed by the
+# hot path (one `-d` per prompt, only while it stays absent — review finding
+# 2026-09-16: a hook that predates agents/ set $ATPKG_AGENTS, the `-d` here failed
+# once, and the shell never looked again) and fronted the moment it appears. The
+# `-d` stats of the steady state live HERE, on the change path, never on the
+# per-prompt one.
+__aterm_managed_want=""
+__aterm_managed_agents_on=0
+__aterm_managed_reroute_on=0
 __aterm_reroute_path_front() {
+    __aterm_managed_want=""
+    __aterm_managed_agents_on=0
+    __aterm_managed_reroute_on=0
     if [[ -n "${ATPKG_AGENTS:-}" && -d "$ATPKG_AGENTS" ]]; then
         __aterm_path_front "$ATPKG_AGENTS"
+        __aterm_managed_want="$ATPKG_AGENTS"
+        __aterm_managed_agents_on=1
     fi
     if [[ -n "${ATERM_REROUTE_DIR:-}" && -d "$ATERM_REROUTE_DIR" ]]; then
         __aterm_path_front "$ATERM_REROUTE_DIR"
+        __aterm_managed_want="$ATERM_REROUTE_DIR${__aterm_managed_want:+:$__aterm_managed_want}"
+        __aterm_managed_reroute_on=1
     fi
 }
 __aterm_reroute_path_front
+
+# ─── LIVE: the tab that is ALREADY OPEN picks the managed dirs up the moment atpkg lays them ───
+#
+# Owner, 2026-09-16, looking at a status row that read "✓ Claude Code 2.1.273 ·
+# Codex 0.154.0 — aterm-managed, current   what `claude` and `codex` run in new
+# tabs": "HEY! this is a bad experience. aterm atpkg DID install the latest but it
+# didn't make them available for me. instead, it is telling me to open a new tab.
+# NO! all the latest and best MUST WORK IN THE SAME TAB with live update! fix this
+# and this message and audit that this is the actual behavior."
+#
+# What was measured in that tab: its shell (pid 1784) was spawned at 10:44:24 by
+# the PREVIOUS app build and ADOPTED across the seamless update — the running app
+# (0.86.0, pid 1868) started at 10:44:32 — and <prefix>/agents plus the shell.d
+# hooks were created at 10:46 by the new build's first pass. The one assert above
+# fires ONCE, at load, gated on $ATPKG_AGENTS / $ATERM_REROUTE_DIR being set and
+# the directories existing AT THAT INSTANT; that shell had neither variable and no
+# directory to find, so `which -a claude` read ~/.local/bin/claude first and the
+# only way to the build atpkg had just installed was a new tab. The same freeze
+# hits EVERY fresh machine: the first tab opens before the seed pass creates agents/.
+#
+# The fix is a per-prompt AND per-command re-assert — from PROMPT_COMMAND and from
+# the DEBUG-trap preexec, because a command typed at an idle prompt after the dirs
+# appear runs BEFORE the next prompt (measured: a PATH assigned in the DEBUG trap
+# is what that very command resolves through) — in four steps, all builtin-only
+# (no `$(...)`, no backticks, no external stat/dirname/readlink; pinned by a grep
+# test):
+#
+#  1. THE HOOK IS THE SOURCE OF TRUTH when the environment is missing or stale.
+#     ~/.aterm/shell.d/00-atpkg.bash is what atpkg generates (crates/atpkg/src/hooks.rs;
+#     the spelling is pinned from that crate's side): it exports $ATPKG_AGENTS and
+#     $ATPKG_BIN, moves agents/ to the front and appends bin/, and it is idempotent.
+#     It is (re)sourced when the TEXT on disk is not the text last sourced — it
+#     appeared (a shell spawned before the file existed), or atpkg rewrote it on a
+#     later pass. bash has no builtin that reads an mtime or an inode, so unlike
+#     zsh (one zstat) the copy is compared by CONTENT: `read` — a builtin, on a
+#     builtin redirection — walks the file's lines into a string, and the string
+#     is compared to the one recorded at the last source. Measured 2026-09-16
+#     (bash 3.2.57, the 11-line hook, 10000 calls): 108 µs per call; a fork of
+#     /usr/bin/true is 1278 µs, and this same prompt already forks a `$(...)`
+#     for OSC 7 and another for 633;E, so the read is under a tenth of what a
+#     command costs here. The `-nt` stamp alternative (3 µs, two stats) was
+#     rejected for the STATE it carries: a per-shell file this shell must mint
+#     symlink-safely in a possibly shared /tmp, own, and delete at exit — a
+#     leak for every shell killed without one. A hook that predates R1 (no
+#     `export ATPKG_AGENTS`) is sourced ONCE per copy, not once per prompt. An
+#     absent hook costs one failed open per call and sources nothing; the empty
+#     text is recorded so a hook that appears later is seen as new.
+#  2. A DIR THAT WAS ABSENT when the front was last laid is probed again — one `-d`
+#     per prompt, only in that degraded state — and fronted when it appears: a hook
+#     that names an agents/ atpkg has not created yet, or a session whose seam
+#     exported no $ATERM_REROUTE_DIR. Nothing is assigned while it stays absent.
+#  3. THE ORDER. $__aterm_managed_want holds the dirs that must lead PATH; the hot
+#     path checks that PATH begins with exactly that head (a literal `case`
+#     pattern) and assigns ONLY on a mismatch — assigning PATH flushes bash's
+#     command hash, which is exactly what a change needs (`claude` re-resolves to
+#     the twin) and pure waste otherwise.
+#  4. THE TWIN WATCH. bash hashes a command's path on first use, and a hashed name
+#     is never searched again while the file exists — so once agents/ leads PATH
+#     and `claude` has run the foreign copy, a twin that lands LATER (a fresh
+#     machine: agents/ is created at launch, the twin only once the managed program
+#     is installed — the exact window in which the owner typed `claude`) would keep
+#     losing to the hashed path for the life of the shell (measured 2026-09-16,
+#     bash 3.2.57 and zsh 5.9). `hash -d claude codex` forgets exactly those two
+#     names every call — a builtin, no syscall; its `2>/dev/null` (a name that was
+#     never hashed is an error) is a builtin redirection, not a fork — so every
+#     `claude`/`codex` walks PATH afresh and finds the twin the moment it exists.
+#     The names are the two agents/ holds by owner decision (2026-09-10: ONLY the
+#     claude and codex twins); a bash glob over agents/ would be generic but is
+#     not safe under a user's `failglob`/`noglob`, so the names are spelled. zsh
+#     watches the directory's listing instead and needs no names.
+#
+# $ATERM_REROUTE_DIR is derived for a shell that predates it — the sibling
+# `<dir of $ATPKG_AGENTS>/reroute`, when it is a directory and $ATERM_NO_REROUTE is
+# not engaged (set, non-empty and not "0": atpkg::reroute::engaged) — so the final
+# order is reroute, agents, everything else, bin/ last (the hook appends it).
+#
+# Gated on BEING INSIDE AN ATERM SESSION ($ATERM_CHILD=1, which the spawn seam sets
+# for every child, or $ATERM_SESSION_ID) — NOT on $ATERM_REROUTE_DIR, which is
+# precisely what the adopted shell lacks. Inert everywhere else.
+__aterm_atpkg_hook="$HOME/.aterm/shell.d/00-atpkg.bash"
+__aterm_atpkg_hook_seen=""
+__aterm_managed_live=0
+if [[ -n "${ATERM_CHILD:-}" || -n "${ATERM_SESSION_ID:-}" ]]; then
+    __aterm_managed_live=1
+fi
+
+# Leaves the hook's text in $__aterm_atpkg_hook_now, or the empty string when it
+# is absent (the failed open is the shell's own, silenced by the redirection
+# that precedes it — no fork). Builtin `read` on a builtin redirection; the
+# `|| [[ -n ... ]]` keeps a final line without a newline. Its own global, not
+# $REPLY: the hot path runs between a user's `read` and the line that consumes
+# $REPLY, and must not clobber it. `local` with a value, so `set -u` holds.
+__aterm_atpkg_hook_now=""
+__aterm_atpkg_hook_read() {
+    __aterm_atpkg_hook_now=""
+    local __aterm_line=""
+    while IFS= read -r __aterm_line || [[ -n "$__aterm_line" ]]; do
+        __aterm_atpkg_hook_now+="$__aterm_line"$'\n'
+    done 2>/dev/null < "$__aterm_atpkg_hook"
+    return 0
+}
+# The copy the shell.d loop above sourced at load is the copy last sourced —
+# whatever it exported (a pre-R1 hook exports no $ATPKG_AGENTS, and is still not
+# sourced again until atpkg rewrites it).
+if (( __aterm_managed_live )); then
+    __aterm_atpkg_hook_read
+    __aterm_atpkg_hook_seen="$__aterm_atpkg_hook_now"
+fi
+
+# Exports $ATERM_REROUTE_DIR (status 0) or leaves it alone (status 1).
+__aterm_managed_derive_reroute() {
+    [[ -z "${ATERM_REROUTE_DIR:-}" && -n "${ATPKG_AGENTS:-}" ]] || return 1
+    case "${ATERM_NO_REROUTE:-}" in
+        ''|0) ;;
+        *) return 1 ;;
+    esac
+    local __aterm_dir="${ATPKG_AGENTS%/*}/reroute"
+    [[ -d "$__aterm_dir" ]] || return 1
+    export ATERM_REROUTE_DIR="$__aterm_dir"
+}
+# A session shell whose seam exported no $ATERM_REROUTE_DIR but whose rc block
+# sourced the hook derives it now, so the load-time order is final too.
+if (( __aterm_managed_live )) && __aterm_managed_derive_reroute; then
+    __aterm_reroute_path_front
+fi
+
+# The hot path: every PROMPT_COMMAND and every preexec. Builtin-only — see above.
+__aterm_managed_path_live() {
+    (( __aterm_managed_live )) || return 0
+    # 1. The hook: sourced when the text on disk is not the text last sourced.
+    #    POSIX `[ ]` equality, not `[[ != ]]` — the latter reads its right side as
+    #    a pattern (and case-insensitively under `nocasematch`). An ABSENT hook
+    #    falls through: steps 2 and 3 keep the reroute dir in front regardless
+    #    (review finding 2026-09-16: an early return here left a PATH prepend at
+    #    the prompt shadowing the reroute stubs for the shell's life).
+    __aterm_atpkg_hook_read
+    if [ "$__aterm_atpkg_hook_now" != "$__aterm_atpkg_hook_seen" ]; then
+        __aterm_atpkg_hook_seen="$__aterm_atpkg_hook_now"
+        if [[ -n "$__aterm_atpkg_hook_now" ]]; then
+            . "$__aterm_atpkg_hook"
+            __aterm_managed_derive_reroute
+            __aterm_reroute_path_front
+            return 0
+        fi
+    fi
+    # 2. A dir that was absent when the front was last laid: probe it again.
+    local __aterm_refront=0
+    if (( ! __aterm_managed_agents_on )) && [[ -n "${ATPKG_AGENTS:-}" && -d "$ATPKG_AGENTS" ]]; then
+        __aterm_refront=1
+    fi
+    if (( ! __aterm_managed_reroute_on )); then
+        if [[ -n "${ATERM_REROUTE_DIR:-}" ]]; then
+            [[ -d "$ATERM_REROUTE_DIR" ]] && __aterm_refront=1
+        elif __aterm_managed_derive_reroute; then
+            __aterm_refront=1
+        fi
+    fi
+    if (( __aterm_refront )); then
+        __aterm_reroute_path_front
+        return 0
+    fi
+    # 3. The order: assign only on a mismatch. A quoted `case` pattern is literal,
+    #    so a directory named with `*` or `[` still compares by equality.
+    if [[ -n "$__aterm_managed_want" ]]; then
+        case "$PATH" in
+            "$__aterm_managed_want") ;;
+            "$__aterm_managed_want":*) ;;
+            *)
+                __aterm_reroute_path_front
+                return 0
+                ;;
+        esac
+    fi
+    # 4. The twin watch: the two managed names always walk PATH afresh.
+    if (( __aterm_managed_agents_on )); then
+        hash -d claude codex 2>/dev/null
+    fi
+    return 0
+}
 
 # Store the real PROMPT_COMMAND before we modify it.
 # Detect array vs scalar to preserve bash 5.1+ array-style PROMPT_COMMAND.
@@ -398,6 +600,10 @@ __aterm_preexec() {
 
     # Only capture the first command (not subshells)
     if [[ -z "$__aterm_last_command" ]]; then
+        # The managed dirs, live — BEFORE this command resolves: a `claude` typed
+        # at a prompt that was drawn before atpkg laid agents/ must already run
+        # the twin (see "LIVE" above).
+        __aterm_managed_path_live
         __aterm_last_command="$BASH_COMMAND"
         # Report command text for session memory (OSC 633;E)
         __aterm_osc "633;E;$(__aterm_encode_cmd "$BASH_COMMAND")${__aterm_id_suffix_str}"
@@ -417,6 +623,9 @@ __aterm_prompt_command() {
     local last_status=$?
     __aterm_last_exit=$last_status
     __aterm_in_prompt_cmd=1
+
+    # The managed dirs, live (see "LIVE" above): one probe, an assign only on change.
+    __aterm_managed_path_live
 
     # If we had a command, mark it finished
     if [[ -n "$__aterm_last_command" ]]; then
@@ -457,7 +666,7 @@ __aterm_prompt_command() {
 
     # One-shot prompt setup. Runs after the original PROMPT_COMMAND so it
     # survives frameworks (starship, oh-my-bash) that set PS1 at init.
-    if [[ -n "$__aterm_pending_prompt_setup" ]]; then
+    if [[ -n "${__aterm_pending_prompt_setup:-}" ]]; then
         __aterm_set_prompt
         unset __aterm_pending_prompt_setup
     fi
@@ -469,7 +678,7 @@ __aterm_prompt_command() {
     # Re-derive the suffix on every PROMPT_COMMAND from the captured
     # shell-local (#8015 — the env var is unset immediately after source
     # time, so all subsequent reads come from $__aterm_shell_nonce).
-    if [[ -z "$__aterm_prompt_has_mark_b" ]]; then
+    if [[ -z "${__aterm_prompt_has_mark_b:-}" ]]; then
         local __aterm_b_suffix=""
         [[ -n "$__aterm_shell_nonce" ]] && __aterm_b_suffix=";id=${__aterm_shell_nonce}"
         local __aterm_b="\[\033]133;B${__aterm_b_suffix}\a\]"
@@ -549,7 +758,13 @@ __aterm_git_segment() {
 
 # Defer prompt setup to first PROMPT_COMMAND so it survives frameworks
 # (starship, oh-my-bash) that overwrite PS1 during their initialization.
-if [[ -n "$ATERM_PROMPT_STYLE" && "$ATERM_PROMPT_STYLE" != "none" ]]; then
+# Every reference to these two is `${…:-}`-guarded and they start EMPTY, so a
+# user's `set -u` (typed, or in .bashrc) neither aborts PROMPT_COMMAND — which
+# left `__aterm_in_prompt_cmd=1` stuck and the DEBUG-trap preexec dead for the
+# life of the shell (review finding 2026-09-16) — nor prints at every prompt.
+__aterm_pending_prompt_setup=""
+__aterm_prompt_has_mark_b=""
+if [[ -n "${ATERM_PROMPT_STYLE:-}" && "${ATERM_PROMPT_STYLE:-}" != "none" ]]; then
     __aterm_pending_prompt_setup=1
 fi
 

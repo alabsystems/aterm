@@ -19,29 +19,30 @@
 
 // The property models are iterated via `harness::instances()`, not named here.
 use aterm_spec::derive::{
-    Model, aa_edge_hardening_model, active_handle_model, alt_selection_park_model,
-    anchored_artifact_transaction_model, artifact_handoff_capacity_model,
+    Model, aa_edge_hardening_model, active_handle_model, alt_archive_pool_model,
+    alt_selection_park_model, anchored_artifact_transaction_model, artifact_handoff_capacity_model,
     artifact_reader_lease_model, artifact_reply_publication_model, asymmetric_pad_layout_model,
     capture_after_present_model, channel_bind_model, chrome_face_gate_model,
     clipboard_mailbox_model, closed_recovery_ledgers_model, coalesce_model,
-    composed_sync_hold_model, composite_accessibility_route_model, config_catalog_snapshot_model,
-    config_file_commit_cas_model, contrast_floor_model, control_connection_admission_model,
-    ct_frac_bearing_model, cursor_cat_curse_wince_model, cursor_cat_earn_floor_model,
-    cursor_cat_fold_model, cursor_cat_model, cursor_cat_motion_pulse_routing_model,
-    cursor_companion_owner_lifecycle_model, cursor_cutout_clip_model, cursor_effect_scroll_model,
-    cursor_hint_license_model, cursor_model, cursor_scroll_signal_model,
-    cursor_viewport_lifecycle_model, damage_to_present_model, deco_band_containment_model,
-    deco_phase_model, done_mark_lru_model, dsu_quiescence_model, echo_ledger_bridge_model,
-    effect_phase_lock_model, effect_present_rebase_model, effect_presentability_settle_model,
-    emacs_search_navigation_model, emacs_search_repeat_work_model, evict_full_model,
-    exact_instance_retention_model, exact_profanity_completion_model, fallback_band_clip_model,
-    fallback_precedence_model, fallback_scale_clamp_model, fd_handoff_no_leak_model,
-    flash_limiter_model, flash_limiter_window_model, focus_modifier_cache_model,
-    gpu_loss_recovery_model, gpu_loss_route_model, grid_translate_model, handoff_roundtrip_model,
-    hdr_present_gate_model, hdr_reconfigure_retag_model, hyperlink_scheme_cap_model,
-    idle_deadline_model, ignition_reservation_lifecycle_model, ignition_reservation_rekey_model,
-    inject_floor_model, input_release_pairing_model, kernel_model, key_injectivity_model,
-    kitty_collectibles_model, kitty_flush_worker_model, kitty_sidecar_durability_model,
+    companion_tenure_flicker_model, composed_sync_hold_model, composite_accessibility_route_model,
+    config_catalog_snapshot_model, config_file_commit_cas_model, contrast_floor_model,
+    control_connection_admission_model, ct_frac_bearing_model, cursor_cat_curse_wince_model,
+    cursor_cat_earn_floor_model, cursor_cat_fold_model, cursor_cat_model,
+    cursor_cat_motion_pulse_routing_model, cursor_companion_owner_lifecycle_model,
+    cursor_cutout_clip_model, cursor_effect_scroll_model, cursor_hint_license_model, cursor_model,
+    cursor_scroll_signal_model, cursor_viewport_lifecycle_model, damage_to_present_model,
+    deco_band_containment_model, deco_phase_model, done_mark_lru_model, dsu_quiescence_model,
+    echo_ledger_bridge_model, effect_phase_lock_model, effect_present_rebase_model,
+    effect_presentability_settle_model, emacs_search_navigation_model,
+    emacs_search_repeat_work_model, evict_full_model, exact_instance_retention_model,
+    exact_profanity_completion_model, fallback_band_clip_model, fallback_precedence_model,
+    fallback_scale_clamp_model, fd_handoff_no_leak_model, flash_limiter_model,
+    flash_limiter_window_model, focus_modifier_cache_model, gpu_loss_recovery_model,
+    gpu_loss_route_model, grid_translate_model, handoff_roundtrip_model, hdr_present_gate_model,
+    hdr_reconfigure_retag_model, hyperlink_scheme_cap_model, idle_deadline_model,
+    ignition_reservation_lifecycle_model, ignition_reservation_rekey_model, inject_floor_model,
+    input_release_pairing_model, kernel_model, key_injectivity_model, kitty_collectibles_model,
+    kitty_flush_worker_model, kitty_pin_merge_model, kitty_sidecar_durability_model,
     kitty_sing_detector_model, layout_coordinate_reset_model, ligature_gate_model,
     manual_config_completion_model, manual_config_diagnostics_lane_model,
     manual_config_handoff_model, manual_config_problem_navigation_model, mint_reachability_model,
@@ -78,8 +79,9 @@ use aterm_spec::derive::{
     scrollback_maintenance_lane_model, seamless_nonce_model, selection_custody_model,
     self_governor_model, semantic_prewarm_generation_model, semantic_prewarm_handshake_model,
     semantic_prewarm_request_swap_model, serious_mode_intent_queue_model, serious_mode_model,
-    session_chrome_expiry_model, session_pool_model, settings_page_scroll_model, shade_phase_model,
-    shared_budget_model, snapshot_generation_commit_model, snapshot_model, sparkle_identity_model,
+    session_chrome_expiry_model, session_id_claim_model, session_pool_model,
+    settings_page_scroll_model, shade_phase_model, shared_budget_model,
+    snapshot_generation_commit_model, snapshot_model, sparkle_identity_model,
     sparkle_persist_capacity_model, sparkle_reflow_cardinality_model, sparkle_retype_rearm_model,
     spawn_locale_model, startup_phase_publication_model, stream_fade_gate_model,
     strike_selection_model, styled_run_face_model, subscribe_model, surface_coverage_model,
@@ -302,11 +304,11 @@ fn assert_every_invariant_carries_a_mutant(m: &Model, bounds_guards: &[&str]) {
             m.name
         );
     }
-    let buggy = aterm_spec::interp::with_buggy(m, 1);
+    // ONE implementation of the isolation sweep, shared with the workspace-wide
+    // ratchet (`non_vacuity_ratchet.rs`) so the two can never drift apart.
+    let uncaught = aterm_spec::verify::uncaught_invariants(m);
     for inv in &m.invariants {
-        let mut alone = buggy.clone();
-        alone.invariants.retain(|other| other.name == inv.name);
-        let caught = aterm_spec::interp::bmc(&alone).is_err();
+        let caught = !uncaught.contains(&inv.name);
         if bounds_guards.contains(&inv.name) {
             assert!(
                 !caught,
@@ -8111,6 +8113,12 @@ fn derived_cursor_hint_license_proves_and_catches_cold_light() {
     assert_eq!(typed["hint"], 1);
     assert_eq!(typed["arms"], 1);
     assert_eq!(typed["credit_arms"], 1);
+    let before_hover = typed.clone();
+    assert!(model.fire("ByteSilentPointerPreservesLicense", &mut typed));
+    assert_eq!(
+        typed, before_hover,
+        "byte-silent hover disposes of no press"
+    );
     assert!(model.fire("LicensedTypedMoveMintsLight", &mut typed));
     assert_eq!(typed["hint"], 0, "the paired echo consumes the stamp");
     assert_eq!(typed["consumed"], 1);
@@ -9241,6 +9249,174 @@ fn derived_flash_limiter_window_proves_catches_and_multiplies() {
         &[("Overlap", 1)],
         "derived flash limiter (window-wide)",
     );
+}
+
+/// **THE ALT-SCREEN ARCHIVE POOL, CHARGED AGAINST THE PROCESS.** The retention
+/// budget belongs to the machine's memory, so it is charged against every live
+/// archive at once — the same aggregation shape as the window-wide flash
+/// limiter, and for the same reason: "this archive never exceeds its budget" is
+/// a true theorem about ONE archive that stays true however many exist, so it
+/// cannot see the defect where each tab keeps a whole 4 MiB and the process
+/// pays eight times over.
+///
+/// The two invariants have one victim each, which is what makes the pair
+/// honest. `PoolBounded` is charged against the SUM and stated over SETTLED
+/// archives, because an archive can only lower its OWN retention — so the bound
+/// CONVERGES rather than holding at every instant, and the antecedent is where
+/// that is written down. `Local = 1` breaks it at every corner: multiplication
+/// alone is the defect, no scenario needed. `IdleTakesNothing` is the review
+/// blocker from the pooling round — an archive that holds nothing must cost the
+/// ones that do nothing — and `Buggy = 1` breaks it immediately, with both
+/// archives still empty. `Local` cannot damage that second invariant (a local
+/// archive's allowance IS the whole total), which is what gives the G5
+/// attribution corner something to say.
+#[test]
+fn derived_alt_archive_pool_proves_catches_and_multiplies() {
+    let _ = verify::prove_catch_and_multiply_scalar(
+        &alt_archive_pool_model(),
+        &[&[]],
+        &[],
+        "derived alt-screen archive pool",
+    );
+}
+
+/// **ONE LIVE HOLDER PER SESSION ID**, machine-checked — the safety property
+/// behind a real incident, where the wrong answer is a keystroke delivered into
+/// a human's window.
+///
+/// A pane's shell exports the identity the OUTER aterm preminted for the inner
+/// aterm that pane may launch, and that export outlives the launch on purpose:
+/// a child that exits must be able to relaunch under its original identity.
+/// What the old spelling could not tell apart is a RELAUNCH from a SECOND
+/// SIMULTANEOUS LAUNCH. Two instances answered to one id, and `@<sid>` resolves
+/// through ONE discovery entry.
+///
+/// The two defects fail differently, which is the whole argument for the
+/// shipped rule having TWO gates rather than one:
+///
+/// * `Local = 1` — each launch decides from its own premint read alone. Every
+///   launch is individually "correct" and the id is held N times, so this
+///   breaks `AtMostOneHolder` at EVERY corner. Multiplication alone is enough.
+/// * `Buggy = 1` — the lock is consulted, the live entry is not. That is
+///   invisible until `Handoff = 1`, because a seamless-update successor keeps
+///   its ids by design and CANNOT inherit the predecessor's flock: the lock
+///   goes free while the successor's own entry is the thing holding the id.
+///   The G3 corner is therefore `Handoff = 1`, and it is why the entry gate
+///   exists BESIDE the lock rather than instead of it.
+///
+/// The relaunch direction is checked too, so the safety property cannot be
+/// satisfied by the lazy fix of never adopting: `Exit` releases the lock with
+/// its holder (which is why the claim file is never unlinked — unlinking one a
+/// peer holds open is how two processes could both come to hold it), and the
+/// trace adopt → exit → adopt lands back on exactly one holder.
+#[test]
+fn derived_session_id_claim_proves_catches_and_multiplies() {
+    let m = session_id_claim_model();
+    let _ = verify::prove_catch_and_multiply_scalar(
+        &m,
+        &[&[], &[("Handoff", 1)]],
+        &[("Handoff", 1)],
+        "derived session id claim",
+    );
+
+    // THE OTHER DIRECTION, so `AtMostOneHolder` cannot be satisfied by refusing
+    // every adoption: the premint survives a relaunch.
+    let mut st = m.init_state();
+    assert!(m.fire("Launch", &mut st), "the first launch adopts");
+    assert_eq!(st.get("holders"), Some(&1));
+    assert!(m.fire("Exit", &mut st), "the holder exits");
+    assert_eq!(st.get("lock"), Some(&0), "the lock dies WITH its holder");
+    assert!(m.fire("Launch", &mut st), "and the relaunch adopts again");
+    assert_eq!(st.get("holders"), Some(&1));
+}
+
+/// **A FLICKERING PROGRAM NEVER TAKES THE CURSOR.** The anti-flap law of the
+/// cursor companion's tenure gate — what stands between the user and a cat that
+/// changes identity every time a command block opens and closes.
+///
+/// `KittyTenure::observe` is a DWELL gate, and the load-bearing arm is the one
+/// that is easy to read past: ANY observation that does not match the standing
+/// candidate restarts it. So a pane whose claim alternates never accumulates
+/// dwell and the cat does not move. This model is the flicker scenario and
+/// nothing else — `last` forces the two observations to alternate, so every
+/// trace in the state space is a flicker storm — which lets the invariant be
+/// the flat sentence `the identity never changes` rather than a rate.
+///
+/// `Buggy = 1` is the pre-tenure behaviour, landing the raw claim at once, and
+/// it breaks the law on the FIRST observation.
+#[test]
+fn derived_companion_tenure_flicker_proves_and_catches_a_flapping_cat() {
+    let m = companion_tenure_flicker_model();
+    assert_proves_and_catches(&m);
+    assert_every_invariant_carries_a_mutant(&m, &[]);
+
+    // And the storm is really a storm: the trace alternates, and the dwell
+    // clock never reaches the tenure because each observation resets it.
+    let mut st = m.init_state();
+    for _ in 0..3 {
+        assert!(m.fire("SeeProgram", &mut st));
+        assert!(m.fire("SeeNone", &mut st));
+    }
+    assert_eq!(
+        st.get("changes"),
+        Some(&0),
+        "six flickers, and the cat held still"
+    );
+    assert_eq!(st.get("worn"), Some(&0), "still the base cat");
+}
+
+/// **WEARING A CAT IS A JOIN, SO NO REPLICA LOSES A PICK.** The kitty
+/// collection is replicated — every instance keeps a copy and folds the others
+/// in — and `merge_collectible` takes `max_ts` on the favourite stamp, which
+/// makes the merge a join: commutative, idempotent, order-independent. That is
+/// the whole reason a wear needs no unpin and no tombstone, and it shipped as a
+/// sentence in a commit message with nothing behind it.
+///
+/// `Buggy = 1` is the wrong merge a reader reaches for when a merge looks like
+/// an assignment: TAKE the incoming value rather than the max. The mutant is not
+/// abstract — it is a stale delta landing on a replica that has since worn
+/// something, destroying a pin the user made.
+///
+/// Convergence is witnessed here as a TRACE rather than stated as an invariant,
+/// because no mutant of one dial can falsify it (an assignment merge converges
+/// too, just on the wrong value) and this suite fails a ghost invariant on
+/// purpose. `assert_every_invariant_carries_a_mutant` is run below to prove the
+/// one law that remains is not one.
+#[test]
+fn derived_kitty_pin_merge_proves_and_catches_a_lost_pin() {
+    let m = kitty_pin_merge_model();
+    assert_proves_and_catches(&m);
+    assert_every_invariant_carries_a_mutant(&m, &[]);
+
+    // THE MUTANT, concretely: B wears a cat, then A's older delta lands and
+    // takes B's stamp back to nothing.
+    let bug = aterm_spec::interp::with_buggy(&m, 1);
+    let mut st = bug.init_state();
+    assert!(bug.fire("WearOneOnA", &mut st));
+    assert!(bug.fire("WearTwoOnB", &mut st));
+    assert_eq!(st.get("b2"), Some(&2), "B's own pick is stamped");
+    assert!(bug.fire("FlushAToB", &mut st));
+    assert_eq!(
+        st.get("b2"),
+        Some(&0),
+        "and an assignment merge destroyed it"
+    );
+    assert!(!bug.check_invariant("AMergeNeverLosesAPick", &st));
+
+    // AND THE TRACE the sentence describes: with the join, a flush each way
+    // leaves both ledgers holding both picks, each at its own stamp.
+    let mut st = m.init_state();
+    assert!(m.fire("WearOneOnA", &mut st));
+    assert!(m.fire("WearTwoOnB", &mut st));
+    assert!(m.fire("FlushAToB", &mut st));
+    assert!(m.fire("FlushBToA", &mut st));
+    assert_eq!(
+        (st.get("a1"), st.get("a2")),
+        (st.get("b1"), st.get("b2")),
+        "the two ledgers agree"
+    );
+    assert_eq!(st.get("a1"), Some(&1), "and cat one kept A's stamp");
+    assert_eq!(st.get("a2"), Some(&2), "and cat two kept B's");
 }
 
 /// Rainbow kitty scheduler regression family: idle blink edges are silent, a content

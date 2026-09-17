@@ -1023,7 +1023,8 @@ mod tests {
         let tex = mint
             .texture_2d(PixelFormat::Rgba8Unorm, w, h, TEXTURE_USAGE_SHADER_READ)
             .expect("texture");
-        // SAFETY: shared-storage texture, exact extent and stride.
+        // SAFETY: managed-storage (non-Private) texture, exact extent and
+        // stride.
         unsafe { tex.upload(ffi::MtlRegion::full_2d(w, h), bytes, w * 4) };
         tex
     }

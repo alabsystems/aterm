@@ -817,7 +817,9 @@ impl AllowlistConfig {
     /// Parse an [`AllowlistConfig`] from a TOML string.
     ///
     /// Requires the `allowlist-toml` feature. Gated so `aterm-core`'s default
-    /// build tree does not pull `toml` + `serde` through this crate (#7729).
+    /// build tree does not pull `aterm-toml` + `serde` through this crate
+    /// (#7729). (The gated dependency was the third-party `toml` when this was
+    /// written; it is the first-party `aterm-toml` now.)
     ///
     /// # Errors
     ///

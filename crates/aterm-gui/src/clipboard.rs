@@ -49,6 +49,19 @@ thread_local! {
 /// string get/set from a non-main thread is established AppKit practice
 /// (Alacritty/copypasta ship exactly this) and the class is not on Apple's
 /// main-thread-only list.
+///
+/// WHAT THE `bool` MEANS ON WAYLAND. A Wayland copy is done by the event loop, not
+/// by the calling thread, and a compositor can REFUSE to hand this client the
+/// selection (see `clipboard.rs` in the vendored winit backend). Called off the
+/// loop thread — the two callers above — this waits for the loop's verdict and
+/// answers with it, so `aterm ctl copy` says `ERR pbcopy failed` for a copy the
+/// compositor dropped instead of `OK <bytes>`. Called ON the loop thread (the GUI
+/// copy shortcut, copy-on-select) it cannot wait for a thread it is already
+/// standing on, so it answers `true` for a request the loop accepted — and those
+/// are the two callers a refusal cannot reach, each carrying the focus and the
+/// fresh input serial the compositor asks for. (`warn!` is not the reporting
+/// channel here: this workspace patches `tracing` to a facade whose macros expand
+/// to nothing, so the answer a caller gets is the only report there is.)
 pub(crate) fn pbcopy(text: &str) -> bool {
     #[cfg(target_os = "macos")]
     {
@@ -83,6 +96,11 @@ pub(crate) fn pbcopy(text: &str) -> bool {
     }
     #[cfg(target_os = "linux")]
     {
+        // A window on Wayland owns its selections through its own seat
+        // (`clipboard_wayland`); everything else is the X11 backend.
+        if let Some(wayland) = crate::clipboard_wayland::handle() {
+            return wayland.copy(crate::clipboard_wayland::WaylandSelection::Clipboard, text);
+        }
         crate::clipboard_x11::X11Clipboard::get_handle()
             .is_some_and(|c| c.set(crate::clipboard_x11::Sel::Clipboard, text))
     }
@@ -153,6 +171,9 @@ pub(crate) fn pbpaste() -> Option<String> {
     }
     #[cfg(target_os = "linux")]
     {
+        if let Some(wayland) = crate::clipboard_wayland::handle() {
+            return wayland.paste(crate::clipboard_wayland::WaylandSelection::Clipboard);
+        }
         crate::clipboard_x11::X11Clipboard::get_handle()
             .and_then(|c| c.get(crate::clipboard_x11::Sel::Clipboard))
     }
@@ -180,6 +201,9 @@ pub(crate) fn pbpaste_owned() -> Option<String> {
     if let Some(stub) = PBPASTE_STUB.with(|s| s.borrow().clone()) {
         return (!stub.is_empty()).then_some(stub);
     }
+    if let Some(wayland) = crate::clipboard_wayland::handle() {
+        return wayland.paste_owned(crate::clipboard_wayland::WaylandSelection::Clipboard);
+    }
     crate::clipboard_x11::X11Clipboard::get_handle()
         .and_then(|c| c.get_owned(crate::clipboard_x11::Sel::Clipboard))
 }
@@ -192,6 +216,9 @@ pub(crate) fn pbpaste_owned() -> Option<String> {
 pub(crate) fn primary_set(text: &str) -> bool {
     #[cfg(target_os = "linux")]
     {
+        if let Some(wayland) = crate::clipboard_wayland::handle() {
+            return wayland.copy(crate::clipboard_wayland::WaylandSelection::Primary, text);
+        }
         crate::clipboard_x11::X11Clipboard::get_handle()
             .is_some_and(|c| c.set(crate::clipboard_x11::Sel::Primary, text))
     }
@@ -213,6 +240,9 @@ pub(crate) fn primary_set(text: &str) -> bool {
 pub(crate) fn primary_get() -> Option<String> {
     #[cfg(target_os = "linux")]
     {
+        if let Some(wayland) = crate::clipboard_wayland::handle() {
+            return wayland.paste(crate::clipboard_wayland::WaylandSelection::Primary);
+        }
         crate::clipboard_x11::X11Clipboard::get_handle()
             .and_then(|c| c.get(crate::clipboard_x11::Sel::Primary))
     }
@@ -245,6 +275,9 @@ pub(crate) fn primary_get_owned() -> Option<String> {
     #[cfg(test)]
     if let Some(stub) = PRIMARY_STUB.with(|s| s.borrow().clone()) {
         return (!stub.is_empty()).then_some(stub);
+    }
+    if let Some(wayland) = crate::clipboard_wayland::handle() {
+        return wayland.paste_owned(crate::clipboard_wayland::WaylandSelection::Primary);
     }
     crate::clipboard_x11::X11Clipboard::get_handle()
         .and_then(|c| c.get_owned(crate::clipboard_x11::Sel::Primary))

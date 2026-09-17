@@ -529,10 +529,44 @@ pub fn hdr_present_gate_model() -> Model {
 /// `Buggy=1` recreates both defects: ignore a failed live re-tag, or leave the
 /// attempted upgrade f16 after its tag fails.
 ///
-/// Tier-1 is `aterm-gpu/tests/hdr_gate.rs`: it drives the shipping
-/// `hdr_reconfigure_plan`, projects both concrete outcomes onto these variables,
-/// checks the real transitions against this model, and includes the old
-/// ignore-failure policy as a negative control.
+/// Tier-1 is in aterm-gpu, in two halves, and every action is `#[refines]`-bound
+/// to BOTH:
+/// * `tests/hdr_gate.rs` enumerates the shipping `hdr_reconfigure_plan` over its
+///   whole boolean domain — the PLANNER decision.
+/// * `src/renderer.rs`'s `hdr_reconfigure_apply_conforms_to_retag_model` drives
+///   the concrete `WindowGpu::apply_hdr_reconfigure_plan` /
+///   `apply_hdr_surface_upgrade` on a real window and projects the result with
+///   `project_hdr_reconfigure_state`. It is an in-crate test because those two
+///   applies are private.
+///
+/// WHAT THE PROJECTION MEASURES, variable by variable. The binding claims this
+/// and no more; read it before trusting a green anchor count:
+/// * `capture_linear` is READ BACK off the window after the shipping apply ran.
+///   It is the only one of the four that can disagree with what the test
+///   expected, so it is what makes this a binding rather than a restatement of
+///   the planner: an apply that skips its metadata half lands on no model
+///   successor at all, and violates `CaptureMatchesSurfaceEncoding` outright.
+/// * `is_f16` is the PLANNER's resolved format, NOT a post-apply surface read.
+///   The format half is composed on the `GpuSurface` inside
+///   `GpuRenderer::finish_surface_color_space_recovery`, which no unit test can
+///   drive — it needs the real DX12 swapchain recreation that clears the
+///   colour-space tag. That seam is held instead by `hdr_gate.rs`'s source-region
+///   gate (`every_live_surface_reconfigure_routes_through_hdr_recovery`), which
+///   requires the SDR escape to select `surf.sdr_format`, configure it, publish
+///   it as the cached format, and only then reconcile capture metadata — in that
+///   order, with no scRGB re-tag follow-up.
+/// * `stage` and `retagged` are DRIVE COORDINATES the test supplies. No code
+///   distinguishes `RetagFails` from `EnterSdrFallback`: both are the same
+///   concrete apply, read at two lifecycle phases, and the phase itself
+///   (`!surf.is_hdr() && self.hdr_glow && surf.supports_f16`) lives on the
+///   renderer, out of a `WindowGpu` projection's reach. The same source gate is
+///   what holds that condition, and the gate is likewise what holds the
+///   `if surf.is_hdr()` guard that picks `UpgradeSucceeds` over `UpgradeFails`.
+///
+/// Both halves include the old ignore-failure policy as a negative control. The
+/// split is deliberate: a binding that stopped at the planner would stay green
+/// if an apply forgot its metadata half, which is precisely what
+/// `CaptureMatchesSurfaceEncoding` exists to forbid.
 #[must_use]
 #[cfg_attr(trust_verify, trust::skip)]
 pub fn hdr_reconfigure_retag_model() -> Model {

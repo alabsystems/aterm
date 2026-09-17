@@ -1685,3 +1685,232 @@ pub fn net_dial_after_grant_model() -> Model {
         inv: "DialImpliesGranted",
     })
 }
+
+/// **ALT-SCREEN ARCHIVE POOL, CHARGED AGAINST THE PROCESS** — the retention
+/// budget belongs to the machine's memory, so it is charged against EVERY live
+/// archive at once.
+///
+/// This is the same shape as [`flash_limiter_window_model`]: a correct theorem
+/// about ONE archive ("it never retains more than its budget") stays true no
+/// matter how many archives exist, which is exactly why it cannot see the
+/// defect it is meant to rule out. Give every tab its own 4 MiB policy and each
+/// archive independently satisfies its own bound while the PROCESS pays N times
+/// over — measured at 8 × 4 MiB before the pool existed.
+///
+/// So this model carries TWO archives (`a`, `b`: rows retained) and three
+/// dials:
+///
+/// * `Instances` — how many archives are joined. `CommitB` is admitted only
+///   when `Instances > 1`, so `Instances = 1` collapses this onto the
+///   single-archive theorem.
+/// * `Local` — WHAT each archive consults when it evicts. `Local = 0`
+///   (committed) is the shipping shape: a SHARE of one pool. `Local = 1` is the
+///   pre-pool world, each archive keeping the whole `Total`.
+/// * `Buggy` — WHICH archives count toward the share. `Buggy = 0` (committed)
+///   counts an archive only while it is DRAWING on the pool — enabled AND
+///   holding rows. `Buggy = 1` is the review blocker: an archive counts as soon
+///   as it is joined, holding or not, so eight open tabs divide the pool by
+///   eight while one of them runs `vim`.
+///
+/// # The two invariants have one victim each, and that is the point
+///
+/// `PoolBounded` is charged against the SUM, because the process's memory is.
+/// It is stated over SETTLED archives — one whose retention is inside its
+/// CURRENT allowance — because that is exactly what the code guarantees and no
+/// more: an archive can only lower its OWN retention (reaching into seven other
+/// terminals' mutexes from whichever thread opened a tab is how deadlocks are
+/// written), so one that filled up while alone keeps those rows until its next
+/// commit. The bound CONVERGES rather than holding at every instant, and the
+/// antecedent is what says so. At `Local = 1` two individually-correct archives
+/// break it at every corner — multiplication alone is the defect.
+///
+/// `IdleTakesNothing` says an archive holding nothing costs the archives that
+/// do nothing: while `b` is empty, `a`'s allowance is the whole `Total`. This
+/// is the invariant `Buggy = 1` violates, and it violates it immediately —
+/// the idle tab takes its share the moment it joins. `Local` cannot damage it
+/// (a local archive's allowance is `Total` by construction), which is what
+/// makes the G5 attribution corner meaningful.
+///
+/// Sizes are the smallest that separate the cases: `Total = 4` rows with
+/// `Half = 2`, because the IR has no division. Tier-1 binding: aterm-core's
+/// `alt_archive_pool_conformance_real_archives_project_onto_model` drives the
+/// REAL `AltArchive` pair through the same commits and projects every retention
+/// onto this model.
+#[must_use]
+// Skip (T2 vcgen-budget lane): a spec-model DATA constructor — the MODEL it
+// returns is what `ty` machine-checks.
+#[cfg_attr(trust_verify, trust::skip)]
+pub fn alt_archive_pool_model() -> Model {
+    crate::ty_model! {
+        AltArchivePool {
+            const Buggy = 0;      // 1 = a joined-but-empty archive still takes a share
+            const Local = 0;      // 1 = each archive keeps its OWN whole budget
+            const Instances = 2;  // archives joined to the pool
+            const Total = 4;      // the pool, in rows
+            const Half = 2;       // Total / 2 — the IR has no division
+            var a = 0;            // rows retained by archive A
+            var b = 0;            // rows retained by archive B
+            var steps = 0;        // run bound
+
+            // A commits one frame: the row goes in, then `evict` trims to what
+            // A may retain RIGHT NOW. A counts ITSELF (it is drawing on the
+            // pool), so the share is read with itself already in the divisor —
+            // a share computed without it is one share too generous.
+            action CommitA when (steps <= 9) {
+                steps = steps + 1;
+                a = if Local == 1 {
+                        (if a + 1 > Total { Total } else { a + 1 })
+                    } else {
+                        (if (if Buggy == 1 { if Instances > 1 { 1 } else { 0 } }
+                             else { if b > 0 { 1 } else { 0 } }) > 0
+                         { (if a + 1 > Half { Half } else { a + 1 }) }
+                         else { (if a + 1 > Total { Total } else { a + 1 }) })
+                    };
+            }
+
+            // B is the SECOND archive and exists only in a multi-archive world.
+            action CommitB when (steps <= 9 && Instances > 1) {
+                steps = steps + 1;
+                b = if Local == 1 {
+                        (if b + 1 > Total { Total } else { b + 1 })
+                    } else {
+                        (if (if Buggy == 1 { 1 }
+                             else { if a > 0 { 1 } else { 0 } }) > 0
+                         { (if b + 1 > Half { Half } else { b + 1 }) }
+                         else { (if b + 1 > Total { Total } else { b + 1 }) })
+                    };
+            }
+
+            // B leaves the alt screen: its rows go, and with them its claim on
+            // the pool. This is what makes `IdleTakesNothing` reachable from a
+            // state where B once held something.
+            action WipeB when (steps <= 9 && Instances > 1) {
+                steps = steps + 1;
+                b = 0;
+            }
+
+            // THE POOL IS ONE TOTAL. Charged against the sum, over SETTLED
+            // archives only (see the doc): an archive over its current
+            // allowance has not drawn since the allowance moved, and comes
+            // within it on its next frame.
+            invariant PoolBounded:
+                (a > (if Local == 1 { Total }
+                      else { if (if Buggy == 1 { if Instances > 1 { 1 } else { 0 } }
+                                 else { if b > 0 { 1 } else { 0 } }) > 0
+                             { Half } else { Total } }))
+                || (b > (if Local == 1 { Total }
+                         else { if (if Buggy == 1 { 1 }
+                                    else { if a > 0 { 1 } else { 0 } }) > 0
+                                { Half } else { Total } }))
+                || (a + b <= Total);
+
+            // AN ARCHIVE HOLDING NOTHING COSTS THE ONES THAT DO NOTHING. While
+            // B is empty, A may fill the whole pool.
+            invariant IdleTakesNothing:
+                (b > 0)
+                || (Total <= (if Local == 1 { Total }
+                              else { if (if Buggy == 1 { if Instances > 1 { 1 } else { 0 } }
+                                         else { if b > 0 { 1 } else { 0 } }) > 0
+                                     { Half } else { Total } }));
+        }
+    }
+}
+
+/// **WEARING A CAT IS A JOIN, SO TWO INSTANCES CONVERGE AND NEITHER LOSES ITS
+/// PICK** — the sentence the kitty-collection merge ships in prose, checked.
+///
+/// The collection is replicated: every aterm instance keeps its own copy and
+/// folds the others in. `KittyLog::merge_collectible` takes `max_ts` on the
+/// favourite stamp, which makes the merge a JOIN on a semilattice — commutative,
+/// idempotent, and order-independent. That is the whole reason a wear needs no
+/// unpin and no tombstone to be reliable, and it was asserted in a commit
+/// message with nothing behind it.
+///
+/// Two replicas, two collected cats, a logical clock, and the two flush
+/// directions in either order. `Buggy = 1` is the obvious wrong merge — TAKE the
+/// incoming value rather than the max, last-writer-by-ARRIVAL — which is what a
+/// reader reaches for when a merge looks like an assignment.
+///
+/// The invariant that IS stated carries its own victim, which is what keeps a
+/// checked law honest:
+///
+/// * `AMergeNeverLosesAPick` is the CRDT property. `b*_hi` records each stamp's
+///   value BEFORE the action that writes it (updates are simultaneous, so the
+///   right-hand side reads the pre-state), so `b*_hi <= b*` says a stamp never
+///   went BACKWARDS. `Buggy = 1` breaks it the moment a flush carrying a stale
+///   row lands on a replica that has since worn something: B's own later pick is
+///   overwritten by A's older one, which is a pin the user made and the machine
+///   silently dropped.
+///
+/// CONVERGENCE ITSELF IS NOT STATED AS AN INVARIANT, deliberately. It follows
+/// from the join and it is what the sentence in the commit message claims — but
+/// NO mutant of a single `Buggy` dial can falsify it, because an assignment
+/// merge converges too (just on the wrong value). This suite's own standard,
+/// `assert_every_invariant_carries_a_mutant`, calls an invariant no mutant can
+/// break a GHOST and fails the build for it, having caught two shipped ones
+/// already. So convergence is witnessed as a concrete TRACE in the discharge
+/// test instead of dressed up as a checked law. The law that carries the mutant
+/// is the one above, and it is the load-bearing half anyway: a join that never
+/// goes backwards is what MAKES the ledgers converge.
+///
+/// Tier-1 binding: aterm-gui's
+/// `a_wear_reaches_the_delta_or_it_does_not_survive_a_restart` drives the real
+/// `KittyLogHost::wear` and `adopt_wear` through the delta this model flushes.
+#[must_use]
+// Skip (T2 vcgen-budget lane): a spec-model DATA constructor — the MODEL it
+// returns is what `ty` machine-checks.
+#[cfg_attr(trust_verify, trust::skip)]
+pub fn kitty_pin_merge_model() -> Model {
+    crate::ty_model! {
+        KittyPinMerge {
+            const Buggy = 0;  // 1 = a merge TAKES the incoming stamp, not the max
+            var a1 = 0;       // replica A's favourite stamp for cat one
+            var a2 = 0;       // replica A's favourite stamp for cat two
+            var b1 = 0;       // replica B's, for cat one
+            var b2 = 0;       // replica B's, for cat two
+            var b1_hi = 0;    // the greatest stamp B held for cat one BEFORE now
+            var b2_hi = 0;
+            var ab = 0;       // A's delta has reached B since the last wear
+            var clock = 0;    // logical clock; each wear takes the next tick
+            var steps = 0;    // run bound
+
+            // The user on instance A wears cat one.
+            action WearOneOnA when (steps <= 5 && clock <= 2) {
+                steps = steps + 1;
+                clock = clock + 1;
+                a1 = clock + 1;
+                ab = 0;
+            }
+
+            // The user on instance B wears cat two.
+            action WearTwoOnB when (steps <= 5 && clock <= 2) {
+                steps = steps + 1;
+                clock = clock + 1;
+                b2 = clock + 1;
+                b2_hi = if b2 > b2_hi { b2 } else { b2_hi };
+                ab = 0;
+            }
+
+            // A's delta lands in B's ledger.
+            action FlushAToB when (steps <= 5) {
+                steps = steps + 1;
+                b1 = if Buggy == 1 { a1 } else { (if a1 > b1 { a1 } else { b1 }) };
+                b2 = if Buggy == 1 { a2 } else { (if a2 > b2 { a2 } else { b2 }) };
+                b1_hi = if b1 > b1_hi { b1 } else { b1_hi };
+                b2_hi = if b2 > b2_hi { b2 } else { b2_hi };
+                ab = 1;
+            }
+
+            // And B's lands in A's.
+            action FlushBToA when (steps <= 5 && ab == 1) {
+                steps = steps + 1;
+                a1 = if Buggy == 1 { b1 } else { (if b1 > a1 { b1 } else { a1 }) };
+                a2 = if Buggy == 1 { b2 } else { (if b2 > a2 { b2 } else { a2 }) };
+            }
+
+            // A STAMP NEVER GOES BACKWARDS: a merge is a join, so no pin the
+            // user made is ever silently dropped.
+            invariant AMergeNeverLosesAPick: b1_hi <= b1 && b2_hi <= b2;
+        }
+    }
+}

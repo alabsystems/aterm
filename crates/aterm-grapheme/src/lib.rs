@@ -53,9 +53,9 @@ pub use position::{byte_to_column, column_to_char_index};
 pub use tables::{char_width, char_width_cjk, is_ambiguous_width, str_width, str_width_cjk};
 pub use types::{Grapheme, GraphemeInfo};
 pub use width::{
-    grapheme_display_width, grapheme_display_width_with_config, grapheme_width,
-    grapheme_width_with_config, is_emoji_char, is_emoji_modifier_base, split_graphemes,
-    split_graphemes_with_config,
+    grapheme_display_width, grapheme_display_width_with_config, grapheme_grid_columns,
+    grapheme_width, grapheme_width_with_config, is_emoji_char, is_emoji_modifier_base,
+    split_graphemes, split_graphemes_with_config, str_grid_columns,
 };
 
 // === Test/Kani-only API ===

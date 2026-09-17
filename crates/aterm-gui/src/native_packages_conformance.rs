@@ -28,6 +28,9 @@ fn report(outcome: &str) -> PackagesStatusReport {
         outcome: outcome.to_string(),
         seams: Vec::new(),
         last_success_at: String::new(),
+        last_index_reached_at: String::new(),
+        last_index_build: 0,
+        index_build_changed_at: String::new(),
         programs: std::collections::BTreeMap::new(),
     };
     PackagesStatusReport::from_parts(true, true, "fp".to_string(), Some(&status), &[])

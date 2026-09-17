@@ -667,6 +667,39 @@ pub(crate) fn cmd_dims(
 /// and `perf_reduced` + `shed_transitions` (the load-shed latch; engaged during light
 /// typing, or flapping at idle, are both wrong).
 ///
+/// WHEN, AND WHOSE. A worst case with no time of occurrence cannot be
+/// correlated with anything else that happened in the process, and a LAST-WRITER
+/// lateness reading is erased before anyone can read it: a live line carried
+/// `max_present_latency_ms=560.54` beside `wake_late_ms=0.00
+/// deadline_late_ms=0.00`, because a late `Timer` wake's lateness is overwritten
+/// with `0` by the next `WaitCancelled` — one per output burst. So the summary
+/// also carries `max_wake_late_ms`/`max_deadline_late_ms` with the OWNER and the
+/// `_at_ms` instant of each, `max_present_latency_at_ms` /
+/// `max_input_present_at_ms`, and `max_present_latency_gap_ms` — the
+/// present→present gap of the frame that set the present max, which separates
+/// "nothing presented for that long" from "frames kept coming while this output
+/// waited". Every `_at_ms` is on the process clock `metrics_now_ms` reads at the
+/// same instant, so "how long ago" is one subtraction. A spike over 100 ms also
+/// writes ONE `aterm.log` line per 10 s in EVERY build — the only other
+/// per-spike record is `$ATERM_TRACE_LATENCY`'s stderr line, and the release
+/// stall watchdog's threshold is 5 s.
+///
+/// THE PARK OUTSIDE THE REDRAW. Everything named so far prices a redraw, a
+/// wake's lateness, or an end-to-end interval that contains both. None of them
+/// could name a main thread parked inside a NON-redraw handler for 100–600 ms —
+/// too short for the 5 s release stall watchdog, never inside the redraw timer,
+/// and charged in full to `present_latency` and `input_present`. So the summary
+/// carries the MAIN-LOOP TURN census (`crate::watchdog`): `max_turn_ms` with the
+/// winit root that owned it (`max_turn_owner=user_event`) and the `_at_ms`
+/// instant it ended, plus `last_turn_ms`, the `turns` booked and the
+/// `long_turns` among them at or over `long_turn_threshold_ms` (one 30 fps frame
+/// budget). Read the max AGAINST `max_redraw_total_ms`: both large is a slow
+/// frame, a large `max_turn_ms` with a small `max_redraw_total_ms` is a park no
+/// other instrument reaches — the bookkeeping the `Wake::Output` arm runs ahead
+/// of its redraw fan-out being the standing candidate. A turn that never ENDS
+/// books nothing here by construction; that one is the stall watchdog's, and it
+/// logs a named root.
+///
 /// THE TAIL, ON THE SUMMARY LINE. `last_` is a momentary reading and `max_` is
 /// an unbounded worst case; neither brackets a distribution. During the 2026-08
 /// spin `last_input_present_ms=8.1` read healthy while the live p99 was 335 ms.
@@ -674,6 +707,17 @@ pub(crate) fn cmd_dims(
 /// `n_present` + `present_p50/p95/p99_ms` — the same histograms `percentiles`
 /// publishes, so a healthy median cannot mask a sick tail from a reader who
 /// asked only one question.
+///
+/// US OR THEM, ON THE SAME LINE. Every slice named so far measures ATERM, so a
+/// sick tail among them cannot say whose lag it is. The summary therefore also
+/// carries [`crate::echo_rtt`]'s fragment — `n_echo` + `echo_p50/p95/p99_ms`,
+/// `echo_last_/echo_max_ms`, and the `echo_arms`/`echo_coalesced`/
+/// `echo_expired`/`echo_dropped_locked` ledger that qualifies them — measuring
+/// bytes out to the PTY → the first bytes back, which belongs to the CHILD.
+/// Read against `input_*`: echo high with input low means the program is
+/// behind; the reverse means we are. It is spliced whole, never as a lone
+/// percentile, and aterm cannot fix a sick one by fiat — it can only decline to
+/// compete with the child (its gate, cutter and package lanes run at utility).
 ///
 /// PRESENT-LATENCY HONESTY. `present_*` describes aterm ONLY while the window is
 /// actually presenting, so an output→present sample taken while the window was
@@ -702,10 +746,11 @@ pub(crate) fn cmd_dims(
 ///    lone `last_`/`max_`.
 ///  * `input_*` (`key-arrival→content-present-return`) has the mirror problem in
 ///    the other direction, already stated at `INPUT_STAMP_NS`: a keystroke that
-///    produces no output is discarded after 5 s rather than booked, and under
-///    CONCURRENT streaming output the closing present may be a log-line frame
-///    rather than the key's own echo — so it reads LOW, never high. It is a
-///    starvation detector, not an echo-attribution profiler.
+///    produces no output is discarded after 5 s rather than booked. A key routed
+///    to a window is closed only by THAT window's content present (a streaming
+///    session in another window cannot close it); under CONCURRENT streaming
+///    output in the SAME window the closing present may still be a log-line
+///    frame rather than the key's own echo — so it reads LOW, never high.
 ///
 ///  * `resize_present` has the same shape with a 2 s bound
 ///    (`RESIZE_SLICE_CAP_NS`) and closes on ANY successful present, not only a
@@ -714,7 +759,10 @@ pub(crate) fn cmd_dims(
 ///    interval is inside the number.
 ///
 /// None of them is key→photon: all stop at application-present return, upstream
-/// of compositor selection, scanout and display.
+/// of compositor selection, scanout and display. The leg after that return is
+/// published separately under `percentiles` as `present_glass`
+/// (`presentDrawable:` registration → the drawable's `presentedTime`); it still
+/// stops at the display's reported present time, not at photons.
 ///
 /// FRAME-EXTRACTION ATTRIBUTION. `frame_refills_scoped` / `frame_refills_full`
 /// split the presented-path refills between the damage-scoped arm and the full
@@ -786,6 +834,13 @@ pub(crate) fn cmd_metrics(term: Option<&Arc<Mutex<Terminal>>>, rest: &str) -> St
     if rest.trim() == "percentiles" {
         let (input, present, render) = crate::metrics::distributions();
         let key_write = crate::metrics::key_write_distribution();
+        // THE OS-QUEUE SHARE OF `key_write`. The key-arrival stamp is backdated by
+        // the NSEvent queue age, so `key_write_*` (and `input_*`) price a parked
+        // event loop — and used to price it INSEPARABLY: an 18.13 ms max could be
+        // 17 ms of queue wait or 17 ms of on-thread dispatch, which are opposite
+        // fixes. Published beside the total it splits, never instead of it.
+        let key_queue = crate::metrics::key_queue_distribution();
+        let (last_key_queue_ns, max_key_queue_ns) = crate::metrics::key_queue_last_max_ns();
         let pre_present = crate::metrics::pre_present_distribution();
         // The drawable-park slice. Until this existed the largest known macOS typing
         // stall could only be estimated as `redraw_total - compose - render`, mixed
@@ -797,6 +852,14 @@ pub(crate) fn cmd_metrics(term: Option<&Arc<Mutex<Terminal>>>, rest: &str) -> St
         // percentiles it qualifies (and on the summary line, which is the read
         // most drivers actually take).
         let (last_acquire_ns, max_acquire_ns) = crate::metrics::acquire_wait_last_max_ns();
+        // THE LEG IN FRONT OF THE PARK. `acquire_*` starts its clock inside the
+        // drawable worker, so it reports what `nextDrawable` cost and nothing
+        // of the wait to be scheduled to call it — a wait the frame spends
+        // parked on `AcquirePending`. Its own slice, so a worker starved behind
+        // other runnable threads is attributable instead of landing in
+        // `input_present` with no cause.
+        let acquire_queue = crate::metrics::acquire_queue_distribution();
+        let (last_queue_ns, max_queue_ns) = crate::metrics::acquire_queue_last_max_ns();
         // The live-drag STALE-FRAME window: bounds change → first frame submitted
         // at the new size. For that interval the compositor has new bounds and an
         // old drawable, so it shows the previous frame rescaled — the smear a drag
@@ -820,14 +883,20 @@ pub(crate) fn cmd_metrics(term: Option<&Arc<Mutex<Terminal>>>, rest: &str) -> St
              n_present={} present_p50_ms={:.2} present_p95_ms={:.2} present_p99_ms={:.2} \
              n_render={} render_p50_ms={:.2} render_p95_ms={:.2} render_p99_ms={:.2} \
              n_key_write={} key_write_p50_ms={:.2} key_write_p95_ms={:.2} \
-             key_write_p99_ms={:.2} n_pre_present={} pre_present_p50_ms={:.2} \
+             key_write_p99_ms={:.2} \
+             n_key_queue={} key_queue_p50_ms={:.2} key_queue_p95_ms={:.2} \
+             key_queue_p99_ms={:.2} last_key_queue_ms={:.2} max_key_queue_ms={:.2} \
+             n_pre_present={} pre_present_p50_ms={:.2} \
              pre_present_p95_ms={:.2} pre_present_p99_ms={:.2} \
              n_acquire={} acquire_p50_ms={:.2} acquire_p95_ms={:.2} acquire_p99_ms={:.2} \
              last_acquire_wait_ms={:.2} max_acquire_wait_ms={:.2} \
+             n_acquire_queue={} acquire_queue_p50_ms={:.2} \
+             acquire_queue_p95_ms={:.2} acquire_queue_p99_ms={:.2} \
+             last_acquire_queue_ms={:.2} max_acquire_queue_ms={:.2} \
              n_resize={} resize_p50_ms={:.2} resize_p95_ms={:.2} resize_p99_ms={:.2} \
              n_reflow={} reflow_p50_ms={:.2} reflow_p95_ms={:.2} reflow_p99_ms={:.2} \
              n_present_tainted={} present_tainted_p50_ms={:.2} \
-             present_tainted_p95_ms={:.2} present_tainted_p99_ms={:.2}{}{}\n",
+             present_tainted_p95_ms={:.2} present_tainted_p99_ms={:.2}{}{}{}\n",
             input.count(),
             p(input, 0.50),
             p(input, 0.95),
@@ -844,6 +913,12 @@ pub(crate) fn cmd_metrics(term: Option<&Arc<Mutex<Terminal>>>, rest: &str) -> St
             p(key_write, 0.50),
             p(key_write, 0.95),
             p(key_write, 0.99),
+            key_queue.count(),
+            p(key_queue, 0.50),
+            p(key_queue, 0.95),
+            p(key_queue, 0.99),
+            ms(last_key_queue_ns),
+            ms(max_key_queue_ns),
             pre_present.count(),
             p(pre_present, 0.50),
             p(pre_present, 0.95),
@@ -854,6 +929,12 @@ pub(crate) fn cmd_metrics(term: Option<&Arc<Mutex<Terminal>>>, rest: &str) -> St
             p(acquire, 0.99),
             ms(last_acquire_ns),
             ms(max_acquire_ns),
+            acquire_queue.count(),
+            p(acquire_queue, 0.50),
+            p(acquire_queue, 0.95),
+            p(acquire_queue, 0.99),
+            ms(last_queue_ns),
+            ms(max_queue_ns),
             resize.count(),
             p(resize, 0.50),
             p(resize, 0.95),
@@ -875,6 +956,9 @@ pub(crate) fn cmd_metrics(term: Option<&Arc<Mutex<Terminal>>>, rest: &str) -> St
             // the child. Formatted by `echo_rtt` itself so its percentiles can
             // never be published apart from the counters that qualify them.
             crate::echo_rtt::percentile_fields_text(),
+            // PRESENT → GLASS: the compositor leg after present-return that
+            // every slice above stops short of.
+            crate::metrics::present_glass_fields_text(),
         );
     }
     if rest.trim() == "reset" {
@@ -893,6 +977,18 @@ pub(crate) fn cmd_metrics(term: Option<&Arc<Mutex<Terminal>>>, rest: &str) -> St
     // p95/p99 the `percentiles` verb already computed now ride the SUMMARY, so
     // a healthy median can never again mask a sick tail from a reader who did
     // not think to ask a second question.
+    //
+    // AND THE CHILD'S SLICE WITH THEM (2026-09-15). That rule was first applied
+    // to `input` and `present` only — both of them ATERM's own — so the summary
+    // could report a sick tail and still not say WHOSE. During a typing-lag
+    // episode the owner read `max_present_latency_ms=560.54` and
+    // `input_p99_ms=83.89` off this line and filed an aterm present regression;
+    // `metrics percentiles` in the same minute held the answer, `n_echo=499
+    // echo_p95_ms=75.69 echo_p99_ms=150.04 echo_max_ms=367.85` against aterm's
+    // own `key_write_p99_ms=6.29` and `render_p99_ms=2.36` — the child waiting
+    // for the scheduler, not aterm failing to paint. A second question nobody
+    // asks mid-incident is not a published fact, so the echo fragment rides the
+    // summary too.
     let (h_input, h_present, _) = crate::metrics::distributions();
     let pct = |h: &crate::metrics::Histogram, q: f64| ms(h.percentile(q).unwrap_or(0));
     let arms = crate::metrics::deadline_arm_attribution();
@@ -919,6 +1015,7 @@ pub(crate) fn cmd_metrics(term: Option<&Arc<Mutex<Terminal>>>, rest: &str) -> St
          pre_present_attempts={} last_pre_present_ms={:.2} pre_present_total_ms={:.2} \
          max_pre_present_ms={:.2} \
          last_acquire_wait_ms={:.2} max_acquire_wait_ms={:.2} \
+         last_gpu_park_ms={:.2} max_gpu_park_ms={:.2} \
          present_drops={} last_present_drop_reason={} last_present_drop_parked={} \
          present_tainted={} last_present_tainted_ms={:.2} max_present_tainted_ms={:.2} \
          capture_episodes={} capture_active={} \
@@ -927,7 +1024,7 @@ pub(crate) fn cmd_metrics(term: Option<&Arc<Mutex<Terminal>>>, rest: &str) -> St
          deadline_in_ms={:.2} deadline_late_ms={:.2} past_deadline_arms={} \
          deadline_arms_by_owner={} \
          past_arm_streak_heals={} \
-         stale_arm_heals={} \
+         stale_arm_heals={}{} \
          max_frame_gap_ms={:.2} \
          rust_main_to_first_present_ms={:.2} \
          rust_main_to_first_visible_ms={:.2} \
@@ -962,7 +1059,7 @@ pub(crate) fn cmd_metrics(term: Option<&Arc<Mutex<Terminal>>>, rest: &str) -> St
          startup_gpu_cell_pipeline_ms={} \
          effect_pipeline_builds={} effect_pipeline_build_ms={:.2} \
          effect_pipelines_built={} \
-         first_present_ms={:.2} first_visible_ms={:.2}\n",
+         first_present_ms={:.2} first_visible_ms={:.2}{}{}\n",
         m.frames_presented,
         ms(m.last_present_latency_ns),
         ms(m.max_present_latency_ns),
@@ -1015,6 +1112,13 @@ pub(crate) fn cmd_metrics(term: Option<&Arc<Mutex<Terminal>>>, rest: &str) -> St
         // acquire of a run was, until now, unpublishable.
         ms(m.last_acquire_wait_ns),
         ms(m.max_acquire_wait_ns),
+        // THE OTHER MAIN-THREAD GPU BLOCK. The armed arm parks in
+        // `waitUntilCompleted` twice per present (the Submit-A pipelining wait,
+        // the pending-ring drain). The first used to be charged to
+        // `frame_render` and the second to nothing at all; both are published
+        // here so a contention stall is attributable at a glance.
+        ms(m.last_gpu_park_ns),
+        ms(m.max_gpu_park_ns),
         m.present_drops,
         m.last_present_drop_reason.as_str(),
         u8::from(m.last_present_drop_parked),
@@ -1037,6 +1141,15 @@ pub(crate) fn cmd_metrics(term: Option<&Arc<Mutex<Terminal>>>, rest: &str) -> St
         deadline_arm_pairs(&arms),
         streak_heal_pairs(&streak_heals),
         m.stale_arm_heals,
+        // WHEN, AND WHOSE (2026-09-15 attribution audit). `wake_late_ms` and
+        // `deadline_late_ms` above are LAST-WRITER readings — the next wake
+        // stores 0 over a late timer — and every `max_` on this line used to
+        // carry no time of occurrence. This fragment publishes the worst wake
+        // and deadline lateness with the owner and instant of each, the
+        // instants of the present/input maxima, the frame gap that says whether
+        // the present max was a stall or an idle stretch, and the process-clock
+        // `metrics_now_ms` that anchors all of them.
+        crate::metrics::lateness_fields_text(),
         ms(m.max_frame_gap_ns),
         ms(m.rust_main_to_first_present_ns),
         ms(m.rust_main_to_first_visible_ns),
@@ -1096,6 +1209,22 @@ pub(crate) fn cmd_metrics(term: Option<&Arc<Mutex<Terminal>>>, rest: &str) -> St
         effect_pipeline_names(m.effect_pipeline_built_mask),
         ms(m.first_present_ns),
         ms(m.first_visible_ns),
+        // THE CHILD'S SLICE, ON THE SUMMARY LINE (2026-09-15 misattribution).
+        // Every other field above measures ATERM. This one measures the program
+        // on the far side of the PTY, and without it the summary cannot answer
+        // the only question a lag report actually asks. Spliced as the WHOLE
+        // fragment `echo_rtt` publishes, never a cherry-picked p99: its
+        // percentiles may not be read apart from the sample/coalesce/expiry
+        // ledger that qualifies them.
+        crate::echo_rtt::percentile_fields_text(),
+        // THE PARK OUTSIDE THE REDRAW. Every slice above prices a redraw, a
+        // wake's lateness or an end-to-end interval; none of them can name a
+        // main thread parked in a NON-redraw handler, which is how
+        // `max_present_latency_ms=560.54` came to sit beside a bounded
+        // `max_redraw_total_ms=13.84` with no publishable producer. Spliced
+        // whole, never as a lone max: the count and the long-turn tally are what
+        // separate one hitch from a main thread that is late all the time.
+        crate::watchdog::turn_census_fields_text(),
     )
 }
 
@@ -1309,6 +1438,11 @@ pub(crate) fn cmd_metrics_json(term: Option<&Arc<Mutex<Terminal>>>, command: &st
     if command.trim() == "percentiles" {
         let (input, present, render) = crate::metrics::distributions();
         let key_write = crate::metrics::key_write_distribution();
+        // Twin of the text form's key-queue split (see there): the OS-event-queue
+        // share the `key_write` total is backdated by, without which a high total
+        // cannot be told from on-thread dispatch cost.
+        let key_queue = crate::metrics::key_queue_distribution();
+        let (last_key_queue_ns, max_key_queue_ns) = crate::metrics::key_queue_last_max_ns();
         let pre_present = crate::metrics::pre_present_distribution();
         // `acquire` was published by the TEXT form and omitted here, so a JSON
         // driver could not read the drawable-park slice at all; `resize` is new.
@@ -1316,6 +1450,10 @@ pub(crate) fn cmd_metrics_json(term: Option<&Arc<Mutex<Terminal>>>, command: &st
         let acquire = crate::metrics::acquire_wait_distribution();
         // Twin of the text form's park scalars (see there).
         let (last_acquire_ns, max_acquire_ns) = crate::metrics::acquire_wait_last_max_ns();
+        // Twin of the text form's queue slice (see there): the worker's
+        // scheduling delay, which the park figures cannot express.
+        let acquire_queue = crate::metrics::acquire_queue_distribution();
+        let (last_queue_ns, max_queue_ns) = crate::metrics::acquire_queue_last_max_ns();
         let resize = crate::metrics::resize_present_distribution();
         let tainted = crate::metrics::tainted_present_distribution();
         let p = |h: &crate::metrics::Histogram, q: f64| ms(h.percentile(q).unwrap_or(0));
@@ -1325,17 +1463,24 @@ pub(crate) fn cmd_metrics_json(term: Option<&Arc<Mutex<Terminal>>>, command: &st
              \"present_p95_ms\":{:.2},\"present_p99_ms\":{:.2},\"n_render\":{},\
              \"render_p50_ms\":{:.2},\"render_p95_ms\":{:.2},\"render_p99_ms\":{:.2},\
              \"n_key_write\":{},\"key_write_p50_ms\":{:.2},\"key_write_p95_ms\":{:.2},\
-             \"key_write_p99_ms\":{:.2},\"n_pre_present\":{},\
+             \"key_write_p99_ms\":{:.2},\
+             \"n_key_queue\":{},\"key_queue_p50_ms\":{:.2},\
+             \"key_queue_p95_ms\":{:.2},\"key_queue_p99_ms\":{:.2},\
+             \"last_key_queue_ms\":{:.2},\"max_key_queue_ms\":{:.2},\
+             \"n_pre_present\":{},\
              \"pre_present_p50_ms\":{:.2},\"pre_present_p95_ms\":{:.2},\
              \"pre_present_p99_ms\":{:.2},\"n_acquire\":{},\
              \"acquire_p50_ms\":{:.2},\"acquire_p95_ms\":{:.2},\
              \"acquire_p99_ms\":{:.2},\
              \"last_acquire_wait_ms\":{:.2},\"max_acquire_wait_ms\":{:.2},\
+             \"n_acquire_queue\":{},\"acquire_queue_p50_ms\":{:.2},\
+             \"acquire_queue_p95_ms\":{:.2},\"acquire_queue_p99_ms\":{:.2},\
+             \"last_acquire_queue_ms\":{:.2},\"max_acquire_queue_ms\":{:.2},\
              \"n_resize\":{},\
              \"resize_p50_ms\":{:.2},\"resize_p95_ms\":{:.2},\
              \"resize_p99_ms\":{:.2},\"n_present_tainted\":{},\
              \"present_tainted_p50_ms\":{:.2},\"present_tainted_p95_ms\":{:.2},\
-             \"present_tainted_p99_ms\":{:.2}{}{}}}",
+             \"present_tainted_p99_ms\":{:.2}{}{}{}}}",
             input.count(),
             p(input, 0.50),
             p(input, 0.95),
@@ -1352,6 +1497,12 @@ pub(crate) fn cmd_metrics_json(term: Option<&Arc<Mutex<Terminal>>>, command: &st
             p(key_write, 0.50),
             p(key_write, 0.95),
             p(key_write, 0.99),
+            key_queue.count(),
+            p(key_queue, 0.50),
+            p(key_queue, 0.95),
+            p(key_queue, 0.99),
+            ms(last_key_queue_ns),
+            ms(max_key_queue_ns),
             pre_present.count(),
             p(pre_present, 0.50),
             p(pre_present, 0.95),
@@ -1362,6 +1513,12 @@ pub(crate) fn cmd_metrics_json(term: Option<&Arc<Mutex<Terminal>>>, command: &st
             p(acquire, 0.99),
             ms(last_acquire_ns),
             ms(max_acquire_ns),
+            acquire_queue.count(),
+            p(acquire_queue, 0.50),
+            p(acquire_queue, 0.95),
+            p(acquire_queue, 0.99),
+            ms(last_queue_ns),
+            ms(max_queue_ns),
             resize.count(),
             p(resize, 0.50),
             p(resize, 0.95),
@@ -1374,6 +1531,8 @@ pub(crate) fn cmd_metrics_json(term: Option<&Arc<Mutex<Terminal>>>, command: &st
             json_term_wait_fields(),
             // Field-for-field twin of the text form's echo fragment.
             crate::echo_rtt::percentile_fields_json(),
+            // Field-for-field twin of the text form's present→glass fragment.
+            crate::metrics::present_glass_fields_json(),
         ));
     }
     if command.trim() == "reset" {
@@ -1385,8 +1544,9 @@ pub(crate) fn cmd_metrics_json(term: Option<&Arc<Mutex<Terminal>>>, command: &st
         |(rows, cols)| (rows.to_string(), cols.to_string()),
     );
     let m = crate::metrics::snapshot();
-    // Same tail surfacing and same honesty split as the text form: the two
-    // stay field-for-field twins so automation never has to scrape the line.
+    // Same tail surfacing and same honesty split as the text form — the child's
+    // echo round trip included: the two stay field-for-field twins so automation
+    // never has to scrape the line.
     let (h_input, h_present, _) = crate::metrics::distributions();
     let pct = |h: &crate::metrics::Histogram, q: f64| ms(h.percentile(q).unwrap_or(0));
     let arms = crate::metrics::deadline_arm_attribution();
@@ -1415,6 +1575,7 @@ pub(crate) fn cmd_metrics_json(term: Option<&Arc<Mutex<Terminal>>>, command: &st
          \"last_pre_present_ms\":{:.2},\"pre_present_total_ms\":{:.2},\
          \"max_pre_present_ms\":{:.2},\
          \"last_acquire_wait_ms\":{:.2},\"max_acquire_wait_ms\":{:.2},\
+         \"last_gpu_park_ms\":{:.2},\"max_gpu_park_ms\":{:.2},\
          \"present_drops\":{},\
          \"last_present_drop_reason\":\"{}\",\"last_present_drop_parked\":{},\
          \"present_tainted\":{},\"last_present_tainted_ms\":{:.2},\
@@ -1425,7 +1586,7 @@ pub(crate) fn cmd_metrics_json(term: Option<&Arc<Mutex<Terminal>>>, command: &st
          \"wake_late_ms\":{:.2},\"deadline_owner\":\"{}\",\"deadline_in_ms\":{:.2},\
          \"deadline_late_ms\":{:.2},\"past_deadline_arms\":{},\
          \"deadline_arms_by_owner\":{},\"past_arm_streak_heals\":{},\
-         \"stale_arm_heals\":{},\
+         \"stale_arm_heals\":{}{},\
          \"max_frame_gap_ms\":{:.2},\
          \"rust_main_to_first_present_ms\":{:.2},\
          \"rust_main_to_first_visible_ms\":{:.2},\
@@ -1460,7 +1621,7 @@ pub(crate) fn cmd_metrics_json(term: Option<&Arc<Mutex<Terminal>>>, command: &st
          \"startup_gpu_cell_pipeline_ms\":{},\
          \"effect_pipeline_builds\":{},\"effect_pipeline_build_ms\":{:.2},\
          \"effect_pipelines_built\":\"{}\",\
-         \"first_present_ms\":{:.2},\"first_visible_ms\":{:.2}}}",
+         \"first_present_ms\":{:.2},\"first_visible_ms\":{:.2}{}{}}}",
         m.frames_presented,
         ms(m.last_present_latency_ns),
         ms(m.max_present_latency_ns),
@@ -1508,6 +1669,9 @@ pub(crate) fn cmd_metrics_json(term: Option<&Arc<Mutex<Terminal>>>, command: &st
         // Field-for-field twin of the text form's drawable-park scalars.
         ms(m.last_acquire_wait_ns),
         ms(m.max_acquire_wait_ns),
+        // Field-for-field twin of the text form's GPU-park scalars.
+        ms(m.last_gpu_park_ns),
+        ms(m.max_gpu_park_ns),
         m.present_drops,
         m.last_present_drop_reason.as_str(),
         m.last_present_drop_parked,
@@ -1530,6 +1694,8 @@ pub(crate) fn cmd_metrics_json(term: Option<&Arc<Mutex<Terminal>>>, command: &st
         deadline_arm_object(&arms),
         streak_heal_object(&streak_heals),
         m.stale_arm_heals,
+        // Field-for-field twin of the text summary's lateness fragment.
+        crate::metrics::lateness_fields_json(),
         ms(m.max_frame_gap_ns),
         ms(m.rust_main_to_first_present_ns),
         ms(m.rust_main_to_first_visible_ns),
@@ -1589,6 +1755,10 @@ pub(crate) fn cmd_metrics_json(term: Option<&Arc<Mutex<Terminal>>>, command: &st
         effect_pipeline_names(m.effect_pipeline_built_mask),
         ms(m.first_present_ns),
         ms(m.first_visible_ns),
+        // Field-for-field twin of the text summary's echo fragment.
+        crate::echo_rtt::percentile_fields_json(),
+        // Field-for-field twin of the text summary's turn-census fragment.
+        crate::watchdog::turn_census_fields_json(),
     ))
 }
 
@@ -2120,6 +2290,11 @@ pub(crate) struct FullHistorySearch {
     pub(crate) point_match: Option<SearchMatch>,
     pub(crate) base_y: i64,
     pub(crate) absolute_row_revision: u64,
+    /// `Grid::history_renumber_epoch()` the rows were keyed against. It travels
+    /// WITH the results for the same reason `absolute_row_revision` does, and
+    /// covers the case that stamp cannot see: a width reflow rewraps history and
+    /// renumbers every retained row wholesale, moving no footer revision at all.
+    pub(crate) history_renumber_epoch: u64,
     pub(crate) content_seq: u64,
     /// Grid width the soft-wrap runs were laid out in. It travels WITH the
     /// results because a match's end column counts straight through a wrap
@@ -2816,6 +2991,7 @@ pub(crate) fn search_full_history_direction(
             point_match,
             base_y,
             absolute_row_revision,
+            history_renumber_epoch: key_epoch,
             content_seq: key_seq,
             cols: wrap.cols,
             consistent,
@@ -2991,6 +3167,7 @@ pub(crate) fn search_full_history_direction(
         point_match,
         base_y,
         absolute_row_revision,
+        history_renumber_epoch: key_epoch,
         content_seq: key_seq,
         cols: wrap.cols,
         consistent,
@@ -3003,6 +3180,8 @@ pub(crate) struct FullHistoryPoint {
     pub(crate) point_match: Option<SearchMatch>,
     pub(crate) base_y: i64,
     pub(crate) absolute_row_revision: u64,
+    /// See [`FullHistorySearch::history_renumber_epoch`].
+    pub(crate) history_renumber_epoch: u64,
     pub(crate) content_seq: u64,
     /// See [`FullHistorySearch::cols`].
     pub(crate) cols: usize,
@@ -3078,6 +3257,7 @@ pub(crate) fn search_full_history_point(
             point_match: full.point_match,
             base_y: full.base_y,
             absolute_row_revision: full.absolute_row_revision,
+            history_renumber_epoch: full.history_renumber_epoch,
             content_seq: full.content_seq,
             cols: full.cols,
             consistent: full.consistent,
@@ -3107,6 +3287,7 @@ pub(crate) fn search_full_history_point(
         point_match,
         base_y,
         absolute_row_revision,
+        history_renumber_epoch: key_epoch,
         content_seq: key_seq,
         cols: wrap.cols,
         consistent,
@@ -4339,6 +4520,7 @@ fn _styled_frame_covers_every_render_input_field(ri: &aterm_core::render::Render
         display_offset: _, // OMITTED: viewport scroll position, not visible-cell content
         base_y: _, // OMITTED: host-consumed re-anchor metadata (absolute row of the top line), not visible-cell content
         absolute_row_revision: _, // OMITTED: host-consumed absolute-row coordinate-space revision, not visible-cell content
+        history_renumber_epoch: _, // OMITTED: host-consumed wholesale-renumber epoch (its twin), not visible-cell content
         scroll_frac_px: _, // OMITTED: M1b sub-row present translate, display-only (not cell content)
         grid_top_row: _,   // OMITTED: M1b grid/chrome partition, display-only
         grid_bot_row: _,   // OMITTED: M1b grid/chrome partition, display-only
@@ -5838,6 +6020,10 @@ mod tests {
             "pre_present_p99_ms",
             "n_acquire",
             "acquire_p99_ms",
+            // The worker's scheduling delay. Published beside the park it is
+            // invisible to, so a JSON driver can attribute a stalled present.
+            "n_acquire_queue",
+            "acquire_queue_p99_ms",
             "n_resize",
             "resize_p99_ms",
             // ECHO ROUND TRIP (audit item 5): the only slice on this line that
@@ -5874,6 +6060,8 @@ mod tests {
             "n_pre_present=",
             "pre_present_p99_ms=",
             "n_acquire=",
+            "n_acquire_queue=",
+            "acquire_queue_p99_ms=",
             "n_resize=",
             "resize_p99_ms=",
             "n_echo=",
@@ -5888,6 +6076,63 @@ mod tests {
             assert!(
                 text_pct.contains(field),
                 "text percentiles omitted `{field}`: {text_pct}"
+            );
+        }
+    }
+
+    /// THE OS-QUEUE SHARE OF `key_write` IS PUBLISHED, IN BOTH PERCENTILE FORMS.
+    ///
+    /// `metrics::note_key_arrival_queued` backdates the key-arrival stamp by the
+    /// NSEvent queue age, so `key_write_*` and `input_*` both price a parked
+    /// event loop — and it kept nothing else, so an 18.13 ms `max_key_write_ms`
+    /// could not be told apart from 18 ms of on-thread `on_key`/`input_to_session`
+    /// work. Those have opposite fixes (present pacing vs. the press path), and
+    /// the ledger answered neither. The queue leg now has its own distribution
+    /// and scalars; this pins them into the text form AND the JSON twin, beside
+    /// the `key_write_*` they split, so the pair can never go dark in one form
+    /// only — the exact gap `acquire_*` had until it was published here.
+    #[test]
+    fn the_key_queue_share_is_published_beside_key_write_in_both_forms() {
+        let text = super::cmd_metrics(None, "percentiles");
+        for field in [
+            "n_key_queue=",
+            "key_queue_p50_ms=",
+            "key_queue_p95_ms=",
+            "key_queue_p99_ms=",
+            "last_key_queue_ms=",
+            "max_key_queue_ms=",
+        ] {
+            assert!(
+                text.contains(field),
+                "text percentiles omitted `{field}`: {text}"
+            );
+        }
+        // BESIDE, never instead of: the total it splits stays published, or the
+        // subtraction a reader performs has nothing to subtract from.
+        assert!(
+            text.contains("n_key_write=") && text.contains("key_write_p99_ms="),
+            "the key-queue split must not displace the total it qualifies: {text}"
+        );
+
+        let reply = super::cmd_metrics_json(None, "percentiles");
+        let body = reply
+            .strip_prefix("OK 1\n")
+            .expect("status frame")
+            .trim_end();
+        let value: aterm_json::Value = aterm_json::from_str(body).expect("valid percentiles JSON");
+        for key in [
+            "n_key_queue",
+            "key_queue_p50_ms",
+            "key_queue_p95_ms",
+            "key_queue_p99_ms",
+            "last_key_queue_ms",
+            "max_key_queue_ms",
+            "n_key_write",
+            "key_write_p99_ms",
+        ] {
+            assert!(
+                value.get(key).is_some(),
+                "percentiles JSON omitted `{key}`: {reply}"
             );
         }
     }
@@ -5936,6 +6181,237 @@ mod tests {
                 );
             }
         }
+    }
+
+    /// THE ARMED GPU PARK IS PUBLISHED IN BOTH SUMMARY FORMS.
+    ///
+    /// The armed Metal arm blocks its UI thread in `waitUntilCompleted` twice
+    /// per present — `await_frame_slot` on the previous frame's Submit A before
+    /// any resident shared buffer is rewritten, and `drain_pending` on the
+    /// oldest command buffer and present ticket once the ring passes depth 3 —
+    /// and neither call is bounded. The first ran INSIDE the renderer's present
+    /// work timer, so a GPU or WindowServer contention stall was reported as
+    /// `frame_render` (compose plus CPU encode) and counted against
+    /// `slow_frames`; the second ran before that timer started and was reported
+    /// nowhere, surfacing only as unexplained `redraw_total` slack. The
+    /// renderer now keeps both out of `frame_render` and books them as one
+    /// park — which only helps if a reader can SEE it, exactly the rule the
+    /// drawable-park test above pins.
+    #[test]
+    fn the_gpu_park_is_published_in_both_metrics_summary_forms() {
+        let text = super::cmd_metrics(None, "");
+        for field in ["last_gpu_park_ms=", "max_gpu_park_ms="] {
+            assert!(
+                text.contains(field),
+                "summary text metrics omitted `{field}`: {text}"
+            );
+        }
+        let reply = super::cmd_metrics_json(None, "");
+        let body = reply
+            .strip_prefix("OK 1\n")
+            .expect("status frame")
+            .trim_end();
+        let value: aterm_json::Value = aterm_json::from_str(body).expect("valid metrics JSON");
+        for key in ["last_gpu_park_ms", "max_gpu_park_ms"] {
+            assert!(
+                value.get(key).is_some(),
+                "metrics JSON omitted `{key}`: {reply}"
+            );
+        }
+    }
+
+    /// THE WORST LATENESS SURVIVES, AND A MAX SAYS WHEN (2026-09-15
+    /// attribution audit).
+    ///
+    /// `wake_late_ms` and `deadline_late_ms` are LAST-WRITER readings: a `Timer`
+    /// wake books `now - due`, and the next `WaitCancelled` — one per PTY output
+    /// burst — stores `0` over it. A live line therefore read
+    /// `max_present_latency_ms=560.54 wake_late_ms=0.00 deadline_late_ms=0.00`
+    /// with every in-redraw slice bounded (`max_redraw_total_ms=13.84`,
+    /// `max_pre_present_ms=7.32`), and nothing published could say whether those
+    /// 560 ms were a late wake, a late deadline, or an idle stretch of an OPEN
+    /// interval — nor even which hour of the process they belonged to, the same
+    /// lifetime having also contained a 5.3 s update-handoff freeze.
+    ///
+    /// This pins the answer into both summary forms: each lateness max with the
+    /// owner that produced it and when, the instants of the present/input
+    /// maxima, the frame gap that qualifies the present max, and the
+    /// process-clock anchor that turns a stamp into "how long ago".
+    #[test]
+    fn the_worst_lateness_and_the_time_of_the_worst_present_ride_both_summary_forms() {
+        let fields = [
+            "max_wake_late_ms",
+            "max_wake_late_owner",
+            "max_wake_late_at_ms",
+            "max_deadline_late_ms",
+            "max_deadline_late_owner",
+            "max_deadline_late_at_ms",
+            "max_present_latency_at_ms",
+            "max_present_latency_gap_ms",
+            "max_input_present_at_ms",
+            "metrics_now_ms",
+        ];
+        let text = super::cmd_metrics(None, "");
+        for field in fields {
+            assert!(
+                text.contains(&format!(" {field}=")),
+                "the metrics SUMMARY omits `{field}`: the worst lateness dies with the next \
+                 wake and a max cannot be placed in time: {text}"
+            );
+        }
+        let reply = super::cmd_metrics_json(None, "");
+        let body = reply
+            .strip_prefix("OK 1\n")
+            .expect("status frame")
+            .trim_end();
+        let value: aterm_json::Value = aterm_json::from_str(body).expect("valid metrics JSON");
+        for field in fields {
+            assert!(
+                value.get(field).is_some(),
+                "the metrics summary JSON omits `{field}`: {reply}"
+            );
+        }
+    }
+
+    /// THE SUMMARY NAMES WHO OWES THE TIME — us or the program (2026-09-15).
+    ///
+    /// `echo_rtt` exists to answer exactly one question: is a session that
+    /// FEELS laggy aterm being slow, or the TUI on the far side of the PTY?
+    /// It was published only by `metrics percentiles`. The line the owner
+    /// actually reads — `aterm ctl metrics` — carried `input_*`, `present_*`,
+    /// `key_write_*` and `render_*`, every one of them ATERM's own slice, so a
+    /// lag report could quote a sick tail off it and still not say whose. It
+    /// did: a typing-lag episode was filed as an aterm present regression from
+    /// `max_present_latency_ms=560.54` and `input_p99_ms=83.89`, while the
+    /// unasked second question held `n_echo=499 echo_p95_ms=75.69
+    /// echo_p99_ms=150.04 echo_max_ms=367.85` against aterm's own
+    /// `key_write_p99_ms=6.29` — the child waiting for the scheduler.
+    ///
+    /// The names are read OUT OF the fragment instead of being listed here, on
+    /// purpose. `echo_rtt` may not publish a percentile apart from the
+    /// sample/coalesce/expiry ledger that qualifies it, so this fails if the
+    /// summary ever carries a cherry-picked `echo_p99_ms` — and a field added
+    /// to the fragment is pinned in BOTH forms without touching this test.
+    #[test]
+    fn the_childs_echo_round_trip_rides_the_metrics_summary_in_both_forms() {
+        let fragment = crate::echo_rtt::percentile_fields_text();
+        let names: Vec<&str> = fragment
+            .split_whitespace()
+            .map(|field| {
+                field
+                    .split_once('=')
+                    .expect("every echo field is key=value")
+                    .0
+            })
+            .collect();
+        // Guard the guard: a fragment that stopped spelling the tail would make
+        // every assertion below vacuous.
+        for required in ["n_echo", "echo_p95_ms", "echo_p99_ms", "echo_expired"] {
+            assert!(
+                names.contains(&required),
+                "the echo fragment no longer spells `{required}`: {fragment}"
+            );
+        }
+
+        let text = super::cmd_metrics(None, "");
+        for name in &names {
+            assert!(
+                text.contains(&format!(" {name}=")),
+                "the metrics SUMMARY omits the child's `{name}`, so a reader of \
+                 this line cannot tell aterm's lag from the program's: {text}"
+            );
+        }
+
+        let reply = super::cmd_metrics_json(None, "");
+        let body = reply
+            .strip_prefix("OK 1\n")
+            .expect("status frame")
+            .trim_end();
+        let value: aterm_json::Value = aterm_json::from_str(body).expect("valid metrics JSON");
+        for name in &names {
+            assert!(
+                value.get(name).is_some(),
+                "the metrics summary JSON omits the child's `{name}`: {reply}"
+            );
+        }
+    }
+
+    /// THE PARK OUTSIDE THE REDRAW RIDES BOTH FORMS (2026-09-15 responsiveness
+    /// audit).
+    ///
+    /// `redraw_total` covers `redraw_window` alone, the `user_event` /
+    /// `window_event` handlers were never timed, and the release stall watchdog
+    /// only fires at 5 s — so a 100–600 ms main-thread park in a NON-redraw
+    /// handler left no attributable trace, while still being charged to
+    /// `present_latency`. That is the shape behind a live
+    /// `max_present_latency_ms=560.54` sitting beside `present_drops=0` and a
+    /// bounded `max_redraw_total_ms=13.84`, read at the time as a GPU problem.
+    ///
+    /// The names are read OUT OF the fragment rather than listed here, on the
+    /// `echo_rtt` precedent: a max may not be published apart from the count and
+    /// the long-turn tally that qualify it, so this fails if the summary ever
+    /// carries a cherry-picked `max_turn_ms` — and a field added to the fragment
+    /// is pinned in BOTH forms without touching this test.
+    #[test]
+    fn the_main_loop_turn_census_rides_the_metrics_summary_in_both_forms() {
+        let fragment = crate::watchdog::turn_census_fields_text();
+        let names: Vec<&str> = fragment
+            .split_whitespace()
+            .map(|field| {
+                field
+                    .split_once('=')
+                    .expect("every turn-census field is key=value")
+                    .0
+            })
+            .collect();
+        // Guard the guard: a fragment that stopped spelling the max, its owner
+        // or the counts that qualify it would make every assertion below vacuous.
+        for required in [
+            "max_turn_ms",
+            "max_turn_owner",
+            "max_turn_at_ms",
+            "last_turn_ms",
+            "turns",
+            "long_turns",
+            "long_turn_threshold_ms",
+        ] {
+            assert!(
+                names.contains(&required),
+                "the turn-census fragment no longer spells `{required}`: {fragment}"
+            );
+        }
+
+        let text = super::cmd_metrics(None, "");
+        for name in &names {
+            assert!(
+                text.contains(&format!(" {name}=")),
+                "the metrics SUMMARY omits `{name}`, so a main-thread park outside \
+                 the redraw has no producer anyone can name: {text}"
+            );
+        }
+
+        let reply = super::cmd_metrics_json(None, "");
+        let body = reply
+            .strip_prefix("OK 1\n")
+            .expect("status frame")
+            .trim_end();
+        let value: aterm_json::Value = aterm_json::from_str(body).expect("valid metrics JSON");
+        for name in &names {
+            assert!(
+                value.get(name).is_some(),
+                "the metrics summary JSON omits `{name}`: {reply}"
+            );
+        }
+        // The owner is a LABEL, not a number scraped by position — and `none`
+        // until a turn is booked, never a claim about a root that never ran.
+        let owner = value
+            .get("max_turn_owner")
+            .and_then(aterm_json::Value::as_str)
+            .expect("the worst turn names its root");
+        assert!(
+            !owner.is_empty() && owner.chars().all(|c| c.is_ascii_lowercase() || c == '_'),
+            "the turn owner must be a stable snake_case label: {owner}"
+        );
     }
 
     /// ITEM 6 wire shape. The per-owner ledger is a self-labelling field in

@@ -2698,6 +2698,21 @@ struct MetalArmLive {
     /// Diagnostic: how many times `await_frame_slot` actually consumed a
     /// prior in-flight Submit A (the pipelining differential's probe).
     awaited_frames: u64,
+    /// THE PARKS, PRICED. Both `await_frame_slot` and `drain_pending` resolve
+    /// to `waitUntilCompleted`, which takes NO timeout: on a contended GPU the
+    /// UI thread sits in one of them while keyDowns pile up in the NSEvent
+    /// queue. The waits themselves are load-bearing (the shared-storage
+    /// rewrite discipline above, and the drawable backpressure below), so they
+    /// stay — but they are COMPLETED GPU EXECUTION, which is precisely what
+    /// `last_present_work_ns` and the frontend's `frame_render` contract say
+    /// they do not measure. Charged there, a GPU/WindowServer contention stall
+    /// was indistinguishable from slow compose and fed the load-shed latch as
+    /// if the CPU were the producer. Each park is clocked here instead, drained
+    /// once per present by [`Self::take_park_ns`], SUBTRACTED from the present's
+    /// work timer (the frame-slot half is the only one inside it) and published
+    /// as `gpu_park`, so the ledger names the producer.
+    frame_slot_wait_ns: u64,
+    pending_ring_wait_ns: u64,
 }
 
 /// One armed present in flight: its committed Submit B and its ticket.
@@ -2710,7 +2725,9 @@ struct PendingPresent {
 #[cfg(target_os = "macos")]
 impl MetalArmLive {
     fn new(latch: Arc<crate::metal::loss::LossLatch>) -> Result<Self, String> {
-        let Some(dev) = crate::metal::ffi::Device::system_default() else {
+        // `preferred`, not `system_default`: the low-power GPU on a dual-GPU
+        // Mac, the same device `GpuContext::new` named — see `Device::preferred`.
+        let Some(dev) = crate::metal::ffi::Device::preferred() else {
             return Err("no Metal device on this machine".to_owned());
         };
         let session = crate::metal::encoder::EncodeSession::new(&dev, Arc::clone(&latch))?;
@@ -2733,6 +2750,8 @@ impl MetalArmLive {
             pending: Vec::new(),
             inflight_frame: None,
             awaited_frames: 0,
+            frame_slot_wait_ns: 0,
+            pending_ring_wait_ns: 0,
         })
     }
 
@@ -2786,7 +2805,23 @@ impl MetalArmLive {
     /// frame degrades by the existing named path).
     fn await_frame_slot(&mut self) {
         if let Some(prev) = self.inflight_frame.take() {
-            let _ = prev.wait_outcome();
+            // POLL BEFORE PARKING. The field doc's own claim is that a whole
+            // present + frontend interval has passed by now, so the handle is
+            // "almost always already terminal" — and where that holds this
+            // costs one status read and books a ZERO park. Only the case the
+            // claim does not cover (the GPU is still executing Submit A)
+            // reaches the unbounded `waitUntilCompleted`, and that one is
+            // MEASURED rather than silently charged to compose. `try_outcome`
+            // feeds the loss latch on its own first terminal answer exactly as
+            // `wait_outcome` does, so the latch contract is unchanged on both
+            // arms and the frame still degrades by the existing named path.
+            if prev.try_outcome().is_none() {
+                let parked = aterm_time::Instant::now();
+                let _ = prev.wait_outcome();
+                self.frame_slot_wait_ns = self
+                    .frame_slot_wait_ns
+                    .saturating_add(u64::try_from(parked.elapsed().as_nanos()).unwrap_or(u64::MAX));
+            }
             self.awaited_frames += 1;
         }
     }
@@ -2799,9 +2834,27 @@ impl MetalArmLive {
             .retain(|p| p.cb.try_outcome().is_none() || p.ticket.try_outcome().is_none());
         while self.pending.len() > 3 {
             let oldest = self.pending.remove(0);
+            // Unbounded by the same `waitUntilCompleted`, and this one runs
+            // BEFORE the present's work timer starts — so it was booked in
+            // neither `frame_render` nor the acquire histogram, and showed up
+            // only as unexplained `redraw_total` slack. Clocked and published.
+            let parked = aterm_time::Instant::now();
             let _ = oldest.cb.wait_outcome();
             let _ = oldest.ticket.wait_outcome();
+            self.pending_ring_wait_ns = self
+                .pending_ring_wait_ns
+                .saturating_add(u64::try_from(parked.elapsed().as_nanos()).unwrap_or(u64::MAX));
         }
+    }
+
+    /// Drain the accumulated parks as `(frame_slot, pending_ring)` nanoseconds.
+    /// Taken once per present so a park can be booked against the frame that
+    /// actually paid it.
+    fn take_park_ns(&mut self) -> (u64, u64) {
+        (
+            std::mem::take(&mut self.frame_slot_wait_ns),
+            std::mem::take(&mut self.pending_ring_wait_ns),
+        )
     }
 
     /// Demand-build the PSO for `row` (frame rows only — all in `cell.metal`,
@@ -2913,7 +2966,7 @@ impl MetalArmLive {
             .map_err(|e| format!("metal arm: {atlas:?} atlas: {e}"))?;
         let mut data = vec![0u8; full];
         data[..bytes.len()].copy_from_slice(bytes);
-        // SAFETY: fresh shared texture of exactly `tw` x `th`; `data` holds
+        // SAFETY: fresh managed texture of exactly `tw` x `th`; `data` holds
         // the full extent at the tight `tw * bpp` stride.
         unsafe {
             tex.upload(
@@ -3796,6 +3849,29 @@ pub struct WindowGpu {
     /// One measurement from the current surface-present attempt, consumed by
     /// the host on either success or failure. None means no acquire ran.
     acquire_wait_sample_ns: Option<u64>,
+    // Wall time the latest completed acquisition spent QUEUED before the
+    // drawable worker was scheduled to start it. Deliberately NOT folded into
+    // `last_acquire_wait_ns` above: that clock starts inside the worker, so it
+    // can only report what `nextDrawable` cost and is blind to the scheduling
+    // delay in front of it — the leg that actually defers a key echo's
+    // present, since the frame is already parked on `AcquirePending` for its
+    // whole duration. Two causes, two counters.
+    last_acquire_queue_ns: u64,
+    /// One queue measurement from the current surface-present attempt,
+    /// consumed by the host exactly once, on either outcome — the twin of
+    /// [`Self::acquire_wait_sample_ns`].
+    acquire_queue_sample_ns: Option<u64>,
+    // Wall time the UI thread spent PARKED on GPU completion during the most
+    // recent armed present: the Submit-A pipelining wait plus the pending-ring
+    // drain, both `waitUntilCompleted` with no timeout. This is completed GPU
+    // execution, which is exactly what `last_present_work_ns` above says it
+    // does not measure — so it is kept OUT of that figure and published on its
+    // own, and a GPU-contention stall can no longer masquerade as slow compose.
+    last_gpu_park_ns: u64,
+    /// The park accumulated by the current surface-present attempt, consumed by
+    /// the host exactly once on either success or failure. None means nothing
+    /// on this attempt ever parked on the GPU (every non-armed arm).
+    gpu_park_sample_ns: Option<u64>,
     // The resident offscreen render target + its blit-source bind group. `None`
     // until the first frame; reused at the same `(w, h)`, recreated only on a
     // dimension change. See `Offscreen`.
@@ -4007,6 +4083,25 @@ pub struct WindowGpu {
     occluded_hint: bool,
 }
 
+/// The present's CPU encode/submit cost with the GPU park taken back out.
+///
+/// `work_elapsed_ns` is the raw span of the armed present's work timer, which
+/// STARTS after the drawable acquire and therefore contains the Submit-A
+/// pipelining wait — an unbounded `waitUntilCompleted` on the previous frame.
+/// That wait is the GPU finishing earlier work, not this frame's encoding, and
+/// booking it as the latter is what let a GPU/WindowServer contention stall
+/// arrive at the frontend as `frame_render`, count against `slow_frames`, and
+/// feed the load-shed latch as though the CPU were the producer. The park is
+/// published separately (see [`WindowGpu::last_gpu_park_ns`]); here it is
+/// subtracted, so `last_present_work_ns` keeps the contract it documents.
+///
+/// Saturating: the timer and the park are read from the same clock but not
+/// atomically, so a park can round up to the whole span.
+#[cfg(target_os = "macos")]
+fn encode_work_ns_excluding_park(work_elapsed_ns: u64, frame_slot_park_ns: u64) -> u64 {
+    work_elapsed_ns.saturating_sub(frame_slot_park_ns)
+}
+
 impl WindowGpu {
     pub fn new() -> Self {
         Self::default()
@@ -4069,8 +4164,57 @@ impl WindowGpu {
         self.acquire_wait_sample_ns.take()
     }
 
+    /// Wall time the latest completed acquisition waited in the drawable
+    /// worker's queue before that worker was scheduled to begin it. Zero
+    /// before the first completion, and always zero on a backend whose
+    /// acquisition is synchronous (there is no queue to wait in).
+    #[must_use]
+    pub fn last_acquire_queue_ns(&self) -> u64 {
+        self.last_acquire_queue_ns
+    }
+
+    /// Consume this surface-present attempt's queue measurement exactly once.
+    /// An attempt that completed no acquisition produces no sample.
+    pub fn take_acquire_queue_sample_ns(&mut self) -> Option<u64> {
+        self.acquire_queue_sample_ns.take()
+    }
+
+    /// Wall time the most recent armed present spent BLOCKED on GPU completion
+    /// — the Submit-A pipelining wait plus the pending-ring drain. Deliberately
+    /// OUTSIDE [`Self::last_present_work_ns`]: that counter's contract is CPU
+    /// encode/submit work, and a park is the GPU finishing EARLIER frames.
+    /// Zero on an armed present that never parked; never written by any other
+    /// arm.
+    #[must_use]
+    pub fn last_gpu_park_ns(&self) -> u64 {
+        self.last_gpu_park_ns
+    }
+
+    /// Consume this surface-present attempt's GPU-park measurement exactly
+    /// once. An attempt that never parked (or never reached the armed path)
+    /// produces no sample.
+    pub fn take_gpu_park_sample_ns(&mut self) -> Option<u64> {
+        self.gpu_park_sample_ns.take()
+    }
+
+    /// Add one park to the CURRENT attempt's total. Called once per park site
+    /// (the ring drain, then the frame slot) so a present refused between them
+    /// still publishes the time it really spent blocked — the acquire pair's
+    /// publish-on-either-outcome rule, applied to the same thread's other wait.
+    #[cfg(target_os = "macos")]
+    fn add_gpu_park(&mut self, parked_ns: u64) {
+        let total = self
+            .gpu_park_sample_ns
+            .unwrap_or(0)
+            .saturating_add(parked_ns);
+        self.gpu_park_sample_ns = Some(total);
+        self.last_gpu_park_ns = total;
+    }
+
     fn begin_surface_present(&mut self) {
         self.acquire_wait_sample_ns = None;
+        self.acquire_queue_sample_ns = None;
+        self.gpu_park_sample_ns = None;
     }
 
     /// Time the acquisition itself before inspecting its outcome. A timeout
@@ -4087,6 +4231,17 @@ impl WindowGpu {
     fn record_surface_acquire(&mut self, waited_ns: u64) {
         self.last_acquire_wait_ns = waited_ns;
         self.acquire_wait_sample_ns = Some(waited_ns);
+    }
+
+    /// Record the QUEUE leg of one completed asynchronous acquisition: the
+    /// span from the request being admitted to the worker dequeuing it. Only
+    /// the worker-backed (attached Metal) path has this leg; a synchronous
+    /// acquire never books one, which is why it is a separate site from
+    /// [`Self::record_surface_acquire`] rather than an addend to it.
+    #[cfg(target_os = "macos")]
+    fn record_surface_acquire_queue(&mut self, queued_ns: u64) {
+        self.last_acquire_queue_ns = queued_ns;
+        self.acquire_queue_sample_ns = Some(queued_ns);
     }
 
     /// M3 phase B: record the screen's EDR maximum for this window (raw; the
@@ -4122,6 +4277,43 @@ impl WindowGpu {
     /// immediately reconfigures the retained 8-bit format, whose Windows
     /// compositor interpretation is ordinary sRGB, so no later present may
     /// retain extended-linear capture metadata or an scRGB white multiplier.
+    ///
+    /// This is the CONCRETE half of every `HdrReconfigureRetag` transition whose
+    /// surface stays where the planner left it. `UpgradeSucceeds` is the one
+    /// action it does NOT perform — crossing SDR→HDR publishes its metadata in
+    /// [`Self::apply_hdr_surface_upgrade`], which carries that anchor instead.
+    #[cfg_attr(
+        any(test, feature = "spec-anchors"),
+        aterm_spec::refines(
+            machine = "HdrReconfigureRetag",
+            action = "RetagSucceeds",
+            project = "aterm_gpu::WindowGpu::project_hdr_reconfigure_state"
+        )
+    )]
+    #[cfg_attr(
+        any(test, feature = "spec-anchors"),
+        aterm_spec::refines(
+            machine = "HdrReconfigureRetag",
+            action = "RetagFails",
+            project = "aterm_gpu::WindowGpu::project_hdr_reconfigure_state"
+        )
+    )]
+    #[cfg_attr(
+        any(test, feature = "spec-anchors"),
+        aterm_spec::refines(
+            machine = "HdrReconfigureRetag",
+            action = "EnterSdrFallback",
+            project = "aterm_gpu::WindowGpu::project_hdr_reconfigure_state"
+        )
+    )]
+    #[cfg_attr(
+        any(test, feature = "spec-anchors"),
+        aterm_spec::refines(
+            machine = "HdrReconfigureRetag",
+            action = "UpgradeFails",
+            project = "aterm_gpu::WindowGpu::project_hdr_reconfigure_state"
+        )
+    )]
     fn apply_hdr_reconfigure_plan(&mut self, plan: crate::format_plan::HdrReconfigurePlan) {
         if plan == crate::format_plan::HdrReconfigurePlan::FallbackToSdr {
             self.capture_color_space = crate::video_tap::CaptureColorSpace::Srgb;
@@ -4134,10 +4326,50 @@ impl WindowGpu {
     /// successfully tagged scRGB. Headroom/reference-white values are reset to
     /// safe inert defaults until the frontend's next monitor query; no frame may
     /// inherit stale values from the previous HDR epoch.
+    ///
+    /// The publication boundary for `UpgradeSucceeds`: a successful f16
+    /// configure+tag alone deliberately leaves the prior SDR metadata in place
+    /// (see [`Self::apply_hdr_reconfigure_plan`]), so this method — not the
+    /// planner — is what makes `capture_linear` true on that action.
+    #[cfg_attr(
+        any(test, feature = "spec-anchors"),
+        aterm_spec::refines(
+            machine = "HdrReconfigureRetag",
+            action = "UpgradeSucceeds",
+            project = "aterm_gpu::WindowGpu::project_hdr_reconfigure_state"
+        )
+    )]
     fn apply_hdr_surface_upgrade(&mut self) {
         self.capture_color_space = crate::video_tap::CaptureColorSpace::ExtendedLinearSrgb;
         self.sdr_white_scale = 1.0;
         self.edr_max = 0.0;
+    }
+
+    /// Project the ALREADY-APPLIED window metadata, plus the planner's resolved
+    /// format, onto the four `HdrReconfigureRetag` model variables.
+    ///
+    /// `stage` and `retagged` are the drive coordinates (which lifecycle phase
+    /// the caller is in, and what the platform re-tag returned). `is_f16` is the
+    /// planner's resolved format. `capture_linear` is the ONLY value that is
+    /// read back off `self`, and it is the one that makes this a binding rather
+    /// than a restatement of the planner: an apply path that skips its metadata
+    /// half leaves it disagreeing with `is_f16`, which no model successor
+    /// admits and `CaptureMatchesSurfaceEncoding` forbids outright.
+    #[cfg(test)]
+    #[must_use]
+    pub(crate) fn project_hdr_reconfigure_state(
+        &self,
+        stage: u8,
+        retagged: bool,
+        plan: crate::format_plan::HdrReconfigurePlan,
+    ) -> crate::format_plan::HdrReconfigureProjection {
+        crate::format_plan::HdrReconfigureProjection {
+            stage,
+            retagged,
+            is_f16: plan == crate::format_plan::HdrReconfigurePlan::KeepHdr,
+            capture_linear: self.capture_color_space
+                == crate::video_tap::CaptureColorSpace::ExtendedLinearSrgb,
+        }
     }
 
     /// The sanitized scRGB reference-white multiplier used by presentation and
@@ -4191,15 +4423,6 @@ impl WindowGpu {
     #[must_use]
     pub fn resident_input_epoch(&self) -> u64 {
         self.resident_input_epoch
-    }
-
-    /// Clone the already-resident present model only when it still matches the
-    /// caller's success-committed epoch. Explicit introspection pays this clone;
-    /// the 60fps present path continues to update one allocation-reusing buffer.
-    #[must_use]
-    pub fn clone_resident_input_at(&self, epoch: u64) -> Option<RenderInput> {
-        (epoch != 0 && epoch != u64::MAX && self.resident_input_epoch == epoch)
-            .then(|| self.prev_input.clone())
     }
 
     /// Clone the resident semantic model together with the exact frontend
@@ -6876,7 +7099,15 @@ impl GpuRenderer {
     /// Forward of the inner CPU rasterizer's
     /// [`set_runtime_font_discovery`](Renderer::set_runtime_font_discovery).
     pub fn set_runtime_font_discovery(&mut self, enabled: bool) {
-        self.cpu.set_runtime_font_discovery(enabled);
+        // WIDENING the chain drops the CPU's rasterized glyphs (a `.notdef`
+        // decided against the narrower chain must not survive), so the atlas
+        // holding a copy of those pixels has to go too — otherwise the CPU
+        // re-rasterizes against the wider chain while the GPU keeps serving the
+        // tofu. Latent today, since every in-tree caller passes `false`, which
+        // is exactly when it is cheap to close.
+        if self.cpu.set_runtime_font_discovery(enabled) {
+            self.invalidate_atlas();
+        }
     }
 
     /// TEST/DEBUG forward of the inner rasterizer's
@@ -6886,6 +7117,19 @@ impl GpuRenderer {
     #[doc(hidden)]
     pub fn debug_block_on_lazy_fallbacks(&mut self) {
         self.cpu.debug_block_on_lazy_fallbacks();
+    }
+
+    /// TEST/DEBUG: [`Renderer::debug_fallback_candidate_paths`] for the GPU's own
+    /// CPU-side renderer.
+    ///
+    /// A GPU/CPU parity pair holds TWO renderers and therefore TWO lazy chains,
+    /// each racing its own background parse; a test that wants to know the pair is
+    /// font-settled has to ask both, and `&self` here so that asking cannot itself
+    /// settle the answer.
+    #[doc(hidden)]
+    #[must_use]
+    pub fn debug_fallback_candidate_paths(&self) -> &[String] {
+        self.cpu.debug_fallback_candidate_paths()
     }
 
     pub fn set_face(&mut self, cpu: Renderer, theme: Theme) {
@@ -7014,6 +7258,13 @@ impl GpuRenderer {
     /// config round-trips and a later backend fallback to CPU presentation
     /// honours it.
     pub fn set_font_subpixel(&mut self, mode: &str) {
+        // Deliberately NO `invalidate_atlas()`: the cache this drops on the CPU
+        // side is `subpx_glyphs`, the LCD overlay, and that overlay is a CPU-only
+        // path — no subpixel bytes ever reach this atlas (grep: this file has no
+        // other mention of it). The ordinary coverage masks the atlas does hold
+        // are unchanged by the mode, so throwing it away would cost a full
+        // re-upload and buy nothing. Measured 2026-09-16 alongside the
+        // `set_adjust_baseline` fix, which WAS a real mismatch.
         let _ = self.cpu.set_font_subpixel(mode);
     }
 
@@ -7255,7 +7506,23 @@ impl GpuRenderer {
     /// (glyph quads read `cpu.baseline()` at encode time), so the atlas stays;
     /// the host invalidates the present (appearance-only) for it to redraw.
     pub fn set_adjust_baseline(&mut self, px: i32) {
+        // THE ATLAS HAS TO GO WITH IT. `baseline_adjust` is a Renderer field, not
+        // part of `GlyphKey`, so the atlas is NOT content-addressed with respect
+        // to it — `activate_px`'s "the atlas grows to hold both" reasoning does
+        // not apply here. The CPU face drops its own rasters on this change
+        // (`clear_glyph_images`), which is the same statement from the other
+        // side: the pixels move. Without this the CPU re-rasterized at the new
+        // baseline while the GPU kept serving the old upload, so a live
+        // `adjust_baseline` edit reached the CPU face and not the glass.
+        //
+        // Guarded on the POST-CLAMP value, so re-applying an unchanged config
+        // (every config save does) does not throw a warm atlas away, and a value
+        // the CPU clamped to the one already held counts as unchanged.
+        let before = self.cpu.adjust_baseline();
         self.cpu.set_adjust_baseline(px);
+        if self.cpu.adjust_baseline() != before {
+            self.invalidate_atlas();
+        }
     }
 
     /// Underline escape hatches (config `adjust_underline_position` /
@@ -7426,7 +7693,8 @@ impl GpuRenderer {
         #[cfg(not(wgpu_arm))]
         {
             // Metal has no suballocator report surface here (the armed arm's
-            // resources are shared-storage exact-size mints).
+            // resources are exact-size mints: Shared buffers and Managed
+            // textures).
             None
         }
         #[cfg(wgpu_arm)]
@@ -7697,6 +7965,17 @@ impl GpuRenderer {
         self.metal_arm.as_mut().map_or((false, 0), |c| {
             let l = c.live_mut();
             (l.inflight_frame.is_some(), l.awaited_frames)
+        })
+    }
+
+    /// THE PARK PROBE — `(frame_slot_wait_ns, pending_ring_wait_ns)` as
+    /// accumulated and NOT yet drained. Reads without taking, so a test can
+    /// watch both `waitUntilCompleted` sites across a run of frames.
+    #[cfg(all(target_os = "macos", test))]
+    pub(crate) fn metal_park_probe_for_test(&mut self) -> (u64, u64) {
+        self.metal_arm.as_mut().map_or((0, 0), |c| {
+            let l = c.live_mut();
+            (l.frame_slot_wait_ns, l.pending_ring_wait_ns)
         })
     }
 
@@ -8552,12 +8831,6 @@ impl GpuRenderer {
         self.backdrop_margins && self.ctx.visual_swapchain
     }
 
-    /// Whether the EDR aurora is opted in (config `hdr_glow`).
-    #[must_use]
-    pub fn hdr_glow_enabled(&self) -> bool {
-        self.hdr_glow
-    }
-
     /// Set the SDR glow-boost strength (config `cursor_glow_sdr_boost`, 0..=1;
     /// 0 disables). Combined with the live theme background's luma into the
     /// per-present budget (`aterm_render::hdr::sdr_glow_budget`, proven bounded)
@@ -9307,7 +9580,7 @@ impl GpuRenderer {
                 crate::metal::ffi::TEXTURE_USAGE_SHADER_READ,
             )
             .map_err(|e| format!("tray card mint: {e}"))?;
-        // SAFETY: fresh shared texture of exactly `pw` x `ph`; the card is
+        // SAFETY: fresh managed texture of exactly `pw` x `ph`; the card is
         // `pw*ph*4` straight-RGBA bytes at the tight stride (the TrayQuad
         // contract).
         unsafe {
@@ -10000,6 +10273,15 @@ impl GpuRenderer {
             };
             let live = cell.live_mut();
             live.drain_pending();
+            // THE RING DRAIN'S PARK. `drain_pending` waits the oldest command
+            // buffer and ticket past depth 3, and it runs BEFORE the drawable
+            // acquire and before this present's work timer — so it was booked
+            // in neither `frame_render` nor the acquire histogram, and a stall
+            // here reached the frontend only as unexplained `redraw_total`
+            // slack. Booked here, at the site, so even a present refused by the
+            // reconcile below still reports the time the UI thread lost.
+            let (_, ring_parked_ns) = live.take_park_ns();
+            win.add_gpu_park(ring_parked_ns);
             let device = live.mint.device().clone_ref();
             let ms = surf.metal.as_mut().expect("checked above");
             let reconciled = ms.reconcile(&device, &want);
@@ -10007,6 +10289,13 @@ impl GpuRenderer {
             // An empty nonblocking poll is never an acquisition measurement.
             if let Some(waited_ns) = ms.take_completed_acquire_wait_ns() {
                 win.record_surface_acquire(waited_ns);
+            }
+            // The leg IN FRONT of that one. Booked from the same completion,
+            // so the pair always describes the same acquisition: how long the
+            // worker took to get scheduled, then how long `nextDrawable` took
+            // once it had.
+            if let Some(queued_ns) = ms.take_completed_acquire_queue_ns() {
+                win.record_surface_acquire_queue(queued_ns);
             }
             match reconciled {
                 Ok(false) => {}
@@ -10117,8 +10406,22 @@ impl GpuRenderer {
                 return Err(SurfacePresentFailure::Validation);
             }
         };
-        win.last_present_work_ns =
-            u64::try_from(work_started.elapsed().as_nanos()).unwrap_or(u64::MAX);
+        // THE FRAME-SLOT PARK, TAKEN BACK OUT. `encode_present_frame` above
+        // ran the armed tail, which opens with `await_frame_slot` — the
+        // unbounded wait on the previous frame's Submit A — and that sits
+        // INSIDE this timer. Subtract it (and book it) so `raster_submit_ns`,
+        // and the `frame_render`/`slow_frames`/load-shed chain the frontend
+        // builds on it, mean CPU encode work as documented. A late ring park is
+        // added for completeness; the drain runs above, so it is normally 0.
+        let (frame_slot_parked_ns, late_ring_parked_ns) = self
+            .metal_arm
+            .as_mut()
+            .map_or((0, 0), |cell| cell.live_mut().take_park_ns());
+        win.add_gpu_park(frame_slot_parked_ns.saturating_add(late_ring_parked_ns));
+        win.last_present_work_ns = encode_work_ns_excluding_park(
+            u64::try_from(work_started.elapsed().as_nanos()).unwrap_or(u64::MAX),
+            frame_slot_parked_ns,
+        );
         // Present AFTER the commit (the wgpu `frame.present()` slot), then
         // hold both handles for status polling — never a blocking wait on
         // the present path.
@@ -10393,6 +10696,14 @@ impl GpuRenderer {
         // probe is terminal by here. The Submit B wait doubles as the tap
         // completion boundary.
         win.virtual_presented_input_epoch = win.resident_input_epoch;
+        // Drain this path's parks and DISCARD them: the headless arm is off the
+        // glass hot path by definition, and its wait/readback cost is documented
+        // to ride inside `last_present_work_ns` (see the fn doc). Draining is
+        // still required — the accumulator is shared with the on-glass arm, and
+        // an undrained virtual park would be charged to the next real present.
+        if let Some(cell) = self.metal_arm.as_mut() {
+            let _ = cell.live_mut().take_park_ns();
+        }
         win.last_present_work_ns =
             u64::try_from(work_started.elapsed().as_nanos()).unwrap_or(u64::MAX);
         self.metal_maybe_inject_loss();
@@ -11825,8 +12136,14 @@ impl GpuRenderer {
         // repaint storm exhausts the pool and parks the event loop — keyDowns
         // queued behind the park measured up to ~84ms to reach the PTY. A third
         // drawable absorbs the in-flight frame (pool non-empty ⇒ acquire returns
-        // immediately) and adds ZERO latency while un-exhausted; FIFO still
-        // paces the glass. Non-Metal backends with real Mailbox keep 1 via env.
+        // immediately) and adds ZERO latency while un-exhausted. "FIFO" above names
+        // the POOL discipline, not the present: the shipped macOS mode is
+        // `Immediate` (`displaySyncEnabled = NO`, `pick_present_mode`), so nothing
+        // here paces on vblank. WindowServer still composites at the display
+        // refresh, and THAT leg is now measured rather than assumed --
+        // `aterm_gpu::present_glass` reports `presentDrawable:` registration ->
+        // the drawable's `presentedTime`, published as `present_glass_*`.
+        // Non-Metal backends with real Mailbox keep 1 via env.
         let default = if cfg!(target_os = "macos") { 2 } else { 1 };
         let Some(raw) = std::env::var("ATERM_GPU_FRAME_LATENCY")
             .ok()
@@ -12262,26 +12579,6 @@ impl GpuRenderer {
         tray: Option<TrayQuad<'_>>,
     ) -> Result<(), SurfacePresentFailure> {
         self.present_input_with_crop(win, surf, input, invert, overlay, tray, None, 0)
-    }
-
-    /// [`Self::present_input`] with an explicit frontend-visible source interval.
-    /// The raw renderer allocation is unchanged; rows outside `crop` are treated
-    /// as destination bands by the shared blit/present seam.
-    #[allow(
-        clippy::too_many_arguments,
-        reason = "the cropped public twin preserves present_input's established presentation tuple and adds one source interval"
-    )]
-    pub fn present_input_cropped(
-        &mut self,
-        win: &mut WindowGpu,
-        surf: &mut GpuSurface,
-        input: &RenderInput,
-        invert: bool,
-        overlay: Option<DropOverlay>,
-        tray: Option<TrayQuad<'_>>,
-        crop: PresentCrop,
-    ) -> Result<(), SurfacePresentFailure> {
-        self.present_input_with_crop(win, surf, input, invert, overlay, tray, Some(crop), 0)
     }
 
     /// Cropped present whose input carries a temporary Y translation on its
@@ -18546,12 +18843,41 @@ impl GpuRenderer {
                     cell_selected,
                     theme_selection,
                 ));
+                // A second mark on the same side of the base is STACKED on the
+                // first, as far as the cell has room — `MarkStack`, the CPU
+                // combining blit's own helper, so every lift is the identical
+                // integer arithmetic on both paths.
+                let mut stack = aterm_render::MarkStack::default();
                 for &m in marks {
                     let key = self.cpu.glyph_key(m);
                     let Some(slot) = atlas.map.get(&key) else {
                         continue;
                     };
+                    // An inkless mark paints nothing and must not lift the
+                    // marks after it — the CPU combining blit skips the same
+                    // cases (an empty raster, or a raster with no covered texel
+                    // anywhere). The second of those is what the ink memo below
+                    // answers with `None`, so the two cases are one guard here
+                    // and the slot carries no ink fields of its own.
                     if slot.gw == 0 || slot.gh == 0 {
+                        continue;
+                    }
+                    // The stack is placed by the mark's INK box, never by the
+                    // raster box the slot carries: the shipping macOS CoreText
+                    // raster pads that box past the baseline, which reads a dot
+                    // below as a straddling overlay that never stacks (see
+                    // `aterm_render::MarkStack`). Read from the CPU renderer's
+                    // MEMO for this key — one stored answer, computed once from
+                    // the very raster this atlas was packed from
+                    // (`build_kind`/`grow_atlas` blit `cpu.glyph_image(key)`),
+                    // and the same entry the CPU blit reads under the key it
+                    // derives from the same `glyph_key(mark)`. So parity is not
+                    // two computations agreeing, and no per-frame row scan
+                    // enters this loop (`Renderer::glyph_ink_box_cached`).
+                    let Some((ink_h, ink_ymin)) = self.cpu.glyph_ink_box_cached(key) else {
+                        continue;
+                    };
+                    if ink_h == 0 {
                         continue;
                     }
                     // Centre the mark's ink in the cell (see CPU `mark_cell_x`):
@@ -18567,13 +18893,24 @@ impl GpuRenderer {
                         aterm_render::mark_cell_x(0, ccw, slot.gw as usize, slot.xmin, scale)
                             + (pad + cx) as i32
                     };
+                    let dy = stack.dy(ink_h, ink_ymin, baseline, ch, scale.ys);
                     // (The run box is already folded into `scale`'s x-clip above —
                     // a mark centred in a double-width run's last visible cell
                     // still cannot spill into the neighbouring pane. CPU twin: the
                     // same `clip_x0`/`clip_x1` window on its combining blit.)
                     let Some((rect, uv)) = aterm_render::glyph_quad(
-                        mx as f32, anchor_y, baseline, scale, slot.ax, slot.ay, slot.gw, slot.gh,
-                        slot.xmin, slot.ymin, aw, ah,
+                        mx as f32,
+                        anchor_y + dy,
+                        baseline,
+                        scale,
+                        slot.ax,
+                        slot.ay,
+                        slot.gw,
+                        slot.gh,
+                        slot.xmin,
+                        slot.ymin,
+                        aw,
+                        ah,
                     ) else {
                         continue;
                     };
@@ -20820,7 +21157,9 @@ impl GpuRenderer {
              present-time layers (W5) — call set_bloom(false)/set_shimmer(false)"
         );
         let _pool = crate::metal::ffi::AutoreleasePool::new();
-        let Some(mdev) = MtlDevice::system_default() else {
+        // The device the metal arm renders on, as the wgpu arm it is compared
+        // against asks for the low-power adapter — see `Device::preferred`.
+        let Some(mdev) = MtlDevice::preferred() else {
             return Ok(None);
         };
 
@@ -20859,8 +21198,8 @@ impl GpuRenderer {
             // bytes the offscreen stores — the EXACT inverse of
             // `frame_from_padded_rgba` (top byte = 255 - alpha), so a seeded
             // replay starts from byte-identical texels. The upload is the
-            // CPU-synchronous `replaceRegion:` (shared storage; no queue), the
-            // W3-pinned cross-domain non-hazard.
+            // CPU-synchronous `replaceRegion:` (Managed (non-Private) storage;
+            // no queue), the W3-pinned cross-domain non-hazard.
             let mut bytes = Vec::with_capacity(seed.pixels.len() * 4);
             for p in &seed.pixels {
                 bytes.extend_from_slice(&[
@@ -21156,7 +21495,7 @@ impl GpuRenderer {
         crop: PresentCrop,
         destination: (u32, u32),
     ) -> Result<Option<PresentDifferential>, String> {
-        if crate::metal::ffi::Device::system_default().is_none() {
+        if crate::metal::ffi::Device::preferred().is_none() {
             return Ok(None);
         }
         assert!(
@@ -21254,7 +21593,9 @@ impl GpuRenderer {
         use std::sync::Arc;
 
         let _pool = crate::metal::ffi::AutoreleasePool::new();
-        let Some(mdev) = MtlDevice::system_default() else {
+        // The device the metal arm renders on, as the wgpu arm it is compared
+        // against asks for the low-power adapter — see `Device::preferred`.
+        let Some(mdev) = MtlDevice::preferred() else {
             return Ok(None);
         };
         assert_eq!(
@@ -21288,7 +21629,7 @@ impl GpuRenderer {
         // The offscreen, seeded byte-for-byte from the wgpu arm's clean base.
         let offscreen =
             mint.texture_2d(PixelFormat::Rgba8Unorm, fw as usize, fh as usize, usage)?;
-        // SAFETY: fresh 2-D shared texture of exactly fw x fh; the seed is
+        // SAFETY: fresh 2-D managed texture of exactly fw x fh; the seed is
         // fw*fh*4 bytes at the tight fw*4 stride.
         unsafe {
             mtl::texture_upload(
@@ -21482,7 +21823,7 @@ impl GpuRenderer {
                     t.ph as usize,
                     TEXTURE_USAGE_SHADER_READ,
                 )?;
-                // SAFETY: fresh shared texture of exactly pw x ph; the card is
+                // SAFETY: fresh managed texture of exactly pw x ph; the card is
                 // pw*ph*4 straight-RGBA bytes at the tight stride.
                 unsafe {
                     mtl::texture_upload(
@@ -25566,6 +25907,292 @@ ab\r\n",
         assert_eq!(win.edr_max(), 0.0);
     }
 
+    /// A confirmed-HDR window as the model's `stage = 0` initial state describes
+    /// it: extended-linear capture metadata and a live scRGB epoch's
+    /// reference-white / headroom values, none of them the inert defaults.
+    ///
+    /// Starting from the inert defaults would make the fallback assertions
+    /// vacuous — `sdr_white_scale` and `edr_max` would already hold the values
+    /// the fallback is supposed to install.
+    fn confirmed_hdr_window() -> WindowGpu {
+        let mut win = WindowGpu::new();
+        win.set_capture_color_space(crate::video_tap::CaptureColorSpace::ExtendedLinearSrgb);
+        win.set_sdr_white_scale(2.5);
+        win.set_edr_max(3.0);
+        win
+    }
+
+    /// Lift a concrete projection onto `before`'s variables to get the state the
+    /// model must agree is the successor.
+    fn project_reconfigure(
+        before: &std::collections::BTreeMap<&'static str, i64>,
+        projection: crate::format_plan::HdrReconfigureProjection,
+    ) -> std::collections::BTreeMap<&'static str, i64> {
+        let mut after = before.clone();
+        after.insert("stage", i64::from(projection.stage));
+        after.insert("retagged", i64::from(projection.retagged));
+        after.insert("is_f16", i64::from(projection.is_f16));
+        after.insert("capture_linear", i64::from(projection.capture_linear));
+        after
+    }
+
+    /// The whole obligation for one action: the model enables it here, the
+    /// concrete `before -> after` step is its EXACT and only successor, the
+    /// tiered validator (interpreter, escalating to `ty` wherever installed)
+    /// admits it under that action's name, and every invariant holds after.
+    fn assert_reconfigure_transition(
+        model: &aterm_spec::derive::Model,
+        before: &std::collections::BTreeMap<&'static str, i64>,
+        after: &std::collections::BTreeMap<&'static str, i64>,
+        action: &'static str,
+    ) {
+        assert!(
+            model.action_enabled(action, before),
+            "{action} must be enabled for {before:?}"
+        );
+        assert_eq!(
+            model.successors(action, before).as_slice(),
+            std::slice::from_ref(after),
+            "the shipping plan+apply projection must be the EXACT {action} successor"
+        );
+        let (conforms, evidence) = aterm_spec::verify::validate_transition_tiered(
+            model,
+            &[],
+            before,
+            after,
+            Some(action),
+            "HDR reconfigure plan/apply conformance",
+        );
+        assert!(conforms, "{action}: {evidence}");
+        for invariant in &model.invariants {
+            assert!(
+                model.check_invariant(invariant.name, after),
+                "{action} violates {}::{}: {after:?}",
+                model.name,
+                invariant.name
+            );
+        }
+    }
+
+    /// TIER-1 REFINEMENT BINDING for `HdrReconfigureRetag`.
+    ///
+    /// `tests/hdr_gate.rs` enumerates the PLANNER's boolean domain; this test is
+    /// the other half the model's actions are anchored to — it drives the real
+    /// `apply_hdr_reconfigure_plan` / `apply_hdr_surface_upgrade` on a real
+    /// `WindowGpu` and reads `capture_linear` back off what those methods left
+    /// behind. A binding that stopped at the planner would stay green if either
+    /// apply forgot its metadata half, which is the exact defect the model's
+    /// `CaptureMatchesSurfaceEncoding` and `FailedRetagFallsBackAtomically`
+    /// invariants exist to forbid.
+    ///
+    /// SCOPE: `capture_linear` is the only variable this test measures rather
+    /// than supplies — `is_f16` is the planner's resolved format and
+    /// `stage`/`retagged` are drive coordinates. The surface-side halves
+    /// (installing the resolved format; the `if surf.is_hdr()` guard that picks
+    /// `UpgradeSucceeds` over `UpgradeFails`) need a real DX12 swapchain, so
+    /// `hdr_gate.rs`'s source-region gate holds them instead. See
+    /// `aterm_spec::derive::hdr_reconfigure_retag_model` for the full accounting.
+    ///
+    /// It lives in this in-crate module, not in `tests/hdr_gate.rs`, precisely
+    /// so the two applies can stay PRIVATE: an integration test would have had
+    /// to widen `WindowGpu`'s API with two HDR metadata mutators to reach them.
+    #[test]
+    fn hdr_reconfigure_apply_conforms_to_retag_model() {
+        use crate::format_plan::{HdrReconfigurePlan, hdr_reconfigure_plan};
+        use crate::video_tap::CaptureColorSpace;
+
+        let model = aterm_spec::derive::hdr_reconfigure_retag_model();
+        let initial = model.init_state();
+
+        // Every action of the machine is anchored, and anchored on BOTH halves:
+        // the planner that decides and the apply that performs. `cfg(test)` is
+        // one of the cfgs the anchors are gated on, so this binary linked them.
+        {
+            use std::collections::{BTreeMap, BTreeSet};
+
+            let anchors: Vec<_> = aterm_spec::xref::refinements()
+                .filter(|anchor| anchor.machine == "HdrReconfigureRetag")
+                .collect();
+            let mut fns_of_action: BTreeMap<&str, BTreeSet<&str>> = BTreeMap::new();
+            for anchor in &anchors {
+                fns_of_action
+                    .entry(anchor.action)
+                    .or_default()
+                    .insert(anchor.rust_method);
+                assert_eq!(
+                    anchor.project, "aterm_gpu::WindowGpu::project_hdr_reconfigure_state",
+                    "{} must name the live projection, not a hand-written table",
+                    anchor.action
+                );
+            }
+            let expected: BTreeMap<&str, BTreeSet<&str>> = [
+                ("RetagSucceeds", "apply_hdr_reconfigure_plan"),
+                ("RetagFails", "apply_hdr_reconfigure_plan"),
+                ("EnterSdrFallback", "apply_hdr_reconfigure_plan"),
+                ("UpgradeFails", "apply_hdr_reconfigure_plan"),
+                ("UpgradeSucceeds", "apply_hdr_surface_upgrade"),
+            ]
+            .into_iter()
+            .map(|(action, apply)| (action, BTreeSet::from(["hdr_reconfigure_plan", apply])))
+            .collect();
+            assert_eq!(
+                fns_of_action, expected,
+                "every HdrReconfigureRetag action must bind the shipping planner AND the \
+                 concrete apply that performs its metadata half"
+            );
+        }
+
+        // stage 0 -> 2: an f16 surface rebuilt by any live reconfigure. The plan
+        // decides; the apply reconciles; the projection reads the apply's work.
+        let mut downgrade_fallbacks = 0usize;
+        for retagged in [false, true] {
+            let action = if retagged {
+                "RetagSucceeds"
+            } else {
+                "RetagFails"
+            };
+            let mut win = confirmed_hdr_window();
+            let plan = hdr_reconfigure_plan(true, retagged);
+            win.apply_hdr_reconfigure_plan(plan);
+            let after = project_reconfigure(
+                &initial,
+                win.project_hdr_reconfigure_state(2, retagged, plan),
+            );
+            assert_reconfigure_transition(&model, &initial, &after, action);
+            match plan {
+                HdrReconfigurePlan::KeepHdr => {
+                    assert_eq!(win.sdr_white_scale(), 2.5, "a kept HDR epoch is preserved");
+                    assert_eq!(win.edr_max(), 3.0);
+                }
+                HdrReconfigurePlan::FallbackToSdr => {
+                    downgrade_fallbacks += 1;
+                    // The two fields the model does not carry, pinned here so
+                    // the atomic fallback cannot half-happen unnoticed.
+                    assert_eq!(win.sdr_white_scale(), 1.0);
+                    assert_eq!(win.edr_max(), 0.0);
+                }
+                HdrReconfigurePlan::KeepSdr => {
+                    panic!("an existing f16 surface cannot take the KeepSdr arm")
+                }
+            }
+        }
+        assert_eq!(
+            downgrade_fallbacks, 1,
+            "exactly the failed f16 re-tag must select SDR fallback"
+        );
+
+        // stage 0 -> 1: the same failed-retag apply, read as the ENTRY to the
+        // retained eligible SDR surface the live HDR-on path starts from.
+        let fallback_plan = hdr_reconfigure_plan(true, false);
+        assert_eq!(fallback_plan, HdrReconfigurePlan::FallbackToSdr);
+        let mut fallback_window = confirmed_hdr_window();
+        fallback_window.apply_hdr_reconfigure_plan(fallback_plan);
+        let sdr = project_reconfigure(
+            &initial,
+            fallback_window.project_hdr_reconfigure_state(1, false, fallback_plan),
+        );
+        assert_reconfigure_transition(&model, &initial, &sdr, "EnterSdrFallback");
+        assert_eq!(sdr["stage"], 1);
+        assert_eq!(sdr["is_f16"], 0);
+        assert_eq!(sdr["capture_linear"], 0);
+
+        // stage 1 -> 2: the symmetric live SDR->HDR upgrade. A successful
+        // configure+tag does NOT publish metadata by itself; the upgrade apply
+        // is the publication boundary, and the projection proves it.
+        let mut upgrade_fallbacks = 0usize;
+        for retagged in [false, true] {
+            let action = if retagged {
+                "UpgradeSucceeds"
+            } else {
+                "UpgradeFails"
+            };
+            let mut win = confirmed_hdr_window();
+            win.apply_hdr_reconfigure_plan(fallback_plan);
+            let plan = hdr_reconfigure_plan(true, retagged);
+            win.apply_hdr_reconfigure_plan(plan);
+            match plan {
+                HdrReconfigurePlan::KeepHdr => {
+                    assert_eq!(
+                        win.capture_color_space(),
+                        CaptureColorSpace::Srgb,
+                        "a successful plan alone must not publish the new encoding"
+                    );
+                    win.apply_hdr_surface_upgrade();
+                }
+                HdrReconfigurePlan::FallbackToSdr => {
+                    upgrade_fallbacks += 1;
+                }
+                HdrReconfigurePlan::KeepSdr => {
+                    panic!("an admitted f16 upgrade cannot take the KeepSdr arm")
+                }
+            }
+            let after =
+                project_reconfigure(&sdr, win.project_hdr_reconfigure_state(2, retagged, plan));
+            assert_reconfigure_transition(&model, &sdr, &after, action);
+        }
+        assert_eq!(
+            upgrade_fallbacks, 1,
+            "a failed upgrade tag must restore exactly one SDR fallback"
+        );
+
+        // An SDR reconfigure never becomes HDR because a meaningless re-tag
+        // boolean is true, and the apply preserves a confirmed non-sRGB tag.
+        for retagged in [false, true] {
+            let plan = hdr_reconfigure_plan(false, retagged);
+            assert_eq!(plan, HdrReconfigurePlan::KeepSdr);
+            let mut p3 = WindowGpu::new();
+            p3.set_capture_color_space(CaptureColorSpace::DisplayP3);
+            p3.apply_hdr_reconfigure_plan(plan);
+            assert_eq!(
+                p3.capture_color_space(),
+                CaptureColorSpace::DisplayP3,
+                "KeepSdr must preserve confirmed non-sRGB SDR metadata"
+            );
+        }
+
+        // NEGATIVE CONTROL: the pre-fix live reconfigure ignored a `false` re-tag
+        // and kept both f16 and linear capture metadata. The tiered validator
+        // must REJECT that step under the very action it claims to be.
+        let mut ignored_failure = initial.clone();
+        ignored_failure.insert("stage", 2);
+        ignored_failure.insert("retagged", 0);
+        ignored_failure.insert("is_f16", 1);
+        ignored_failure.insert("capture_linear", 1);
+        let (accepted, evidence) = aterm_spec::verify::validate_transition_tiered(
+            &model,
+            &[],
+            &initial,
+            &ignored_failure,
+            Some("RetagFails"),
+            "HDR ignored-retag-failure negative control",
+        );
+        assert!(
+            !accepted,
+            "ignored retag failure unexpectedly conformed: {evidence}"
+        );
+
+        // NEGATIVE CONTROL: an HDR-on upgrade configured f16, its tag failed, and
+        // the old path left that plausible f16 surface live while capture stayed
+        // honestly SDR — the metadata/format mismatch the model forbids.
+        let mut failed_upgrade = sdr.clone();
+        failed_upgrade.insert("stage", 2);
+        failed_upgrade.insert("retagged", 0);
+        failed_upgrade.insert("is_f16", 1);
+        failed_upgrade.insert("capture_linear", 0);
+        let (accepted, evidence) = aterm_spec::verify::validate_transition_tiered(
+            &model,
+            &[],
+            &sdr,
+            &failed_upgrade,
+            Some("UpgradeFails"),
+            "HDR failed-upgrade negative control",
+        );
+        assert!(
+            !accepted,
+            "failed upgrade mutant unexpectedly conformed: {evidence}"
+        );
+    }
+
     /// Same-size Windows HDR toggles have no guaranteed surface event, so live
     /// f16 presents periodically re-check scRGB support. The gate must check an
     /// unvalidated/dormant surface immediately while bounding an animated
@@ -25902,5 +26529,82 @@ mod acquire_wait_failure_tests {
         window.measure_surface_acquire(|| ());
         window.begin_surface_present();
         assert_eq!(window.take_acquire_wait_sample_ns(), None);
+    }
+}
+
+#[cfg(all(target_os = "macos", test))]
+mod gpu_park_accounting_tests {
+    use super::{WindowGpu, encode_work_ns_excluding_park};
+
+    /// ONE PARK LEDGER PER ATTEMPT, PUBLISHED EXACTLY ONCE. The armed present
+    /// parks at two sites (the pending-ring drain, then the frame slot) and may
+    /// be refused between them, so the total accumulates across the attempt and
+    /// is handed to the host once — the acquire sample's rule, applied to the
+    /// same thread's other wait.
+    #[test]
+    fn a_gpu_park_accumulates_per_attempt_and_publishes_exactly_once() {
+        let mut window = WindowGpu::new();
+        window.begin_surface_present();
+        assert_eq!(
+            window.take_gpu_park_sample_ns(),
+            None,
+            "an attempt that never parked must publish no sample"
+        );
+
+        window.begin_surface_present();
+        window.add_gpu_park(3_000_000);
+        window.add_gpu_park(7_000_000);
+        assert_eq!(window.last_gpu_park_ns(), 10_000_000);
+        assert_eq!(window.take_gpu_park_sample_ns(), Some(10_000_000));
+        assert_eq!(
+            window.take_gpu_park_sample_ns(),
+            None,
+            "no duplicate publication"
+        );
+
+        // A fresh attempt starts from zero and cannot replay the old total.
+        window.begin_surface_present();
+        assert_eq!(window.take_gpu_park_sample_ns(), None);
+        window.add_gpu_park(250_000);
+        assert_eq!(window.take_gpu_park_sample_ns(), Some(250_000));
+    }
+
+    /// A GPU PARK IS NOT A SLOW FRAME. The staging wait sits inside the armed
+    /// present's work timer, so before this the whole park was reported as
+    /// `raster_submit_ns` -> `frame_render` and judged against the frontend's
+    /// ~30 fps budget. A contended GPU could therefore trip `slow_frames` and
+    /// the load-shed latch while the CPU did almost nothing.
+    #[test]
+    fn a_contention_park_is_subtracted_from_the_presents_encode_cost() {
+        // 14 ms in the work timer, 10 ms of it parked on the previous frame's
+        // Submit A: 4 ms of real encode work.
+        assert_eq!(
+            encode_work_ns_excluding_park(14_000_000, 10_000_000),
+            4_000_000
+        );
+
+        // THE REGRESSION THIS PINS. The GPU is contended and the staging wait
+        // parks 38 ms while the frame itself encodes in 2 ms. Charged raw, the
+        // 40 ms span blows the slow-frame budget the frontend applies to
+        // `frame_render`; attributed, the frame costs 2 ms and the park is
+        // reported as the park it is. (`SLOW_FRAME_THRESHOLD_NS` is the
+        // frontend's, restated here so this crate pins the arithmetic it feeds.)
+        const SLOW_FRAME_THRESHOLD_NS: u64 = 33_333_333;
+        let raw_span_ns = 40_000_000;
+        let park_ns = 38_000_000;
+        assert!(
+            raw_span_ns > SLOW_FRAME_THRESHOLD_NS,
+            "the raw span must be one the frontend would call a slow frame"
+        );
+        let attributed = encode_work_ns_excluding_park(raw_span_ns, park_ns);
+        assert_eq!(attributed, 2_000_000);
+        assert!(
+            attributed < SLOW_FRAME_THRESHOLD_NS,
+            "a GPU park must not count against the compose path's budget"
+        );
+
+        // Saturating: the timer and the park are read from the same clock but
+        // not atomically, so a park may round up to the whole span.
+        assert_eq!(encode_work_ns_excluding_park(1_000, 5_000), 0);
     }
 }

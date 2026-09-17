@@ -218,7 +218,6 @@ pub(crate) const EDIT_CURSOR_TRAIL_MS: &str = "cursor_trail_ms";
 pub(crate) const EDIT_CURSOR_TRAIL_LENGTH: &str = "cursor_trail_length";
 pub(crate) const EDIT_CURSOR_TRAIL_INTENSITY: &str = "cursor_trail_intensity";
 pub(crate) const EDIT_CURSOR_TRAIL_RADIUS: &str = "cursor_trail_radius";
-pub(crate) const EDIT_CURSOR_TRAIL_WAKE_MS: &str = "cursor_trail_wake_ms";
 pub(crate) const EDIT_CURSOR_TRAIL_RING: &str = "cursor_trail_ring";
 pub(crate) const EDIT_CURSOR_TRAIL_BLOOM: &str = "cursor_trail_bloom";
 pub(crate) const EDIT_CURSOR_TRAIL_BLOOM_STRENGTH: &str = "cursor_trail_bloom_strength";
@@ -1017,11 +1016,12 @@ pub(crate) const DEFERRED_CONFIG_KEYS: &[(&str, &str)] = &[
     ),
     (
         "tab_menu_chord",
-        "the Windows-only keyboard spelling of the tab context menu (on|menu_key|off): a \
-         key-OWNERSHIP escape hatch, not a preference — its whole purpose is to hand \
-         Menu / Shift+F10 back to a terminal application, which is a Keyboard-section \
-         concern the registry has no page for yet; it joins the registry with that section \
-         rather than sitting as an orphan enum row on an unrelated page",
+        "the keyboard spelling of the tab context menu on the in-grid-strip platforms, \
+         Windows and Linux (on|menu_key|off, defaulting to menu_key so Shift+F10 stays the \
+         application's terminfo kf22): a key-OWNERSHIP escape hatch, not a preference — \
+         its whole purpose is to say which of Menu / Shift+F10 the terminal may claim, a \
+         Keyboard-section concern the registry has no page for yet; it joins the registry \
+         with that section rather than sitting as an orphan enum row on an unrelated page",
     ),
     (
         "font_hinting",
@@ -1109,10 +1109,12 @@ pub(crate) const VISUAL_PREVIEW_KEYS: &[&str] = &[
     EDIT_STEM_GAMMA,
     EDIT_FONT_WEIGHT,
     EDIT_FONT_VARIATION,
-    // Cursor Kitty (3) — the cat's own page; every one previews through the
-    // SAME cursor scene as the Cursor & Motion block below it.
+    // Cursor Kitty (2) — the cat's own page; both preview through the SAME
+    // cursor scene as the Cursor & Motion block below it. It was three until
+    // `cursor_trail_wake_ms` was retired (2026-09-16): a preview key must move
+    // something on the glass, and that dial had not moved anything since the
+    // v1 wake walk was deleted.
     EDIT_CURSOR_TRAIL_STYLE,
-    EDIT_CURSOR_TRAIL_WAKE_MS,
     EDIT_CURSOR_NYAN_SPRITE,
     // Cursor & Motion (17)
     EDIT_CURSOR_STYLE,
@@ -1604,7 +1606,6 @@ pub(crate) fn edit_kind(key: &str) -> EditKind {
         EDIT_SCROLLBACK
         | EDIT_CURSOR_TRAIL_MS
         | EDIT_CURSOR_TRAIL_LENGTH
-        | EDIT_CURSOR_TRAIL_WAKE_MS
         | EDIT_STREAM_FADE_MS
         | EDIT_COLUMNS
         | EDIT_LINES
@@ -2404,8 +2405,10 @@ pub(crate) enum Section {
     /// default now ([`DEFAULT_CURSOR_TRAIL_STYLE`]), and it was reachable only
     /// through a ten-option popup buried in a page that also owns bloom radius
     /// and the whole Sound menu. This section holds the keys that belong to the
-    /// CAT and nothing else: which companion you get, how long its rainbow wake
-    /// runs, and the sprite art it wears.
+    /// CAT and nothing else: which companion you get and the sprite art it
+    /// wears. The third — how long its rainbow wake runs
+    /// (`cursor_trail_wake_ms`) — was retired 2026-09-16 because nothing read
+    /// it, so this section's whole content is the companion showcase card.
     CursorKitty,
     Typography,
     /// Window sizing, tabs, smart titles, and chrome.
@@ -2509,16 +2512,14 @@ pub(crate) fn section_of(key: &str) -> Section {
         return Section::Appearance;
     }
     // THE CURSOR KITTY'S OWN PANE, ahead of the generic cursor arms below: these
-    // three keys answer to the CAT, not to the trail engine. `cursor_trail_style`
+    // two keys answer to the CAT, not to the trail engine. `cursor_trail_style`
     // is the choice between the walking pet (the shipped default), the flying
-    // head, another look entirely, and off; `cursor_trail_wake_ms` is documented
-    // in `app_config` as the rainbow-kitty wake specifically; `cursor_nyan_sprite`
-    // is the kitty's ART (it is Manual-only, so it never paints a row here — it
-    // rides this section for Search/Modified grouping and the preview registry).
-    if matches!(
-        key,
-        EDIT_CURSOR_TRAIL_STYLE | EDIT_CURSOR_TRAIL_WAKE_MS | EDIT_CURSOR_NYAN_SPRITE
-    ) {
+    // head, another look entirely, and off; `cursor_nyan_sprite` is the kitty's
+    // ART (it is Manual-only, so it never paints a row here — it rides this
+    // section for Search/Modified grouping and the preview registry). The third
+    // was `cursor_trail_wake_ms`, retired 2026-09-16; the page's content is the
+    // companion showcase card, which is what it was always for.
+    if matches!(key, EDIT_CURSOR_TRAIL_STYLE | EDIT_CURSOR_NYAN_SPRITE) {
         return Section::CursorKitty;
     }
     match key {
@@ -2664,13 +2665,12 @@ pub(crate) fn group_of(key: &str) -> (&'static str, u8) {
     // The Cursor Kitty pane. "Companion" is the picker's own caption — the page
     // paints that row as its showcase card (the key is a Top Setting, so the
     // ordinary registry never draws it), and this entry only orders it first in
-    // Search and Modified. "Rainbow wake" is the one group box the page paints;
-    // "Kitty art" is Manual-only for the same reason and likewise never paints.
+    // Search and Modified. "Kitty art" is Manual-only and likewise never
+    // paints. The page therefore paints NO ordinary group box: its content is
+    // the showcase card. "Rainbow wake" was the one box it had until
+    // `cursor_trail_wake_ms` was retired (2026-09-16).
     if key == EDIT_CURSOR_TRAIL_STYLE {
         return ("Companion", 0);
-    }
-    if key == EDIT_CURSOR_TRAIL_WAKE_MS {
-        return ("Rainbow wake", 1);
     }
     if key == EDIT_CURSOR_NYAN_SPRITE {
         return ("Kitty art", 2);
@@ -2889,22 +2889,15 @@ pub(crate) fn group_footnote(caption: &str) -> Option<&'static str> {
         "Sound" => {
             "Music effects in Top Settings is the master switch for the synth voices; Volume scales them. Neither reaches the terminal bell's system alert sound."
         }
-        // The Cursor Kitty box's consequence copy states the two facts its one
-        // row cannot. (a) `0` is a real, useful value — it hides the plume and
-        // KEEPS the cat, which a bare 0..1500 slider reads as "off" — see
-        // `cursor_glow::rainbow_wake_persistence_is_a_host_dial_that_fails_off`.
-        // (b) The dial is a rainbow-style dial: `GlowConfig::wake_persist_s`
-        // only reaches the rainbow ribbon's wake, so on `comet`/`fire`/`beam`
-        // it moves nothing. The upstream gates (Serious Mode, Reduced motion,
-        // an unfocused window, `cursor_trail = false`) each already carry a
-        // per-row `motion_suppression` disclosure, so they are not repeated.
-        // BUDGETED to five wrapped lines at 2× Dynamic Type on a 320pt page:
-        // one row plus a six-line footnote overflowed its own group box there
-        // (`advanced_group_footnotes_…`), and a footnote that paints past the
-        // page is worse than a shorter one.
-        "Rainbow wake" => {
-            "How much recent typing shows as a plume; 0 hides the plume and keeps the cat. Rainbow styles only."
-        }
+        // THE "Rainbow wake" FOOTNOTE IS GONE with the row it belonged to
+        // (`cursor_trail_wake_ms`, retired 2026-09-16). Its copy — "How much
+        // recent typing shows as a plume; 0 hides the plume and keeps the cat.
+        // Rainbow styles only." — was the most confident sentence in Settings
+        // about a value nothing read, and it cited a proof
+        // (`cursor_glow::rainbow_wake_persistence_is_a_host_dial_that_fails_off`)
+        // that had not existed since the v1 wake walk was deleted. There is no
+        // replacement caption: the Cursor Kitty page paints no ordinary group
+        // box now, only its companion showcase card.
         "Trail color" => {
             "Blank colors follow the active terminal theme; Nyan uses its built-in sprite."
         }
@@ -3112,10 +3105,6 @@ pub(crate) fn range_of(key: &str) -> Option<Range> {
         // the authored 30/2000 ms endpoints on the slider's exact value grid.
         EDIT_CURSOR_TRAIL_MS => r(30.0, 2000.0, 10.0),
         EDIT_CURSOR_TRAIL_LENGTH => r(1.0, 512.0, 1.0),
-        // The typing wake spans OFF (0) to a long 1.5 s of travel. Unlike the
-        // comet duration above, 0 is a real, reachable setting here — it is
-        // how you keep the rainbow ribbon and drop the plume.
-        EDIT_CURSOR_TRAIL_WAKE_MS => r(0.0, 1500.0, 25.0),
         EDIT_CURSOR_TRAIL_INTENSITY => r(0.0, 1.0, 0.05),
         EDIT_CURSOR_TRAIL_RADIUS => r(0.0, 2.0, 0.05),
         EDIT_CURSOR_TRAIL_BLOOM_STRENGTH => r(0.0, 3.0, 0.05),
@@ -3254,17 +3243,30 @@ pub(crate) fn keywords_of(key: &str) -> &'static [&'static str] {
         // glow is what replaces it while they type.
         EDIT_CURSOR_MOMENTUM_GLOW => &["blink", "glow", "typing", "speed", "momentum", "effect"],
         EDIT_CURSOR_TRAIL
-        | EDIT_CURSOR_TRAIL_STYLE
         | EDIT_CURSOR_TRAIL_MS
         | EDIT_CURSOR_TRAIL_LENGTH
         | EDIT_CURSOR_TRAIL_INTENSITY
         | EDIT_CURSOR_TRAIL_RADIUS
         | EDIT_CURSOR_TRAIL_RING => &["effect", "motion", "comet", "trail"],
-        // "nyan" stays alongside "kitty"/"rainbow": search keywords are DISCOVERY
-        // aliases, and a user who knows the effect by its old name must still find
-        // the row.
-        EDIT_CURSOR_TRAIL_WAKE_MS => &[
-            "effect", "motion", "trail", "wake", "typing", "kitty", "rainbow", "nyan", "plume",
+        // THE COMPANION PICKER INHERITS THE CAT'S NAMES. Until 2026-09-16 the
+        // only row in Settings carrying "kitty"/"rainbow"/"nyan" as discovery
+        // aliases was the typing-wake dial — so a user who searched "kitty" was
+        // answered by a control that had not moved a pixel since the v1 wake
+        // walk was deleted, while the picker that actually chooses the cat
+        // matched nothing. Retiring that dial must not leave the cat
+        // unsearchable by its own name, so the aliases move to the row they
+        // always described.
+        EDIT_CURSOR_TRAIL_STYLE => &[
+            "effect",
+            "motion",
+            "comet",
+            "trail",
+            "kitty",
+            "cat",
+            "rainbow",
+            "nyan",
+            "pet",
+            "companion",
         ],
         EDIT_CURSOR_TRAIL_COLOR | EDIT_CURSOR_TRAIL_ACCENT => {
             &["effect", "trail", "color", "colour", "aurora", "accent"]
@@ -4200,17 +4202,6 @@ pub(crate) fn editable_fields(cfg: &Config) -> Vec<EditField> {
             placeholder: match cfg.cursor_trail_intensity {
                 Some(v) => v.to_string(),
                 None => "1.0 (default)".to_string(),
-            },
-        },
-        EditField {
-            label: "Typing wake",
-            key: EDIT_CURSOR_TRAIL_WAKE_MS,
-            kind: EditKind::Integer,
-            seed: cfg.cursor_trail_wake_ms.map(|n| n.to_string()),
-            placeholder: match cfg.cursor_trail_wake_ms {
-                Some(0) => "off".to_string(),
-                Some(n) => format!("{n} ms of travel"),
-                None => "300 ms (default)".to_string(),
             },
         },
         EditField {
@@ -6083,7 +6074,7 @@ mod edit_tests {
             super::VISUAL_PREVIEW_KEYS.len(),
             "duplicate preview key"
         );
-        assert_eq!(registry.len(), 58, "the explicit visual contract changed");
+        assert_eq!(registry.len(), 57, "the explicit visual contract changed");
 
         let fields = super::editable_fields(&Config::default());
         let expected = fields
@@ -6136,9 +6127,10 @@ mod edit_tests {
             (super::Section::Appearance, 11),
             (super::Section::Typography, 22),
             // 21 → 18 + 3: the trail-style picker, the rainbow wake dial and the
-            // custom sprite moved to the cat's own pane. Same 58 total.
+            // custom sprite moved to the cat's own pane. 58 → 57 and 3 → 2 when
+            // the wake dial was retired (2026-09-16).
             (super::Section::Cursor, 18),
-            (super::Section::CursorKitty, 3),
+            (super::Section::CursorKitty, 2),
             (super::Section::Window, 4),
         ] {
             assert_eq!(

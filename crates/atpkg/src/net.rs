@@ -7,7 +7,11 @@
 //! It lists `…/releases` PAGINATED ([`paged_releases`]: `per_page=100`, up to
 //! [`MAX_RELEASE_PAGES`] pages — the index and app releases share ONE repo, so the index
 //! tag drifts down the listing at the app-release cadence and a single unpaginated page
-//! lost it within days; `aterm-update`'s catalog walk paginates for the same reason) and,
+//! lost it within days; `aterm-update`'s catalog walk paginates for the same reason), no
+//! further than the asking lane can use ([`GithubFetcher::index_releases`] stops at the
+//! page that completes [`INDEX_CANDIDATE_CAP`] candidates, since no later page can
+//! contribute one; the memo keeps that prefix marked incomplete, and a lane that needs the
+//! whole catalog resumes the walk after it) and,
 //! for each release, locates the `<name>` + `<name>.sig` asset pair, then downloads their
 //! bytes through `aterm-update-core`'s authenticated `curl` plumbing
 //! (`api_get`/`download_bytes`/`download_to` — the SAME proven layer the macOS updater
@@ -29,7 +33,11 @@ use serde::Deserialize;
 use crate::select::Candidate;
 
 /// A GitHub Release (subset). Unknown fields ignored.
-#[derive(Debug, Deserialize)]
+///
+/// `Clone` so a memoized PREFIX can be EXTENDED: a lane needing the whole catalog resumes
+/// the walk over the pages a shorter-walking lane already paid for (see [`Listing`]),
+/// which costs a few hundred small clones and saves a metered request.
+#[derive(Debug, Clone, Deserialize)]
 pub struct Release {
     /// The release tag (diagnostics / `Candidate::label`).
     #[serde(default)]
@@ -40,7 +48,7 @@ pub struct Release {
 }
 
 /// A release asset (subset): its name + the API URL to download its bytes.
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Clone, Deserialize)]
 pub struct Asset {
     /// The asset file name (e.g. `index.toml`, `index.toml.sig`).
     pub name: String,
@@ -122,10 +130,20 @@ fn direct_manifest_urls(slug: &str, program: &str, build: u64) -> Option<(String
     Some((toml, sig))
 }
 
-/// The CDN URL for a release ASSET whose name already encodes its build
-/// (`ty-2973.tar.zst` lives under tag `atpkg-ty-2973`), so the tag is the file name with
-/// its extension removed. `None` when the name has no extension to strip or is not
-/// URL-safe — again falling back to enumeration rather than guessing.
+/// The CDN URL for a release ASSET whose name carries the build it was published under
+/// (`ty-2973.tar.zst` and `ty-2973-x86_64-unknown-linux-gnu.tar.zst` BOTH live under tag
+/// `atpkg-ty-2973`). `None` when the name has no extension to strip, carries no build
+/// number, or is not URL-safe — again falling back to enumeration rather than guessing.
+///
+/// The tag is the build-qualified PREFIX of the name, NOT the whole stem. Only the
+/// historical `aarch64-apple-darwin` asset is named `<prog>-<build>.tar.zst`; every other
+/// triple is `<prog>-<build>-<triple>.tar.zst` and lands on the SAME
+/// `atpkg-<prog>-<build>` release (tools/atpkg-pack.sh, tools/atpkg-pack-bundle.sh,
+/// tools/linux-auto-atpkg.sh). Taking the whole stem therefore derived
+/// `atpkg-trust-4821-x86_64-unknown-linux-gnu`, a tag that has never existed, so every
+/// non-darwin host 404'd here and fell back to the metered listing — the very lane this
+/// derivation exists to remove. The build number is the anchor: it is the first all-digit
+/// `-` segment, and neither a program name nor a target triple has one.
 fn direct_asset_url(slug: &str, asset: &str) -> Option<String> {
     // Strip the FULL extension: these are `.tar.zst`, and `Path::file_stem` would leave
     // `ty-2973.tar`, naming a tag that does not exist.
@@ -137,8 +155,23 @@ fn direct_asset_url(slug: &str, asset: &str) -> Option<String> {
     {
         return None;
     }
+    // `<prog>-<build>`: the stem truncated after its first all-digit segment — which
+    // drops a `-<triple>` suffix when there is one and changes nothing when there is not.
+    // The stem is ASCII by the check above, so the index is a char boundary. A name with
+    // NO build number derives nothing: no such tag can exist, and taking the listing is
+    // cheaper than spending a request on a URL that can only 404.
+    let mut end = None;
+    let mut pos = 0usize;
+    for seg in stem.split('-') {
+        let seg_end = pos + seg.len();
+        if !seg.is_empty() && seg.bytes().all(|b| b.is_ascii_digit()) {
+            end = Some(seg_end);
+            break;
+        }
+        pos = seg_end + 1;
+    }
     let mut tag = String::from("atpkg-");
-    tag.push_str(stem);
+    tag.push_str(stem.get(..end?)?);
     web_asset_url(slug, &tag, asset)
 }
 
@@ -177,6 +210,33 @@ pub fn parse_releases(body: &[u8]) -> Result<Vec<Release>, String> {
 const MANIFEST_CAP: u64 = 5_000_000; // 5 MB
 const SIG_CAP: u64 = 4_096; // an Ed25519 detached sig is 64 bytes; cap generously
 const ARTIFACT_CAP: u64 = 8u64 << 30; // 8 GiB ceiling for a toolchain bundle
+
+/// The byte cap for ONE artifact transfer: the row's SIGNED `size`, clamped by
+/// [`ARTIFACT_CAP`] — never the constant alone.
+///
+/// The signed number is the one the disk preflight was computed from (`flow`'s
+/// `disk_gate(size + disk_installed)`), and that preflight runs ONCE, before the
+/// transfer: nothing bounds the bytes while they land but the cap the fetcher is given,
+/// and the sha256 gate sees the file only after it is WHOLE. Capping the release lane at
+/// the 8 GiB ceiling instead therefore let a mis-uploaded or substituted asset — up to
+/// GitHub's 2 GiB per-asset limit — write straight through the free-space floor the
+/// preflight had just defended, for a row whose signed `size` said 30 MB, and be
+/// discarded only afterwards. The vendor lane (`download_url`) has always taken the
+/// signed size exactly; this is the same rule for the release lane, and it is what §9
+/// ("Large-artifact handling — caps from the SIGNED manifest, not the API") asks for.
+///
+/// `0` is the one row that can state no size — [`crate::vendor::check_row`] requires
+/// `size > 0` only for the `https`/`pkg` protocols, so a `github-release` row published
+/// before that rule may carry none — and it keeps the ceiling rather than capping the
+/// transfer at zero bytes, which would refuse every such artifact.
+fn artifact_cap(size: u64) -> u64 {
+    if size == 0 || size > ARTIFACT_CAP {
+        ARTIFACT_CAP
+    } else {
+        size
+    }
+}
+
 /// A roster is a few hundred bytes per machine and is capped at 16 machines. Same ceiling
 /// `aterm-update`'s armed path uses for the identical asset — one document, one bound.
 const ROSTER_CAP: u64 = 65_536;
@@ -216,24 +276,67 @@ const MAX_RELEASE_PAGES: u64 = 10;
 /// so a full candidate set is never refused by the cache write.
 const INDEX_CANDIDATE_CAP: usize = 4;
 
-/// Walk the release listing page by page via `fetch_page(page)` (1-based) until a short
-/// page (the listing is exhausted) or [`MAX_RELEASE_PAGES`]. A mid-walk error fails the
+/// Where a page walk got to: the highest page READ, and whether the catalog is
+/// EXHAUSTED by it (a short page, or [`MAX_RELEASE_PAGES`] — beyond which nothing is
+/// reachable anyway). `complete == false` means the walk stopped early because the
+/// caller had enough, so what it collected is a newest-first PREFIX and must never be
+/// handed to someone asking for the whole catalog.
+#[derive(Debug)]
+struct Walk {
+    pages: u64,
+    complete: bool,
+}
+
+/// Walk the release listing page by page via `fetch_page(page)` (1-based), starting at
+/// page `from` and extending `seen`, until `enough(&seen)` is satisfied, a short page
+/// (the listing is exhausted) or [`MAX_RELEASE_PAGES`]. A mid-walk error fails the
 /// WHOLE listing — a silently truncated catalog would reintroduce the pushed-off-page
-/// blindness this walk exists to close — and an errored listing is never memoized, so a
-/// transient page failure stays retryable.
+/// blindness this walk exists to close — and only a curl-level failure is memoized (as
+/// the offline verdict [`GithubFetcher::releases_at`] documents), so a transient page
+/// failure stays retryable.
+///
+/// # `enough` IS THE METER
+///
+/// Every page is one `api.github.com` request, against a budget of **60 per hour per IP**
+/// on the anonymous lane the advertised `curl … | bash` install runs on. The index lane
+/// can only ever use the newest [`INDEX_CANDIDATE_CAP`] releases carrying a complete quad
+/// ([`index_pair_urls`] stops there), so once a page has completed that many, every
+/// further page is a metered request whose rows nothing can choose. That became real cost
+/// when the shared app repo crossed 100 releases (117 on 2026-09-16 = two pages) while all
+/// four `atpkg-index-*` candidates still sat on page 1: two requests per pass, per
+/// machine, where one answers — and three once the repo passes 200.
+///
+/// The stop is CONDITIONAL, never "page 1 only": four quads that are NOT on page 1 (a
+/// sparse index history, or a burst of app releases pushing the tags down) keep the walk
+/// going, which is the pushed-off-page blindness the walk was added to close.
+///
+/// `from`/`seen` are what let a prefix be memoized honestly: a lane that needs the whole
+/// catalog RESUMES after the pages already read instead of paying for them twice.
 fn paged_releases(
+    from: u64,
+    seen: &mut Vec<Release>,
+    enough: &mut dyn FnMut(&[Release]) -> bool,
     mut fetch_page: impl FnMut(u64) -> Result<Vec<Release>, String>,
-) -> Result<Vec<Release>, String> {
-    let mut all = Vec::new();
-    for page in 1..=MAX_RELEASE_PAGES {
+) -> Result<Walk, String> {
+    let mut walk = Walk {
+        pages: from.saturating_sub(1),
+        complete: from > MAX_RELEASE_PAGES,
+    };
+    for page in from..=MAX_RELEASE_PAGES {
         let batch = fetch_page(page)?;
         let exhausted = batch.len() < RELEASES_PER_PAGE;
-        all.extend(batch);
-        if exhausted {
+        seen.extend(batch);
+        walk.pages = page;
+        if exhausted || page == MAX_RELEASE_PAGES {
+            // The safety cap is as complete as any walk gets: nothing past it is reachable.
+            walk.complete = true;
+            break;
+        }
+        if enough(seen.as_slice()) {
             break;
         }
     }
-    Ok(all)
+    Ok(walk)
 }
 
 /// The four asset URLs one candidate needs, resolved from a release's asset list.
@@ -395,6 +498,45 @@ type ManifestBytes = std::sync::Arc<(Vec<u8>, Vec<u8>)>;
 /// field.
 type ManifestMemo = std::sync::Mutex<std::collections::BTreeMap<ManifestKey, ManifestBytes>>;
 
+/// ONE slug's memoized release walk: the pages read so far, and whether the catalog was
+/// EXHAUSTED by them.
+///
+/// A walk that stopped early because the asking lane had enough
+/// ([`GithubFetcher::index_releases`]) is a legitimate entry — marked incomplete, so it is
+/// NEVER served to a lane that needs the whole catalog. That lane RESUMES at `pages + 1`
+/// and pays only for the pages nobody has read yet, which is what keeps the index lane's
+/// saving from reappearing as a second walk in the manifest/artifact fallbacks.
+#[derive(Clone)]
+struct Listing {
+    /// The releases read so far, newest first — the WHOLE catalog iff `complete`.
+    releases: std::sync::Arc<Vec<Release>>,
+    /// The highest page read into `releases` (pages are 1-based and contiguous).
+    pages: u64,
+    /// Whether the walk reached the end of the listing (or [`MAX_RELEASE_PAGES`]).
+    complete: bool,
+}
+
+/// ONE slug's memoized listing outcome: the release walk above, or the OFFLINE
+/// verdict [`GithubFetcher::releases_at`] latches (and only that one).
+type ListingOutcome = Result<Listing, String>;
+
+/// The listing memo itself: the locked map behind the fetcher's `releases` field.
+type ReleaseMemo = std::sync::Mutex<std::collections::BTreeMap<String, ListingOutcome>>;
+
+/// Whether a failed listing is a verdict about the LINK rather than about the request:
+/// curl itself could not reach the host — DNS, a refused or black-holed connect, a
+/// `--max-time` expiry, a refused spawn — after [`aterm_update_core::api_get_classified`]
+/// already spent its three attempts and two back-offs on it.
+///
+/// That is the ONLY class [`GithubFetcher::releases_at`] latches for the life of the
+/// process, because it is the only one that cannot change between two asks microseconds
+/// apart. A rate limit lifts, a 5xx passes, an auth answer can be re-read against a
+/// rotated credential, a portal-mangled body can arrive whole on the retry — every one of
+/// those stays retryable.
+fn listing_is_offline(e: &aterm_update_core::HttpError) -> bool {
+    matches!(e, aterm_update_core::HttpError::Transport(_))
+}
+
 /// The production fetcher: an `owner` account + a per-machine `token` (optional rate-limit
 /// / private-repo aid, §5.1) + the optional per-program `[packages.links]` `owner/repo`
 /// FETCH overrides. Construct with [`GithubFetcher::new`] (+ [`GithubFetcher::with_overrides`]).
@@ -412,12 +554,17 @@ pub struct GithubFetcher {
     ///
     /// Every miss is a `curl` SUBPROCESS plus a DNS+TLS+HTTP round-trip to
     /// api.github.com — not an in-process call — and the flow lists the same slug
-    /// repeatedly: `group_disk_required` → `stage_member` → `download_for` all resolve
+    /// repeatedly: `group_install_need` → `stage_member` → `download_for` all resolve
     /// the same program, and a recursive `install_inner` repeats the index listing per
     /// transitive dependency. Memoizing collapses those to one request each, which also
     /// matters functionally: the anonymous lane (`credential()` → `None`) gets ~60
     /// requests/hour per IP and the layer has a dedicated `RateLimited` arm for it.
-    releases: std::sync::Mutex<std::collections::BTreeMap<String, std::sync::Arc<Vec<Release>>>>,
+    ///
+    /// The memo holds the OUTCOME, not only the success: a listing that failed because
+    /// curl could not reach the host at all ([`listing_is_offline`]) is latched as that
+    /// verdict, so an offline pass asks once instead of once per caller. See
+    /// [`GithubFetcher::releases_at`] for why that class and no other.
+    releases: ReleaseMemo,
     /// Per-invocation memo of the index candidate set — the expensive one: a miss lists
     /// the index repo AND downloads `index.toml` + `.sig` for every release carrying the
     /// pair (up to 20 × 2 asset downloads). `install_inner` re-resolves it once per
@@ -497,19 +644,94 @@ impl GithubFetcher {
     /// (`owner/repo`), memoized for the life of this fetcher (see the `releases` field
     /// for the cost model — one repo's walk is one request until it exceeds 100 releases).
     ///
-    /// ONLY complete successes are memoized — an `Err` on ANY page fails the whole
-    /// listing and must stay retryable, so a transient network failure is never frozen
-    /// in (nor a truncated catalog served as complete). The lock is held ONLY around the
-    /// map lookup/insert, never across the request, so an in-flight fetch can neither
-    /// block another lane nor poison the mutex; a poisoned lock degrades to an uncached
-    /// (correct) fetch rather than panicking.
+    /// A complete success is memoized whole; a failure is memoized ONLY when curl could
+    /// not reach the host ([`listing_is_offline`]), and then as exactly that verdict. Every
+    /// other class — a rate limit, an auth answer, a 5xx, an unparsable or truncated body —
+    /// stays retryable, so a transient failure is never frozen in (nor a truncated catalog
+    /// served as complete).
+    ///
+    /// THE OFFLINE LATCH IS NOT A MICRO-OPTIMIZATION. One `resolve_candidates` asks this
+    /// listing TWICE — [`crate::flow::Fetcher::index_identities`] for the cheap §14 identity
+    /// probe, then `index_candidates` → `listed_candidates` for the bytes — and one `update`
+    /// pass resolves at least twice more (`apply_channel`, the default-set bootstrap, plus
+    /// once per ungrouped member it installs). Without a latch every one of those re-asks a
+    /// question this process has already had answered `Err`, and then falls back to the very
+    /// §14 cache that answered the first one. Each ask is three curl subprocesses with 1 s +
+    /// 2 s of back-off (`api_get_with_headers`): ~3 s of pure sleep per listing where DNS
+    /// fails fast, and up to ~93 s on a black-holed captive link, where `--max-time 30` is
+    /// the only bound — minutes of a pass that holds the store flock, with `--wait-lock`
+    /// siblings queued behind it, spent learning nothing. The latch costs nothing across
+    /// passes: the next one is a new process with an empty memo either way.
+    ///
+    /// The lock is held ONLY around the map lookup/insert, never across the request, so an
+    /// in-flight fetch can neither block another lane nor poison the mutex; a poisoned lock
+    /// degrades to an uncached (correct) fetch rather than panicking.
+    ///
+    /// THE WHOLE CATALOG, always. This lane enumerates assets BY NAME, so a page it did not
+    /// read is an asset it would report missing: it accepts no prefix, and a memoized one
+    /// (left by [`Self::index_releases`], which needs only the newest candidates) is RESUMED
+    /// after its last page rather than re-read from page 1 or mistaken for the whole list.
     fn releases_at(&self, slug: &str) -> Result<std::sync::Arc<Vec<Release>>, String> {
+        self.releases_at_with(slug, &mut |url| {
+            aterm_update_core::api_get_classified(url, self.credential())
+        })
+    }
+
+    /// [`Self::releases_at`] over an INJECTED page GET — the seam the memo is measured
+    /// through without a network, the same way [`Self::index_lane`] is measured over an
+    /// injected HEAD. Production passes `api_get_classified`, whose flattened `Display` is
+    /// byte-identical to the `api_get` this lane used to call, so every message, log line
+    /// and status string is the historical one; the classification decides one thing only —
+    /// whether the failure was the LINK's.
+    fn releases_at_with(
+        &self,
+        slug: &str,
+        get: &mut dyn FnMut(&str) -> Result<Vec<u8>, aterm_update_core::HttpError>,
+    ) -> Result<std::sync::Arc<Vec<Release>>, String> {
+        // `|_| false`: nothing short of the whole catalog satisfies this lane (see
+        // [`Self::releases_at`]), so the walk runs to the end of the listing as it always has.
+        self.listing_with(slug, get, &mut |_| false)
+    }
+
+    /// The walk both listing lanes share, over an injected page GET and the `enough`
+    /// predicate that says how far THIS caller needs it to go — the one place the memo is
+    /// read, extended and written.
+    ///
+    /// `enough` is consulted twice: on the memoized walk (a prefix that already satisfies
+    /// the caller is served without a request) and after each page (the walk stops the
+    /// moment there is enough, so no metered page is bought for rows the caller cannot
+    /// use). A walk is memoized with its page count and completeness, so the prefix the
+    /// index lane leaves is an honest partial answer rather than a truncated catalog:
+    /// [`Self::releases_at`] resumes it instead of accepting or re-reading it.
+    fn listing_with(
+        &self,
+        slug: &str,
+        get: &mut dyn FnMut(&str) -> Result<Vec<u8>, aterm_update_core::HttpError>,
+        enough: &mut dyn FnMut(&[Release]) -> bool,
+    ) -> Result<std::sync::Arc<Vec<Release>>, String> {
+        let mut seen: Vec<Release> = Vec::new();
+        let mut from = 1u64;
         if let Ok(memo) = self.releases.lock()
             && let Some(hit) = memo.get(slug)
         {
-            return Ok(std::sync::Arc::clone(hit));
+            match hit {
+                Ok(listing) if listing.complete || enough(listing.releases.as_slice()) => {
+                    return Ok(std::sync::Arc::clone(&listing.releases));
+                }
+                // A prefix somebody else stopped at, short of what this caller needs: keep
+                // the pages it paid for and resume the walk after them.
+                Ok(listing) => {
+                    seen = (*listing.releases).clone();
+                    from = listing.pages + 1;
+                }
+                Err(offline) => return Err(offline.clone()),
+            }
         }
-        let list = std::sync::Arc::new(paged_releases(|page| {
+        // The walk reports only the flattened message (that is the historical contract), so
+        // the CLASS — the one thing that decides whether this outcome may be latched — is
+        // carried out here.
+        let mut offline = false;
+        let walked = paged_releases(from, &mut seen, enough, |page| {
             // Manual concat of the previous
             // `format!("https://api.github.com/repos/{}/releases?…", ..)`
             // — byte-identical (`dec_u64` renders exactly as `u64`'s `Display`):
@@ -522,12 +744,41 @@ impl GithubFetcher {
             url.push_str(&crate::dec_u64(RELEASES_PER_PAGE as u64));
             url.push_str("&page=");
             url.push_str(&crate::dec_u64(page));
-            parse_releases(&aterm_update_core::api_get(&url, self.credential())?)
-        })?);
-        if let Ok(mut memo) = self.releases.lock() {
-            memo.insert(slug.to_string(), std::sync::Arc::clone(&list));
+            match get(&url) {
+                Ok(body) => parse_releases(&body),
+                Err(e) => {
+                    offline = offline || listing_is_offline(&e);
+                    Err(e.to_string())
+                }
+            }
+        });
+        match walked {
+            Ok(walk) => {
+                let list = std::sync::Arc::new(seen);
+                if let Ok(mut memo) = self.releases.lock() {
+                    memo.insert(
+                        slug.to_string(),
+                        Ok(Listing {
+                            releases: std::sync::Arc::clone(&list),
+                            pages: walk.pages,
+                            complete: walk.complete,
+                        }),
+                    );
+                }
+                Ok(list)
+            }
+            Err(message) => {
+                // A walk that reached the dead link on a LATER page latches too: the pages
+                // already read are discarded whole (never a truncated catalog), and the next
+                // ask in this process would start again into the same dead link. The latch
+                // replaces any prefix in the slot for the same reason — a resumed walk into a
+                // dead link is the repetition this latch exists to stop.
+                if offline && let Ok(mut memo) = self.releases.lock() {
+                    memo.insert(slug.to_string(), Err(message.clone()));
+                }
+                Err(message)
+            }
         }
-        Ok(list)
     }
 
     /// List a repo's recent releases under this fetcher's own account.
@@ -545,6 +796,40 @@ impl GithubFetcher {
         s.push('/');
         s.push_str(&crate::discovery::index_repo());
         s
+    }
+
+    /// The index repo's listing, walked only as far as index SELECTION can use it.
+    ///
+    /// Selection is defined over a prefix: [`index_pair_urls`] takes the newest
+    /// [`INDEX_CANDIDATE_CAP`] releases carrying a complete quad, in listing order, so once
+    /// that many have been seen no later page can contribute a candidate — and every
+    /// further page is one `api.github.com` request out of the anonymous lane's 60/hour per
+    /// IP, buying rows nothing here can choose. The walk stopped only at the END of the
+    /// listing, so when the shared app repo crossed 100 releases (117 on 2026-09-16) every
+    /// index resolution on every machine started paying a second request for a page whose
+    /// oldest `atpkg-index-*` tag could never win; all four candidates sat on page 1. On a
+    /// shared NAT that is the whole office's budget spent on pages nobody reads.
+    ///
+    /// Still PAGES when it must: a sparse index history, or app releases pushing the index
+    /// tags past page 1, keeps the walk going until the cap is met or the listing ends —
+    /// the drift this walk was added to survive. The prefix is memoized as a prefix, so the
+    /// manifest/artifact fallbacks ([`crate::flow::Fetcher::pkg_manifest`], `download`),
+    /// which do need the whole catalog, resume it rather than re-read it.
+    fn index_releases(&self) -> Result<std::sync::Arc<Vec<Release>>, String> {
+        self.index_releases_with(&mut |url| {
+            aterm_update_core::api_get_classified(url, self.credential())
+        })
+    }
+
+    /// [`Self::index_releases`] over an INJECTED page GET — the seam the early stop is
+    /// measured through without a network, exactly as [`Self::releases_at_with`] is.
+    fn index_releases_with(
+        &self,
+        get: &mut dyn FnMut(&str) -> Result<Vec<u8>, aterm_update_core::HttpError>,
+    ) -> Result<std::sync::Arc<Vec<Release>>, String> {
+        self.listing_with(&self.index_slug(), get, &mut |seen| {
+            index_pair_urls(seen).len() >= INDEX_CANDIDATE_CAP
+        })
     }
 
     /// THE WEB LANE'S DISCOVERY: one anonymous, redirect-refusing HEAD of
@@ -653,7 +938,7 @@ impl GithubFetcher {
     /// assets of each of the newest [`INDEX_CANDIDATE_CAP`] carrying releases from their
     /// derived web URLs with the listing's API URL as the fallback.
     fn listed_candidates(&self, slug: &str) -> Result<Vec<Candidate>, String> {
-        let releases = self.releases(&crate::discovery::index_repo())?;
+        let releases = self.index_releases()?;
         let mut out = Vec::new();
         // Newest-first, capped ([`index_pair_urls`]): the paginated listing may now span
         // hundreds of releases, and only the newest carrying releases can win selection.
@@ -661,9 +946,10 @@ impl GithubFetcher {
             // ZERO-API ASSET FETCH, same derivation as `pkg_manifest`/`download_for`.
             // `u.label` IS the release tag, so each of these four assets has a
             // deterministic CDN URL and none of them needs the assets API. This is the
-            // dominant remaining term: the listing above is ONE request, but the four
-            // assets were four more PER CANDIDATE, which is what made index resolution
-            // cost ~7 requests after the per-program cost went to zero.
+            // dominant remaining term: the listing above is ONE request per page walked
+            // — and [`index_releases`] walks only to the page that completes the cap, so
+            // one — but the four assets were four more PER CANDIDATE, which is what made
+            // index resolution cost ~7 requests after the per-program cost went to zero.
             //
             // `direct` falls back to the API URL the listing already handed us whenever
             // the slug is not URL-safe or the download fails, so a private mirror or an
@@ -744,9 +1030,14 @@ impl crate::flow::Fetcher for GithubFetcher {
             Err(_) => return None,
         }
         // ONE request, and it is the request `index_candidates` was going to make anyway:
-        // `releases_at` memoizes per process, so whichever of the two runs first pays the
-        // listing and the other is free. That is what makes this probe honest — it cannot
-        // ADD a round-trip, only remove sixteen.
+        // the listing memoizes per process, so whichever of the two runs first pays the
+        // walk and the other is free — and `index_releases` stops that walk at the page
+        // that completes the candidate cap, so in the shipped shape it IS one request, not
+        // one per page of a listing whose later pages hold nothing selectable. That is what
+        // makes this probe honest — it cannot ADD a round-trip, only remove sixteen.
+        // OFFLINE INCLUDED, since the listing latches a link failure: the candidate fetch
+        // behind this probe gets that verdict back without a second three-attempt walk into
+        // the same dead link.
         //
         // Derived from the SAME `index_pair_urls` walk the download loop runs, over the
         // same memoized listing, so the identities are in the same order and of the same
@@ -758,7 +1049,7 @@ impl crate::flow::Fetcher for GithubFetcher {
         // historical path, where the real fetch surfaces the real reason (and, failing
         // that, the §14 fallback answers). This probe must never be the thing that turns
         // an offline machine's diagnosis into "no signature-valid index".
-        let releases = self.releases(&crate::discovery::index_repo()).ok()?;
+        let releases = self.index_releases().ok()?;
         Some(
             index_pair_urls(&releases)
                 .iter()
@@ -860,6 +1151,10 @@ impl crate::flow::Fetcher for GithubFetcher {
     }
 
     fn download(&self, repo: &str, asset: &str, dest: &Path) -> Result<(), String> {
+        // The UNSIZED lane: this signature holds no row, so the only bound available is
+        // the ceiling. The flow's artifact path does not come through here — it calls
+        // `download_for` with the row's signed `size` (see `artifact_cap`).
+        //
         // DIRECT FIRST, exactly as `download_for`: the asset name carries the build, so
         // its unmetered download URL follows from the name alone and the listing — one
         // metered request PER PAGE, and the one a drained IP answers 403 to — is only
@@ -905,25 +1200,38 @@ impl crate::flow::Fetcher for GithubFetcher {
         repo: &str,
         asset: &str,
         dest: &Path,
+        cap: u64,
     ) -> Result<(), String> {
+        // THE CAP IS THE ROW'S SIGNED `size` (clamped; see `artifact_cap`), on BOTH legs
+        // below — they are two hosts for the SAME signed object and write the same
+        // `.part`, so a bound on one only is no bound at all.
+        let cap = artifact_cap(cap);
         // The artifact rides the SAME release repo as the program's manifest, so the
         // `[packages.links]` fetch override redirects it identically (same token). The
         // listing is the memoized one this program's `pkg_manifest` already paid for.
         let slug = self.slug_for(program, repo);
         // Same zero-API derivation as `pkg_manifest` (see its note): the artifact rides
         // the release its manifest does, and the asset name carries the build, so the tag
-        // follows from the name alone (`ty-2973.tar.zst` → `atpkg-ty-2973`). This is the
+        // follows from the name alone (`ty-2973.tar.zst` AND its triple-suffixed sibling
+        // `ty-2973-x86_64-unknown-linux-gnu.tar.zst` → `atpkg-ty-2973`). This is the
         // request that actually moves hundreds of megabytes, and routing it through the
         // CDN URL rather than the assets API is what takes a default-set install off the
         // 60/hour meter entirely.
         //
-        // RESUMABLE on both legs. The two legs are two HOSTS for the SAME signed object,
-        // so a prefix left by a failed CDN attempt is a valid prefix for the API-URL
-        // attempt that follows it — and if it ever is not, the sha256 gate over the
-        // complete file refuses it, which costs exactly what a failed download costs
-        // today.
+        // RESUMABLE on both legs, in BOTH directions. The two legs are two HOSTS for the
+        // SAME signed object, so a prefix left by a failed CDN attempt is a valid prefix
+        // for the API-URL attempt that follows it — and if it ever is not, the sha256
+        // gate over the complete file refuses it, which costs exactly what a failed
+        // download costs today. The reverse direction is the one that used to leak: the
+        // CDN probe runs FIRST on the next pass, and for a slug whose derived URL can
+        // only 404 (a private `[packages.links]` repo — see `slug_for`; any asset whose
+        // name carries no build number) it answered 404 to a ranged request and the
+        // no-progress rule swept the API leg's prefix away, so a multi-hundred-MB
+        // artifact restarted from byte 0 on every pass. A URL verdict now spares the
+        // prefix (`aterm_update_core`'s `keep_partial_after_failure`), which is what
+        // makes "resumable" true for these repos and not just for the public ones.
         if let Some(url) = direct_asset_url(&slug, asset)
-            && web_fetch_to(&url, dest, ARTIFACT_CAP).is_ok()
+            && web_fetch_to(&url, dest, cap).is_ok()
         {
             return Ok(());
         }
@@ -934,7 +1242,7 @@ impl crate::flow::Fetcher for GithubFetcher {
                     &a.url,
                     self.credential(),
                     dest,
-                    ARTIFACT_CAP,
+                    cap,
                 );
             }
         }
@@ -1209,15 +1517,17 @@ impl crate::flow::Fetcher for ChainFetcher {
         repo: &str,
         asset: &str,
         dest: &Path,
+        cap: u64,
     ) -> Result<(), String> {
         // Route through both sides' OWN `download_for` so the primary's
         // per-program `[packages.links]` fetch override still applies on the
-        // fallback leg.
+        // fallback leg — and so the row's signed `size` bounds whichever leg
+        // actually moves the bytes (the seed leg copies a file already on disk).
         self.secondary
-            .download_for(program, repo, asset, dest)
+            .download_for(program, repo, asset, dest, cap)
             .or_else(|e1| {
                 self.primary
-                    .download_for(program, repo, asset, dest)
+                    .download_for(program, repo, asset, dest, cap)
                     .map_err(|e2| chain_err(&e2, &e1))
             })
     }
@@ -1326,6 +1636,56 @@ mod tests {
         );
     }
 
+    /// EVERY triple but the historical `aarch64-apple-darwin` one is published as
+    /// `<prog>-<build>-<triple>.tar.zst` on the SHARED `atpkg-<prog>-<build>` release
+    /// (tools/atpkg-pack.sh:401, tools/atpkg-pack-bundle.sh:530, and
+    /// tools/linux-auto-atpkg.sh's `gh release upload atpkg-$prog-$b`). A tag taken from
+    /// the WHOLE stem named `atpkg-trust-4821-x86_64-unknown-linux-gnu`, which has never
+    /// existed, so on Linux and x86_64 macOS every artifact fetch 404'd and fell back to
+    /// the `releases_at` listing — an anonymous metered request per program, the exact
+    /// cost this derivation removes. The build number is the anchor, not the stem.
+    #[test]
+    fn a_triple_suffixed_asset_derives_the_shared_build_tag() {
+        for (slug, asset, tag) in [
+            (
+                "alabsystems/trust",
+                "trust-4821-x86_64-unknown-linux-gnu.tar.zst",
+                "atpkg-trust-4821",
+            ),
+            (
+                "alabsystems/trust",
+                "trust-4821-aarch64-apple-darwin.tar.zst",
+                "atpkg-trust-4821",
+            ),
+            // The historical darwin spelling keeps deriving exactly what it did.
+            (
+                "alabsystems/trust",
+                "trust-4821.tar.zst",
+                "atpkg-trust-4821",
+            ),
+            (
+                "alabsystems/trust-mc",
+                "trust-mc-20011-x86_64-unknown-linux-gnu.tar.zst",
+                "atpkg-trust-mc-20011",
+            ),
+            (
+                "alabsystems/ty",
+                "ty-2973-aarch64-unknown-linux-musl.tar.zst",
+                "atpkg-ty-2973",
+            ),
+        ] {
+            assert_eq!(
+                super::direct_asset_url(slug, asset).as_deref(),
+                Some(format!("https://github.com/{slug}/releases/download/{tag}/{asset}").as_str()),
+                "{asset}"
+            );
+        }
+        // No build number in the name ⇒ no tag follows from it, and none of the
+        // publisher's assets look like this: derive nothing rather than spend a request
+        // on a URL that can only 404.
+        assert!(super::direct_asset_url("alabsystems/ty", "ty-latest.tar.zst").is_none());
+    }
+
     /// Anything that could splice a synthesized URL onto another host or path must decline
     /// and take the enumeration fallback — never emit a URL built from it.
     #[test]
@@ -1418,8 +1778,41 @@ mod tests {
                 "https://github.com/alabsystems/ty/releases/download/atpkg-ty-2973/ty-2973.tar.zst"
             )
         );
+        // …and for the triple-suffixed spelling every non-darwin host is served, which
+        // rides the SAME build tag as its darwin sibling.
+        assert_eq!(
+            super::direct_asset_url(&slug, "ty-2973-x86_64-unknown-linux-gnu.tar.zst").as_deref(),
+            Some(
+                "https://github.com/alabsystems/ty/releases/download/atpkg-ty-2973/ty-2973-x86_64-unknown-linux-gnu.tar.zst"
+            )
+        );
         assert!(super::direct_asset_url(&slug, "../ty-2973.tar.zst").is_none());
         assert!(super::direct_asset_url("alabsystems/ty/extra", "ty-2973.tar.zst").is_none());
+    }
+
+    /// The artifact cap is the ROW'S SIGNED SIZE, clamped by the ceiling — the same
+    /// number `disk_gate` bounded the free-space check with. A constant 8 GiB is not a
+    /// bound on a 30 MB row: a mis-uploaded or substituted asset fits inside it whole,
+    /// lands in `staging/` through the free-space floor, and is refused only afterwards
+    /// by the sha256 gate, which cannot run until the file is complete.
+    #[test]
+    fn artifact_cap_is_the_signed_size_clamped_by_the_ceiling() {
+        assert_eq!(super::artifact_cap(30_000_000), 30_000_000);
+        // A row that states no size keeps the ceiling — never a zero-byte cap, which
+        // would refuse the transfer outright (`check_row` requires `size > 0` only for
+        // the https/pkg protocols, so an older github-release row may carry none).
+        assert_eq!(super::artifact_cap(0), super::ARTIFACT_CAP);
+        // …and a size above the ceiling is clamped DOWN to it, never up: a signed row
+        // can lower this lane's bound, never raise it.
+        assert_eq!(
+            super::artifact_cap(super::ARTIFACT_CAP + 1),
+            super::ARTIFACT_CAP
+        );
+        assert_eq!(super::artifact_cap(u64::MAX), super::ARTIFACT_CAP);
+        assert_eq!(
+            super::artifact_cap(super::ARTIFACT_CAP),
+            super::ARTIFACT_CAP
+        );
     }
 
     /// No credential on the web host, pinned STRUCTURALLY from both sides: the only
@@ -1482,6 +1875,11 @@ mod tests {
             .collect()
     }
 
+    /// The whole catalog is what this lane asks for: never satisfied early.
+    fn to_the_end(_: &[Release]) -> bool {
+        false
+    }
+
     // The page walk that keeps the index findable once app releases push it off the
     // first page: full pages keep walking (in order), a short page ends the listing,
     // an error on ANY page fails the WHOLE walk (a silently truncated catalog would
@@ -1489,15 +1887,19 @@ mod tests {
     #[test]
     fn paged_releases_walks_to_a_short_page_errors_whole_and_caps() {
         // Short first page: one request, done.
-        let one = paged_releases(|p| {
+        let mut one = Vec::new();
+        let walk = paged_releases(1, &mut one, &mut to_the_end, |p| {
             assert_eq!(p, 1, "a short first page ends the walk");
             Ok(page(3, "only"))
         })
         .unwrap();
         assert_eq!(one.len(), 3);
+        assert!(walk.complete, "a short page IS the end of the catalog");
+        assert_eq!(walk.pages, 1);
 
         // A full page keeps walking; the short second page ends it; order is preserved.
-        let two = paged_releases(|p| match p {
+        let mut two = Vec::new();
+        let walk = paged_releases(1, &mut two, &mut to_the_end, |p| match p {
             1 => Ok(page(RELEASES_PER_PAGE, "full")),
             2 => Ok(page(2, "tail")),
             _ => panic!("the walk must stop at the short page"),
@@ -1506,24 +1908,65 @@ mod tests {
         assert_eq!(two.len(), RELEASES_PER_PAGE + 2);
         assert_eq!(two[0].tag_name, "full-0", "newest-first order preserved");
         assert_eq!(two[RELEASES_PER_PAGE].tag_name, "tail-0");
+        assert_eq!((walk.pages, walk.complete), (2, true));
 
         // An error mid-walk fails the whole listing (retryable, never truncated).
-        let err = paged_releases(|p| match p {
+        let mut broken = Vec::new();
+        let err = paged_releases(1, &mut broken, &mut to_the_end, |p| match p {
             1 => Ok(page(RELEASES_PER_PAGE, "full")),
             _ => Err("page 2 down".into()),
         })
         .unwrap_err();
         assert!(err.contains("page 2 down"));
 
-        // Runaway listing: the cap bounds the walk.
+        // Runaway listing: the cap bounds the walk, and IS the end of what can be read.
         let mut calls = 0u64;
-        let capped = paged_releases(|_| {
+        let mut endless = Vec::new();
+        let walk = paged_releases(1, &mut endless, &mut to_the_end, |_| {
             calls += 1;
             Ok(page(RELEASES_PER_PAGE, "endless"))
         })
         .unwrap();
         assert_eq!(calls, MAX_RELEASE_PAGES);
-        assert_eq!(capped.len(), RELEASES_PER_PAGE * MAX_RELEASE_PAGES as usize);
+        assert_eq!(
+            endless.len(),
+            RELEASES_PER_PAGE * MAX_RELEASE_PAGES as usize
+        );
+        assert!(
+            walk.complete,
+            "nothing past the cap is reachable to walk to"
+        );
+
+        // RESUME: a walk that starts after a prefix reads only the pages nobody has,
+        // and extends what it was given rather than replacing it.
+        let mut resumed = page(RELEASES_PER_PAGE, "page1");
+        let walk = paged_releases(2, &mut resumed, &mut to_the_end, |p| {
+            assert_eq!(p, 2, "page 1 was already paid for");
+            Ok(page(1, "page2"))
+        })
+        .unwrap();
+        assert_eq!(resumed.len(), RELEASES_PER_PAGE + 1);
+        assert_eq!(
+            resumed[0].tag_name, "page1-0",
+            "the prefix is kept, in order"
+        );
+        assert_eq!(resumed[RELEASES_PER_PAGE].tag_name, "page2-0");
+        assert_eq!((walk.pages, walk.complete), (2, true));
+
+        // And a walk stops the moment the caller has enough — the metered-page rule.
+        let mut early = Vec::new();
+        let mut two_pages_is_enough = |seen: &[Release]| seen.len() >= RELEASES_PER_PAGE * 2;
+        let walk = paged_releases(1, &mut early, &mut two_pages_is_enough, |p| {
+            assert!(p <= 2, "page {p} was bought after the caller had enough");
+            Ok(page(RELEASES_PER_PAGE, "full"))
+        })
+        .unwrap();
+        assert_eq!(early.len(), RELEASES_PER_PAGE * 2);
+        assert_eq!(
+            (walk.pages, walk.complete),
+            (2, false),
+            "a prefix is never marked complete"
+        );
     }
 
     /// An asset row.
@@ -1928,17 +2371,17 @@ mod tests {
         // applies), and falls back with BOTH reasons when neither has it.
         let out = a.join("fetched.bin");
         chain
-            .download_for("ay", "r", "pkg-ay-1.toml", &out)
+            .download_for("ay", "r", "pkg-ay-1.toml", &out, 1 << 20)
             .expect("primary serves what it has");
         assert_eq!(std::fs::read(&out).unwrap(), b"pkg a");
         std::fs::remove_file(&out).unwrap();
         chain
-            .download_for("ny", "r", "pkg-ny-2.toml", &out)
+            .download_for("ny", "r", "pkg-ny-2.toml", &out, 1 << 20)
             .expect("fallback serves what the primary lacks");
         assert_eq!(std::fs::read(&out).unwrap(), b"pkg b");
         std::fs::remove_file(&out).unwrap();
         let err = chain
-            .download_for("x", "r", "absent.bin", &out)
+            .download_for("x", "r", "absent.bin", &out, 1 << 20)
             .unwrap_err();
         assert!(err.contains("fallback:"), "{err}");
 
@@ -2220,6 +2663,315 @@ mod tests {
         assert!(
             token.pointer.lock().unwrap().is_none(),
             "nothing was memoized: the memo is `index_pointer`'s, and it was not called"
+        );
+    }
+
+    /// THE OFFLINE LATCH. A listing that failed because curl could not reach the host is
+    /// asked ONCE per process, not once per caller.
+    ///
+    /// The count IS the defect: one `resolve_candidates` asks this same listing twice
+    /// (`index_identities`, then `index_candidates` → `listed_candidates`), and an `update`
+    /// pass resolves at least twice more (`apply_channel`, the default-set bootstrap, once
+    /// per ungrouped member it installs). Every ask was three curl subprocesses with 1 s +
+    /// 2 s of back-off — ~3 s of pure sleep per listing on a fast DNS failure, ~93 s on a
+    /// black-holed captive link — before the §14 cache that had already answered the first
+    /// one answered again.
+    #[test]
+    fn a_link_failure_is_asked_once_per_process() {
+        let f = GithubFetcher::new("alabsystems".into(), String::new());
+        // A `Cell`, not a `mut` binding: the count is read BETWEEN two uses of the closure
+        // that writes it, which is the whole shape of the assertion.
+        let asks = std::cell::Cell::new(0u32);
+        let mut dead = |_: &str| -> Result<Vec<u8>, aterm_update_core::HttpError> {
+            asks.set(asks.get() + 1);
+            Err(aterm_update_core::HttpError::Transport(
+                "curl GET https://api.github.com/repos/alabsystems/aterm/releases failed \
+                 (exit status: 28): curl: (28) Operation timed out"
+                    .into(),
+            ))
+        };
+        let first = f
+            .releases_at_with("alabsystems/aterm", &mut dead)
+            .unwrap_err();
+        let second = f
+            .releases_at_with("alabsystems/aterm", &mut dead)
+            .unwrap_err();
+        assert_eq!(
+            asks.get(),
+            1,
+            "the second ask must come out of the memo, not the link"
+        );
+        assert_eq!(
+            first, second,
+            "and carry the identical verdict, byte for byte"
+        );
+        assert!(first.contains("(28) Operation timed out"), "{first}");
+        // Per slug: another repo is another question, and is asked.
+        assert!(f.releases_at_with("alabsystems/ty", &mut dead).is_err());
+        assert_eq!(asks.get(), 2);
+    }
+
+    /// ...and NOTHING else is latched. The memo must never freeze a failure that can lift
+    /// inside one process — that is the property the success-only memo was protecting, and
+    /// it survives the latch intact.
+    #[test]
+    fn every_other_listing_failure_stays_retryable() {
+        for (why, kind) in [
+            ("a rate limit lifts", 0u8),
+            ("a 5xx passes", 1),
+            ("a credential can rotate", 2),
+            ("a portal-mangled body can arrive whole", 3),
+        ] {
+            let f = GithubFetcher::new("alabsystems".into(), String::new());
+            let mut asks = 0u32;
+            let mut refuse = |_: &str| -> Result<Vec<u8>, aterm_update_core::HttpError> {
+                asks += 1;
+                Err(match kind {
+                    0 => aterm_update_core::HttpError::RateLimited {
+                        code: 429,
+                        url: "u".into(),
+                        authenticated: false,
+                    },
+                    1 => aterm_update_core::HttpError::Status {
+                        code: 503,
+                        url: "u".into(),
+                    },
+                    2 => aterm_update_core::HttpError::Unauthorized { code: 401 },
+                    _ => aterm_update_core::HttpError::Malformed("no status trailer".into()),
+                })
+            };
+            assert!(
+                f.releases_at_with("alabsystems/aterm", &mut refuse)
+                    .is_err()
+            );
+            assert!(
+                f.releases_at_with("alabsystems/aterm", &mut refuse)
+                    .is_err()
+            );
+            assert_eq!(asks, 2, "{why}: the second ask must reach the network");
+        }
+        // A body that arrived but would not parse is a verdict about the PUBLISHER, not the
+        // link, and is retried the same way.
+        let f = GithubFetcher::new("alabsystems".into(), String::new());
+        let mut asks = 0u32;
+        let mut junk = |_: &str| -> Result<Vec<u8>, aterm_update_core::HttpError> {
+            asks += 1;
+            Ok(b"not json".to_vec())
+        };
+        assert!(f.releases_at_with("alabsystems/aterm", &mut junk).is_err());
+        assert!(f.releases_at_with("alabsystems/aterm", &mut junk).is_err());
+        assert_eq!(
+            asks, 2,
+            "an unparsable body is not a verdict about the link"
+        );
+    }
+
+    /// One release row as the API serves it, carrying the COMPLETE authorization quad.
+    fn quad_row(tag: &str) -> String {
+        let roster = aterm_update_core::roster::ROSTER_ASSET;
+        format!(
+            "{{\"tag_name\":\"{tag}\",\"assets\":[\
+               {{\"name\":\"index.toml\",\"url\":\"u:{tag}\"}},\
+               {{\"name\":\"index.toml.sig\",\"url\":\"s:{tag}\"}},\
+               {{\"name\":\"{roster}\",\"url\":\"r:{tag}\"}},\
+               {{\"name\":\"{roster}.sig\",\"url\":\"rs:{tag}\"}}]}}"
+        )
+    }
+
+    /// An ordinary app release: no index assets at all, so it can never be a candidate.
+    fn app_row(tag: &str) -> String {
+        format!("{{\"tag_name\":\"{tag}\",\"assets\":[]}}")
+    }
+
+    /// A listing page body.
+    fn json_page(rows: &[String]) -> Vec<u8> {
+        let mut body = String::from("[");
+        body.push_str(&rows.join(","));
+        body.push(']');
+        body.into_bytes()
+    }
+
+    /// The `page=` the walk asked for.
+    fn asked_page(url: &str) -> u64 {
+        url.rsplit("&page=")
+            .next()
+            .and_then(|p| p.parse().ok())
+            .unwrap_or_else(|| panic!("not a listing URL: {url}"))
+    }
+
+    /// THE METERED PAGE NOBODY CAN USE.
+    ///
+    /// Index selection is defined over the newest `INDEX_CANDIDATE_CAP` releases carrying
+    /// a complete quad (`index_pair_urls`), so once a page has completed that many, every
+    /// further page is one `api.github.com` request — out of 60/hour PER IP on the
+    /// anonymous lane the advertised `curl … | bash` install runs on — whose rows nothing
+    /// downstream can choose. The walk used to stop only at the END of the listing, so
+    /// when the shared app repo crossed 100 releases (117 on 2026-09-16 = two pages) with
+    /// all four `atpkg-index-*` candidates still on page 1, every pass on every machine
+    /// bought page 2 for nothing, and would buy a third past 200 releases.
+    ///
+    /// The count IS the assertion, in both directions: the cap stops the walk, and a
+    /// listing that has NOT met the cap keeps paging (the pushed-off-page blindness the
+    /// walk exists to close).
+    #[test]
+    fn the_index_lane_stops_at_the_page_that_completes_the_candidate_cap() {
+        // The live shape: a FULL page of app releases with four index releases
+        // interleaved newest-first, then a short second page nothing can select from.
+        let rows: Vec<String> = (0..RELEASES_PER_PAGE)
+            .map(|i| match i {
+                1 | 2 | 8 | 9 => quad_row(&format!("atpkg-index-{i}")),
+                _ => app_row(&format!("v0.{i}.0")),
+            })
+            .collect();
+        let page1 = json_page(&rows);
+        let page2 = json_page(&[
+            app_row("v0.7.0"),
+            quad_row("atpkg-index-6"),
+            app_row("v0.6.0"),
+        ]);
+
+        let f = GithubFetcher::new("alabsystems".into(), String::new());
+        let asked = std::cell::RefCell::new(Vec::<u64>::new());
+        let mut get = |url: &str| -> Result<Vec<u8>, aterm_update_core::HttpError> {
+            let p = asked_page(url);
+            asked.borrow_mut().push(p);
+            match p {
+                1 => Ok(page1.clone()),
+                2 => Ok(page2.clone()),
+                _ => panic!("page {p} does not exist"),
+            }
+        };
+
+        let prefix = f.index_releases_with(&mut get).unwrap();
+        assert_eq!(
+            *asked.borrow(),
+            vec![1],
+            "page 2 can contribute no candidate, so it is not bought"
+        );
+        assert_eq!(index_pair_urls(&prefix).len(), INDEX_CANDIDATE_CAP);
+
+        // The identity probe and the download loop share that one request, as the pairing
+        // contract requires — same candidates, same order.
+        let again = f.index_releases_with(&mut get).unwrap();
+        assert_eq!(*asked.borrow(), vec![1], "the second ask is the memo");
+        let labels = |rs: &[Release]| -> Vec<String> {
+            index_pair_urls(rs)
+                .iter()
+                .map(|u| u.label.to_string())
+                .collect()
+        };
+        assert_eq!(labels(&prefix), labels(&again));
+        assert_eq!(labels(&prefix)[0], "atpkg-index-1", "newest first");
+
+        // A lane that needs the WHOLE catalog is never handed the prefix: it RESUMES
+        // after it, paying for page 2 only — and never re-reads page 1.
+        let whole = f.releases_at_with(&f.index_slug(), &mut get).unwrap();
+        assert_eq!(
+            *asked.borrow(),
+            vec![1, 2],
+            "the prefix is resumed, not re-walked, and not served as the whole listing"
+        );
+        assert_eq!(whole.len(), RELEASES_PER_PAGE + 3);
+        assert_eq!(whole[RELEASES_PER_PAGE + 2].tag_name, "v0.6.0");
+        // ...and once complete, it answers both lanes with no further request.
+        assert_eq!(f.index_releases_with(&mut get).unwrap().len(), whole.len());
+        assert_eq!(*asked.borrow(), vec![1, 2]);
+
+        // CONDITIONAL, not "page 1 only": an index history sparse enough that page 1
+        // cannot complete the cap keeps paging, exactly as the unpaginated listing's
+        // blindness fix demands.
+        let sparse1 = json_page(
+            &(0..RELEASES_PER_PAGE)
+                .map(|i| match i {
+                    0 => quad_row("atpkg-index-9"),
+                    _ => app_row(&format!("v1.{i}.0")),
+                })
+                .collect::<Vec<_>>(),
+        );
+        let sparse2 = json_page(&[
+            quad_row("atpkg-index-8"),
+            quad_row("atpkg-index-7"),
+            quad_row("atpkg-index-6"),
+        ]);
+        let sparse = GithubFetcher::new("alabsystems".into(), String::new());
+        let sparse_asked = std::cell::RefCell::new(Vec::<u64>::new());
+        let mut sparse_get = |url: &str| -> Result<Vec<u8>, aterm_update_core::HttpError> {
+            let p = asked_page(url);
+            sparse_asked.borrow_mut().push(p);
+            match p {
+                1 => Ok(sparse1.clone()),
+                2 => Ok(sparse2.clone()),
+                _ => panic!("page {p} does not exist"),
+            }
+        };
+        let deep = sparse.index_releases_with(&mut sparse_get).unwrap();
+        assert_eq!(
+            *sparse_asked.borrow(),
+            vec![1, 2],
+            "one candidate on page 1 is not a candidate set: the walk pages on"
+        );
+        assert_eq!(index_pair_urls(&deep).len(), INDEX_CANDIDATE_CAP);
+    }
+
+    /// The success half is unchanged: a complete walk is memoized whole, and a failure that
+    /// was NOT latched leaves the slot free for the listing that recovers.
+    #[test]
+    fn a_complete_listing_is_still_memoized_whole() {
+        let f = GithubFetcher::new("alabsystems".into(), String::new());
+        let mut asks = 0u32;
+        let mut ok = |_: &str| -> Result<Vec<u8>, aterm_update_core::HttpError> {
+            asks += 1;
+            Ok(RELEASES_JSON.to_vec())
+        };
+        assert_eq!(
+            f.releases_at_with("alabsystems/aterm", &mut ok)
+                .unwrap()
+                .len(),
+            2
+        );
+        assert_eq!(
+            f.releases_at_with("alabsystems/aterm", &mut ok)
+                .unwrap()
+                .len(),
+            2
+        );
+        assert_eq!(asks, 1, "one walk, then the memo");
+
+        let recovered = GithubFetcher::new("alabsystems".into(), String::new());
+        let mut n = 0u32;
+        let mut flaky = |_: &str| -> Result<Vec<u8>, aterm_update_core::HttpError> {
+            n += 1;
+            if n == 1 {
+                Err(aterm_update_core::HttpError::Status {
+                    code: 503,
+                    url: "u".into(),
+                })
+            } else {
+                Ok(RELEASES_JSON.to_vec())
+            }
+        };
+        assert!(
+            recovered
+                .releases_at_with("alabsystems/aterm", &mut flaky)
+                .is_err()
+        );
+        assert_eq!(
+            recovered
+                .releases_at_with("alabsystems/aterm", &mut flaky)
+                .unwrap()
+                .len(),
+            2
+        );
+        assert_eq!(
+            recovered
+                .releases_at_with("alabsystems/aterm", &mut flaky)
+                .unwrap()
+                .len(),
+            2
+        );
+        assert_eq!(
+            n, 2,
+            "the recovered listing is memoized like any other success"
         );
     }
 }

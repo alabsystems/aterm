@@ -213,7 +213,6 @@ pub fn lane_name(lane: Lane) -> &'static str {
         Lane::FreezeGateTarget => "tools/freeze-safety-gate/target/",
         Lane::LibcOracleTarget => "libc-oracle/{target,target-symgate}/",
         Lane::RegexTarget => "target-regex/",
-        Lane::SealedTarget => "target-sealed/",
         Lane::XtaskTarget => "target-xtask/",
         Lane::DriverTarget => "target-drivers/",
     }
@@ -236,12 +235,7 @@ mod tests {
         }
     }
 
-    const SIDE_LANES: [Lane; 4] = [
-        Lane::RegexTarget,
-        Lane::SealedTarget,
-        Lane::XtaskTarget,
-        Lane::DriverTarget,
-    ];
+    const SIDE_LANES: [Lane; 3] = [Lane::RegexTarget, Lane::XtaskTarget, Lane::DriverTarget];
 
     fn plan_shape() -> Vec<StageSpec> {
         vec![
@@ -252,7 +246,6 @@ mod tests {
             },
             spec(StageId::Doctests, "doctests", Lane::MainTarget, false),
             spec(StageId::RegexLane, "regex", Lane::RegexTarget, false),
-            spec(StageId::SealedLane, "sealed", Lane::SealedTarget, false),
             spec(StageId::Tippy, "tippy", Lane::TippyTarget, false),
             spec(StageId::Formatting, "fmt", Lane::XtaskTarget, false),
             spec(StageId::GrepGuards, "grep", Lane::Pure, false),
@@ -261,6 +254,8 @@ mod tests {
             spec(StageId::LibcOracle, "libc", Lane::LibcOracleTarget, false),
             spec(StageId::FreezeGate, "l0", Lane::FreezeGateTarget, false),
             spec(StageId::DriverBuilds, "drivers", Lane::DriverTarget, false),
+            spec(StageId::SealedLane, "sealed", Lane::DriverTarget, false),
+            spec(StageId::AtpkgTooling, "atpkg", Lane::DriverTarget, false),
             spec(
                 StageId::ControlSocketSmoke,
                 "smoke",
@@ -440,7 +435,17 @@ mod tests {
     /// ready (re-checking after each start, as the real waiters do), then finish
     /// one running stage chosen by `pick`. Panics on a state where stages remain
     /// but nothing runs and nothing can start — a deadlock.
-    fn model_check(specs: &[StageSpec], mut pick: impl FnMut(&[usize]) -> usize) {
+    fn model_check(specs: &[StageSpec], pick: impl FnMut(&[usize]) -> usize) {
+        model_check_observed(specs, pick, |_, _, _| {});
+    }
+
+    /// [`model_check`], calling `on_start(i, done, running)` just before stage
+    /// `i` starts — `done` as it stands then, `running` without `i`.
+    fn model_check_observed(
+        specs: &[StageSpec],
+        mut pick: impl FnMut(&[usize]) -> usize,
+        mut on_start: impl FnMut(usize, &[bool], &[usize]),
+    ) {
         let n = specs.len();
         let (mut started, mut done) = (vec![false; n], vec![false; n]);
         let mut running: Vec<usize> = Vec::new();
@@ -448,6 +453,7 @@ mod tests {
             loop {
                 let next = (0..n).find(|&i| ready(specs, &started, &done, running.len(), i));
                 let Some(i) = next else { break };
+                on_start(i, &done, &running);
                 started[i] = true;
                 running.push(i);
             }
@@ -522,6 +528,121 @@ mod tests {
                 "nothing may run beside the exclusive stage {}",
                 specs[ex].title
             );
+        }
+    }
+
+    /// THE SEALED RUNG NEVER STARTS BEFORE A FRESH aterm-gui EXISTS (2026-09-14).
+    ///
+    /// `two_nodes_sealed` drives the `aterm-gui` it finds in its own target dir
+    /// and refuses one older than its sources. On 28508563a's plan it started at
+    /// t0 in `target-sealed/`, beside the build that was still linking the binary
+    /// it fell through to, and 5 of its 9 tests were refused STALE. Over every
+    /// real plan that carries it, and every interleaving this model reaches: the
+    /// rung starts only once the driver builds (which build `aterm-gui` into its
+    /// lane's dir) have FINISHED, and no other stage of its lane — the only
+    /// stages that write that dir — starts or runs while it does.
+    #[test]
+    fn the_sealed_rung_starts_only_after_the_driver_builds_and_alone_in_its_lane() {
+        assert_runs_behind_the_driver_builds(
+            StageId::SealedLane,
+            &[
+                crate::Scope::workspace(),
+                crate::Scope::crate_only("aterm-link"),
+                crate::Scope::changed("main", vec!["aterm-link".into()], true),
+            ],
+        );
+    }
+
+    /// THE SAME OBLIGATION, for the atpkg publish tooling (2026-09-16). Its
+    /// end-to-end pack suite drives an `atpkg` binary; as a `Lane::Pure` row at
+    /// t0 the only one it could find was a previous run's, and on a cold gate
+    /// there was none. It is now this lane's last non-exclusive row, and what
+    /// makes the fix real is the same pair of facts the rung needs: it cannot
+    /// START before the driver builds are done, and nothing else writes the
+    /// lane's binaries while it runs. `stages.rs` pins that its first child
+    /// builds `-p atpkg` into that dir and that the suite is handed it.
+    #[test]
+    fn the_atpkg_publish_tooling_starts_only_after_the_driver_builds_and_alone_in_its_lane() {
+        assert_runs_behind_the_driver_builds(
+            StageId::AtpkgTooling,
+            &[
+                crate::Scope::workspace(),
+                crate::Scope::crate_only("atpkg"),
+                crate::Scope::crate_only("aterm-grid"),
+                crate::Scope::changed("main", vec!["aterm-gui".into()], true),
+            ],
+        );
+    }
+
+    /// Model-check one driver-lane row against every interleaving the scheduler
+    /// allows, over the synthetic shape and over the real plans of `scopes`:
+    /// it starts only once the driver builds have FINISHED, and no other stage
+    /// of its lane — the only stages that write that lane's binaries — starts
+    /// or runs while it does.
+    fn assert_runs_behind_the_driver_builds(row: StageId, scopes: &[crate::Scope]) {
+        let ctx = |mode, scope| {
+            crate::Ctx::new(
+                std::path::PathBuf::from("/repo"),
+                mode,
+                scope,
+                false,
+                crate::EnvSnapshot::default(),
+                std::path::PathBuf::from("/tmp"),
+            )
+        };
+        let mut shapes = vec![plan_shape()];
+        for mode in [crate::Mode::Fast, crate::Mode::Full] {
+            for scope in scopes {
+                shapes.push(crate::plan::plan(&ctx(mode, scope.clone())));
+            }
+        }
+        for specs in &shapes {
+            let at = |id| {
+                specs
+                    .iter()
+                    .position(|s| s.id == id)
+                    .expect("the stage is planned")
+            };
+            let (me, builds) = (at(row), at(StageId::DriverBuilds));
+            let lane = specs[me].lane;
+            let title = specs[me].title.as_str();
+            for order in 0..3 {
+                let mut seed = 0x9e37_79b9_u32;
+                let mut row_started = false;
+                model_check_observed(
+                    specs,
+                    |r| match order {
+                        0 => 0,
+                        1 => r.len() - 1,
+                        _ => {
+                            seed ^= seed << 13;
+                            seed ^= seed >> 17;
+                            seed ^= seed << 5;
+                            seed as usize % r.len()
+                        }
+                    },
+                    |i, done, running| {
+                        if i == me {
+                            row_started = true;
+                            assert!(
+                                done[builds],
+                                "{title} started before the driver builds finished"
+                            );
+                            assert!(
+                                running.iter().all(|&j| specs[j].lane != lane),
+                                "{title} started beside a stage of its own lane"
+                            );
+                        } else if running.contains(&me) {
+                            assert_ne!(
+                                specs[i].lane, lane,
+                                "{} started in {title}'s lane while it ran",
+                                specs[i].title
+                            );
+                        }
+                    },
+                );
+                assert!(row_started, "{title} never started");
+            }
         }
     }
 

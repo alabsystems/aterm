@@ -2925,7 +2925,13 @@ pub(crate) fn attach_fabric_bridge(
     };
     std::thread::Builder::new()
         .name("aterm-fabric-bridge".to_string())
-        .spawn(move || context.serve_bridge(stream, generation))
+        .spawn(move || {
+            // Same floor as the pooled lanes below: this thread serves the very
+            // same verbs (`serve_borrowed`) and then STAYS here for the push
+            // loop, so it holds the terminal mutex on both halves.
+            crate::qos::set_self(crate::qos::Role::Responsive);
+            context.serve_bridge(stream, generation);
+        })
         .is_ok()
 }
 
@@ -2939,6 +2945,16 @@ fn spawn_control_workers(
         let context = context.clone();
         let name = format!("aterm-control-{index}");
         match std::thread::Builder::new().name(name).spawn(move || {
+            // QoS FLOOR (qos.rs): this lane runs the verb dispatch, and a read
+            // verb HOLDS THE TERMINAL MUTEX while it formats — `text` walks
+            // every visible row under one `term_lock`. Undeclared, the thread
+            // ran at the inherited DEFAULT band, below the UI thread that takes
+            // the same mutex on the key path (`term_lock_ui`) and in the redraw,
+            // so an agent polling `text`/`screen` could leave a descheduled
+            // holder in front of the next keystroke. Deliberately NOT
+            // `Interactive`: a verb storm must never outrank the UI thread, only
+            // stop sitting descheduled underneath it.
+            crate::qos::set_self(crate::qos::Role::Responsive);
             loop {
                 let stream = dispatch.pop();
                 let _completion = dispatch.completion_guard();
@@ -2973,6 +2989,10 @@ fn spawn_subscription_workers(
         let context = context.clone();
         let name = format!("aterm-subscribe-{index}");
         match std::thread::Builder::new().name(name).spawn(move || {
+            // The same floor for the same reason as the RPC lanes: the push loop
+            // takes `term_lock` per target per tick (render signature, title,
+            // bell, completed blocks) and gathers a screen delta under one hold.
+            crate::qos::set_self(crate::qos::Role::Responsive);
             loop {
                 let job = dispatch.jobs.pop();
                 let _completion = dispatch.jobs.completion_guard();
@@ -3334,6 +3354,12 @@ pub(crate) fn spawn(
         proxy: proxy.clone(),
     };
     let _ = std::thread::Builder::new().name("aterm-control-listener".into()).spawn(move || {
+        // The admission path in front of every lane above, and itself a holder of
+        // a lock the UI thread contends: the startup graph-entry publish below
+        // holds the session store's read guard across its per-session file writes
+        // (a `for` iterator expression's temporary lives to the end of the loop).
+        // Same floor, and it costs nothing when idle in `accept`.
+        crate::qos::set_self(crate::qos::Role::Responsive);
         // This guard also publishes failure if thread creation fails (the
         // unstarted closure is dropped), or startup unwinds before preparation.
         let preparation_guard = preparation_guard;
@@ -3949,6 +3975,7 @@ fn dispatch_app_verb(
         "streak" => control_media::cmd_streak(proxy, rest),
         "tone" => control_media::cmd_tone(proxy, rest),
         "trail" => control_media::cmd_trail(proxy, rest),
+        "kitty" => control_media::cmd_kitty(proxy, rest),
         // No selector on this path, so no `@<sid>` aim; `window=` still aims.
         "spawn" => control_media::cmd_spawn(proxy, rest, None),
         "settings" => control_media::cmd_settings_overlay(proxy, rest),
@@ -4544,31 +4571,68 @@ fn dispatch_before_session(
     dispatch_app_verb(verb, rest, scope, proxy, sock_dir, active_term.as_ref())
 }
 
-/// Resolve only an explicit non-self selector, independent of front content.
-fn resolve_explicit(store: &Store, selector: &Selector) -> Option<Target> {
-    match selector {
-        Selector::SelfTok => None,
-        Selector::Local(id) => {
-            let guard = store.read().unwrap_or_else(|p| p.into_inner());
-            let handle = guard.by_local(*id)?;
-            Some((
-                handle.term.clone(),
-                handle.master,
-                handle.local_id,
-                handle.ctx.clone(),
-            ))
-        }
-        Selector::Sid(id) => {
-            let guard = store.read().unwrap_or_else(|p| p.into_inner());
-            let handle = guard.by_sid(id)?;
-            Some((
-                handle.term.clone(),
-                handle.master,
-                handle.local_id,
-                handle.ctx.clone(),
-            ))
+/// Resolve only an explicit non-self selector, independent of front content —
+/// **AND REFUSE AN ID THAT NAMES TWO PLACES**, which is why this answers a
+/// `Result` and not an `Option`.
+///
+/// `Ok(None)` is the ordinary miss (no session of that name HERE) and the
+/// caller keeps its own wording for it. `Err(refusal)` is
+/// [`ambiguous_sid_refusal`]'s line, ready to write: the id resolves here AND
+/// a live foreign instance also publishes it, so it addresses two places and
+/// the request is refused rather than delivered to whichever of them this
+/// happens to be.
+///
+/// **THE REFUSAL LIVES IN THE RESOLVER ON PURPOSE.** It first sat at the one
+/// seam in [`handle`], and four seams that resolve a selector do not go
+/// through `handle` at all — `post` with a binary body, `feed-bin`/`paste-bin`
+/// at BOTH the header fence and the effect boundary, and `subscribe`'s target
+/// list. Those are the seams that WRITE INPUT and stream a pane's output, so
+/// they are precisely the ones an ambiguous address must not reach. A check a
+/// new seam has to remember is a check a new seam will forget; a `Result` it
+/// cannot ignore is one it cannot.
+fn resolve_explicit(store: &Store, selector: &Selector) -> Result<Option<Target>, String> {
+    /// The registry lookup alone, with no ambiguity gate. NESTED so that it is
+    /// not a spelling any seam can reach for: the gate is not optional, and a
+    /// function nobody else can name is a stronger statement of that than a
+    /// comment asking them not to.
+    fn look_up(store: &Store, selector: &Selector) -> Option<Target> {
+        match selector {
+            Selector::SelfTok => None,
+            Selector::Local(id) => {
+                let guard = store.read().unwrap_or_else(|p| p.into_inner());
+                let handle = guard.by_local(*id)?;
+                Some((
+                    handle.term.clone(),
+                    handle.master,
+                    handle.local_id,
+                    handle.ctx.clone(),
+                ))
+            }
+            Selector::Sid(id) => {
+                let guard = store.read().unwrap_or_else(|p| p.into_inner());
+                let handle = guard.by_sid(id)?;
+                Some((
+                    handle.term.clone(),
+                    handle.master,
+                    handle.local_id,
+                    handle.ctx.clone(),
+                ))
+            }
         }
     }
+
+    let found = look_up(store, selector);
+    // Only an id this instance HOSTS can be ambiguous, so the probe is asked
+    // ONLY on a hit: a miss is `ERR no such session` as it always was, and
+    // pays nothing. `live_holder` then reads `graph/<sid>` and names a live
+    // FOREIGN pid, and is itself gated on the ids this process ADOPTED — an
+    // id we minted is answered from a register.
+    if found.is_some()
+        && let Some(refusal) = ambiguous_sid_refusal(selector)
+    {
+        return Err(refusal);
+    }
+    Ok(found)
 }
 
 /// Full polling-request dispatch. Classification precedes terminal resolution,
@@ -4633,7 +4697,11 @@ fn dispatch_request(
     let front_active_session = active_target.as_ref().map(|(_, _, session, _)| *session);
     let target = match selector.as_ref() {
         Some(selector @ (Selector::Local(_) | Selector::Sid(_))) => {
-            resolve_explicit(store, selector)
+            match resolve_explicit(store, selector) {
+                Ok(target) => target,
+                // Two instances answer to this id: refuse, do not pick one.
+                Err(refusal) => return refusal.into(),
+            }
         }
         None | Some(Selector::SelfTok) => active_target,
     };
@@ -6612,8 +6680,19 @@ fn run_post_bin<W: Write>(
     let (selector, verb, rest) = request_head(line);
     debug_assert_eq!(verb, "post");
     let target = match selector.as_ref() {
-        None | Some(Selector::SelfTok) => resolve_active(active),
+        None | Some(Selector::SelfTok) => Ok(resolve_active(active)),
         Some(sel) => resolve_explicit(store, sel),
+    };
+    let target = match target {
+        Ok(target) => target,
+        // The body is already read, so the stream stays framed: answer the
+        // refusal and keep the connection.
+        Err(refusal) => {
+            if writer.write_all(refusal.as_bytes()).is_err() {
+                return false;
+            }
+            return writer.flush().is_ok();
+        }
     };
     let response = match target {
         _ if post_scope_denied(scope) => "ERR denied\n".to_string(),
@@ -6662,12 +6741,30 @@ where
     // state.  Framing behavior below remains unchanged.
     let attempt_selector = binary_frame_attempt_selector(line, verb);
     let header_active_target = resolve_active(route.active);
+    // An ambiguous id must not clear another instance's movement licence
+    // either, so the header fence takes the same refusal — and takes it
+    // BEFORE the payload, which is the whole point of resolving here.
+    let mut header_refusal = None;
     let header_target = attempt_selector
         .as_ref()
         .and_then(|selector| match selector {
             None | Some(Selector::SelfTok) => header_active_target.clone(),
-            Some(sel) => resolve_explicit(route.store, sel),
+            Some(sel) => match resolve_explicit(route.store, sel) {
+                Ok(target) => target,
+                Err(refusal) => {
+                    header_refusal = Some(refusal);
+                    None
+                }
+            },
         });
+    if let Some(refusal) = header_refusal {
+        // The payload has NOT been read, so the stream is desynced by whatever
+        // the client already pipelined behind the header. Answer and close,
+        // exactly as the `too large` arm below does for the same reason.
+        let _ = writer.write_all(refusal.as_bytes());
+        let _ = writer.flush();
+        return false;
+    }
     let header_authorized = header_target.as_ref().is_some_and(|(_, _, _, ctx)| {
         route.scope.is_owner_class() || cross_session_authorized(route.scope, "feed", ctx)
     });
@@ -6722,8 +6819,20 @@ where
     let active_target = resolve_active(route.active);
     let front_terminal_session = active_target.as_ref().map(|(_, _, session, _)| *session);
     let target = match selector.as_ref() {
-        None | Some(Selector::SelfTok) => active_target.clone(),
+        None | Some(Selector::SelfTok) => Ok(active_target.clone()),
         Some(sel) => resolve_explicit(route.store, sel),
+    };
+    // Re-checked at the effect boundary for the same reason the target is:
+    // a second instance can have published this id while `read_exact` blocked.
+    // The payload IS consumed here, so this one replies and stays framed.
+    let target = match target {
+        Ok(target) => target,
+        Err(refusal) => {
+            if writer.write_all(refusal.as_bytes()).is_err() {
+                return false;
+            }
+            return writer.flush().is_ok();
+        }
     };
     let authorized = target.as_ref().is_some_and(|(_, _, _, ctx)| {
         route.scope.is_owner_class() || cross_session_authorized(route.scope, "feed", ctx)
@@ -7276,8 +7385,18 @@ fn run_subscribe_with_peer_probe<W: Write, P: FnMut() -> bool>(
         };
         let sel = Selector::parse(body);
         let target = match &sel {
-            Selector::SelfTok => resolve_active(active),
+            Selector::SelfTok => Ok(resolve_active(active)),
             Selector::Local(_) | Selector::Sid(_) => resolve_explicit(store, &sel),
+        };
+        // A subscribe is a READ, and an ambiguous one streams a pane's output
+        // to a caller who asked for a different instance's pane. Refuse.
+        let target = match target {
+            Ok(target) => target,
+            Err(refusal) => {
+                let _ = writer.write_all(refusal.as_bytes());
+                let _ = writer.flush();
+                return;
+            }
         };
         let Some((term, _master, local_id, ctx)) = target else {
             let error = if matches!(sel, Selector::SelfTok) {
@@ -7435,6 +7554,41 @@ fn resolve_target(self_tuple: &Target, store: &Store, sel: &Selector) -> Option<
             Some((h.term.clone(), h.master, h.local_id, h.ctx.clone()))
         }
     }
+}
+
+/// AN AMBIGUOUS ID IS AN ERROR, NEVER A DELIVERY: the refusal an `@<sid>` earns
+/// when THIS instance hosts it and another LIVE instance also answers to it.
+///
+/// Two instances sharing one `s-…` share one `graph/<sid>` discovery entry, and
+/// the id alone then cannot say which window a caller meant — which is how a
+/// driver that reads a sid out of a fleet listing and sends `@<sid> key enter`
+/// lands the keystroke in a stranger's terminal. `identity_claim` stops new
+/// duplicates being MINTED; this is what one that already exists (an instance
+/// from a build without that gate, still running) gets instead of the keystroke.
+///
+/// Deterministic and one-sided by design: the instance the entry NAMES keeps
+/// serving, so an address that resolves at all keeps resolving to exactly one
+/// place, and the answer names the pid to address instead.
+///
+/// WHAT IT COSTS, and where it does not: `@.` never arrives (the dispatch matches
+/// it with the flagless path) and `@<local>` leaves on the first line, both being
+/// process-local by construction; an id this process MINTED is answered from a
+/// register in memory (80 bits of CSPRNG cannot be held twice), so the ordinary
+/// `@<sid>` pays one lock read and a string compare. Only an ADOPTED id — one
+/// that arrived from an outer aterm's premint or a handoff, a handful per
+/// instance at most — spends the read of `graph/<sid>` plus a `kill(pid, 0)`:
+/// measured 11.7–12.7 µs in the debug lane on this machine, against a 4.8–5.7 µs
+/// floor for one request+reply over the socket the request already crossed.
+fn ambiguous_sid_refusal(sel: &Selector) -> Option<String> {
+    let Selector::Sid(sid) = sel else {
+        return None;
+    };
+    let pid = crate::identity_claim::live_holder(sid)?;
+    Some(format!(
+        "ERR ambiguous session id {} also served by pid {pid}; address that \
+         instance directly (aterm-ctl --pid {pid})\n",
+        sid.as_str()
+    ))
 }
 
 /// Whether a CROSS-session call (target != connection's own session) is authorized
@@ -8404,7 +8558,10 @@ fn handle(
     let (term, master, session, ctx) = match &selector {
         None | Some(Selector::SelfTok) => self_tuple,
         Some(sel) => match resolve_target(&self_tuple, store, sel) {
-            Some(t) => t,
+            Some(t) => match ambiguous_sid_refusal(sel) {
+                Some(refusal) => return refusal,
+                None => t,
+            },
             None => return "ERR no such session\n".to_string(),
         },
     };
@@ -9149,6 +9306,7 @@ fn handle(
         // focused window); the one-command face of the ATERM_TRACE_SPAWN
         // sensor and of "I don't see the rainbow cursor trails".
         "trail" => control_media::cmd_trail(proxy, rest),
+        "kitty" => control_media::cmd_kitty(proxy, rest),
         // `spawn`: mint ONE new tab session and reply `OK <sid>` — birth as a
         // socket primitive. The sid is immediately addressable (`@<sid> turn …`),
         // so fleet provisioning is a loop of spawn calls, no exec'ing binaries.
@@ -9492,6 +9650,168 @@ fn typing_momentum_reading(
 
 #[cfg(test)]
 mod tests {
+
+    /// **AND THE REFUSAL IS THE RESOLVER'S, SO THE SEAMS THAT SKIP `handle`
+    /// CANNOT SKIP IT.** The check first sat at the single seam in [`handle`],
+    /// and four seams resolve a selector without ever reaching `handle`: `post`
+    /// with a binary body, `feed-bin`/`paste-bin` at the header fence AND at
+    /// the effect boundary, and `subscribe`'s target list. Those four are the
+    /// ones that write input and stream a pane's output — the exact traffic an
+    /// id naming two instances must not carry. So the gate moved into
+    /// [`resolve_explicit`], whose `Result` no caller can drop on the floor,
+    /// and the bare lookup is nested inside it where nothing else can name it.
+    ///
+    /// What this pins is the resolver's three answers. That every seam is
+    /// bound by them is the type checker's job, not a test's: a seam that
+    /// ignored the `Err` would not compile.
+    #[test]
+    fn an_ambiguous_id_is_refused_by_the_resolver_every_seam_shares() {
+        use super::{Selector, resolve_explicit};
+        use aterm_session::{LaunchNonce, SessionId};
+
+        let _guard = crate::identity_claim::rendezvous_test_guard();
+        let dir = aterm_tempfile::tempdir().expect("scratch control dir");
+        crate::identity_claim::set_rendezvous_override(Some(dir.path().to_path_buf()));
+
+        // One session this instance really hosts, under an id it ADOPTED —
+        // the premint population, the only one that can be doubly held.
+        let store = crate::session_store::new_store();
+        let mut handle = crate::session_store::test_handle(1);
+        let sid = SessionId::generate();
+        handle.sid = sid.clone();
+        store
+            .write()
+            .unwrap_or_else(|p| p.into_inner())
+            .register(handle);
+        crate::identity_claim::note_adopted(&sid);
+        let sel = Selector::Sid(sid.clone());
+
+        // Our own entry, nobody else's: the ordinary cross-session address.
+        crate::proxy::write_graph_entry(
+            dir.path(),
+            &sid,
+            "/nonexistent/aterm.sock",
+            &LaunchNonce::generate(),
+        );
+        assert!(
+            resolve_explicit(&store, &sel)
+                .expect("an id only this instance serves resolves")
+                .is_some(),
+            "the gate must not refuse the ids this instance published"
+        );
+
+        // A live foreign instance publishing the SAME id (pid 1 exists on
+        // every unix and is never us).
+        std::fs::write(
+            dir.path().join("graph").join(sid.as_str()),
+            "sock /nonexistent/aterm.sock\nnonce ab\npid 1\n",
+        )
+        .expect("plant a foreign entry");
+        let Err(refusal) = resolve_explicit(&store, &sel) else {
+            panic!("an id two live instances serve names two places, and is refused");
+        };
+        assert!(
+            refusal.starts_with("ERR ambiguous session id ") && refusal.contains("pid 1"),
+            "the refusal must name the pid to address instead: {refusal:?}"
+        );
+
+        // AND A MISS IS STILL A MISS. An id this instance does not host earns
+        // `ERR no such session` even with a live foreign entry under it —
+        // otherwise a planted entry would turn every unknown id into an
+        // ambiguity, which is a denial of service wearing a safety check.
+        let stranger = SessionId::generate();
+        crate::identity_claim::note_adopted(&stranger);
+        std::fs::write(
+            dir.path().join("graph").join(stranger.as_str()),
+            "sock /nonexistent/aterm.sock\nnonce ab\npid 1\n",
+        )
+        .expect("plant a foreign entry");
+        assert!(
+            resolve_explicit(&store, &Selector::Sid(stranger))
+                .expect("an id we do not host is a miss, not an ambiguity")
+                .is_none(),
+        );
+    }
+
+    /// THE OTHER HALF OF THE DUPLICATE-ID FIX: when two live instances DO answer
+    /// to one id (one of them from a build without the adoption claim), `@<sid>`
+    /// must be an ERROR here, never a keystroke delivered into whichever window
+    /// this process happens to hold. The refusal names the pid to address instead,
+    /// so the caller has somewhere to go.
+    #[test]
+    fn an_id_a_second_live_instance_also_serves_is_refused_not_delivered() {
+        use super::{Selector, ambiguous_sid_refusal};
+        use aterm_session::{LaunchNonce, SessionId};
+
+        let _guard = crate::identity_claim::rendezvous_test_guard();
+        let dir = aterm_tempfile::tempdir().expect("scratch control dir");
+        crate::identity_claim::set_rendezvous_override(Some(dir.path().to_path_buf()));
+
+        let sid = SessionId::generate();
+        let sel = Selector::parse(sid.as_str());
+
+        // An id this process MINTED cannot be held by anyone else, so it is never
+        // ambiguous — not even with a live foreign entry planted under it, which
+        // could only be another instance's id colliding with ours at 80 bits.
+        std::fs::create_dir_all(dir.path().join("graph")).expect("graph dir");
+        std::fs::write(
+            dir.path().join("graph").join(sid.as_str()),
+            "sock /nonexistent/aterm.sock\nnonce ab\npid 1\n",
+        )
+        .expect("plant a foreign entry");
+        assert!(
+            ambiguous_sid_refusal(&sel).is_none(),
+            "a minted id is not contestable, and must not pay for a probe"
+        );
+
+        // From here the id is one this process ADOPTED — the premint case, the
+        // only population that can be doubly held.
+        crate::identity_claim::note_adopted(&sid);
+        std::fs::remove_file(dir.path().join("graph").join(sid.as_str())).expect("unplant");
+
+        // No discovery entry: nobody else claims the id, so nothing is refused.
+        assert!(ambiguous_sid_refusal(&sel).is_none());
+
+        // OUR OWN entry — the ordinary case for every session this instance
+        // hosts. Reading it as a rival would refuse every cross-session address
+        // on the machine, so this one is load-bearing.
+        crate::proxy::write_graph_entry(
+            dir.path(),
+            &sid,
+            "/nonexistent/aterm.sock",
+            &LaunchNonce::generate(),
+        );
+        assert!(
+            ambiguous_sid_refusal(&sel).is_none(),
+            "an instance must serve the ids IT published"
+        );
+
+        // A LIVE FOREIGN instance also serving it (pid 1 exists on every unix and
+        // is never us) — the duplicate the whole fix is about.
+        std::fs::write(
+            dir.path().join("graph").join(sid.as_str()),
+            "sock /nonexistent/aterm.sock\nnonce ab\npid 1\n",
+        )
+        .expect("plant a foreign entry");
+        let refusal = ambiguous_sid_refusal(&sel).expect("an ambiguous id must be refused");
+        assert!(
+            refusal.starts_with("ERR ambiguous session id "),
+            "{refusal:?}"
+        );
+        assert!(refusal.contains(sid.as_str()), "{refusal:?}");
+        assert!(refusal.contains("pid 1"), "{refusal:?}");
+        assert!(
+            refusal.ends_with('\n'),
+            "every reply is one line: {refusal:?}"
+        );
+
+        // The PROCESS-LOCAL forms cannot be ambiguous — they never leave this
+        // process — and must not pay for a probe or earn a refusal.
+        assert!(ambiguous_sid_refusal(&Selector::parse("7")).is_none());
+        assert!(ambiguous_sid_refusal(&Selector::parse(".")).is_none());
+
+        crate::identity_claim::set_rendezvous_override(None);
+    }
 
     /// THE ROUTING LAW an explicit selector takes (regression: `@self` — the
     /// selector the docs recommend — expands client-side to `@<sid>`, which was
@@ -13533,7 +13853,9 @@ mod tests {
         assert_eq!(text.target, Target::Session);
         assert_eq!(NO_ACTIVE_TERMINAL, "ERR no active terminal\n");
         assert!(
-            resolve_explicit(&store, &Selector::Local(7)).is_none(),
+            resolve_explicit(&store, &Selector::Local(7))
+                .expect("a local id is never ambiguous")
+                .is_none(),
             "an explicit unknown PTY never falls back to hidden front content"
         );
     }
@@ -13890,6 +14212,86 @@ mod tests {
         let _ = std::fs::remove_dir_all(dir);
     }
 
+    /// A `pipe(2)` whose BOTH ENDS are flagged close-on-exec as early as the
+    /// platform allows — the only spelling any test in this file should use.
+    ///
+    /// **WHY IT IS NOT A BARE `libc::pipe`.** `pipe(2)` on Darwin returns both
+    /// descriptors UNFLAGGED (measured in aterm-pty's `unix.rs`: `F_GETFD` is
+    /// 0x0 the instant `pipe` returns). This suite runs thousands of tests
+    /// across many threads and some of them spawn real processes, so a
+    /// `posix_spawn` racing an unflagged pipe hands the child a copy of an end
+    /// the test believes it owns. On the READ end that is a wrong answer, not
+    /// a leak: a stranger holding a reader means the peer is NOT dead, so
+    /// `drop(rx)` no longer closes the last one, a write lands in the buffer
+    /// instead of earning `EPIPE`, and
+    /// `cross_session_input_reports_a_dead_peer_as_write_failed` gets `Ok`
+    /// where it requires `WriteFailed`. Measured twice: once in a full-suite
+    /// run under load, and again on 2026-09-16 — one failure in three
+    /// full-suite runs, on the FIRST assertion. aterm-pty measured the same
+    /// mechanism at 6 inherits per 1500 spawns.
+    ///
+    /// **AND A FIFO CANNOT CLOSE THE WINDOW HERE — MEASURED 2026-09-16.** Linux
+    /// closes it for free with `pipe2(O_CLOEXEC)`. Darwin has no `pipe2`, and
+    /// the obvious substitute is the `mkfifo` + two `O_CLOEXEC` opens + `unlink`
+    /// carrier that aterm-pty's `open_exec_status_fifo` uses in PRODUCTION for
+    /// this same inherit problem. It IS atomic, and it was tried here — but a
+    /// Darwin FIFO is not a pipe where these tests need one. With the buffer
+    /// full, closing the LAST READER leaves `poll(wr, POLLOUT)` reporting
+    /// NOTHING — no `POLLOUT`, no `POLLERR`, no `POLLHUP`, the poll simply runs
+    /// to its deadline — where the same probe on an anonymous pipe returns
+    /// `POLLHUP` at once. (A write earns `EPIPE` on both; it is only the
+    /// readiness report that differs, and `aterm_pty::poll_writable` polls
+    /// WITHOUT a deadline.) So the swap does not buy safety with a flake, it
+    /// buys it with a DETERMINISTIC HANG: the sink drainer parks forever in
+    /// `poll_writable` and `cross_session_paste_reports_a_dead_spill_peer_as_write_failed`
+    /// wedged 3 runs out of 3, taking the whole `aterm-gui` suite with it.
+    /// Darwin therefore keeps `pipe(2)` + `F_SETFD`, and keeps the narrowed but
+    /// real window, because a rare wrong answer is the lesser defect against a
+    /// suite that never finishes. This is the same trade
+    /// [`crate::seamless`]'s own `cloexec_pipe` already records.
+    ///
+    /// The flag is READ BACK on both descriptors rather than trusted, because
+    /// the flag is the entire point of the helper — the same discipline the
+    /// production carrier applies.
+    #[cfg(unix)]
+    fn cloexec_pipe() -> (i32, i32) {
+        let mut fds = [-1i32; 2];
+        #[cfg(any(target_os = "linux", target_os = "android"))]
+        {
+            assert_eq!(
+                // SAFETY: `pipe2` fills the two-element array this frame owns,
+                // and flags BOTH descriptors as it creates them.
+                unsafe { libc::pipe2(fds.as_mut_ptr(), libc::O_CLOEXEC) },
+                0,
+                "pipe2(O_CLOEXEC)"
+            );
+        }
+        #[cfg(not(any(target_os = "linux", target_os = "android")))]
+        {
+            assert_eq!(
+                // SAFETY: `pipe` fills the two-element array this frame owns.
+                unsafe { libc::pipe(fds.as_mut_ptr()) },
+                0,
+                "pipe(2)"
+            );
+            for fd in fds {
+                aterm_pty::set_cloexec(fd, true).expect("pipe end cloexec");
+            }
+        }
+        for fd in fds {
+            // SAFETY: `fd` is a descriptor this function just created, and
+            // `F_GETFD` takes no further argument.
+            let flags = unsafe { libc::fcntl(fd, libc::F_GETFD) };
+            assert_ne!(flags, -1, "F_GETFD");
+            assert!(
+                flags & libc::FD_CLOEXEC != 0,
+                "a descriptor came back WITHOUT FD_CLOEXEC — the race this helper \
+                 exists to close is open again"
+            );
+        }
+        (fds[0], fds[1])
+    }
+
     /// A live, PIPE-backed session: a real `SinkWriter` over the WRITE end of a
     /// `pipe(2)` (so tracked input bytes are readable from `rx`), its own
     /// `Terminal`, and a `SessionHandle` registered under `local_id`. The read end
@@ -13902,9 +14304,7 @@ mod tests {
         use crate::session_store::{SessionHandle, SessionState};
         use aterm_session::sink::SinkWriter;
         use aterm_session::{EdgeTable, LaunchNonce, SessionId};
-        let mut fds = [0i32; 2];
-        assert_eq!(unsafe { libc::pipe(fds.as_mut_ptr()) }, 0, "pipe(2)");
-        let (rd, wr) = (fds[0], fds[1]);
+        let (rd, wr) = cloexec_pipe();
         let rx = unsafe { std::fs::File::from_raw_fd(rd) };
         let sid = SessionId::generate();
         let nonce = LaunchNonce::generate();
@@ -15095,6 +15495,12 @@ mod tests {
                 "open",
                 "invoke",
                 "rain",
+                // `kitty wear` changes what the user SEES on their own cursor and
+                // stamps the durable collection. Not `ReadScreen` (it changes
+                // something) and not `ConfigWrite` (that authority is reserved for
+                // `aterm.toml` and the security knobs a keystroke edge must never
+                // reach); the same class as `rain`/`fx` — a look, not a secret.
+                "kitty",
                 // `fx` ARMS a celebration the session's next keyed edge spends:
                 // a runtime latch, no PTY bytes, no durable config — the same
                 // class as `rain`'s per-session override.
@@ -15635,9 +16041,7 @@ mod tests {
         // all injected input verbs escalate identically.
         for kind in [
             OverlayKind::Settings,
-            OverlayKind::About,
             OverlayKind::Palette,
-            OverlayKind::Update,
             OverlayKind::ConnectionMap,
         ] {
             for verb in [
@@ -15652,12 +16056,7 @@ mod tests {
         }
 
         // OWNER is ALWAYS exempt — the owner's established control path is untouched.
-        for kind in [
-            OverlayKind::Settings,
-            OverlayKind::About,
-            OverlayKind::Palette,
-            OverlayKind::Update,
-        ] {
+        for kind in [OverlayKind::Settings, OverlayKind::Palette] {
             assert_eq!(
                 front_drive_escalation(owner, "key", FrontControlSurface::Overlay(kind)),
                 None,
@@ -16847,9 +17246,7 @@ mod tests {
     #[cfg(unix)]
     fn cross_session_send_reaches_target_master_only_when_authorized() {
         // The peer's "master" is a pipe; we read back what `send` writes.
-        let mut fds = [0i32; 2];
-        assert_eq!(unsafe { libc::pipe(fds.as_mut_ptr()) }, 0);
-        let (read_fd, write_fd) = (fds[0], fds[1]);
+        let (read_fd, write_fd) = cloexec_pipe();
 
         let store = session_store::new_store();
         let self_h = registered_session(0, -1, b"");
@@ -19977,11 +20374,22 @@ mod tests {
     /// held): a key whose write fails is revoked at the seam — stamp AND
     /// press credit, since the one-press echo (2026-09-12) — so a ribbon can
     /// only be laid by keys that actually reached the wire.
+    //
+    // UNIX-PINNED, and a portable pipe would be a FALSE pin rather than a
+    // wider one. `SinkWriter::new` takes an `i32` that means two different
+    // things: a PTY master FD on unix, and an opaque ConPTY registry KEY on
+    // Windows (`aterm_pty::windows::write_some` looks it up and answers
+    // `unknown PTY master key (closed or never spawned)` for anything else).
+    // A `std::io::pipe()` end therefore cannot be this sink's wire on Windows
+    // — and the `try_write_frame_immediate` family is fail-closed there
+    // (`ImmediateWrite::BusyZero`, refuse without writing) on purpose. The law
+    // below needs a key whose write REACHES the wire; on Windows no such
+    // fixture exists yet, so the honest answer is to say so here and let the
+    // compiler skip it, not to compile a test whose premise is false.
+    #[cfg(unix)]
     fn rainbow_kitty_window() -> (crate::App, crate::WindowId, std::fs::File) {
         use std::os::unix::io::FromRawFd;
-        let mut fds = [0i32; 2];
-        assert_eq!(unsafe { libc::pipe(fds.as_mut_ptr()) }, 0, "pipe(2)");
-        let (rd, wr) = (fds[0], fds[1]);
+        let (rd, wr) = cloexec_pipe();
         let rx = unsafe { std::fs::File::from_raw_fd(rd) };
         let mut app = crate::App::headless_for_test_with_sink(Arc::new(
             aterm_session::sink::SinkWriter::new(wr),
@@ -20009,6 +20417,9 @@ mod tests {
     /// carries no keystroke licence and lays nothing. Fails before: `typed=`
     /// is not an option (`ERR usage`) and no route presses keys.
     #[test]
+    // Unix-pinned with its fixture — see `rainbow_kitty_window` for why a
+    // Windows twin needs a ConPTY-backed sink and not a portable pipe.
+    #[cfg(unix)]
     fn an_agent_s_typed_turn_lays_ribbon_and_a_pasted_turn_does_not() {
         use std::cell::{Cell, RefCell};
         use std::time::{Duration, Instant};

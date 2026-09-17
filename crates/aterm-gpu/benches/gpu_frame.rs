@@ -390,6 +390,16 @@ fn main() {
              {} presents this guard just drove",
             frames.len() - 1
         );
+        // WHICH ARM produced these numbers. macOS builds this bench with the
+        // wgpu ORACLE feature compiled in, so "backend Metal" in wgpu's adapter
+        // line is NOT the same claim as "the first-party Metal arm drew this
+        // frame" — and a GPU A/B attributed to the wrong backend is worse than no
+        // A/B at all. Say it out loud next to the timings.
+        #[cfg(target_os = "macos")]
+        eprintln!(
+            "gpu_present arm: first-party Metal arm live = {}",
+            gpu.metal_render_armed()
+        );
         eprintln!(
             "gpu_present_scrollback_{rows}x{cols}: {scissored} scissored / {fulls} \
              full repaints over {} scroll notches, {} instances on the last frame",
@@ -411,6 +421,75 @@ fn main() {
                     i -= 1;
                     forward = i == 0;
                 }
+                gpu.present_encode_poll(&mut win, &frames[i]);
+            });
+        });
+    }
+
+    // BOTTOM-PINNED OUTPUT FLOOD — the frame class `compute_dirty_rows` ADMITS
+    // (equal `display_offset`, both 0) and then reports 49 of 50 rows dirty on,
+    // because it compares destination row `r` against SOURCE row `r` while the
+    // screen has slid by one. The CPU backend now diffs against row `r + da`
+    // (`scroll_shift_plan`) and blits the rest; this case exists so the GPU's
+    // policy is a MEASURED choice rather than an assumed one — the alternative
+    // here is not a full repaint but a 49-row SCISSORED encode, which is a much
+    // stronger baseline than the scrollback case's Clear-and-redraw.
+    {
+        let (rows, cols) = (50usize, 200usize);
+        let mut term = busy_term(rows, cols);
+        // Cursor hidden: the planner refuses a frame whose cursor moves, and a
+        // flood's cursor sits on the bottom row either way — hiding it keeps the
+        // A/B about the rows, not the caret.
+        term.process(b"\x1b[?25l");
+        let mut filler = String::with_capacity(cols);
+        for c in 0..cols - 1 {
+            filler.push(char::from(b'a' + (c % 26) as u8));
+        }
+        for _ in 0..600 {
+            term.process(filler.as_bytes());
+            term.process(b"\r\n");
+        }
+        // DISTINCT flood lines, one per frame, bottom-pinned (`display_offset`
+        // stays 0). 64 of them so the wrap-around frame — a jump the planner
+        // refuses in either arm — is 1/64 of the iterations and cancels in the A/B.
+        let mut frames = Vec::with_capacity(64);
+        for f in 0..64 {
+            term.process(format!("flood {f} ").as_bytes());
+            term.process(&filler.as_bytes()[..cols / 2]);
+            term.process(b"\r\n");
+            frames.push(term.cell_frame(rows, cols));
+        }
+        let mut win = aterm_gpu::WindowGpu::new();
+        gpu.present_encode_poll(&mut win, &frames[0]);
+        let (s0, f0, r0) = (
+            gpu.scissor_taken(),
+            gpu.full_repaints(),
+            gpu.scroll_rescues(),
+        );
+        for f in frames.iter().skip(1) {
+            gpu.present_encode_poll(&mut win, f);
+        }
+        let (scissored, fulls, rescues) = (
+            gpu.scissor_taken() - s0,
+            gpu.full_repaints() - f0,
+            gpu.scroll_rescues() - r0,
+        );
+        assert!(
+            scissored + fulls == (frames.len() - 1) as u64,
+            "present_flood: {scissored} scissored + {fulls} full is not the {} presents \
+             this guard just drove",
+            frames.len() - 1
+        );
+        eprintln!(
+            "gpu_present_flood_{rows}x{cols}: {scissored} scissored / {fulls} full / \
+             {rescues} scroll-rescued over {} flood frames, {} instances on the last frame",
+            frames.len() - 1,
+            gpu.last_instances()
+        );
+        let mut i = 0usize;
+        c.bench_function(&format!("gpu_present_flood_{rows}x{cols}"), |b| {
+            b.iter(|| {
+                i = (i + 1) % frames.len();
                 gpu.present_encode_poll(&mut win, &frames[i]);
             });
         });

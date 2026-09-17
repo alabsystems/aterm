@@ -23,7 +23,14 @@ impl BuiltinRules {
     // File path pattern: matches absolute and relative paths
     // Unix: /path/to/file, ./relative, ../parent
     // Windows: C:\path\to\file, .\relative
-    const FILE_PATH_PATTERN: &'static str = r"(?:/(?:[a-zA-Z0-9._-]+/)*[a-zA-Z0-9._-]+|\.{1,2}/(?:[a-zA-Z0-9._-]+/)*[a-zA-Z0-9._-]+|[A-Za-z]:[/\\](?:[a-zA-Z0-9._-]+[/\\])*[a-zA-Z0-9._-]+)";
+    // A path is one or more `/`-joined segments with an optional prefix: `/` (absolute),
+    // `.`/`..` (explicitly relative), `~` (home), or a first SEGMENT — `crates/x/y.rs`.
+    // The bare-relative shape matters: without it the leftmost match inside
+    // `crates/aterm-gui/src/lib.rs` began at its first slash, and a double-click on a
+    // relative path copied `/aterm-gui/src/lib.rs` — the first segment dropped and a
+    // leading `/` added, an absolute path that does not exist (glass hunt, m17-tower,
+    // 2026-09-01, finding 3). A Windows drive path keeps its own alternative.
+    const FILE_PATH_PATTERN: &'static str = r"(?:~|\.{1,2}|[a-zA-Z0-9._-]+)?(?:/[a-zA-Z0-9._-]+)+/?|[A-Za-z]:[/\\](?:[a-zA-Z0-9._-]+[/\\])*[a-zA-Z0-9._-]+";
 
     // Email pattern: RFC 5321 compliant (simplified)
     const EMAIL_PATTERN: &'static str = r"[a-zA-Z0-9._%+-]+@[a-zA-Z0-9](?:[a-zA-Z0-9-]*[a-zA-Z0-9])?(?:\.[a-zA-Z0-9](?:[a-zA-Z0-9-]*[a-zA-Z0-9])?)*\.[a-zA-Z]{2,}";

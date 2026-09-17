@@ -1081,8 +1081,10 @@ impl PrivacySnapshot {
     }
 }
 
-/// Every name on the `folder` row: the three `$HOME` folders the consent
-/// module resolves, then the two volume classes that have no path.
+/// Every name on the `folder` row: the consent module's own roster (the three
+/// `$HOME` folders it resolves, then `app-data` — every other app's own data,
+/// promptable and resettable exactly as a folder is), then the two volume
+/// classes that have no path.
 fn folder_names() -> Vec<&'static str> {
     let mut names: Vec<&'static str> = Folder::ALL.iter().map(|f| f.as_str()).collect();
     names.extend_from_slice(VOLUME_ROWS);

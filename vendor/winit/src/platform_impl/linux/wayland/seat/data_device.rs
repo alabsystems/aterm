@@ -288,13 +288,18 @@ impl DataSourceHandler for WinitState {
         &mut self,
         _conn: &Connection,
         _qh: &QueueHandle<Self>,
-        _source: &WlDataSource,
+        source: &WlDataSource,
         _mime: String,
-        _fd: WritePipe,
+        fd: WritePipe,
     ) {
+        // The clipboard's copy-paste source (see `clipboard.rs`); winit starts no
+        // drags, so no other source of ours exists.
+        let _ = self.clipboard_send_request(source, fd);
     }
 
-    fn cancelled(&mut self, _conn: &Connection, _qh: &QueueHandle<Self>, _source: &WlDataSource) {}
+    fn cancelled(&mut self, _conn: &Connection, _qh: &QueueHandle<Self>, source: &WlDataSource) {
+        let _ = self.clipboard_cancelled(source);
+    }
 
     fn dnd_dropped(&mut self, _conn: &Connection, _qh: &QueueHandle<Self>, _source: &WlDataSource) {}
 

@@ -138,10 +138,22 @@ impl WarmupRow {
 /// `EPERM` and `EACCES` are NOT interchangeable here (design §1.5): a TCC
 /// refusal is `EPERM`, and an ordinary Unix permission problem is `EACCES`.
 /// Folding `EACCES` to `Denied` would report a `chmod` as a privacy denial.
-pub(crate) const fn fold_read_dir(outcome: ReadDirOutcome) -> WarmupRow {
+///
+/// `ENOENT` IS ALSO ITEM-DEPENDENT. For the three folders macOS creates at
+/// account setup, a missing path is a broken home and reads as `Error`. For
+/// the app-data item, whose probe names one app's container that an account
+/// may never have created, being TOLD it is missing is proof the look was
+/// permitted — tccd decides before the lookup can report a missing name, so a
+/// refusal would have arrived as `EPERM`. `Folder::absent_means_allowed` owns
+/// that distinction, so it stays one rule in one place rather than a variant
+/// match in this module.
+pub(crate) const fn fold_read_dir(folder: Folder, outcome: ReadDirOutcome) -> WarmupRow {
     match outcome {
         ReadDirOutcome::Listed => WarmupRow::Allowed,
         ReadDirOutcome::Failed(consent::ERRNO_EPERM) => WarmupRow::Denied,
+        ReadDirOutcome::Failed(consent::ERRNO_ENOENT) if folder.absent_means_allowed() => {
+            WarmupRow::Allowed
+        }
         ReadDirOutcome::Failed(_) => WarmupRow::Error,
         ReadDirOutcome::Refused => WarmupRow::Unknown,
     }
@@ -458,14 +470,14 @@ impl WarmupState {
             WarmupProgress::Asking { folder, .. } => self.set_row(folder, WarmupRow::Asking),
             WarmupProgress::Answered {
                 folder, outcome, ..
-            } => self.set_row(folder, fold_read_dir(outcome)),
+            } => self.set_row(folder, fold_read_dir(folder, outcome)),
             WarmupProgress::Finished {
                 elapsed_ms,
                 answers,
                 ..
             } => {
                 for (folder, outcome) in answers {
-                    self.set_row(folder, fold_read_dir(outcome));
+                    self.set_row(folder, fold_read_dir(folder, outcome));
                 }
                 self.last_pass_ms = Some(elapsed_ms);
                 self.end_pass();
@@ -719,7 +731,50 @@ mod tests {
             (ReadDirOutcome::Refused, WarmupRow::Unknown),
         ];
         for (outcome, expected) in table {
-            assert_eq!(fold_read_dir(outcome), expected, "folding {outcome:?}");
+            assert_eq!(
+                fold_read_dir(Folder::Documents, outcome),
+                expected,
+                "folding {outcome:?}"
+            );
+        }
+    }
+
+    /// The one item whose probe path may legitimately not exist reads `ENOENT`
+    /// as permission, and no other item does. Everything else about the fold
+    /// stays identical across items — in particular `EPERM` is a denial for
+    /// all four and `EACCES` is a denial for none.
+    #[test]
+    fn a_missing_path_is_permission_for_the_app_data_item_alone() {
+        const EACCES: i32 = 13;
+        const ENOENT: i32 = 2;
+        assert_eq!(
+            fold_read_dir(Folder::AppData, ReadDirOutcome::Failed(ENOENT)),
+            WarmupRow::Allowed,
+            "being told another app's container is absent means the look was allowed"
+        );
+        for folder in [Folder::Documents, Folder::Desktop, Folder::Downloads] {
+            assert_eq!(
+                fold_read_dir(folder, ReadDirOutcome::Failed(ENOENT)),
+                WarmupRow::Error,
+                "{folder:?}: a missing home folder is not a consent verdict"
+            );
+        }
+        for folder in Folder::ALL {
+            assert_eq!(
+                fold_read_dir(*folder, ReadDirOutcome::Failed(consent::ERRNO_EPERM)),
+                WarmupRow::Denied,
+                "{folder:?}"
+            );
+            assert_eq!(
+                fold_read_dir(*folder, ReadDirOutcome::Failed(EACCES)),
+                WarmupRow::Error,
+                "{folder:?}"
+            );
+            assert_eq!(
+                fold_read_dir(*folder, ReadDirOutcome::Listed),
+                WarmupRow::Allowed,
+                "{folder:?}"
+            );
         }
     }
 

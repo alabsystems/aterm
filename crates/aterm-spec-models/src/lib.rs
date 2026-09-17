@@ -27,10 +27,3 @@ use std::path::{Path, PathBuf};
 pub fn specs_dir() -> PathBuf {
     Path::new(env!("CARGO_MANIFEST_DIR")).join("specs")
 }
-
-/// The quarantined kernel-family specs, superseded by derived twins (Phase 1).
-/// Kept on disk under `specs/legacy/` for provenance; excluded from the checked
-/// set (`tests/model_check.rs`) and from the xref gate's external resolution.
-pub fn legacy_specs_dir() -> PathBuf {
-    specs_dir().join("legacy")
-}

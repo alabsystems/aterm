@@ -130,7 +130,10 @@ fn main() -> ExitCode {
     // dispatched above the verb match for the same reason `atpkg`'s own CLI dispatches
     // them above its: they are unlisted, they are not `aterm_cli::Verb`s, and no roster
     // or help surface may grow a row for them.
-    if first == atpkg::stage_helper::HIDDEN_VERB || first == atpkg::lay::HIDDEN_VERB {
+    if first == atpkg::stage_helper::HIDDEN_VERB
+        || first == atpkg::lay::HIDDEN_VERB
+        || first == atpkg::seam::HIDDEN_VERB
+    {
         return atpkg::cli::main_entry(rest.to_vec());
     }
 
@@ -496,6 +499,18 @@ fn main() -> ExitCode {
     //     the session over pipes (the integration tests, a driver's `--session`
     //     child) must never provision the machine's real prefix as a side effect
     //     (2026-09-10 review: `targo test -p aterm` rewrote the owner's status.toml).
+    // THE HOST SETTINGS ARE NOT THE PACKAGE MANAGER'S TO GATE. A session launch — this
+    // binary run from another terminal, or over ssh — could only apply them as a side
+    // effect of a package pass that was due, so a Mac with `[packages] enabled = false`,
+    // `auto_update = false`, `ATPKG_DISABLE` set, or simply a pass that ran an hour ago
+    // never got them from this lane at all. They take no store lock, need no index and
+    // no network, and `machine apply` prints nothing when nothing changed, so the lane
+    // that can run them unconditionally should. Interactive launches only, for the same
+    // reason the pass above is gated that way: a harness driving a session over pipes
+    // must not touch the real machine.
+    if cfg!(target_os = "macos") && session_lane_is_interactive() {
+        spawn_detached_machine_apply();
+    }
     if let Some(layout) = atpkg::store::resolve_configured()
         && std::env::var_os("ATPKG_DISABLE").is_none()
     {
@@ -535,6 +550,23 @@ fn session_lane_is_interactive() -> bool {
 /// `status.toml`; the window's loop is the surface that streams markers), and the
 /// child never waited for. A spawn that fails is said on stderr once — a session
 /// must never be blocked by its package manager.
+/// One DETACHED `aterm pkg machine apply` — the lock-free host settings, on every
+/// interactive session launch.
+///
+/// Separate from [`spawn_detached_pkg_update`] because the two are gated differently on
+/// purpose: a package pass is due or it is not, and a user may switch it off entirely;
+/// the `[machine]` settings are the doctor's, they take no store lock, and their own
+/// `[machine]` table is where a user switches them off. Detached and never waited for,
+/// like the pass, so a session is never blocked by it.
+fn spawn_detached_machine_apply() {
+    let Ok(exe) = std::env::current_exe() else {
+        return;
+    };
+    if let Err(error) = spawn_detached(exe.as_os_str(), &["pkg", "machine", "apply"]) {
+        eprintln!("aterm: could not start the background `aterm pkg machine apply`: {error}");
+    }
+}
+
 fn spawn_detached_pkg_update() {
     let Ok(exe) = std::env::current_exe() else {
         return;
@@ -1231,6 +1263,45 @@ const COMPLETION_FLAGS: &[(&str, &str)] = &[
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// THE HOST SETTINGS RUN ON EVERY INTERACTIVE SESSION LAUNCH, not only when a
+    /// package pass happens to be due.
+    ///
+    /// This lane exists because only the WINDOW entry ran the updater; the same gap
+    /// applied to the `[machine]` settings, which are not the package manager's to gate:
+    /// they take no store lock, need no index and no network, and a Mac with
+    /// `[packages] enabled = false` (or `auto_update = false`, or `ATPKG_DISABLE` set,
+    /// or simply a pass that ran an hour ago) got them from this lane never. A scrape,
+    /// in the idiom of atpkg's own placement test, because the alternative is spawning a
+    /// real detached child in a unit test.
+    #[test]
+    fn the_session_lane_applies_the_machine_settings_outside_every_package_gate() {
+        let src = include_str!("main.rs");
+        let start = src
+            .find("\nfn session_entry")
+            .or_else(|| src.find("spawn_detached_machine_apply();"))
+            .expect("the session lane");
+        let call = src
+            .find("spawn_detached_machine_apply();")
+            .expect("the session lane applies the [machine] settings");
+        let gate = src
+            .find("if let Some(layout) = atpkg::store::resolve_configured()")
+            .expect("the package-pass gate");
+        assert!(
+            call < gate,
+            "the host settings must not sit inside the package manager's gate"
+        );
+        assert!(start <= call);
+        // And the argv is the lock-free verb, not a pass.
+        let spawner = src
+            .find("fn spawn_detached_machine_apply()")
+            .expect("the spawner");
+        let body = &src[spawner..spawner + 600];
+        assert!(
+            body.contains(r#"&["pkg", "machine", "apply"]"#),
+            "the lane runs `aterm pkg machine apply`: {body}"
+        );
+    }
 
     /// THE DETACHED PASS IS NOT THIS PROCESS'S CHILD (2026-09-12). The session lane
     /// runs `aterm_cli::session_main` in this same process, and its unix driver

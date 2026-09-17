@@ -21,6 +21,7 @@
 //   ATERM_COMPILER_VERSION_LINE  full first line of `$RUSTC -vV`
 //   ATERM_COMPILER_COMMIT        the compiler's full git commit hash
 //   ATERM_COMPILER_HOST          the compiler's host triple
+//   ATERM_COMPILER_TRUST_VERSION Trust's OWN version (the `trust:` -vV line), "" if none
 //   ATERM_COMPILER_FLAVOR 'r' (upstream Rust) | 't' (Trust: trustc)
 //   ATERM_BUILD_PROFILE  cargo PROFILE ("debug"/"release")
 //   ATERM_TRUST_VERIFY   "on" iff --cfg trust_verify was active, else "off"
@@ -206,6 +207,13 @@ fn main() {
     );
     println!("cargo:rustc-env=ATERM_COMPILER_COMMIT={}", compiler.commit);
     println!("cargo:rustc-env=ATERM_COMPILER_HOST={}", compiler.host);
+    // Trust's OWN version (the `trust:` -vV line, e.g. 0.1.0) — "" when the
+    // compiler reports none. Distinct from the rustc-shaped release token in the
+    // version line, which is the Rust release Trust is compatible with.
+    println!(
+        "cargo:rustc-env=ATERM_COMPILER_TRUST_VERSION={}",
+        compiler.trust_version
+    );
     println!("cargo:rustc-env=ATERM_COMPILER_FLAVOR={flavor}");
     println!(
         "cargo:rustc-env=ATERM_BUILD_PROFILE={}",

@@ -639,12 +639,111 @@ pub struct Baseline {
 //     so [`WASM_CPU`] and [`WASM_GPU`] are untouched. The commit that added
 //     the crate did not touch this file, and the six baseline tests were red
 //     at origin/main from its merge until this note.
+//
+// RE-MEASURED 2026-09-15 — THE winit FORK GREW BY 610 LINES, and nothing else
+//     moved anywhere. Two commits landed in `vendor/winit` after the round-13
+//     re-pin (dd444ac8b, the commit these constants were last measured at), and
+//     both are aterm's own edits inside the fork — the shape notes (5), (7) and
+//     (8) above keep recording, one more time:
+//
+//       c5326f2d8  feat(gui,winit): a native Wayland clipboard — copy, paste,
+//                  copy-on-select and OSC 52 with no XWayland. +571 / -3 over
+//                  nine files, the bulk of it the new 452-line
+//                  platform_impl/linux/wayland/clipboard.rs.          net +568
+//       b41e769b0  fix(gui,types,winit-keymap): the physical keypad reaches the
+//                  keypad encoder — event.rs grows the keypad predicate.
+//                  +45 / -3 in one file.                              net  +42
+//
+//     Measured directly, not inferred: physical `*.rs` lines under
+//     `vendor/winit` go 63,600 (dd444ac8b) -> 64,168 (c5326f2d8) -> 64,210
+//     (b41e769b0 = HEAD), and `git diff --numstat dd444ac8b..HEAD -- vendor/`
+//     is +616 / -6 with EVERY path under `vendor/winit/`. No other fork moved.
+//
+//       mac-arm  440,327 -> 440,937
+//       linux    2,788,536 -> 2,789,146
+//       win      3,586,896 -> 3,587,506
+//
+//     THE SAME +610 ON ALL THREE, which is the evidence it is one fork's edits
+//     and not three unrelated drifts — the identical fingerprint notes (4),
+//     (5), (7) and (8) carry, and the wasm modules never resolve winit so
+//     [`WASM_CPU`] and [`WASM_GPU`] do not move by a line.
+//
+//     NO DEPENDENCY CHANGED VERSION, and that was checked rather than assumed:
+//     `Cargo.lock` against `git show dd444ac8b:Cargo.lock` moves exactly two
+//     things — the workspace version 0.85.0 -> 0.86.0 on all 84 first-party
+//     entries, and ONE added name, `aterm-winsign`, a path package no shipped
+//     cell resolves. Not one third-party package's version or `source` line
+//     differs. `vendor/winit/Cargo.toml` is byte-identical, so the clipboard
+//     took no new dependency: `resolved`, `workspace`, `third_party`,
+//     `build_scripts`, `proc_macros` and `duplicate_names` are UNCHANGED in
+//     all five cells (122/75/47, 272/77/195, 162/71/91), and only the LOC rows
+//     and `winit`'s dominator move. That is the 2026-08-30 shape: a
+//     measurement of the same graph, with the fork's own source larger.
+//
+//     ONE DOMINATOR MOVED, by exactly the same 610: `winit` 12 / 83,332 ->
+//     12 / 83,942, package count unchanged because the fork gained no edge.
+//     It still LEADS the mac-arm ranking (`rustls` is second at 5 / 65,413),
+//     so the order is untouched. No other anchor reaches winit and none moved.
+//     `tools/forge-budget.tsv` is raised on the same three rows through
+//     `--allow-regress`, with this cause in its fourth column.
+// RE-MEASURED 2026-09-16 — THE FORK'S APACHE NOTICES, eight comment lines and
+//     nothing else. `cargo forge attest` was red with four [OB-7] violations:
+//     c5326f2d8 and b41e769b0 edited three files of `vendor/winit` and added a
+//     fourth without the modification notice Apache-2.0 §4(b) requires. The
+//     notices are two comment lines per file over four files — `src/platform/
+//     wayland.rs`, `src/platform_impl/linux/wayland/mod.rs`, `.../seat/keyboard/
+//     mod.rs` and the added `.../wayland/clipboard.rs` — so every cell that
+//     resolves winit gains exactly 8 physical lines and nothing else moves:
+//
+//       mac-arm  440,937 -> 440,945
+//       linux    2,789,146 -> 2,789,154
+//       win      3,587,506 -> 3,587,514
+//
+//     THE SAME +8 ON ALL THREE, the same fingerprint the 2026-09-15 note
+//     describes: one fork's own source, no package, version or edge. The wasm
+//     modules never resolve winit, so [`WASM_CPU`] and [`WASM_GPU`] do not move.
+//     `winit`'s dominator takes the same +8 (12 / 83,942 -> 12 / 83,950) and
+//     still leads the mac-arm ranking. `tools/forge-budget.tsv` is raised on the
+//     same three rows through `--allow-regress`, with this cause in its fourth
+//     column.
+// RE-MEASURED 2026-09-16 — THE WAYLAND CLIPBOARD'S CLAIM ORDER, one defect fix
+//     in the fork and nothing else. A copy claimed the selection before it
+//     released the one it already held, so a compositor dropped every second
+//     copy in silence and the fork's own release then walked the clipboard back
+//     to the PREVIOUS text; the fix releases first, refuses to release in front
+//     of a claim the compositor will not take (no keyboard focus on the seat),
+//     and answers the caller with the outcome instead of `true`. THREE files of
+//     `vendor/winit` — `.../wayland/clipboard.rs` (+564 / -47, the bulk of it a
+//     compositor model and the eight tests added around it, five of which drive
+//     the real copy through it), `.../wayland/seat/mod.rs` (+25) and
+//     `.../wayland/seat/keyboard/mod.rs` (+11) — so every cell that resolves
+//     winit gains exactly 553 physical lines:
+//
+//       mac-arm  440,945 -> 441,498
+//       linux    2,789,154 -> 2,789,707
+//       win      3,587,514 -> 3,588,067
+//
+//     Measured directly, not inferred: physical `*.rs` lines under
+//     `vendor/winit` go 64,218 -> 64,771 over the same 179 files, and
+//     `git diff --numstat ce5c66bf6..HEAD -- vendor/` is +600 / -47 with every
+//     path under `vendor/winit/`. THE SAME +553 ON ALL THREE, the fingerprint
+//     notes (4), (5), (7), (8) and the two 2026-09-15/16 notes above describe:
+//     one fork's own source, no package, version or edge. `vendor/winit/
+//     Cargo.toml` is byte-identical and the fix took no new dependency, so
+//     `resolved`, `workspace`, `third_party`, `build_scripts`, `proc_macros`
+//     and `duplicate_names` are unchanged in all five cells. The wasm modules
+//     never resolve winit, so [`WASM_CPU`] and [`WASM_GPU`] do not move.
+//     `winit`'s dominator takes the same +553 (12 / 83,950 -> 12 / 84,503),
+//     package count unchanged, and still leads the mac-arm ranking (`rustls` is
+//     second at 5 / 65,413). `tools/forge-budget.tsv` is raised on the same
+//     three rows through `--allow-regress`, with this cause in its fourth
+//     column.
 pub const MAC_ARM: Baseline = Baseline {
     cell: "mac-arm",
     resolved: 122,
     workspace: 75,
     third_party: 47,
-    third_party_loc: 440_327,
+    third_party_loc: 441_498,
     build_scripts: 10,
     proc_macros: 2,
     duplicate_names: 1,
@@ -655,7 +754,7 @@ pub const LINUX: Baseline = Baseline {
     resolved: 272,
     workspace: 77,
     third_party: 195,
-    third_party_loc: 2_788_536,
+    third_party_loc: 2_789_707,
     build_scripts: 32,
     proc_macros: 16,
     duplicate_names: 6,
@@ -666,7 +765,7 @@ pub const WIN: Baseline = Baseline {
     resolved: 162,
     workspace: 71,
     third_party: 91,
-    third_party_loc: 3_586_896,
+    third_party_loc: 3_588_067,
     build_scripts: 19,
     proc_macros: 7,
     duplicate_names: 1,
@@ -901,11 +1000,18 @@ pub struct Dom {
 /// sha2's dominator is NESTED inside the mint's, so these totals must never
 /// be summed blindly.
 pub const MAC_ARM_DOMINATORS: [Dom; 5] = [
+    // RE-PINNED 2026-09-16 by the Wayland clipboard's claim-order fix, +553
+    // (the note above). Before that, 2026-09-15 by the two vendor/winit commits
+    // (c5326f2d8's Wayland clipboard, +568; b41e769b0's keypad fix, +42) and
+    // 2026-09-16 by the fork's Apache §4(b) notices, +8. The package COUNT does
+    // not move in any of them — the fork took no new edge, and its Cargo.toml is
+    // byte-identical — so this is the fork's own source growing and nothing
+    // else. winit still leads the ranking.
     Dom {
         name: "winit",
         version: None,
         pkgs: 12,
-        loc: 83_332,
+        loc: 84_503,
     },
     // RE-PINNED 2026-09-01 by the `once_cell` row, and it is the first time a
     // first-party patch target has moved an anchor in this file. `rustls` is

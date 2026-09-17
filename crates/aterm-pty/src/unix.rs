@@ -3363,10 +3363,24 @@ pub fn close_fd(fd: i32) {
 
 /// Focus-linked shell QoS boost — Unix no-op stub (identical signature, so
 /// the GUI's focus-change call site compiles unchanged). On Unix the kernel
-/// PTY is a zero-process byte queue with no starvable middlemen, and the
-/// scheduler's own interactivity wake-up boosts already protect the shell's
-/// echo; the real implementation (ConPTY conhost + shell root,
-/// `SetPriorityClass` + power-throttling) lives in `src/windows/mod.rs`.
+/// PTY is a zero-process byte queue with no starvable middlemen, and there is
+/// no boost to hand the child anyway: raising ANOTHER process's priority needs
+/// root (an unprivileged `nice` moves a process down, never back up) and macOS
+/// publishes no cross-process QoS API, so the child keeps the band it
+/// inherited — the same `pri 31` a login shell and the TUI inside it run at.
+///
+/// This comment used to assert that "the scheduler's own interactivity wake-up
+/// boosts already protect the shell's echo". Measured on a saturated machine
+/// (2026-09-15) they do not: a child sharing that band with this repo's own
+/// compilers answered keystrokes at `echo_p95_ms=75.69 echo_p99_ms=150.04
+/// echo_max_ms=367.85` while aterm wrote each key at `key_write_p99_ms=6.29`.
+/// What aterm can actually do is DECLINE TO COMPETE — its merge gate, release
+/// cutter and package lane all spawn at utility, below the band being typed
+/// into — and publish the child's `echo_*` round trip on the `metrics` summary
+/// beside its own slices, so a lag report can tell the two apart.
+///
+/// The real implementation (ConPTY conhost + shell root, `SetPriorityClass` +
+/// power-throttling) lives in `src/windows/mod.rs`.
 pub fn set_focus_boost(_master: i32, _on: bool) {}
 
 /// Resize the PTY to `rows`×`cols` (`TIOCSWINSZ`), leaving the PIXEL fields

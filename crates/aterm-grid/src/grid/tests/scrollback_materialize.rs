@@ -971,3 +971,190 @@ fn fill_row_mixed_content_allocation_free_path() {
         "col 6 should be 'B'"
     );
 }
+
+/// A rendition belongs to the CHARACTER, not to the column: a double-width
+/// character is one character in two columns, so its continuation spacer carries
+/// the lead's visual attributes.
+///
+/// Scroll-off conversion DROPS spacers (`scroll_convert::is_spacer`) and both
+/// consumers re-derive them — `materialize_from_line` for a scrolled-back read,
+/// `fill_row_from_line` for the deferred fill. Built there with a bare
+/// `WIDE_CONTINUATION`, a highlighted wide glyph would lose its right half the
+/// moment its row left the screen even after the live write path was fixed:
+/// the renderer swaps fg/bg for the lead only, and `lead.resolved_fg ==
+/// spacer.resolved_bg` for every colour pair, so the spilled half composites
+/// invisibly (measured 153/153 flat pixels per spacer, zero glyph ink).
+#[test]
+fn line_roundtrip_carries_rendition_into_the_wide_spacer() {
+    use crate::grid::scroll_materialize::materialize_from_line;
+
+    let fg = PackedColor::indexed(1);
+    let bg = PackedColor::indexed(4);
+    // SGR 7 plus the rules that must not gap at the column seam.
+    let rendition = CellFlags::INVERSE
+        .union(CellFlags::UNDERLINE)
+        .union(CellFlags::STRIKETHROUGH);
+
+    // Built cell-by-cell, NOT through `Row::write_wide_char`: the live write
+    // path has a spacer of its own, and this test must fail for the
+    // materialize/fill sites rather than for that one.
+    let mut grid = Grid::new(2, 8);
+    grid.row_mut(0).unwrap().set(
+        0,
+        Cell::with_style('\u{6F22}', fg, bg, rendition.union(CellFlags::WIDE)),
+    );
+    grid.row_mut(0).unwrap().set(
+        1,
+        Cell::with_style(' ', fg, bg, CellFlags::WIDE_CONTINUATION),
+    );
+
+    let line = Grid::row_to_line_static(grid.row(0).unwrap());
+
+    let mat = materialize_from_line(&line, 8);
+    assert!(mat.cells[0].is_wide() && mat.cells[0].flags().contains(rendition));
+    assert!(
+        mat.cells[1].is_wide_continuation(),
+        "materialize keeps the spacer's role bit"
+    );
+    assert!(
+        mat.cells[1].flags().contains(rendition),
+        "materialize must re-derive the spacer WITH the lead's rendition"
+    );
+    assert!(
+        !mat.cells[1].flags().contains(CellFlags::WIDE),
+        "the spacer must not become a second lead"
+    );
+
+    let mut restored = Grid::new(2, 8);
+    restored.fill_row_from_line(0, &line, 8);
+    assert!(restored.is_wide_continuation_at(0, 1));
+    assert!(
+        restored.cell(0, 1).unwrap().flags().contains(rendition),
+        "the deferred fill path must re-derive the spacer WITH the lead's rendition"
+    );
+    assert!(
+        !restored
+            .cell(0, 1)
+            .unwrap()
+            .flags()
+            .contains(CellFlags::WIDE)
+    );
+}
+
+/// The companion law for the values the flags SELECT: the spacer must also carry
+/// the lead's SGR 58 underline colour and truecolor fg/bg, which do not fit in
+/// the flag word and live in the cell's `CellExtra`.
+///
+/// The `Line` deliberately carries the underline span over the LEAD'S COLUMN
+/// ONLY — which is exactly the shape `extract_row_extras` produces, because it
+/// skips spacer columns, and exactly the shape already sitting in every
+/// scrollback file an older build wrote. Both re-derivation paths must colour
+/// both halves from it anyway; that is what makes this a heal rather than a
+/// format change. Without the mirror the spacer takes `wide_continuation_of`'s
+/// UNDERLINE bit and then reports no colour, which `render_cells` publishes as a
+/// default-foreground rule: a two-tone underline under one character.
+#[test]
+fn line_roundtrip_carries_rendition_extras_into_the_wide_spacer() {
+    use crate::grid::scroll_materialize::materialize_from_line;
+    use aterm_scrollback::UnderlineColorSpan;
+
+    // 0x01 = explicit RGB, 0x00FF00 green.
+    const GREEN: u32 = 0x01_00_FF_00;
+
+    let fg = PackedColor::indexed(1);
+    let bg = PackedColor::indexed(4);
+    let rendition = CellFlags::UNDERLINE.union(CellFlags::INVERSE);
+
+    let mut grid = Grid::new(2, 8);
+    grid.row_mut(0).unwrap().set(
+        0,
+        Cell::with_style('\u{4E2D}', fg, bg, rendition.union(CellFlags::WIDE)),
+    );
+    grid.row_mut(0).unwrap().set(
+        1,
+        Cell::with_style(' ', fg, bg, CellFlags::WIDE_CONTINUATION),
+    );
+
+    let mut line = Grid::row_to_line_static(grid.row(0).unwrap());
+    // [0, 1): the lead alone, as the extractor writes it.
+    line.set_underline_colors(vec![UnderlineColorSpan::new(0, 1, GREEN)]);
+
+    let mat = materialize_from_line(&line, 8);
+    assert!(
+        mat.cells[1].is_wide_continuation() && !mat.cells[1].is_wide(),
+        "cell 1 must materialize as the spacer"
+    );
+    assert_eq!(
+        mat.get_extra(0).and_then(CellExtra::underline_color),
+        Some([0, 255, 0]),
+        "the lead keeps the colour the span named"
+    );
+    assert_eq!(
+        mat.get_extra(1).and_then(CellExtra::underline_color),
+        Some([0, 255, 0]),
+        "materialize must give the spacer the LEAD'S underline colour, not just its UNDERLINE bit"
+    );
+
+    let mut restored = Grid::new(2, 8);
+    restored.fill_row_from_line(0, &line, 8);
+    assert!(restored.is_wide_continuation_at(0, 1));
+    assert_eq!(
+        restored
+            .cell_extra(0, 1)
+            .and_then(CellExtra::underline_color),
+        Some([0, 255, 0]),
+        "the deferred fill path must agree with the materializer"
+    );
+    assert!(
+        restored.cell(0, 1).is_some_and(Cell::has_extras),
+        "the live render path gates its extras probe on HAS_EXTRAS, so the mirror must set it"
+    );
+}
+
+/// An indexed SGR 58 colour must reach the spacer in its PACKED form, so it
+/// still re-resolves against the live palette. `set_underline_color_u32` clears
+/// `HAS_UNDERLINE_COLOR` when it stores an index, so a mirror that copied
+/// `underline_color()` — the RGB-only accessor — would silently carry nothing.
+#[test]
+fn wide_spacer_mirror_preserves_an_indexed_underline_colour() {
+    use crate::grid::scroll_materialize::materialize_from_line;
+    use aterm_scrollback::UnderlineColorSpan;
+
+    // 0x02 = indexed, palette entry 5.
+    const INDEXED_5: u32 = 0x02_00_00_05;
+
+    let mut grid = Grid::new(2, 8);
+    grid.row_mut(0).unwrap().set(
+        0,
+        Cell::with_style(
+            '\u{4E2D}',
+            PackedColor::DEFAULT_FG,
+            PackedColor::DEFAULT_BG,
+            CellFlags::UNDERLINE.union(CellFlags::WIDE),
+        ),
+    );
+    grid.row_mut(0).unwrap().set(
+        1,
+        Cell::with_style(
+            ' ',
+            PackedColor::DEFAULT_FG,
+            PackedColor::DEFAULT_BG,
+            CellFlags::WIDE_CONTINUATION,
+        ),
+    );
+
+    let mut line = Grid::row_to_line_static(grid.row(0).unwrap());
+    line.set_underline_colors(vec![UnderlineColorSpan::new(0, 1, INDEXED_5)]);
+
+    let mat = materialize_from_line(&line, 8);
+    assert_eq!(
+        mat.get_extra(1).and_then(CellExtra::underline_color_index),
+        Some(5),
+        "the spacer must hold the palette INDEX, not a resolved triple"
+    );
+    assert_eq!(
+        mat.get_extra(1).and_then(CellExtra::underline_color),
+        None,
+        "an indexed colour resolves at draw time, so the RGB slot stays empty"
+    );
+}

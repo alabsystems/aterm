@@ -57,12 +57,16 @@ impl Grid {
             .saturating_sub(self.scrollback_lines() as u64)
     }
 
-    /// Monotonic epoch of history-row RENUMBERINGS that are invisible to the
+    /// Monotonic epoch of row RENUMBERINGS that are invisible to the
     /// `(content_gen, absolute_row_revision)` pair — see
-    /// `GridStorage::history_renumber_epoch`. An advance means the absolute
-    /// keys of retained history rows may have shifted wholesale (Kitty CSI +T
-    /// unscroll removed the newest scrollback lines): absolute-row-keyed
-    /// incremental caches must REBUILD rather than refresh.
+    /// `GridStorage::history_renumber_epoch`. An advance means absolute row
+    /// keys may have shifted wholesale: a WIDTH reflow rewrapped the same
+    /// lines into a different number of rows (live screen included, whether or
+    /// not any history row was spliced), or a Kitty CSI +T unscroll removed the
+    /// newest scrollback lines. Absolute-row-keyed incremental caches must
+    /// REBUILD rather than refresh, and anything holding a CACHED absolute row
+    /// — a search hit, a parked find anchor — must refuse to re-anchor it
+    /// until it is recomputed.
     #[must_use]
     #[inline]
     pub fn history_renumber_epoch(&self) -> u64 {

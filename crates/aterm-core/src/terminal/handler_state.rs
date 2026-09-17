@@ -620,7 +620,8 @@ impl CursorStateHandler<'_> {
     /// See: <https://terminal-wg.pages.freedesktop.org/bidi/recommendation/escape-sequences.html>
     ///
     /// Parameters:
-    /// - 0: Reset to default character direction (Auto)
+    /// - 0: the terminal's default character direction (`Auto`: LTR; first-strong
+    ///   detection applies only while DECSET 2501 is set)
     /// - 1: Set LTR (left-to-right) character direction
     /// - 2: Set RTL (right-to-left) character direction
     pub(super) fn handle_scp(&mut self, params: &[u16]) {
@@ -641,5 +642,235 @@ impl CursorStateHandler<'_> {
             // presented grid directly.
             self.grid.damage_mut().mark_full();
         }
+    }
+}
+
+/// Terminal-level goldens for the deferred wrap at an erase.
+///
+/// Each feeds real bytes, so the grid rule (`aterm-grid` `grid/erase.rs`) is
+/// exercised through the CSI / VT52 / DECSET dispatch that reaches it. The
+/// expected screens are xterm's: `util.c` `ClearRight`, `ClearInLine2` and
+/// `ClearScreen` all call `ResetWrap`, so the glyph printed after the erase
+/// overwrites the parked last column instead of wrapping. Several are Ghostty's
+/// own goldens (`Terminal.zig` "eraseLine resets pending wrap", "eraseLine left
+/// resets wrap").
+#[cfg(test)]
+mod erase_pending_wrap_tests {
+    use crate::terminal::Terminal;
+
+    /// The glyphs of visible row `row` of the ACTIVE screen, one char per column.
+    fn row_glyphs(term: &Terminal, row: u16) -> String {
+        let grid = term.grid();
+        (0..grid.cols())
+            .map(|col| grid.cell(row, col).map_or(' ', |c| c.char()))
+            .collect()
+    }
+
+    fn cursor(term: &Terminal) -> (u16, u16) {
+        let c = term.cursor();
+        (c.row, c.col)
+    }
+
+    fn glyph(term: &Terminal, row: u16, col: u16) -> char {
+        term.grid().cell(row, col).map_or(' ', |c| c.char())
+    }
+
+    fn row_is_blank(term: &Terminal, row: u16) -> bool {
+        row_glyphs(term, row).trim().is_empty()
+    }
+
+    #[test]
+    fn el0_at_pending_wrap_ghostty_golden() {
+        let mut term = Terminal::new(1, 5);
+        term.process(b"ABCDE\x1b[KB");
+        assert_eq!(row_glyphs(&term, 0), "ABCDB");
+        assert_eq!(cursor(&term), (0, 4));
+        assert!(term.grid().pending_wrap(), "the B re-arms the wrap");
+    }
+
+    #[test]
+    fn el0_at_pending_wrap_with_decawm_off() {
+        let mut term = Terminal::new(1, 5);
+        term.process(b"\x1b[?7lABCDE\x1b[KB");
+        assert_eq!(row_glyphs(&term, 0), "ABCDB");
+        assert_eq!(cursor(&term), (0, 4));
+    }
+
+    #[test]
+    fn vt52_esc_k_at_pending_wrap_clears_parked_glyph() {
+        // VTPrsTbl.c maps VT52 'K' to CASE_EL, so ESC K takes ClearRight too.
+        let mut term = Terminal::new(2, 5);
+        term.process(b"\x1b[?2lABCDE");
+        assert!(
+            term.grid().pending_wrap(),
+            "precondition: VT52 print armed the wrap"
+        );
+        term.process(b"\x1bK");
+        assert_eq!(row_glyphs(&term, 0), "ABCD ");
+        assert!(!term.grid().pending_wrap(), "ESC K resets the wrap");
+    }
+
+    #[test]
+    fn vt52_esc_j_at_pending_wrap_clears_parked_glyph() {
+        // VTPrsTbl.c maps VT52 'J' to CASE_ED.
+        let mut term = Terminal::new(2, 5);
+        term.process(b"\x1b[?2l\x1bY! xyz\x1bH");
+        term.process(b"ABCDE");
+        assert!(
+            term.grid().pending_wrap(),
+            "precondition: VT52 print armed the wrap"
+        );
+        term.process(b"\x1bJ");
+        assert_eq!(row_glyphs(&term, 0), "ABCD ");
+        assert!(row_is_blank(&term, 1), "ESC J clears the rows below");
+        assert!(!term.grid().pending_wrap(), "ESC J resets the wrap");
+    }
+
+    #[test]
+    fn ed0_at_pending_wrap_then_print_overwrites_last_column() {
+        let mut term = Terminal::new(24, 80);
+        term.process(b"\x1b[1;80H!\x1b[J?");
+        assert_eq!(glyph(&term, 0, 79), '?');
+        assert!(row_is_blank(&term, 1), "nothing wrapped to row 1");
+        assert_eq!(cursor(&term), (0, 79));
+    }
+
+    #[test]
+    fn ed0_without_a_print_clears_the_parked_glyph() {
+        // The differential seed's shape: the parked glyph is erased (alacritty
+        // agrees on the cells; only the wrap differs).
+        let mut term = Terminal::new(24, 80);
+        term.process(b"\x1b[1;80H!\x1b[0J");
+        assert_eq!(glyph(&term, 0, 79), ' ');
+        assert_eq!(cursor(&term), (0, 79));
+        assert!(!term.grid().pending_wrap());
+    }
+
+    #[test]
+    fn ed1_at_bottom_right_pending_wrap_reduces_to_full_clear() {
+        let mut term = Terminal::new(24, 80);
+        term.process(b"top\x1b[24;80H!\x1b[1J?");
+        for row in 0..23 {
+            assert!(row_is_blank(&term, row), "row {row} cleared");
+        }
+        assert_eq!(row_glyphs(&term, 23).trim(), "?");
+        assert_eq!(glyph(&term, 23, 79), '?');
+        assert_eq!(cursor(&term), (23, 79));
+    }
+
+    #[test]
+    fn ed1_at_pending_wrap_then_print_overwrites_last_column() {
+        let mut term = Terminal::new(24, 80);
+        term.process(b"\x1b[1;80H!\x1b[1J?");
+        assert_eq!(glyph(&term, 0, 79), '?');
+        assert!(row_is_blank(&term, 1), "nothing wrapped to row 1");
+        assert_eq!(cursor(&term), (0, 79));
+    }
+
+    #[test]
+    fn ed2_at_pending_wrap_then_print_overwrites_last_column() {
+        let mut term = Terminal::new(24, 80);
+        term.process(b"\x1b[1;80H!\x1b[2J?");
+        assert_eq!(glyph(&term, 0, 79), '?');
+        assert!(row_is_blank(&term, 1), "nothing wrapped to row 1");
+        assert_eq!(cursor(&term), (0, 79));
+    }
+
+    #[test]
+    fn el1_at_pending_wrap_ghostty_golden() {
+        let mut term = Terminal::new(2, 5);
+        term.process(b"ABCDE\x1b[1KB");
+        assert_eq!(row_glyphs(&term, 0), "    B");
+        assert_eq!(cursor(&term), (0, 4));
+        assert!(row_is_blank(&term, 1));
+    }
+
+    #[test]
+    fn el1_at_pending_wrap_four_columns_is_xterms_result_not_xterm_js() {
+        // Commit 4f27c52af's repro claimed `Z` lands on row 1; that was xterm.js.
+        // Real xterm resets the wrap in ClearInLine2, so `Z` overwrites col 3.
+        let mut term = Terminal::new(2, 4);
+        term.process(b"ABCD\x1b[1KZ");
+        assert_eq!(row_glyphs(&term, 0), "   Z");
+        assert!(row_is_blank(&term, 1));
+    }
+
+    #[test]
+    fn el2_at_pending_wrap_then_print_overwrites_last_column() {
+        let mut term = Terminal::new(2, 5);
+        term.process(b"ABCDE\x1b[2KB");
+        assert_eq!(row_glyphs(&term, 0), "    B");
+        assert_eq!(cursor(&term), (0, 4));
+        assert!(row_is_blank(&term, 1));
+    }
+
+    #[test]
+    fn decsel0_protected_parked_glyph_survives_but_wrap_resets() {
+        let mut term = Terminal::new(24, 80);
+        term.process(b"\x1b[1\"q\x1b[1;80H!\x1b[0\"q\x1b[?K");
+        assert_eq!(
+            glyph(&term, 0, 79),
+            '!',
+            "DECSCA-protected glyph survives DECSEL"
+        );
+        assert!(
+            !term.grid().pending_wrap(),
+            "ClearRight's ResetWrap still runs"
+        );
+        term.process(b"?");
+        assert_eq!(
+            glyph(&term, 0, 79),
+            '?',
+            "the print overwrites the parked column"
+        );
+        assert!(row_is_blank(&term, 1), "nothing wrapped to row 1");
+    }
+
+    #[test]
+    fn alt_1047_exit_clears_the_wrap_it_hands_back() {
+        // xterm srm_OPT_ALTBUF reset: `ClearScreen` (ResetWrap) then
+        // `FromAlternate`, which never writes do_wrap.
+        let mut term = Terminal::new(24, 80);
+        term.process(b"\x1b[?1047h\x1b[1;80H!\x1b[?1047l?");
+        assert!(!term.is_alternate_screen(), "back on the main screen");
+        assert_eq!(glyph(&term, 0, 79), '?');
+        assert!(row_is_blank(&term, 1), "nothing wrapped to row 1");
+    }
+
+    #[test]
+    fn alt_1049_enter_resets_wrap_and_exit_restores_it() {
+        let mut term = Terminal::new(24, 80);
+        term.process(b"\x1b[1;80H!\x1b[?1049h?");
+        assert!(term.is_alternate_screen());
+        // CursorSave; ToAlternate; ClearScreen — the clear runs last.
+        assert_eq!(
+            glyph(&term, 0, 79),
+            '?',
+            "alt screen: the print overwrites col 79"
+        );
+        assert_eq!(cursor(&term), (0, 79));
+        assert!(row_is_blank(&term, 1), "alt screen: nothing wrapped");
+        // CursorRestore brings back the wrap CursorSave recorded (cursor.c).
+        term.process(b"\x1b[?1049lZ");
+        assert!(!term.is_alternate_screen());
+        assert_eq!(
+            glyph(&term, 0, 79),
+            '!',
+            "main screen keeps its parked glyph"
+        );
+        assert_eq!(
+            glyph(&term, 1, 0),
+            'Z',
+            "the restored wrap takes the next glyph"
+        );
+    }
+
+    #[test]
+    fn alt_47_enter_carries_the_wrap_over() {
+        // Mode 47 is `ToAlternate(xw, False)` with no ClearScreen: the wrap survives.
+        let mut term = Terminal::new(24, 80);
+        term.process(b"\x1b[1;80H!\x1b[?47hZ");
+        assert!(term.is_alternate_screen());
+        assert_eq!(glyph(&term, 1, 0), 'Z', "the carried wrap moves Z to row 1");
     }
 }

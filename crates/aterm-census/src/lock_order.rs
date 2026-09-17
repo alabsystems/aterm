@@ -834,6 +834,19 @@ fn mask_cfg_test_items(text: &str) -> String {
 /// Closing early is the subtractive direction, so it costs at most a false
 /// positive.
 pub(crate) fn mask_gated_items(text: &str, gates: &[&str]) -> String {
+    mask_items_where(text, &|attr| gates.contains(&attr))
+}
+
+/// [`mask_gated_items`] with the gate test as a PREDICATE over the trimmed
+/// attribute line rather than a fixed list of spellings. The list-based
+/// wrapper above is byte-identical to what it always did (`gates.contains`),
+/// so every census that reads it keeps its exact-match, fail-closed posture
+/// and its measured counts; the predicate form exists for the ONE caller that
+/// must recognise a family of spellings rather than a roster of them — the
+/// main-loop census's `cfg`-predicate matcher
+/// ([`crate::cfg_attr_never_ships`]), which has to see
+/// `#[cfg(all(test, any(windows, target_os = "linux")))]` as test-only.
+pub(crate) fn mask_items_where(text: &str, is_gate: &dyn Fn(&str) -> bool) -> String {
     let lines: Vec<&str> = text.lines().collect();
     // The code of a line: comments stripped, then string/char literals blanked
     // to spaces (length-preserving, so column indices still line up). EVERY
@@ -845,7 +858,7 @@ pub(crate) fn mask_gated_items(text: &str, gates: &[&str]) -> String {
     let mut i = 0;
     while i < lines.len() {
         let t = lines[i].trim_start();
-        if !gates.contains(&t) {
+        if !is_gate(t) {
             i += 1;
             continue;
         }
@@ -5234,9 +5247,47 @@ mod tests {
         // with any aterm identity — they are unreachable from the artifact this
         // census judges. Bumping the pin without saying that would make the next
         // reader think a count was rubber-stamped.
+        //
+        // RE-AUDITED 2026-09-15, linux 110 -> 119. ONE commit moved it:
+        // c5326f2d8 ("a native Wayland clipboard — copy, paste, copy-on-select
+        // and OSC 52 work with no XWayland"), the only commit to touch ANY
+        // registered linux-slice path since the 110 pin (`git log --since
+        // 2026-08-31 -- src/platform_impl/linux src/platform/{x11,wayland,
+        // startup_notify}.rs` returns it and 42b2affd5, whose linux hunks are
+        // six lines carrying no acquisition token). It adds
+        // `platform_impl/linux/wayland/clipboard.rs`, 452 lines holding TEN
+        // `.lock()` tokens — nine counted, the tenth at line 449 inside the
+        // file's own `#[cfg(test)] mod tests`, which `mask_cfg_test_items`
+        // blanks. 110 + 9 = 119, and no other slice moved (windows/web/android/
+        // ios/orbital are byte-identical pins), which is itself part of the
+        // audit: a change touching several slices would mean something other
+        // than this commit.
+        //
+        // THE RE-AUDIT THE PIN ASKS FOR — no new lock EDGE, on either side of
+        // the vendor boundary:
+        //   * The new code owns exactly two mutexes, `WaylandClipboard.sender`
+        //     (`Arc<Mutex<Sender<ClipboardRequest>>>`) and `.shared`
+        //     (`Arc<Mutex<Shared>>`), and NO site holds one while acquiring the
+        //     other, so the pair is never ordered and no ABBA is expressible.
+        //     `copy` closes its `if let Ok(mut shared) = self.shared.lock()`
+        //     block BEFORE `send` takes `sender`; `paste` reads the own slot
+        //     through `paste_owned` (guard dropped with the statement) and only
+        //     then sends; `send` holds `sender` across an UNBOUNDED-channel
+        //     `Sender::send`, which cannot block. Every loop-thread handler
+        //     (`clipboard_disown`, `clipboard_paste`, `clipboard_send_request`,
+        //     `PrimarySelectionSourceHandler::send_request`) takes `shared`
+        //     alone.
+        //   * The one bounded WAIT, `receiver.recv_timeout(PASTE_TIMEOUT)` in
+        //     `paste`, is performed holding NOTHING — the hazard shape this
+        //     census exists to name, and it is not present.
+        //   * The aterm side of the same commit (crates/aterm-gui's
+        //     clipboard.rs, clipboard_wayland.rs, lib.rs, +67 lines) adds ZERO
+        //     acquisition tokens, so the graphed half of the census sees no new
+        //     site at all — OB-7 stays green on its own evidence, not on this
+        //     note's say-so.
         assert!(
             out.log
-                .contains("linux 110, windows 47, web 4, android 0, ios 1, orbital 7"),
+                .contains("linux 119, windows 47, web 4, android 0, ios 1, orbital 7"),
             "the per-platform slice counts must be reported (never silent); a \
              changed count means the vendored winit tree changed — re-audit:\n{}",
             out.log

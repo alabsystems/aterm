@@ -168,18 +168,40 @@ pub enum TxnOutcome {
     /// requirement gate, [`crate::requires::unmet_requirement`]) — [`transact`] never
     /// returns it.
     Blocked { dep: String, dep_state: String },
+    /// The group is held on its current builds because `member`'s pinned `build` publishes
+    /// NO artifact for `triple` — proven from its release-verified manifest, bound to that
+    /// pin: the bootstrap's clean-skip doctrine ([`crate::flow::group_missing_triple`])
+    /// lifted to an INSTALLED tuple, since a tuple that cannot fully exist on this host is
+    /// a correct state, not a failure. Nothing was resolved, downloaded, staged or flipped,
+    /// and the next pass retries. Never over a Tombstone, and never over a force-upgrade
+    /// off a revoked current build — that aborts instead, with the revoked build's
+    /// commands disabled. Constructed by [`crate::flow`]'s group transaction directly —
+    /// [`transact`] never returns it.
+    Unpublished {
+        member: String,
+        build: u64,
+        triple: String,
+    },
     /// A member failed; the whole group was aborted. `during_flip` distinguishes a
     /// stage-phase abort (nothing was flipped) from a flip-phase abort (already-flipped
-    /// members were rolled back).
-    Aborted { failed: String, during_flip: bool },
+    /// members were rolled back). `why` is the failing step's own sentence — until
+    /// 2026-09-15 every stage failure collapsed to the two words `aborted: stage`, and
+    /// nobody could tell from the record whether the rustc group on the owner's machine
+    /// had aborted on the provenance refusal, a full disk or a bad download.
+    Aborted {
+        failed: String,
+        during_flip: bool,
+        why: String,
+    },
 }
 
 /// Run one coherence group as an all-or-nothing transaction over injected actions (see the
-/// module docs). `stage`/`flip` return `true` on success; `rollback` undoes a member that
-/// was flipped. Pure control flow — no I/O of its own — so it is exhaustively unit-tested.
+/// module docs). `stage` answers `Err(why)` on failure — the sentence the abort carries —
+/// and `flip` returns `true` on success; `rollback` undoes a member that was flipped. Pure
+/// control flow — no I/O of its own — so it is exhaustively unit-tested.
 pub fn transact(
     decisions: &[(String, ApplyDecision)],
-    stage: &mut dyn FnMut(&str) -> bool,
+    stage: &mut dyn FnMut(&str) -> Result<(), String>,
     flip: &mut dyn FnMut(&str) -> bool,
     rollback: &mut dyn FnMut(&str),
 ) -> TxnOutcome {
@@ -206,10 +228,11 @@ pub fn transact(
 
     // 3. Stage every member FIRST. A single failure aborts the group with nothing flipped.
     for name in &installs {
-        if !stage(name) {
+        if let Err(why) = stage(name) {
             return TxnOutcome::Aborted {
                 failed: (*name).clone(),
                 during_flip: false,
+                why,
             };
         }
     }
@@ -226,6 +249,9 @@ pub fn transact(
             return TxnOutcome::Aborted {
                 failed: (*name).clone(),
                 during_flip: true,
+                why: String::from(
+                    "the flip failed and the members already flipped were rolled back",
+                ),
             };
         }
     }
@@ -279,6 +305,7 @@ requires = ["clt"]
             name: "stable".into(),
             channel_build: 1,
             min_build: 0,
+            min_build_by_program: Default::default(),
             yanked: vec![],
             pin: pins.iter().map(|(k, v)| ((*k).to_string(), *v)).collect(),
             pin_by_target: Default::default(),
@@ -379,7 +406,7 @@ requires = ["clt"]
             &decs,
             &mut |n| {
                 staged.push(n.to_string());
-                true
+                Ok(())
             },
             &mut |n| {
                 flipped.push(n.to_string());
@@ -406,7 +433,7 @@ requires = ["clt"]
             &decs,
             &mut |n| {
                 order.borrow_mut().push(format!("stage:{n}"));
-                true
+                Ok(())
             },
             &mut |n| {
                 order.borrow_mut().push(format!("flip:{n}"));
@@ -431,7 +458,14 @@ requires = ["clt"]
         let mut flipped = Vec::new();
         let out = transact(
             &decs,
-            &mut |n| n != "trust", // trust fails to stage
+            &mut |n| {
+                // trust fails to stage
+                if n == "trust" {
+                    Err(String::from("stage refused"))
+                } else {
+                    Ok(())
+                }
+            },
             &mut |n| {
                 flipped.push(n.to_string());
                 true
@@ -442,7 +476,8 @@ requires = ["clt"]
             out,
             TxnOutcome::Aborted {
                 failed: "trust".into(),
-                during_flip: false
+                during_flip: false,
+                why: "stage refused".into(),
             }
         );
         assert!(flipped.is_empty(), "a stage failure must flip nothing");
@@ -457,7 +492,7 @@ requires = ["clt"]
         let mut rolled = Vec::new();
         let out = transact(
             &decs,
-            &mut |_| true,         // both stage ok
+            &mut |_| Ok(()),       // both stage ok
             &mut |n| n != "trust", // ay flips ok, trust's flip fails
             &mut |n| rolled.push(n.to_string()),
         );
@@ -465,7 +500,8 @@ requires = ["clt"]
             out,
             TxnOutcome::Aborted {
                 failed: "trust".into(),
-                during_flip: true
+                during_flip: true,
+                why: "the flip failed and the members already flipped were rolled back".into(),
             }
         );
         assert_eq!(
@@ -487,7 +523,7 @@ requires = ["clt"]
             &decs,
             &mut |_| {
                 touched.set(true);
-                true
+                Ok(())
             },
             &mut |_| {
                 touched.set(true);

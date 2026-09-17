@@ -205,6 +205,7 @@ pub(crate) const fn menu_command(action: menu::MenuAction) -> CommandSpec {
         // focused leaf and no terminal; `LocalUi` because the only durable
         // write is the machine-owned toy ledger, not config.
         M::FavouriteKitty => spec("effects.kitty.favourite", S::Process, A::LocalUi, C::Any),
+        M::NextKitty => spec("effects.kitty.next", S::Process, A::LocalUi, C::Any),
         M::ToggleSeriousMode => spec(
             "effects.serious.toggle",
             S::Process,

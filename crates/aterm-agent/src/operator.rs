@@ -4432,9 +4432,6 @@ pub struct DurableQueue {
     shared: Arc<SharedQueue>,
 }
 
-/// Descriptive alias used by hosts that expose the queue as their operator.
-pub type OperatorQueue = DurableQueue;
-
 impl DurableQueue {
     /// Open a queue and fence its writes with `run_epoch`.
     pub fn open(
@@ -4460,15 +4457,6 @@ impl DurableQueue {
         config: QueueConfig,
     ) -> Result<(Self, RecoveryReport), OperatorError> {
         Self::open_internal(directory.as_ref(), None, config)
-    }
-
-    /// Open the conventional private state directory for `fleet_id`.
-    pub fn open_fleet(
-        fleet_id: &str,
-        run_epoch: u64,
-        config: QueueConfig,
-    ) -> Result<Self, OperatorError> {
-        Self::open(fleet_state_dir(fleet_id)?, run_epoch, config)
     }
 
     fn open_internal(

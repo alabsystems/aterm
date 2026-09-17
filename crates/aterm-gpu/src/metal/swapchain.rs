@@ -167,7 +167,9 @@
 use std::ffi::c_void;
 use std::sync::Arc;
 
-use super::ffi::{AutoreleasePool, ClassPtr, Device, Id, Obj, PixelFormat, Sel, class, msg, sel};
+use super::ffi::{
+    AutoreleasePool, ClassPtr, Device, Id, Obj, ObjcBool, PixelFormat, Sel, class, msg, sel,
+};
 use super::{encoder, loss};
 
 // The QuartzCore linkage lives HERE, beside the only code that resolves
@@ -462,9 +464,9 @@ impl Swapchain {
                 // caller on the CPU floor.
                 let txn = class(c"CATransaction");
                 let cls_void: unsafe extern "C" fn(ClassPtr, Sel) = msg();
-                let cls_bool: unsafe extern "C" fn(ClassPtr, Sel, bool) = msg();
+                let cls_bool: unsafe extern "C" fn(ClassPtr, Sel, ObjcBool) = msg();
                 cls_void(txn, sel(c"begin"));
-                cls_bool(txn, sel(c"setDisableActions:"), true);
+                cls_bool(txn, sel(c"setDisableActions:"), true.into());
                 let set_scale: unsafe extern "C" fn(Id, Sel, f64) = msg();
                 set_scale(self.layer.id(), sel(c"setContentsScale:"), scale);
                 // …and give the layer the bounds its contents actually
@@ -545,14 +547,14 @@ impl Swapchain {
         let _pool = AutoreleasePool::new();
         // SAFETY: every send below is a documented property setter on the live
         // layer, with the prototype written out per selector: object, usize
-        // (NSUInteger), bool (BOOL), CGSize by value (HFA in v0/v1), and
-        // CGColorSpaceRef. The EDR colorspace is created at +1 and released
-        // after `setColorspace:` — the property retains it
-        // (CAMetalLayer.h:122).
+        // (NSUInteger), `ObjcBool` (BOOL — `signed char` on x86_64, see its
+        // docs), CGSize by value (HFA in v0/v1), and CGColorSpaceRef. The EDR
+        // colorspace is created at +1 and released after `setColorspace:` —
+        // the property retains it (CAMetalLayer.h:122).
         unsafe {
             let set_obj: unsafe extern "C" fn(Id, Sel, Id) = msg();
             let set_usize: unsafe extern "C" fn(Id, Sel, usize) = msg();
-            let set_bool: unsafe extern "C" fn(Id, Sel, bool) = msg();
+            let set_bool: unsafe extern "C" fn(Id, Sel, ObjcBool) = msg();
             let set_size: unsafe extern "C" fn(Id, Sel, CgSize) = msg();
 
             set_obj(layer.id(), sel(c"setDevice:"), device.id());
@@ -573,23 +575,27 @@ impl Swapchain {
             set_bool(
                 layer.id(),
                 sel(c"setFramebufferOnly:"),
-                config.framebuffer_only,
+                config.framebuffer_only.into(),
             );
             set_bool(
                 layer.id(),
                 sel(c"setDisplaySyncEnabled:"),
-                config.display_sync,
+                config.display_sync.into(),
             );
             set_usize(
                 layer.id(),
                 sel(c"setMaximumDrawableCount:"),
                 config.maximum_drawables,
             );
-            set_bool(layer.id(), sel(c"setOpaque:"), config.opaque);
+            set_bool(layer.id(), sel(c"setOpaque:"), config.opaque.into());
             // Explicit although it is the OS default: this is the bounded-wait
             // contract, and the module header records it as a deliberate
             // divergence from wgpu-hal's block-forever NO (surface.rs:102-104).
-            set_bool(layer.id(), sel(c"setAllowsNextDrawableTimeout:"), true);
+            set_bool(
+                layer.id(),
+                sel(c"setAllowsNextDrawableTimeout:"),
+                true.into(),
+            );
 
             // The EDR arm, derived from the format exactly as wgpu-hal derives
             // it (surface.rs:93-96) — plus the colorspace wgpu never names.
@@ -597,7 +603,7 @@ impl Swapchain {
             set_bool(
                 layer.id(),
                 sel(c"setWantsExtendedDynamicRangeContent:"),
-                wants_edr,
+                wants_edr.into(),
             );
             // BOTH arms now name their colorspace explicitly. The EDR set was
             // always deliberate; the SDR set became LOAD-BEARING with the
@@ -777,16 +783,16 @@ impl Swapchain {
     pub(crate) fn framebuffer_only(&self) -> bool {
         // SAFETY: BOOL getter on the live layer.
         unsafe {
-            let f: unsafe extern "C" fn(Id, Sel) -> bool = msg();
-            f(self.layer.id(), sel(c"framebufferOnly"))
+            let f: unsafe extern "C" fn(Id, Sel) -> ObjcBool = msg();
+            f(self.layer.id(), sel(c"framebufferOnly")).get()
         }
     }
 
     pub(crate) fn display_sync_enabled(&self) -> bool {
         // SAFETY: BOOL getter on the live layer.
         unsafe {
-            let f: unsafe extern "C" fn(Id, Sel) -> bool = msg();
-            f(self.layer.id(), sel(c"displaySyncEnabled"))
+            let f: unsafe extern "C" fn(Id, Sel) -> ObjcBool = msg();
+            f(self.layer.id(), sel(c"displaySyncEnabled")).get()
         }
     }
 
@@ -801,24 +807,24 @@ impl Swapchain {
     pub(crate) fn wants_extended_dynamic_range(&self) -> bool {
         // SAFETY: BOOL getter on the live layer.
         unsafe {
-            let f: unsafe extern "C" fn(Id, Sel) -> bool = msg();
-            f(self.layer.id(), sel(c"wantsExtendedDynamicRangeContent"))
+            let f: unsafe extern "C" fn(Id, Sel) -> ObjcBool = msg();
+            f(self.layer.id(), sel(c"wantsExtendedDynamicRangeContent")).get()
         }
     }
 
     pub(crate) fn allows_next_drawable_timeout(&self) -> bool {
         // SAFETY: BOOL getter on the live layer.
         unsafe {
-            let f: unsafe extern "C" fn(Id, Sel) -> bool = msg();
-            f(self.layer.id(), sel(c"allowsNextDrawableTimeout"))
+            let f: unsafe extern "C" fn(Id, Sel) -> ObjcBool = msg();
+            f(self.layer.id(), sel(c"allowsNextDrawableTimeout")).get()
         }
     }
 
     pub(crate) fn is_opaque(&self) -> bool {
         // SAFETY: BOOL getter on the live layer.
         unsafe {
-            let f: unsafe extern "C" fn(Id, Sel) -> bool = msg();
-            f(self.layer.id(), sel(c"isOpaque"))
+            let f: unsafe extern "C" fn(Id, Sel) -> ObjcBool = msg();
+            f(self.layer.id(), sel(c"isOpaque")).get()
         }
     }
 
@@ -1117,6 +1123,12 @@ impl Frame<'_> {
             let raw = get(session.one_shot_queue().id(), sel(c"commandBuffer"));
             let cb = Obj::retain(raw)
                 .ok_or_else(|| "commandBuffer returned nil for the present".to_owned())?;
+            // PRESENT → GLASS (`crate::present_glass`): a presented handler
+            // must be added before the drawable is presented, so it goes on
+            // here, ahead of `presentDrawable:`. Only when a sink listens.
+            if crate::present_glass::sink_installed() {
+                register_presented_handler(self.drawable.id());
+            }
             let present: unsafe extern "C" fn(Id, Sel, Id) = msg();
             present(cb.id(), sel(c"presentDrawable:"), self.drawable.id());
             let commit: unsafe extern "C" fn(Id, Sel) = msg();
@@ -1127,6 +1139,45 @@ impl Frame<'_> {
                 settled: std::cell::Cell::new(None),
             })
         }
+    }
+}
+
+/// Hang `addPresentedHandler:` on `drawable`, reporting `presentDrawable:`
+/// registration → `-[MTLDrawable presentedTime]` through
+/// [`crate::present_glass::deliver`]. The registration instant is read here on
+/// `CACurrentMediaTime`, the clock `presentedTime` is stated in.
+///
+/// # Safety
+///
+/// `drawable` must be a live `id<MTLDrawable>` that has not been presented yet
+/// (Metal accepts presented handlers only before presentation).
+unsafe fn register_presented_handler(drawable: Id) {
+    // SAFETY: a pure clock read.
+    let registered_s = unsafe { CACurrentMediaTime() };
+    // The handler itself, defined OUTSIDE any `unsafe` block so its one real
+    // unsafe operation — the `presentedTime` message — carries its own scope.
+    let handler = move |presented: Id| {
+        // SAFETY: Metal passes the live drawable being reported;
+        // `presentedTime` is a `CFTimeInterval` (double) getter, 0 when the
+        // drawable was never shown.
+        let presented_s = unsafe {
+            let get: unsafe extern "C" fn(Id, Sel) -> f64 = msg();
+            get(presented, sel(c"presentedTime"))
+        };
+        crate::present_glass::deliver(crate::present_glass::classify(registered_s, presented_s));
+    };
+    // SAFETY: `MTLDrawablePresentedHandler` is `void (^)(id<MTLDrawable>)` —
+    // exactly `(Id) -> ()`, the prototype this block is invoked with. The
+    // closure captures one `f64`, performs no allocation or panicking
+    // operation, and the sink contract forbids blocking or unwinding.
+    let block = unsafe { aterm_objc::RcBlock::new1(handler) };
+    let Some(block) = block else { return };
+    // SAFETY: `addPresentedHandler:` takes one block argument and copies it
+    // (a retain on this heap block), so our reference is released
+    // independently when `block` drops at the end of scope.
+    unsafe {
+        let add: unsafe extern "C" fn(Id, Sel, aterm_objc::BlockPtr) = msg();
+        add(drawable, sel(c"addPresentedHandler:"), block.as_block_ptr());
     }
 }
 
@@ -2885,8 +2936,8 @@ mod tests {
                     height: h as f64,
                 },
             );
-            let set_bool: unsafe extern "C" fn(Id, Sel, bool) = msg();
-            set_bool(layer.id(), sel(c"setFramebufferOnly:"), false);
+            let set_bool: unsafe extern "C" fn(Id, Sel, ObjcBool) = msg();
+            set_bool(layer.id(), sel(c"setFramebufferOnly:"), false.into());
             layer
         }
     }
@@ -2975,7 +3026,8 @@ mod tests {
                 )
                 .expect("solid src");
             let bytes: Vec<u8> = c.iter().copied().cycle().take(W * H * 4).collect();
-            // SAFETY: shared-storage texture, exact extent and stride.
+            // SAFETY: managed-storage (non-Private) texture, exact extent and
+            // stride.
             unsafe { ffi::texture_upload(&tex, ffi::MtlRegion::full_2d(W, H), &bytes, W * 4) };
             tex
         };
@@ -3440,6 +3492,62 @@ mod tests {
                 "the injection seam stays uncached"
             );
         }
+        assert!(!latch.is_lost());
+    }
+
+    /// PRESENT → GLASS: with a sink installed, a present hangs a presented
+    /// handler and Metal delivers one sample per present — on glass or
+    /// skipped (this unparented standalone layer never reaches a display, so a
+    /// headless run may read `Skipped`; both arms count). Before the handler
+    /// existed nothing observed the drawable after `commit`, and `delivered`
+    /// never moved.
+    #[test]
+    fn a_present_delivers_a_glass_sample_once_a_sink_listens() {
+        use crate::metal::loss::{CbOutcome, LossLatch};
+        use crate::present_glass::{GlassSample, delivered, install_sink};
+
+        fn sink(_: GlassSample) {}
+
+        let Some(dev) = device() else { return };
+        let _test_pool = AutoreleasePool::new();
+        let _ = install_sink(sink);
+        let latch = Arc::new(LossLatch::new());
+        let session = encoder::EncodeSession::new(&dev, Arc::clone(&latch)).expect("session");
+        let mut sc = Swapchain::standalone(
+            &dev,
+            &SwapchainConfig {
+                format: PixelFormat::Bgra8Unorm,
+                width: 16,
+                height: 16,
+                framebuffer_only: true,
+                display_sync: false,
+                maximum_drawables: 3,
+                opaque: true,
+            },
+            Arc::clone(&latch),
+        )
+        .expect("swapchain");
+
+        const PRESENTS: u64 = 3;
+        let before = delivered();
+        for _ in 0..PRESENTS {
+            let ticket = sc
+                .acquire()
+                .expect("frame")
+                .present(&session)
+                .expect("present");
+            assert_eq!(ticket.wait_outcome(), CbOutcome::Completed);
+        }
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        while delivered() < before + PRESENTS && std::time::Instant::now() < deadline {
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        }
+        assert!(
+            delivered() >= before + PRESENTS,
+            "{PRESENTS} presents delivered {} presented-handler samples: the \
+             compositor leg is unobserved",
+            delivered() - before
+        );
         assert!(!latch.is_lost());
     }
 

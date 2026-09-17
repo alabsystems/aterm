@@ -495,14 +495,21 @@ impl Auditor {
 /// difference between a two-node test and a one-node test wearing two hats.
 ///
 /// aterm's ROOT session ADOPTS `$ATERM_SESSION_ID` / `$ATERM_LAUNCH_NONCE` when
-/// they are set (`spawn.rs:783-786`, `adopt_injected_identity`), which is how an
-/// outer aterm hands an inner one the identity its preminted edges already name.
-/// A test run FROM INSIDE an aterm therefore has both variables in its own
-/// environment, and every `aterm-gui` it spawns adopts the SAME sid and the SAME
-/// launch nonce — two nodes hosting one sid, a bare `@s-<sid>` that resolves to
-/// the sender itself, and a "relaunch" whose successor has the identical epoch.
-/// Every one of those is a silent pass or a silent fail depending on which way
-/// the assertion points.
+/// they are set (`spawn::adopt_injected_identity`), which is how an outer aterm
+/// hands an inner one the identity its preminted edges already name. A test run
+/// FROM INSIDE an aterm therefore has both variables in its own environment, and
+/// every `aterm-gui` it spawns adopts the SAME sid and the SAME launch nonce —
+/// two nodes hosting one sid, a bare `@s-<sid>` that resolves to the sender
+/// itself, and a "relaunch" whose successor has the identical epoch. Every one
+/// of those is a silent pass or a silent fail depending on which way the
+/// assertion points.
+///
+/// STILL REQUIRED, and by a narrower margin than it reads. `aterm-gui`'s
+/// `identity_claim` now lets only ONE live process answer to an adopted id, so
+/// the second `aterm-gui` a test spawns would mint its own — but the FIRST one
+/// would still take the harness's own inherited identity, and a node wearing the
+/// test runner's sid is the same two-hats failure. The variables are the problem
+/// whatever the adopter does with them; strip them here.
 /// DENY BY DEFAULT, DERIVED — not a list. This was eleven enumerated names, and
 /// an enumerated boundary is the failure this repository keeps re-buying: the
 /// list is complete on the day it is written and silently incomplete every day
@@ -1023,6 +1030,13 @@ impl World {
     /// 13's `--presence minimal`, say).
     pub fn boot_flags(tag: &str, extra_serve_flags: &[&str]) -> Self {
         Self::boot_full(tag, &[], &[], None, extra_serve_flags, None)
+    }
+
+    /// [`World::boot_flags`] and [`World::boot_with`] at once: extra `serve`
+    /// flags AND extra environment for the bridge child — a `--receipts`
+    /// bridge under a fault the test arms.
+    pub fn boot_flags_with(tag: &str, extra_serve_flags: &[&str], env: &[(&str, &str)]) -> Self {
+        Self::boot_full(tag, &[], env, None, extra_serve_flags, None)
     }
 
     /// [`World::boot`] with the node's cap file holding `grants(node)` instead

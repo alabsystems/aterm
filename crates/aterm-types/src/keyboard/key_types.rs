@@ -26,6 +26,64 @@ impl Key {
     pub fn named(key: NamedKey) -> Self {
         Key::Named(key)
     }
+
+    /// The main-block key a KEYPAD key stands in for — `None` when `self` is
+    /// not a keypad key, or is `NumpadBegin`, the one keypad key the main
+    /// block has no twin for (xterm's `CSI E`).
+    ///
+    /// ONE fold, so its consumers cannot drift, now that a physical keypad
+    /// reaches the engine as `Numpad*` (the winit seam resolves KP_5 to
+    /// `Numpad5`, KP_Enter to `NumpadEnter`, a NumLock-off KP_1 to
+    /// `NumpadEnd`): the kitty encoder's legacy rule — "all keypad keys are
+    /// reported as their equivalent non-keypad keys" until the application
+    /// asks to tell them apart — and, in the GUI, the native pages (a Settings
+    /// field types `5` for KP_5 and an editor moves to the line end for a
+    /// NumLock-off KP_1; no page needs the keypad identity) and the press
+    /// classifier (KP_Enter submits a turn, a keypad digit is a typed glyph).
+    /// The PTY encoders never fold outside kitty legacy semantics: DECKPAM's
+    /// SS3 forms and kitty disambiguate exist to tell the keypad apart.
+    ///
+    /// Digits and operators fold to the glyph the key types — `'5'`, `'.'`,
+    /// `','` for KP_Separator, `'='` for KP_Equal — and the editing and
+    /// navigation keys to their named twins (`NumpadEnter` -> `Enter`,
+    /// `NumpadEnd` -> `End`, …).
+    #[must_use]
+    pub fn main_block_twin(&self) -> Option<Key> {
+        let Key::Named(named) = self else {
+            return None;
+        };
+        Some(match named {
+            NamedKey::Numpad0 => Key::Character('0'),
+            NamedKey::Numpad1 => Key::Character('1'),
+            NamedKey::Numpad2 => Key::Character('2'),
+            NamedKey::Numpad3 => Key::Character('3'),
+            NamedKey::Numpad4 => Key::Character('4'),
+            NamedKey::Numpad5 => Key::Character('5'),
+            NamedKey::Numpad6 => Key::Character('6'),
+            NamedKey::Numpad7 => Key::Character('7'),
+            NamedKey::Numpad8 => Key::Character('8'),
+            NamedKey::Numpad9 => Key::Character('9'),
+            NamedKey::NumpadDecimal => Key::Character('.'),
+            NamedKey::NumpadSeparator => Key::Character(','),
+            NamedKey::NumpadDivide => Key::Character('/'),
+            NamedKey::NumpadMultiply => Key::Character('*'),
+            NamedKey::NumpadSubtract => Key::Character('-'),
+            NamedKey::NumpadAdd => Key::Character('+'),
+            NamedKey::NumpadEqual => Key::Character('='),
+            NamedKey::NumpadEnter => Key::Named(NamedKey::Enter),
+            NamedKey::NumpadArrowUp => Key::Named(NamedKey::ArrowUp),
+            NamedKey::NumpadArrowDown => Key::Named(NamedKey::ArrowDown),
+            NamedKey::NumpadArrowLeft => Key::Named(NamedKey::ArrowLeft),
+            NamedKey::NumpadArrowRight => Key::Named(NamedKey::ArrowRight),
+            NamedKey::NumpadHome => Key::Named(NamedKey::Home),
+            NamedKey::NumpadEnd => Key::Named(NamedKey::End),
+            NamedKey::NumpadPageUp => Key::Named(NamedKey::PageUp),
+            NamedKey::NumpadPageDown => Key::Named(NamedKey::PageDown),
+            NamedKey::NumpadInsert => Key::Named(NamedKey::Insert),
+            NamedKey::NumpadDelete => Key::Named(NamedKey::Delete),
+            _ => return None,
+        })
+    }
 }
 
 /// Named special keys.

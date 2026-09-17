@@ -32,6 +32,7 @@ pub mod verification;
 
 pub mod ordered_map;
 
+pub mod identity;
 pub mod version;
 
 // ============================================================================

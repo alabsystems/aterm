@@ -5648,7 +5648,7 @@ impl App {
     ) {
         use std::hash::Hash;
 
-        "terminal-render-model-v6".hash(hash);
+        "terminal-render-model-v7".hash(hash);
         input.rows.hash(hash);
         input.cols.hash(hash);
         for row in &input.cells {
@@ -5731,6 +5731,16 @@ impl App {
         input.display_offset.hash(hash);
         input.base_y.hash(hash);
         input.absolute_row_revision.hash(hash);
+        // v7: the renumber epoch travels with the revision everywhere else
+        // (`splice_find_bar`, `search_stamp_mismatch`, the parked find anchor),
+        // and the same reason applies here — both name a way absolute row
+        // numbers stopped meaning what they meant. Nothing observable today:
+        // every path that raises the epoch also moves cells, dims or
+        // `display_offset`, all hashed above. Hashed anyway, on the rule the
+        // `overline_color` note a few lines up states: a field left out of this
+        // hash is a difference a capture cannot report, and the cheap moment to
+        // wire one is exactly when it changes no identity.
+        input.history_renumber_epoch.hash(hash);
         input.cursor_row.hash(hash);
         input.cursor_col.hash(hash);
         input.cursor_visible.hash(hash);

@@ -80,7 +80,7 @@
 //! tree and tells the operator to read the diff. [`render_report`] says so in the output.
 
 use crate::fsio::{
-    concat, ensure_parent_dir, read_bytes, sync_parent, write_bytes, write_bytes_atomic,
+    concat, ensure_parent_dir, read_bytes, sync_parent, write_bytes_atomic,
     write_owner_file_create_new,
 };
 use crate::master::MasterSeed;
@@ -1723,8 +1723,38 @@ pub fn write_rest(planned: Planned) -> Result<Report, String> {
     record.push_str("\"\nminted_at = \"");
     record.push_str(&aterm_types::rfc3339::format_rfc3339(planned.now));
     record.push_str("\"\n");
-    let _ = ensure_parent_dir(&planned.paths.machine_pub);
-    let _ = write_bytes(&planned.paths.machine_pub, record.as_bytes());
+    // THE RECORD IS THE HALF A PUBLISHER CANNOT DO WITHOUT, so its write is checked, and
+    // atomic for the same reason the roster's is. `tools/atpkg-index.sh` refuses to build
+    // an index when `machine.toml` is missing, empty or unparseable — the index must state
+    // WHICH machine signed it, and that id is not derivable from the key — and the one
+    // remedy it names is "re-run `atpkg-keys join --id <this-machine-id>`". That remedy is
+    // refused by this module's own preflight the moment `machine.key` exists, and by
+    // `roster_ops::add` for an id the roster already carries. So a discarded error, or the
+    // truncate-then-write window a plain `File::create` leaves, did not cost a retry: it
+    // left a machine that could neither publish nor be re-joined, recoverable only by
+    // hand-writing the file that script tells the operator not to hand-edit.
+    //
+    // It stays BEFORE the roster is published, so a failure here leaves exactly the state
+    // the key write above leaves — a machine holding a key nothing has authorized — and
+    // the message says so rather than inventing a third recovery.
+    ensure_parent_dir(&planned.paths.machine_pub)
+        .and_then(|()| write_bytes_atomic(&planned.paths.machine_pub, record.as_bytes()))
+        .map_err(|e| {
+            concat(&[
+                "write this machine's public record ",
+                &planned.paths.machine_pub,
+                ": ",
+                &e.to_string(),
+                ".\nNothing authorizes this machine yet: the roster was not published, so \
+                 the pair on disk is still the one from before this run. This machine's \
+                 key file DOES exist; undo it before retrying, or the retry will mint a \
+                 second key: `rm ",
+                &planned.paths.key,
+                "` (and `git checkout -- ",
+                &planned.paths.pins,
+                "` if this run armed the master anchor).",
+            ])
+        })?;
 
     // The roster last, under the lock this function already holds. The redo transaction's
     // commit is the line the recovery advice turns on: BEFORE it, nothing canonical moved
@@ -2764,6 +2794,76 @@ mod tests {
             !std::path::Path::new(&paths.roster).exists()
                 && !std::path::Path::new(&concat(&[&paths.roster, ".sig"])).exists(),
             "neither half of a pair that could not publish exists on disk"
+        );
+    }
+
+    /// THE MACHINE'S PUBLIC RECORD IS A CHECKED WRITE, NOT A WISH.
+    ///
+    /// `machine.toml` is the other half of this machine's identity, and it is the half a
+    /// publisher cannot do without: `tools/atpkg-index.sh` refuses to build an index when
+    /// the record is missing and names ONE remedy — "Re-run `atpkg-keys join --id
+    /// <this-machine-id>`". That remedy is refused by this module's own preflight the
+    /// moment `machine.key` exists, and by `roster_ops::add` for an id already on the
+    /// roster, so a record whose write failed silently left an operator with a machine
+    /// that can neither publish nor be re-joined — recoverable only by hand-writing a
+    /// file the script tells them not to hand-edit.
+    ///
+    /// The write is therefore checked, and it happens BEFORE the roster is published, so
+    /// its failure leaves the state this module's recovery advice already covers: a key
+    /// nothing has authorized yet.
+    ///
+    /// Driven by taking the write permission off the record's OWN directory after
+    /// preflight — the only way to fail that one step in isolation, the key and the
+    /// roster living in a directory that stays writable. It is the finding's ENOSPC in
+    /// miniature.
+    ///
+    /// MUTATION: restore `let _ = write_bytes(&planned.paths.machine_pub, ...)` and this
+    /// fails at `unwrap_err` — the run reports success and publishes a master-signed
+    /// roster naming a machine that has no record of its own id.
+    #[test]
+    fn a_record_that_cannot_be_written_fails_the_run_before_the_roster_is_published() {
+        use std::os::unix::fs::PermissionsExt as _;
+        let dir = scratch("record-write-fails");
+        let mut paths = paths_in(&dir);
+        let record_dir = dir.join("home");
+        paths.machine_pub = record_dir
+            .join("machine.toml")
+            .to_str()
+            .unwrap()
+            .to_string();
+        write_fixture(&paths);
+
+        let pre = preflight(Verb::Setup, "m3", HEAD_ID, &paths).expect("preflight");
+        let planned = plan(pre, &seed_of(PAPER), NOW).expect("plan");
+        write_pins(&planned).expect("the anchor is written");
+        assert!(
+            record_dir.is_dir(),
+            "the premise: preflight created the record's directory"
+        );
+        std::fs::set_permissions(&record_dir, std::fs::Permissions::from_mode(0o500)).unwrap();
+        let result = write_rest(planned);
+        std::fs::set_permissions(&record_dir, std::fs::Permissions::from_mode(0o700)).unwrap();
+
+        let err = result.unwrap_err();
+        assert!(
+            err.contains(&paths.machine_pub),
+            "the message names the file that could not be written: {err}"
+        );
+        assert!(err.contains("Nothing authorizes this machine yet"), "{err}");
+        assert!(err.contains("rm "), "the recovery undoes the key: {err}");
+        assert!(
+            std::path::Path::new(&paths.key).exists(),
+            "the key was written first, which is what makes the recovery the two commands \
+             the message names"
+        );
+        assert!(
+            !std::path::Path::new(&paths.roster).exists()
+                && !std::path::Path::new(&concat(&[&paths.roster, ".sig"])).exists(),
+            "NO signed document names a machine whose record could not be written"
+        );
+        assert!(
+            !std::path::Path::new(&paths.machine_pub).exists(),
+            "and no half-written record is left behind"
         );
     }
 

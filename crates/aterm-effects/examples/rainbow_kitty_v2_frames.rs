@@ -394,7 +394,7 @@ impl Sim {
                 dark_theme: true,
                 intensity: 1.0,
                 duration: Duration::from_millis(900),
-                ribbon_tall: true,
+                ribbon_tall: ribbon_tall(),
                 ribbon_flat: false,
                 theme_fg: INK,
                 theme_bg: GROUND,
@@ -1170,6 +1170,20 @@ fn key_ms() -> u64 {
 /// +720 ms (see the module doc).
 fn ctrl_a_only() -> bool {
     std::env::var("RK_FRAMES_CTRL_A_ONLY").is_ok_and(|v| v == "1")
+}
+
+/// `RK_FRAMES_UNDERLINE=1`: run the scanner under D16's OTHER band anchor —
+/// `ribbon_tall: false`, the `underline` ribbon a user reaches by typing
+/// "rainbow kitty underline".
+///
+/// It exists because this example was `tall`-only, and so was every other
+/// fixture of the §33 round: the sky band sits in a DIFFERENT GRID ROW under
+/// the two spellings (`default_band_top`), which is how a blank-frontier
+/// clamp that read the wrong row survived a whole round of golden hashes.
+/// A hash says a byte moved; only glass says whether a mark is standing on a
+/// glyph. Run both before any on-glass judgement of this section.
+fn ribbon_tall() -> bool {
+    !std::env::var("RK_FRAMES_UNDERLINE").is_ok_and(|v| v == "1")
 }
 
 /// The instants of the lone-Ctrl-A audit, ms after the spawn — the seven

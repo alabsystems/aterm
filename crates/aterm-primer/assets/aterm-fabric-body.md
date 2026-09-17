@@ -58,14 +58,15 @@ one is waiting on somebody. `[fabric] presence = "minimal"` turns the meaning fi
 ```sh
 aterm ctl @self inbox                    # rows, and MOVES the listed watermark
 aterm ctl @self inbox --peek --meta      # moves nothing; omits the bodies
-aterm ctl @self inbox get <id>           # one full body
+aterm ctl @self inbox get <id>           # one full body, by row id
+aterm ctl @self inbox get @<off>         # one body by BROKER OFFSET — even after the ring dropped it
 aterm ctl @self inbox seen <id> handled  # the HANDLED watermark (also: refused, deferred)
 ```
 
 The header is the half people miss:
 
 ```
-OK 3 hold=0 holder=- seen=40 bus_head=90340 dropped=0 pending=1
+OK 3 hold=0 holder=- seen=40 bus_head=90340 oldest_on_bus=@90001 dropped=0 pending=1
 msg 41 off=90312 t=… from=s-7c1e…@n-b2f0… kind=ask trust=agent dl=240000 len=34 text=which%20branch%3F
 post 7 to=@s-9a01…@n-b2f0… kind=ask off=-
 ```
@@ -73,14 +74,25 @@ post 7 to=@s-9a01…@n-b2f0… kind=ask off=-
 - `<n>` counts **every** row that follows, `post` rows included.
 - `seen=` is the handled watermark; `pending=` is delivered rows this reply did not carry.
 - `dropped=` counts unhandled rows the bounded ring evicted. It is never silent — if it
-  is non-zero, mail was lost and you should say so.
+  is non-zero, mail was lost, **but not gone**: see below.
 - `text=` is percent-encoded and cut at 512 B with `more=1`. `truncated=1` means the
-  endpoint never received the rest and no verb can recover it.
+  endpoint never received the rest: `inbox get @<off>` fetches the whole body from the bus.
 - A `post` row is **your own** outbound message that has not landed yet.
 
 Two watermarks, not one. A bare `inbox` advances only the *listed* mark (what the ring may
 evict and what releases a sender's quota). `seen=` moves only on `inbox seen`. An agent
 that only ever `--peek`s should still `inbox seen` its mail, or the sender's quota fills.
+
+**Nothing lost: `inbox get @<off>`.** The ring is bounded, so a burst can push a row out
+(`dropped=` counts it), and a long body can arrive cut (`truncated=1`) — but the record is
+still on the bus. `inbox get @<off>` fetches one by its broker offset: from the ring while
+it holds the whole row, otherwise through the bridge from the broker's log, whole up to
+256 KiB. `oldest_on_bus=@<off>` in the header is the lowest offset ever delivered to you;
+every one of *your* records from it to `bus_head=` is fetchable while the broker holds it,
+but the offsets in between are shared by the whole fleet and most are other lanes' — ask
+for the `off=` of rows you saw. The answer carries the record's own fields on the tail
+(`OK <nbytes> off=<n> from=<p> kind=<k> trust=<t> …` then the body); nothing is
+re-delivered. `ERR no such record` means that offset is not on your lane.
 
 ## Sending
 
@@ -98,9 +110,9 @@ session's inbox; a recipient must be subscribed.
 Failure tokens that mean opposite things, and are easy to confuse:
 
 - `ERR fabric absent|stalled|disconnected id=<n> queued=1` — the message **is** in the
-  outbox and a bridge will publish it. Do **not** re-post: there is no idempotency key, so
-  you would duplicate it. `stalled` is answered at once — the bridge has said its broker
-  link is down, so there is no wait to sit out.
+  outbox and a bridge will publish it. Do **not** re-post: without `key=` there is no
+  idempotency key, so you would duplicate it. `stalled` is answered at once — the bridge
+  has said its broker link is down, so there is no wait to sit out.
 - `… no-bridge=1` — this instance has **no bridge right now**. Not a verdict on the
   message: `aterm ctl fabric attach <command...>` arms a supervisor and the same outbox
   drains (measured 2026-09-12, the post landed the moment a bridge attached). Report it as
@@ -112,6 +124,33 @@ Failure tokens that mean opposite things, and are easy to confuse:
   does **not** mean queued: the bridge **retired** the post, so `outbox` no longer lists it
   and no bridge will drain it again. Report it as that reason, and re-post once the address
   is right.
+
+**Exactly once, when you need it: `post … key=<token>`** (1–64 of `[A-Za-z0-9._:-]`, per
+session). A re-post under the same key — after `ERR timeout`, a bridge restart, a broker
+restart — answers `OK <id> off=<n> dup=1` with the *original* offset and puts nothing new
+on the bus: the bridge reserved the producer sequence for that key before publishing and
+reuses it, so the broker's own dedup collapses the copy. The newest 4096 keys per session
+are kept. The address is still resolved first: a re-post to one that no longer routes
+(the session has gone) is retired like any unroutable post (`ERR unroutable`), and puts
+nothing new on the bus either.
+
+**A deadline is kept by your own bridge: `kind=ask dl=<ms>`.** If no answer, report or
+ack carrying `re=<n>` reaches *you* before it passes (a reply sent to someone else does
+not count), a row `kind=expired re=<n> dl=<ms>` lands in *your* inbox (once), a reply that
+comes after it arrives `late=1` (unless your bridge restarted in between — the `expired`
+row is still there), and `aterm fabric` lists the ask under WARNINGS.
+
+**Receipts: your `inbox seen` acks the sender (R8).** When the fabric runs with receipts on
+(the default `aterm fabric on` writes; `[fabric] receipts = true`, or `--receipts` on the
+bridge), running `inbox seen <id> handled|refused|deferred` on an **ask** or **task** puts
+`kind=ack re=<off> verdict=<v>` in the *sender's* inbox — so a manager knows their task was
+taken. The receipt is owed until it is on the bus, so a verdict given while the broker or
+the bridge is down is sent when they return, once; never say it again to resend it. A
+`note` earns none; a session that only `--peek`s acks nothing. From the sending side,
+`post … kind=task --wait-ack` blocks for that receipt and returns `OK <id> off=<n>
+ack=<verdict> msg=<id>` — bounded by `--wait-ack=<ms>` when given, else by `dl=` plus 5 s
+for the verdict to come back, else 30 s; `ERR expired` when the deadline passes first —
+and `await inbox re=<off>` latches on any reply to that post: answer, receipt, or expiry.
 
 ## Waiting instead of polling
 

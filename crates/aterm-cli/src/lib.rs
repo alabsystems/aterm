@@ -84,8 +84,8 @@ pub use windowing::{
 /// Polished `--help` text: synopsis, description, OPTIONS, ENVIRONMENT, EXAMPLES.
 /// Mirrors `aterm-gui`'s `parse_cli()` help in tone and layout, scoped to what the
 /// daily-driver CLI actually does (transparent passthrough of `$SHELL`).
+const HELP_TITLE: &str = "aterm — a transparent, introspecting terminal\n";
 const HELP_HEAD: &str = concat!(
-    "aterm — a transparent, introspecting terminal\n",
     "\n",
     "Spawns your $SHELL in a PTY and passes I/O through unchanged, so it looks and\n",
     "behaves exactly like your shell. The output is NOT modelled: the host terminal\n",
@@ -406,7 +406,12 @@ fn verb_help_block(verb: Verb) -> String {
 /// `--help`, assembled. The VERBS section is RENDERED from [`Verb::ALL`] rather
 /// than written out, which is what makes "advertised" and "exists" the same fact.
 fn help_text() -> String {
-    let mut out = String::from(HELP_HEAD);
+    // Title, then WHO MAKES IT (`by Andrew Yates · ALab · alab.systems`) — the one
+    // origin line every surface prints, from `aterm_types::identity`.
+    let mut out = format!(
+        "{HELP_TITLE}{}\n{HELP_HEAD}",
+        aterm_types::identity::ORIGIN_LINE
+    );
     out.push_str("VERBS (the one command, its powers — run `aterm help` for the full manual):\n");
     for verb in Verb::ALL {
         out.push_str(&verb_help_block(*verb));
@@ -675,18 +680,26 @@ const MACHINE_CONFIG_PARAGRAPH: &str = "\n\
      \x20 universal_control       \"off\" (default) | \"leave\". Off writes the two per-host keys\n\
      \x20                         that stop the cursor and keyboard roaming to other Macs and\n\
      \x20                         iPads on the same Apple account; leave never touches them.\n\
-     \x20 spotlight_noindex       true (default) renames every cargo target dir under $HOME to\n\
-     \x20                         target.noindex, with a `target` symlink left in place so cargo\n\
-     \x20                         keeps working, so Spotlight never indexes build output.\n\
+     \x20 spotlight_noindex       true (default) renames the cargo target dirs the scan\n\
+     \x20                         reaches under $HOME to target.noindex, so Spotlight never\n\
+     \x20                         indexes build output. Cargo keeps working either way: a\n\
+     \x20                         `target` symlink in a git checkout, a `[build] target-dir`\n\
+     \x20                         line in .cargo/config.toml elsewhere. Documents, Desktop,\n\
+     \x20                         Downloads, Pictures, Movies, Music and Library are never\n\
+     \x20                         walked: macOS asks a human before a program reads those.\n\
      \x20 Both are applied FIRST by every package pass (update, seed, install) and on the\n\
      \x20 spot by `aterm pkg machine apply`; `aterm pkg machine` reads the measured state,\n\
      \x20 and Settings ▸ Security shows it with the two switches and an Apply now button.\n\
      \x20 A saved change lands on the next package pass, or on Apply now. `defaults` writes\n\
      \x20 the ACCOUNT's per-host domain regardless of $HOME, so a pass under a redirected\n\
-     \x20 HOME is refused and says so. Undo Universal Control with the revert line the\n\
-     \x20 doctor prints (`defaults -currentHost delete com.apple.universalcontrol Disable`,\n\
-     \x20 then the same for DisableMagicEdges); undo a rename by removing the `target`\n\
-     \x20 symlink and renaming target.noindex back to target.\n";
+     \x20 HOME is refused and says so, as is a pass whose aterm.toml does not parse (the\n\
+     \x20 switches cannot be read, and both defaults act). Undo Universal Control with the\n\
+     \x20 revert line the doctor prints (`defaults -currentHost delete\n\
+     \x20 com.apple.universalcontrol Disable`, then the same for DisableMagicEdges) AND set\n\
+     \x20 universal_control = \"leave\", or the next pass disables it again. Undo a rename in\n\
+     \x20 a git checkout by removing the `target` symlink and renaming target.noindex back;\n\
+     \x20 elsewhere the pass left no symlink and pointed cargo with a `[build] target-dir`\n\
+     \x20 line in .cargo/config.toml, so delete that line as well.\n";
 
 /// The `[privacy]` paragraph of `explain-config` (design §4). Hand-written, like
 /// the rest of this page.
@@ -716,8 +729,10 @@ const PRIVACY_CONFIG_PARAGRAPH: &str = "\n\
      \x20                         only when the owner presses the button in Settings — never at\n\
      \x20                         first launch, never on a timer, and never because a program\n\
      \x20                         inside a session asked for it.\n\
-     \x20 warmup_folders          which folders that gesture asks for; warmup_hold_ms caps how\n\
-     \x20                         long an in-place apply will wait for it.\n\
+     \x20 warmup_folders          what that gesture asks for: the folders, and `app-data` \u{2014}\n\
+     \x20                         every other app's own data, which macOS guards with the same\n\
+     \x20                         kind of grant. warmup_hold_ms caps how long an in-place\n\
+     \x20                         apply will wait for it.\n\
      \x20 probe_interval_ms       floor on re-probing; macOS probe duration has no guaranteed bound.\n\
      \x20                         `aterm ctl @<sid> await consent` waits for completed observations.\n\
      \x20 protected_roots         the sensitive set; empty = the containment tier's own list, so\n\
@@ -1324,7 +1339,14 @@ fn decide_args<I: Iterator<Item = String>>(args: I) -> CliAction {
 /// by its own output (`empty` names an unarmed tier).
 #[must_use]
 pub fn version_text(copy: Option<&aterm_update::which_copy::WhichCopy>) -> String {
-    let mut out = format!("aterm {}\n", aterm_types::version::APP_VERSION);
+    // Identity line first (install.sh greps `^aterm `), then the origin line —
+    // `by Andrew Yates · ALab · alab.systems` — so `--version` says where the
+    // program comes from; then the build number, which copy runs, and the trust roots.
+    let mut out = format!(
+        "aterm {}\n{}\n",
+        aterm_types::version::APP_VERSION,
+        aterm_types::identity::ORIGIN_LINE
+    );
     if let Some(build) = running_build() {
         out.push_str(&format!("build: {build}\n"));
     }
@@ -1520,16 +1542,214 @@ const NO_REROUTE_ENV: &str = "ATERM_NO_REROUTE";
 /// stubs into, and establishes in THIS process's environment before `session_main` runs.
 /// `None` when `$ATERM_NO_REROUTE` is engaged (non-empty and not `0` — `env_flag_engaged`,
 /// THE reading, the same the stubs and the window apply), when the variable is unset or
-/// empty, or when it does not name an existing directory (Windows lays no stubs; a stale
-/// value must never put a nonexistent entry first on every child's PATH).
+/// empty, when it does not name an existing directory (Windows lays no stubs; a stale
+/// value must never put a nonexistent entry first on every child's PATH), or when the
+/// value is RELATIVE (2026-09-16 audit: the front door always hands an absolute path, so a
+/// relative one is an inherited stray — put first on PATH it would resolve against every
+/// directory the shell later `cd`s into, and its `agents/` sibling would be derived in and
+/// created under the session's cwd).
 fn reroute_dir_from_env() -> Option<String> {
-    if aterm_types::control_socket::env_flag_engaged(std::env::var(NO_REROUTE_ENV).ok().as_deref())
-    {
+    reroute_dir_from_values(
+        std::env::var(NO_REROUTE_ENV).ok().as_deref(),
+        std::env::var(REROUTE_DIR_ENV).ok().as_deref(),
+    )
+}
+
+/// [`reroute_dir_from_env`] over explicit values, so the rule is testable without a
+/// process environment: `no_reroute` is `$ATERM_NO_REROUTE`, `dir` is `$ATERM_REROUTE_DIR`.
+fn reroute_dir_from_values(no_reroute: Option<&str>, dir: Option<&str>) -> Option<String> {
+    if aterm_types::control_socket::env_flag_engaged(no_reroute) {
         return None;
     }
-    std::env::var(REROUTE_DIR_ENV)
-        .ok()
-        .filter(|dir| !dir.is_empty() && std::path::Path::new(dir).is_dir())
+    dir.filter(|dir| is_absolute_existing_dir(dir))
+        .map(str::to_owned)
+}
+
+/// Whether `dir` is a non-empty ABSOLUTE path naming an existing directory — the one
+/// shape either managed directory may have before it goes first on a child's PATH.
+fn is_absolute_existing_dir(dir: &str) -> bool {
+    let path = std::path::Path::new(dir);
+    !dir.is_empty() && path.is_absolute() && path.is_dir()
+}
+
+/// `ATPKG_AGENTS`, atpkg's spelling restated (`atpkg::hooks` exports it from the shell
+/// hook; pinned by `reroute_env_names_match_atpkg`): the managed `<prefix>/agents/` as an
+/// enclosing shell that sourced the hook names it.
+const AGENTS_DIR_ENV: &str = "ATPKG_AGENTS";
+
+/// THE MANAGED `agents/` DIRECTORY A TTY SESSION PUTS IN FRONT OF ITS SHELL'S PATH
+/// (2026-09-16). The window's spawn seam has front-inserted `<prefix>/agents/` — the
+/// shims of the agent programs aterm is the version manager for (`claude`, `codex`),
+/// ahead of `~/.local/bin/claude` and the brew casks — since 2026-09-10, and ensured the
+/// directory at launch since 2026-09-16 (`aterm-gui`'s `spawn::managed_agents_dir`).
+/// The `aterm` TTY session never did: its shell got `reroute/` in front and nothing
+/// else, so `claude` there was whichever copy the user's rc put first until the shell
+/// hook ran. Owner, 2026-09-16: "all the latest and best MUST WORK IN THE SAME TAB with
+/// live update!"
+///
+/// WHAT THIS LANE'S FRONT-INSERT IS, HONESTLY (audit 2026-09-16): a PRE-RC hint. The
+/// session spawns its shell as a LOGIN shell with no aterm shell integration (that is
+/// the window's ZDOTDIR/`--rcfile` seam; this lane sets neither `ATERM_CHILD` nor
+/// `ATERM_SESSION_ID`, see `session_main`), so on macOS `/etc/zprofile`'s `path_helper`
+/// rebuilds PATH before any rc runs — measured on this Mac, 2026-09-16: the two managed
+/// dirs handed first came out at positions 12–13, behind `/usr/local/bin` and
+/// `/opt/homebrew/bin`. What puts `agents/` FIRST at the prompt of a TTY session is the
+/// rc-sourced `~/.aterm/shell.d/00-atpkg.<shell>` hook atpkg wires into `~/.zshrc` /
+/// `~/.bashrc` / `config.fish` (it MOVES the dir to the front, every earlier mention
+/// removed), once, at shell start; there is no per-prompt re-assert and no live
+/// re-source of a rewritten hook in this lane — those are the window tab's. So in a TTY
+/// session the managed `claude`/`codex` lead from the first prompt on a machine whose rc
+/// carries the hook (and a later update pass is picked up on the next invocation, because
+/// atpkg re-lays the twins in place under the directory that is already on PATH); on a
+/// machine whose rc does not yet carry it, the entry handed here survives (once, behind
+/// `path_helper`'s list) and `. ~/.aterm/shell.d/00-atpkg.<shell>` moves it first.
+/// Pinned by `a_login_zsh_demotes_the_seams_front_insert_and_the_rc_hook_moves_agents_first`.
+///
+/// This crate does not link atpkg (Cargo.toml: "the router composes these crates,
+/// aterm-cli does not call atpkg"), so the store's layout is not asked here; the
+/// directory is DERIVED from the same contract the window resolves through
+/// `atpkg::store::Layout` — `reroute/` and `agents/` are siblings under the ONE manager
+/// prefix (`Layout::reroute_dir` = `<prefix>/reroute`, `Layout::agents_dir` =
+/// `<prefix>/agents`; pinned against the real layout by
+/// `the_agents_dir_is_the_reroute_dirs_sibling_in_atpkgs_layout`) — from the reroute
+/// directory the front door hands this process as `$ATERM_REROUTE_DIR` (which it sets
+/// only for an existing directory, so the prefix exists too; a relative value is refused
+/// before anything is derived or created, [`reroute_dir_from_env`]). With no reroute
+/// handle (`--no-reroute`, `ATERM_NO_REROUTE`, Windows), `enclosing_agents` —
+/// `$ATPKG_AGENTS` as an enclosing shell that sourced the atpkg hook exported it — is
+/// taken when it is an absolute existing directory; otherwise there is nothing to
+/// front-insert, as before.
+///
+/// RESIDUAL, DOCUMENTED (R3, 2026-09-16): the reroute escape hatch is for the UPSTREAM
+/// RUST NAMES (`aterm help reroute`), yet in this lane it also drops the managed
+/// `claude`/`codex` front-insert, because the agents dir is derived from the reroute
+/// handle and the front door hands nothing else. An `aterm --no-reroute` from
+/// Terminal.app (no `$ATPKG_AGENTS` in the environment) therefore leaves `agents/` to
+/// the rc hook alone — which is where a login shell puts it anyway (above). Closing it
+/// means the front door handing an agents-dir variable of its own that is not
+/// `ATPKG_AGENTS` (an inherited `ATPKG_AGENTS` would stop the window's shell
+/// integration from ever sourcing the hook) and this crate reading it; not done here.
+///
+/// ENSURED TO EXIST, the way the window ensures it through `Layout::ensure_dir`, whose
+/// rule is restated from the PREFIX's own metadata ([`agents_dir_mode`]): one `mkdir`
+/// (`0700` in a prefix we own — the `$HOME` shape; `0755` in a root-owned system
+/// prefix — every user must traverse it, a `0700` there is exactly the failure
+/// `ensure_dir`'s doc records; REFUSED in a prefix owned by anyone else), never a wait,
+/// never through a symlink at `agents/` (refused, as atpkg's `ensure_shared_dir` and
+/// `ensure_private_dir` refuse it: a pre-created link must never capture the twins), and
+/// a failure is said on stderr rather than passed over silently, naming `aterm pkg
+/// repair` — the verb that re-lays the directory with the twins (`activate`'s
+/// `ensure_dir`); `aterm pkg doctor` has no row for an absent `agents/` (audit
+/// 2026-09-16). What the session needs synchronously is only that the directory exist,
+/// so the twins atpkg lays into it later are found on the next invocation. No
+/// `ATPKG_AGENTS` is exported here (the window exports none either): the shell
+/// integration sources the hook while that variable is unset, and a seam-exported value
+/// would stop it from ever doing so.
+fn managed_agents_dir(reroute_dir: Option<&str>, enclosing_agents: Option<&str>) -> Option<String> {
+    let derived = reroute_dir
+        .map(std::path::Path::new)
+        .filter(|reroute| reroute.is_absolute())
+        .and_then(|reroute| {
+            let prefix = reroute.parent()?;
+            let dir = prefix.join("agents");
+            if let Err(reason) = ensure_agents_dir(prefix, &dir) {
+                eprintln!(
+                    "aterm: managed agents dir not created ({reason}); the managed `claude`/`codex` are NOT in front of PATH in this session — `aterm pkg repair` re-lays it (a system prefix needs root)"
+                );
+                return None;
+            }
+            dir.to_str().map(str::to_owned)
+        });
+    derived.or_else(|| {
+        enclosing_agents
+            .filter(|dir| is_absolute_existing_dir(dir))
+            .map(str::to_owned)
+    })
+}
+
+/// The mode the managed `agents/` directory is created with under a prefix whose owner is
+/// `prefix_uid` with permission bits `prefix_mode`, by a process whose real uid is
+/// `our_uid` — `atpkg::store::Layout::ensure_dir`'s rule restated (this crate does not
+/// link atpkg): a root-owned prefix that is not group/other-writable is the SYSTEM shape
+/// (`platform::dir_meta_is_system`) ⇒ `0755`, so every user can traverse it; a prefix we
+/// own ⇒ `0700`, the private `$HOME` shape; any other owner ⇒ `None`, refuse — a
+/// directory of ours inside someone else's prefix (a `sudo aterm` over a user's `$HOME`
+/// prefix, say) is never right. Pure, so the rule is testable without a filesystem.
+fn agents_dir_mode(prefix_uid: u32, prefix_mode: u32, our_uid: u32) -> Option<u32> {
+    if prefix_uid == 0 && prefix_mode & 0o022 == 0 {
+        Some(0o755)
+    } else if prefix_uid == our_uid {
+        Some(0o700)
+    } else {
+        None
+    }
+}
+
+/// Ensure `dir` (`<prefix>/agents`) exists as a REAL directory, [`managed_agents_dir`]'s
+/// contract: an existing directory is left exactly as it is (its mode is atpkg's to keep;
+/// a same-mode `chmod` would still move `st_ctime`); a symlink or a non-directory at the
+/// path is refused; otherwise one `mkdir` with [`agents_dir_mode`]'s mode, made exact
+/// afterwards (the request is subject to the umask), the `AlreadyExists` race with a
+/// concurrent session or atpkg pass tolerated. The `Err` is the sentence for stderr.
+#[cfg(unix)]
+fn ensure_agents_dir(prefix: &std::path::Path, dir: &std::path::Path) -> Result<(), String> {
+    use std::os::unix::fs::{DirBuilderExt as _, MetadataExt as _, PermissionsExt as _};
+    let existing = |md: std::fs::Metadata| -> Result<(), String> {
+        if md.file_type().is_symlink() {
+            Err(format!("{} is a symlink; refusing", dir.display()))
+        } else if md.is_dir() {
+            Ok(())
+        } else {
+            Err(format!("{} exists and is not a directory", dir.display()))
+        }
+    };
+    if let Ok(md) = std::fs::symlink_metadata(dir) {
+        return existing(md);
+    }
+    let prefix_meta =
+        std::fs::metadata(prefix).map_err(|error| format!("{}: {error}", prefix.display()))?;
+    // SAFETY: getuid() takes no arguments and cannot fail.
+    let our_uid = unsafe { libc::getuid() };
+    let mode = agents_dir_mode(prefix_meta.uid(), prefix_meta.mode() & 0o7777, our_uid)
+        .ok_or_else(|| {
+            format!(
+                "{} is owned by uid {}, not by this user (uid {our_uid}) and not by root",
+                prefix.display(),
+                prefix_meta.uid()
+            )
+        })?;
+    let mut builder = std::fs::DirBuilder::new();
+    builder.mode(mode);
+    match builder.create(dir) {
+        Ok(()) => {
+            if !std::fs::symlink_metadata(dir).is_ok_and(|m| m.mode() & 0o7777 == mode) {
+                std::fs::set_permissions(dir, std::fs::Permissions::from_mode(mode))
+                    .map_err(|error| format!("{}: {error}", dir.display()))?;
+            }
+            Ok(())
+        }
+        Err(error) => match std::fs::symlink_metadata(dir) {
+            // Lost the race to another session or an atpkg pass: judge what is there.
+            Ok(md) => existing(md),
+            Err(_) => Err(format!("{}: {error}", dir.display())),
+        },
+    }
+}
+
+/// [`ensure_agents_dir`] where no reroute handle is ever handed (Windows lays no stubs, so
+/// this is unreached in practice): a plain `create_dir`, the symlink refusal kept.
+#[cfg(not(unix))]
+fn ensure_agents_dir(_prefix: &std::path::Path, dir: &std::path::Path) -> Result<(), String> {
+    match std::fs::symlink_metadata(dir) {
+        Ok(md) if md.file_type().is_symlink() => {
+            Err(format!("{} is a symlink; refusing", dir.display()))
+        }
+        Ok(md) if md.is_dir() => Ok(()),
+        Ok(_) => Err(format!("{} exists and is not a directory", dir.display())),
+        Err(_) => std::fs::create_dir(dir)
+            .or_else(|error| if dir.is_dir() { Ok(()) } else { Err(error) })
+            .map_err(|error| format!("{}: {error}", dir.display())),
+    }
 }
 
 /// THE ONE `("PATH", value)` pair the session hands its shell (the pty seam's
@@ -1538,27 +1758,33 @@ fn reroute_dir_from_env() -> Option<String> {
 /// removed, so a nested aterm or a user PATH that already lists it later still ends up
 /// with it first (the measured 2026-09-07 failure was an ORDER: `~/.cargo/bin` at position
 /// 17 ahead of the managed store at 19; skip-if-present would have left it there) — then
-/// `front_door_dir` through [`prepend_path`] (skip-if-present: a second front door is
-/// harmless, a shadowed reroute dir is not), then the inherited PATH verbatim. `None` when
-/// nothing is injected. Mirrors aterm-gui's `spawn::reroute_path_env`.
+/// `agents_dir` by the same move-to-front rule (2026-09-16, [`managed_agents_dir`]: the
+/// managed `claude`/`codex` must outrank `~/.local/bin` and the brew casks wherever the
+/// inherited PATH had them) — then `front_door_dir` through [`prepend_path`]
+/// (skip-if-present: a second front door is harmless, a shadowed managed dir is not),
+/// then the inherited PATH verbatim. `None` when nothing is injected. Mirrors
+/// aterm-gui's `spawn::reroute_path_env`, in its order: reroute, agents, front door,
+/// inherited.
 fn session_path_env(
     reroute_dir: Option<&str>,
+    agents_dir: Option<&str>,
     front_door_dir: Option<&str>,
     inherited: Option<&str>,
 ) -> Option<(String, String)> {
     let sep = if cfg!(windows) { ';' } else { ':' };
-    let Some(reroute) = reroute_dir else {
+    let moved: Vec<&str> = [reroute_dir, agents_dir].into_iter().flatten().collect();
+    if moved.is_empty() {
         return front_door_dir.and_then(|dir| prepend_path(dir, inherited));
-    };
+    }
     let front = front_door_dir
         .and_then(|dir| prepend_path(dir, inherited))
         .map(|(_, value)| value);
     let base = front.as_deref().or(inherited).filter(|p| !p.is_empty());
-    let mut entries: Vec<&str> = vec![reroute];
+    let mut entries: Vec<&str> = moved.clone();
     entries.extend(
         base.into_iter()
             .flat_map(|p| p.split(sep))
-            .filter(|entry| *entry != reroute),
+            .filter(|entry| !moved.contains(entry)),
     );
     Some(("PATH".to_string(), entries.join(&sep.to_string())))
 }
@@ -1734,16 +1960,37 @@ pub fn session_main(quiet: bool) -> ! {
     // baseline `env_add` composes it (`docs/DESIGN-toolchain-reroute-2026-09-07.md`
     // §"Reaching PATH"): the REROUTE dir first (move-to-front — a bare `cargo`/`rustc` in
     // the session is announced or signposted instead of running upstream Rust silently),
-    // then aterm's own binary directory so `aterm` (and thus every `aterm <verb>`) always
-    // resolves even when aterm was launched by an absolute path from a dir not on $PATH
-    // (inert for a lone binary or when already on PATH), then the inherited PATH verbatim.
-    // The reroute dir arrives as `$ATERM_REROUTE_DIR` from the front door, which owns the
+    // then the managed `agents/` (move-to-front too, 2026-09-16 — the managed
+    // `claude`/`codex` ahead of the native installer's and the casks', derived beside
+    // the reroute dir and ensured to exist, `managed_agents_dir`), then aterm's own
+    // binary directory so `aterm` (and thus every `aterm <verb>`) always resolves even
+    // when aterm was launched by an absolute path from a dir not on $PATH (inert for a
+    // lone binary or when already on PATH), then the inherited PATH verbatim. The
+    // reroute dir arrives as `$ATERM_REROUTE_DIR` from the front door, which owns the
     // store (`reroute_dir_from_env`); `ATERM_NO_REROUTE` engaged ⇒ no prepend and no
-    // export, the same rule the stubs and the window apply. The dir is re-exported so the
-    // shell integration can re-assert it first after the user's rc files have run.
+    // export, the same rule the stubs and the window apply.
+    //
+    // WHAT THIS PAIR IS IN THIS LANE (audit 2026-09-16): the PRE-RC environment of a
+    // LOGIN shell (`aterm-pty` spawns `-zsh`) that carries NO aterm shell integration —
+    // that is the window's ZDOTDIR/`--rcfile` seam, gated on `ATERM_CHILD` /
+    // `ATERM_SESSION_ID`, and this lane sets neither (below). So the order composed here
+    // holds until the user's startup files run and no further: on macOS `/etc/zprofile`'s
+    // `path_helper` rebuilds PATH first (measured on this Mac, 2026-09-16: the two managed
+    // dirs at positions 12–13, behind `/usr/local/bin` and `/opt/homebrew/bin`), and what
+    // puts `agents/` FIRST at the prompt is the rc-sourced `~/.aterm/shell.d/00-atpkg.*`
+    // hook atpkg wires into the rc — once, at shell start. There is no per-prompt
+    // re-assert and no live hook re-source here; those are the window tab's
+    // (`__aterm_managed_path_live`). The reroute dir is still re-exported so a NESTED
+    // window or session reads the same handle; nothing here exports `ATPKG_AGENTS`, so a
+    // shell that does get the integration still sources the hook the moment it lands.
     let reroute_dir = reroute_dir_from_env();
+    let agents_dir = managed_agents_dir(
+        reroute_dir.as_deref(),
+        std::env::var(AGENTS_DIR_ENV).ok().as_deref(),
+    );
     let mut env_add: Vec<(String, String)> = session_path_env(
         reroute_dir.as_deref(),
+        agents_dir.as_deref(),
         front_door_bin_dir().as_deref(),
         std::env::var("PATH").ok().as_deref(),
     )
@@ -1825,12 +2072,13 @@ pub fn session_main(quiet: bool) -> ! {
 #[cfg(test)]
 mod tests {
     use super::{
-        CliAction, DIAG_COMMANDS, DrClass, FdaState, Mark, NO_REROUTE_ENV, PrivacyFacts,
-        ProbeLabel, REROUTE_DIR_ENV, SESSION_MODEL_ENV, VERB_BLURB_COLUMN, Verb, decide_args,
-        diag_report, doctor_checks, doctor_report, explain_config_report, help_text,
-        is_tool_candidate, list_fonts_report, list_themes_report, prepend_path,
-        session_model_armed, session_path_env, show_face_report, validate_containment_value,
-        verb_help_block, version_text,
+        AGENTS_DIR_ENV, CliAction, DIAG_COMMANDS, DrClass, FdaState, Mark, NO_REROUTE_ENV,
+        PrivacyFacts, ProbeLabel, REROUTE_DIR_ENV, SESSION_MODEL_ENV, VERB_BLURB_COLUMN, Verb,
+        agents_dir_mode, decide_args, diag_report, doctor_checks, doctor_report,
+        explain_config_report, help_text, is_tool_candidate, list_fonts_report, list_themes_report,
+        managed_agents_dir, prepend_path, reroute_dir_from_values, session_model_armed,
+        session_path_env, show_face_report, validate_containment_value, verb_help_block,
+        version_text,
     };
 
     fn decide(args: &[&str]) -> CliAction {
@@ -2281,7 +2529,12 @@ mod tests {
         let bin = "/opt/aterm/bin";
         // Front position, ahead of the front door and the inherited PATH.
         assert_eq!(
-            session_path_env(Some(reroute), Some(bin), Some(&join(&["/usr/bin", "/bin"]))),
+            session_path_env(
+                Some(reroute),
+                None,
+                Some(bin),
+                Some(&join(&["/usr/bin", "/bin"]))
+            ),
             Some((
                 "PATH".to_string(),
                 join(&[reroute, bin, "/usr/bin", "/bin"])
@@ -2290,43 +2543,479 @@ mod tests {
         // Listed later (twice) in the inherited PATH: moved to the front, once.
         let inherited = join(&["/Users//u/.cargo/bin", reroute, bin, "/usr/bin", reroute]);
         let (_, value) =
-            session_path_env(Some(reroute), Some(bin), Some(&inherited)).expect("injects");
+            session_path_env(Some(reroute), None, Some(bin), Some(&inherited)).expect("injects");
         assert_eq!(
             value,
             join(&[reroute, "/Users//u/.cargo/bin", bin, "/usr/bin"])
         );
         assert_eq!(value.matches(reroute).count(), 1);
         // Applied to its own output: the same value (a nested aterm stacks nothing).
-        let (_, again) = session_path_env(Some(reroute), Some(bin), Some(&value)).expect("injects");
+        let (_, again) =
+            session_path_env(Some(reroute), None, Some(bin), Some(&value)).expect("injects");
         assert_eq!(again, value);
         // No front door (a lone binary), no inherited PATH: the reroute dir alone.
         assert_eq!(
-            session_path_env(Some(reroute), None, None).map(|p| p.1),
+            session_path_env(Some(reroute), None, None, None).map(|p| p.1),
             Some(reroute.to_string())
         );
         assert_eq!(
-            session_path_env(Some(reroute), None, Some("")).map(|p| p.1),
+            session_path_env(Some(reroute), None, None, Some("")).map(|p| p.1),
             Some(reroute.to_string())
         );
         // No reroute dir (`--no-reroute`, Windows): `prepend_path`'s contract, unchanged.
         assert_eq!(
-            session_path_env(None, Some(bin), Some("/usr/bin")),
+            session_path_env(None, None, Some(bin), Some("/usr/bin")),
             prepend_path(bin, Some("/usr/bin"))
         );
         assert_eq!(
-            session_path_env(None, Some(bin), Some(&join(&["/usr/bin", bin]))),
+            session_path_env(None, None, Some(bin), Some(&join(&["/usr/bin", bin]))),
             None
         );
-        assert_eq!(session_path_env(None, None, Some("/usr/bin")), None);
+        assert_eq!(session_path_env(None, None, None, Some("/usr/bin")), None);
     }
 
-    /// The two reroute variables this crate reads are atpkg's spellings — restated in
-    /// this crate because atpkg is a test-only dependency here, and pinned so the two
-    /// copies cannot drift apart.
+    /// THE TTY SESSION'S SHELL GETS THE MANAGED `agents/` IN FRONT (2026-09-16), in the
+    /// window's order — reroute, agents, front door, inherited — by the same
+    /// move-to-front rule: a `~/.local/bin` (Anthropic's native `claude`) or
+    /// `/opt/homebrew/bin` (the casks) listed ahead of it in the inherited PATH ends up
+    /// behind it, every earlier occurrence removed, idempotently. Owner, 2026-09-16:
+    /// "all the latest and best MUST WORK IN THE SAME TAB with live update!" — an
+    /// `aterm` session in another terminal is a tab too.
+    #[test]
+    fn session_path_puts_the_agents_dir_second_by_the_same_move_to_front_rule() {
+        let sep = if cfg!(windows) { ';' } else { ':' };
+        let join = |parts: &[&str]| parts.join(&sep.to_string());
+        let reroute = "/Users//u/Library/Application Support/aterm/pkg/reroute";
+        let agents = "/Users//u/Library/Application Support/aterm/pkg/agents";
+        let bin = "/opt/aterm/bin";
+        let foreign = ["/Users//u/.local/bin", "/opt/homebrew/bin", "/usr/bin"];
+        // The window's order, ahead of the foreign homes.
+        let (_, value) = session_path_env(
+            Some(reroute),
+            Some(agents),
+            Some(bin),
+            Some(&join(&foreign)),
+        )
+        .expect("injects");
+        assert_eq!(
+            value,
+            join(&[
+                reroute,
+                agents,
+                bin,
+                "/Users//u/.local/bin",
+                "/opt/homebrew/bin",
+                "/usr/bin"
+            ])
+        );
+        // Listed later (twice, behind the foreign homes): moved to the front, once.
+        let inherited = join(&["/Users//u/.local/bin", agents, "/opt/homebrew/bin", agents]);
+        let (_, value) =
+            session_path_env(Some(reroute), Some(agents), None, Some(&inherited)).expect("injects");
+        assert_eq!(
+            value,
+            join(&[reroute, agents, "/Users//u/.local/bin", "/opt/homebrew/bin"])
+        );
+        assert_eq!(value.matches(agents).count(), 1);
+        // Applied to its own output: the same value.
+        let (_, again) =
+            session_path_env(Some(reroute), Some(agents), None, Some(&value)).expect("injects");
+        assert_eq!(again, value);
+        // Without a reroute dir the agents dir still leads (`$ATPKG_AGENTS` from an
+        // enclosing shell); alone, it is the whole PATH.
+        assert_eq!(
+            session_path_env(None, Some(agents), Some(bin), Some("/usr/bin")).map(|p| p.1),
+            Some(join(&[agents, bin, "/usr/bin"]))
+        );
+        assert_eq!(
+            session_path_env(None, Some(agents), None, None).map(|p| p.1),
+            Some(agents.to_string())
+        );
+    }
+
+    /// The agents dir this crate derives is atpkg's own: `reroute/` and `agents/` are
+    /// siblings under the one manager prefix (`Layout::reroute_dir`, `Layout::agents_dir`),
+    /// so `<parent of $ATERM_REROUTE_DIR>/agents` IS `Layout::agents_dir` for the same
+    /// prefix — pinned against the real layout (atpkg is a test-only dependency here), so
+    /// a relocation of either directory in atpkg fails this test rather than silently
+    /// putting a directory that is not the store's in front of every session's PATH.
+    /// And the derivation ENSURES the directory (private, `0700`), the window's own
+    /// discipline, so the very first session on a fresh machine has it on PATH before
+    /// atpkg lays a twin.
+    #[test]
+    fn the_agents_dir_is_the_reroute_dirs_sibling_in_atpkgs_layout() {
+        let scratch = std::env::temp_dir().join(format!(
+            "aterm-cli-agents-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map_or(0, |d| d.as_nanos())
+        ));
+        let layout = atpkg::store::Layout {
+            prefix: scratch.join("pkg"),
+        };
+        let reroute = layout.reroute_dir();
+        std::fs::create_dir_all(&reroute).expect("the front door's reroute dir");
+        assert!(
+            !layout.agents_dir().is_dir(),
+            "a fresh prefix has no agents/"
+        );
+        let derived = managed_agents_dir(reroute.to_str(), None).expect("derived and created");
+        assert_eq!(derived, layout.agents_dir().to_str().unwrap());
+        assert!(layout.agents_dir().is_dir(), "ensured, like the window's");
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt as _;
+            let mode = std::fs::metadata(layout.agents_dir())
+                .unwrap()
+                .permissions()
+                .mode()
+                & 0o777;
+            assert_eq!(mode, 0o700, "a $HOME prefix's directory is private");
+        }
+        // A second call is a no-op with the same answer.
+        assert_eq!(
+            managed_agents_dir(reroute.to_str(), None).as_deref(),
+            Some(derived.as_str())
+        );
+        // And the sibling rule is the layout's: the reroute dir is `<prefix>/reroute`.
+        assert_eq!(reroute, layout.prefix.join(atpkg::reroute::DIR_NAME));
+        assert_eq!(layout.agents_dir(), layout.prefix.join("agents"));
+        let _ = std::fs::remove_dir_all(&scratch);
+    }
+
+    /// The reroute variables and the agents variable this crate reads are atpkg's
+    /// spellings — restated in this crate because atpkg is a test-only dependency here,
+    /// and pinned so the copies cannot drift apart. `ATPKG_AGENTS` has no constant on
+    /// atpkg's side; it is the name the shell hook exports, so the pin is the hook body.
     #[test]
     fn reroute_env_names_match_atpkg() {
         assert_eq!(REROUTE_DIR_ENV, atpkg::reroute::REROUTE_DIR_ENV);
         assert_eq!(NO_REROUTE_ENV, atpkg::reroute::NO_REROUTE_ENV);
+        let hooks = atpkg::hooks::hook_files(
+            std::path::Path::new("/p/bin"),
+            std::path::Path::new("/p/agents"),
+        );
+        let zsh = hooks
+            .iter()
+            .find(|(name, _)| name.ends_with(".zsh"))
+            .map(|(_, body)| body.as_str())
+            .expect("the zsh hook");
+        assert!(
+            zsh.contains(&format!("export {AGENTS_DIR_ENV}=")),
+            "the hook exports {AGENTS_DIR_ENV}: {zsh}"
+        );
+    }
+
+    /// A fresh scratch directory for one test, named by pid and nanos.
+    fn scratch_dir(tag: &str) -> std::path::PathBuf {
+        let dir = std::env::temp_dir().join(format!(
+            "aterm-cli-{tag}-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map_or(0, |d| d.as_nanos())
+        ));
+        std::fs::create_dir_all(&dir).expect("scratch dir");
+        dir
+    }
+
+    /// `$ATERM_REROUTE_DIR` is taken only as a non-empty ABSOLUTE path naming an existing
+    /// directory (2026-09-16 audit: a relative inherited stray put first on PATH would
+    /// resolve against every later cwd, and its derived `agents/` sibling would be created
+    /// in the session's cwd), and never while `$ATERM_NO_REROUTE` is engaged — by
+    /// `env_flag_engaged`'s reading, so `0` and the empty string do not engage it.
+    #[test]
+    fn reroute_dir_from_values_takes_only_an_absolute_existing_dir() {
+        let scratch = scratch_dir("reroute-values");
+        let reroute = scratch.join("reroute");
+        std::fs::create_dir(&reroute).unwrap();
+        let abs = reroute.to_str().unwrap();
+        assert_eq!(
+            reroute_dir_from_values(None, Some(abs)).as_deref(),
+            Some(abs)
+        );
+        assert_eq!(
+            reroute_dir_from_values(Some(""), Some(abs)).as_deref(),
+            Some(abs)
+        );
+        assert_eq!(
+            reroute_dir_from_values(Some("0"), Some(abs)).as_deref(),
+            Some(abs)
+        );
+        assert_eq!(reroute_dir_from_values(Some("1"), Some(abs)), None);
+        assert_eq!(reroute_dir_from_values(None, None), None);
+        assert_eq!(reroute_dir_from_values(None, Some("")), None);
+        assert_eq!(
+            reroute_dir_from_values(None, Some("reroute")),
+            None,
+            "relative"
+        );
+        assert_eq!(
+            reroute_dir_from_values(None, Some("./reroute")),
+            None,
+            "relative"
+        );
+        assert_eq!(
+            reroute_dir_from_values(None, scratch.join("absent").to_str()),
+            None,
+            "must exist"
+        );
+        let _ = std::fs::remove_dir_all(&scratch);
+    }
+
+    /// `agents_dir_mode` IS `Layout::ensure_dir`'s rule (`0700` for the `$HOME` shape,
+    /// `0755` for a root-owned system prefix, `platform::dir_meta_is_system`'s
+    /// "root-owned and not group/other-writable"), plus the refusal `ensure_dir` never
+    /// needs because atpkg vets its prefix first: a prefix owned by another user. The
+    /// `sudo aterm` cases are the ones that bit (audit 2026-09-16): root over a system
+    /// prefix gets `0755`, not the `0700` no other user could traverse; root over a
+    /// user's `$HOME` prefix creates nothing.
+    #[test]
+    fn agents_dir_mode_restates_layout_ensure_dirs_rule() {
+        // A user's own $HOME prefix, by that user.
+        assert_eq!(agents_dir_mode(501, 0o700, 501), Some(0o700));
+        assert_eq!(agents_dir_mode(501, 0o755, 501), Some(0o700));
+        // A system prefix, by any user: 0755 (a non-root mkdir there fails on its own).
+        assert_eq!(agents_dir_mode(0, 0o755, 0), Some(0o755));
+        assert_eq!(agents_dir_mode(0, 0o755, 501), Some(0o755));
+        assert_eq!(agents_dir_mode(0, 0o700, 0), Some(0o755));
+        // Root-owned but group/other-writable is NOT the system shape; root owns it ⇒ 0700.
+        assert_eq!(agents_dir_mode(0, 0o775, 0), Some(0o700));
+        assert_eq!(agents_dir_mode(0, 0o777, 501), None);
+        // Someone else's prefix: refused — root over a user's $HOME prefix included.
+        assert_eq!(agents_dir_mode(501, 0o700, 0), None);
+        assert_eq!(agents_dir_mode(501, 0o700, 502), None);
+    }
+
+    /// `managed_agents_dir` derives and creates NOTHING from a relative reroute handle
+    /// (no `./agents` in the session's cwd, no relative entry first on PATH), refuses a
+    /// symlink and a regular file at `agents/` (as atpkg's `ensure_shared_dir` /
+    /// `ensure_private_dir` refuse a symlink — a pre-created link must never capture the
+    /// twins), and with no derivable directory — no handle, a refused one — falls back to
+    /// the enclosing shell's `$ATPKG_AGENTS` only when that is an absolute existing
+    /// directory. The derived directory wins over the fallback.
+    #[test]
+    fn managed_agents_dir_refuses_relative_handles_and_links_and_falls_back_to_the_enclosing_shell()
+    {
+        let scratch = scratch_dir("agents-refuse");
+        let cwd_agents = std::path::Path::new("agents");
+        assert!(
+            !cwd_agents.exists(),
+            "precondition: the test cwd has no `agents` entry"
+        );
+        // Relative handle: nothing derived, nothing created.
+        assert_eq!(managed_agents_dir(Some("reroute"), None), None);
+        assert_eq!(managed_agents_dir(Some("./pkg/reroute"), None), None);
+        assert!(!cwd_agents.exists(), "no `agents` created in the cwd");
+        // Fallback shapes.
+        let enclosing = scratch.join("enclosing-agents");
+        std::fs::create_dir(&enclosing).unwrap();
+        let enclosing_str = enclosing.to_str().unwrap();
+        assert_eq!(
+            managed_agents_dir(None, Some(enclosing_str)).as_deref(),
+            Some(enclosing_str)
+        );
+        assert_eq!(
+            managed_agents_dir(Some("reroute"), Some(enclosing_str)).as_deref(),
+            Some(enclosing_str),
+            "a refused relative handle still leaves the fallback"
+        );
+        assert_eq!(managed_agents_dir(None, Some("")), None);
+        assert_eq!(managed_agents_dir(None, Some("agents")), None, "relative");
+        assert_eq!(
+            managed_agents_dir(None, scratch.join("absent").to_str()),
+            None,
+            "must exist"
+        );
+        assert_eq!(managed_agents_dir(None, None), None);
+        // Derived wins over the fallback.
+        let prefix = scratch.join("pkg");
+        let reroute = prefix.join("reroute");
+        std::fs::create_dir_all(&reroute).unwrap();
+        let derived = managed_agents_dir(reroute.to_str(), Some(enclosing_str)).expect("derived");
+        assert_eq!(derived, prefix.join("agents").to_str().unwrap());
+        // A regular file at agents/: refused (said on stderr), left alone; the enclosing
+        // shell's directory — one that shell already had first on its PATH — is still the
+        // fallback, as it was before the refusal existed.
+        let filed = scratch.join("filed");
+        std::fs::create_dir_all(filed.join("reroute")).unwrap();
+        std::fs::write(filed.join("agents"), b"not a dir").unwrap();
+        assert_eq!(
+            managed_agents_dir(filed.join("reroute").to_str(), None),
+            None
+        );
+        assert_eq!(
+            managed_agents_dir(filed.join("reroute").to_str(), Some(enclosing_str)).as_deref(),
+            Some(enclosing_str)
+        );
+        assert!(filed.join("agents").is_file(), "left alone");
+        #[cfg(unix)]
+        {
+            // A symlink at agents/ — even one that points at a real directory: refused.
+            let linked = scratch.join("linked");
+            std::fs::create_dir_all(linked.join("reroute")).unwrap();
+            std::os::unix::fs::symlink(&enclosing, linked.join("agents")).unwrap();
+            assert!(linked.join("agents").is_dir(), "the link resolves");
+            assert_eq!(
+                managed_agents_dir(linked.join("reroute").to_str(), None),
+                None
+            );
+            assert_eq!(
+                managed_agents_dir(linked.join("reroute").to_str(), Some(enclosing_str)).as_deref(),
+                Some(enclosing_str)
+            );
+            assert!(
+                std::fs::symlink_metadata(linked.join("agents"))
+                    .unwrap()
+                    .file_type()
+                    .is_symlink(),
+                "left alone"
+            );
+        }
+        let _ = std::fs::remove_dir_all(&scratch);
+    }
+
+    /// A prefix that refuses the `mkdir` (read-only, owned by us) yields `None` — said on
+    /// stderr, never a nonexistent entry first on PATH — and creates nothing. Root
+    /// ignores mode bits, so the case is not observable as root and is skipped there.
+    #[cfg(unix)]
+    #[test]
+    fn managed_agents_dir_says_no_when_the_prefix_refuses_the_mkdir() {
+        use std::os::unix::fs::PermissionsExt as _;
+        // SAFETY: getuid() takes no arguments and cannot fail.
+        if unsafe { libc::getuid() } == 0 {
+            eprintln!("running as root; a read-only prefix refuses nothing — skipping");
+            return;
+        }
+        let scratch = scratch_dir("agents-readonly");
+        let prefix = scratch.join("pkg");
+        let reroute = prefix.join("reroute");
+        std::fs::create_dir_all(&reroute).unwrap();
+        std::fs::set_permissions(&prefix, std::fs::Permissions::from_mode(0o500)).unwrap();
+        assert_eq!(managed_agents_dir(reroute.to_str(), None), None);
+        assert!(!prefix.join("agents").exists());
+        std::fs::set_permissions(&prefix, std::fs::Permissions::from_mode(0o700)).unwrap();
+        // Writable again: created, private.
+        assert_eq!(
+            managed_agents_dir(reroute.to_str(), None).as_deref(),
+            prefix.join("agents").to_str()
+        );
+        let mode = std::fs::metadata(prefix.join("agents"))
+            .unwrap()
+            .permissions()
+            .mode()
+            & 0o7777;
+        assert_eq!(mode, 0o700);
+        let _ = std::fs::remove_dir_all(&scratch);
+    }
+
+    /// THE TTY LANE'S PATH, MEASURED AT A REAL PROMPT (audit 2026-09-16). The session
+    /// hands its shell `session_path_env`'s order and spawns it as a LOGIN shell with no
+    /// aterm shell integration, so what a user sees at the prompt is what the startup
+    /// files leave. Two runs of `/bin/zsh -l -i -c 'print -r -- $PATH'` with a private
+    /// `ZDOTDIR` and an empty `HOME`:
+    ///
+    /// 1. an EMPTY `.zshrc` — the pre-rc front-insert alone. Where `/etc/zprofile` runs
+    ///    `path_helper` (macOS), the managed dirs come out DEMOTED behind `/etc/paths`'
+    ///    list (measured here 2026-09-16: positions 12–13, behind `/usr/local/bin` and
+    ///    `/opt/homebrew/bin`) — the honest shape of this lane's front-insert; both
+    ///    survive, exactly once. Elsewhere only survival is asserted.
+    /// 2. a `.zshrc` sourcing atpkg's REAL `00-atpkg.zsh` hook body (the crate is a
+    ///    test-only dependency here), the block atpkg wires into `~/.zshrc`: `agents/`
+    ///    is FIRST at the prompt, exactly once, the reroute dir still present — this is
+    ///    what makes the managed `claude`/`codex` lead in a TTY session.
+    #[cfg(unix)]
+    #[test]
+    fn a_login_zsh_demotes_the_seams_front_insert_and_the_rc_hook_moves_agents_first() {
+        let zsh = std::path::Path::new("/bin/zsh");
+        if !zsh.exists() {
+            eprintln!("/bin/zsh not installed; skipping the login-zsh PATH measurement");
+            return;
+        }
+        let scratch = scratch_dir("login-zsh");
+        let home = scratch.join("home");
+        let zdotdir = scratch.join("zdotdir");
+        let prefix = scratch.join("pkg");
+        let reroute = prefix.join("reroute");
+        std::fs::create_dir_all(&home).unwrap();
+        std::fs::create_dir_all(&zdotdir).unwrap();
+        std::fs::create_dir_all(&reroute).unwrap();
+        let agents = managed_agents_dir(reroute.to_str(), None).expect("derived and created");
+        let reroute = reroute.to_str().unwrap().to_owned();
+        let foreign = "/opt/homebrew/bin:/usr/bin:/bin";
+        let (_, seam_path) = session_path_env(
+            Some(&reroute),
+            Some(&agents),
+            Some("/opt/aterm/bin"),
+            Some(foreign),
+        )
+        .expect("injects");
+        assert!(seam_path.starts_with(&format!("{reroute}:{agents}:")));
+        let prompt_path = |rc: &str| -> Vec<String> {
+            std::fs::write(zdotdir.join(".zshrc"), rc).unwrap();
+            let out = std::process::Command::new(zsh)
+                .args(["-l", "-i", "-c", "print -r -- $PATH"])
+                .env_clear()
+                .env("HOME", &home)
+                .env("ZDOTDIR", &zdotdir)
+                .env("TERM", "dumb")
+                .env("PATH", &seam_path)
+                .stdin(std::process::Stdio::null())
+                .output()
+                .expect("spawn /bin/zsh");
+            assert!(
+                out.status.success(),
+                "zsh: {}",
+                String::from_utf8_lossy(&out.stderr)
+            );
+            String::from_utf8_lossy(&out.stdout)
+                .trim_end()
+                .split(':')
+                .map(str::to_owned)
+                .collect()
+        };
+        // 1. The pre-rc front-insert alone.
+        let bare = prompt_path("");
+        assert_eq!(bare.iter().filter(|e| **e == agents).count(), 1, "{bare:?}");
+        assert_eq!(
+            bare.iter().filter(|e| **e == reroute).count(),
+            1,
+            "{bare:?}"
+        );
+        let path_helper_runs = std::fs::read_to_string("/etc/zprofile")
+            .is_ok_and(|body| body.contains("path_helper"))
+            && std::path::Path::new("/usr/libexec/path_helper").exists();
+        if path_helper_runs {
+            assert_ne!(
+                bare[0], agents,
+                "path_helper rebuilds PATH ahead of the seam's order: {bare:?}"
+            );
+            assert_eq!(bare[0], "/usr/local/bin", "/etc/paths leads: {bare:?}");
+        }
+        // 2. The rc-sourced atpkg hook, the block atpkg wires into ~/.zshrc.
+        let hook = atpkg::hooks::hook_files(&prefix.join("bin"), std::path::Path::new(&agents))
+            .into_iter()
+            .find(|(name, _)| name.ends_with(".zsh"))
+            .map(|(_, body)| body)
+            .expect("the zsh hook");
+        let shell_d = home.join(".aterm/shell.d");
+        std::fs::create_dir_all(&shell_d).unwrap();
+        std::fs::write(shell_d.join("00-atpkg.zsh"), hook).unwrap();
+        let hooked = prompt_path(
+            "[ -f \"$HOME/.aterm/shell.d/00-atpkg.zsh\" ] && . \"$HOME/.aterm/shell.d/00-atpkg.zsh\"\n",
+        );
+        assert_eq!(
+            hooked[0], agents,
+            "the hook moves agents/ first: {hooked:?}"
+        );
+        assert_eq!(
+            hooked.iter().filter(|e| **e == agents).count(),
+            1,
+            "{hooked:?}"
+        );
+        assert!(hooked.contains(&reroute), "{hooked:?}");
+        let _ = std::fs::remove_dir_all(&scratch);
     }
 
     #[test]
@@ -2479,7 +3168,17 @@ mod tests {
             "Apply now",
             "regardless of $HOME",
             "com.apple.universalcontrol Disable",
-            "target.noindex back to target",
+            // The undo, in BOTH shapes: the symlink a git checkout has, and the
+            // `.cargo/config.toml` line a tree without one got instead. The page used
+            // to describe only the first, so the documented undo left cargo pointed at
+            // a directory that no longer existed.
+            "renaming target.noindex back",
+            "[build] target-dir",
+            ".cargo/config.toml, so delete that line as well",
+            // And the half that makes the Universal Control revert stick.
+            "or the next pass disables it again",
+            // The refusal a reader otherwise files as a bug.
+            "does not parse",
         ] {
             assert!(r.contains(needle), "explain-config missing {needle:?}\n{r}");
         }
@@ -2906,12 +3605,18 @@ mod tests {
         }
     }
 
-    /// `--version` keeps its identity line first (install.sh greps `^aterm `) and then
-    /// says which copy runs — the updater's own S12 lines, verbatim.
+    /// `--version` keeps its identity line first (install.sh greps `^aterm `), then
+    /// the origin line (who makes it), and then says which copy runs — the
+    /// updater's own S12 lines, verbatim.
     #[test]
     fn version_text_names_the_running_copy_and_any_other() {
         use aterm_update::which_copy::{OtherCopy, Running, WhichCopy};
-        let identity = format!("aterm {}\n", aterm_types::version::APP_VERSION);
+        let identity = format!(
+            "aterm {}\n{}\n",
+            aterm_types::version::APP_VERSION,
+            aterm_types::identity::ORIGIN_LINE
+        );
+        assert!(identity.contains("by Andrew Yates") && identity.contains("alab.systems"));
         let anchors = super::trust_anchors_line();
         assert!(
             anchors.starts_with("trusts: master=") && anchors.contains(" channel="),

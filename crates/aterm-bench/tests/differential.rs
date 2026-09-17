@@ -48,11 +48,12 @@
 use alacritty_terminal::Term;
 use alacritty_terminal::event::VoidListener;
 use alacritty_terminal::index::{Column, Line};
-use alacritty_terminal::term::Config;
 use alacritty_terminal::term::cell::{Cell as AlaCell, Flags};
+use alacritty_terminal::term::{Config, TermMode};
 use alacritty_terminal::vte::ansi::{Color as AlaColor, NamedColor, Processor};
 use aterm_core::terminal::UnderlineStyle;
 use proptest::prelude::*;
+use std::borrow::Cow;
 
 const ROWS: usize = 24;
 const COLS: usize = 80;
@@ -387,7 +388,12 @@ fn alacritty_screen(input: &[u8]) -> Screen {
     // Pin the defaulted Timeout type param (StdSyncHandler).
     let mut parser: Processor = Processor::new();
     parser.advance(&mut term, input);
+    alacritty_project(&term, &pal)
+}
 
+/// Project `term`'s active grid through `pal` (aterm's palette and defaults for
+/// the same input) into a normalized [`Screen`].
+fn alacritty_project(term: &Term<VoidListener>, pal: &AtermPalette) -> Screen {
     let grid = term.grid();
     let rows = (0..ROWS)
         .map(|r| {
@@ -402,7 +408,7 @@ fn alacritty_screen(input: &[u8]) -> Screen {
                     let is_spacer = cell
                         .flags
                         .intersects(Flags::WIDE_CHAR_SPACER | Flags::LEADING_WIDE_CHAR_SPACER);
-                    let (fg, bg) = ala_resolve(cell, &pal);
+                    let (fg, bg) = ala_resolve(cell, pal);
                     CellProj {
                         ch: if is_spacer {
                             ' '
@@ -765,6 +771,58 @@ const PINNED_ALACRITTY_DIVERGENCES: &[PinnedDivergence] = &[
         input: b"\x1b[21mx",
         why: "xterm CASE_SGR 21 sets double-underline (DOUBLE_UNDERLINE); alacritty 0.26 treats SGR 21 as CancelBold (no decoration). aterm matches xterm.",
     },
+    // --- the deferred-wrap reset on ED / EL / 1049h (see the COUNTERFACTUAL-ORACLE
+    // section below for the class gates that generalize these repros) ---
+    PinnedDivergence {
+        name: "EL 0 at pending wrap clears the parked glyph",
+        input: b"\x1b[1;80H!\x1b[K",
+        why: "xterm CASE_EL -> util.c do_erase_line(0) -> ClearRight(xw,-1) clears from cur_col INCLUSIVE, and while do_wrap is set cur_col is the parked last column, so the '!' at col 79 is erased; alacritty clear_line(Right) returns early while input_needs_wrap and keeps it. aterm matches xterm.",
+    },
+    PinnedDivergence {
+        name: "EL 0 at pending wrap resets the wrap",
+        input: b"\x1b[1;80H!\x1b[K?",
+        why: "xterm util.c ClearRight ends with ResetWrap, so the '?' overwrites col 79; alacritty clear_line(Right) returns early with input_needs_wrap still set, so the parked '!' stays and '?' wraps to (1,0). aterm matches xterm.",
+    },
+    PinnedDivergence {
+        name: "ED 0 at pending wrap resets the wrap",
+        input: b"\x1b[1;80H!\x1b[J?",
+        why: "xterm CASE_ED -> util.c do_erase_display(0) -> ClearBelow -> ClearRight(xw,-1) clears col 79 and ends with ResetWrap, so '?' overwrites col 79; alacritty clear_screen(Below) clears the cells but keeps input_needs_wrap, so '?' wraps to (1,0). aterm matches xterm.",
+    },
+    PinnedDivergence {
+        name: "ED 1 at pending wrap resets the wrap",
+        input: b"\x1b[1;80H!\x1b[1J?",
+        why: "xterm util.c do_erase_display(1) -> ClearAbove -> ClearLeft -> ClearInLine2, which calls ResetWrap, so '?' overwrites col 79; alacritty clear_screen(Above) keeps input_needs_wrap and wraps '?' to (1,0). aterm matches xterm.",
+    },
+    PinnedDivergence {
+        name: "ED 2 at pending wrap resets the wrap",
+        input: b"\x1b[1;80H!\x1b[2J?",
+        why: "xterm util.c do_erase_display(2) -> ClearScreen, which calls ResetWrap, so '?' overwrites col 79; alacritty clear_screen(All) keeps input_needs_wrap and wraps '?' to (1,0). aterm matches xterm.",
+    },
+    PinnedDivergence {
+        name: "EL 1 at pending wrap resets the wrap",
+        input: b"\x1b[1;80H!\x1b[1K?",
+        why: "xterm util.c do_erase_line(1) -> ClearLeft -> ClearInLine2, which calls ResetWrap, so '?' overwrites col 79; alacritty clear_line(Left) keeps input_needs_wrap and wraps '?' to (1,0). aterm matches xterm.",
+    },
+    PinnedDivergence {
+        name: "EL 2 at pending wrap resets the wrap",
+        input: b"\x1b[1;80H!\x1b[2K?",
+        why: "xterm util.c do_erase_line(2) -> ClearLine -> ClearInLine2, which calls ResetWrap, so '?' overwrites col 79; alacritty clear_line(All) keeps input_needs_wrap and wraps '?' to (1,0). aterm matches xterm.",
+    },
+    PinnedDivergence {
+        name: "ED 0 at pending wrap on the bottom row does not scroll",
+        input: b"\x1b[24;80H!\x1b[J?",
+        why: "xterm util.c ClearBelow -> ClearRight ends with ResetWrap, so the '?' after ED 0 on the bottom row overwrites col 79 and nothing scrolls; alacritty keeps input_needs_wrap and its wrapline at the region bottom linefeeds, scrolling the screen and printing '?' at (23,0). aterm matches xterm.",
+    },
+    PinnedDivergence {
+        name: "EL 2 at pending wrap on the region bottom does not scroll",
+        input: b"\x1b[5;10r\x1b[10;80H!\x1b[2K?",
+        why: "xterm util.c ClearLine -> ClearInLine2 calls ResetWrap, so the '?' after EL 2 on the DECSTBM bottom margin overwrites col 79 and nothing scrolls; alacritty keeps input_needs_wrap and its wrapline scrolls the 5..10 region, printing '?' at (9,0). aterm matches xterm.",
+    },
+    PinnedDivergence {
+        name: "1049h at pending wrap resets the wrap",
+        input: b"\x1b[1;80H!\x1b[?1049h?",
+        why: "xterm charproc.c srm_OPT_ALTBUF_CURSOR set runs CursorSave; ToAlternate; ClearScreen, and ClearScreen's ResetWrap (util.c) runs last, so '?' overwrites the alt screen's col 79; alacritty swap_alt copies the primary cursor, input_needs_wrap included, into the alt grid, so '?' wraps to (1,0). aterm matches xterm.",
+    },
 ];
 
 /// DEC Special Graphics (line-drawing) translation for the `0x5f..=0x7e` range,
@@ -818,6 +876,10 @@ fn dec_special_graphics(c: char) -> Option<char> {
 /// Rather than match the INPUT (the coarse-substring trap the oracle redesign
 /// A differing (aterm, alacritty) cell pair extracted from a divergence.
 struct CellDiff {
+    /// Screen row of the cell.
+    row: usize,
+    /// Screen column of the cell.
+    col: usize,
     a: CellProj,
     b: CellProj,
 }
@@ -848,7 +910,12 @@ fn collect_cell_diffs(input: &[u8]) -> Option<(Vec<CellDiff>, bool)> {
             let ca = a.rows[r].get(col).copied().unwrap_or(blank);
             let cb = b.rows[r].get(col).copied().unwrap_or(blank);
             if ca != cb {
-                diffs.push(CellDiff { a: ca, b: cb });
+                diffs.push(CellDiff {
+                    row: r,
+                    col,
+                    a: ca,
+                    b: cb,
+                });
             }
         }
     }
@@ -908,7 +975,7 @@ fn is_sgr21_double_underline_divergence(input: &[u8]) -> bool {
     // classifier with the SGR-21 gate already satisfied above).
     diffs
         .iter()
-        .all(|d| cell_diff_is_classifiable(d, true, false))
+        .all(|d| cell_diff_is_classifiable(d, true, false, None))
 }
 
 /// True if `input` has a `CSI … m` (SGR) whose parameter list contains the exact
@@ -989,9 +1056,9 @@ fn is_cursor_cascade_content_shift(input: &[u8]) -> bool {
 /// aterm fills the erased span with the current SGR background (BCE) and clears
 /// the documented region; alacritty either (a) skips the BCE fill, or (b) its
 /// `clear_screen(Above)` `if cursor.line > 1` guard leaves a row uncleared.
-/// Either way the differing cells are EITHER aterm-has-bg / alacritty-default
-/// (BCE drop) OR a glyph that alacritty left where xterm/aterm cleared it. The
-/// input must contain an ED (`CSI J`) or EL (`CSI K`). aterm matches xterm.
+/// Either way every differing cell is one of the shapes in
+/// [`clear_cell_diff_is_classifiable`]. The input must contain an ED (`CSI J`)
+/// or EL (`CSI K`). aterm matches xterm.
 fn is_clear_bce_or_above_divergence(input: &[u8]) -> bool {
     // Require the input to actually contain an ED (`CSI J`) / EL (`CSI K`) op —
     // escape-aware, so a literal 'J'/'K' glyph in printable text does NOT count.
@@ -1005,28 +1072,142 @@ fn is_clear_bce_or_above_divergence(input: &[u8]) -> bool {
     if !cursor_eq || diffs.is_empty() {
         return false;
     }
-    diffs.iter().all(|d| {
-        // (a) aterm painted BCE bg, alacritty left default (alacritty drops BCE
-        //     on this clear) — same glyph, aterm bg != default == alacritty bg.
-        let aterm_bce = d.a.ch == d.b.ch
-            && d.a.bg != d.b.bg
-            && d.a.fg == d.b.fg
-            && d.a.bold == d.b.bold
-            && d.a.italic == d.b.italic
-            && d.a.underline == d.b.underline
-            && d.a.strikethrough == d.b.strikethrough;
-        // (b) aterm cleared a cell to blank that alacritty left as a glyph
-        //     (alacritty's clear-above row>1 guard / off-by-one).
-        let aterm_cleared = d.a.ch == ' ' && d.b.ch != ' ';
-        aterm_bce || aterm_cleared
-    })
+    let ed1_row0 = alacritty_ed1_row0_counterfactual(input);
+    diffs
+        .iter()
+        .all(|d| clear_cell_diff_is_classifiable(d, ed1_row0.as_deref()))
+}
+
+/// alacritty's final row 0 with xterm's ED 1 row-0 clear restored.
+///
+/// alacritty 0.26 `clear_screen(ClearMode::Above)` resets the rows above the
+/// cursor only `if cursor.line > 1` (term/mod.rs), so an ED 1 run with the
+/// cursor on line 1 leaves row 0 as it was, while xterm util.c `ClearAbove`
+/// clears every row above the cursor, as aterm does. This replays ALACRITTY
+/// and, right after each exact `CSI 1 J` that runs with its cursor on line 1
+/// (escape-aware, parameter exactly `1`, no private marker, no intermediate:
+/// the [`wrap_reset_ops`] scan), performs the skipped clear itself:
+/// `reset_region` of row 0, on the grid active at that moment, with the cursor
+/// template alacritty's own clear uses. The rest of the input replays over that
+/// counterfactual grid, so a later write, a later erase or an alt-screen switch
+/// acts on it exactly as on the real one.
+///
+/// The clear is restored only where xterm clears ALL of row 0: `ClearAbove`
+/// resets the rows above the cursor and then `ClearLeft` clears `[0, cur_col]`
+/// of the cursor row, so row 0 is wholly cleared only from a cursor below it.
+/// An earlier alacritty wrap quirk can leave alacritty on line 1 while xterm
+/// and aterm are still on row 0 (proptest swallow repro
+/// `\x1b[1;78H\x1b[1m \x1b[0m  \x1b[K \x08\x08\x08\x1b[1J\x1b[H`); resetting the whole row
+/// there would excuse an aterm ED 1 that over-clears row 0. So aterm replays the
+/// same prefix and the clear is restored only when aterm's cursor row is >= 1
+/// at that same ED 1. The restore also needs both engines on the same buffer at
+/// that ED 1: alacritty 0.26 ignores private modes 47 and 1047 (vte names only
+/// 1049), so after `CSI ?1047h` xterm and aterm erase the alternate buffer while
+/// alacritty erases main, and restoring main row 0 there would excuse an aterm
+/// that wipes main row 0 on the way back (`\x1b[1m \x1b[?1047h\x1b[2;1H\x1b[1J\x1b[?1047l`).
+/// aterm's state only NARROWS the counterfactual: it can withhold a restore,
+/// never add one alacritty's own guard did not skip.
+///
+/// Returns the counterfactual row 0 as `COLS` projected cells, padded the way
+/// [`collect_cell_diffs`] pads, or `None` when no such ED 1 ran (the
+/// counterfactual would be alacritty itself). Where aterm equals this row but
+/// not real alacritty, the skipped clear alone explains the cell. Where the
+/// counterfactual still equals real alacritty, it does not: a cell rewritten
+/// after the ED 1 (even with an identical cell), a row 0 of the other grid, or a
+/// row 0 whose ED 1 ran with aterm's cursor on row 0.
+fn alacritty_ed1_row0_counterfactual(input: &[u8]) -> Option<Vec<CellProj>> {
+    let ed1_spans: Vec<(usize, usize)> = wrap_reset_ops(input)
+        .into_iter()
+        .filter(|&(op, _, _)| op == WrapResetOp::Ed(1))
+        .map(|(_, start, end)| (start, end))
+        .collect();
+    if ed1_spans.is_empty() {
+        return None;
+    }
+    let mut term = Term::new(Config::default(), &Dims, VoidListener);
+    let mut parser: Processor = Processor::new();
+    let mut aterm = aterm_core::terminal::Terminal::new(ROWS as u16, COLS as u16);
+    let mut restored = false;
+    let mut fed = 0;
+    for (start, end) in ed1_spans {
+        parser.advance(&mut term, &input[fed..start]);
+        aterm.process(&input[fed..start]);
+        let skips_row0 = alacritty_ed1_skipped_row0_clear(&term).is_some();
+        // Same row AND same buffer: alacritty 0.26 ignores private modes 47 and
+        // 1047 (vte names only 1049), so after `CSI ?1047h` xterm and aterm run
+        // this ED 1 on the alternate buffer while alacritty runs it on main.
+        let same_buffer = aterm.is_alternate_screen() == term.mode().contains(TermMode::ALT_SCREEN);
+        let xterm_clears_row0 = aterm.cursor().row >= 1 && same_buffer;
+        parser.advance(&mut term, &input[start..end]);
+        aterm.process(&input[start..end]);
+        if skips_row0 && xterm_clears_row0 {
+            // The `reset_region(..cursor.line)` the guard skipped, on this grid.
+            term.grid_mut().reset_region(..Line(1));
+            restored = true;
+        }
+        fed = end;
+    }
+    if !restored {
+        return None;
+    }
+    parser.advance(&mut term, &input[fed..]);
+    let screen = alacritty_project(&term, &aterm_palette(input));
+    let blank = CellProj {
+        ch: ' ',
+        fg: screen.default_fg,
+        bg: screen.default_bg,
+        bold: false,
+        italic: false,
+        underline: Underline::None,
+        strikethrough: false,
+    };
+    let mut row0 = screen.rows.into_iter().next().unwrap_or_default();
+    row0.resize(COLS, blank);
+    Some(row0)
+}
+
+/// The ED/EL clear class for one differing cell. The caller has checked that
+/// an ED or EL is present; `ed1_row0` is [`alacritty_ed1_row0_counterfactual`].
+///   (a) aterm painted BCE bg, alacritty left default (alacritty drops BCE on
+///       this clear): same glyph and attributes, only the bg differs.
+///   (b) aterm cleared a cell to blank that alacritty left as a glyph
+///       (alacritty's clear-above row>1 guard / off-by-one).
+///   (c) on row 0, alacritty kept a STYLED blank (the same space with other
+///       attributes or colors, e.g. a BOLD space: proptest seed cc 9b0599af…,
+///       `\x1b[1m \n\x1b[1J`) and aterm shows a blank equal to alacritty's
+///       counterfactual, where each ED 1 its line-1 guard skipped has cleared
+///       row 0 after all. The cells differ, so real alacritty differs from the
+///       counterfactual there too: the skipped clear alone explains the cell.
+///       A styled blank written after the ED 1 (an identical one included), a
+///       row 0 of the other screen, or a blank aterm wrongly cleared on any
+///       other row still surfaces.
+fn clear_cell_diff_is_classifiable(d: &CellDiff, ed1_row0: Option<&[CellProj]>) -> bool {
+    let aterm_bce = d.a.ch == d.b.ch
+        && d.a.bg != d.b.bg
+        && d.a.fg == d.b.fg
+        && d.a.bold == d.b.bold
+        && d.a.italic == d.b.italic
+        && d.a.underline == d.b.underline
+        && d.a.strikethrough == d.b.strikethrough;
+    let aterm_cleared = d.a.ch == ' ' && d.b.ch != ' ';
+    let ed1_row0_restored_clear = d.row == 0
+        && d.a.ch == ' '
+        && d.b.ch == ' '
+        && ed1_row0.and_then(|row| row.get(d.col)) == Some(&d.a);
+    aterm_bce || aterm_cleared || ed1_row0_restored_clear
 }
 
 /// True if a single differing cell matches one of the documented CELL-level
 /// alacritty quirks (DEC-graphics glyph, SGR-21 underline/bold, ED/EL clear BCE
 /// or off-by-one). `has_sgr21`/`has_clear` gate the SGR-21 and clear classes on
-/// the relevant op actually appearing in the input.
-fn cell_diff_is_classifiable(d: &CellDiff, has_sgr21: bool, has_clear: bool) -> bool {
+/// the relevant op actually appearing in the input; `ed1_row0` is
+/// [`alacritty_ed1_row0_counterfactual`] (`None` when the clear class is off).
+fn cell_diff_is_classifiable(
+    d: &CellDiff,
+    has_sgr21: bool,
+    has_clear: bool,
+    ed1_row0: Option<&[CellProj]>,
+) -> bool {
     // DEC-graphics: aterm shows the DEC translation of alacritty's literal char.
     let dec_graphics = {
         let rendition_eq = d.a.fg == d.b.fg
@@ -1051,17 +1232,7 @@ fn cell_diff_is_classifiable(d: &CellDiff, has_sgr21: bool, has_clear: bool) -> 
         && matches!(d.a.underline, Underline::Double | Underline::Single)
         && matches!(d.b.underline, Underline::None | Underline::Single);
     // ED/EL clear: aterm painted BCE bg or cleared a cell alacritty kept.
-    let clear = has_clear && {
-        let aterm_bce = d.a.ch == d.b.ch
-            && d.a.bg != d.b.bg
-            && d.a.fg == d.b.fg
-            && d.a.bold == d.b.bold
-            && d.a.italic == d.b.italic
-            && d.a.underline == d.b.underline
-            && d.a.strikethrough == d.b.strikethrough;
-        let aterm_cleared = d.a.ch == ' ' && d.b.ch != ' ';
-        aterm_bce || aterm_cleared
-    };
+    let clear = has_clear && clear_cell_diff_is_classifiable(d, ed1_row0);
     dec_graphics || sgr21 || clear
 }
 
@@ -1086,9 +1257,10 @@ fn is_composable_cell_divergence(input: &[u8]) -> bool {
     let has_sgr21 = sgr_contains_param(input, 21);
     // Escape-aware ED/EL detection: a literal 'J'/'K' glyph must NOT gate the clear class.
     let has_clear = csi_final_present(input, b'J') || csi_final_present(input, b'K');
+    let ed1_row0 = alacritty_ed1_row0_counterfactual(input);
     diffs
         .iter()
-        .all(|d| cell_diff_is_classifiable(d, has_sgr21, has_clear))
+        .all(|d| cell_diff_is_classifiable(d, has_sgr21, has_clear, ed1_row0.as_deref()))
 }
 
 /// Class predicate: a CONTENT cascade rooted in one of the documented
@@ -1253,9 +1425,10 @@ fn is_quirk_cascade_with_classifiable_cells(input: &[u8]) -> bool {
     let has_sgr21 = sgr_contains_param(input, 21);
     // Escape-aware ED/EL detection: a literal 'J'/'K' glyph must NOT gate the clear class.
     let has_clear = csi_final_present(input, b'J') || csi_final_present(input, b'K');
+    let ed1_row0 = alacritty_ed1_row0_counterfactual(input);
     let cells_ok = diffs
         .iter()
-        .all(|d| cell_diff_is_classifiable(d, has_sgr21, has_clear));
+        .all(|d| cell_diff_is_classifiable(d, has_sgr21, has_clear, ed1_row0.as_deref()));
     if !cells_ok {
         return false;
     }
@@ -1395,6 +1568,566 @@ fn is_tab_pending_wrap_quirk(input: &[u8]) -> bool {
     input.contains(&b'\t') && collect_cell_diffs(input).is_some()
 }
 
+// ---------------------------------------------------------------------------
+// COUNTERFACTUAL-ORACLE gate: the deferred-wrap reset alacritty skips on an
+// erase, on the 1049 alt-screen enter, and on the character and line edits.
+//
+// xterm resets `do_wrap` on ED/EL 0/1/2 (util.c `ClearRight`, `ClearInLine2`
+// and `ClearScreen` all call `ResetWrap`), on CSI ?1049 h (charproc.c
+// `srm_OPT_ALTBUF_CURSOR`: `CursorSave; ToAlternate; ClearScreen`), on ICH and
+// DCH (charproc.c `CASE_ICH` / `CASE_DCH` -> util.c `InsertChar` / `DeleteChar`,
+// which call `ResetWrap` for a cursor inside the left/right margins, always so
+// without DECLRMM), on ECH (charproc.c `CASE_ECH` -> util.c `do_erase_char` ->
+// `ClearRight`), and on IL / DL for a cursor row inside the scroll region
+// (charproc.c `CASE_IL` / `CASE_DL` -> util.c `InsertLine` / `DeleteLine`, which
+// return before `set_cur_col(left margin)` and `ResetWrap` otherwise). alacritty
+// 0.26 keeps `input_needs_wrap` through every one of them (term/mod.rs
+// `clear_line`, `clear_screen`, `swap_alt`, `insert_blank`, `delete_chars`,
+// `erase_chars`, `insert_blank_lines`, `delete_lines`), and its EL 0 even
+// returns early and keeps the parked glyph. aterm follows xterm (aterm-grid
+// line_ops.rs clears the pending wrap in each edit), so the engines part ways at
+// exactly those instants, and the difference cascades into any later print: a
+// one-row offset, or a region scroll at the bottom margin.
+//
+// Not extended, per source: SU / SD (util.c `xtermScroll` saves and restores
+// `do_wrap`, `RevScroll` never touches it), SL / SR and DECIC / DECDC (util.c
+// `xtermScrollLR` / `xtermColScroll` never reset it, and vte 0.15 dispatches none
+// of them), CHT / CBT (tabs.c `TabToNextStop` / `TabToPrevStop` only
+// `set_cur_col`), and IL / DL with the cursor row outside the scroll region,
+// where xterm keeps the wrap.
+//
+// These classes are NOT recognized from the shape of the diff. The broad
+// predicates further down (`is_clear_bce_or_above_divergence`'s aterm-cleared
+// branch, `cursor_diff_is_pending_wrap`, `is_cursor_cascade_content_shift`)
+// already accept most of these shapes without looking at the ops — and would
+// accept a genuine aterm bug of the same shape just as happily. Instead the gate
+// builds xterm's counterfactual FOR ALACRITTY ONLY and demands an exact match:
+//   1. find each qualifying op in the input, escape-aware and in order;
+//   2. replay ALACRITTY (never aterm — no circular oracle) up to the op; the op
+//      is witnessed only if alacritty holds `input_needs_wrap` at the last column
+//      there (and, for 1049h, is still on the main screen; for IL / DL, has its
+//      cursor row inside the scroll region);
+//   3. insert `CSI C` next to each witnessed op — before an erase, after the
+//      1049h (before it would clear the wrap alacritty SAVES for the main screen,
+//      which xterm's `CursorSave` keeps). alacritty `move_forward` clamps the
+//      column at 79 and clears `input_needs_wrap`. In xterm, cursor.c
+//      `CursorForward` clamps and calls `ResetWrap`, and the erase reads the
+//      unchanged `cur_col`, so xterm(input') == xterm(input): input' is
+//      alacritty with exactly xterm's reset applied. An ICH / DCH / ECH takes the
+//      `CSI C` before it, as an erase does. An IL / DL takes a CR AFTER it
+//      instead: xterm's op both moves to the left margin and resets the wrap, and
+//      alacritty skips both (it keeps the column as well), while cursor.c
+//      `CarriageReturn` (`set_cur_col(left margin); ResetWrap`) changes nothing in
+//      xterm right after that op and alacritty `carriage_return` sets column 0 and
+//      clears `input_needs_wrap`;
+//   4. the class matches only if aterm_screen(input) equals
+//      alacritty_screen(input') on EVERY row and on the cursor. Any residual
+//      difference means "not this class", and the input falls through to the
+//      other predicates on the original bytes.
+// Step 2 replays the ALREADY-REWRITTEN prefix, so a second witnessed op sees the
+// state xterm has after the first reset.
+//
+// Before step 1 the gate also takes SGR 21 out of the comparison. alacritty 0.26
+// reads SGR 21 as CancelBold (vte ansi.rs `attrs_from_sgr_parameters`:
+// `[21] => Attr::CancelBold`), while xterm charproc.c CASE_SGR 21 sets
+// ATR_DBL_UNDER and leaves bold alone, and aterm handler_sgr.rs sets a double
+// underline too. Left in input', a wrap reset whose cascade reaches SGR 21 cells
+// leaves an underline-only residual that no class explains (proptest seed
+// cc 74e9661b…: `CSI 21 m`, then ED 0 at a pending wrap). [`sgr21_as_xterm`]
+// rewrites each SGR parameter both engines read as the code 21 into `4:2`, vte's
+// DoubleUnderline, which alacritty `terminal_attribute` applies by clearing every
+// underline style and setting DOUBLE_UNDERLINE, bold untouched, the way aterm
+// applies its 21. One composition is not xterm's: a later SGR 4 while the double
+// underline is set. xterm keeps both bits and util.c `drawUnderline` still draws
+// two lines, while aterm and alacritty both switch to a single underline. They
+// agree there on the original input as well, so the rewrite hides no difference
+// the plain comparison would show.
+//
+// input' inherits the alacritty CELL quirks of each rewritten op itself: `CSI C`
+// only cancels the wrap, and the erase still runs through alacritty's own clear.
+// Where such a quirk is visible, an aterm bug with the same cells reproduces
+// alacritty(input') exactly and would pass step 4, so step 2 refuses the whole
+// counterfactual instead. Refused today: ED 1 with alacritty's cursor on line 1
+// while row 0 holds a cell the clear would change. alacritty 0.26
+// `clear_screen(ClearMode::Above)` resets the rows above only
+// `if cursor.line > 1` (term/mod.rs), so row 0 survives, where xterm util.c
+// `ClearAbove` clears every row above the cursor. And a DCH with a count above 1
+// while a cell left of the parked column would change: alacritty `delete_chars`
+// clears the row's last `count` cells, where xterm util.c `DeleteChar` clamps the
+// count to `right + 1 - cur_col`, the parked cell alone.
+// ---------------------------------------------------------------------------
+
+/// An op whose deferred-wrap reset alacritty skips (see the section header).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum WrapResetOp {
+    /// EL, `CSI Ps K` with Ps empty, 0, 1 or 2.
+    El(u8),
+    /// ED, `CSI Ps J` with Ps empty, 0, 1 or 2 (ED 3 never resets in xterm).
+    Ed(u8),
+    /// `CSI ? 1049 h`.
+    AltScreen1049Set,
+    /// ICH, `CSI Ps @`.
+    Ich,
+    /// DCH, `CSI Ps P`, with its count (an empty or zero Ps is 1).
+    Dch(u16),
+    /// ECH, `CSI Ps X`.
+    Ech,
+    /// IL, `CSI Ps L`.
+    Il,
+    /// DL, `CSI Ps M`.
+    Dl,
+}
+
+/// Escape-aware scan for [`WrapResetOp`]s, returning each with its byte span
+/// `[start, end)`. Only the exact forms qualify: `CSI K`, `CSI 0 K`, `CSI 1 K`,
+/// `CSI 2 K` (likewise `J`) with no private marker and no intermediate, and the
+/// exact `CSI ? 1049 h`, and `CSI Ps @` / `P` / `X` / `L` / `M` with Ps empty or
+/// one decimal count that fits a u16, again with no private marker and no
+/// intermediate. A DECSEL/DECSED (`CSI ? K`), an ED 3, an SL (`CSI Ps SP @`), a
+/// multi-parameter form or a literal `K` glyph in text never qualifies.
+fn wrap_reset_ops(input: &[u8]) -> Vec<(WrapResetOp, usize, usize)> {
+    let mut ops = Vec::new();
+    let mut i = 0;
+    while i + 1 < input.len() {
+        if input[i] != 0x1b || input[i + 1] != b'[' {
+            i += 1;
+            continue;
+        }
+        let start = i;
+        let mut j = i + 2;
+        let private = match input.get(j) {
+            Some(&b) if (b'<'..=b'?').contains(&b) => {
+                j += 1;
+                Some(b)
+            }
+            _ => None,
+        };
+        let params_start = j;
+        while j < input.len() && (input[j].is_ascii_digit() || input[j] == b';') {
+            j += 1;
+        }
+        let params = &input[params_start..j];
+        let intermediates_start = j;
+        while j < input.len() && (0x20..=0x2f).contains(&input[j]) {
+            j += 1;
+        }
+        let has_intermediate = j > intermediates_start;
+        let Some(&final_byte) = input.get(j) else {
+            break;
+        };
+        if !(0x40..=0x7e).contains(&final_byte) {
+            // Not a well-formed CSI; resume the scan just past this ESC.
+            i += 1;
+            continue;
+        }
+        let end = j + 1;
+        let mode = match params {
+            b"" | b"0" => Some(0),
+            b"1" => Some(1),
+            b"2" => Some(2),
+            _ => None,
+        };
+        // vte `next_param_or(1)`, xterm `one_if_default` and aterm all read an
+        // empty or zero count as 1.
+        let count = match params {
+            b"" => Some(1),
+            _ if params.iter().all(u8::is_ascii_digit) => std::str::from_utf8(params)
+                .ok()
+                .and_then(|s| s.parse::<u16>().ok())
+                .map(|n| n.max(1)),
+            _ => None,
+        };
+        let op = match (private, has_intermediate, final_byte, mode, count) {
+            (None, false, b'K', Some(m), _) => Some(WrapResetOp::El(m)),
+            (None, false, b'J', Some(m), _) => Some(WrapResetOp::Ed(m)),
+            (Some(b'?'), false, b'h', _, _) if params == b"1049" => {
+                Some(WrapResetOp::AltScreen1049Set)
+            }
+            (None, false, b'@', _, Some(_)) => Some(WrapResetOp::Ich),
+            (None, false, b'P', _, Some(n)) => Some(WrapResetOp::Dch(n)),
+            (None, false, b'X', _, Some(_)) => Some(WrapResetOp::Ech),
+            (None, false, b'L', _, Some(_)) => Some(WrapResetOp::Il),
+            (None, false, b'M', _, Some(_)) => Some(WrapResetOp::Dl),
+            _ => None,
+        };
+        if let Some(op) = op {
+            ops.push((op, start, end));
+        }
+        i = end;
+    }
+    ops
+}
+
+/// One op the counterfactual rewrote (step 3 of the gate).
+struct WrapResetWitness {
+    op: WrapResetOp,
+    /// Length of `input'` just before the inserted `CSI C` / the witnessed op:
+    /// `input'[..prefix_len]` is alacritty's state at the op.
+    prefix_len: usize,
+}
+
+/// The row-0 clear alacritty 0.26 skips on ED 1 (`CSI 1 J`) in `term`'s state.
+/// `clear_screen(ClearMode::Above)` resets the rows above the cursor only
+/// `if cursor.line > 1` (term/mod.rs), so with the cursor on line 1 row 0 is
+/// left exactly as it was, where xterm util.c `ClearAbove` clears it. Returns
+/// the cell that clear would have written (`reset_region` -> `Cell::reset`,
+/// which keeps only the cursor template's bg) when the cursor is on line 1, and
+/// `None` on any other line, where the guard skips nothing.
+fn alacritty_ed1_skipped_row0_clear(term: &Term<VoidListener>) -> Option<AlaCell> {
+    let grid = term.grid();
+    (grid.cursor.point.line == Line(1)).then(|| AlaCell {
+        bg: grid.cursor.template.bg,
+        ..AlaCell::default()
+    })
+}
+
+/// True when alacritty's cursor row after `prefix` lies inside the scroll
+/// region, where xterm util.c `InsertLine` / `DeleteLine` reset the wrap (both
+/// return first for a row outside `[top_marg, bot_marg]`). alacritty 0.26
+/// `insert_blank_lines` acts only when `scroll_region.contains(&cursor line)`,
+/// and `Term::scroll_region` is private, so a probe replay asks IL itself: after
+/// `CR X CR`, an IL inside the region replaces the cursor row with a blank one,
+/// while outside it the `X` stays. The leading `CSI m` ends any sequence the
+/// prefix left open, as the op's own ESC does in the real replay.
+fn alacritty_cursor_in_scroll_region(prefix: &[u8]) -> bool {
+    let mut term = Term::new(Config::default(), &Dims, VoidListener);
+    let mut parser: Processor = Processor::new();
+    parser.advance(&mut term, prefix);
+    parser.advance(&mut term, b"\x1b[m");
+    let line = term.grid().cursor.point.line;
+    parser.advance(&mut term, b"\rX\r\x1b[L");
+    term.grid()[line][Column(0)].c != 'X'
+}
+
+/// True when alacritty 0.26 `delete_chars` with the cursor parked in the last
+/// column would change a cell LEFT of it: it clears the row's last `count`
+/// cells (`columns - count..`) to the cursor template's bg, where xterm util.c
+/// `DeleteChar` clamps the count to `right + 1 - cur_col`, the parked cell.
+fn alacritty_dch_clears_left_of_parked_column(term: &Term<VoidListener>, count: u16) -> bool {
+    let grid = term.grid();
+    let cleared = AlaCell {
+        bg: grid.cursor.template.bg,
+        ..AlaCell::default()
+    };
+    let row = &grid[grid.cursor.point.line];
+    let count = usize::from(count).min(COLS);
+    (COLS - count..COLS - 1).any(|c| row[Column(c)] != cleared)
+}
+
+/// The gate's SGR 21 step: `input` with each SGR parameter 21 spelled `4:2`,
+/// the way alacritty renders xterm's 21 (see the section header).
+///
+/// Only `CSI Ps ; … m` with no private marker and no intermediate qualifies. A
+/// 21 is rewritten where vte and xterm both read it as the code 21. It is left
+/// alone as the index of `38;5;n` / `48;5;n`, as a component of `38;2;r;g;b`,
+/// or as the mode after 38 / 48 (vte `parse_sgr_color`; xterm charproc.c
+/// `parse_extended_colors`, which takes `extended_colors_limit` values after the
+/// mode: 1 for 5, 3 for 2, none otherwise). Returns `input` borrowed when
+/// nothing is rewritten. Returns `None` when a 21 is involved and the engines
+/// may read the list differently: a `38;2` component above 255 (vte stops the
+/// color there, xterm still takes three), a 58 (vte takes its arguments as an
+/// underline color, xterm has no SGR 58), any subparameter, or more parameters
+/// than xterm's NPARAM (30, ptyx.h) and vte's MAX_PARAMS (32, where `4:2` takes
+/// two) leave room for.
+fn sgr21_as_xterm(input: &[u8]) -> Option<Cow<'_, [u8]>> {
+    let mut out = Vec::new();
+    let mut fed = 0;
+    let mut i = 0;
+    while i + 1 < input.len() {
+        if input[i] != 0x1b || input[i + 1] != b'[' {
+            i += 1;
+            continue;
+        }
+        let mut j = i + 2;
+        let private = input.get(j).is_some_and(|b| (b'<'..=b'?').contains(b));
+        j += usize::from(private);
+        let params_start = j;
+        while j < input.len() && matches!(input[j], b'0'..=b'9' | b';' | b':') {
+            j += 1;
+        }
+        let params_end = j;
+        while j < input.len() && (0x20..=0x2f).contains(&input[j]) {
+            j += 1;
+        }
+        let has_intermediate = j > params_end;
+        let Some(&final_byte) = input.get(j) else {
+            break;
+        };
+        if !(0x40..=0x7e).contains(&final_byte) {
+            // Not a well-formed CSI; resume the scan just past this ESC.
+            i += 1;
+            continue;
+        }
+        if final_byte == b'm' && !private && !has_intermediate {
+            let params = &input[params_start..params_end];
+            let spelled = sgr21_params_as_xterm(params)?;
+            if spelled != params {
+                out.extend_from_slice(&input[fed..params_start]);
+                out.extend_from_slice(&spelled);
+                fed = params_end;
+            }
+        }
+        i = j + 1;
+    }
+    if fed == 0 {
+        return Some(Cow::Borrowed(input));
+    }
+    out.extend_from_slice(&input[fed..]);
+    Some(Cow::Owned(out))
+}
+
+/// One SGR parameter list for [`sgr21_as_xterm`]: the list with its SGR 21
+/// codes spelled `4:2` (unchanged when there are none), or `None` where the
+/// rewrite cannot be exact.
+fn sgr21_params_as_xterm(params: &[u8]) -> Option<Vec<u8>> {
+    // Below xterm's NPARAM (30) with room for the added subparameters in vte's
+    // MAX_PARAMS (32), both engines read every parameter of input and input'.
+    const MAX_SLOTS: usize = 29;
+    let tokens: Vec<&[u8]> = params.split(|&b| b == b';').collect();
+    // An empty parameter is 0, and vte folds digits with saturating u16
+    // arithmetic. `None` for a parameter with subparameters.
+    let code = |token: &[u8]| {
+        token.iter().try_fold(0u16, |n, &b| {
+            b.is_ascii_digit()
+                .then(|| n.saturating_mul(10).saturating_add(u16::from(b - b'0')))
+        })
+    };
+    let is_21 = |token: &[u8]| code(token) == Some(21);
+    let twenty_ones = tokens.iter().filter(|t| is_21(t)).count();
+    if twenty_ones == 0 {
+        return Some(params.to_vec());
+    }
+    if params.contains(&b':') || tokens.len() + twenty_ones > MAX_SLOTS {
+        return None;
+    }
+    let mut rewrite = vec![false; tokens.len()];
+    let mut k = 0;
+    while k < tokens.len() {
+        match code(tokens[k]) {
+            Some(38 | 48) => match tokens.get(k + 1).and_then(|t| code(t)) {
+                Some(5) => k += 3,
+                Some(2) => {
+                    let components = &tokens[k + 2..tokens.len().min(k + 5)];
+                    if components.iter().all(|t| code(t).is_some_and(|n| n <= 255)) {
+                        k += 5;
+                    } else if tokens[k + 2..].iter().any(|t| is_21(t)) {
+                        return None;
+                    } else {
+                        break;
+                    }
+                }
+                Some(_) => k += 2,
+                None => break,
+            },
+            Some(58) if tokens[k + 1..].iter().any(|t| is_21(t)) => return None,
+            Some(21) => {
+                rewrite[k] = true;
+                k += 1;
+            }
+            _ => k += 1,
+        }
+    }
+    let mut spelled = Vec::with_capacity(params.len() + twenty_ones);
+    for (n, (token, rewritten)) in tokens.iter().zip(&rewrite).enumerate() {
+        if n > 0 {
+            spelled.push(b';');
+        }
+        let part: &[u8] = if *rewritten { b"4:2" } else { token };
+        spelled.extend_from_slice(part);
+    }
+    Some(spelled)
+}
+
+/// Steps 1-3 of the gate: xterm's wrap-reset counterfactual input for
+/// alacritty, over the ops `accept` admits, built on [`sgr21_as_xterm`] of
+/// `input`. `None` when no admitted op is witnessed at an alacritty pending
+/// wrap, so the class cannot apply; when a witnessed op's own alacritty cell
+/// quirk is visible (ED 1 over a row 0 the line-1 guard keeps, or a DCH whose
+/// clear reaches left of the parked column; see the section header), so input'
+/// cannot be trusted; and when an SGR 21 cannot be rewritten exactly.
+fn wrap_reset_counterfactual(
+    input: &[u8],
+    accept: impl Fn(WrapResetOp) -> bool,
+) -> Option<(Vec<u8>, Vec<WrapResetWitness>)> {
+    const CUF: &[u8] = b"\x1b[C";
+    const CR: &[u8] = b"\r";
+    let input = sgr21_as_xterm(input)?;
+    let input = &*input;
+    let ops: Vec<_> = wrap_reset_ops(input)
+        .into_iter()
+        .filter(|&(op, _, _)| accept(op))
+        .collect();
+    if ops.is_empty() {
+        return None;
+    }
+    let mut term = Term::new(Config::default(), &Dims, VoidListener);
+    let mut parser: Processor = Processor::new();
+    let mut rewritten = Vec::with_capacity(input.len() + CUF.len() * ops.len());
+    let mut witnesses = Vec::new();
+    let mut fed = 0;
+    for (op, start, end) in ops {
+        parser.advance(&mut term, &input[fed..start]);
+        rewritten.extend_from_slice(&input[fed..start]);
+        let witnessed = {
+            let cursor = &term.grid().cursor;
+            let at_wrap = cursor.input_needs_wrap && cursor.point.column == Column(COLS - 1);
+            at_wrap
+                && match op {
+                    WrapResetOp::AltScreen1049Set => !term.mode().contains(TermMode::ALT_SCREEN),
+                    WrapResetOp::Il | WrapResetOp::Dl => {
+                        alacritty_cursor_in_scroll_region(&rewritten)
+                    }
+                    _ => true,
+                }
+        };
+        if witnessed
+            && op == WrapResetOp::Ed(1)
+            && alacritty_ed1_skipped_row0_clear(&term).is_some_and(|cleared| {
+                let row0 = &term.grid()[Line(0)];
+                (0..COLS).any(|c| row0[Column(c)] != cleared)
+            })
+        {
+            return None;
+        }
+        if witnessed
+            && let WrapResetOp::Dch(count) = op
+            && alacritty_dch_clears_left_of_parked_column(&term, count)
+        {
+            return None;
+        }
+        let token = &input[start..end];
+        let prefix_len = rewritten.len();
+        let sequence: [&[u8]; 2] = match (witnessed, op) {
+            (false, _) => [token, b""],
+            (true, WrapResetOp::AltScreen1049Set) => [token, CUF],
+            (true, WrapResetOp::Il | WrapResetOp::Dl) => [token, CR],
+            (true, _) => [CUF, token],
+        };
+        for part in sequence {
+            parser.advance(&mut term, part);
+            rewritten.extend_from_slice(part);
+        }
+        if witnessed {
+            witnesses.push(WrapResetWitness { op, prefix_len });
+        }
+        fed = end;
+    }
+    rewritten.extend_from_slice(&input[fed..]);
+    (!witnesses.is_empty()).then_some((rewritten, witnesses))
+}
+
+/// The whole gate (steps 1-4): the counterfactual exists AND reproduces aterm's
+/// screen exactly — every row and the cursor.
+fn wrap_reset_gate(
+    input: &[u8],
+    accept: impl Fn(WrapResetOp) -> bool,
+) -> Option<(Vec<u8>, Vec<WrapResetWitness>)> {
+    let (counterfactual, witnesses) = wrap_reset_counterfactual(input, accept)?;
+    let a = aterm_screen(input);
+    let b = alacritty_screen(&counterfactual);
+    (a.rows == b.rows && a.cursor == b.cursor).then_some((counterfactual, witnesses))
+}
+
+/// True when, in alacritty's state after `prefix`, a wrap would NOT move the
+/// cursor down a row: the cursor is on the scroll-region bottom (the wrap's
+/// linefeed scrolls the region) or on the last screen row below the region.
+/// alacritty 0.26 `wrapline` calls `linefeed` when `line + 1 >= scroll_region.end`
+/// and otherwise steps down, and `linefeed` steps down unless the next line is the
+/// region end or off-screen — so a probe LF moves the line exactly as a wrap would.
+/// (`Term::scroll_region` is private, hence the probe.)
+fn alacritty_wrap_stays_on_row(prefix: &[u8]) -> bool {
+    let mut term = Term::new(Config::default(), &Dims, VoidListener);
+    let mut parser: Processor = Processor::new();
+    parser.advance(&mut term, prefix);
+    let before = term.grid().cursor.point.line;
+    parser.advance(&mut term, b"\n");
+    term.grid().cursor.point.line == before
+}
+
+/// Class C1: EL 0 (`CSI K` / `CSI 0 K`) at a pending wrap with nothing printed
+/// afterwards. Both cursors sit on (r,79); the only differing cells are (r,79)
+/// on each row where EL 0 ran — aterm/xterm blank (BCE), alacritty still the
+/// parked glyph. xterm util.c `ClearRight` clears from `cur_col` inclusive
+/// (the parked column) and resets the wrap; alacritty's `clear_line(Right)`
+/// returns early while `input_needs_wrap`. Gate: the counterfactual over EL 0
+/// only, plus "nothing printed afterwards" — the cursors already agree.
+fn is_el0_at_pending_wrap_glyph_divergence(input: &[u8]) -> bool {
+    wrap_reset_gate(input, |op| op == WrapResetOp::El(0)).is_some()
+        && aterm_screen(input).cursor == alacritty_screen(input).cursor
+}
+
+/// Classes C2 and C3: ED 0/1/2 or EL 0/1/2 at a pending wrap, followed by a
+/// printable (possibly after ops neither engine uses to move or clear the wrap).
+/// xterm resets the wrap in the erase (util.c `ClearRight` / `ClearInLine2` /
+/// `ClearScreen`), so the printable overwrites (r,79); alacritty never clears
+/// `input_needs_wrap` on these ops, so its next `input()` wraps.
+///   C2: above the region bottom, alacritty's glyph lands at (r+1,0);
+///   C3: on the region bottom (or the last row below it), alacritty's wrap
+///       scrolls the region instead, and every region row sits one line higher.
+/// Returns `Some(true)` for C3 (some witnessed erase sits where alacritty's wrap
+/// cannot step down), `Some(false)` for C2, `None` when the gate does not match.
+/// Deliberately no scroll- or multiset-shaped test for C3: that breadth would
+/// swallow a genuine aterm scroll bug.
+fn erase_at_pending_wrap_class(input: &[u8]) -> Option<bool> {
+    let (counterfactual, witnesses) = wrap_reset_gate(input, |op| {
+        matches!(op, WrapResetOp::El(_) | WrapResetOp::Ed(_))
+    })?;
+    Some(
+        witnesses
+            .iter()
+            .any(|w| alacritty_wrap_stays_on_row(&counterfactual[..w.prefix_len])),
+    )
+}
+
+/// Class C4: a row filled to column 79 with the wrap pending, then CSI ?1049 h
+/// from the main screen, then a printable. xterm's `srm_OPT_ALTBUF_CURSOR` runs
+/// `ClearScreen` LAST, whose `ResetWrap` means the printable overwrites alt
+/// (r,79); alacritty's `swap_alt` copies the primary cursor, `input_needs_wrap`
+/// included, into the alt grid, so its printable wraps (or scrolls at the region
+/// bottom). Visible only while the alt screen is shown: after ?1049 l both
+/// engines have the main-screen wrap back (xterm `CursorRestore`). A prefix
+/// already on the alt screen is excluded by the witness.
+fn is_1049h_at_pending_wrap_divergence(input: &[u8]) -> bool {
+    wrap_reset_gate(input, |op| op == WrapResetOp::AltScreen1049Set).is_some()
+}
+
+/// Class C5: an ICH, DCH or ECH at a pending wrap, or an IL / DL there with the
+/// cursor row inside the scroll region, possibly followed by output. xterm
+/// resets the wrap in each (util.c `InsertChar`, `DeleteChar`, `ClearRight` via
+/// `do_erase_char`, `InsertLine`, `DeleteLine`), so the next printable
+/// overwrites the parked column, or after IL / DL lands at the left margin;
+/// alacritty `insert_blank` / `delete_chars` / `erase_chars` /
+/// `insert_blank_lines` / `delete_lines` keep `input_needs_wrap`, so it wraps
+/// (or scrolls the region at its bottom). Gate: the counterfactual over those
+/// ops only.
+fn is_edit_at_pending_wrap_divergence(input: &[u8]) -> bool {
+    wrap_reset_gate(input, |op| {
+        matches!(
+            op,
+            WrapResetOp::Ich
+                | WrapResetOp::Dch(_)
+                | WrapResetOp::Ech
+                | WrapResetOp::Il
+                | WrapResetOp::Dl
+        )
+    })
+    .is_some()
+}
+
+/// The pin class C5 reports (module level, so a test can name it).
+static EDIT_WRAP_RESET_PIN: PinnedDivergence = PinnedDivergence {
+    name: "ICH/DCH/ECH/IL/DL at pending wrap resets the wrap (class C5)",
+    input: b"\x1b[1;80H!\x1b[@?",
+    why: "xterm util.c InsertChar / DeleteChar call ResetWrap, ECH (charproc.c CASE_ECH -> do_erase_char -> ClearRight) ends with it, and InsertLine / DeleteLine call it after set_cur_col(left margin) for a cursor row inside the scroll region; alacritty insert_blank / delete_chars / erase_chars / insert_blank_lines / delete_lines keep input_needs_wrap (IL/DL keep the column too), so the next printable wraps instead of overwriting. Proven per input by the counterfactual gate. aterm matches xterm.",
+};
+
+/// The union of C1-C5 on one input: several witnessed erases, 1049h enters
+/// and/or edits, each needing its reset for the screens to agree. Same gate, all
+/// ops.
+fn is_mixed_wrap_reset_divergence(input: &[u8]) -> bool {
+    wrap_reset_gate(input, |_| true).is_some()
+}
+
 /// Suppress iff the OBSERVED divergence for `input` matches a pinned
 /// alacritty-divergence signature EXACTLY, or one of the documented
 /// alacritty-divergence CLASS predicates (position-/co-code-invariant families
@@ -1412,6 +2145,51 @@ fn matched_alacritty_divergence(input: &[u8]) -> Option<&'static PinnedDivergenc
         .find(|pinned| divergence_signature(pinned.input).as_deref() == Some(sig.as_str()))
     {
         return Some(pin);
+    }
+    // The deferred-wrap reset classes come FIRST: their counterfactual gate is an
+    // exact proof, while several predicates below accept the same shapes with no
+    // look at the ops at all (see the COUNTERFACTUAL-ORACLE section).
+    static EL0_PARKED_GLYPH_PIN: PinnedDivergence = PinnedDivergence {
+        name: "EL 0 at pending wrap clears the parked glyph (class C1)",
+        input: b"\x1b[1;80H!\x1b[K",
+        why: "xterm CASE_EL -> util.c do_erase_line(0) -> ClearRight(xw,-1) clears from cur_col inclusive — the parked last column while do_wrap is set — and ends with ResetWrap; alacritty clear_line(Right) returns early while input_needs_wrap, keeping the glyph. Proven per input by the counterfactual gate. aterm matches xterm.",
+    };
+    static ERASE_WRAP_CASCADE_PIN: PinnedDivergence = PinnedDivergence {
+        name: "ED/EL at pending wrap resets the wrap (class C2, print cascade)",
+        input: b"\x1b[1;80H!\x1b[J?",
+        why: "xterm resets do_wrap in ED/EL 0/1/2 (util.c ClearRight / ClearInLine2 / ClearScreen all call ResetWrap), so the next printable overwrites col 79; alacritty clear_line / clear_screen keep input_needs_wrap, so it wraps to the next row and later output sits one row lower. Proven per input by the counterfactual gate. aterm matches xterm.",
+    };
+    static ERASE_WRAP_REGION_BOTTOM_PIN: PinnedDivergence = PinnedDivergence {
+        name: "ED/EL at pending wrap on the region bottom does not scroll (class C3)",
+        input: b"\x1b[24;80H!\x1b[J?",
+        why: "xterm resets do_wrap in ED/EL 0/1/2 (util.c ClearRight / ClearInLine2 / ClearScreen), so a printable after the erase on the scroll-region bottom overwrites col 79 and nothing scrolls; alacritty keeps input_needs_wrap and its wrapline linefeeds at the region bottom, scrolling the region. Proven per input by the counterfactual gate. aterm matches xterm.",
+    };
+    static ALT_1049_WRAP_PIN: PinnedDivergence = PinnedDivergence {
+        name: "1049h at pending wrap resets the wrap (class C4)",
+        input: b"\x1b[1;80H!\x1b[?1049h?",
+        why: "xterm charproc.c srm_OPT_ALTBUF_CURSOR set is CursorSave; ToAlternate; ClearScreen, and ClearScreen's ResetWrap (util.c) runs last, so the alt screen starts with no pending wrap; alacritty swap_alt copies input_needs_wrap into the alt cursor. Proven per input by the counterfactual gate. aterm matches xterm.",
+    };
+    static MIXED_WRAP_RESET_PIN: PinnedDivergence = PinnedDivergence {
+        name: "ED/EL/1049h/ICH/DCH/ECH/IL/DL wrap resets combined (classes C1-C5)",
+        input: b"\x1b[1;80H!\x1b[K?\x1b[?1049h\x1b[1;80H!\x1b[2J?",
+        why: "several ops at a pending wrap on one input, each reset by xterm (util.c ClearRight / ClearInLine2 / ClearScreen / InsertChar / DeleteChar / InsertLine / DeleteLine; charproc.c srm_OPT_ALTBUF_CURSOR) and kept by alacritty; the counterfactual with every witnessed reset applied reproduces aterm exactly. aterm matches xterm.",
+    };
+    if is_el0_at_pending_wrap_glyph_divergence(input) {
+        return Some(&EL0_PARKED_GLYPH_PIN);
+    }
+    match erase_at_pending_wrap_class(input) {
+        Some(false) => return Some(&ERASE_WRAP_CASCADE_PIN),
+        Some(true) => return Some(&ERASE_WRAP_REGION_BOTTOM_PIN),
+        None => {}
+    }
+    if is_1049h_at_pending_wrap_divergence(input) {
+        return Some(&ALT_1049_WRAP_PIN);
+    }
+    if is_edit_at_pending_wrap_divergence(input) {
+        return Some(&EDIT_WRAP_RESET_PIN);
+    }
+    if is_mixed_wrap_reset_divergence(input) {
+        return Some(&MIXED_WRAP_RESET_PIN);
     }
     static DEC_GRAPHICS_PIN: PinnedDivergence = PinnedDivergence {
         name: "alacritty GL/charset class (DEC-graphics glyph family)",
@@ -1441,7 +2219,7 @@ fn matched_alacritty_divergence(input: &[u8]) -> Option<&'static PinnedDivergenc
     static CLEAR_BCE_PIN: PinnedDivergence = PinnedDivergence {
         name: "alacritty ED/EL clear (BCE drop / clear-above off-by-one)",
         input: b"\n\x1b[42;27m\x1b[1J",
-        why: "on ED/EL alacritty drops the BCE background fill, or its clear_screen(Above) `if cursor.line > 1` guard leaves a row uncleared, where xterm/aterm paint BCE and clear the documented region. aterm matches xterm.",
+        why: "on ED/EL alacritty drops the BCE background fill, or its clear_screen(Above) `if cursor.line > 1` guard leaves a row uncleared (a glyph, or on row 0 a styled blank such as a BOLD space), where xterm/aterm paint BCE and clear the documented region. aterm matches xterm.",
     };
     static QUIRK_CASCADE_PIN: PinnedDivergence = PinnedDivergence {
         name: "quirk-op content cascade (DECALN-margins / DECOM-reset / REP / OOR-DECSTBM)",
@@ -1908,6 +2686,31 @@ fn differential_smoke() {
         // restored G0 (DEC graphics), so CSI 6 b re-translates the raw 'x'
         // to graphics; alacritty's GL is still G1/ASCII. aterm matches xterm.
         ("REP through restored GL shift (alacritty bug)", b"\x1b(0\x1b[?1049h\x0ex\x1b[?1049l\x1b[6b"),
+        // alacritty: ED / EL at a pending wrap keep input_needs_wrap (and EL 0
+        // keeps the parked glyph); xterm's ClearRight / ClearInLine2 /
+        // ClearScreen all call ResetWrap (util.c). aterm matches xterm.
+        ("EL 0 at pending wrap clears parked glyph (alacritty bug)", b"\x1b[1;80H!\x1b[K"),
+        ("EL 0 at pending wrap resets wrap (alacritty bug)", b"\x1b[1;80H!\x1b[K?"),
+        ("ED 0 at pending wrap resets wrap (alacritty bug)", b"\x1b[1;80H!\x1b[J?"),
+        ("ED 1 at pending wrap resets wrap (alacritty bug)", b"\x1b[1;80H!\x1b[1J?"),
+        ("ED 2 at pending wrap resets wrap (alacritty bug)", b"\x1b[1;80H!\x1b[2J?"),
+        ("EL 1 at pending wrap resets wrap (alacritty bug)", b"\x1b[1;80H!\x1b[1K?"),
+        ("EL 2 at pending wrap resets wrap (alacritty bug)", b"\x1b[1;80H!\x1b[2K?"),
+        ("ED 0 at pending wrap on bottom row (alacritty bug)", b"\x1b[24;80H!\x1b[J?"),
+        ("EL 2 at pending wrap on region bottom (alacritty bug)", b"\x1b[5;10r\x1b[10;80H!\x1b[2K?"),
+        // alacritty: swap_alt carries input_needs_wrap into the alt screen;
+        // xterm's 1049 set ends in ClearScreen (ResetWrap). aterm matches xterm.
+        ("1049h at pending wrap resets wrap (alacritty bug)", b"\x1b[1;80H!\x1b[?1049h?"),
+        // alacritty: ICH / DCH / ECH, and IL / DL inside the scroll region, keep
+        // input_needs_wrap at a pending wrap; xterm's InsertChar / DeleteChar /
+        // ClearRight / InsertLine / DeleteLine call ResetWrap (util.c). aterm
+        // matches xterm.
+        ("ICH at pending wrap resets wrap (alacritty bug)", b"\x1b[1;80H!\x1b[@?"),
+        ("DCH at pending wrap resets wrap (alacritty bug)", b"\x1b[1;80H!\x1b[P?"),
+        ("ECH at pending wrap resets wrap (alacritty bug)", b"\x1b[1;80H!\x1b[X?"),
+        ("IL at pending wrap resets wrap (alacritty bug)", b"\x1b[1;79Hab\x1b[L?"),
+        ("DL at pending wrap resets wrap (alacritty bug)", b"\x1b[2;1Hcd\x1b[1;79Hab\x1b[M?"),
+        ("ICH at pending wrap on region bottom (alacritty bug)", b"\x1b[5;10r\x1b[10;80H!\x1b[@?"),
     ];
 
     let mut failures = Vec::new();
@@ -1923,6 +2726,63 @@ fn differential_smoke() {
             failures.push(format!("--- smoke case \"{name}\" diverged ---\n{report}"));
         }
     }
+    // Inputs where the engines must AGREE exactly — no pin and no class predicate
+    // may excuse a divergence here. Both engines clear the same cells on these
+    // erases, and nothing printed afterwards can expose the wrap alacritty keeps.
+    let must_agree: &[(&str, &[u8])] = &[
+        // The proptest seed cc 535c8fb9… (differential.proptest-regressions): a row
+        // filled to col 79 (via a no-op SU in between), then ED 0. xterm's
+        // ClearBelow -> ClearRight clears the parked '!' (util.c); aterm used to
+        // keep it under the xterm.js pending-wrap rule.
+        ("ED 0 at pending wrap clears parked glyph (proptest seed)", b"                                                           \x1b[0S                    !\x1b[0J"),
+        ("ED 0 at pending wrap, nothing after", b"\x1b[1;80H!\x1b[J"),
+        ("ED 1 at pending wrap, nothing after", b"\x1b[1;80H!\x1b[1J"),
+        ("ED 2 at pending wrap, nothing after", b"\x1b[1;80H!\x1b[2J"),
+        ("EL 1 at pending wrap, nothing after", b"\x1b[1;80H!\x1b[1K"),
+        ("EL 2 at pending wrap, nothing after", b"\x1b[1;80H!\x1b[2K"),
+        // Over-clear guards: the erase at a pending wrap starts AT the parked
+        // column, never one to its left (ED 0 keeps col 78), and EL 2 stays on
+        // its own row (the row below keeps its glyphs).
+        ("ED 0 at pending wrap keeps the column before the parked one", b"\x1b[1;79Hab\x1b[J"),
+        ("EL 2 at pending wrap leaves the row below intact", b"\x1b[2;1Hzz\x1b[1;80H!\x1b[2K"),
+        ("1049h at pending wrap, nothing after", b"\x1b[1;80H!\x1b[?1049h"),
+        ("1049h at pending wrap, then exit and print", b"\x1b[1;80H!\x1b[?1049h?\x1b[?1049lZ"),
+        // A BOLD space alacritty's ED 1 line-1 guard kept on row 0 but that was
+        // rewritten afterwards, identically, then an ED 1 on row 0; and one on
+        // the main screen while that guard ran on the alternate one. Neither
+        // may pass as the guard's kept blank if aterm clears it.
+        ("ED 1 on row 0 keeps a cell rewritten after a line-1 ED 1", b"\x1b[1;5H\x1b[1m \x1b[2;1H\x1b[1J\x1b[1;5H \x1b[1;1H\x1b[1J"),
+        ("1049 exit keeps main row 0 an alt-screen line-1 ED 1 never touched", b"\x1b[1m \x1b[?1049h\x1b[H \n\x1b[1J\x1b[?1049l"),
+        // An EL 0 / ICH / ECH at a pending wrap sends alacritty's next space to line
+        // 1 while xterm and aterm stay parked on row 0, so only alacritty runs the
+        // ED 1 on line 1. xterm clears just [0, 76] of row 0 there and the BOLD space
+        // at col 77 survives on both screens: an aterm ED 1 on row 0 that clears one
+        // column too many, or the whole row, must not pass as the line-1 guard's kept
+        // blank (review swallow repros).
+        ("ED 1 on row 0 keeps col 77 after an EL 0 sent alacritty to line 1", b"\x1b[1;78H\x1b[1m \x1b[0m  \x1b[K \x08\x08\x08\x1b[1J\x1b[H"),
+        ("ED 1 on row 0 keeps col 77 after an ICH sent alacritty to line 1", b"\x1b[1;78H\x1b[1m \x1b[0m  \x1b[@ \x08\x08\x08\x1b[1J\x1b[H"),
+        ("ED 1 on row 0 keeps col 77 after an ECH sent alacritty to line 1", b"\x1b[1;78H\x1b[1m \x1b[0m  \x1b[X \x08\x08\x08\x1b[1J\x1b[H"),
+        // ED 1 from row 3 clears every row above, row 1 included (xterm util.c
+        // ClearAbove; alacritty resets them too, its guard only skips line 1): a
+        // glyph and a BOLD space on row 1 must both be gone. Nothing else in the
+        // corpus erases above from row >= 2 without a shape class excusing it.
+        ("ED 1 from row 3 clears a glyph on row 1", b"\x1b[2;1Hx\x1b[4;1H\x1b[1J"),
+        ("ED 1 from row 3 clears a BOLD space on row 1", b"\x1b[2;1H\x1b[1m \x1b[4;1H\x1b[1J"),
+        // An ED 1 on the 1047 alternate buffer leaves main row 0 alone: alacritty
+        // ignores 1047 and 47, so only this must-agree guards aterm's main row 0
+        // across the switch (an exit that wiped it was excused by the ED 1
+        // counterfactual before it checked the buffer).
+        ("ED 1 on the 1047 buffer keeps main row 0", b"\x1b[1m \x1b[?1047h\x1b[2;1H\x1b[1J\x1b[?1047l"),
+        ("ED 1 on the 47 buffer keeps main row 0", b"\x1b[1m \x1b[?47h\x1b[2;1H\x1b[1J\x1b[?47l"),
+    ];
+    for (name, input) in must_agree {
+        if let Some(report) = diff_screens(input) {
+            failures.push(format!(
+                "--- must-agree smoke case \"{name}\" diverged ---\n{report}"
+            ));
+        }
+    }
+
     assert!(
         failures.is_empty(),
         "{} smoke case(s) diverged:\n\n{}",
@@ -2082,6 +2942,714 @@ fn scosc_scorc_equals_decsc_decrc() {
             "cursor must match DECSC/DECRC: {case:?}"
         );
     }
+}
+
+/// A non-blank glyph at `(row, col)`.
+type GlyphAt = (usize, usize, char);
+
+/// One xterm expectation: input bytes, every non-blank glyph, final cursor.
+type XtermScreenExpectation = (&'static [u8], Vec<GlyphAt>, (usize, usize));
+
+/// Every non-blank glyph of a projected screen as `(row, col, glyph)`.
+fn glyph_positions(screen: &Screen) -> Vec<GlyphAt> {
+    screen
+        .rows
+        .iter()
+        .enumerate()
+        .flat_map(|(r, row)| {
+            row.iter()
+                .enumerate()
+                .filter(|(_, c)| c.ch != ' ')
+                .map(move |(c, cell)| (r, c, cell.ch))
+        })
+        .collect()
+}
+
+/// Pin aterm's xterm results for the ops the deferred-wrap fix changed. The
+/// pins above only prove aterm still DIFFERS from alacritty there; this proves
+/// what aterm shows is xterm's screen. xterm ground truth: util.c `ClearRight`
+/// (EL 0, ED 0 via `ClearBelow`) clears from the parked column inclusive and
+/// resets the wrap; `ClearInLine2` (EL 1 via `ClearLeft`, EL 2 via `ClearLine`,
+/// ED 1 via `ClearAbove`) and `ClearScreen` (ED 2, the tail of CSI ?1049 h)
+/// reset it; so each trailing '?' overwrites the parked column.
+#[test]
+fn erase_and_1049h_at_pending_wrap_match_xterm() {
+    let cases: &[XtermScreenExpectation] = &[
+        (b"\x1b[1;80H!\x1b[K", vec![], (0, 79)),
+        (b"\x1b[1;80H!\x1b[K?", vec![(0, 79, '?')], (0, 79)),
+        // ClearRight starts at cur_col, the parked column: col 78 survives.
+        (
+            b"\x1b[1;79Hab\x1b[K?",
+            vec![(0, 78, 'a'), (0, 79, '?')],
+            (0, 79),
+        ),
+        (b"\x1b[1;79Hab\x1b[J", vec![(0, 78, 'a')], (0, 79)),
+        (b"\x1b[1;80H!\x1b[J?", vec![(0, 79, '?')], (0, 79)),
+        (b"\x1b[1;80H!\x1b[1J?", vec![(0, 79, '?')], (0, 79)),
+        (b"\x1b[1;80H!\x1b[2J?", vec![(0, 79, '?')], (0, 79)),
+        (b"\x1b[1;80H!\x1b[1K?", vec![(0, 79, '?')], (0, 79)),
+        (b"\x1b[1;80H!\x1b[2K?", vec![(0, 79, '?')], (0, 79)),
+        (b"\x1b[24;80H!\x1b[J?", vec![(23, 79, '?')], (23, 79)),
+        (
+            b"\x1b[5;10r\x1b[10;80H!\x1b[2K?",
+            vec![(9, 79, '?')],
+            (9, 79),
+        ),
+        (b"\x1b[1;80H!\x1b[?1049h?", vec![(0, 79, '?')], (0, 79)),
+        (b"top\x1b[24;80H!\x1b[1J?", vec![(23, 79, '?')], (23, 79)),
+        // ED 1 on row 1: ClearAbove clears row 0 as well. alacritty's line-1 guard
+        // keeps it, so the counterfactual gate refuses this input and only this
+        // golden pins aterm's row 0.
+        (b"top\x1b[2;80H!\x1b[1J?", vec![(1, 79, '?')], (1, 79)),
+    ];
+    for (input, glyphs, cursor) in cases {
+        let screen = aterm_screen(input);
+        assert_eq!(
+            &glyph_positions(&screen),
+            glyphs,
+            "glyphs for {:?}",
+            escape_bytes(input)
+        );
+        assert_eq!(
+            &screen.cursor,
+            cursor,
+            "cursor for {:?}",
+            escape_bytes(input)
+        );
+    }
+}
+
+/// The counterfactual rewrite inserts `CSI C` exactly at the witnessed ops and
+/// nowhere else, and each class gate accepts its canonical repro while refusing
+/// inputs it must not explain.
+#[test]
+fn wrap_reset_counterfactual_rewrites_only_witnessed_ops() {
+    let any = |_: WrapResetOp| true;
+    let rewrite = |input: &[u8]| wrap_reset_counterfactual(input, any).map(|(bytes, _)| bytes);
+
+    // Erase at a pending wrap: CSI C goes BEFORE the erase.
+    assert_eq!(
+        rewrite(b"\x1b[1;80H!\x1b[K?").as_deref(),
+        Some(&b"\x1b[1;80H!\x1b[C\x1b[K?"[..])
+    );
+    // A second erase is witnessed on the REWRITTEN prefix (xterm's state), and the
+    // witnesses name both ops with the prefix each one saw.
+    let (bytes, witnesses) =
+        wrap_reset_counterfactual(b"\x1b[1;80H!\x1b[K?\x1b[2K?", any).expect("two witnesses");
+    assert_eq!(bytes, b"\x1b[1;80H!\x1b[C\x1b[K?\x1b[C\x1b[2K?");
+    let seen: Vec<(WrapResetOp, usize)> = witnesses.iter().map(|w| (w.op, w.prefix_len)).collect();
+    assert_eq!(
+        seen,
+        vec![(WrapResetOp::El(0), 8), (WrapResetOp::El(2), 15)],
+        "each witness records its op and the rewritten prefix before it"
+    );
+    // 1049h: CSI C goes AFTER the switch.
+    assert_eq!(
+        rewrite(b"\x1b[1;80H!\x1b[?1049h?").as_deref(),
+        Some(&b"\x1b[1;80H!\x1b[?1049h\x1b[C?"[..])
+    );
+    // Not witnessed: no pending wrap, ED 3, DECSEL, already on the alt screen.
+    assert!(rewrite(b"ab\x1b[K?").is_none());
+    assert!(rewrite(b"\x1b[1;80H!\x1b[3J?").is_none());
+    assert!(rewrite(b"\x1b[1;80H!\x1b[?K?").is_none());
+    assert!(rewrite(b"\x1b[1;80H!\x1b[1;2K?").is_none());
+    assert!(rewrite(b"\x1b[?1049h\x1b[1;80H!\x1b[?1049h?").is_none());
+    assert!(rewrite(b"\x1b[1;78HK!\x1b[1;80H!").is_none());
+
+    // Each class gate accepts its canonical repro.
+    assert!(is_el0_at_pending_wrap_glyph_divergence(
+        b"\x1b[1;80H!\x1b[K"
+    ));
+    for input in [
+        &b"\x1b[1;80H!\x1b[K?"[..],
+        b"\x1b[1;80H!\x1b[J?",
+        b"\x1b[1;80H!\x1b[1J?",
+        b"\x1b[1;80H!\x1b[2J?",
+        b"\x1b[1;80H!\x1b[1K?",
+        b"\x1b[1;80H!\x1b[2K?",
+    ] {
+        assert_eq!(
+            erase_at_pending_wrap_class(input),
+            Some(false),
+            "C2 for {:?}",
+            escape_bytes(input)
+        );
+    }
+    for input in [
+        &b"\x1b[24;80H!\x1b[J?"[..],
+        b"\x1b[5;10r\x1b[10;80H!\x1b[2K?",
+    ] {
+        assert_eq!(
+            erase_at_pending_wrap_class(input),
+            Some(true),
+            "C3 for {:?}",
+            escape_bytes(input)
+        );
+    }
+    assert!(is_1049h_at_pending_wrap_divergence(
+        b"\x1b[1;80H!\x1b[?1049h?"
+    ));
+    assert!(is_mixed_wrap_reset_divergence(
+        b"\x1b[1;80H!\x1b[K?\x1b[?1049h\x1b[1;80H!\x1b[2J?"
+    ));
+
+    // C1 needs "nothing printed afterwards": a print cascade is C2, not C1.
+    assert!(!is_el0_at_pending_wrap_glyph_divergence(
+        b"\x1b[1;80H!\x1b[K?"
+    ));
+    // All-or-nothing: a residual difference from ANOTHER quirk (after the erase,
+    // a DECOM reset, which homes the cursor in xterm srm_DECOM and aterm but not
+    // in alacritty, so the `x` lands on another row) is not explained by the
+    // reset, so the gate refuses.
+    assert_eq!(
+        erase_at_pending_wrap_class(b"\x1b[1;80H!\x1b[K?\x1b[5;1H\x1b[?6lx"),
+        None
+    );
+    // SGR 21 is no residual: input' spells it as alacritty's double underline.
+    assert_eq!(
+        rewrite(b"\x1b[1;80H!\x1b[K\x1b[21m?").as_deref(),
+        Some(&b"\x1b[1;80H!\x1b[C\x1b[K\x1b[4:2m?"[..])
+    );
+    assert_eq!(
+        erase_at_pending_wrap_class(b"\x1b[1;80H!\x1b[K\x1b[21m?"),
+        Some(false)
+    );
+    // Unrelated alacritty quirks never match these classes.
+    for input in [&b"xxxx\x1b[2L"[..], b"\x1b[1;75Habcdef\t", b"\x1b[21mx"] {
+        assert!(
+            !is_mixed_wrap_reset_divergence(input),
+            "{:?}",
+            escape_bytes(input)
+        );
+    }
+}
+
+/// input' inherits the rewritten op's own alacritty cell quirks, so the
+/// counterfactual refuses where one is visible. ED 1 with alacritty's cursor on
+/// line 1 keeps row 0 (`clear_screen(ClearMode::Above)` clears the rows above
+/// only `if cursor.line > 1`). Before the refusal, an aterm mutant that also
+/// kept row 0 reproduced alacritty(input') exactly on `top\x1b[2;80H!\x1b[1J?`
+/// and passed the gate as class C2.
+#[test]
+fn wrap_reset_counterfactual_refuses_ed1_where_alacritty_keeps_row_0() {
+    let any = |_: WrapResetOp| true;
+    let kept_row0: &[u8] = b"top\x1b[2;80H!\x1b[1J?";
+    assert!(wrap_reset_counterfactual(kept_row0, any).is_none());
+    assert_eq!(erase_at_pending_wrap_class(kept_row0), None);
+    assert!(!is_mixed_wrap_reset_divergence(kept_row0));
+    // A blank row 0 still shows the skipped clear when that clear paints a BCE bg.
+    assert!(wrap_reset_counterfactual(b"\x1b[2;80H!\x1b[41m\x1b[1J?", any).is_none());
+    // Away from the guard the witness stands and the gate matches: a default
+    // blank row 0, ED 1 on line 2, and ED 0 / EL 2 on line 1.
+    for input in [
+        &b"\x1b[2;80H!\x1b[1J?"[..],
+        b"top\x1b[3;80H!\x1b[1J?",
+        b"top\x1b[2;80H!\x1b[J?",
+        b"top\x1b[2;80H!\x1b[2K?",
+    ] {
+        assert_eq!(
+            erase_at_pending_wrap_class(input),
+            Some(false),
+            "C2 for {:?}",
+            escape_bytes(input)
+        );
+    }
+}
+
+/// alacritty's ED 1 line-1 guard keeps row 0, a STYLED blank included (a BOLD
+/// space), where xterm `ClearAbove` and aterm clear it to the blank the clear
+/// writes. The proptest seed cc 9b0599af… (`\x1b[1m \n\x1b[1J`) diverged
+/// unmatched on exactly that cell. The class restores the skipped clear in a
+/// counterfactual alacritty replay (at the ED 1's own cursor row, on the grid
+/// active then) and accepts a row-0 cell only where aterm equals that
+/// counterfactual, so an aterm over-clear the rest of the input exposes still
+/// surfaces.
+#[test]
+fn ed1_on_line_1_styled_blank_alacritty_keeps_is_classified() {
+    for input in [
+        &b"\x1b[1m \n\x1b[1J"[..],
+        // The cursor comes back to row 0 after the ED 1.
+        b"\x1b[1m \n\x1b[1J\x1b[H",
+        // A BCE ED 1: aterm's row 0 is the red blank the clear writes.
+        b"\x1b[1m \n\x1b[41m\x1b[1J",
+    ] {
+        assert!(
+            diff_screens(input).is_some(),
+            "precondition: {:?} diverges",
+            escape_bytes(input)
+        );
+        assert!(
+            is_clear_bce_or_above_divergence(input),
+            "{:?}",
+            escape_bytes(input)
+        );
+    }
+
+    // The seed's counterfactual row 0 holds the default blank where alacritty
+    // kept the BOLD space.
+    let seed = b"\x1b[1m \n\x1b[1J";
+    let real = alacritty_screen(seed);
+    let blank = CellProj {
+        ch: ' ',
+        fg: real.default_fg,
+        bg: real.default_bg,
+        bold: false,
+        italic: false,
+        underline: Underline::None,
+        strikethrough: false,
+    };
+    assert!(
+        real.rows[0][0].bold,
+        "precondition: alacritty kept the BOLD space"
+    );
+    let row0 = alacritty_ed1_row0_counterfactual(seed).expect("an ED 1 ran on line 1");
+    assert_eq!(row0.len(), COLS);
+    assert!(row0.iter().all(|&c| c == blank), "{row0:?}");
+
+    // No restore where alacritty runs the ED 1 on line 1 but aterm (and xterm) run
+    // it on row 0: `ClearLeft` clears only [0, cur_col] there. An EL 0 / ICH / ECH
+    // at a pending wrap keeps alacritty's wrap, so its next space lands on line 1
+    // while aterm stays on row 0. The engines agree on these inputs at HEAD; an
+    // aterm ED 1 that over-clears row 0 turns (0, 77) into a default blank against
+    // alacritty's BOLD space, and a whole-row restore would have excused it.
+    for input in [
+        &b"\x1b[1;78H\x1b[1m \x1b[0m  \x1b[K \x08\x08\x08\x1b[1J\x1b[H"[..],
+        b"\x1b[1;78H\x1b[1m \x1b[0m  \x1b[@ \x08\x08\x08\x1b[1J\x1b[H",
+        b"\x1b[1;78H\x1b[1m \x1b[0m  \x1b[X \x08\x08\x08\x1b[1J\x1b[H",
+    ] {
+        let ed1 = input
+            .windows(4)
+            .position(|w| w == b"\x1b[1J")
+            .expect("an ED 1");
+        let mut term = Term::new(Config::default(), &Dims, VoidListener);
+        let mut parser: Processor = Processor::new();
+        parser.advance(&mut term, &input[..ed1]);
+        assert!(
+            alacritty_ed1_skipped_row0_clear(&term).is_some(),
+            "precondition: alacritty runs the ED 1 on line 1 for {:?}",
+            escape_bytes(input)
+        );
+        assert_eq!(
+            aterm_screen(&input[..ed1]).cursor.0,
+            0,
+            "precondition: aterm runs the ED 1 on row 0 for {:?}",
+            escape_bytes(input)
+        );
+        let kept = alacritty_screen(input).rows[0][77];
+        assert!(
+            kept.ch == ' ' && kept.bold,
+            "precondition: a BOLD space at (0, 77) for {:?}",
+            escape_bytes(input)
+        );
+        assert!(
+            alacritty_ed1_row0_counterfactual(input).is_none(),
+            "{:?}",
+            escape_bytes(input)
+        );
+    }
+
+    // No counterfactual without an exact ED 1 on line 1.
+    for input in [
+        // ED 1 on line 2: alacritty clears row 0 too.
+        &b"\x1b[1m \x1b[3;1H\x1b[1J"[..],
+        // Not an exact ED 1: ED 2, DECSED 1, a second parameter, literal text.
+        b"\x1b[1m \n\x1b[2J",
+        b"\x1b[1m \n\x1b[?1J",
+        b"\x1b[1m \n\x1b[1;1J",
+        b"\x1b[1m \n1J",
+    ] {
+        assert!(
+            alacritty_ed1_row0_counterfactual(input).is_none(),
+            "{:?}",
+            escape_bytes(input)
+        );
+    }
+
+    // A cell rewritten after the skipped clear reads the same in the
+    // counterfactual as in alacritty, so aterm clearing it is never excused.
+    // Both inputs agree at HEAD; in each, an aterm bug turns (0, col) into a
+    // default blank against alacritty's BOLD space, and that must surface.
+    for (input, col, bug) in [
+        (
+            &b"\x1b[1;5H\x1b[1m \x1b[2;1H\x1b[1J\x1b[1;5H \x1b[1;1H\x1b[1J"[..],
+            4,
+            "an identical BOLD space rewritten after the line-1 ED 1; \
+             an aterm ED 1 on row 0 that over-clears the whole row",
+        ),
+        (
+            b"\x1b[1m \x1b[?1049h\x1b[H \n\x1b[1J\x1b[?1049l",
+            0,
+            "the line-1 ED 1 ran on the alternate screen; \
+             an aterm 1049 exit that wipes main row 0",
+        ),
+    ] {
+        assert!(
+            diff_screens(input).is_none(),
+            "precondition: {:?} agrees",
+            escape_bytes(input)
+        );
+        let kept = alacritty_screen(input).rows[0][col];
+        assert!(
+            kept.ch == ' ' && kept.bold,
+            "precondition: a BOLD space at (0, {col}) for {:?}",
+            escape_bytes(input)
+        );
+        let row0 = alacritty_ed1_row0_counterfactual(input).expect("an ED 1 ran on line 1");
+        assert_eq!(row0[col], kept, "{bug}");
+        let over_clear = CellDiff {
+            row: 0,
+            col,
+            a: blank,
+            b: kept,
+        };
+        assert!(
+            !clear_cell_diff_is_classifiable(&over_clear, Some(&row0)),
+            "{bug}"
+        );
+        assert!(
+            !cell_diff_is_classifiable(&over_clear, false, true, Some(&row0)),
+            "{bug}"
+        );
+    }
+}
+
+/// Pin aterm's xterm results for the character and line edits at a pending
+/// wrap (class C5). xterm ground truth: util.c `InsertChar` and `DeleteChar`
+/// clamp the count to `right + 1 - cur_col` (one cell at the parked column) and
+/// call `ResetWrap`; ECH (`do_erase_char` -> `ClearRight`) clears `min(n, cols -
+/// cur_col)` cells and calls it; `InsertLine` / `DeleteLine` on a row inside the
+/// scroll region `set_cur_col(left margin)` and call it. So each trailing '?'
+/// overwrites the parked column, or after IL / DL lands at column 0. An aterm
+/// edit that keeps the wrap sends the '?' to the next row instead.
+#[test]
+fn edits_at_pending_wrap_match_xterm() {
+    let cases: &[XtermScreenExpectation] = &[
+        (
+            b"\x1b[1;79Hab\x1b[@?",
+            vec![(0, 78, 'a'), (0, 79, '?')],
+            (0, 79),
+        ),
+        (
+            b"\x1b[1;79Hab\x1b[5@?",
+            vec![(0, 78, 'a'), (0, 79, '?')],
+            (0, 79),
+        ),
+        (
+            b"\x1b[1;79Hab\x1b[P?",
+            vec![(0, 78, 'a'), (0, 79, '?')],
+            (0, 79),
+        ),
+        // DeleteChar clamps to the parked cell: cols 76-78 survive.
+        (
+            b"\x1b[1;77Habcd\x1b[5P?",
+            vec![(0, 76, 'a'), (0, 77, 'b'), (0, 78, 'c'), (0, 79, '?')],
+            (0, 79),
+        ),
+        (
+            b"\x1b[1;79Hab\x1b[X?",
+            vec![(0, 78, 'a'), (0, 79, '?')],
+            (0, 79),
+        ),
+        (
+            b"\x1b[1;77Habcd\x1b[5X?",
+            vec![(0, 76, 'a'), (0, 77, 'b'), (0, 78, 'c'), (0, 79, '?')],
+            (0, 79),
+        ),
+        (
+            b"\x1b[1;79Hab\x1b[L?",
+            vec![(0, 0, '?'), (1, 78, 'a'), (1, 79, 'b')],
+            (0, 1),
+        ),
+        (
+            b"\x1b[2;1Hcd\x1b[1;79Hab\x1b[M?",
+            vec![(0, 0, '?'), (0, 1, 'd')],
+            (0, 1),
+        ),
+        // On the scroll-region bottom: nothing scrolls, the '?' stays on row 9.
+        (
+            b"\x1b[5;10r\x1b[10;80H!\x1b[@?",
+            vec![(9, 79, '?')],
+            (9, 79),
+        ),
+        (b"\x1b[5;10r\x1b[10;79Hab\x1b[L?", vec![(9, 0, '?')], (9, 1)),
+        (b"\x1b[5;10r\x1b[10;79Hab\x1b[M?", vec![(9, 0, '?')], (9, 1)),
+    ];
+    for (input, glyphs, cursor) in cases {
+        let screen = aterm_screen(input);
+        assert_eq!(
+            &glyph_positions(&screen),
+            glyphs,
+            "glyphs for {:?}",
+            escape_bytes(input)
+        );
+        assert_eq!(
+            &screen.cursor,
+            cursor,
+            "cursor for {:?}",
+            escape_bytes(input)
+        );
+    }
+}
+
+/// Class C5's rewrite: `CSI C` before an ICH / DCH / ECH and a CR after an IL /
+/// DL, witnessed only where xterm resets the wrap, refused where the op's own
+/// alacritty cell quirk is visible.
+#[test]
+fn wrap_reset_counterfactual_covers_the_edits() {
+    let any = |_: WrapResetOp| true;
+    let rewrite = |input: &[u8]| wrap_reset_counterfactual(input, any).map(|(bytes, _)| bytes);
+
+    for (input, rewritten) in [
+        (&b"\x1b[1;80H!\x1b[@?"[..], &b"\x1b[1;80H!\x1b[C\x1b[@?"[..]),
+        (b"\x1b[1;80H!\x1b[0X?", b"\x1b[1;80H!\x1b[C\x1b[0X?"),
+        (b"\x1b[1;80H!\x1b[P?", b"\x1b[1;80H!\x1b[C\x1b[P?"),
+        // An overlong DCH over cells its clear leaves as they were.
+        (b"\x1b[1;80H!\x1b[3P?", b"\x1b[1;80H!\x1b[C\x1b[3P?"),
+        (b"\x1b[1;77Habcd\x1b[P?", b"\x1b[1;77Habcd\x1b[C\x1b[P?"),
+        (b"\x1b[1;80H!\x1b[2L?", b"\x1b[1;80H!\x1b[2L\r?"),
+        (b"\x1b[1;80H!\x1b[M?", b"\x1b[1;80H!\x1b[M\r?"),
+        (
+            b"\x1b[5;10r\x1b[10;80H!\x1b[L?",
+            b"\x1b[5;10r\x1b[10;80H!\x1b[L\r?",
+        ),
+    ] {
+        assert_eq!(
+            rewrite(input).as_deref(),
+            Some(rewritten),
+            "{:?}",
+            escape_bytes(input)
+        );
+        assert!(
+            is_edit_at_pending_wrap_divergence(input),
+            "C5 for {:?}",
+            escape_bytes(input)
+        );
+    }
+
+    // Not witnessed: IL / DL with the cursor row above or below the scroll region
+    // (xterm keeps the wrap there), no pending wrap, a second parameter, an
+    // intermediate (SL is `CSI Ps SP @`), a private marker, a count past u16.
+    for input in [
+        &b"\x1b[5;10r\x1b[1;80H!\x1b[L?"[..],
+        b"\x1b[5;10r\x1b[1;80H!\x1b[M?",
+        b"\x1b[5;10r\x1b[24;80H!\x1b[L?",
+        b"ab\x1b[@?",
+        b"\x1b[1;80H!\x1b[1;2@?",
+        b"\x1b[1;80H!\x1b[1 @?",
+        b"\x1b[1;80H!\x1b[?1P?",
+        b"\x1b[1;80H!\x1b[99999X?",
+    ] {
+        assert!(rewrite(input).is_none(), "{:?}", escape_bytes(input));
+    }
+
+    // Refused: a DCH whose clear reaches left of the parked column and would change
+    // a cell there (alacritty `delete_chars` clears the row's last `count` cells;
+    // xterm `DeleteChar` only the parked one): glyphs, or blanks under a BCE bg.
+    for input in [
+        &b"\x1b[1;77Habcd\x1b[5P?"[..],
+        b"\x1b[1;80H!\x1b[41m\x1b[5P?",
+    ] {
+        assert!(rewrite(input).is_none(), "{:?}", escape_bytes(input));
+        assert!(
+            !is_edit_at_pending_wrap_divergence(input),
+            "{:?}",
+            escape_bytes(input)
+        );
+    }
+
+    // An erase class gate never admits an edit, and the edit gate never an erase.
+    assert_eq!(erase_at_pending_wrap_class(b"\x1b[1;80H!\x1b[@?"), None);
+    assert!(!is_edit_at_pending_wrap_divergence(b"\x1b[1;80H!\x1b[K?"));
+}
+
+/// A named class predicate over one input.
+type NamedPredicate = (&'static str, fn(&[u8]) -> bool);
+
+/// The proptest divergence `<80 spaces>\x1b[0@! \x1b[1I\x1b[0S`, unmatched on
+/// origin/main 94d94db78: aterm's ICH resets the pending wrap (xterm util.c
+/// `InsertChar` -> `ResetWrap`; aterm-grid line_ops.rs `insert_chars`), so `!`
+/// overwrites (0, 79) and the SU scrolls it away, while alacritty `insert_blank`
+/// keeps `input_needs_wrap`, so `!` wraps to (1, 0) and the SU lifts it into row
+/// 0. The ICH counterfactual is what classifies it: no pinned signature, no
+/// shape predicate and no other wrap-reset gate matches it.
+#[test]
+fn ich_at_pending_wrap_proptest_divergence_is_classified_by_the_counterfactual() {
+    let mut input = vec![b' '; COLS];
+    input.extend_from_slice(b"\x1b[0@! \x1b[1I\x1b[0S");
+    assert!(
+        diff_screens(&input).is_some(),
+        "precondition: the engines diverge"
+    );
+
+    let (counterfactual, witnesses) = wrap_reset_gate(&input, |op| op == WrapResetOp::Ich)
+        .expect("the ICH counterfactual reproduces aterm");
+    let mut expected = vec![b' '; COLS];
+    expected.extend_from_slice(b"\x1b[C\x1b[0@! \x1b[1I\x1b[0S");
+    assert_eq!(counterfactual, expected);
+    let seen: Vec<(WrapResetOp, usize)> = witnesses.iter().map(|w| (w.op, w.prefix_len)).collect();
+    assert_eq!(seen, vec![(WrapResetOp::Ich, COLS)]);
+
+    let sig = divergence_signature(&input);
+    assert!(
+        PINNED_ALACRITTY_DIVERGENCES
+            .iter()
+            .all(|pin| divergence_signature(pin.input) != sig),
+        "no pinned signature matches"
+    );
+    let shape_predicates: [NamedPredicate; 12] = [
+        ("dec_graphics", is_dec_graphics_glyph_divergence),
+        ("sgr21", is_sgr21_double_underline_divergence),
+        ("clear_bce_or_above", is_clear_bce_or_above_divergence),
+        ("composable_cell", is_composable_cell_divergence),
+        ("cursor_only", is_cursor_only_position_quirk),
+        ("tab_pending_wrap", is_tab_pending_wrap_quirk),
+        ("cascade_content_shift", is_cursor_cascade_content_shift),
+        (
+            "quirk_cascade_cells",
+            is_quirk_cascade_with_classifiable_cells,
+        ),
+        ("quirk_op_cascade", is_quirk_op_cascade),
+        ("moving_lf", has_margin_filling_run_then_moving_lf),
+        ("cbt", contains_cbt),
+        ("scosc_scorc", contains_scosc_scorc),
+    ];
+    for (name, predicate) in shape_predicates {
+        assert!(!predicate(&input), "{name} must not explain it");
+    }
+    assert!(!is_el0_at_pending_wrap_glyph_divergence(&input));
+    assert_eq!(erase_at_pending_wrap_class(&input), None);
+    assert!(!is_1049h_at_pending_wrap_divergence(&input));
+
+    let matched = matched_alacritty_divergence(&input).expect("classified");
+    assert!(
+        std::ptr::eq(matched, &EDIT_WRAP_RESET_PIN),
+        "matched {:?}",
+        matched.name
+    );
+}
+
+/// [`sgr21_as_xterm`] rewrites exactly the SGR parameters vte and xterm both
+/// read as the code 21, and refuses where the two could read the list
+/// differently.
+#[test]
+fn sgr21_as_xterm_rewrites_only_what_both_engines_read_as_21() {
+    let rewrite = |input: &[u8]| sgr21_as_xterm(input).map(Cow::into_owned);
+    let fits = format!("\x1b[{}21m", "1;".repeat(27)).into_bytes();
+    let fits_spelled = format!("\x1b[{}4:2m", "1;".repeat(27)).into_bytes();
+    for (input, expected) in [
+        (&b"\x1b[21mx"[..], &b"\x1b[4:2mx"[..]),
+        (b"\x1b[1;21;3m", b"\x1b[1;4:2;3m"),
+        (b"\x1b[021m", b"\x1b[4:2m"),
+        (b"\x1b[;21m", b"\x1b[;4:2m"),
+        (b"\x1b[21m!\x1b[21;21m", b"\x1b[4:2m!\x1b[4:2;4:2m"),
+        // A 21 after a complete extended color, or after an unknown mode both
+        // engines consume alone, is a code again.
+        (b"\x1b[38;5;21;21m", b"\x1b[38;5;21;4:2m"),
+        (b"\x1b[48;2;21;21;21;21m", b"\x1b[48;2;21;21;21;4:2m"),
+        (b"\x1b[38;7;21m", b"\x1b[38;7;4:2m"),
+        (&fits, &fits_spelled),
+    ] {
+        assert_eq!(
+            rewrite(input).as_deref(),
+            Some(expected),
+            "{:?}",
+            escape_bytes(input)
+        );
+    }
+    // Left alone: a 21 that is a color index, component or mode, not in an SGR,
+    // or only a subparameter, which neither engine reads as SGR 21.
+    for input in [
+        &b"\x1b[38;5;21m"[..],
+        b"\x1b[48;2;21;21;21m",
+        b"\x1b[38;21m",
+        b"\x1b[>21m",
+        b"\x1b[21 m",
+        b"\x1b[21K",
+        b"\x1b[21:1m",
+        b"21m",
+        b"\x1b[1;4m",
+    ] {
+        assert!(
+            matches!(sgr21_as_xterm(input), Some(Cow::Borrowed(_))),
+            "{:?}",
+            escape_bytes(input)
+        );
+    }
+    // Refused: the engines could read the list differently around a 21.
+    let too_long = format!("\x1b[{}21m", "1;".repeat(28)).into_bytes();
+    for input in [
+        &b"\x1b[38;2;300;21;21m"[..],
+        b"\x1b[58;5;21m",
+        b"\x1b[4:3;21m",
+        &too_long,
+    ] {
+        assert!(sgr21_as_xterm(input).is_none(), "{:?}", escape_bytes(input));
+    }
+}
+
+/// The 20000-case proptest seed cc 74e9661b… (persisted in
+/// differential.proptest-regressions) failed once aterm's ED 0 began resetting
+/// the wrap: CHT reaches column 48, SGR 21 styles 32 spaces up to the parked
+/// column 79, and ED 0 there resets the wrap in aterm, so `!` overwrites (0,79)
+/// where alacritty wraps it to (1,0). The wrap reset alone left aterm's double
+/// underline against alacritty's CancelBold cells, so no class matched. With SGR
+/// 21 spelled as alacritty's double underline, the counterfactual reproduces
+/// aterm exactly and the input is class C2.
+#[test]
+fn sgr21_cells_at_ed0_pending_wrap_proptest_divergence_is_classified_by_the_counterfactual() {
+    let build = |sgr21: &[u8], before_erase: &[u8]| {
+        let mut bytes = vec![b' '; 8];
+        bytes.extend_from_slice(b"\x1b[5I");
+        bytes.extend_from_slice(sgr21);
+        bytes.extend_from_slice(&[b' '; 32]);
+        bytes.extend_from_slice(before_erase);
+        bytes.extend_from_slice(b"\x1b[0J!\x1b[0;2r");
+        bytes
+    };
+    let input = build(b"\x1b[21m", b"");
+    assert!(
+        diff_screens(&input).is_some(),
+        "precondition: the engines diverge"
+    );
+
+    // The wrap reset alone does not reproduce aterm, and the underline is the
+    // whole residual.
+    let aterm = aterm_screen(&input);
+    let wrap_only = alacritty_screen(&build(b"\x1b[21m", b"\x1b[C"));
+    assert_eq!(aterm.cursor, wrap_only.cursor);
+    assert_ne!(aterm.rows, wrap_only.rows);
+    let without_underline = |screen: &Screen| -> Vec<Vec<CellProj>> {
+        screen
+            .rows
+            .iter()
+            .map(|row| {
+                let row = row
+                    .iter()
+                    .map(|cell| CellProj {
+                        underline: Underline::None,
+                        ..*cell
+                    })
+                    .collect();
+                trim_row(row, screen.default_bg)
+            })
+            .collect()
+    };
+    assert_eq!(without_underline(&aterm), without_underline(&wrap_only));
+
+    let (counterfactual, witnesses) = wrap_reset_gate(&input, |op| {
+        matches!(op, WrapResetOp::El(_) | WrapResetOp::Ed(_))
+    })
+    .expect("the counterfactual with SGR 21 spelled 4:2 reproduces aterm");
+    assert_eq!(counterfactual, build(b"\x1b[4:2m", b"\x1b[C"));
+    let seen: Vec<(WrapResetOp, usize)> = witnesses.iter().map(|w| (w.op, w.prefix_len)).collect();
+    assert_eq!(seen, vec![(WrapResetOp::Ed(0), 50)]);
+    assert_eq!(erase_at_pending_wrap_class(&input), Some(false));
+
+    let matched = matched_alacritty_divergence(&input).expect("classified");
+    assert_eq!(
+        matched.name,
+        "ED/EL at pending wrap resets the wrap (class C2, print cascade)"
+    );
 }
 
 proptest! {

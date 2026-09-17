@@ -204,7 +204,7 @@ fn ship_is_a_front_door_verb_at_a_terminal() {
 /// cannot write it at all. Both verbs, because they are two dispatch arms.
 #[test]
 fn the_front_door_serves_the_hidden_helper_verbs_under_its_own_name() {
-    for verb in ["__lay-files", "__stage-payload"] {
+    for verb in ["__lay-files", "__stage-payload", "__refresh-view"] {
         let dir =
             std::env::temp_dir().join(format!("aterm-hidden-verb-{verb}-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);

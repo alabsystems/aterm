@@ -110,7 +110,12 @@ fn column_range_to_byte_offsets(s: &str, start_col: usize, end_col: usize) -> (u
     let mut found_start = false;
 
     for g in split_graphemes(s) {
-        let width = g.width;
+        // GRID cells, not the cluster's display width. `Grapheme::width` answers
+        // "how wide does this look" and is right about emoji; the grid advances
+        // per CHARACTER outside them, so a Devanagari conjunct it paints in 3
+        // cells was being charged 1. A stored line then copied a different run
+        // of cells than the highlight painted.
+        let width = aterm_grapheme::grapheme_grid_columns(g.text);
         if width > 0 {
             let next_col = current_col + width;
             if !found_start && start_col < next_col {

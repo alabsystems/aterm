@@ -11,6 +11,9 @@
 # Features enabled:
 # - Directory tracking (OSC 7): tab title updates, "Open Terminal Here" support
 # - Command tracking (OSC 133): command history indexing, timing, notifications
+# - The managed dirs, LIVE: an already-running session shell resolves `claude`/`codex`
+#   to atpkg's <prefix>/agents twins (and cargo/rustc to <prefix>/reroute) the moment
+#   atpkg lays them — no new tab, no `exec zsh` (owner ask 2026-09-16; see "LIVE" below)
 #
 # Compatible with: zsh 5.0+
 
@@ -83,7 +86,7 @@ fi
 
 # Skip if already loaded — marking the boundary on the way out when the
 # inherited guard means we crossed one.
-if [[ -n "$ATERM_SHELL_INTEGRATION_INSTALLED" ]]; then
+if [[ -n "${ATERM_SHELL_INTEGRATION_INSTALLED:-}" ]]; then
     if [[ -n "$__aterm_mux" ]]; then
         export ATERM_MUX="$__aterm_mux"
         if [[ -n "${ATERM_PARENT_SESSION_ID:-}" ]]; then
@@ -178,15 +181,237 @@ fi
 # `${(@)path:#…}`: `:#` matches the expanded value LITERALLY (no GLOB_SUBST), so a
 # directory named with `[` or `*` is still removed by equality; `(@)` in quotes
 # keeps an EMPTY entry ("here", to a POSIX shell) — the user's — from being dropped.
+#
+# It also records, in $__aterm_managed_want, the dirs it put in front (in order),
+# which is what the per-prompt hot path below compares the head of $path against,
+# and in $__aterm_managed_agents_on / $__aterm_managed_reroute_on whether each dir
+# WAS there to front. A dir that was absent is re-probed by the hot path (one `-d`
+# per prompt, only while it stays absent — review finding 2026-09-16: a hook that
+# predates agents/ set $ATPKG_AGENTS, the `-d` here failed once, and the shell
+# never looked again) and fronted the moment it appears. The `-d` stats of the
+# steady state live HERE, on the change path, never on the per-prompt one.
+#
+# `emulate -L zsh` opens every function of this block: a user's rc may `setopt
+# ksh_arrays` (subscripts from 0 — `path[1,n]` read the wrong elements, and
+# `${(@)path:#…}` collapsed to element 0, so PATH was truncated to the two managed
+# dirs at every prompt; measured 2026-09-16), `sh_word_split`, `glob_subst`, or
+# `warn_create_global` (sourcing the hook from inside a function then printed four
+# "created globally" lines at the prompt). `emulate -L` is a builtin, local to the
+# function, and restores every option on return.
+#
+# $__aterm_managed_agents_listing leaves the names inside <prefix>/agents, joined
+# by ":", in $__aterm_managed_agents_now: one readdir, in-process — a bare glob
+# stats nothing, `(N)` makes an empty directory the empty string, and atpkg's
+# dot-prefixed temp files are not matched. It is the TWIN WATCH of the hot path
+# (step 4 below); the front records what it saw so the first prompt after a twin
+# lands is the one that rehashes.
+typeset -g __aterm_managed_agents_now=""
+__aterm_managed_agents_listing() {
+    emulate -L zsh
+    __aterm_managed_agents_now=""
+    [[ -n "${ATPKG_AGENTS:-}" ]] || return 0
+    local -a __aterm_ls
+    __aterm_ls=("$ATPKG_AGENTS"/*(N))
+    __aterm_managed_agents_now="${(j.:.)__aterm_ls}"
+}
+typeset -ga __aterm_managed_want
+typeset -gi __aterm_managed_agents_on=0
+typeset -gi __aterm_managed_reroute_on=0
+typeset -g __aterm_managed_agents_seen=""
 __aterm_reroute_path_front() {
+    emulate -L zsh
+    __aterm_managed_want=()
+    __aterm_managed_agents_on=0
+    __aterm_managed_reroute_on=0
     if [[ -n "${ATPKG_AGENTS:-}" && -d "$ATPKG_AGENTS" ]]; then
         path=("$ATPKG_AGENTS" "${(@)path:#$ATPKG_AGENTS}")
+        __aterm_managed_want=("$ATPKG_AGENTS")
+        __aterm_managed_agents_on=1
+        __aterm_managed_agents_listing
+        __aterm_managed_agents_seen="$__aterm_managed_agents_now"
     fi
     if [[ -n "${ATERM_REROUTE_DIR:-}" && -d "$ATERM_REROUTE_DIR" ]]; then
         path=("$ATERM_REROUTE_DIR" "${(@)path:#$ATERM_REROUTE_DIR}")
+        __aterm_managed_want=("$ATERM_REROUTE_DIR" "${__aterm_managed_want[@]}")
+        __aterm_managed_reroute_on=1
     fi
 }
 __aterm_reroute_path_front
+
+# ─── LIVE: the tab that is ALREADY OPEN picks the managed dirs up the moment atpkg lays them ───
+#
+# Owner, 2026-09-16, looking at a status row that read "✓ Claude Code 2.1.273 ·
+# Codex 0.154.0 — aterm-managed, current   what `claude` and `codex` run in new
+# tabs": "HEY! this is a bad experience. aterm atpkg DID install the latest but it
+# didn't make them available for me. instead, it is telling me to open a new tab.
+# NO! all the latest and best MUST WORK IN THE SAME TAB with live update! fix this
+# and this message and audit that this is the actual behavior."
+#
+# What was measured in that tab: its zsh (pid 1784) was spawned at 10:44:24 by the
+# PREVIOUS app build and ADOPTED across the seamless update — the running app
+# (0.86.0, pid 1868) started at 10:44:32 — and <prefix>/agents plus the shell.d
+# hooks were created at 10:46 by the new build's first pass. Nothing above runs
+# again in a shell that is already up: the load-time assert and the first-precmd
+# one both fire ONCE, gated on $ATPKG_AGENTS / $ATERM_REROUTE_DIR being set and the
+# directories existing AT THAT INSTANT, and that shell had neither variable and no
+# directory to find. So `which -a claude` read ~/.local/bin/claude first, `codex`
+# resolved to a brew cask that hung two minutes on `--version`, and the only way to
+# the build atpkg had just installed was a new tab. The same freeze hits EVERY fresh
+# machine: the first tab opens before the seed pass creates agents/.
+#
+# The fix is a per-prompt AND per-command re-assert — preexec matters because a
+# command typed at an idle prompt after the dirs appear runs BEFORE the next precmd
+# — in four steps, all builtin-only (no `$(...)`, no backticks, no external
+# stat/dirname/readlink; pinned by a grep test):
+#
+#  1. THE HOOK IS THE SOURCE OF TRUTH when the environment is missing or stale.
+#     ~/.aterm/shell.d/00-atpkg.zsh is what atpkg generates (crates/atpkg/src/hooks.rs;
+#     the spelling is pinned from that crate's side): it exports $ATPKG_AGENTS and
+#     $ATPKG_BIN, moves agents/ to the front and appends bin/, and it is idempotent.
+#     It is (re)sourced when the copy on disk is not the copy last sourced — it
+#     appeared (a shell spawned before the file existed), or atpkg rewrote it
+#     temp+rename on a later pass, so mtime OR inode moved. The stamp is read with
+#     `zstat` (zsh/stat, loaded as the one builtin `b:zstat` so the module never
+#     shadows /usr/bin/stat): ONE stat syscall, in-process, and its `2>/dev/null` is
+#     a builtin redirection, not a fork. A hook that predates R1 (no `export
+#     ATPKG_AGENTS`) is sourced ONCE per copy, not once per prompt (review finding
+#     2026-09-16). Without the module (a minimal zsh) the fallback probes `-f` and
+#     sources only while $ATPKG_AGENTS is unset (bash and fish compare the hook's
+#     TEXT instead — their step 1; this rare fallback keeps the cheaper rule and
+#     picks a REWRITTEN hook up in the next tab).
+#  2. A DIR THAT WAS ABSENT when the front was last laid is probed again — one `-d`
+#     per prompt, only in that degraded state — and fronted when it appears: a hook
+#     that names an agents/ atpkg has not created yet, or a session whose seam
+#     exported no $ATERM_REROUTE_DIR. Nothing is assigned while it stays absent.
+#  3. THE ORDER. $__aterm_managed_want holds the dirs that must lead $path; the hot
+#     path compares the head of $path against it by string equality and assigns
+#     ONLY on a mismatch — assigning $path flushes zsh's command hash, which is
+#     exactly what a change needs (`claude` re-resolves to the twin) and pure
+#     waste otherwise.
+#  4. THE TWIN WATCH. zsh hashes a command's path on first use, and a hashed name is
+#     never searched again while the file exists — so once agents/ leads $path and
+#     `claude` has run the foreign copy, a twin that lands LATER (a fresh machine:
+#     agents/ is created at launch, the twin only once the managed program is
+#     installed — the exact window in which the owner typed `claude`) would keep
+#     losing to the hashed path for the life of the shell (measured 2026-09-16, zsh
+#     5.9 and bash 3.2.57). The names inside agents/ are listed each call (one
+#     readdir, no stat, no fork) and compared to the listing recorded when the dir
+#     was fronted; on a change — a twin laid, or removed — `rehash` empties the
+#     table and the next lookup walks $path again. A twin RE-laid under the same
+#     name changes nothing here and needs nothing: the hashed path IS the twin.
+#
+# Per prompt and per command, steady state: one zstat, one readdir, no assignment.
+# Measured 2026-09-16 (zsh 5.9, 10000 calls): ~30 µs per call before the twin
+# watch; a fork of /usr/bin/true costs ~1400 µs.
+#
+# $ATERM_REROUTE_DIR is derived for a shell that predates it — the sibling
+# `<dir of $ATPKG_AGENTS>/reroute`, when it is a directory and $ATERM_NO_REROUTE is
+# not engaged (set, non-empty and not "0": atpkg::reroute::engaged) — so the final
+# order is reroute, agents, everything else, bin/ last (the hook appends it).
+#
+# Gated on BEING INSIDE AN ATERM SESSION ($ATERM_CHILD=1, which the spawn seam sets
+# for every child, or $ATERM_SESSION_ID) — NOT on $ATERM_REROUTE_DIR, which is
+# precisely what the adopted shell lacks. Inert everywhere else.
+typeset -g __aterm_atpkg_hook="$HOME/.aterm/shell.d/00-atpkg.zsh"
+typeset -g __aterm_atpkg_hook_seen=""
+typeset -gi __aterm_managed_live=0
+typeset -gi __aterm_have_zstat=0
+if [[ -n "${ATERM_CHILD:-}" || -n "${ATERM_SESSION_ID:-}" ]]; then
+    __aterm_managed_live=1
+    zmodload -F zsh/stat b:zstat 2>/dev/null && __aterm_have_zstat=1
+fi
+
+# Leaves "<mtime>:<inode>" of the hook on disk in $__aterm_atpkg_hook_now, or the
+# empty string when it is absent (or zsh/stat is unavailable). One stat syscall,
+# no fork. Its own global, not $REPLY: precmd runs between a user's `read` and
+# the line that consumes $REPLY, and must not clobber it.
+typeset -g __aterm_atpkg_hook_now=""
+__aterm_atpkg_hook_stamp() {
+    emulate -L zsh
+    __aterm_atpkg_hook_now=""
+    (( __aterm_have_zstat )) || return 0
+    local -A __aterm_st
+    zstat -H __aterm_st -- "$__aterm_atpkg_hook" 2>/dev/null || return 0
+    __aterm_atpkg_hook_now="$__aterm_st[mtime]:$__aterm_st[inode]"
+}
+# The copy the shell.d loop above sourced at load is the copy last sourced —
+# whatever it exported (a pre-R1 hook exports no $ATPKG_AGENTS, and is still not
+# sourced again until atpkg rewrites it).
+if (( __aterm_managed_live )); then
+    __aterm_atpkg_hook_stamp
+    __aterm_atpkg_hook_seen="$__aterm_atpkg_hook_now"
+fi
+
+# Exports $ATERM_REROUTE_DIR (status 0) or leaves it alone (status 1).
+__aterm_managed_derive_reroute() {
+    emulate -L zsh
+    [[ -z "${ATERM_REROUTE_DIR:-}" && -n "${ATPKG_AGENTS:-}" ]] || return 1
+    case "${ATERM_NO_REROUTE:-}" in
+        ''|0) ;;
+        *) return 1 ;;
+    esac
+    local __aterm_dir="${ATPKG_AGENTS%/*}/reroute"
+    [[ -d "$__aterm_dir" ]] || return 1
+    export ATERM_REROUTE_DIR="$__aterm_dir"
+}
+# A session shell whose seam exported no $ATERM_REROUTE_DIR but whose rc block
+# sourced the hook derives it now, so the load-time order is final too.
+if (( __aterm_managed_live )) && __aterm_managed_derive_reroute; then
+    __aterm_reroute_path_front
+fi
+
+# The hot path: every precmd and every preexec. Builtin-only — see above.
+__aterm_managed_path_live() {
+    emulate -L zsh
+    (( __aterm_managed_live )) || return 0
+    # 1. The hook: sourced when the copy on disk is not the copy last sourced.
+    if (( __aterm_have_zstat )); then
+        __aterm_atpkg_hook_stamp
+        if [[ -n "$__aterm_atpkg_hook_now" && "$__aterm_atpkg_hook_now" != "$__aterm_atpkg_hook_seen" ]]; then
+            __aterm_atpkg_hook_seen="$__aterm_atpkg_hook_now"
+            . "$__aterm_atpkg_hook"
+            __aterm_managed_derive_reroute
+            __aterm_reroute_path_front
+            return 0
+        fi
+    elif [[ -z "${ATPKG_AGENTS:-}" && -f "$__aterm_atpkg_hook" ]]; then
+        . "$__aterm_atpkg_hook"
+        __aterm_managed_derive_reroute
+        __aterm_reroute_path_front
+        return 0
+    fi
+    # 2. A dir that was absent when the front was last laid: probe it again.
+    local -i __aterm_refront=0
+    if (( ! __aterm_managed_agents_on )) && [[ -n "${ATPKG_AGENTS:-}" && -d "$ATPKG_AGENTS" ]]; then
+        __aterm_refront=1
+    fi
+    if (( ! __aterm_managed_reroute_on )); then
+        if [[ -n "${ATERM_REROUTE_DIR:-}" ]]; then
+            [[ -d "$ATERM_REROUTE_DIR" ]] && __aterm_refront=1
+        elif __aterm_managed_derive_reroute; then
+            __aterm_refront=1
+        fi
+    fi
+    if (( __aterm_refront )); then
+        __aterm_reroute_path_front
+        return 0
+    fi
+    # 3. The order: assign only on a mismatch.
+    local -i __aterm_n=$#__aterm_managed_want
+    if (( __aterm_n )) && [[ "${(j.:.)path[1,__aterm_n]}" != "${(j.:.)__aterm_managed_want}" ]]; then
+        __aterm_reroute_path_front
+        return 0
+    fi
+    # 4. The twin watch: a name appearing in (or leaving) agents/ empties the hash.
+    if (( __aterm_managed_agents_on )); then
+        __aterm_managed_agents_listing
+        if [[ "$__aterm_managed_agents_now" != "$__aterm_managed_agents_seen" ]]; then
+            __aterm_managed_agents_seen="$__aterm_managed_agents_now"
+            rehash
+        fi
+    fi
+    return 0
+}
 
 # State tracking
 typeset -g __aterm_in_command=0
@@ -326,6 +551,10 @@ __aterm_mark_exec_finish() {
 __aterm_precmd() {
     local last_status=$?
 
+    # The managed dirs, live (see "LIVE" above): one stat, one readdir, an assign
+    # (or a rehash) only on a change.
+    __aterm_managed_path_live
+
     # If we were in a command, mark it finished
     if (( __aterm_in_command )); then
         __aterm_mark_exec_finish $last_status
@@ -386,6 +615,10 @@ __aterm_encode_cmd() {
 # preexec - runs before command execution
 __aterm_preexec() {
     __aterm_in_command=1
+
+    # The managed dirs, live — BEFORE this command resolves: a `claude` typed at a
+    # prompt that was drawn before atpkg laid agents/ must already run the twin.
+    __aterm_managed_path_live
 
     # Report command text for session memory (OSC 633;E)
     __aterm_osc "633;E;$(__aterm_encode_cmd "$1")${__aterm_id_suffix_str}"
@@ -486,13 +719,18 @@ __aterm_first_precmd() {
     local last_status=$?
 
     # Apply prompt override if requested
-    if [[ -n "$ATERM_PROMPT_STYLE" && "$ATERM_PROMPT_STYLE" != "none" ]]; then
+    # `${…:-}`: under a user's `setopt nounset` the bare form errored at every
+    # prompt and this one-shot never uninstalled itself (review note 2026-09-16).
+    if [[ -n "${ATERM_PROMPT_STYLE:-}" && "${ATERM_PROMPT_STYLE:-}" != "none" ]]; then
         __aterm_set_prompt
     fi
 
-    # The reroute and agents directories, FIRST — for the last time: /etc/zprofile and ~/.zshrc
-    # have both run by now (see __aterm_reroute_path_front for why the load-time
-    # assert above is not final).
+    # The reroute and agents directories, FIRST — unconditionally, once: /etc/zprofile
+    # and ~/.zshrc have both run by now (see __aterm_reroute_path_front for why the
+    # load-time assert above is not final), and a ~/.zshrc carrying atpkg's rc block
+    # may have set $ATPKG_AGENTS itself, so $__aterm_managed_want is recomputed here.
+    # From this prompt on, __aterm_precmd/__aterm_preexec keep it live (the "LIVE"
+    # block above) without assigning $path unless the order is actually wrong.
     __aterm_reroute_path_front
 
     add-zsh-hook -d precmd __aterm_first_precmd

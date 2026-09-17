@@ -134,8 +134,10 @@ impl Layout {
     /// `agents/` — the ONE managed directory that goes FIRST on `PATH` (the shell hook
     /// prepends it, [`crate::hooks`]; the GUI's spawn seam front-inserts it beside
     /// `reroute/`). It holds ONLY the shims of the agent programs
-    /// ([`crate::stub::AGENT_PROGRAMS`]), each byte-identical to its `bin/` twin
-    /// ([`crate::activate::reconcile_agents`]), so `claude`/`codex` run the managed copy
+    /// ([`crate::stub::AGENT_PROGRAMS`]), each forwarding exactly where its `bin/` twin
+    /// does with the same exported environment ([`crate::activate::reconcile_agents`];
+    /// since 2026-09-16 the twin also carries the landing prelude, [`crate::landing`]),
+    /// so `claude`/`codex` run the managed copy
     /// ahead of a vendor's native install or a brew cask — the rule-1 exception (owner
     /// decision 2026-09-10: aterm is the version manager for the coding agents;
     /// docs/design/DESIGN-which-copy-runs). Every other managed tool stays in `bin/`,
@@ -150,6 +152,24 @@ impl Layout {
     #[must_use]
     pub fn agent_shim(&self, tool: &ToolName) -> PathBuf {
         self.agents_dir().join(tool.shim_file())
+    }
+
+    /// `landing/` — the LANDING MARKERS ([`crate::landing`], 2026-09-16): one file per
+    /// agent program whose NEWER pinned build a pass is fetching/staging/activating right
+    /// now. The `agents/` twin tests for its marker with one `[ -f ]` before it execs,
+    /// and hands over to `atpkg __landing` while the marker stands, so a `claude` typed
+    /// mid-update waits for the new build instead of silently running the old one. Its
+    /// own directory, not a dotfile under `agents/`: [`crate::activate::sweep_agents_dir`]
+    /// removes everything in `agents/` that is not a live twin.
+    #[must_use]
+    pub fn landing_dir(&self) -> PathBuf {
+        self.prefix.join("landing")
+    }
+
+    /// `landing/<tool>` — the landing marker of one agent program ([`Self::landing_dir`]).
+    #[must_use]
+    pub fn landing_marker(&self, tool: &ToolName) -> PathBuf {
+        self.landing_dir().join(tool.as_str())
     }
 
     /// `bin/<tool>` — a single shim. The concrete file name is [`ToolName::shim_file`]
@@ -628,6 +648,13 @@ fn ready_marker_path(build_dir: &Path) -> Option<PathBuf> {
 /// Its spelling is a compatibility surface, not a detail — see [`ready_text_accepts`].
 const READY_PLATFORM_KEY: &str = "platform=";
 
+/// Line 1 of every readiness marker every version of atpkg has ever written — and now the
+/// WELL-FORMEDNESS gate a marker must pass before [`ready_text_accepts`] reads anything
+/// else out of it. Bytes that do not carry this line were not written by this writer, so
+/// they are a crash artefact rather than a legacy marker. One spelling, shared by the
+/// writer ([`mark_build_ready`]) and the reader, so the two cannot drift.
+const READY_OK_LINE: &str = "ok";
+
 /// `<arch>-<os>` for the atpkg slice that is RUNNING: `aarch64-macos`, `x86_64-macos`,
 /// `x86_64-linux`, …
 ///
@@ -649,6 +676,17 @@ const READY_PLATFORM_KEY: &str = "platform=";
 /// So the marker records this value and [`build_is_complete`] refuses one that does not
 /// match: a store populated by the other slice reads as NOT installed and is re-staged
 /// natively. That is a re-download, never an error — the direction that repairs itself.
+///
+/// WHO RE-STAGES IT, precisely — because "reads as not installed" is a claim about READERS,
+/// and for a LIVE build only some of them read this marker. [`crate::ops::list_installed`],
+/// `doctor` and `gc` always did. The APPLY DECISION did not: [`crate::gate::decide`] is fed
+/// [`crate::ops::active_builds`], the `bin/` shim view, which resolves a shim and stats its
+/// target without ever opening `<build>.ready`. So a live build carrying the other slice's
+/// marker was `UpToDate` forever, and doctor's named remedy (`install <program>`) came back
+/// through that same view and printed "already current" — the hazard above, left intact and
+/// merely made noisy. `flow::installed_for_decide` is the input that closes it: every apply
+/// path now drops a live build this predicate refuses BEFORE deciding, so the re-stage this
+/// paragraph promises is the one that actually happens.
 ///
 /// Deliberately `std::env::consts` and NOT the artifact triple (`aarch64-apple-darwin`):
 /// std exposes no target triple, so spelling one here means duplicating
@@ -693,11 +731,36 @@ fn recorded_platform(text: &str) -> Option<&str> {
 /// re-spelling it silently demotes every marker this version wrote back to "no record"
 /// (harmless — they are accepted) but also unprotects them, so a re-spelling has to keep
 /// reading the old key rather than simply replacing it.
+///
+/// **AN ABSENT RECORD IS NOT AN ABSENT MARKER.** The lenience above is about a marker
+/// that is WELL FORMED and merely predates the platform field — a bare `ok\n`, which is
+/// what every earlier version wrote. It used to be reached by a ZERO-LENGTH file too, and
+/// that is a different thing entirely: `<build>.ready` is published by a rename, and a
+/// rename commits a NAME while the bytes behind it are still page cache, so a marker with
+/// no contents is precisely what a power loss leaves behind. Reading that as "installed,
+/// no record" vouched for a build whose tree may equally have lost its data — the state
+/// nothing downstream ever repairs ([`crate::gate::decide`] answers `UpToDate` and the
+/// superseded tree is already reclaimed). So [`READY_OK_LINE`] is REQUIRED: a marker with
+/// no readable `ok` first line — empty, NUL-filled, a torn prefix — is refused and the
+/// build re-stages, which is the direction that repairs itself. Only a well-formed marker
+/// gets the legacy lenience.
 fn ready_text_accepts(text: &str, running: &str) -> bool {
+    if !first_line_is_ok(text) {
+        return false;
+    }
     match recorded_platform(text) {
         None => true,
         Some(recorded) => recorded == running,
     }
+}
+
+/// Whether a marker's FIRST line is the historical [`READY_OK_LINE`] — the
+/// well-formedness gate [`ready_text_accepts`] applies before the lenient platform rule.
+/// Surrounding whitespace (a `\r` from a Windows-y tool, the same tolerance
+/// [`recorded_platform`] already had) is not a different line; a missing trailing newline
+/// is not a torn marker either, since `ok` alone is the whole of line 1.
+fn first_line_is_ok(text: &str) -> bool {
+    matches!(text.lines().next(), Some(first) if first.trim() == READY_OK_LINE)
 }
 
 /// What this process could learn about whether `path` is there — THREE answers,
@@ -765,6 +828,13 @@ pub fn build_is_complete(build_dir: &Path) -> bool {
     };
     match std::fs::read_to_string(&marker) {
         Ok(text) => ready_text_accepts(&text, &running_platform()),
+        Err(e) if e.kind() == std::io::ErrorKind::InvalidData => false,
+        // Present and READ, but not text at all. Every marker this writer produces is
+        // ASCII (`ok\n` plus an ASCII platform record), so bytes that are not UTF-8 were
+        // never written here — they are the same crash artefact the `ok`-line rule
+        // refuses, arriving as a read error instead of as a string. That is evidence
+        // about CONTENT, so it decides the content question; the arm below is for the
+        // errors that say nothing about content.
         // Present, but not readable AS TEXT: a directory planted at the marker path, a
         // permissions oddity, a filesystem handing back non-UTF-8. `exists()` — the whole
         // of this predicate before the platform record — answered `true` for all of those,
@@ -775,8 +845,16 @@ pub fn build_is_complete(build_dir: &Path) -> bool {
     }
 }
 
-/// Atomically mark `build_dir` complete (temp + rename, so a crash during the write
-/// leaves NO marker rather than a half-written one). Call as the LAST staging step.
+/// Atomically AND DURABLY mark `build_dir` complete (temp + fsync + rename, so a crash
+/// during the write leaves NO marker rather than a half-written one). Call as the LAST
+/// staging step.
+///
+/// The fsync is not ceremony. A rename publishes a NAME — metadata — and the bytes behind
+/// that name stay in the page cache until something flushes them, so on any filesystem
+/// that can commit metadata ahead of data a power loss could expose `<build>.ready` as a
+/// correctly-named ZERO-LENGTH file. This is the commit record of an entire multi-GB
+/// stage: it has to be on disk before its name is. (A refusal from a volume that cannot
+/// flush is not a failure — see [`sync_contents_or_accept_refusal`].)
 ///
 /// The text also records WHICH SLICE of the universal binary installed the build
 /// ([`running_platform`]), so the other slice cannot silently inherit the verdict. Line 1
@@ -794,12 +872,23 @@ pub fn mark_build_ready(build_dir: &Path) -> std::io::Result<()> {
     tmp_name.push_str(&crate::dec_u64(u64::from(std::process::id())));
     let tmp = parent.join(tmp_name);
     // Manual concat (no `format!`): Trust-gate lowering workaround — see `lib.rs::dec_u64`.
-    let mut body = String::from("ok\n");
+    let mut body = String::from(READY_OK_LINE);
+    body.push('\n');
     body.push_str(READY_PLATFORM_KEY);
     body.push_str(&running_platform());
     body.push('\n');
-    // `fs::write` via `call2`: Trust-gate name-matching workaround — see `lib.rs::call2`.
-    crate::call2(std::fs::write, &tmp, body.as_bytes())?;
+    {
+        use std::io::Write as _;
+        // `0644` explicitly rather than `fs::write`'s umask-dependent `0666 & ~umask`:
+        // under a SYSTEM prefix this file is root-owned and every unprivileged reader
+        // must still be able to read the verdict it carries — the same argument the
+        // durable floor settled (`sig.rs`).
+        let mut f = crate::platform::open_create_write(&tmp, 0o644)?;
+        f.write_all(body.as_bytes())?;
+        // Inside the braces: on stable storage BEFORE the handle drops, and before the
+        // rename below publishes the name.
+        sync_contents_or_accept_refusal(&f)?;
+    }
     std::fs::rename(&tmp, &dest)
 }
 
@@ -881,6 +970,283 @@ pub fn tracked_install_record(build_dir: &Path) -> Option<String> {
 pub fn clear_tracked_install(build_dir: &Path) {
     if let Some(marker) = tracked_install_marker_path(build_dir) {
         let _ = std::fs::remove_file(marker);
+    }
+}
+
+/// The suffix of the stage-refusal memo beside a build dir (`<build>.refused`).
+pub const STAGE_REFUSAL_SUFFIX: &str = ".refused";
+
+/// The memo's first line — the schema gate. A file that does not open with it is not
+/// read at all, so a future shape can never be half-understood by this reader.
+const STAGE_REFUSAL_HEADER: &str = "stage-refusal v1";
+
+/// Bound on a memo read: it holds six short lines.
+const MAX_REFUSAL_BYTES: usize = 4 * 1024;
+
+/// How long the SECOND consecutive refusal of a build's signed digests holds the next
+/// attempt off the wire — 12 h, two of the GUI's six-hourly ticks — doubling per further
+/// refusal up to [`REFUSAL_COOLDOWN_CAP_SECS`]. The FIRST refusal holds nothing at all:
+/// see [`StageRefusal::cooldown_secs`].
+const REFUSAL_COOLDOWN_BASE_SECS: i64 = 12 * 60 * 60;
+
+/// The ceiling on that doubling: one week. A pin whose SIGNED digests do not match the
+/// published asset is a publishing fact that only a new index can fix, and every attempt
+/// to re-prove it costs the whole asset.
+const REFUSAL_COOLDOWN_CAP_SECS: i64 = 7 * 24 * 60 * 60;
+
+/// The longest `why` sentence a memo keeps — the stage's own words, truncated so the
+/// memo cannot grow past a line or two.
+const MAX_REFUSAL_WHY_CHARS: usize = 300;
+
+/// What a DETERMINISTIC stage failure recorded beside `store/<program>/<build>`: the
+/// SIGNED digests the published bytes did not match, the stage's own sentence, when it
+/// was recorded, and how many consecutive attempts have now proved the same thing.
+///
+/// # Why a memo exists at all
+///
+/// A signed-`sha256` mismatch says the published bytes are not the bytes the manifest
+/// names, and while the pin and its digest hold still, so does that answer. The archive
+/// is (rightly) deleted on that failure, and any `.part` with it — the bytes are wrong,
+/// and a poisoned prefix must never seed the next attempt — so the NEXT attempt starts
+/// from byte 0: every six-hourly tick re-downloaded the whole asset (~3.4 GB for
+/// `trust`) to reach the identical verdict, on every machine in the fleet, until the
+/// publisher cut a new index. This is the record that stops that, and the ONLY thing it
+/// can do is skip a transfer — it is consulted after the signed manifest has been
+/// fetched and verified, and it can never admit bytes, relax a digest, or keep a build
+/// alive.
+///
+/// # Why it lapses
+///
+/// A publisher can repair the asset UNDER the same pin (re-upload the bytes the signed
+/// digest always named), and a transfer can simply have been truncated on the wire — a
+/// permanent memo would hide both. So the record holds a COOLDOWN, not a verdict, and
+/// the first one is ZERO: the next pass downloads again exactly as it always did. From
+/// the second identical verdict it bounds the retry to one attempt per 12 h, then 24,
+/// 48, 96, up to one a week, instead of four a day — and any change to the pinned
+/// build's signed `sha256`/`tree_root` makes it stop binding at once.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct StageRefusal {
+    /// The SIGNED `sha256` of the artifact this refusal is about.
+    pub sha256: String,
+    /// The SIGNED `tree_root` of that artifact (empty when the manifest carries none).
+    pub tree_root: String,
+    /// The stage's own sentence ([`crate::install::StageError`]'s `Display`).
+    pub why: String,
+    /// When it was recorded (Unix epoch second).
+    pub at: i64,
+    /// How many consecutive attempts have failed on these digests (>= 1).
+    pub attempts: u32,
+}
+
+impl StageRefusal {
+    /// The cooldown this record's attempt count buys — ZERO for a first refusal, then
+    /// [`REFUSAL_COOLDOWN_BASE_SECS`] doubled once per further consecutive refusal,
+    /// capped at [`REFUSAL_COOLDOWN_CAP_SECS`].
+    ///
+    /// THE FIRST RETRY IS ALWAYS FREE, and that is the load-bearing half. A digest
+    /// mismatch is not proof of a publishing slip: a truncated transfer, a bad mirror or
+    /// a meddling proxy produces exactly the same verdict, and those heal on the very
+    /// next attempt. So one failure buys nothing — the next pass downloads again, as it
+    /// always did, and a publisher who repaired the asset under the same pin is found
+    /// there (`flow`'s `a_member_stage_failure_aborts_the_group_and_a_retry_heals_it`
+    /// pins that healing). Only a SECOND failure over the identical signed digests — two
+    /// independent downloads, two identical verdicts — is evidence about the publication
+    /// rather than about the wire, and that is where holding off starts to pay.
+    #[must_use]
+    pub fn cooldown_secs(&self) -> i64 {
+        let Some(steps) = self.attempts.checked_sub(2) else {
+            return 0;
+        };
+        REFUSAL_COOLDOWN_BASE_SECS
+            .saturating_mul(1_i64 << steps.min(8))
+            .min(REFUSAL_COOLDOWN_CAP_SECS)
+    }
+
+    /// The epoch second at which a new attempt is due.
+    #[must_use]
+    pub fn retry_after(&self) -> i64 {
+        self.at.saturating_add(self.cooldown_secs())
+    }
+
+    /// Whether this record still stands in the way of re-fetching an artifact with these
+    /// SIGNED digests at `now_unix`. Fail-OPEN by construction: a memo with no `sha256`,
+    /// one whose digests differ from the pin's (the publisher moved them — the repair
+    /// this memo must not hide), or one whose cooldown has lapsed binds nothing, and a
+    /// clock that cannot be read (`i64::MAX`) makes every memo look lapsed. The only
+    /// thing a memo can do is skip a download that would fail again.
+    #[must_use]
+    pub fn binds(&self, sha256: &str, tree_root: &str, now_unix: i64) -> bool {
+        !self.sha256.is_empty()
+            && self.sha256.eq_ignore_ascii_case(sha256)
+            && self.tree_root.eq_ignore_ascii_case(tree_root)
+            && now_unix < self.retry_after()
+    }
+}
+
+/// `store/<program>/<build>.refused` for `build_dir` — a SIBLING, like `<build>.ready`
+/// and `<build>.shim-env`, so it never perturbs the build's `tree_root` and can outlive a
+/// build directory that never came to exist (which is the point: the stage it records
+/// FAILED).
+fn stage_refusal_path(build_dir: &Path) -> Option<PathBuf> {
+    let name = crate::call1(std::path::Path::file_name, build_dir)?;
+    let name = crate::call1(std::ffi::OsStr::to_str, name)?;
+    let mut marker = String::from(name);
+    marker.push_str(STAGE_REFUSAL_SUFFIX);
+    Some(build_dir.with_file_name(marker))
+}
+
+/// Record that staging `build_dir` failed on the SIGNED digests (temp + rename, so a
+/// crash leaves no half-written memo). A record already naming these digests has its
+/// attempt count ADVANCED — that is what lengthens the cooldown; a record naming other
+/// digests is replaced, starting the count again.
+///
+/// At most ONE memo survives per program: writing one reclaims every other `*.refused`
+/// beside it — the same bound `staging/` keeps for partials — so a program whose pin
+/// moves repeatedly leaves one small file, never one per build it refused.
+///
+/// # Errors
+/// The memo could not be written (its parent — `store/<program>/` — cannot be created,
+/// or the volume refuses).
+pub fn record_stage_refusal(
+    build_dir: &Path,
+    sha256: &str,
+    tree_root: &str,
+    why: &str,
+    now_unix: i64,
+) -> std::io::Result<()> {
+    let dest = stage_refusal_path(build_dir).ok_or_else(|| {
+        std::io::Error::new(std::io::ErrorKind::InvalidInput, "build dir has no name")
+    })?;
+    let attempts = stage_refusal(build_dir)
+        .filter(|prior| {
+            prior.sha256.eq_ignore_ascii_case(sha256)
+                && prior.tree_root.eq_ignore_ascii_case(tree_root)
+        })
+        .map_or(1, |prior| prior.attempts.saturating_add(1));
+    let parent = dest.parent().unwrap_or(build_dir);
+    std::fs::create_dir_all(parent)?;
+    // Manual (byte-identical) render, no `format!`: Trust-gate lowering workaround —
+    // see `lib.rs::dec_u64`.
+    let mut tmp_name = String::from(".refused.tmp-");
+    tmp_name.push_str(&crate::dec_u64(u64::from(std::process::id())));
+    let tmp = parent.join(tmp_name);
+    let mut body = String::from(STAGE_REFUSAL_HEADER);
+    body.push_str("\nsha256=");
+    body.push_str(sha256);
+    body.push_str("\ntree_root=");
+    body.push_str(tree_root);
+    body.push_str("\nattempts=");
+    body.push_str(&crate::dec_u64(u64::from(attempts)));
+    body.push_str("\nat=");
+    body.push_str(&crate::dec_u64(u64::try_from(now_unix).unwrap_or(0)));
+    // One line: the reader takes the `why=` line whole.
+    body.push_str("\nwhy=");
+    let one_line: String = why
+        .replace(['\n', '\r'], " ")
+        .chars()
+        .take(MAX_REFUSAL_WHY_CHARS)
+        .collect();
+    body.push_str(&one_line);
+    body.push('\n');
+    crate::call2(std::fs::write, &tmp, body.as_bytes())?;
+    if let Err(e) = std::fs::rename(&tmp, &dest) {
+        let _ = std::fs::remove_file(&tmp);
+        return Err(e);
+    }
+    if let Some(name) = dest.file_name() {
+        sweep_other_refusals(parent, name);
+    }
+    Ok(())
+}
+
+/// Reclaim every `*.refused` in `dir` except `keep` — the one-memo-per-program bound.
+fn sweep_other_refusals(dir: &Path, keep: &OsStr) {
+    let Ok(entries) = std::fs::read_dir(dir) else {
+        return;
+    };
+    for entry in entries.flatten() {
+        let name = entry.file_name();
+        if name == keep || !entry.file_type().is_ok_and(|t| t.is_file()) {
+            continue;
+        }
+        if name
+            .to_str()
+            .is_some_and(|n| n.ends_with(STAGE_REFUSAL_SUFFIX))
+        {
+            let _ = std::fs::remove_file(entry.path());
+        }
+    }
+}
+
+/// The refusal recorded beside `build_dir`, if one is there and reads. `None` is "no
+/// usable record" — a missing, unreadable, oversized, symlinked or malformed memo says
+/// nothing, so the caller downloads, which is the behaviour without this file at all.
+#[must_use]
+pub fn stage_refusal(build_dir: &Path) -> Option<StageRefusal> {
+    let path = stage_refusal_path(build_dir)?;
+    let text = crate::metadata_io::read_bounded_regular_utf8(&path, MAX_REFUSAL_BYTES).ok()?;
+    parse_stage_refusal(&text)
+}
+
+/// [`stage_refusal`]'s parser, split out so the schema gate and every malformed shape are
+/// testable without a filesystem. Fail-closed to `None`.
+fn parse_stage_refusal(text: &str) -> Option<StageRefusal> {
+    let mut lines = text.lines();
+    if lines.next()?.trim() != STAGE_REFUSAL_HEADER {
+        return None;
+    }
+    let (mut sha256, mut tree_root, mut why) = (None, None, None);
+    let (mut at, mut attempts) = (None, None);
+    for line in lines {
+        if let Some(v) = line.strip_prefix("sha256=") {
+            sha256 = Some(v.to_string());
+        } else if let Some(v) = line.strip_prefix("tree_root=") {
+            tree_root = Some(v.to_string());
+        } else if let Some(v) = line.strip_prefix("why=") {
+            why = Some(v.to_string());
+        } else if let Some(v) = line.strip_prefix("at=") {
+            at = v.trim().parse::<i64>().ok();
+        } else if let Some(v) = line.strip_prefix("attempts=") {
+            attempts = v.trim().parse::<u32>().ok().filter(|n| *n >= 1);
+        }
+    }
+    Some(StageRefusal {
+        sha256: sha256?,
+        tree_root: tree_root?,
+        why: why.unwrap_or_default(),
+        at: at?,
+        attempts: attempts?,
+    })
+}
+
+/// Remove the refusal beside `build_dir`, if any — a stage of this build that SUCCEEDED,
+/// every discard, and the explicit install door, so the memo never outlives its cause.
+pub fn clear_stage_refusal(build_dir: &Path) {
+    if let Some(marker) = stage_refusal_path(build_dir) {
+        let _ = std::fs::remove_file(marker);
+    }
+}
+
+/// Forget every refusal recorded for `program` — what the EXPLICIT door
+/// (`aterm pkg install <program>`) does before it installs, so a person who has just
+/// fixed the publish (or the proxy that corrupted the transfer) never waits out a
+/// cooldown meant for an unattended six-hourly loop.
+pub fn clear_stage_refusals(layout: &Layout, program: &str) {
+    let dir = layout.prefix.join("store").join(program);
+    let Ok(entries) = std::fs::read_dir(&dir) else {
+        return;
+    };
+    for entry in entries.flatten() {
+        if !entry.file_type().is_ok_and(|t| t.is_file()) {
+            continue;
+        }
+        if entry
+            .file_name()
+            .to_str()
+            .is_some_and(|n| n.ends_with(STAGE_REFUSAL_SUFFIX))
+        {
+            let _ = std::fs::remove_file(entry.path());
+        }
     }
 }
 
@@ -990,7 +1356,10 @@ fn scratch_siblings(build_dir: &Path) -> Vec<(Scratch, PathBuf)> {
 /// It does NOT re-mark the recovered tree. The swap clears the marker before the first
 /// rename, so whether that tree was complete is unrecoverable from disk — leaving it
 /// unmarked means it reads as not-installed and is re-staged, which is honest, whereas
-/// re-marking would promote a tree nothing can vouch for.
+/// re-marking would promote a tree nothing can vouch for. The re-stage is the next apply
+/// pass's, shims or no shims: `flow::installed_for_decide` drops an unmarked live build
+/// before [`crate::gate::decide`] sees it, so a recovered tree the shims still resolve into
+/// is repaired rather than read as up to date.
 pub(crate) fn recover_interrupted_swap(build_dir: &Path) -> bool {
     // `symlink_metadata`, not `exists()`: a DANGLING symlink at the build path is still
     // something being there, and "the window" means nothing at all is. Narrower is safer.
@@ -1054,8 +1423,103 @@ pub(crate) fn sync_dir(dir: &Path) {
     }
 }
 
+/// [`crate::platform::sync_file_contents`], with a REFUSAL degraded to success.
+///
+/// The rule the updater's boot sentinel already settled: some volumes a store can live on
+/// (a network home, some FUSE mounts) answer a flush `ENOTSUP`/`EINVAL`, and failing an
+/// install there would trade a durability guarantee the volume cannot give for a
+/// toolchain the user cannot have. A REAL error (`EIO`, `ENOSPC`) still propagates —
+/// those are the answers that say the bytes are not on disk, which is the whole question
+/// being asked.
+fn sync_contents_or_accept_refusal(f: &std::fs::File) -> std::io::Result<()> {
+    match crate::platform::sync_file_contents(f) {
+        Ok(()) => Ok(()),
+        Err(e)
+            if matches!(
+                e.kind(),
+                std::io::ErrorKind::Unsupported | std::io::ErrorKind::InvalidInput
+            ) =>
+        {
+            Ok(())
+        }
+        Err(e) => Err(e),
+    }
+}
+
+/// What [`sync_tree`] flushed. The counts exist so a test can prove the walk reached
+/// EVERY file and directory of a staged tree rather than some arbitrary subset of it —
+/// there is no other observable the flush leaves behind.
+#[derive(Debug, Default)]
+pub(crate) struct Synced {
+    /// Regular files whose contents were pushed to the filesystem.
+    pub files: u64,
+    /// Directories whose entries were pushed to the filesystem.
+    pub dirs: u64,
+}
+
+/// Flush a STAGED TREE — every regular file's contents, then every directory's entries —
+/// so that nothing which PUBLISHES the tree can become durable ahead of the bytes it
+/// publishes. Call between the last verification and the swap.
+///
+/// **The hazard, concretely.** Staging writes gigabytes through a plain write loop and
+/// then publishes them with renames. A rename is metadata; the data behind it is page
+/// cache until something flushes it. Under ext4's default delayed allocation — whose
+/// `auto_da_alloc` heuristic covers a rename OVER AN EXISTING FILE, which neither the
+/// swap nor the marker is — the journal can commit `store/<program>/<build>/` and its
+/// sibling `<build>.ready` while the payload is still unwritten. After a power loss the
+/// store then says "build N is complete" over files that are zero-length or truncated,
+/// and NOTHING repairs that state: [`crate::gate::decide`] answers `UpToDate`, the apply
+/// path never re-fetches, and the superseded tree was already reclaimed by the swap that
+/// installed this one. Only a hand-run `atpkg verify` would ever walk the tree again.
+/// [`sync_dir`] orders the RENAMES against each other; it never made the data durable.
+///
+/// **The cost, deliberately bounded.** One `fsync(2)` per file, never
+/// `fcntl(F_FULLFSYNC)` — see [`crate::platform::sync_file_contents`]. The work is
+/// dominated by writeback the install already owes the filesystem; what this gives up is
+/// batching it, and what it buys is that no crash can mark a build installed over data
+/// that never landed.
+///
+/// Symlinks are never followed and never opened: a link has no contents of its own, and
+/// the directory entry naming it is flushed with its directory. A file this process
+/// cannot OPEN is one it cannot flush — the `dmg` lane copies a vendor bundle with its
+/// modes preserved, so an unreadable member is possible, and failing a whole install over
+/// one would be strictly worse than the gap this closes.
+pub(crate) fn sync_tree(root: &Path) -> std::io::Result<Synced> {
+    let mut counts = Synced::default();
+    let mut stack = vec![root.to_path_buf()];
+    while let Some(dir) = stack.pop() {
+        for child in std::fs::read_dir(&dir)? {
+            let path = child?.path();
+            // `symlink_metadata`: a link is never followed (the staged tree admits in-root
+            // links, and following one could leave the tree or walk a cycle).
+            let ft = std::fs::symlink_metadata(&path)?.file_type();
+            if ft.is_dir() {
+                stack.push(path);
+            } else if ft.is_file() {
+                match std::fs::File::open(&path) {
+                    Ok(f) => {
+                        sync_contents_or_accept_refusal(&f)?;
+                        counts.files = counts.files.saturating_add(1);
+                    }
+                    Err(e) if e.kind() == std::io::ErrorKind::PermissionDenied => {}
+                    Err(e) => return Err(e),
+                }
+            }
+        }
+        // The directory's own entries, AFTER the contents they name. Best-effort on the
+        // open alone: Windows cannot open a directory as a file at all, and that platform
+        // has no store to strand.
+        if let Ok(handle) = std::fs::File::open(&dir) {
+            sync_contents_or_accept_refusal(&handle)?;
+            counts.dirs = counts.dirs.saturating_add(1);
+        }
+    }
+    Ok(counts)
+}
+
 /// Discard a build entirely: remove its tree AND its sibling completeness marker (the
-/// inverse of a stage + [`mark_build_ready`]). Used to clean up a build that a transaction
+/// inverse of a stage + [`mark_build_ready`]), its sidecars, and the exec root
+/// [`crate::compat`] laid for it. Used to clean up a build that a transaction
 /// STAGED but then ABORTED without activating — leaving it complete-but-inactive would make
 /// `list_installed`/`decide` mis-read it as the active build on the next run. Best-effort.
 ///
@@ -1076,6 +1540,11 @@ pub(crate) fn sync_dir(dir: &Path) {
 /// deletes only trees that NOTHING on disk points into, which is what earns it the right
 /// to name a build number it read out of a directory listing.
 pub(crate) fn discard_build(build_dir: &Path) {
+    // The build's EXEC ROOT (`<prefix>/compat/<program>/<n>`, `crate::compat`) goes
+    // FIRST: it is a copy-on-write clone of this build's files, so left behind it would
+    // keep every reclaimed block allocated and could still run the tools of a build the
+    // store no longer has. Derived from this path's own `store/<program>/<n>` chain only.
+    crate::compat::discard_root_of(build_dir);
     let _ = std::fs::remove_dir_all(build_dir);
     if let Some(marker) = ready_marker_path(build_dir) {
         let _ = std::fs::remove_file(marker);
@@ -1095,6 +1564,10 @@ pub(crate) fn discard_build(build_dir: &Path) {
     // And the tracked-install record (`<build>.tracked-install`): the cause it named is
     // gone with the tree, and a clean reinstall must not be reported under it.
     clear_tracked_install(build_dir);
+    // And the digest-refusal memo (`<build>.refused`): it is a statement about the bytes
+    // a pin named, and a later reinstall under this build number must start from the
+    // signed manifest, never from a verdict about a tree that is gone.
+    clear_stage_refusal(build_dir);
 }
 
 /// The default prefix under `home`. On macOS `…/Library/Application Support/aterm/pkg`
@@ -1643,6 +2116,144 @@ mod tests {
         let _ = std::fs::remove_dir_all(&h);
     }
 
+    /// The refusal's PURE half: what it binds, and for how long. A memo binds only the
+    /// digests it was recorded for, only from the SECOND identical verdict, and only
+    /// until its cooldown lapses — the three escapes that keep a bandwidth cooldown from
+    /// ever becoming a verdict (a truncated transfer heals on the next attempt, a
+    /// publisher may repair the asset under the same pin, and a re-cut pin moves the
+    /// digests).
+    #[test]
+    fn a_stage_refusal_binds_only_while_its_digests_and_cooldown_hold() {
+        let memo = |attempts| StageRefusal {
+            sha256: "AA".into(),
+            tree_root: "bb".into(),
+            why: "asset sha256 mismatch: expected aa, got cc".into(),
+            at: 1_000,
+            attempts,
+        };
+        // THE FIRST RETRY IS FREE: one mismatch can be a truncated transfer, and the next
+        // pass must still be able to find the publisher's repair. From the second
+        // identical verdict: 12 h, doubling, capped at a week.
+        assert_eq!(memo(1).cooldown_secs(), 0, "one failure holds nothing");
+        assert_eq!(memo(2).cooldown_secs(), 12 * 3600);
+        assert_eq!(memo(3).cooldown_secs(), 24 * 3600);
+        assert_eq!(memo(4).cooldown_secs(), 48 * 3600);
+        assert_eq!(
+            memo(10).cooldown_secs(),
+            7 * 24 * 3600,
+            "capped at one week"
+        );
+        assert_eq!(memo(1_000).cooldown_secs(), 7 * 24 * 3600, "no overflow");
+        assert!(
+            !memo(1).binds("aa", "bb", 1_000),
+            "a single failure never holds the next attempt off the wire"
+        );
+
+        let m = memo(2);
+        assert_eq!(m.retry_after(), 1_000 + 12 * 3600);
+        assert!(
+            m.binds("aa", "BB", 1_000),
+            "case-insensitive on both digests"
+        );
+        assert!(
+            !m.binds("aa", "BB", m.retry_after()),
+            "the cooldown lapses — the next attempt is due"
+        );
+        assert!(
+            !m.binds("dd", "bb", 1_000),
+            "a re-cut pin's new sha256 binds nothing"
+        );
+        assert!(
+            !m.binds("aa", "dd", 1_000),
+            "a re-cut pin's new tree_root binds nothing"
+        );
+        assert!(
+            !m.binds("aa", "bb", i64::MAX),
+            "an unreadable clock (now_unix's fail-closed i64::MAX) reads as lapsed, \
+             so it can only cost a download — never block an install"
+        );
+        assert!(
+            !StageRefusal {
+                sha256: String::new(),
+                ..memo(2)
+            }
+            .binds("", "bb", 1_000),
+            "a memo with no digest binds nothing"
+        );
+    }
+
+    /// The refusal memo on disk: written beside the build like `.ready`/`.shim-env`, read
+    /// back whole, its attempt count ADVANCED while the digests hold and reset when they
+    /// move, one memo per program at most, and taken away by the success/discard/explicit
+    /// -door clears. A malformed or foreign file reads as no memo at all.
+    #[test]
+    fn the_refusal_memo_round_trips_advances_and_is_one_per_program() {
+        let h = temp_home("stage-refusal");
+        let l = Layout { prefix: h.clone() };
+        let build = l.build_dir("trust", 4900);
+        assert_eq!(stage_refusal(&build), None, "nothing recorded yet");
+
+        record_stage_refusal(
+            &build,
+            "AA",
+            "bb",
+            "asset sha256 mismatch:\nexpected aa",
+            1_000,
+        )
+        .unwrap();
+        let marker = build.with_file_name("4900.refused");
+        assert!(marker.is_file(), "a sibling, outside the tree");
+        assert!(!build.exists(), "the build it refused never came to exist");
+        let m = stage_refusal(&build).unwrap();
+        assert_eq!((m.sha256.as_str(), m.tree_root.as_str()), ("AA", "bb"));
+        assert_eq!(m.at, 1_000);
+        assert_eq!(m.attempts, 1);
+        assert_eq!(
+            m.why, "asset sha256 mismatch: expected aa",
+            "one line: the newline is folded"
+        );
+
+        // The same digests again: the attempt count advances, which is what lengthens the
+        // cooldown (12 h, then 24, …) instead of retrying every six-hourly tick.
+        record_stage_refusal(&build, "aa", "BB", "again", 50_000).unwrap();
+        let m = stage_refusal(&build).unwrap();
+        assert_eq!((m.attempts, m.at), (2, 50_000));
+        // Digests that MOVED are a different question: the count starts again.
+        record_stage_refusal(&build, "cc", "bb", "new pin, new verdict", 60_000).unwrap();
+        assert_eq!(stage_refusal(&build).unwrap().attempts, 1);
+
+        // One memo per program: recording the next build's reclaims the last build's.
+        let next = l.build_dir("trust", 4901);
+        record_stage_refusal(&next, "dd", "ee", "and again", 70_000).unwrap();
+        assert!(
+            !marker.exists(),
+            "the superseded build's memo is reclaimed, not left to accumulate"
+        );
+        assert!(stage_refusal(&next).is_some());
+
+        // Malformed/foreign content reads as NO memo — the fail-open direction.
+        std::fs::write(next.with_file_name("4901.refused"), b"nonsense\nat=1\n").unwrap();
+        assert_eq!(
+            stage_refusal(&next),
+            None,
+            "a file that does not open with the schema line is not read"
+        );
+
+        // The three clears.
+        record_stage_refusal(&next, "dd", "ee", "once more", 80_000).unwrap();
+        clear_stage_refusal(&next);
+        assert_eq!(stage_refusal(&next), None);
+        clear_stage_refusal(&next); // idempotent
+        record_stage_refusal(&next, "dd", "ee", "once more", 90_000).unwrap();
+        clear_stage_refusals(&l, "trust");
+        assert_eq!(stage_refusal(&next), None, "the explicit door forgets it");
+        record_stage_refusal(&next, "dd", "ee", "once more", 95_000).unwrap();
+        std::fs::create_dir_all(next.join("bin")).unwrap();
+        discard_build(&next);
+        assert_eq!(stage_refusal(&next), None, "the discard takes it too");
+        let _ = std::fs::remove_dir_all(&h);
+    }
+
     /// The EXTRAS opt-in markers: recorded by name (idempotent, `0600`, regular file),
     /// listed, cleared one at a time and all at once; a name that could never be a
     /// program is refused rather than joined onto the path; a planted symlink is never a
@@ -2153,7 +2764,18 @@ mod tests {
     #[test]
     fn ready_text_accepts_only_an_absent_or_matching_record() {
         assert!(ready_text_accepts("ok\n", "aarch64-macos"));
-        assert!(ready_text_accepts("", "aarch64-macos"));
+        // A marker with no `ok` line is a CRASH ARTEFACT, never a legacy marker: empty is
+        // what a rename-without-fsync exposes after a power loss, and a NUL run is how a
+        // committed-but-unwritten inode reads back.
+        assert!(!ready_text_accepts("", "aarch64-macos"));
+        assert!(!ready_text_accepts("\0\0\0\0", "aarch64-macos"));
+        assert!(!ready_text_accepts("o", "aarch64-macos"));
+        assert!(!ready_text_accepts(
+            "platform=aarch64-macos\n",
+            "aarch64-macos"
+        ));
+        // …while a well-formed marker that never grew a trailing newline is well formed.
+        assert!(ready_text_accepts("ok", "aarch64-macos"));
         assert!(ready_text_accepts(
             "ok\nplatform=aarch64-macos\n",
             "aarch64-macos"
@@ -2181,6 +2803,78 @@ mod tests {
             "ok\narch=x86_64-macos\n",
             "aarch64-macos"
         ));
+    }
+
+    /// THE CRASH MARKER, through the real predicate. `<build>.ready` is published by a
+    /// rename — a directory entry — while the bytes behind it are page cache, so a power
+    /// loss in that window leaves the NAME with no contents. Until the `ok` line was
+    /// required, such a marker took the "no platform record" branch and vouched for the
+    /// build: the store reported it installed, `decide` answered `UpToDate`, and nothing
+    /// short of a hand-run `atpkg verify` ever looked at the tree again — while the tree's
+    /// own data, flushed by nothing either, may have been just as lost.
+    #[test]
+    fn a_marker_left_empty_or_torn_by_a_crash_reads_as_incomplete() {
+        let home = temp_home("readytorn");
+        let build = home.join("store").join("ay").join("18");
+        std::fs::create_dir_all(&build).unwrap();
+        let marker = ready_marker_path(&build).unwrap();
+
+        // Exactly what a rename of unflushed bytes exposes after a power loss.
+        std::fs::write(&marker, b"").unwrap();
+        assert!(
+            !build_is_complete(&build),
+            "a zero-length marker must never vouch for a build"
+        );
+        // The same crash's other shape: the inode committed, its blocks read back as zeros.
+        std::fs::write(&marker, vec![0u8; 4096]).unwrap();
+        assert!(
+            !build_is_complete(&build),
+            "a NUL-filled marker is not `ok`"
+        );
+        // Bytes that are not text at all — never something this writer produced.
+        std::fs::write(&marker, [0xff_u8, 0xfe, 0xff]).unwrap();
+        assert!(!build_is_complete(&build), "a non-UTF-8 marker is not `ok`");
+        // A marker torn mid-word is still honest about line 1.
+        std::fs::write(&marker, b"o").unwrap();
+        assert!(!build_is_complete(&build), "a torn marker is not `ok`");
+
+        // NON-VACUITY, both directions: the real writer's marker vouches, and so does the
+        // legacy bare `ok` a pre-platform-record version left behind.
+        mark_build_ready(&build).unwrap();
+        assert!(build_is_complete(&build));
+        std::fs::write(&marker, b"ok\n").unwrap();
+        assert!(build_is_complete(&build));
+        let _ = std::fs::remove_dir_all(&home);
+    }
+
+    /// THE STAGED TREE IS FLUSHED BEFORE IT IS PUBLISHED. The walk has to reach every
+    /// regular file and every directory — a subset would leave exactly the files the
+    /// swap's renames then vouch for unflushed — and must never follow a symlink out of
+    /// the tree it was handed.
+    #[test]
+    fn sync_tree_flushes_every_file_and_directory_it_walks() {
+        let home = temp_home("synctree");
+        let root = home.join("18.incoming-1");
+        std::fs::create_dir_all(root.join("bin")).unwrap();
+        std::fs::create_dir_all(root.join("lib").join("nested")).unwrap();
+        std::fs::write(root.join("bin").join("ay"), b"#!/bin/true\n").unwrap();
+        std::fs::write(root.join("lib").join("a.rlib"), b"payload").unwrap();
+        std::fs::write(root.join("lib").join("nested").join("b.rlib"), b"deep").unwrap();
+        #[cfg(unix)]
+        std::os::unix::fs::symlink("../lib/a.rlib", root.join("bin").join("link")).unwrap();
+
+        let synced = sync_tree(&root).unwrap();
+        assert_eq!(
+            synced.files, 3,
+            "every regular file, and the symlink is not one"
+        );
+        assert_eq!(synced.dirs, 4, "the root, bin, lib and lib/nested");
+
+        // A tree that is not there is an ERROR, not a quiet success: this runs on the path
+        // an install is about to publish, so "nothing to flush" must never read as
+        // "flushed".
+        assert!(sync_tree(&home.join("absent")).is_err());
+        let _ = std::fs::remove_dir_all(&home);
     }
 
     #[test]

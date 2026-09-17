@@ -52,11 +52,21 @@ fn run_urlencode_via_shell(
 
 #[cfg(unix)]
 fn bash_shell() -> &'static str {
-    if std::path::Path::new("/bin/bash").exists() {
-        "/bin/bash"
-    } else {
-        "bash"
-    }
+    static BASH: std::sync::OnceLock<String> = std::sync::OnceLock::new();
+    BASH.get_or_init(|| {
+        // `$ATERM_TEST_BASH` overrides (the prompt-parity test needs a bash with
+        // `${PS1@P}`, which macOS's /bin/bash 3.2 lacks — see the resolver's doc);
+        // otherwise /bin/bash, then a `$PATH` scan, then the bare name as before.
+        #[cfg(unix)]
+        if let Some(found) = resolve_test_shell("ATERM_TEST_BASH", &["/bin/bash"], "bash") {
+            return found;
+        }
+        if std::path::Path::new("/bin/bash").exists() {
+            "/bin/bash".to_string()
+        } else {
+            "bash".to_string()
+        }
+    })
 }
 
 /// Resolve an interpreter for the live-spawn tests: an explicit `$ATERM_TEST_<SHELL>`
@@ -236,6 +246,12 @@ fn shell_command(shell: &str) -> Command {
         // hook, and every script moves it to the front beside the reroute dir, so an
         // inherited one would re-order the test shell's PATH the same way.
         "ATPKG_AGENTS",
+        // The session gate of the LIVE re-assert (2026-09-16): inside an aterm
+        // session both are set, and every script would then probe the (hermetic,
+        // empty) ~/.aterm/shell.d at every prompt. Inert by default; the live
+        // tests set ATERM_CHILD=1 themselves.
+        "ATERM_CHILD",
+        "ATERM_SESSION_ID",
     ] {
         cmd.env_remove(var);
     }
@@ -3619,6 +3635,24 @@ fn test_fish_prompt_colors_are_sgr_indices_like_bash() {
         return;
     };
     let bash = bash_shell();
+    // The bash half expands PS1 with `${PS1@P}`, a bash 4.4 parameter transformation
+    // that macOS's /bin/bash 3.2 does not have (it prints the literal template, so the
+    // fixture-sanity assert below fails before any fish byte is compared). Measured
+    // 2026-09-16, the first time this test ran on a Mac with fish installed. A bash
+    // without `@P` cannot be the reference, so the test skips — honestly, on stderr —
+    // rather than fail on the wrong shell; `$ATERM_TEST_BASH` can point at a newer
+    // bash (Homebrew's) to run the parity for real.
+    let probe = shell_command(bash)
+        .args(["--noprofile", "--norc", "-c", "x=ok; printf '%s' \"${x@P}\""])
+        .output()
+        .unwrap_or_else(|error| panic!("spawn bash for the @P probe: {error}"));
+    if probe.stdout != b"ok" {
+        eprintln!(
+            "bash at {bash} lacks ${{PS1@P}} (bash 4.4+); skipping \
+             test_fish_prompt_colors_are_sgr_indices_like_bash"
+        );
+        return;
+    }
     let bash_script = format!(
         "{}/src/scripts/aterm_shell_integration.bash",
         env!("CARGO_MANIFEST_DIR")
@@ -3707,12 +3741,12 @@ fn test_scripts_mark_the_multiplexer_boundary_before_the_loader_guard() {
         (
             "bash",
             scripts::BASH,
-            "if [[ -n \"$ATERM_SHELL_INTEGRATION_INSTALLED\" ]]; then",
+            "if [[ -n \"${ATERM_SHELL_INTEGRATION_INSTALLED:-}\" ]]; then",
         ),
         (
             "zsh",
             scripts::ZSH,
-            "if [[ -n \"$ATERM_SHELL_INTEGRATION_INSTALLED\" ]]; then",
+            "if [[ -n \"${ATERM_SHELL_INTEGRATION_INSTALLED:-}\" ]]; then",
         ),
         (
             "fish",
@@ -3722,12 +3756,12 @@ fn test_scripts_mark_the_multiplexer_boundary_before_the_loader_guard() {
         (
             "app-bash",
             APP_BASH_RESOURCE,
-            "if [[ -n \"$ATERM_SHELL_INTEGRATION_INSTALLED\" ]]; then",
+            "if [[ -n \"${ATERM_SHELL_INTEGRATION_INSTALLED:-}\" ]]; then",
         ),
         (
             "app-zsh",
             APP_ZSH_RESOURCE,
-            "if [[ -n \"$ATERM_SHELL_INTEGRATION_INSTALLED\" ]]; then",
+            "if [[ -n \"${ATERM_SHELL_INTEGRATION_INSTALLED:-}\" ]]; then",
         ),
         (
             "app-fish",
@@ -4151,4 +4185,1180 @@ fn test_fish_marks_a_multiplexer_pane_and_clears_a_stale_marker() {
         ("ATERM_MUX", "tmux"),
     ]);
     assert_eq!(out, "mux=UNSET outer=UNSET", "stderr: {err:?}");
+}
+
+// ---------------------------------------------------------------------------
+// LIVE: the tab that is ALREADY OPEN picks the managed dirs up (2026-09-16).
+//
+// Owner: "aterm atpkg DID install the latest but it didn't make them available
+// for me. instead, it is telling me to open a new tab. NO! all the latest and
+// best MUST WORK IN THE SAME TAB with live update! fix this and this message and
+// audit that this is the actual behavior." Measured: the tab's zsh (pid 1784)
+// was spawned 10:44:24 by the previous app build and adopted across the seamless
+// update (app 10:44:32); <prefix>/agents and the shell.d hooks were created at
+// 10:46 by the new build — and nothing in the running shell ever learned of them.
+// ---------------------------------------------------------------------------
+
+/// The atpkg hook in `crates/atpkg/src/hooks.rs`'s EXACT format — a golden of
+/// `hook_files()` for two fixture paths, pinned to that function from atpkg's side
+/// (`crates/atpkg/tests/shell_integration_hook_pin.rs`), with the fixture paths
+/// substituted here. `aterm-shell-integration` cannot depend on `atpkg`.
+#[cfg(unix)]
+const ATPKG_HOOK_POSIX_GOLDEN: &str = include_str!(concat!(
+    env!("CARGO_MANIFEST_DIR"),
+    "/src/fixtures/atpkg-hook-posix.golden"
+));
+#[cfg(unix)]
+const ATPKG_HOOK_FISH_GOLDEN: &str = include_str!(concat!(
+    env!("CARGO_MANIFEST_DIR"),
+    "/src/fixtures/atpkg-hook-fish.golden"
+));
+#[cfg(unix)]
+const ATPKG_HOOK_FIXTURE_AGENTS: &str = "/opt/aterm-si fixture/pkg/agents";
+#[cfg(unix)]
+const ATPKG_HOOK_FIXTURE_BIN: &str = "/opt/aterm-si fixture/pkg/bin";
+
+/// The name the reroute stubs' directory carries (`atpkg::reroute::DIR_MARKER_FILE`).
+#[cfg(unix)]
+const REROUTE_DIR_MARKER: &str = ".atpkg-reroute-dir";
+
+/// One live, INTERACTIVE shell driven over pipes: commands go in one line at a
+/// time, and the test waits for each command's own output before it changes the
+/// world and sends the next — so a directory laid between two commands is laid
+/// while the shell sits at an idle prompt, exactly the owner's tab. Interactive
+/// (`-i`) with a piped stdin still runs every hook this crate installs (measured
+/// on zsh 5.9 and bash 3.2.57: precmd/PROMPT_COMMAND fire before every prompt,
+/// preexec/the DEBUG trap before every command); fish needs a real pty for its
+/// `fish_prompt`/`fish_preexec` events and is wrapped in `script` for that.
+#[cfg(unix)]
+struct LiveShell {
+    label: String,
+    child: std::process::Child,
+    stdin: std::process::ChildStdin,
+    stdout: std::sync::Arc<std::sync::Mutex<Vec<u8>>>,
+    stderr: std::sync::Arc<std::sync::Mutex<Vec<u8>>>,
+}
+
+#[cfg(unix)]
+fn pump(mut reader: impl std::io::Read + Send + 'static) -> std::sync::Arc<std::sync::Mutex<Vec<u8>>> {
+    let sink = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+    let out = std::sync::Arc::clone(&sink);
+    std::thread::spawn(move || {
+        let mut buf = [0u8; 4096];
+        loop {
+            match reader.read(&mut buf) {
+                Ok(0) | Err(_) => break,
+                Ok(n) => out
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner)
+                    .extend_from_slice(&buf[..n]),
+            }
+        }
+    });
+    sink
+}
+
+#[cfg(unix)]
+fn find_bytes(hay: &[u8], needle: &[u8]) -> Option<usize> {
+    if needle.is_empty() || hay.len() < needle.len() {
+        return None;
+    }
+    hay.windows(needle.len()).position(|w| w == needle)
+}
+
+#[cfg(unix)]
+impl LiveShell {
+    const TIMEOUT: std::time::Duration = std::time::Duration::from_secs(20);
+
+    fn spawn(label: &str, cmd: &mut Command) -> Self {
+        cmd.stdin(std::process::Stdio::piped())
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::piped());
+        let mut child = cmd
+            .spawn()
+            .unwrap_or_else(|error| panic!("{label}: spawn: {error}"));
+        let stdin = child.stdin.take().expect("piped stdin");
+        let stdout = pump(child.stdout.take().expect("piped stdout"));
+        let stderr = pump(child.stderr.take().expect("piped stderr"));
+        Self {
+            label: label.to_owned(),
+            child,
+            stdin,
+            stdout,
+            stderr,
+        }
+    }
+
+    fn stderr_text(&self) -> String {
+        let err = self
+            .stderr
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        String::from_utf8_lossy(&err).into_owned()
+    }
+
+    fn transcript(&self) -> String {
+        let out = self
+            .stdout
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let err = self
+            .stderr
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        format!(
+            "--- stdout ---\n{}\n--- stderr ---\n{}",
+            String::from_utf8_lossy(&out),
+            String::from_utf8_lossy(&err)
+        )
+    }
+
+    fn send(&mut self, line: &str) {
+        use std::io::Write as _;
+        self.stdin
+            .write_all(format!("{line}\n").as_bytes())
+            .and_then(|()| self.stdin.flush())
+            .unwrap_or_else(|error| panic!("{}: write {line:?}: {error}\n{}", self.label, self.transcript()));
+    }
+
+    /// Wait until `marker` appears in stdout at or after byte offset `from`;
+    /// returns the offset just past it. Panics with the whole transcript on
+    /// timeout or when the shell exits first.
+    fn wait_for_after(&mut self, marker: &str, from: usize) -> usize {
+        let started = std::time::Instant::now();
+        loop {
+            {
+                let out = self
+                    .stdout
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner);
+                if let Some(pos) = find_bytes(&out[from.min(out.len())..], marker.as_bytes()) {
+                    return from + pos + marker.len();
+                }
+            }
+            if let Ok(Some(status)) = self.child.try_wait() {
+                panic!(
+                    "{}: shell exited ({status}) before {marker:?} appeared\n{}",
+                    self.label,
+                    self.transcript()
+                );
+            }
+            assert!(
+                started.elapsed() < Self::TIMEOUT,
+                "{}: timed out waiting for {marker:?}\n{}",
+                self.label,
+                self.transcript()
+            );
+            std::thread::sleep(std::time::Duration::from_millis(15));
+        }
+    }
+
+    /// The text after the LAST `key` before `end` (the OSC 633;E mark quotes the
+    /// command line, which carries `key` too — but the output comes after it),
+    /// cut at the first control byte.
+    fn value_before(&self, key: &str, end: usize) -> String {
+        let out = self
+            .stdout
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let text = String::from_utf8_lossy(&out[..end.min(out.len())]);
+        text.rsplit(key)
+            .next()
+            .unwrap_or("")
+            .chars()
+            .take_while(|c| !c.is_control())
+            .collect()
+    }
+
+    fn finish(mut self) {
+        self.send("exit");
+        let started = std::time::Instant::now();
+        loop {
+            if let Ok(Some(_)) = self.child.try_wait() {
+                return;
+            }
+            if started.elapsed() > Self::TIMEOUT {
+                let _ = self.child.kill();
+                panic!("{}: did not exit after `exit`\n{}", self.label, self.transcript());
+            }
+            std::thread::sleep(std::time::Duration::from_millis(15));
+        }
+    }
+}
+
+/// The owner's machine in a temp dir: a home whose rc prepends a FOREIGN `claude`
+/// (their ~/.zshrc prepends ~/.local/bin), and a managed prefix that does not
+/// exist yet — atpkg's first pass lays it while the shell is already running.
+#[cfg(unix)]
+struct LiveFixture {
+    _dir: aterm_tempfile::TempDir,
+    base: std::path::PathBuf,
+    home: std::path::PathBuf,
+    foreign: std::path::PathBuf,
+    agents: std::path::PathBuf,
+    reroute: std::path::PathBuf,
+    bin: std::path::PathBuf,
+}
+
+#[cfg(unix)]
+fn write_executable(path: &Path, body: &str) {
+    use std::os::unix::fs::PermissionsExt as _;
+    std::fs::write(path, body).unwrap_or_else(|error| panic!("write {}: {error}", path.display()));
+    std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o755))
+        .unwrap_or_else(|error| panic!("chmod {}: {error}", path.display()));
+}
+
+#[cfg(unix)]
+impl LiveFixture {
+    fn new() -> Self {
+        let dir = aterm_tempfile::tempdir().expect("tempdir");
+        let root = dir.path().to_path_buf();
+        let home = root.join("home");
+        let foreign = root.join("foreign");
+        // A prefix with a SPACE, like the real one under "Application Support".
+        let prefix = root.join("Application Support").join("pkg");
+        std::fs::create_dir_all(&home).expect("home");
+        std::fs::create_dir_all(&foreign).expect("foreign");
+        write_executable(&foreign.join("claude"), "#!/bin/sh\necho foreign\n");
+        Self {
+            base: root.join("si"),
+            home,
+            foreign,
+            agents: prefix.join("agents"),
+            reroute: prefix.join("reroute"),
+            bin: prefix.join("bin"),
+            _dir: dir,
+        }
+    }
+
+    fn shell_d(&self) -> std::path::PathBuf {
+        self.home.join(".aterm").join("shell.d")
+    }
+
+    fn hook_body(&self, golden: &str) -> String {
+        golden
+            .replace(ATPKG_HOOK_FIXTURE_AGENTS, self.agents.to_str().expect("UTF-8"))
+            .replace(ATPKG_HOOK_FIXTURE_BIN, self.bin.to_str().expect("UTF-8"))
+    }
+
+    /// atpkg's pass, as the running shell sees it: agents/ + reroute/ (+ its
+    /// marker) + bin/ created, the twin laid, then the hook written temp+rename.
+    fn lay(&self, hook_ext: &str, golden: &str, twin_says: &str) {
+        self.lay_dirs();
+        self.lay_twin(twin_says);
+        self.lay_hook(hook_ext, golden);
+    }
+
+    /// The three managed dirs (agents/ EMPTY — no twin yet) and the reroute marker:
+    /// what the spawn seam / the seed pass creates before any program is installed.
+    fn lay_dirs(&self) {
+        std::fs::create_dir_all(&self.agents).expect("agents");
+        std::fs::create_dir_all(&self.reroute).expect("reroute");
+        std::fs::create_dir_all(&self.bin).expect("bin");
+        std::fs::write(self.reroute.join(REROUTE_DIR_MARKER), "").expect("marker");
+    }
+
+    /// The hook alone, in hooks.rs's exact format.
+    fn lay_hook(&self, ext: &str, golden: &str) {
+        self.write_hook(ext, &self.hook_body(golden));
+    }
+
+    /// The twin, atomically (temp + rename), the way atpkg re-lays it on update.
+    fn lay_twin(&self, says: &str) {
+        let tmp = self.agents.join(".claude.tmp");
+        write_executable(&tmp, &format!("#!/bin/sh\necho {says}\n"));
+        std::fs::rename(&tmp, self.agents.join("claude")).expect("rename twin");
+    }
+
+    /// The seam's reroute dir with its marker and ONE stub in it (`aterm help
+    /// reroute`): what a session shell inherits before any agent program exists.
+    fn lay_reroute_stub(&self, name: &str, says: &str) {
+        std::fs::create_dir_all(&self.reroute).expect("reroute");
+        std::fs::write(self.reroute.join(REROUTE_DIR_MARKER), "").expect("marker");
+        write_executable(&self.reroute.join(name), &format!("#!/bin/sh\necho {says}\n"));
+    }
+
+    fn write_hook(&self, ext: &str, body: &str) {
+        let shell_d = self.shell_d();
+        std::fs::create_dir_all(&shell_d).expect("shell.d");
+        let tmp = shell_d.join(format!(".00-atpkg.{ext}.tmp"));
+        std::fs::write(&tmp, body).expect("hook tmp");
+        std::fs::rename(&tmp, shell_d.join(format!("00-atpkg.{ext}"))).expect("rename hook");
+    }
+
+    fn assert_path_order(&self, label: &str, path: &str) {
+        let (reroute, agents, bin) = (
+            self.reroute.to_str().expect("UTF-8"),
+            self.agents.to_str().expect("UTF-8"),
+            self.bin.to_str().expect("UTF-8"),
+        );
+        assert!(
+            path.starts_with(&format!("{reroute}:{agents}:")),
+            "{label}: PATH must lead with reroute then agents: {path:?}"
+        );
+        assert!(
+            path.ends_with(&format!(":{bin}")),
+            "{label}: the managed bin/ must stay LAST: {path:?}"
+        );
+        for (name, dir) in [("reroute", reroute), ("agents", agents), ("bin", bin)] {
+            assert_eq!(
+                path.split(':').filter(|e| *e == dir).count(),
+                1,
+                "{label}: {name} exactly once: {path:?}"
+            );
+        }
+        assert!(
+            path.split(':').any(|e| e == self.foreign.to_str().expect("UTF-8")),
+            "{label}: the foreign dir is demoted, not removed: {path:?}"
+        );
+    }
+}
+
+/// THE OWNER'S SCENARIO, zsh, through the crate's own ZDOTDIR wrapper: an
+/// interactive shell inside a session (ATERM_CHILD=1) with no ATPKG_AGENTS, no
+/// ATERM_REROUTE_DIR, no hook file and no agents dir, whose rc puts a foreign
+/// `claude` first. `claude` → foreign. With the SAME shell still running and idle
+/// at a prompt, atpkg's pass lays the hook (hooks.rs's exact format), agents/ with
+/// a twin and reroute/ with its marker: `claude` → "managed 1" — that pickup is
+/// preexec's, a whole prompt cycle having passed with nothing laid. The twin is
+/// re-laid temp+rename: `claude` → "managed 2". The hook is rewritten temp+rename:
+/// re-sourced (zstat sees the new inode). PATH then reads reroute, agents, …, bin
+/// last, each once, and ATERM_REROUTE_DIR was derived beside agents/. Then the two
+/// negatives: outside a session nothing happens live, and an engaged
+/// ATERM_NO_REROUTE derives no reroute dir.
+/// An interactive zsh through the crate's own ZDOTDIR wrapper, reading the
+/// fixture home's .zshrc — `rc_prelude` (a user's `setopt` lines, say) then the
+/// foreign prepend — exactly the real launch shape.
+#[cfg(unix)]
+fn spawn_live_zsh(zsh: &str, fx: &LiveFixture, rc_prelude: &str, extra: &[(&str, &str)]) -> LiveShell {
+    std::fs::write(
+        fx.home.join(".zshrc"),
+        format!("{rc_prelude}export PATH=\"{}:$PATH\"\n", fx.foreign.display()),
+    )
+    .expect(".zshrc");
+    let InjectionEnv { env_add, .. } = prepare_into(ShellType::Zsh, &fx.base)
+        .expect("prepare")
+        .expect("zsh injection");
+    let mut cmd = shell_command(zsh);
+    cmd.arg("-i")
+        .env("HOME", &fx.home)
+        .env("PATH", "/usr/bin:/bin")
+        .env("TERM", "dumb");
+    for (key, value) in env_add {
+        cmd.env(key, value);
+    }
+    // The wrapper restores ZDOTDIR to the test home, so the shell reads ITS
+    // .zshrc (the foreign prepend) — the real launch shape.
+    cmd.env_remove("ATERM_UNSET_ZDOTDIR")
+        .env("ATERM_ORIGINAL_ZDOTDIR", &fx.home);
+    for (key, value) in extra {
+        cmd.env(key, value);
+    }
+    LiveShell::spawn("zsh", &mut cmd)
+}
+
+/// An interactive bash through the crate's own `--rcfile` wrapper (which sources
+/// /etc/profile — on macOS, path_helper — then the home's .bashrc: `rc_prelude` (a
+/// user's `set -u`, say) then the foreign prepend, exactly the owner's shape),
+/// inside a session; `extra` is applied last, so it can override PATH.
+#[cfg(unix)]
+fn spawn_live_bash(fx: &LiveFixture, rc_prelude: &str, extra: &[(&str, &str)]) -> LiveShell {
+    std::fs::write(
+        fx.home.join(".bashrc"),
+        format!("{rc_prelude}export PATH=\"{}:$PATH\"\n", fx.foreign.display()),
+    )
+    .expect(".bashrc");
+    let InjectionEnv {
+        env_add,
+        argv_override,
+    } = prepare_into(ShellType::Bash, &fx.base)
+        .expect("prepare")
+        .expect("bash injection");
+    let argv = argv_override.expect("bash uses --rcfile");
+    let mut cmd = shell_command(bash_shell());
+    cmd.args(&argv[1..])
+        .arg("-i")
+        .env("HOME", &fx.home)
+        .env("PATH", "/usr/bin:/bin")
+        .env("TERM", "dumb")
+        .env("ATERM_CHILD", "1")
+        .env_remove("BASH_ENV");
+    for (key, value) in env_add {
+        cmd.env(key, value);
+    }
+    for (key, value) in extra {
+        cmd.env(key, value);
+    }
+    LiveShell::spawn("bash", &mut cmd)
+}
+
+#[cfg(unix)]
+#[test]
+fn test_zsh_already_running_session_shell_picks_up_the_managed_dirs_live() {
+    let Some(zsh) = zsh_shell() else {
+        eprintln!("zsh not installed; skipping the live zsh scenario");
+        return;
+    };
+    let spawn = |fx: &LiveFixture, extra: &[(&str, &str)]| spawn_live_zsh(zsh, fx, "", extra);
+
+    // 1. The scenario.
+    let fx = LiveFixture::new();
+    let mut sh = spawn(&fx, &[("ATERM_CHILD", "1")]);
+    sh.send("claude");
+    let at = sh.wait_for_after("foreign", 0);
+    // A whole idle prompt cycle with nothing laid — the next pickup is preexec's.
+    sh.send("echo IDLE-$((1+0))");
+    let at = sh.wait_for_after("IDLE-1", at);
+    let at = sh.wait_for_after("\x1b]133;A", at);
+    fx.lay("zsh", ATPKG_HOOK_POSIX_GOLDEN, "managed 1");
+    sh.send("claude");
+    let at = sh.wait_for_after("managed 1", at);
+    fx.lay_twin("managed 2");
+    sh.send("claude");
+    let at = sh.wait_for_after("managed 2", at);
+    // The hook rewritten under the live shell (a later pass): re-sourced.
+    fx.write_hook(
+        "zsh",
+        &format!("{}export ATPKG_HOOK_GEN=2\n", fx.hook_body(ATPKG_HOOK_POSIX_GOLDEN)),
+    );
+    sh.send("echo \"GEN=$ATPKG_HOOK_GEN\"");
+    let at = sh.wait_for_after("GEN=2", at);
+    sh.send("print -r -- \"LIVEPATH=$PATH\"; print -r -- \"LIVERR=$ATERM_REROUTE_DIR\"; print -r -- \"MARK$((40+2))\"");
+    let at = sh.wait_for_after("MARK42", at);
+    let path = sh.value_before("LIVEPATH=", at);
+    let rr = sh.value_before("LIVERR=", at);
+    fx.assert_path_order("zsh", &path);
+    assert_eq!(
+        rr,
+        fx.reroute.to_str().expect("UTF-8"),
+        "zsh: ATERM_REROUTE_DIR derived beside agents/"
+    );
+    sh.finish();
+
+    // 2. Outside a session: inert. The hook and dirs appear; `claude` stays foreign.
+    let fx = LiveFixture::new();
+    let mut sh = spawn(&fx, &[]);
+    sh.send("claude");
+    let at = sh.wait_for_after("foreign", 0);
+    fx.lay("zsh", ATPKG_HOOK_POSIX_GOLDEN, "managed 1");
+    sh.send("claude; print -r -- \"MARK$((40+2))\"");
+    let at = sh.wait_for_after("MARK42", at);
+    let out = sh.value_before("\x1b]133;C\x07", at);
+    assert!(
+        out.starts_with("foreign") && !out.contains("managed"),
+        "zsh: outside a session the live re-assert must be inert: {out:?}"
+    );
+    sh.finish();
+
+    // 3. ATERM_NO_REROUTE engaged: agents/ is fronted, no reroute dir is derived.
+    let fx = LiveFixture::new();
+    let mut sh = spawn(&fx, &[("ATERM_CHILD", "1"), ("ATERM_NO_REROUTE", "1")]);
+    sh.send("claude");
+    let at = sh.wait_for_after("foreign", 0);
+    fx.lay("zsh", ATPKG_HOOK_POSIX_GOLDEN, "managed 1");
+    sh.send("claude");
+    let at = sh.wait_for_after("managed 1", at);
+    sh.send("print -r -- \"LIVEPATH=$PATH\"; print -r -- \"LIVERR=${ATERM_REROUTE_DIR:-unset}\"; print -r -- \"MARK$((40+2))\"");
+    let at = sh.wait_for_after("MARK42", at);
+    let path = sh.value_before("LIVEPATH=", at);
+    assert!(
+        path.starts_with(&format!("{}:", fx.agents.display())),
+        "zsh: agents/ leads without the reroute dir: {path:?}"
+    );
+    assert!(
+        !path.contains(fx.reroute.to_str().expect("UTF-8")),
+        "zsh: no reroute dir on PATH under ATERM_NO_REROUTE=1: {path:?}"
+    );
+    assert_eq!(sh.value_before("LIVERR=", at), "unset");
+    sh.finish();
+}
+
+/// The owner's scenario in one bash: `claude` → foreign; a whole idle prompt cycle;
+/// atpkg's pass lays everything; `claude` → "managed 1" (preexec's pickup); the
+/// twin re-laid → "managed 2"; the hook REWRITTEN under the live shell (a later
+/// pass) → re-sourced, its new export visible at the next prompt (the content
+/// watch: bash reads the hook's text with the `read` builtin and compares — the
+/// residual R1 of 2026-09-16, closed); PATH reads reroute, agents, …, bin last;
+/// ATERM_REROUTE_DIR derived beside agents/.
+#[cfg(unix)]
+fn bash_owner_scenario(sh: &mut LiveShell, fx: &LiveFixture) {
+    sh.send("claude");
+    let at = sh.wait_for_after("foreign", 0);
+    sh.send("echo IDLE-$((1+0))");
+    let at = sh.wait_for_after("IDLE-1", at);
+    let at = sh.wait_for_after("\x1b]133;A", at);
+    fx.lay("bash", ATPKG_HOOK_POSIX_GOLDEN, "managed 1");
+    sh.send("claude");
+    let at = sh.wait_for_after("managed 1", at);
+    fx.lay_twin("managed 2");
+    sh.send("claude");
+    let at = sh.wait_for_after("managed 2", at);
+    fx.write_hook(
+        "bash",
+        &format!("{}export ATPKG_HOOK_GEN=2\n", fx.hook_body(ATPKG_HOOK_POSIX_GOLDEN)),
+    );
+    sh.send("echo \"GEN=${ATPKG_HOOK_GEN:-unset}\"");
+    let at = sh.wait_for_after("GEN=2", at);
+    sh.send(BASH_PRINT_PATH);
+    let at = sh.wait_for_after("MARK42", at);
+    let path = sh.value_before("LIVEPATH=", at);
+    fx.assert_path_order("bash", &path);
+    assert_eq!(
+        sh.value_before("LIVERR=", at),
+        fx.reroute.to_str().expect("UTF-8"),
+        "bash: ATERM_REROUTE_DIR derived beside agents/"
+    );
+}
+
+/// The same scenario in bash, through the crate's own `--rcfile` wrapper (which
+/// sources /etc/profile — on macOS, path_helper — then the home's .bashrc, where
+/// the foreign prepend lives, exactly the owner's shape).
+#[cfg(unix)]
+#[test]
+fn test_bash_already_running_session_shell_picks_up_the_managed_dirs_live() {
+    let fx = LiveFixture::new();
+    let mut sh = spawn_live_bash(&fx, "", &[]);
+    bash_owner_scenario(&mut sh, &fx);
+    sh.finish();
+}
+
+/// The same scenario under a user's `set -u` (in .bashrc, so it governs the
+/// script's load AND every prompt). Before 2026-09-16 the prompt command aborted
+/// on the unbound `__aterm_pending_prompt_setup` at every prompt, leaving
+/// `__aterm_in_prompt_cmd=1` stuck and the DEBUG-trap preexec — the per-command
+/// re-assert — dead: the `claude` typed after the twins landed ran the FOREIGN
+/// copy (the same at the parent commit; the live pickup made it a live claim).
+/// Pinned: the whole scenario holds, and stderr carries no "unbound variable".
+#[cfg(unix)]
+#[test]
+fn test_bash_live_pickup_holds_under_set_u() {
+    let fx = LiveFixture::new();
+    let mut sh = spawn_live_bash(&fx, "set -u\n", &[]);
+    bash_owner_scenario(&mut sh, &fx);
+    let err = sh.stderr_text();
+    assert!(
+        !err.contains("unbound variable"),
+        "bash: the integration must be nounset-clean at load and at every prompt:\n{err}"
+    );
+    sh.finish();
+}
+
+/// No hook at all — a fresh machine before any agent program is installed, or
+/// a hook that predates R1 — and the seam's ATERM_REROUTE_DIR leading PATH with a
+/// `cargo` stub in it. `cargo` → stub. The user prepends a dir holding its own
+/// `cargo` AT THE PROMPT (a `. ~/.cargo/env`, a tool installer): the very next
+/// `cargo` must still run the stub (preexec's re-front), and so must one typed a
+/// prompt cycle later; PATH leads with the reroute dir. Review finding
+/// 2026-09-16: bash and fish returned from the hot path's step 1 whenever
+/// $ATPKG_AGENTS was unset, hook or no hook, so the order was never re-checked
+/// and the prepend shadowed the stubs for the life of the shell — only zsh held.
+#[cfg(unix)]
+fn live_reroute_survives_a_prepend_with_no_hook(
+    label: &str,
+    sh: &mut LiveShell,
+    fx: &LiveFixture,
+    prepend: &str,
+    print_path: &str,
+    idle: &str,
+) {
+    sh.send("cargo");
+    let at = sh.wait_for_after("stub-cargo", 0);
+    sh.send(prepend);
+    sh.send("cargo");
+    let at = sh.wait_for_after("stub-cargo", at);
+    sh.send(idle);
+    let at = sh.wait_for_after("IDLE-1", at);
+    let at = sh.wait_for_after("\x1b]133;A", at);
+    sh.send("cargo");
+    let at = sh.wait_for_after("stub-cargo", at);
+    sh.send(print_path);
+    let at = sh.wait_for_after("MARK42", at);
+    let path = sh.value_before("LIVEPATH=", at);
+    assert!(
+        path.starts_with(&format!("{}:", fx.reroute.display())),
+        "{label}: the reroute dir must lead PATH after the prepend: {path:?}"
+    );
+    assert!(
+        path.split(':').any(|e| e == fx.foreign.to_str().expect("UTF-8")),
+        "{label}: the prepended dir is demoted, not removed: {path:?}"
+    );
+}
+
+#[cfg(unix)]
+fn reroute_prepend_fixture() -> (LiveFixture, Vec<(String, String)>) {
+    let fx = LiveFixture::new();
+    fx.lay_reroute_stub("cargo", "stub-cargo");
+    write_executable(&fx.foreign.join("cargo"), "#!/bin/sh\necho foreign-cargo\n");
+    let env = vec![
+        ("ATERM_CHILD".to_owned(), "1".to_owned()),
+        (
+            "ATERM_REROUTE_DIR".to_owned(),
+            fx.reroute.to_str().expect("UTF-8").to_owned(),
+        ),
+        ("PATH".to_owned(), format!("{}:/usr/bin:/bin", fx.reroute.display())),
+    ];
+    (fx, env)
+}
+
+#[cfg(unix)]
+#[test]
+fn test_reroute_stubs_survive_a_prompt_time_prepend_with_no_hook_in_bash() {
+    let (fx, env) = reroute_prepend_fixture();
+    let env: Vec<(&str, &str)> = env.iter().map(|(k, v)| (k.as_str(), v.as_str())).collect();
+    let mut sh = spawn_live_bash(&fx, "", &env);
+    live_reroute_survives_a_prepend_with_no_hook(
+        "bash",
+        &mut sh,
+        &fx,
+        &format!("export PATH=\"{}:$PATH\"", fx.foreign.display()),
+        BASH_PRINT_PATH,
+        "echo IDLE-$((1+0))",
+    );
+    sh.finish();
+}
+
+#[cfg(unix)]
+#[test]
+fn test_reroute_stubs_survive_a_prompt_time_prepend_with_no_hook_in_zsh() {
+    let Some(zsh) = zsh_shell() else {
+        eprintln!("zsh not installed; skipping the live zsh no-hook reroute scenario");
+        return;
+    };
+    let (fx, env) = reroute_prepend_fixture();
+    let env: Vec<(&str, &str)> = env.iter().map(|(k, v)| (k.as_str(), v.as_str())).collect();
+    let mut sh = spawn_live_zsh(zsh, &fx, "", &env);
+    live_reroute_survives_a_prepend_with_no_hook(
+        "zsh",
+        &mut sh,
+        &fx,
+        &format!("export PATH=\"{}:$PATH\"", fx.foreign.display()),
+        ZSH_PRINT_PATH,
+        "echo IDLE-$((1+0))",
+    );
+    sh.finish();
+}
+
+#[cfg(unix)]
+#[test]
+fn test_reroute_stubs_survive_a_prompt_time_prepend_with_no_hook_in_fish() {
+    let Some(fish) = fish_shell() else {
+        eprintln!("fish not installed; skipping the live fish no-hook reroute scenario");
+        return;
+    };
+    if !script_can_allocate_a_pty() {
+        eprintln!("no `script` to allocate a pty; skipping the live fish no-hook reroute scenario");
+        return;
+    }
+    let (fx, env) = reroute_prepend_fixture();
+    let env: Vec<(&str, &str)> = env.iter().map(|(k, v)| (k.as_str(), v.as_str())).collect();
+    let mut sh = spawn_live_fish(fish, &fx, &env);
+    live_reroute_survives_a_prepend_with_no_hook(
+        "fish",
+        &mut sh,
+        &fx,
+        &format!("set -gx PATH \"{}\" $PATH", fx.foreign.display()),
+        FISH_PRINT_PATH,
+        "echo IDLE-(math 1 + 0)",
+    );
+    sh.finish();
+}
+
+/// The OTHER order the owner's gesture reaches (review finding 2026-09-16): the
+/// hook and an EMPTY agents/ exist when the shell starts — a fresh machine creates
+/// agents/ at launch and lays the twin only once the managed program is installed
+/// — so `claude` runs the foreign copy and the shell HASHES that path. The twin
+/// lands, with NO hook rewrite: `claude` must run it. Before the twin watch both
+/// shells kept the hashed foreign path for the life of the shell (measured: zsh
+/// 5.9 and bash 3.2.57). Also pinned: the steady state assigns nothing — a manual
+/// hash entry (`zzz`) survives two idle prompt cycles — and, for zsh, a user rc
+/// with `setopt ksh_arrays warn_create_global` neither truncates PATH nor prints a
+/// "created globally" line (the hot path runs under `emulate -L zsh`).
+#[cfg(unix)]
+fn live_twin_lands_later(
+    label: &str,
+    sh: &mut LiveShell,
+    fx: &LiveFixture,
+    hash_foreign: &str,
+    print_path: &str,
+) {
+    sh.send("claude");
+    let at = sh.wait_for_after("foreign", 0);
+    sh.send(&format!("{hash_foreign}; echo IDLE-$((1+0))"));
+    let at = sh.wait_for_after("IDLE-1", at);
+    let at = sh.wait_for_after("\x1b]133;A", at);
+    sh.send("echo IDLE-$((2+0))");
+    let at = sh.wait_for_after("IDLE-2", at);
+    let at = sh.wait_for_after("\x1b]133;A", at);
+    // The hash table survived two steady prompts: nothing was assigned or flushed.
+    sh.send("zzz");
+    let at = sh.wait_for_after("foreign", at);
+    fx.lay_twin("managed 1");
+    sh.send("claude");
+    let at = sh.wait_for_after("managed 1", at);
+    fx.lay_twin("managed 2");
+    sh.send("claude");
+    let at = sh.wait_for_after("managed 2", at);
+    sh.send(print_path);
+    let at = sh.wait_for_after("MARK42", at);
+    let path = sh.value_before("LIVEPATH=", at);
+    fx.assert_path_order(label, &path);
+    assert_eq!(
+        sh.value_before("LIVERR=", at),
+        fx.reroute.to_str().expect("UTF-8"),
+        "{label}: ATERM_REROUTE_DIR derived beside agents/"
+    );
+}
+
+/// The hook exists at spawn but names an agents/ atpkg has NOT created yet (a
+/// hook written on a machine with no agent program installed, or a wiped managed
+/// prefix): `claude` → foreign; agents/ + reroute/ + bin/ and the twin appear with
+/// NO hook rewrite; `claude` must run the twin, PATH must lead reroute, agents.
+/// Before the re-probe, `$__aterm_managed_want` stayed empty and the hot path
+/// returned early forever (review finding 2026-09-16, both lenses).
+#[cfg(unix)]
+fn live_hook_first_dirs_later(label: &str, sh: &mut LiveShell, fx: &LiveFixture, print_path: &str) {
+    sh.send("claude");
+    let at = sh.wait_for_after("foreign", 0);
+    sh.send("echo IDLE-$((1+0))");
+    let at = sh.wait_for_after("IDLE-1", at);
+    let at = sh.wait_for_after("\x1b]133;A", at);
+    fx.lay_dirs();
+    fx.lay_twin("managed 1");
+    sh.send("claude");
+    let at = sh.wait_for_after("managed 1", at);
+    sh.send(print_path);
+    let at = sh.wait_for_after("MARK42", at);
+    let path = sh.value_before("LIVEPATH=", at);
+    fx.assert_path_order(label, &path);
+    assert_eq!(
+        sh.value_before("LIVERR=", at),
+        fx.reroute.to_str().expect("UTF-8"),
+        "{label}: ATERM_REROUTE_DIR derived beside agents/"
+    );
+}
+
+#[cfg(unix)]
+const ZSH_PRINT_PATH: &str = "print -r -- \"LIVEPATH=$PATH\"; print -r -- \"LIVERR=$ATERM_REROUTE_DIR\"; print -r -- \"MARK$((40+2))\"";
+#[cfg(unix)]
+const BASH_PRINT_PATH: &str = "printf 'LIVEPATH=%s\\n' \"$PATH\"; printf 'LIVERR=%s\\n' \"$ATERM_REROUTE_DIR\"; echo \"MARK$((40+2))\"";
+
+#[cfg(unix)]
+#[test]
+fn test_zsh_twin_landing_in_an_agents_dir_already_leading_path_is_run_live() {
+    let Some(zsh) = zsh_shell() else {
+        eprintln!("zsh not installed; skipping the live zsh twin-watch scenario");
+        return;
+    };
+    let fx = LiveFixture::new();
+    fx.lay_dirs();
+    fx.lay_hook("zsh", ATPKG_HOOK_POSIX_GOLDEN);
+    let mut sh = spawn_live_zsh(
+        zsh,
+        &fx,
+        "setopt ksh_arrays warn_create_global\n",
+        &[("ATERM_CHILD", "1")],
+    );
+    let hash_foreign = format!("hash zzz={}/claude", fx.foreign.display());
+    live_twin_lands_later("zsh", &mut sh, &fx, &hash_foreign, ZSH_PRINT_PATH);
+    let err = sh.stderr_text();
+    assert!(
+        !err.contains("created globally"),
+        "zsh: sourcing the hook from the hot path must not trip warn_create_global:\n{err}"
+    );
+    sh.finish();
+}
+
+#[cfg(unix)]
+#[test]
+fn test_zsh_hook_naming_an_agents_dir_that_appears_later_is_fronted_live() {
+    let Some(zsh) = zsh_shell() else {
+        eprintln!("zsh not installed; skipping the live zsh hook-first scenario");
+        return;
+    };
+    let fx = LiveFixture::new();
+    fx.lay_hook("zsh", ATPKG_HOOK_POSIX_GOLDEN);
+    let mut sh = spawn_live_zsh(zsh, &fx, "", &[("ATERM_CHILD", "1")]);
+    live_hook_first_dirs_later("zsh", &mut sh, &fx, ZSH_PRINT_PATH);
+    sh.finish();
+}
+
+#[cfg(unix)]
+#[test]
+fn test_bash_twin_landing_in_an_agents_dir_already_leading_path_is_run_live() {
+    let fx = LiveFixture::new();
+    fx.lay_dirs();
+    fx.lay_hook("bash", ATPKG_HOOK_POSIX_GOLDEN);
+    let mut sh = spawn_live_bash(&fx, "", &[]);
+    let hash_foreign = format!("hash -p {}/claude zzz", fx.foreign.display());
+    live_twin_lands_later("bash", &mut sh, &fx, &hash_foreign, BASH_PRINT_PATH);
+    sh.finish();
+}
+
+#[cfg(unix)]
+#[test]
+fn test_bash_hook_naming_an_agents_dir_that_appears_later_is_fronted_live() {
+    let fx = LiveFixture::new();
+    fx.lay_hook("bash", ATPKG_HOOK_POSIX_GOLDEN);
+    let mut sh = spawn_live_bash(&fx, "", &[]);
+    live_hook_first_dirs_later("bash", &mut sh, &fx, BASH_PRINT_PATH);
+    sh.finish();
+}
+
+/// An interactive fish inside a session. fish's `fish_prompt`/`fish_preexec`
+/// events fire only from its interactive reader, which needs a real pty, so the
+/// shell runs under `script` (macOS and util-linux spellings). The integration
+/// arrives the way aterm delivers it — the vendor conf.d on XDG_DATA_DIRS — and
+/// the foreign prepend lives in the home's config.fish. TERM=dumb, like the
+/// other two lanes: under a terminal-class TERM fish 4.9.3 queries Primary
+/// Device Attributes and waits 10 s for the reply nobody here sends before its
+/// first prompt (measured 2026-09-16: 10.1 s to the prompt against 0.04 s under
+/// dumb) — three spawns spent 30 of the lane's 32 s idle and left the first
+/// `wait_for_after` half its budget. The OSC 133;A marker is the integration's
+/// own, not fish's terminal layer's, so it still arrives (pinned below).
+#[cfg(unix)]
+fn spawn_live_fish(fish: &str, fx: &LiveFixture, extra: &[(&str, &str)]) -> LiveShell {
+    let config = fx.home.join("config").join("fish");
+    std::fs::create_dir_all(&config).expect("config.fish dir");
+    std::fs::write(
+        config.join("config.fish"),
+        format!("set -gx PATH \"{}\" $PATH\n", fx.foreign.display()),
+    )
+    .expect("config.fish");
+    let InjectionEnv { env_add, .. } = prepare_into(ShellType::Fish, &fx.base)
+        .expect("prepare")
+        .expect("fish injection");
+    let mut cmd = Command::new("script");
+    if cfg!(target_os = "macos") {
+        cmd.args(["-q", "/dev/null", fish, "-i"]);
+    } else {
+        cmd.args(["-q", "-c", &format!("{fish} -i"), "/dev/null"]);
+    }
+    // The hermetic environment of `shell_command`, applied to `script` (fish
+    // inherits it), then the fixture's home and the conf.d injection.
+    let hermetic = shell_command(fish);
+    for (key, value) in hermetic.get_envs() {
+        match value {
+            Some(value) => {
+                cmd.env(key, value);
+            }
+            None => {
+                cmd.env_remove(key);
+            }
+        }
+    }
+    cmd.env("HOME", &fx.home)
+        .env("XDG_CONFIG_HOME", fx.home.join("config"))
+        .env("PATH", "/usr/bin:/bin")
+        .env("TERM", "dumb")
+        .env("ATERM_CHILD", "1");
+    for (key, value) in env_add {
+        if key == "XDG_DATA_DIRS" {
+            // Narrowed to the injection's own conf.d plus the hermetic data dir:
+            // `prepare_fish` folds in the TEST PROCESS's XDG_DATA_DIRS otherwise.
+            cmd.env(
+                key,
+                format!(
+                    "{}:{}",
+                    fx.base.join("fish-xdg").display(),
+                    hermetic_home().join("data").display()
+                ),
+            );
+        } else {
+            cmd.env(key, value);
+        }
+    }
+    for (key, value) in extra {
+        cmd.env(key, value);
+    }
+    LiveShell::spawn("fish", &mut cmd)
+}
+
+#[cfg(unix)]
+const FISH_PRINT_PATH: &str = "printf 'LIVEPATH=%s\\n' (string join : -- $PATH); printf 'LIVERR=%s\\n' \"$ATERM_REROUTE_DIR\"; echo MARK(math 40 + 2)";
+
+#[cfg(unix)]
+fn fish_assert_path_and_reroute(sh: &mut LiveShell, fx: &LiveFixture, at: usize) {
+    sh.send(FISH_PRINT_PATH);
+    let at = sh.wait_for_after("MARK42", at);
+    let path = sh.value_before("LIVEPATH=", at);
+    fx.assert_path_order("fish", &path);
+    assert_eq!(
+        sh.value_before("LIVERR=", at),
+        fx.reroute.to_str().expect("UTF-8"),
+        "fish: ATERM_REROUTE_DIR derived beside agents/"
+    );
+}
+
+#[cfg(unix)]
+fn script_can_allocate_a_pty() -> bool {
+    Command::new("script").arg("-V").output().is_ok() || Command::new("script").arg("--version").output().is_ok()
+}
+
+/// The same three orders in fish, when installed: the owner's scenario — with
+/// the hook REWRITTEN under the live shell and re-sourced (fish reads the hook's
+/// text with `read -z` and compares; residual R1 of 2026-09-16, closed); the hook
+/// and an empty agents/ at spawn with the twin landing later (fish keeps no
+/// command hash, so this is the order check plus PATH's own walk); and the hook
+/// first, the dirs later (the re-probe).
+#[cfg(unix)]
+#[test]
+fn test_fish_already_running_session_shell_picks_up_the_managed_dirs_live() {
+    let Some(fish) = fish_shell() else {
+        eprintln!("fish not installed; skipping the live fish scenario");
+        return;
+    };
+    if !script_can_allocate_a_pty() {
+        eprintln!("no `script` to allocate a pty; skipping the live fish scenario");
+        return;
+    }
+    // 1. The owner's scenario.
+    let fx = LiveFixture::new();
+    let mut sh = spawn_live_fish(fish, &fx, &[]);
+    sh.send("claude");
+    let at = sh.wait_for_after("foreign", 0);
+    sh.send("echo IDLE-(math 1 + 0)");
+    let at = sh.wait_for_after("IDLE-1", at);
+    let at = sh.wait_for_after("\x1b]133;A", at);
+    fx.lay("fish", ATPKG_HOOK_FISH_GOLDEN, "managed 1");
+    sh.send("claude");
+    let at = sh.wait_for_after("managed 1", at);
+    fx.lay_twin("managed 2");
+    sh.send("claude");
+    let at = sh.wait_for_after("managed 2", at);
+    // The hook rewritten under the live shell (a later pass): re-sourced.
+    fx.write_hook(
+        "fish",
+        &format!("{}set -gx ATPKG_HOOK_GEN 2\n", fx.hook_body(ATPKG_HOOK_FISH_GOLDEN)),
+    );
+    sh.send("echo \"GEN=$ATPKG_HOOK_GEN\"");
+    let at = sh.wait_for_after("GEN=2", at);
+    fish_assert_path_and_reroute(&mut sh, &fx, at);
+    sh.finish();
+
+    // 2. Hook + empty agents/ at spawn; the twin lands later, no hook rewrite.
+    let fx = LiveFixture::new();
+    fx.lay_dirs();
+    fx.lay_hook("fish", ATPKG_HOOK_FISH_GOLDEN);
+    let mut sh = spawn_live_fish(fish, &fx, &[]);
+    sh.send("claude");
+    let at = sh.wait_for_after("foreign", 0);
+    sh.send("echo IDLE-(math 1 + 0)");
+    let at = sh.wait_for_after("IDLE-1", at);
+    let at = sh.wait_for_after("\x1b]133;A", at);
+    fx.lay_twin("managed 1");
+    sh.send("claude");
+    let at = sh.wait_for_after("managed 1", at);
+    fx.lay_twin("managed 2");
+    sh.send("claude");
+    let at = sh.wait_for_after("managed 2", at);
+    fish_assert_path_and_reroute(&mut sh, &fx, at);
+    sh.finish();
+
+    // 3. The hook first, naming an agents/ that does not exist yet.
+    let fx = LiveFixture::new();
+    fx.lay_hook("fish", ATPKG_HOOK_FISH_GOLDEN);
+    let mut sh = spawn_live_fish(fish, &fx, &[]);
+    sh.send("claude");
+    let at = sh.wait_for_after("foreign", 0);
+    sh.send("echo IDLE-(math 1 + 0)");
+    let at = sh.wait_for_after("IDLE-1", at);
+    let at = sh.wait_for_after("\x1b]133;A", at);
+    fx.lay_dirs();
+    fx.lay_twin("managed 1");
+    sh.send("claude");
+    let at = sh.wait_for_after("managed 1", at);
+    fish_assert_path_and_reroute(&mut sh, &fx, at);
+    sh.finish();
+}
+
+/// The body of a shell function, comment lines dropped: POSIX `name() {` … `}`
+/// at column 0, fish `function name` … `end` at column 0.
+fn shell_function_body(script: &str, name: &str, fish: bool) -> String {
+    let (open, close) = if fish {
+        (format!("function {name}"), "end")
+    } else {
+        (format!("{name}() {{"), "}")
+    };
+    let mut lines = script.lines();
+    let _ = lines
+        .by_ref()
+        .find(|line| line.starts_with(&open))
+        .unwrap_or_else(|| panic!("{name} not defined at column 0"));
+    let mut body = String::new();
+    for line in lines {
+        if line == close {
+            return body;
+        }
+        if line.trim_start().starts_with('#') {
+            continue;
+        }
+        body.push_str(line);
+        body.push('\n');
+    }
+    panic!("{name}: unterminated body")
+}
+
+/// The hot path runs at EVERY prompt and EVERY command, so it forks nothing: no
+/// `$(...)`, no backticks, no external command — only builtins. Pinned by grep over
+/// the functions that run per prompt in zsh and bash (fish's substitutions are
+/// checked to be of builtins: `string`, `math`, `count`).
+#[test]
+fn test_live_hot_path_functions_fork_nothing() {
+    let hot = [
+        "__aterm_managed_path_live",
+        "__aterm_reroute_path_front",
+        "__aterm_managed_derive_reroute",
+    ];
+    for (label, script, extra) in [
+        ("zsh", scripts::ZSH, vec!["__aterm_atpkg_hook_stamp", "__aterm_managed_agents_listing"]),
+        ("bash", scripts::BASH, vec!["__aterm_path_front", "__aterm_atpkg_hook_read"]),
+    ] {
+        for name in hot.iter().copied().chain(extra) {
+            let body = shell_function_body(script, name, false);
+            assert!(
+                !body.contains("$(") && !body.contains('`'),
+                "{label}: {name} must not fork a command substitution:\n{body}"
+            );
+            // No external command as a line's first word (zsh's `zstat` is the
+            // module builtin, hence the whole-word check).
+            for line in body.lines() {
+                let first = line.trim_start().split_whitespace().next().unwrap_or("");
+                assert!(
+                    !["stat", "dirname", "readlink", "basename", "sed", "awk", "grep", "cut", "command"]
+                        .contains(&first),
+                    "{label}: {name} must not run an external {first:?}:\n{body}"
+                );
+            }
+        }
+    }
+    for name in hot.iter().copied().chain(["__aterm_path_front", "__aterm_atpkg_hook_read"]) {
+        let body = shell_function_body(scripts::FISH, name, true);
+        assert!(
+            !body.contains("$(") && !body.contains('`'),
+            "fish: {name}:\n{body}"
+        );
+        for (i, _) in body.match_indices('(') {
+            let rest = &body[i + 1..];
+            assert!(
+                ["string ", "math ", "count "]
+                    .iter()
+                    .any(|builtin| rest.starts_with(builtin)),
+                "fish: {name} substitutes something that is not a builtin:\n{body}"
+            );
+        }
+    }
+}
+
+/// Every shell's per-prompt AND per-command hook calls the live re-assert — the
+/// per-command half is what cures a command typed at a prompt drawn before the
+/// dirs existed — and the re-assert is gated on the session, never on the reroute
+/// dir the adopted shell lacks.
+#[test]
+fn test_live_reassert_is_wired_into_every_prompt_and_preexec_hook_and_gated_on_the_session() {
+    for (label, script, precmd, preexec, fish) in [
+        ("zsh", scripts::ZSH, "__aterm_precmd", "__aterm_preexec", false),
+        ("bash", scripts::BASH, "__aterm_prompt_command", "__aterm_preexec", false),
+        ("fish", scripts::FISH, "fish_prompt", "__aterm_fish_preexec", true),
+    ] {
+        for hook in [precmd, preexec] {
+            let body = shell_function_body(script, hook, fish);
+            assert!(
+                body.contains("__aterm_managed_path_live"),
+                "{label}: {hook} must call __aterm_managed_path_live:\n{body}"
+            );
+        }
+        let gate_zsh_bash = "if [[ -n \"${ATERM_CHILD:-}\" || -n \"${ATERM_SESSION_ID:-}\" ]]; then";
+        let gate_fish = "if test -n \"$ATERM_CHILD\"; or test -n \"$ATERM_SESSION_ID\"";
+        assert!(
+            script.contains(if fish { gate_fish } else { gate_zsh_bash }),
+            "{label}: the live re-assert is gated on ATERM_CHILD / ATERM_SESSION_ID"
+        );
+        assert!(
+            script.contains(&format!(".aterm/shell.d/00-atpkg.{label}")),
+            "{label}: names the atpkg hook it re-sources"
+        );
+    }
+    // The re-probe (review finding 2026-09-16): a dir absent when the front was
+    // last laid is looked for again by the hot path, in every shell.
+    for (label, script, fish) in [
+        ("zsh", scripts::ZSH, false),
+        ("bash", scripts::BASH, false),
+        ("fish", scripts::FISH, true),
+    ] {
+        let hot = shell_function_body(script, "__aterm_managed_path_live", fish);
+        for flag in ["__aterm_managed_agents_on", "__aterm_managed_reroute_on"] {
+            assert!(
+                hot.contains(flag),
+                "{label}: the hot path re-probes a dir that was absent ({flag}):\n{hot}"
+            );
+        }
+        assert!(
+            hot.contains("__aterm_managed_derive_reroute"),
+            "{label}: the hot path derives the reroute dir once agents/ is known"
+        );
+        // The hook watch (residual R1, closed 2026-09-16): every shell re-sources a
+        // hook that CHANGED on disk — zsh by zstat, bash and fish by the text `read`
+        // takes in — and an absent hook never returns early, so the order below is
+        // still checked (review finding 2026-09-16).
+        let watch = if label == "zsh" { "__aterm_atpkg_hook_stamp" } else { "__aterm_atpkg_hook_read" };
+        assert!(
+            hot.contains(watch) && hot.contains("__aterm_atpkg_hook_seen"),
+            "{label}: the hot path compares the hook on disk to the copy last sourced:\n{hot}"
+        );
+    }
+    // The twin watch (review finding 2026-09-16): zsh and bash hash a command's
+    // path on first use, so a twin landing in an agents/ that already leads PATH
+    // needs the hash forgotten — zsh by watching the directory's listing, bash by
+    // forgetting the two managed names every call. fish keeps no hash.
+    let zsh_hot = shell_function_body(scripts::ZSH, "__aterm_managed_path_live", false);
+    assert!(
+        zsh_hot.contains("__aterm_managed_agents_listing") && zsh_hot.contains("rehash"),
+        "zsh: the hot path watches the agents/ listing and rehashes on a change:\n{zsh_hot}"
+    );
+    let bash_hot = shell_function_body(scripts::BASH, "__aterm_managed_path_live", false);
+    assert!(
+        bash_hot.contains("hash -d claude codex 2>/dev/null"),
+        "bash: the hot path forgets the two managed names every call:\n{bash_hot}"
+    );
+    // zsh: every function of the block runs under `emulate -L zsh`, so a user's
+    // ksh_arrays / sh_word_split / glob_subst / warn_create_global cannot change
+    // the comparison or print at the prompt.
+    for name in [
+        "__aterm_managed_path_live",
+        "__aterm_reroute_path_front",
+        "__aterm_managed_derive_reroute",
+        "__aterm_atpkg_hook_stamp",
+        "__aterm_managed_agents_listing",
+    ] {
+        let body = shell_function_body(scripts::ZSH, name, false);
+        assert_eq!(
+            body.lines().next().map(str::trim),
+            Some("emulate -L zsh"),
+            "zsh: {name} must open with `emulate -L zsh`:\n{body}"
+        );
+    }
+    // PowerShell, statically: the prompt function and the readline shim both call it.
+    let ps = scripts::POWERSHELL;
+    let prompt = ps.find("function Global:Prompt {").expect("prompt fn");
+    let readline = ps
+        .find("function Global:PSConsoleHostReadLine {")
+        .expect("readline shim");
+    let live_calls: Vec<usize> = ps
+        .match_indices("    __aterm_managed_path_live")
+        .map(|(i, _)| i)
+        .collect();
+    assert!(
+        live_calls.iter().any(|&i| i > prompt && i < readline),
+        "pwsh: the prompt function calls __aterm_managed_path_live"
+    );
+    assert!(
+        live_calls.iter().any(|&i| i > readline),
+        "pwsh: the PSReadLine submit shim calls __aterm_managed_path_live"
+    );
+    assert!(ps.contains("[bool]($env:ATERM_CHILD -or $env:ATERM_SESSION_ID)"));
+    assert!(ps.contains(".aterm/shell.d/00-atpkg.ps1"));
+    assert!(
+        ps.contains("$Global:__aterm_managed_agents_on") && ps.contains("$__aterm_refront"),
+        "pwsh: the hot path re-probes a dir that was absent"
+    );
 }

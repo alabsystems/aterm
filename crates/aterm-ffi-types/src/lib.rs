@@ -23,7 +23,6 @@ pub mod callback_struct_manifest;
 pub mod ffi_bounds;
 mod ffi_callback;
 pub mod ffi_combinator;
-mod ffi_error;
 pub mod ffi_error_contract;
 pub mod ffi_error_types;
 pub mod ffi_free_combinator;

@@ -44,7 +44,15 @@ pub fn ensure_private_dir(dir: &Path) -> io::Result<()> {
         ));
     }
     std::fs::create_dir_all(dir)?;
-    std::fs::set_permissions(dir, std::fs::Permissions::from_mode(0o700))?;
+    // Only a mode that is not already `0700` is written. A `chmod(2)` to the mode a
+    // directory already has still moves its `st_ctime` (measured on APFS, 2026-09-15), and
+    // tippy snapshots the ctime of every ancestor of the executable it runs: re-hardening an
+    // unchanged atpkg prefix on each store-lock acquisition aborted every tippy running from
+    // the store with "ancestor … changed identity or contents" at each `repair` and `gc`.
+    // The lstat below still proves the final mode, whichever branch ran.
+    if !std::fs::symlink_metadata(dir).is_ok_and(|m| m.mode() & 0o7777 == 0o700) {
+        std::fs::set_permissions(dir, std::fs::Permissions::from_mode(0o700))?;
+    }
     // Re-check with lstat (NOT metadata, which would follow a link swapped in after
     // creation): the final component must be a real, we-owned, non-shared directory.
     let meta = std::fs::symlink_metadata(dir)?;
@@ -123,4 +131,40 @@ fn is_reparse_point(md: &std::fs::Metadata) -> bool {
     use std::os::windows::fs::MetadataExt;
     const FILE_ATTRIBUTE_REPARSE_POINT: u32 = 0x400;
     md.file_type().is_symlink() || (md.file_attributes() & FILE_ATTRIBUTE_REPARSE_POINT != 0)
+}
+
+#[cfg(all(test, unix))]
+mod tests {
+    use super::*;
+
+    /// A directory already `0700` and ours is left EXACTLY alone — no `chmod(2)`, so its
+    /// `st_ctime` does not move (a same-mode chmod moves it on APFS, and tippy reads the
+    /// ctime of every ancestor of the executable it runs; measured 2026-09-15) — while a
+    /// mode that drifted is still forced back to `0700`, and a symlink is still refused.
+    #[test]
+    fn an_already_private_dir_is_not_rewritten_and_a_drifted_one_is_hardened() {
+        let dir = std::env::temp_dir().join(format!("atuc-privatedir-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        ensure_private_dir(&dir).unwrap();
+        let stamp = || {
+            let m = std::fs::symlink_metadata(&dir).unwrap();
+            (m.ctime(), m.ctime_nsec(), m.mode() & 0o7777)
+        };
+        let before = stamp();
+        assert_eq!(before.2, 0o700);
+        std::thread::sleep(std::time::Duration::from_millis(20));
+        ensure_private_dir(&dir).unwrap();
+        assert_eq!(stamp(), before, "an unchanged directory was written");
+
+        std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o755)).unwrap();
+        ensure_private_dir(&dir).unwrap();
+        assert_eq!(stamp().2, 0o700, "a drifted mode is hardened");
+
+        let link = dir.with_extension("link");
+        let _ = std::fs::remove_file(&link);
+        std::os::unix::fs::symlink(&dir, &link).unwrap();
+        assert!(ensure_private_dir(&link).is_err(), "a symlink is refused");
+        let _ = std::fs::remove_file(&link);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
 }

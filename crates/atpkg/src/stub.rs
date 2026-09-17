@@ -31,8 +31,9 @@
 //! 2. `command -v atpkg` (the `~/.local/bin` alias / shell hook);
 //! 3. a static honest message — and exit 127.
 //!
-//! The per-launch seed-pass reconcile REWRITES stubs, refreshing embedded paths as
-//! a matter of course.
+//! The per-launch seed-pass reconcile REWRITES stubs whose bytes changed (or that
+//! carry the provenance tag), refreshing embedded paths as a matter of course; a
+//! byte-identical untagged stub is left alone, so a steady-state pass lays nothing.
 //!
 //! # Trust posture
 //!
@@ -294,11 +295,14 @@ fn stub_content_sh_with(
     }
     s.push_str("# Replaced by the real shim when the program installs.\nATPKG=");
     s.push_str(&sh_single_quote(&atpkg.to_string_lossy()));
+    // The caller's arguments ride along (`"$@"`, 2026-09-15): an agent program's stub
+    // execs the user's own copy meanwhile ([`crate::cli::pending_passthrough`]), and
+    // `claude -p 'x'` typed during the install must reach it whole.
     s.push_str("\nif [ -x \"$ATPKG\" ]; then\n  exec \"$ATPKG\" __pending ");
     s.push_str(&name);
-    s.push_str("\nfi\nif command -v atpkg >/dev/null 2>&1; then\n  exec atpkg __pending ");
+    s.push_str(" \"$@\"\nfi\nif command -v atpkg >/dev/null 2>&1; then\n  exec atpkg __pending ");
     s.push_str(&name);
-    s.push_str("\nfi\nprintf '%s\\n' ");
+    s.push_str(" \"$@\"\nfi\nprintf '%s\\n' ");
     s.push_str(&sh_single_quote(STUB_UNREACHABLE_MSG));
     s.push_str(" 1>&2\nexit 127\n");
     s
@@ -513,6 +517,30 @@ pub fn write_pending_stub_with(
     }
 }
 
+/// Whether a stub of OURS that is byte-identical to the body this pass renders must
+/// nevertheless be re-laid. There is exactly one reason to: to clear
+/// `com.apple.provenance`, which a tagged shim passes on to every tool it `exec`s (law
+/// m21, `crate::lay`). So the tag alone is not the question — a rewrite that would land
+/// tagged again clears nothing, and re-lays identical bytes forever.
+///
+/// That shape is not hypothetical: a provenance-tracked process with NO untracked lane
+/// at all ([`crate::lay::Lane::Unavailable`] — a test harness, a foreign embedding of
+/// this crate) writes every byte it lays tagged, by construction. Under the
+/// unconditional tag clause the first stub such a process laid was re-laid by every
+/// later pass for ever, converging on nothing: the byte-identical skip — the whole point
+/// of which is that a steady-state pass hands `lay_executables` an EMPTY list — was dead
+/// there. A tracked binary that HAS a lane is unaffected and still retries: the lane
+/// normally lays the file clean, and a tagged shim is a real repair, not a cosmetic one.
+///
+/// Both inputs are lazy: the xattr read happens once per identical stub, and the
+/// tracking probe only when that stub is actually tagged.
+pub(crate) fn identical_stub_needs_relay(
+    tagged: impl FnOnce() -> bool,
+    lay_clears_tag: impl FnOnce() -> bool,
+) -> bool {
+    tagged() && lay_clears_tag()
+}
+
 /// The pending stub [`write_pending_stub_with`] would lay, RENDERED but not written —
 /// `Ok(None)` when there is nothing to lay (an alias, a name Windows cannot embed
 /// inertly, a name something else occupies), so the two roster loops can lay a whole
@@ -534,16 +562,57 @@ pub(crate) fn pending_stub_executable(
         // installed, and the plain name's stub already answers until then.
         return Ok(None);
     }
-    let shim = layout.shim(tool);
+    pending_stub_executable_at(layout, tool, kind, requires, layout.shim(tool))
+}
+
+/// [`pending_stub_executable`] for a stub at an explicit path — the `bin/` slot, or an
+/// AGENT program's `agents/` twin (2026-09-15): `agents/` is first on every PATH, so
+/// a pending `claude`/`codex` laid only in `bin/` (appended LAST) never answered on a
+/// machine with a brew cask, and R6's "typing the name prints the install state" did
+/// not hold for the two names it matters most for (audit 2026-09-14). Same precedence
+/// rule: never over anything that is not already a pending stub.
+pub(crate) fn pending_stub_executable_at(
+    layout: &Layout,
+    tool: &ToolName,
+    kind: StubKind,
+    requires: &[String],
+    shim: std::path::PathBuf,
+) -> io::Result<Option<crate::lay::Executable>> {
+    let body = stub_content_with(tool, &embedded_atpkg_path(), kind, requires);
     match std::fs::symlink_metadata(&shim) {
-        Err(_) => {}                          // absent: ours to claim
-        Ok(_) if is_pending_stub(&shim) => {} // ours: rewrite refreshes path + kind
+        Err(_) => {} // absent: ours to claim
+        Ok(_) if is_pending_stub(&shim) => {
+            // Ours already. Byte-identical and untagged: nothing to lay — the
+            // reroute stubs' rule (`reroute::lay`, audit 2026-09-14). Every seed runs
+            // the adoption lay and every install pass reconciles twice, so a name that
+            // stays wanted-and-absent (a disk-gated tuple, a deferred member) re-laid
+            // identical bytes each time: from a tracked app, a launchd job and a
+            // whole-bundle copy per call. A body that differs — the embedded atpkg
+            // path, the kind or the requires changed — or a tagged stub is rewritten.
+            if stub_is_current(&shim, &body, crate::provenance::carries_provenance(&shim)) {
+                return Ok(None);
+            }
+        }
         Ok(_) => return Ok(None), // someone else's file (shim/tombstone/hand-made): never touch
     }
-    let bin = layout.bin_dir();
-    layout.ensure_dir(&bin)?;
-    let body = stub_content_with(tool, &embedded_atpkg_path(), kind, requires);
+    if let Some(dir) = shim.parent() {
+        layout.ensure_dir(dir)?;
+    }
     Ok(Some(crate::lay::Executable::new(shim, body)))
+}
+
+/// Whether the pending stub at `shim` is CURRENT — the exact bytes this pass would
+/// render (`body`), and CLEAN. `tagged` is that file's measured `com.apple.provenance`
+/// ([`crate::provenance::carries_provenance`]), handed in rather than taken here so both
+/// halves of the rule are exercisable from a test whose own writes are tagged by the
+/// session running it — the tag can be neither minted nor removed by hand, and
+/// [`crate::lay::lay_executables_with`] takes its tracking measurement as a parameter for
+/// exactly this reason. A tagged stub is NOT current however identical its bytes: it is a
+/// file the kernel execs, so it tracks every program it runs (law m21, [`crate::lay`]),
+/// and re-laying it is the only way the untracked lane gets to replace it with a clean
+/// one.
+fn stub_is_current(shim: &Path, body: &str, tagged: bool) -> bool {
+    !tagged && std::fs::read(shim).is_ok_and(|have| have == body.as_bytes())
 }
 
 /// Remove `program`'s stub iff the name still resolves to a pending stub — the
@@ -592,10 +661,17 @@ pub fn lay_adoption_stubs(layout: &Layout) {
         if installed.contains_key(name) || removed.contains(name) {
             continue;
         }
-        if let Some(tool) = ToolName::new(name)
-            && let Ok(Some(file)) = pending_stub_executable(layout, &tool, kind, &[])
-        {
-            files.push(file);
+        if let Some(tool) = ToolName::new(name) {
+            if let Ok(Some(file)) = pending_stub_executable(layout, &tool, kind, &[]) {
+                files.push(file);
+            }
+            // The agent programs' stubs go FIRST on PATH too ([`pending_stub_executable_at`]).
+            if is_agent_program(name)
+                && let Ok(Some(twin)) =
+                    pending_stub_executable_at(layout, &tool, kind, &[], layout.agent_shim(&tool))
+            {
+                files.push(twin);
+            }
         }
     }
     // One pass for the whole roster (one untracked job when this process is tracked).
@@ -663,6 +739,12 @@ pub fn reconcile_with_requires(
             }
             Err(_) => {}
         }
+        if is_agent_program(name)
+            && let Ok(Some(twin)) =
+                pending_stub_executable_at(layout, &tool, kind, requires, layout.agent_shim(&tool))
+        {
+            files.push(twin);
+        }
     }
     // One pass for every stub this reconcile adds or refreshes (one untracked job when
     // this process is tracked). A pass that could not be laid leaves the names it would
@@ -671,22 +753,26 @@ pub fn reconcile_with_requires(
     if let Err(e) = crate::lay::lay_executables(&files) {
         eprintln!("atpkg: warn — pending stubs not laid: {e}");
     }
-    let Ok(entries) = std::fs::read_dir(layout.bin_dir()) else {
-        return;
-    };
-    for entry in entries.flatten() {
-        let path = entry.path();
-        if !is_pending_stub(&path) {
-            continue;
-        }
-        let name = entry.file_name();
-        let Some(name) = name.to_str() else {
+    // Both directories a pending stub can stand in: `bin/`, and `agents/` for the
+    // agent programs' twins.
+    for dir in [layout.bin_dir(), layout.agents_dir()] {
+        let Ok(entries) = std::fs::read_dir(&dir) else {
             continue;
         };
-        let logical = ToolName::from_shim_file(name);
-        let stays = logical.as_ref().is_some_and(|t| keep.contains(t.as_str()));
-        if !stays {
-            let _ = std::fs::remove_file(&path);
+        for entry in entries.flatten() {
+            let path = entry.path();
+            if !is_pending_stub(&path) {
+                continue;
+            }
+            let name = entry.file_name();
+            let Some(name) = name.to_str() else {
+                continue;
+            };
+            let logical = ToolName::from_shim_file(name);
+            let stays = logical.as_ref().is_some_and(|t| keep.contains(t.as_str()));
+            if !stays {
+                let _ = std::fs::remove_file(&path);
+            }
         }
     }
 }
@@ -713,6 +799,42 @@ mod tests {
     /// Every compiled roster name passes the shim gate — a roster entry that could
     /// not be shimmed could never be stubbed either, and should fail HERE, not at a
     /// user's first launch.
+    /// An agent program's pending stub stands in `agents/` too — first on every PATH —
+    /// carries the caller's arguments through, and leaves once the program installs or
+    /// is de-listed (2026-09-15). A non-agent program gets no twin.
+    #[test]
+    fn an_agent_programs_pending_stub_stands_in_agents_too_and_passes_arguments() {
+        let l = layout("agents-stub");
+        lay_adoption_stubs(&l);
+        let claude = tool("claude");
+        let twin = l.agent_shim(&claude);
+        assert!(
+            is_pending_stub(&twin),
+            "claude's stub stands first on PATH: {}",
+            twin.display()
+        );
+        assert!(is_pending_stub(&l.shim(&claude)), "and in bin/ as before");
+        assert!(
+            !l.agent_shim(&tool("trust")).exists(),
+            "only the agent programs get a twin"
+        );
+        let body = std::fs::read_to_string(&twin).unwrap();
+        assert!(
+            body.contains("__pending 'claude' \"$@\""),
+            "the caller's arguments ride through: {body}"
+        );
+        // Installed: the reconcile's sweep removes the twin stub (its real twin, laid by
+        // activation, is what stands there next).
+        let mut installed = BTreeMap::new();
+        installed.insert(String::from("claude"), 1u64);
+        reconcile(&l, &BTreeSet::new(), &BTreeSet::new(), &installed);
+        assert!(
+            !twin.exists(),
+            "an installed program's stub is swept from agents/"
+        );
+        let _ = std::fs::remove_dir_all(&l.prefix);
+    }
+
     #[test]
     fn roster_names_all_pass_shim_allowed() {
         for (name, desc) in DEFAULT_SET_STUB_NAMES {
@@ -972,6 +1094,136 @@ mod tests {
             assert!(!pending_stub_exists(&l, name), "{name} swept with the rest");
         }
         assert!(l.bin_dir().join("mine").exists());
+        let _ = std::fs::remove_dir_all(&l.prefix);
+    }
+
+    /// A stub already on disk with the exact bytes the pass would render AND clean is not
+    /// re-laid: `pending_stub_executable` answers `Ok(None)` (the reconcile keeps the
+    /// name), so a steady-state seed or install pass hands `lay_executables` an empty
+    /// list — no launchd job and no bundle copy from a tracked app. A stub whose body
+    /// changed (kind flip, new requires) is still rewritten — and so is one that carries
+    /// `com.apple.provenance`, on purpose: a tagged stub is a file the kernel execs, so
+    /// it tracks every program it runs, and re-laying it is how the untracked lane gets
+    /// to replace it with a clean one ([`stub_is_current`], `reroute::lay`, law m21).
+    ///
+    /// THE TAG IS AN ENVIRONMENT FACT, NOT A CHOICE (audit 2026-09-15). Every file this
+    /// test writes inherits the tag when the session running it is provenance-tracked (an
+    /// agent's shell, a shell inside aterm.app — [`crate::provenance`]), and the tag can
+    /// be neither minted nor removed by hand (`xattr -w` is refused, `xattr -d` exits 0
+    /// and removes nothing). Asserting only the untagged outcome asserted something this
+    /// machine cannot produce. So the test splits:
+    ///
+    /// * the RULE is asserted BOTH ways on every machine, by handing `stub_is_current`
+    ///   the measurement instead of letting it take one — identical-and-clean is current,
+    ///   identical-but-tagged is not, a changed body is never current;
+    /// * the END TO END half (a real file through the reconcile and the adoption lay)
+    ///   asserts the full outcome for the tag this session actually produces: the inode is
+    ///   KEPT under an untracked session, and the stub is re-laid — same bytes, new inode,
+    ///   `Ok(Some)` — under a tracked one. Which case ran is printed, never assumed.
+    #[cfg(unix)]
+    #[test]
+    fn an_identical_stub_is_left_alone_and_a_changed_one_is_rewritten() {
+        use std::os::unix::fs::MetadataExt as _;
+        let l = layout("identical-skip");
+        let t = tool("trust");
+        let body = stub_content_with(&t, &embedded_atpkg_path(), StubKind::DefaultSet, &[]);
+        let fresh = pending_stub_executable(&l, &t, StubKind::DefaultSet, &[]).unwrap();
+        assert!(fresh.is_some(), "an absent name is ours to claim");
+        write_pending_stub_with(&l, &t, StubKind::DefaultSet, &[]).unwrap();
+        let shim = l.shim(&t);
+        assert!(is_pending_stub(&shim));
+        assert_eq!(
+            std::fs::read(&shim).unwrap(),
+            body.as_bytes(),
+            "the writer lays exactly the bytes the renderer renders"
+        );
+        // The rule itself, both ways, whatever this session's own writes carry.
+        assert!(
+            stub_is_current(&shim, &body, false),
+            "byte-identical and clean: nothing to lay"
+        );
+        assert!(
+            !stub_is_current(&shim, &body, true),
+            "byte-identical but TAGGED: re-laid on purpose, so the untracked lane can put \
+             a clean file there"
+        );
+        let flipped = stub_content_with(&t, &embedded_atpkg_path(), StubKind::Extra, &[]);
+        assert!(
+            !stub_is_current(&shim, &flipped, false),
+            "a changed body is never current, tag or no tag"
+        );
+        // End to end through the reconcile and the adoption lay, against the tag this
+        // session really produces: an untracked one keeps the inode (temp+rename would
+        // give it a new one), a tracked one re-lays the same bytes.
+        let tagged = crate::provenance::carries_provenance(&shim);
+        eprintln!(
+            "an_identical_stub_is_left_alone: this session writes {} files, so the {} case \
+             is the one exercised end to end",
+            if tagged { "TAGGED" } else { "clean" },
+            if tagged { "re-lay" } else { "skip" }
+        );
+        let ino = std::fs::metadata(&shim).unwrap().ino();
+        let wanted: BTreeSet<String> = ["trust".to_string()].into_iter().collect();
+        reconcile(&l, &wanted, &BTreeSet::new(), &BTreeMap::new());
+        lay_adoption_stubs(&l);
+        assert!(pending_stub_exists(&l, "trust"), "the reconcile keeps it");
+        assert_eq!(
+            std::fs::read(&shim).unwrap(),
+            body.as_bytes(),
+            "the bytes are the rendered ones either way"
+        );
+        let after = std::fs::metadata(&shim).unwrap().ino();
+        if tagged {
+            assert!(
+                pending_stub_executable(&l, &t, StubKind::DefaultSet, &[])
+                    .unwrap()
+                    .is_some(),
+                "a tagged stub is re-laid even byte-identical"
+            );
+            assert_ne!(
+                after, ino,
+                "a tagged stub is re-laid: temp+rename, new inode"
+            );
+        } else {
+            assert!(
+                pending_stub_executable(&l, &t, StubKind::DefaultSet, &[])
+                    .unwrap()
+                    .is_none(),
+                "byte-identical clean stub: nothing to lay"
+            );
+            assert_eq!(after, ino, "an identical stub is never re-laid");
+        }
+        // A changed body is still a rewrite: the requires line and the kind.
+        let requires = vec!["ay".to_string()];
+        assert!(
+            pending_stub_executable(&l, &t, StubKind::DefaultSet, &requires)
+                .unwrap()
+                .is_some(),
+            "new requires: rewrite"
+        );
+        assert!(
+            pending_stub_executable(&l, &t, StubKind::Extra, &[])
+                .unwrap()
+                .is_some(),
+            "kind flip: rewrite"
+        );
+        // Measured HERE, not before the reconcile above: under a tracked session that
+        // reconcile already re-laid the file, and comparing against the older inode would
+        // pass without the kind flip changing anything.
+        let before_flip = std::fs::metadata(&shim).unwrap().ino();
+        let extras: BTreeSet<String> = ["trust".to_string()].into_iter().collect();
+        reconcile(&l, &BTreeSet::new(), &extras, &BTreeMap::new());
+        assert_eq!(pending_stub_kind(&l, "trust"), Some(StubKind::Extra));
+        assert_eq!(
+            std::fs::read(&shim).unwrap(),
+            flipped.as_bytes(),
+            "the extra's body is what landed"
+        );
+        assert_ne!(
+            std::fs::metadata(&shim).unwrap().ino(),
+            before_flip,
+            "a changed stub is re-laid"
+        );
         let _ = std::fs::remove_dir_all(&l.prefix);
     }
 

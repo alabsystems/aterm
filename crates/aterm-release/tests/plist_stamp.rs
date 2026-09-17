@@ -328,3 +328,40 @@ fn the_shipped_bundle_requires_native_execution() {
         "LSRequiresNativeExecution must be <true/>, not a string: {out}"
     );
 }
+
+/// The shipped bundle must let a dual-GPU Mac's graphics mux switch.
+///
+/// Per Apple's documentation (not measured on any aterm build), an app whose
+/// Info.plist lacks NSSupportsAutomaticGraphicsSwitching keeps a dual-GPU
+/// MacBook Pro's discrete chip powered for the app's whole life, whichever
+/// MTLDevice the renderer picks, so crates/aterm-gpu's low-power pick
+/// (`Device::preferred`) is only half the fix; the key is the other half. This
+/// test is the gate: delete the key from apps/aterm-mac/Info.plist and it goes
+/// red.
+///
+/// Asserted on the STAMPED output too, for the reason
+/// [`the_shipped_bundle_requires_native_execution`] gives, and this key sits
+/// directly after that one: stamping is a textual splice, and a stamp that
+/// rewrote the wrong element could drop a neighbouring boolean silently.
+#[test]
+fn the_shipped_bundle_supports_automatic_graphics_switching() {
+    let template = real_template();
+    assert!(
+        template.contains("<key>NSSupportsAutomaticGraphicsSwitching</key>\n\t<true/>"),
+        "apps/aterm-mac/Info.plist must carry NSSupportsAutomaticGraphicsSwitching=true \
+         — without it a dual-GPU Mac keeps its discrete GPU powered for as long as \
+         aterm runs, whichever device the renderer picks: {template}"
+    );
+    let out = stamp_real(Some("aterm"));
+    assert!(
+        out.contains("<key>NSSupportsAutomaticGraphicsSwitching</key>\n\t<true/>"),
+        "stamping dropped NSSupportsAutomaticGraphicsSwitching: {out}"
+    );
+    // A BOOLEAN, as Apple documents the key and as the template ships it.
+    // What a `<string>true</string>` would do is not measured; the stamp must
+    // not be what turns it into one.
+    assert!(
+        !out.contains("<key>NSSupportsAutomaticGraphicsSwitching</key>\n\t<string>"),
+        "NSSupportsAutomaticGraphicsSwitching must be <true/>, not a string: {out}"
+    );
+}

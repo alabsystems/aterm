@@ -591,6 +591,14 @@ fn functional_form_witnesses() {
         encode_key(&Key::Named(NamedKey::F3), Modifiers::SHIFT, disamb),
         b"\x1b[13;2~"
     );
+
+    // Shift+F10 keeps its legacy tilde form (terminfo kf22) under disambiguate:
+    // the host tab-menu chord defers it only under report-all, so this is the
+    // sequence a kitty-aware TUI that binds it receives.
+    assert_eq!(
+        encode_key(&Key::Named(NamedKey::F10), Modifiers::SHIFT, disamb),
+        b"\x1b[21;2~"
+    );
     assert_eq!(
         encode_key_with_event(
             &Key::Named(NamedKey::F3),
@@ -761,4 +769,302 @@ fn shift_enter_concrete_witnesses() {
     // xterm modifyOtherKeys level 2: Shift+Enter is the CSI 27 form.
     let mok2 = KeyboardMode::XTERM_MODIFY_OTHER_KEYS_LEVEL2;
     assert_eq!(encode_enter(mok2, Modifiers::SHIFT), b"\x1b[27;2;13~");
+}
+
+/// `Key::main_block_twin` is the ONE keypad fold — the kitty legacy rule's
+/// "equivalent non-keypad key", shared with the GUI's native pages and its
+/// press classifier. Every keypad key has a twin except KP_Begin, which the
+/// main block cannot name; a main-block key never folds.
+#[test]
+fn main_block_twin_table() {
+    use Key::{Character, Named};
+    use NamedKey as N;
+    let twins = [
+        (N::Numpad0, Character('0')),
+        (N::Numpad5, Character('5')),
+        (N::Numpad9, Character('9')),
+        (N::NumpadDecimal, Character('.')),
+        (N::NumpadSeparator, Character(',')),
+        (N::NumpadDivide, Character('/')),
+        (N::NumpadMultiply, Character('*')),
+        (N::NumpadSubtract, Character('-')),
+        (N::NumpadAdd, Character('+')),
+        (N::NumpadEqual, Character('=')),
+        (N::NumpadEnter, Named(N::Enter)),
+        (N::NumpadArrowUp, Named(N::ArrowUp)),
+        (N::NumpadArrowDown, Named(N::ArrowDown)),
+        (N::NumpadArrowLeft, Named(N::ArrowLeft)),
+        (N::NumpadArrowRight, Named(N::ArrowRight)),
+        (N::NumpadHome, Named(N::Home)),
+        (N::NumpadEnd, Named(N::End)),
+        (N::NumpadPageUp, Named(N::PageUp)),
+        (N::NumpadPageDown, Named(N::PageDown)),
+        (N::NumpadInsert, Named(N::Insert)),
+        (N::NumpadDelete, Named(N::Delete)),
+    ];
+    for (keypad, twin) in twins {
+        assert_eq!(Named(keypad).main_block_twin(), Some(twin), "{keypad:?}");
+    }
+    assert_eq!(Named(N::NumpadBegin).main_block_twin(), None);
+    for main in [Character('5'), Named(N::Enter), Named(N::End), Named(N::F5)] {
+        assert_eq!(main.main_block_twin(), None, "{main:?} is not a keypad key");
+    }
+}
+
+/// A physical KP_5 reaches the encoder as `Numpad5` now (the winit seam keeps
+/// the keypad identity). Under a kitty mode that has NOT asked to tell the
+/// keypad apart it is the `5` kitty sends — a text press AND a text repeat —
+/// where the unfolded key reported a dedicated `CSI 57404;1:2 u` repeat no
+/// kitty client emits. Disambiguate keeps the dedicated key, and with no kitty
+/// flag at all DECKPAM still owns the keypad (SS3 u).
+#[test]
+fn kitty_legacy_folds_keypad_digits_to_their_glyph() {
+    let events_only = KeyboardMode::REPORT_EVENT_TYPES;
+    let kp5 = Key::Named(NamedKey::Numpad5);
+    assert_eq!(encode_key(&kp5, Modifiers::empty(), events_only), b"5");
+    assert_eq!(
+        encode_key_with_event(&kp5, Modifiers::empty(), events_only, KeyEventType::Repeat),
+        b"5",
+        "a keypad digit repeat is text under kitty legacy semantics"
+    );
+    assert_eq!(
+        encode_key(
+            &Key::Named(NamedKey::NumpadAdd),
+            Modifiers::empty(),
+            events_only
+        ),
+        b"+"
+    );
+    assert_eq!(
+        encode_key(
+            &kp5,
+            Modifiers::empty(),
+            KeyboardMode::DISAMBIGUATE_ESC_CODES
+        ),
+        b"\x1b[57404u"
+    );
+    assert_eq!(
+        encode_key(&kp5, Modifiers::empty(), KeyboardMode::APP_KEYPAD),
+        b"\x1bOu",
+        "no kitty flag: the legacy encoder's DECKPAM form is untouched"
+    );
+}
+
+/// DECKPAM OUTRANKS THE KITTY LEGACY FOLD. The fold stands in for "the app has
+/// not asked to tell the keypad from the main block" — and application keypad
+/// mode IS that request, spelled in the very legacy encoding the fold folds
+/// into. Folding there threw the mode away and answered an SS3-reading app the
+/// main row's `5` for its KP_5.
+#[test]
+fn kitty_legacy_fold_yields_to_application_keypad_mode() {
+    let events_only = KeyboardMode::REPORT_EVENT_TYPES;
+    let kp5 = Key::Named(NamedKey::Numpad5);
+    assert_eq!(
+        encode_key(
+            &kp5,
+            Modifiers::empty(),
+            events_only | KeyboardMode::APP_KEYPAD
+        ),
+        b"\x1bOu",
+        "a kitty flag must not launder DECKPAM into plain text"
+    );
+    assert_eq!(
+        encode_key(
+            &Key::Named(NamedKey::NumpadEnter),
+            Modifiers::empty(),
+            events_only | KeyboardMode::APP_KEYPAD
+        ),
+        b"\x1bOM"
+    );
+    // SHIFT cancels application keypad mode inside the legacy encoder, so the
+    // unfolded key lands on the same byte the fold would have produced.
+    assert_eq!(
+        encode_key(
+            &kp5,
+            Modifiers::SHIFT,
+            events_only | KeyboardMode::APP_KEYPAD
+        ),
+        b"5"
+    );
+    // …and without DECKPAM the fold is exactly as it was.
+    assert_eq!(encode_key(&kp5, Modifiers::empty(), events_only), b"5");
+}
+
+/// `REPORT_ASSOCIATED_TEXT` answers "what did this press put on the screen",
+/// and a keypad glyph key puts its glyph there. The keypad used to arrive from
+/// the hosts as `Key::Character` and reported it; since the winit seam resolves
+/// the physical keypad it arrives as `Key::Named(Numpad5)`, whose `Named` arm
+/// answered `None` — the text vanished from the report while the dedicated
+/// `57404` code stayed. The twin supplies the text; the CODE is still the
+/// keypad's own.
+#[test]
+fn kitty_associated_text_carries_the_keypad_glyph() {
+    let full = KeyboardMode::DISAMBIGUATE_ESC_CODES
+        | KeyboardMode::REPORT_EVENT_TYPES
+        | KeyboardMode::REPORT_ALTERNATE_KEYS
+        | KeyboardMode::REPORT_ALL_KEYS_AS_ESC
+        | KeyboardMode::REPORT_ASSOCIATED_TEXT;
+    assert_eq!(
+        encode_key(&Key::Named(NamedKey::Numpad5), Modifiers::empty(), full),
+        b"\x1b[57404;1;53u",
+        "KP_5 reports the text `5` alongside its own key code"
+    );
+    assert_eq!(
+        encode_key(
+            &Key::Named(NamedKey::NumpadDecimal),
+            Modifiers::empty(),
+            full
+        ),
+        b"\x1b[57409;1;46u"
+    );
+    assert_eq!(
+        encode_key(
+            &Key::Named(NamedKey::NumpadSeparator),
+            Modifiers::empty(),
+            full
+        ),
+        b"\x1b[57416;1;44u"
+    );
+    // A keypad key whose twin is NAMED carries no text, exactly as its twin
+    // does — and KP_Begin, which has no twin, carries none either.
+    assert_eq!(
+        encode_key(&Key::Named(NamedKey::NumpadEnd), Modifiers::empty(), full),
+        b"\x1b[57424u"
+    );
+    assert_eq!(
+        encode_key(&Key::Named(NamedKey::NumpadBegin), Modifiers::empty(), full),
+        b"\x1b[E",
+        "KP_Begin keeps its legacy letter form in every kitty mode"
+    );
+    // The main block is unmoved: `5` still reports itself.
+    assert_eq!(
+        encode_key(&Key::Character('5'), Modifiers::empty(), full),
+        b"\x1b[53;1;53u"
+    );
+}
+
+/// A KEYPAD KEY DOES NOT COMPOSE, and a kitty REPORTING flag cannot make it.
+/// The legacy fold above names the key for the CSI-u report; handing that name
+/// to the legacy encoder too ran the MAIN ROW's tables over it, so under a bare
+/// `REPORT_EVENT_TYPES` a Shift+KP_5 typed `%` and a Ctrl+KP_5 typed 0x1D —
+/// glyphs no keypad emits, and a strict regression for the NumLock-OFF shifted
+/// press (xkb's KEYPAD type is `map[Shift] = Level2`, the level holding the
+/// digit, so that press IS KP_5 and arrives here as `Numpad5` + SHIFT). xterm's
+/// keypad rule is that SHIFT only cancels application keypad mode, and kitty's
+/// legacy rule is to send the text the key produced; both say `5`.
+#[test]
+fn a_modified_keypad_key_never_composes_the_main_rows_glyph() {
+    use NamedKey as N;
+    let events_only = KeyboardMode::REPORT_EVENT_TYPES;
+
+    // The shifted keypad types its own glyph; the trailing comment is what the
+    // fold composed before — the main row's shifted character.
+    for (named, want) in [
+        (N::Numpad0, &b"0"[..]),    // was ")"
+        (N::Numpad1, b"1"),         // was "!"
+        (N::Numpad5, b"5"),         // was "%"
+        (N::Numpad9, b"9"),         // was "("
+        (N::NumpadDecimal, b"."),   // was ">"
+        (N::NumpadSeparator, b","), // was "<"
+        (N::NumpadDivide, b"/"),    // was "?"
+        (N::NumpadSubtract, b"-"),  // was "_"
+    ] {
+        assert_eq!(
+            encode_key(&Key::Named(named), Modifiers::SHIFT, events_only),
+            want,
+            "{named:?} under SHIFT"
+        );
+    }
+
+    // …and no kitty reporting flag changes what the keypad types, for any
+    // chord: the same physical key must answer the same bytes with the flag on
+    // and off. CTRL is the other table the fold used to reach.
+    for (named, mods) in [
+        (N::Numpad1, Modifiers::SHIFT),
+        (N::Numpad5, Modifiers::SHIFT),
+        (N::Numpad5, Modifiers::CTRL),
+        (N::Numpad2, Modifiers::CTRL),
+        (N::NumpadDivide, Modifiers::CTRL),
+        (N::NumpadSubtract, Modifiers::CTRL | Modifiers::SHIFT),
+        (N::NumpadEnd, Modifiers::SHIFT),
+        (N::NumpadArrowUp, Modifiers::CTRL),
+        (N::NumpadEnter, Modifiers::SHIFT),
+    ] {
+        let key = Key::Named(named);
+        assert_eq!(
+            encode_key(&key, mods, events_only),
+            encode_key(&key, mods, KeyboardMode::empty()),
+            "{named:?}+{mods:?}: a kitty REPORTING flag must not change what the keypad types",
+        );
+    }
+
+    // The NEGATIVE CONTROL: the main row still composes. The fold is what must
+    // not compose, not the shift table.
+    assert_eq!(
+        encode_key(&Key::Character('5'), Modifiers::SHIFT, events_only),
+        b"%"
+    );
+    assert_eq!(
+        encode_key(&Key::Character('5'), Modifiers::CTRL, events_only),
+        b"\x1d"
+    );
+
+    // The unshifted fold is exactly as it was: the digit is still the digit.
+    assert_eq!(
+        encode_key(&Key::Named(N::Numpad5), Modifiers::empty(), events_only),
+        b"5"
+    );
+    assert_eq!(
+        encode_key(&Key::Named(N::NumpadAdd), Modifiers::empty(), events_only),
+        b"+"
+    );
+
+    // CTRL on the keypad is the engine's documented keypad rule (#7480: the
+    // keypad encoder ignores it), now the SAME rule in every mode rather than
+    // the control byte with a kitty flag and the glyph without.
+    assert_eq!(
+        encode_key(&Key::Named(N::NumpadDivide), Modifiers::CTRL, events_only),
+        b"/"
+    );
+    assert_eq!(
+        encode_key(
+            &Key::Named(N::NumpadDivide),
+            Modifiers::CTRL,
+            KeyboardMode::empty()
+        ),
+        b"/"
+    );
+
+    // The KITTY side of the split is untouched: where the fold reaches the
+    // CSI-u encoder it still reports the twin's code AND the full modifier
+    // set, SHIFT bit included (`5`=53, Ctrl+Shift=6, release=`:3`).
+    assert_eq!(
+        encode_key_with_event(
+            &Key::Named(N::Numpad5),
+            Modifiers::CTRL | Modifiers::SHIFT,
+            events_only,
+            KeyEventType::Release,
+        ),
+        b"\x1b[53;6:3u",
+        "the kitty report keeps the folded code and the unmodified modifiers"
+    );
+
+    // …and DECKPAM still outranks both halves.
+    assert_eq!(
+        encode_key(
+            &Key::Named(N::Numpad5),
+            Modifiers::empty(),
+            events_only | KeyboardMode::APP_KEYPAD
+        ),
+        b"\x1bOu"
+    );
+    assert_eq!(
+        encode_key(
+            &Key::Named(N::Numpad5),
+            Modifiers::CTRL,
+            events_only | KeyboardMode::APP_KEYPAD
+        ),
+        b"\x1bOu",
+        "only SHIFT cancels application keypad mode; CTRL leaves the SS3 form"
+    );
 }

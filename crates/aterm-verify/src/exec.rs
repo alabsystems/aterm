@@ -51,6 +51,9 @@ pub struct Cmd {
     /// `env VAR=… cmd` prefixes the script used.
     pub envs: Vec<(OsString, OsString)>,
     pub capture: Capture,
+    /// Spawn under UTILITY QoS rather than the gate's inherited tier — see
+    /// [`Cmd::demoted`] for which children may, and why the rest may not.
+    pub demoted: bool,
 }
 
 impl Cmd {
@@ -61,6 +64,7 @@ impl Cmd {
             args: Vec::new(),
             envs: Vec::new(),
             capture: Capture::Emit,
+            demoted: false,
         }
     }
 
@@ -89,6 +93,37 @@ impl Cmd {
     #[must_use]
     pub fn capture(mut self, c: Capture) -> Self {
         self.capture = c;
+        self
+    }
+
+    /// Run this child at UTILITY QoS (`taskpolicy -c utility`, where macOS has
+    /// it), so a compile yields the CPU to the programs a person is typing into.
+    ///
+    /// WHY (2026-09-15). Every stage child used to start at the default band,
+    /// the band the user's shell and its programs run in: a `trustc` and the
+    /// Codex a person was typing into both read `pri 31` in `ps`. While ~45
+    /// runnable threads shared 18 cores, aterm's own share of a keystroke stayed
+    /// short (`key_write_p99_ms=6.29`) while the child's share, write to first
+    /// byte back, stretched to `echo_p95_ms=75.69 echo_p99_ms=150.04
+    /// echo_max_ms=367.85`. The program has to be scheduled to read the key,
+    /// update and repaint, and the compiles competed with it as equals. Measured:
+    /// under `taskpolicy -c utility` a child reads `pri 20`, under the
+    /// inherited tier `31`.
+    ///
+    /// Utility, not background (`-b`, `pri 4`): background also throttles disk
+    /// I/O hard, and a cold workspace compile is already the child that sets
+    /// [`DEFAULT_CHILD_CEILING`].
+    ///
+    /// ONLY FOR A CHILD THAT JUST COMPILES. A QoS clamp is inherited by
+    /// everything the child starts, and docs/RELEASING.md measured what that
+    /// does to a child the gate MEASURES: an aterm launched under UTILITY had
+    /// its paint probe's 50 ms timer fire 75 ms late, and the smoke went red 11
+    /// times in 30. So the test run (`--tests`, which runs the paint and spin
+    /// guards), the smokes, the drives and every other child that RUNS code keep
+    /// the inherited tier. That is why this is opt-in per child, not a default.
+    #[must_use]
+    pub fn demoted(mut self) -> Self {
+        self.demoted = true;
         self
     }
 
@@ -434,6 +469,10 @@ pub fn ceiling_from_env(raw: Option<&OsStr>) -> Option<Duration> {
 
 static SEQ: AtomicU64 = AtomicU64::new(0);
 
+/// macOS's QoS launcher, the same one `snapshot::delete_in_background` uses for
+/// trash deletion. Absent elsewhere, where a [`Cmd::demoted`] child runs as is.
+pub const TASKPOLICY: &str = "/usr/sbin/taskpolicy";
+
 /// Spawn, wait, and collect. Never panics on a missing tool: an unspawnable
 /// child is a failed run whose "output" names the reason, so the caller still
 /// reaches its own fail-closed branch.
@@ -449,8 +488,8 @@ pub fn run(cmd: &Cmd, env: ExecEnv<'_>) -> Run {
 }
 
 fn run_untimed(cmd: &Cmd, env: ExecEnv<'_>) -> Run {
-    let mut c = Command::new(&cmd.program);
-    c.args(&cmd.args).current_dir(env.cwd).env("PATH", env.path);
+    let mut c = spawn_command(cmd, env, Path::new(TASKPOLICY));
+    c.current_dir(env.cwd).env("PATH", env.path);
     for k in env.remove_env {
         c.env_remove(k);
     }
@@ -498,6 +537,49 @@ fn run_untimed(cmd: &Cmd, env: ExecEnv<'_>) -> Run {
             r
         }
     }
+}
+
+/// The `Command` for `cmd` before its cwd and environment are applied: the
+/// program itself or, for a [`Cmd::demoted`] child, the program behind
+/// `taskpolicy -c utility`.
+///
+/// Wrapped only when both are real: `taskpolicy` exists and the program
+/// resolves to an executable. If the program is missing, `taskpolicy` exits 66
+/// on its own ("taskpolicy: posix_spawn: No such file or directory", measured).
+/// The gate would see an ordinary nonzero exit instead of a [`Run::spawn_error`],
+/// losing the fact that the tool could not run. So an unresolvable program is
+/// spawned bare and fails exactly as it always did.
+///
+/// `taskpolicy` replaces itself with the program rather than parenting it
+/// (measured: the program's parent is the process that ran `taskpolicy`), so the
+/// pid [`over_ceiling`] kills is the tool's own. The timing rows and the ceiling
+/// diagnostic name `cmd`'s argv, so neither ever mentions the wrapper.
+fn spawn_command(cmd: &Cmd, env: ExecEnv<'_>, taskpolicy: &Path) -> Command {
+    let mut c = if cmd.demoted && crate::is_executable_file(taskpolicy) && resolves(cmd, env) {
+        let mut c = Command::new(taskpolicy);
+        c.args(["-c", "utility"]).arg(&cmd.program);
+        c
+    } else {
+        Command::new(&cmd.program)
+    };
+    c.args(&cmd.args);
+    c
+}
+
+/// Whether `execvp` would find `cmd.program` from the child's cwd, on the PATH
+/// the child is actually given (its own [`Cmd::envs`] override included).
+fn resolves(cmd: &Cmd, env: ExecEnv<'_>) -> bool {
+    let program = cmd.program.as_path();
+    if program.components().count() > 1 {
+        return crate::is_executable_file(&env.cwd.join(program));
+    }
+    let path = cmd
+        .envs
+        .iter()
+        .rev()
+        .find(|(k, _)| k == "PATH")
+        .map_or(env.path, |(_, v)| v.as_os_str());
+    std::env::split_paths(path).any(|d| crate::is_executable_file(&env.cwd.join(d).join(program)))
 }
 
 /// Spawn and wait, under `ceiling`. Returns a [`Run`] whose `output` is EMPTY
@@ -692,6 +774,105 @@ mod tests {
             c.envs,
             [(OsString::from("RUSTDOC"), OsString::from("/s2/trustdoc"))]
         );
+    }
+
+    fn spawned_argv(c: &Command) -> Vec<String> {
+        std::iter::once(c.get_program())
+            .chain(c.get_args())
+            .map(|s| s.to_string_lossy().into_owned())
+            .collect()
+    }
+
+    /// Checks the wrapping decision, with a stand-in `taskpolicy` so it runs
+    /// the same on every Unix: a demoted child whose two ends are real runs
+    /// behind `taskpolicy -c utility`; every other child is the tool alone.
+    #[cfg(unix)]
+    #[test]
+    fn only_a_demoted_child_that_can_run_is_spawned_under_utility_qos() {
+        use std::os::unix::fs::PermissionsExt;
+        let tmp = crate::mktemp_dir("atv-qos").expect("mktemp");
+        let fake = tmp.join("taskpolicy");
+        std::fs::write(&fake, "#!/bin/sh\nexit 0\n").expect("write");
+        std::fs::set_permissions(&fake, std::fs::Permissions::from_mode(0o755)).expect("chmod");
+        let fake_s = fake.to_string_lossy().into_owned();
+        let env = env_in(&tmp);
+        let tool = Cmd::new("/bin/sh").args(["-c", "exit 0"]);
+
+        assert_eq!(
+            spawned_argv(&spawn_command(&tool, env, &fake)),
+            ["/bin/sh", "-c", "exit 0"],
+            "a child nobody demoted keeps the inherited tier"
+        );
+        assert_eq!(
+            spawned_argv(&spawn_command(&tool.clone().demoted(), env, &fake)),
+            [fake_s.as_str(), "-c", "utility", "/bin/sh", "-c", "exit 0"]
+        );
+        assert_eq!(
+            spawned_argv(&spawn_command(
+                &tool.clone().demoted(),
+                env,
+                &tmp.join("absent")
+            ))[0],
+            "/bin/sh",
+            "no taskpolicy on this machine: the tool alone"
+        );
+        let missing = Cmd::new(tmp.join("no-such-tool")).demoted();
+        assert_eq!(
+            spawned_argv(&spawn_command(&missing, env, &fake))[0],
+            missing.program.to_string_lossy(),
+            "a missing tool is spawned bare, so it still fails to SPAWN"
+        );
+        assert_eq!(
+            spawned_argv(&spawn_command(&Cmd::new("sh").demoted(), env, &fake))[0],
+            fake_s,
+            "a bare name resolves on the child's PATH"
+        );
+        let hidden = Cmd::new("sh").env("PATH", tmp.as_os_str()).demoted();
+        assert_eq!(
+            spawned_argv(&spawn_command(&hidden, env, &fake))[0],
+            "sh",
+            "the child's own PATH override is the one searched"
+        );
+        std::fs::remove_dir_all(&tmp).ok();
+    }
+
+    #[test]
+    fn a_demoted_child_that_cannot_run_still_says_it_could_not_run() {
+        let tmp = crate::mktemp_dir("atv-qos-missing").expect("mktemp");
+        let r = run(&Cmd::new(tmp.join("no-such-tool")).demoted(), env_in(&tmp));
+        assert!(!r.ok);
+        assert!(r.spawn_error.is_some(), "{r:?}");
+        std::fs::remove_dir_all(&tmp).ok();
+    }
+
+    /// The measurement behind [`Cmd::demoted`], as a test. The child reads its
+    /// own base priority, so there is no load to generate and no timing to
+    /// flake on. Inherited, a child sits in the default band (`31`, even under
+    /// `nice -n 19`). Demoted, it is at most UTILITY's `20`.
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn a_demoted_child_really_runs_below_the_default_band() {
+        if !crate::is_executable_file(Path::new(TASKPOLICY)) {
+            return;
+        }
+        let tmp = crate::mktemp_dir("atv-qos-live").expect("mktemp");
+        let pri = |cmd: Cmd| -> i32 {
+            let r = run(&cmd, env_in(&tmp));
+            assert!(r.ok, "{r:?}");
+            r.trimmed_output()
+                .trim()
+                .parse()
+                .unwrap_or_else(|e| panic!("ps said {:?}: {e}", r.output))
+        };
+        let probe = Cmd::new("/bin/sh").args(["-c", "ps -o pri= -p $$"]);
+        let inherited = pri(probe.clone());
+        let demoted = pri(probe.demoted());
+        assert!(demoted <= 20, "demoted child at pri {demoted}");
+        assert!(
+            demoted < inherited || inherited <= 20,
+            "demoted pri {demoted} is not below the inherited {inherited}"
+        );
+        std::fs::remove_dir_all(&tmp).ok();
     }
 
     #[test]

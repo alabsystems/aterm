@@ -172,12 +172,23 @@ impl WatchStatusState {
     }
 
     pub(crate) fn message(&self) -> Option<String> {
-        let mut messages = Vec::with_capacity(2);
+        let mut messages: Vec<String> = Vec::with_capacity(2);
         if let Some(kind) = self.config {
-            messages.push(failure_message(kind));
+            let mut message = failure_message(kind).to_string();
+            // "Kept unchanged" protects a loaded configuration. When the launch
+            // could not read the file there is none: say what is actually
+            // running, so the reload refusal cannot read as "your settings are
+            // safe" over a window on all-defaults (glass hunt 2026-09-01, #2).
+            if crate::app_config::launch_load_failed() {
+                message.push_str(
+                    " (The file did not load at launch either: every setting is at its \
+                     default until it does.)",
+                );
+            }
+            messages.push(message);
         }
         if let Some(kind) = self.themes {
-            messages.push(failure_message(kind));
+            messages.push(failure_message(kind).to_string());
         }
         (!messages.is_empty()).then(|| messages.join(" "))
     }

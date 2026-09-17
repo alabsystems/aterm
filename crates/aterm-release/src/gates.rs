@@ -647,17 +647,76 @@ pub fn gh_auth() -> Result<Option<String>> {
     Ok(account)
 }
 
+/// The `[target.…]` tables in `.cargo/config.toml` that can carry the native
+/// Trust lane's rustflags, in lookup order. The live one is FIRST and is not a
+/// triple: ecb1d6691 (2026-08-30) replaced the two per-triple copies with one
+/// `[target.'cfg(trust_verify)']` table scoped to the COMPILER that understands
+/// the flag rather than to a host, so the single table now reaches every Trust
+/// lane on every target. The two retired triples stay behind it only so an older
+/// checkout still reads its own config.
+const TRUST_LANE_TABLES: [&str; 3] = [
+    "cfg(trust_verify)",
+    "aarch64-apple-darwin",
+    "x86_64-unknown-linux-gnu",
+];
+
+/// trustc's own words for "the off-switch took effect".
+///
+/// The gate reads THIS rather than matching a flag spelling, and the distinction
+/// is the point: hardcoding `-Ztrust-verify=off` anywhere in the cutter is the
+/// drift [`native_lane_rustflags`] exists to avoid, so the gate asks the compiler
+/// whether the config's flags — whatever they spell — actually turned
+/// verification off. Measured 2026-09-16 against a stage2 trustc compiling
+/// [`PROBE_SRC`] with `--emit=metadata`: under the config's flags,
+/// `note: compiled WITHOUT Trust verification — 0 obligations checked`; under no
+/// flags, `=== Trust Verification Report (probe) ===` and a
+/// `note: Trust verification: 1 proved, … out of 1 obligation(s)` instead.
+const OFF_SWITCH_NOTE: &str = "compiled WITHOUT Trust verification";
+
+/// The probe's source. It carries ONE real Level 0 obligation on purpose — the
+/// divisor-is-zero check on `numerator / denominator`.
+///
+/// `fn main() {}` used to stand here and it made the probe unfalsifiable. A
+/// program with no obligations compiles the same way in both lanes and trustc
+/// says "0 obligations checked" either way, so NOTHING about the verification
+/// lane is observable in its output — the probe could only ever see a broken
+/// stage2 or a flag spelling the compiler cannot parse. One obligation is enough
+/// to make the two lanes print different things, which is what lets
+/// [`verification_off_verdict`] tell them apart.
+const PROBE_SRC: &str = "\
+pub fn divide(numerator: u32, denominator: u32) -> u32 {
+    numerator / denominator
+}
+
+fn main() {
+    let _ = divide(6, 3);
+}
+";
+
 /// The native-lane rustflags the repo's `.cargo/config.toml` applies to the
-/// Trust slice's triple — the ONE temporary verification opt-out. Read from the
-/// file, never hardcoded: a hardcoded off-switch spelling drifted from the
-/// config twice (`-Zno-trust-verify=yes` vs `-Ztrust-verify=off`) and either
-/// direction of that drift kills the cut in the build step. Empty when the
-/// table is gone (the Trust-Std campaign greened): the probe then compiles
-/// batteries-on, which is exactly what the build lane will do.
+/// Trust slice — the ONE temporary verification opt-out. Read from the file,
+/// never hardcoded: a hardcoded off-switch spelling drifted from the config
+/// twice (`-Zno-trust-verify=yes` vs `-Ztrust-verify=off`) and either direction
+/// of that drift kills the cut in the build step.
+///
+/// FAILS CLOSED when the file is there and none of [`TRUST_LANE_TABLES`] is. It
+/// used to answer `[]` for that case and read the emptiness as good news — "the
+/// table is gone, the Trust-Std campaign greened, so the probe compiles
+/// batteries-on like the build lane will". Through a single dead key a RENAMED
+/// table is indistinguishable from a deleted one, and the rename is what
+/// actually happened: ecb1d6691 moved the table on 2026-08-30 while this reader
+/// went on asking for `aarch64-apple-darwin`, so from that day the macOS release
+/// gate probed with no flags at all and could not fail on them — and the
+/// campaign's own file still says it is red (`targo trust check -p aterm-types`,
+/// 708 errors, measured 2026-09-16). The campaign greening is a deliberate edit
+/// here, never something a lookup miss may assume on the reader's behalf.
 fn native_lane_rustflags(repo: &Path) -> Result<Vec<String>> {
     let path = repo.join(".cargo/config.toml");
     let text = match fs::read_to_string(&path) {
         Ok(text) => text,
+        // No config at all is not drift: there is no table to have been renamed
+        // and nothing applies flags to anything. The empty list still refuses,
+        // one step later in `verification_off_verdict`, where it reads well.
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
         Err(error) => {
             return Err(Error::new(format!("read {}: {error}", path.display())));
@@ -666,18 +725,83 @@ fn native_lane_rustflags(repo: &Path) -> Result<Vec<String>> {
     let value: aterm_toml::Value = text
         .parse()
         .map_err(|error| Error::new(format!("parse {}: {error}", path.display())))?;
-    Ok(value
-        .get("target")
-        .and_then(|targets| targets.get("aarch64-apple-darwin"))
-        .and_then(|target| target.get("rustflags"))
-        .and_then(|flags| flags.as_array())
-        .map(|flags| {
-            flags
+    trust_lane_rustflags(&value).ok_or_else(|| {
+        Error::new(format!(
+            "{} carries no Trust-lane rustflags: none of {TRUST_LANE_TABLES:?} under \
+             [target] has a `rustflags` array. The probe compiles under the flags the \
+             build lane will really use, so a table renamed out from under this list \
+             makes the probe silently flagless — which is exactly how this gate stopped \
+             gating on 2026-08-30. If the table moved, add its name to \
+             TRUST_LANE_TABLES; if the Trust-Std campaign greened and the opt-out is \
+             genuinely gone, say so here rather than letting a lookup miss say it.",
+            path.display()
+        ))
+    })
+}
+
+/// The pure half of [`native_lane_rustflags`]: the first of
+/// [`TRUST_LANE_TABLES`] that carries a `rustflags` array, as strings.
+///
+/// Split out so the table-name contract is a machine-checked test against the
+/// config this repo actually ships — on every host, with no Mac and no Trust
+/// toolchain in sight — instead of a comment. The drift it guards is invisible
+/// from the machine whose lane it breaks.
+fn trust_lane_rustflags(config: &aterm_toml::Value) -> Option<Vec<String>> {
+    let targets = config.get("target")?;
+    TRUST_LANE_TABLES.iter().find_map(|name| {
+        Some(
+            targets
+                .get(*name)?
+                .get("rustflags")?
+                .as_array()?
                 .iter()
                 .filter_map(|flag| flag.as_str().map(String::from))
-                .collect()
-        })
-        .unwrap_or_default())
+                .collect(),
+        )
+    })
+}
+
+/// Did the config's flags actually turn verification off in the trustc that just
+/// ran? Pure over (flags, trustc's stderr), so the verdict is a test rather than
+/// a promise.
+///
+/// Three drifts die here, all of them at the cheap pre-claim moment instead of
+/// twenty minutes into the build step:
+///
+/// * the flag list arrived EMPTY — the Trust-lane table renamed away again, or a
+///   `.cargo/config.toml` that is not this repo's;
+/// * the switch parsed but did not switch (a value drift, `…=off` to `…=on`):
+///   trustc prints its verification report instead of [`OFF_SWITCH_NOTE`];
+/// * the off-switch left the table while the campaign is still red.
+///
+/// A spelling the compiler cannot parse never reaches here — that one fails the
+/// compile itself, one branch above this call.
+fn verification_off_verdict(flags: &[String], stderr: &str) -> Result<()> {
+    if flags.is_empty() {
+        return Err(Error::new(
+            "the native lane's rustflags came back EMPTY, so the trustc probe compiled \
+             under no flags and gated on nothing. .cargo/config.toml's Trust-lane table \
+             is the source of truth for them (see native_lane_rustflags); a probe with \
+             no flags cannot see a flag drift, which is the one thing it is for",
+        ));
+    }
+    if !stderr.contains(OFF_SWITCH_NOTE) {
+        return Err(Error::new(format!(
+            "the probe compiled under the config's native-lane rustflags {flags:?} and \
+             trustc did NOT report \"{OFF_SWITCH_NOTE}\" — the off-switch was accepted \
+             but did not switch verification off, so the real build verifies every unit \
+             strictly and dies deep in the build step. `trustc -Z help | grep \
+             trust-verify` names the spelling this compiler accepts, and \
+             .cargo/config.toml's Trust-lane table carries the one in use. trustc said: \
+             {}",
+            stderr
+                .lines()
+                .find(|line| line.contains("Trust verification"))
+                .unwrap_or("(no Trust verification line)")
+                .trim()
+        )));
+    }
+    Ok(())
 }
 
 /// Probe the trustc the native slice uses — the Trust stage2 compiler that
@@ -686,7 +810,7 @@ fn native_lane_rustflags(repo: &Path) -> Result<Vec<String>> {
 /// fallback. The exact path is printed on failure so the remediation is
 /// copy-pasteable.
 ///
-/// The probe COMPILES a trivial program under the exact rustflags
+/// The probe COMPILES [`PROBE_SRC`] under the exact rustflags
 /// .cargo/config.toml applies to the native lane, not just `--version`: a
 /// stage2 whose library build never landed has a runnable trustc but no std
 /// rlibs in its sysroot (the 2026-07-07 dry-run failure — every crate E0463s
@@ -694,6 +818,12 @@ fn native_lane_rustflags(repo: &Path) -> Result<Vec<String>> {
 /// does not parse fails every unit the same way. Compiling is the only honest
 /// check that the toolchain can do what the build lane is about to ask of it;
 /// the metadata-only emit keeps it fast (no codegen, no link).
+///
+/// Then it reads what trustc SAID, through [`verification_off_verdict`]. A
+/// compile that succeeds proves the toolchain works; only the compiler's own
+/// note proves the config's opt-out reached it. An exit status alone cannot,
+/// which is why [`PROBE_SRC`] carries an obligation: the two lanes have to
+/// differ before there is anything for a gate to read.
 pub fn trustc_probe(repo: &Path) -> Result<PathBuf> {
     let trustc = trust_stage2_bin()?.join("trustc");
     let probe = Command::new(&trustc).arg("--version").output();
@@ -721,7 +851,7 @@ pub fn trustc_probe(repo: &Path) -> Result<PathBuf> {
     let dir = std::env::temp_dir().join(format!("aterm-trust-probe-{}", std::process::id()));
     std::fs::create_dir_all(&dir).map_err(|e| Error::new(format!("probe tmpdir: {e}")))?;
     let src = dir.join("probe.rs");
-    std::fs::write(&src, "fn main() {}\n").map_err(|e| Error::new(format!("probe src: {e}")))?;
+    std::fs::write(&src, PROBE_SRC).map_err(|e| Error::new(format!("probe src: {e}")))?;
     let out = Command::new(&trustc)
         .args(&flags)
         .arg("--emit=metadata")
@@ -730,7 +860,10 @@ pub fn trustc_probe(repo: &Path) -> Result<PathBuf> {
         .arg(&src)
         .output();
     let result = match out {
-        Ok(o) if o.status.success() => Ok(trustc),
+        Ok(o) if o.status.success() => {
+            verification_off_verdict(&flags, &String::from_utf8_lossy(&o.stderr))
+                .map(|()| trustc.clone())
+        }
         Ok(o) => Err(Error::new(format!(
             "trustc at {} runs but cannot COMPILE under the native-lane rustflags {flags:?} \
              (stage2 library missing/stale — reinstall with `aterm pkg install trust`, or from \
@@ -763,6 +896,9 @@ pub fn trustc_probe(repo: &Path) -> Result<PathBuf> {
 ///   tracked shell, and the cut died at tools/proof_snapshot.py's "published proof
 ///   snapshot has extended metadata" AFTER the ledger claim — a burned build number);
 /// * the `targo` beside it, which drives that trustc and writes on its own;
+/// * the dynamic libraries under the bundle's `lib/` that trustc loads — a tagged one
+///   tracks the process that loads it (measured 2026-09-15), so they carry the tag into
+///   a cut exactly as a tagged `trustc` does;
 /// * the cutter's own binary — AND, separately, whether this PROCESS is tracked, which
 ///   the binary's attribute cannot tell (a clean cutter under a tracked parent — a shell
 ///   inside aterm.app, an agent started from a tagged `claude` — is tracked too). That is
@@ -798,6 +934,36 @@ pub fn provenance_gate(trustc: &Path) -> Result<()> {
                     "provenance gate: cannot inspect {label} at {} for com.apple.provenance: {e}",
                     path.display()
                 )));
+            }
+        }
+    }
+    // THE DYLIBS THE COMPILER LOADS (2026-09-15): a process that `dlopen`s a tagged
+    // library becomes tracked — measured with a launchd-spawned python loading a tagged
+    // copy of the bundle's `libstd` — so a clean `trustc` over a tagged `lib/` writes
+    // tagged files all the same. Every dylib under the bundle's `lib/` is a carrier
+    // candidate; the first few are named, the count says the rest.
+    if let Some(lib) = trustc
+        .parent()
+        .and_then(Path::parent)
+        .map(|b| b.join("lib"))
+        && lib.is_dir()
+    {
+        let scan = atpkg::provenance::tagged_files_under(&lib, atpkg::provenance::PROVENANCE_XATTR);
+        let dylibs: Vec<PathBuf> = scan
+            .carriers
+            .into_iter()
+            .filter(|p| p.extension().is_some_and(|e| e == "dylib"))
+            .collect();
+        if !dylibs.is_empty() {
+            let shown = dylibs.len().min(3);
+            for path in dylibs.iter().take(shown) {
+                carriers.push(("a library trustc loads", path.clone()));
+            }
+            if dylibs.len() > shown {
+                carriers.push((
+                    "…and more libraries under the bundle's lib/ (count in the message)",
+                    lib.join(format!("({} tagged dylibs in all)", dylibs.len())),
+                ));
             }
         }
     }
@@ -1174,5 +1340,234 @@ mod provenance_gate_tests {
         assert!(!atpkg::provenance::carries(&clean, "user.aterm.probe"));
         assert!(atpkg::provenance::xattr_names(&d.join("absent")).is_err());
         let _ = fs::remove_dir_all(&d);
+    }
+}
+
+#[cfg(test)]
+mod native_lane_flag_tests {
+    //! THE DRIFT THIS PINS IS INVISIBLE FROM THE MACHINE IT BREAKS.
+    //!
+    //! The macOS release gate reads one table name out of `.cargo/config.toml`
+    //! to learn the flags its trustc probe must compile under. When ecb1d6691
+    //! renamed that table on 2026-08-30 — two per-triple copies collapsed into
+    //! one `[target.'cfg(trust_verify)']` — nothing went red: the lookup missed,
+    //! the reader answered `[]`, and every probe since compiled under no flags
+    //! and could not fail on them. The gate existed precisely to catch a flag
+    //! drift before a cut, and for a fortnight it caught nothing.
+    //!
+    //! A comment cannot stop that happening again, so these do, on every host,
+    //! with no Mac and no Trust toolchain: the config's own shape is read back
+    //! and compared against the names this file knows.
+
+    use super::*;
+
+    /// `crates/aterm-release` sits two levels under the workspace root — the
+    /// same walk `bundle.rs`'s alias test makes.
+    fn repo_root() -> PathBuf {
+        Path::new(env!("CARGO_MANIFEST_DIR"))
+            .parent()
+            .and_then(Path::parent)
+            .expect("crates/aterm-release sits two levels under the root")
+            .to_path_buf()
+    }
+
+    /// Every `[target.…]` table in the shipped config that carries a
+    /// `rustflags` array, found WITHOUT [`TRUST_LANE_TABLES`]: the scan follows
+    /// the file's shape, the way cargo's own selection ends up, rather than a
+    /// key somebody typed twice.
+    fn flag_carrying_tables(config: &aterm_toml::Value) -> Vec<(String, Vec<String>)> {
+        config
+            .get("target")
+            .and_then(|targets| targets.as_table())
+            .expect("[target] section")
+            .iter()
+            .filter_map(|(name, table)| {
+                Some((
+                    name.clone(),
+                    table
+                        .get("rustflags")?
+                        .as_array()?
+                        .iter()
+                        .filter_map(|flag| flag.as_str().map(String::from))
+                        .collect::<Vec<_>>(),
+                ))
+            })
+            .collect()
+    }
+
+    /// THE ANTI-RENAME GATE. Rename the Trust lane's table again and the scan
+    /// still finds it by its flags, the name list does not, and this fails —
+    /// here, in a unit test on any host, instead of silently in a release cut
+    /// on one.
+    #[test]
+    fn the_gate_knows_the_name_of_the_table_the_config_actually_carries() {
+        let repo = repo_root();
+        let path = repo.join(".cargo/config.toml");
+        let text = fs::read_to_string(&path).unwrap_or_else(|e| panic!("{}: {e}", path.display()));
+        let config: aterm_toml::Value = text
+            .parse()
+            .unwrap_or_else(|e| panic!("{}: {e}", path.display()));
+
+        let carriers = flag_carrying_tables(&config);
+        let trust_lane: Vec<&(String, Vec<String>)> = carriers
+            .iter()
+            .filter(|(_, flags)| flags.iter().any(|flag| flag.contains("trust-verify")))
+            .collect();
+        assert!(
+            !trust_lane.is_empty(),
+            "no [target.…] table in {} carries a trust-verify flag. If the Trust-Std \
+             campaign really greened, that is a deliberate edit in gates.rs \
+             (native_lane_rustflags) and in this test — not a silent one. Tables with \
+             rustflags: {carriers:?}",
+            path.display()
+        );
+        for (name, _) in &trust_lane {
+            assert!(
+                TRUST_LANE_TABLES.contains(&name.as_str()),
+                "[target.{name:?}] carries the Trust lane's verification off-switch and \
+                 gates.rs does not know that name: TRUST_LANE_TABLES is \
+                 {TRUST_LANE_TABLES:?}. The reader would answer [] and the release's \
+                 trustc probe would compile under no flags at all — the 2026-08-30 \
+                 regression, exactly. Add the name to TRUST_LANE_TABLES."
+            );
+        }
+
+        let read = native_lane_rustflags(&repo).expect("the shipped config reads");
+        assert!(
+            trust_lane.iter().any(|(_, flags)| *flags == read),
+            "native_lane_rustflags answered {read:?}, which is no table's rustflags in \
+             {}: {trust_lane:?}",
+            path.display()
+        );
+        assert!(
+            !read.is_empty() && read.iter().any(|flag| flag.contains("trust-verify")),
+            "the flags the probe would compile under say nothing about verification: \
+             {read:?}"
+        );
+    }
+
+    /// The 2026-08-30 shape itself: the Trust table renamed away, the Windows
+    /// cross-compile table left standing. The old reader called this the green
+    /// campaign and returned `[]`.
+    #[test]
+    fn a_config_whose_trust_table_vanished_fails_closed() {
+        let dir = env::temp_dir().join(format!("aterm-release-lane-flags-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(dir.join(".cargo")).unwrap();
+        fs::write(
+            dir.join(".cargo/config.toml"),
+            "[target.x86_64-pc-windows-gnu]\nlinker = \"x86_64-w64-mingw32-gcc\"\n",
+        )
+        .unwrap();
+
+        let err = native_lane_rustflags(&dir).expect_err("a renamed table must not read as empty");
+        let msg = err.to_string();
+        assert!(
+            msg.contains("cfg(trust_verify)"),
+            "the names looked for: {msg}"
+        );
+        assert!(msg.contains("TRUST_LANE_TABLES"), "the fix: {msg}");
+        assert!(msg.contains("2026-08-30"), "why this refusal exists: {msg}");
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    /// An older checkout still reads its own config: the retired per-triple
+    /// names stay in the list behind the live one.
+    #[test]
+    fn a_retired_per_triple_table_is_still_read() {
+        let config: aterm_toml::Value =
+            "[target.aarch64-apple-darwin]\nrustflags = [\"-Ztrust-verify=off\"]\n"
+                .parse()
+                .unwrap();
+        assert_eq!(
+            trust_lane_rustflags(&config),
+            Some(vec!["-Ztrust-verify=off".to_string()])
+        );
+    }
+
+    /// …but where both exist the LIVE table wins, because that is the one cargo
+    /// applies on a Trust compiler.
+    #[test]
+    fn the_live_table_wins_over_a_retired_one() {
+        let config: aterm_toml::Value = "[target.'cfg(trust_verify)']\n\
+             rustflags = [\"-Ztrust-verify=off\", \"--cfg\", \"clean_islands\"]\n\
+             [target.aarch64-apple-darwin]\n\
+             rustflags = [\"-Zstale\"]\n"
+            .parse()
+            .unwrap();
+        assert_eq!(
+            trust_lane_rustflags(&config),
+            Some(vec![
+                "-Ztrust-verify=off".to_string(),
+                "--cfg".to_string(),
+                "clean_islands".to_string(),
+            ])
+        );
+    }
+
+    /// A table with no `rustflags` is not a Trust-lane table, whatever its name.
+    #[test]
+    fn a_table_without_rustflags_is_not_a_carrier() {
+        let config: aterm_toml::Value =
+            "[target.'cfg(trust_verify)']\nrustdocflags = [\"-Ztrust-verify=off\"]\n"
+                .parse()
+                .unwrap();
+        assert_eq!(trust_lane_rustflags(&config), None);
+    }
+
+    /// The verdict is about the COMPILER's word, not a spelling this file
+    /// knows — hardcoding the off-switch here is the very drift the reader
+    /// exists to avoid.
+    #[test]
+    fn the_verdict_reads_the_compilers_note_not_a_flag_spelling() {
+        let unknown_spelling = vec!["-Zsome-future-verification-switch=off".to_string()];
+        assert!(
+            verification_off_verdict(
+                &unknown_spelling,
+                "note: compiled WITHOUT Trust verification — 0 obligations checked\n"
+            )
+            .is_ok(),
+            "the compiler is the authority on its own flags"
+        );
+    }
+
+    /// The value drift: the switch parses, the compiler verifies anyway. This is
+    /// the measured 2026-09-16 batteries-on output for [`PROBE_SRC`], and it is
+    /// the reason the probe source carries an obligation — with `fn main() {}`
+    /// there is no such line to read, in either lane.
+    #[test]
+    fn a_switch_that_parsed_but_did_not_switch_is_refused() {
+        let canonical = vec!["-Ztrust-verify=off".to_string()];
+        let report = "=== Trust Verification Report (probe) ===\n\
+                      note: Trust verification: 1 proved, 0 failed, 0 unknown, 0 timed out, \
+                      0 runtime-checked out of 1 obligation(s)\n";
+        let err = verification_off_verdict(&canonical, report)
+            .expect_err("a compiler that verified is not an off lane");
+        let msg = err.to_string();
+        assert!(msg.contains("did NOT report"), "{msg}");
+        assert!(msg.contains("1 proved"), "the compiler's own line: {msg}");
+        assert!(msg.contains("trust-verify"), "the deciding probe: {msg}");
+    }
+
+    /// No flags is the drift itself — refused even when the note is there,
+    /// because a probe that gated on nothing proves nothing about flags.
+    #[test]
+    fn an_empty_flag_list_is_the_drift_itself() {
+        let err = verification_off_verdict(&[], "note: compiled WITHOUT Trust verification\n")
+            .expect_err("no flags means the probe gated on nothing, note or no note");
+        assert!(err.to_string().contains("EMPTY"), "{err}");
+    }
+
+    /// The probe source IS the gate's sensitivity. `fn main() {}` compiles
+    /// identically in both lanes and trustc reports "0 obligations checked"
+    /// either way, so a probe built on it can never see a flag drift.
+    #[test]
+    fn the_probe_source_still_carries_an_obligation() {
+        assert!(
+            PROBE_SRC.contains("numerator / denominator"),
+            "PROBE_SRC lost the divisor-is-zero obligation the 2026-09-16 measurement \
+             was made against; without an obligation verification_off_verdict is \
+             unfalsifiable: {PROBE_SRC}"
+        );
     }
 }

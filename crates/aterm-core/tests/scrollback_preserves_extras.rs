@@ -525,6 +525,118 @@ fn scrollback_parity_underline_color_wide_char() {
 }
 
 #[test]
+fn scrollback_parity_inverse_truecolor_wide_char() {
+    // Reverse video over a TRUECOLOR wide char, live vs history. The flags half
+    // of this fix gives the re-derived spacer the lead's INVERSE bit; the swap is
+    // applied per cell by `color_resolve::resolve_both`, so the 24-bit pair it
+    // acts on has to cross the scroll-off boundary with it. That pair does not
+    // fit in a `PackedColor` — it lives in the cell's `CellExtra` — and before
+    // the extras mirror the spacer inherited INVERSE and then swapped a pair it
+    // had not been given: measured live `fg=[0,0,255] bg=[255,0,0]` against
+    // history `fg=[0,0,0] bg=[229,229,229]`, a bright near-white block where the
+    // character's right half belongs, on any `less`/tmux/bat highlight.
+    let input = "Q\u{1b}[38;2;255;0;0;48;2;0;0;255;7m\u{4E2D}\u{1b}[0mZ".as_bytes();
+
+    // Non-vacuous guard: pin the LIVE spacer's swapped pair first, so the parity
+    // assertion below cannot be satisfied by both sides being equally wrong.
+    let mut t = Terminal::new(6, 80);
+    t.process(input);
+    let live = t.cell_frame(6, 80);
+    let spacer = &live.cells[0][2];
+    assert!(spacer.wide, "cell 2 must be the wide continuation");
+    assert_eq!(
+        (spacer.fg, spacer.bg),
+        ([0, 0, 255], [255, 0, 0]),
+        "live spacer must carry the lead's SGR 7-swapped truecolor pair"
+    );
+
+    assert_scrollback_parity(input, 'Q');
+}
+
+#[test]
+fn scrollback_spacer_keeps_lead_underline_colour() {
+    // The flag and the colour it SELECTS must cross the boundary together.
+    // `render_cells` publishes `underline_color` only when the UNDERLINE bit is
+    // set, so `wide_continuation_of` turning that bit on is exactly what makes a
+    // dropped colour visible: green under the character's left half and
+    // default-foreground grey under its right, a two-tone underline under one
+    // character — the very column seam the rules half of this fix closes.
+    let mut t = scrolled_off("Q\u{1b}[4;58:2::0:255:0m\u{4E2D}\u{1b}[0mZ".as_bytes());
+    t.scroll_to_top();
+    let frame = t.cell_frame(6, 80);
+    let r = render_row(&frame, 'Q').expect("Q row visible after scroll_to_top");
+    assert!(
+        frame.cells[r][2].wide,
+        "cell 2 must be the wide continuation"
+    );
+    assert_eq!(
+        frame.cells[r][1].underline_color,
+        Some([0, 255, 0]),
+        "the lead keeps its SGR 58 colour through scrollback"
+    );
+    assert_eq!(
+        frame.cells[r][2].underline_color,
+        Some([0, 255, 0]),
+        "the re-derived spacer must carry the lead's underline COLOUR, not just its UNDERLINE bit"
+    );
+}
+
+#[test]
+fn scrollback_spacer_underline_index_reresolves_after_palette_change() {
+    // The spacer's copy must be the PACKED form, not a frozen RGB triple.
+    // Redefine palette entry 1 AFTER the row scrolls off: both halves of the one
+    // character must re-resolve to the NEW colour. A mirror reading
+    // `underline_color()` (the RGB-only accessor) would leave the spacer `None`,
+    // because storing an index deliberately clears `HAS_UNDERLINE_COLOR`; one
+    // that resolved the index eagerly would pin the spacer to the OLD colour
+    // while the lead moved.
+    let mut t = Terminal::new(6, 80);
+    t.process("Q\u{1b}[4;58:5:1m\u{4E2D}\u{1b}[0mZ".as_bytes());
+    t.process(b"\r\n");
+    for i in 0..10 {
+        t.process(format!("f{i}\r\n").as_bytes());
+    }
+    t.set_palette_color_components(1, 0x11, 0x22, 0x33);
+    t.scroll_to_top();
+    let frame = t.cell_frame(6, 80);
+    let r = render_row(&frame, 'Q').expect("Q row visible after scroll_to_top");
+    assert_eq!(
+        frame.cells[r][1].underline_color,
+        Some([0x11, 0x22, 0x33]),
+        "the lead re-resolves against the changed palette"
+    );
+    assert_eq!(
+        frame.cells[r][2].underline_color,
+        Some([0x11, 0x22, 0x33]),
+        "the spacer must carry the INDEX, so it re-resolves with the lead"
+    );
+}
+
+#[test]
+fn vs16_widened_spacer_carries_the_lead_underline_colour_live() {
+    // The law does not care WHICH widening produced the pair. VS16 promotes a
+    // narrow base to two columns AFTER `apply_cell_extras_preflagged` already ran
+    // with `cols = 1`, so the base's SGR 58 colour sat on its own column alone
+    // and the emoji's right half answered `None` while a CJK char's answered the
+    // colour — one law, two live answers. It is also what keeps
+    // `scrollback_parity_underline_color_emoji` honest: the history mirror copies
+    // the lead unconditionally, so a live spacer left empty here would make
+    // history disagree with the screen.
+    let mut t = Terminal::new(6, 80);
+    t.process("Q\u{1b}[4;58:2::0:0:255m\u{2764}\u{FE0F}\u{1b}[0mZ".as_bytes());
+    let live = t.cell_frame(6, 80);
+    assert!(
+        live.cells[0][2].wide,
+        "cell 2 must be the VS16 widening's continuation"
+    );
+    assert_eq!(
+        live.cells[0][2].underline_color,
+        Some([0, 0, 255]),
+        "a VS16-widened pair must answer the same colour for its right half as a naturally-wide one"
+    );
+}
+
+#[test]
 fn scrollback_parity_underline_color_emoji() {
     // Underline colour on a VS16-widened emoji (❤️): full parity across the
     // colour sidecar AND the width replay together.

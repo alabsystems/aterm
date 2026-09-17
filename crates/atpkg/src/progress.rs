@@ -324,7 +324,14 @@ impl ProgressSink {
         };
         let mut guard = sink.inner.lock().ok()?;
         write_now(&mut guard);
-        if guard.disabled {
+        // Both halves of the contract above, because `disabled` is only the
+        // non-regular-destination half: a write that simply FAILED (the prefix does not
+        // exist yet, or is not writable by this user) leaves `disabled` false and
+        // `last_write` None, and a successful first write always stamps `last_write`.
+        // A live sink over a file that can never appear is not free — `begin_pass`
+        // would report an owned pass, spin the heartbeat thread every tick and run
+        // every `.part` poller against a write that cannot succeed.
+        if guard.disabled || guard.last_write.is_none() {
             return None;
         }
         drop(guard);
@@ -624,6 +631,45 @@ fn write_now(s: &mut SinkState) {
 // (the terminal lanes, every existing test).
 // ---------------------------------------------------------------------------
 
+/// The wait BOTH pass-owned threads use between ticks: hold for `tick`, but
+/// return the INSTANT [`stop_and_join`] raises `stop`.
+///
+/// `std::thread::sleep` cannot be interrupted, so the stop flag alone bought
+/// nothing at the join: the thread that stops these pollers is the PASS thread —
+/// the one holding the store flock — and it sat out whatever remained of the
+/// current tick before `join` returned. That was up to [`PART_POLL_TICK_MS`] of
+/// pure idle between download-complete and the sha256, once per downloaded
+/// artifact (a default set pays it a dozen times), and up to
+/// [`HEARTBEAT_TICK_MS`] at [`end_pass`] before the terminal snapshot the GUI
+/// retires its row on. Parking is the same wait with a doorbell, and the unpark
+/// token is STICKY: a stop landing in the window between the flag check and the
+/// park itself is not lost, it makes the next park return at once.
+///
+/// The deadline is recomputed rather than trusted, because `park_timeout` may
+/// return spuriously early and a stale token spends itself on the first park:
+/// re-parking for the REMAINDER keeps the tick cadence exactly what `sleep`
+/// gave it, so nothing downstream of these ticks changes.
+fn tick_or_stop(stop: &AtomicBool, tick: Duration) {
+    let deadline = Instant::now() + tick;
+    while !stop.load(Ordering::Acquire) {
+        let Some(left) = deadline.checked_duration_since(Instant::now()) else {
+            return;
+        };
+        std::thread::park_timeout(left);
+    }
+}
+
+/// Stop a thread parked in [`tick_or_stop`] and join it: raise the flag, ring the
+/// doorbell, THEN wait. The order is the contract — a thread woken by the unpark
+/// must be able to see the flag it was woken for.
+fn stop_and_join(stop: &AtomicBool, handle: Option<std::thread::JoinHandle<()>>) {
+    stop.store(true, Ordering::Release);
+    if let Some(h) = handle {
+        h.thread().unpark();
+        let _ = h.join();
+    }
+}
+
 /// The pass heartbeat: a thread that ticks the live sink every
 /// [`HEARTBEAT_TICK_MS`] for the pass's whole lifetime, INDEPENDENT of flow
 /// calls. The heartbeat promise used to rest on the `.part` download poller
@@ -655,7 +701,7 @@ impl PassHeartbeat {
             .spawn(move || {
                 while !stop2.load(Ordering::Acquire) {
                     sink.heartbeat();
-                    std::thread::sleep(Duration::from_millis(HEARTBEAT_TICK_MS));
+                    tick_or_stop(&stop2, Duration::from_millis(HEARTBEAT_TICK_MS));
                 }
             })
             .ok();
@@ -663,10 +709,7 @@ impl PassHeartbeat {
     }
 
     fn stop(mut self) {
-        self.stop.store(true, Ordering::Release);
-        if let Some(h) = self.handle.take() {
-            let _ = h.join();
-        }
+        stop_and_join(&self.stop, self.handle.take());
     }
 }
 
@@ -699,24 +742,60 @@ pub const ORPHAN_LOG_NAME: &str = "orphan-pass.log";
 /// never to the window. A print that lands between the parent's exit and the next poll
 /// still dies the old way — a ≤ 100 ms window against passes that print at program
 /// boundaries minutes apart — and costs what every death always cost, one program's
-/// redo on a crash-consistent store (`crate::lock`), nothing more. Two shapes it does
-/// not cover, on purpose: a parent that exec's in place keeps its pid (the cold apply
-/// lane), so nothing changes and nothing needs to; and an orphan that outlives a
-/// self-update resolves its launchd helper by path, so the NEW binary serves its hidden
-/// verbs — a spec of another version is refused through the result file, and the
-/// policy's in-process fallback then records what it wrote.
+/// redo on a crash-consistent store (`crate::lock`), nothing more. A parent that exec's
+/// in place keeps its pid (the cold apply lane) but closes the pipes it read, which the
+/// watch sees as a pipe with no reader ([`stdio_lost_its_reader`]). One shape it does
+/// not cover, on purpose: an orphan that outlives a self-update resolves its launchd
+/// helper by path, so the NEW binary serves its hidden verbs — a spec of another
+/// version is refused through the result file, and the policy's fallback then records
+/// what it wrote.
 pub fn watch_for_orphaning(log: PathBuf) {
     let _ = std::thread::Builder::new()
         .name("atpkg-orphan-watch".into())
         .spawn(move || {
             loop {
-                if crate::cli::parent_is_gone() {
+                if crate::cli::parent_is_gone() || stdio_lost_its_reader() {
                     quiet_stdio(&log);
                     return;
                 }
                 std::thread::sleep(Duration::from_millis(ORPHAN_POLL_MS));
             }
         });
+}
+
+/// Whether the pipe on fd 1 or fd 2 has NO READER any more — the hazard itself, which
+/// a parent that `exec`s in place produces WITHOUT changing its pid (the cold apply
+/// lane: the same process image is replaced, the pipes it read are closed). Measured
+/// 2026-09-15 on macOS: `poll(2)` on a pipe's write end with `POLLOUT` requested reports
+/// `POLLHUP` once the read end is closed (and nothing with no events requested); a tty
+/// or a regular file reports `POLLOUT` alone. `POLLERR`/`POLLNVAL` count as gone too.
+#[cfg(unix)]
+fn stdio_lost_its_reader() -> bool {
+    let mut fds = [
+        libc::pollfd {
+            fd: 1,
+            events: libc::POLLOUT,
+            revents: 0,
+        },
+        libc::pollfd {
+            fd: 2,
+            events: libc::POLLOUT,
+            revents: 0,
+        },
+    ];
+    // SAFETY: `poll` reads and writes only the array handed to it, for its stated
+    // length, and a zero timeout never blocks.
+    let rc = unsafe { libc::poll(fds.as_mut_ptr(), 2, 0) };
+    if rc < 0 {
+        return false;
+    }
+    fds.iter()
+        .any(|p| p.revents & (libc::POLLHUP | libc::POLLERR | libc::POLLNVAL) != 0)
+}
+
+#[cfg(not(unix))]
+fn stdio_lost_its_reader() -> bool {
+    false
 }
 
 /// How often the orphan watch asks for its parent pid — one `getppid(2)`, so cheap
@@ -750,7 +829,7 @@ fn quiet_stdio(log: &Path) {
     }
     std::mem::forget(file);
     eprintln!(
-        "atpkg: the window that spawned this pass (pid {}) is gone; the pass continues \
+        "atpkg: the window that spawned this pass is gone; the pass (pid {}) continues \
          and its output lands here",
         std::process::id()
     );
@@ -883,13 +962,18 @@ impl Drop for ExtractScope {
     }
 }
 
+/// How often the `.part` poller stats the growing asset: the 10 Hz the sink's
+/// own write cap is sized for.
+const PART_POLL_TICK_MS: u64 = 100;
+
 /// Flow hook: watch a growing `<asset>.part` while a download runs.
 ///
 /// Downloads happen in a curl child, so atpkg never sees the bytes in-process; a
 /// sibling poller thread stats the `.part` at 10 Hz against the SIGNED
 /// `artifact.size` and feeds [`ProgressSink::download_bytes`] — which also keeps the
-/// heartbeat fresh through a long quiet transfer. The guard stops and joins the
-/// thread on drop; with no live pass it spawns nothing.
+/// heartbeat fresh through a long quiet transfer. The guard stops, WAKES and joins
+/// the thread on drop — never waiting out a tick, see [`tick_or_stop`] — and with no
+/// live pass it spawns nothing.
 #[must_use]
 pub fn watch_download(program: &str, asset_path: &Path, total: u64) -> DownloadWatch {
     let Some(sink) = active() else {
@@ -943,7 +1027,7 @@ pub fn watch_download(program: &str, asset_path: &Path, total: u64) -> DownloadW
                     // refresh its heartbeat through the rate-cap policy.
                     sink.download_bytes(&program, 0, total);
                 }
-                std::thread::sleep(Duration::from_millis(100));
+                tick_or_stop(&stop2, Duration::from_millis(PART_POLL_TICK_MS));
             }
         })
         .ok();
@@ -958,10 +1042,7 @@ pub struct DownloadWatch {
 
 impl Drop for DownloadWatch {
     fn drop(&mut self) {
-        self.stop.store(true, Ordering::Release);
-        if let Some(h) = self.handle.take() {
-            let _ = h.join();
-        }
+        stop_and_join(&self.stop, self.handle.take());
     }
 }
 
@@ -999,22 +1080,36 @@ pub fn snapshot_running(file: &ProgressFile, now_unix: u64) -> bool {
     fresh && pid_alive(pid)
 }
 
-/// Best-effort pid liveness. Probed via `/bin/kill -0` (a safe subprocess, no
-/// signal delivered — "does this process exist and may I signal it") rather than a
-/// raw `libc::kill`, keeping atpkg's non-test code `unsafe`-free. When the probe
-/// itself cannot run, the answer falls back to `true` — the heartbeat window is the
-/// authoritative staleness gate and covers that case within 10 s.
+/// Best-effort pid liveness: ONE `kill(pid, 0)` — no signal is delivered, the kernel
+/// only answers whether the pid is addressable.
+///
+/// This used to fork `/bin/kill -0 <pid>` and wait for it, "keeping atpkg's non-test
+/// code `unsafe`-free". That reason had already lapsed — this very file calls
+/// `libc::poll` and `libc::dup2` a few hundred lines up, and the crate probes a pid
+/// exactly this way in [`crate::stage_helper`] — while the cost was real and repeated:
+/// [`snapshot_running`] runs on every `__pending` stub invocation while a pass is live,
+/// and the GUI tailer's foreign-pid probe calls it every 2 s for as long as ANOTHER
+/// installer holds the store lock (a multi-GB pass queued behind `--wait-lock` for 40
+/// minutes = ~1200 fork+execs on a GUI worker thread) to learn a fact one syscall
+/// returns in microseconds.
+///
+/// `ESRCH` is the only "no". A pid we may not signal (`EPERM` — a pass owned by another
+/// user, e.g. one run under `sudo`) EXISTS, and the subprocess spelling used to read it
+/// as a DEAD installer because `/bin/kill` exits non-zero there. A pid wider than
+/// `pid_t` cannot name a process and stays dead, as it read before. Any other errno —
+/// the probe could not answer — still falls back to `true`: the heartbeat window is the
+/// authoritative staleness gate and covers that case within [`HEARTBEAT_STALE_SECS`].
 #[must_use]
-fn pid_alive(pid: u32) -> bool {
+pub(crate) fn pid_alive(pid: u32) -> bool {
     #[cfg(unix)]
     {
-        std::process::Command::new("/bin/kill")
-            .arg("-0")
-            .arg(crate::dec_u64(u64::from(pid)))
-            .stdout(std::process::Stdio::null())
-            .stderr(std::process::Stdio::null())
-            .status()
-            .map_or(true, |s| s.success())
+        let Ok(pid) = libc::pid_t::try_from(pid) else {
+            return false;
+        };
+        // SAFETY: `kill` with signal 0 delivers nothing and touches no memory of ours;
+        // it only asks the kernel whether the pid is addressable.
+        let rc = unsafe { libc::kill(pid, 0) };
+        rc == 0 || std::io::Error::last_os_error().raw_os_error() != Some(libc::ESRCH)
     }
     #[cfg(not(unix))]
     {
@@ -1318,6 +1413,38 @@ mod writer_tests {
         let _ = std::fs::remove_dir_all(&l.prefix);
     }
 
+    /// `create`'s OTHER refusal, the one `disabled` cannot see: the destination is
+    /// nothing suspicious, the first write simply cannot land — the GUI passed
+    /// `--progress-file <prefix>/progress.json` before the prefix exists (or the
+    /// prefix is not writable by this user). The write fails, nothing in the state
+    /// changes, and a `Some` here would hand [`begin_pass`] a pass it reports as OWNED
+    /// (`true`) whose file never appears: the heartbeat thread ticks every
+    /// [`HEARTBEAT_TICK_MS`] and every `.part` poller runs, each retrying a write that
+    /// cannot succeed, for the whole pass.
+    #[test]
+    fn writer_refuses_a_destination_the_first_write_cannot_reach() {
+        let l = layout("unreachable");
+        let unreachable = l
+            .prefix
+            .join("prefix-not-created-yet")
+            .join("progress.json");
+        assert!(
+            ProgressSink::create(&unreachable, "net").is_none(),
+            "a first write that cannot land must not yield a live sink"
+        );
+        let _gate = PASS_TEST_GATE.lock().unwrap_or_else(|e| e.into_inner());
+        let began = begin_pass(&unreachable, "net");
+        if began {
+            // Never leak a live pass into the next test when this assertion fails.
+            end_pass();
+        }
+        assert!(
+            !began,
+            "an unwritable progress file must leave the lane with NO pass"
+        );
+        let _ = std::fs::remove_dir_all(&l.prefix);
+    }
+
     /// Staleness is the reader's law: a fresh-heartbeat live-pid file is running; a
     /// cleared pid, an old heartbeat, or a far-future heartbeat (backward skew) is not.
     #[test]
@@ -1370,6 +1497,30 @@ mod writer_tests {
             !snapshot_running(&file, 1_000_000),
             "a reaped pid must not read as a live installer"
         );
+    }
+
+    /// A pid we may not SIGNAL is still a pid that EXISTS. The probe used to fork
+    /// `/bin/kill -0 <pid>`, which exits non-zero on `EPERM`, so an installer owned by
+    /// another user (pid 1 — launchd/init — stands in for one here, and is the same
+    /// witness `stage_helper`'s twin probe uses) read as DEAD under a fresh heartbeat.
+    /// The syscall spelling answers "exists", which is what the staleness gate asks.
+    #[cfg(unix)]
+    #[test]
+    fn pid_alive_reads_an_unsignalable_foreign_pid_as_alive() {
+        assert!(pid_alive(std::process::id()), "this process is alive");
+        assert!(
+            pid_alive(1),
+            "pid 1 exists — EPERM is not ESRCH, and a foreign pass is not a dead one"
+        );
+        let mut file: ProgressFile = aterm_json::from_str(r#"{"v":1}"#).unwrap();
+        file.pid = Some(1);
+        file.heartbeat_unix = 1_000_000;
+        assert!(
+            snapshot_running(&file, 1_000_000),
+            "a fresh heartbeat from a live pid we cannot signal is a RUNNING installer"
+        );
+        // Wider than `pid_t`: cannot name a process, and read dead before too.
+        assert!(!pid_alive(u32::MAX), "an impossible pid is not alive");
     }
 
     /// TTY sanitization: control characters (escape injection) stripped, length capped
@@ -1463,6 +1614,59 @@ mod writer_tests {
         );
         drop(watch);
         end_pass();
+        let _ = std::fs::remove_dir_all(&l.prefix);
+    }
+
+    /// STOPPING A PASS POLLER MUST NOT COST ITS TICK. Both pass-owned threads
+    /// are joined by the PASS thread — the one holding the store flock — and an
+    /// uninterruptible `sleep` made each join wait out whatever remained of the
+    /// current tick: up to 100 ms between download-complete and the sha256 on
+    /// EVERY downloaded artifact, and up to 500 ms at `end_pass` before the
+    /// terminal snapshot the GUI retires its row on. Asserted on the cost of the
+    /// STOP itself, measured from mid-tick, never on the tick cadence — which is
+    /// deliberately unchanged, and is what the heartbeat tests above pin.
+    #[test]
+    fn stopping_a_pass_poller_does_not_wait_out_its_tick() {
+        let _gate = PASS_TEST_GATE.lock().unwrap_or_else(|e| e.into_inner());
+        let l = layout("prompt-stop");
+        assert!(begin_pass(&l.progress_file(), "net"));
+        // Four watches, each dropped from the MIDDLE of a tick. A poller that has
+        // to sleep out the rest owes ~50 ms per drop (~200 ms over the four),
+        // which no plausible scheduler jitter brings under the budget.
+        let mut stopping = Duration::ZERO;
+        for _ in 0..4 {
+            let watch = watch_download("trust", &l.prefix.join("trust-1.tar.zst"), 1000);
+            assert!(watch.handle.is_some(), "a net pass gets the live poller");
+            std::thread::sleep(Duration::from_millis(PART_POLL_TICK_MS / 2));
+            let t = Instant::now();
+            drop(watch);
+            stopping += t.elapsed();
+        }
+        assert!(
+            stopping < Duration::from_millis(80),
+            "four mid-tick drops must not wait out four poll ticks (took {stopping:?})"
+        );
+        // The heartbeat's tick is five times longer, and `end_pass` joins it
+        // BEFORE `finish()` writes the terminal snapshot — so the whole stall
+        // lands between the pass ending and the GUI being told it ended.
+        std::thread::sleep(Duration::from_millis(HEARTBEAT_TICK_MS / 2));
+        let t = Instant::now();
+        end_pass();
+        let ending = t.elapsed();
+        assert!(
+            ending < Duration::from_millis(150),
+            "end_pass must not wait out the heartbeat tick (took {ending:?})"
+        );
+        // The stop still means what it meant: no tick may land after the
+        // terminal snapshot, whichever way the thread was woken.
+        let ended = read_file(&l.progress_file());
+        assert_eq!(ended.pid, None);
+        std::thread::sleep(Duration::from_millis(HEARTBEAT_TICK_MS * 2));
+        assert_eq!(
+            read_file(&l.progress_file()).heartbeat_unix,
+            ended.heartbeat_unix,
+            "no heartbeat tick may land after end_pass"
+        );
         let _ = std::fs::remove_dir_all(&l.prefix);
     }
 

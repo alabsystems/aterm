@@ -844,6 +844,15 @@ impl<T: 'static> EventLoop<T> {
         }
     }
 
+    /// The Wayland clipboard handle; `None` on any other backend.
+    #[cfg(wayland_platform)]
+    pub fn wayland_clipboard(&self) -> Option<wayland::WaylandClipboard> {
+        match self {
+            EventLoop::Wayland(evlp) => Some(evlp.clipboard()),
+            _ => None,
+        }
+    }
+
     pub fn create_proxy(&self) -> EventLoopProxy<T> {
         any_backend!(match self; EventLoop(evlp) => evlp.create_proxy(); as EventLoopProxy)
     }

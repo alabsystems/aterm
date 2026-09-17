@@ -98,9 +98,9 @@
 //!   Two stops lost it two different ways. Indigo `#4B0082` was walked
 //!   TOWARD WHITE onto the bar and arrived as `(82, 60, 136)` composited —
 //!   `S 0.61`, a grey lavender next to a blue at 210–230 — and the
-//!   green→blue crossing carried the arc's authored `S 0.53`
-//!   ([`crate::spectrum::SPECTRUM_CROSSING_ROOF`], sized for the cyan
-//!   census the owner retired on 2026-09-01) and composited as
+//!   green→blue crossing carried the arc's authored `S 0.53` (the crossing
+//!   roof, sized for the cyan census the owner retired on 2026-09-01 and
+//!   itself deleted on 2026-09-15) and composited as
 //!   `(45, 92, 93)`, the greyest cell on the line. The owner's standing
 //!   rulings cover the class — "bright not dim", and "the anti-cyan laws
 //!   were what greyed the arc" — so the recipe now spends CHROMA before it
@@ -513,7 +513,9 @@ pub const HOT_EDGE_GAIN_FLOOR: f32 = 0.5;
 pub const HOT_EDGE_CARET_REACH_CH: f32 = 0.55;
 
 /// Cells of the classic walk's FIRST phase, which advances `d/16` per cell so
-/// a short word already shows several stops (§4, v1 verbatim).
+/// a short word already shows several stops (§4, v1 verbatim). The 2026-09-15
+/// re-pace ([`CROSS_PACE`]) moves cells WITHIN the arc and never lengthens
+/// it, so this is still sixteen and the meteor's reach still covers a sweep.
 pub const WALK_FAST_CELLS: f32 = 16.0;
 
 /// The classic walk's steady lay rate, `t`-units per cell, after
@@ -894,20 +896,23 @@ pub const BED_LUMA_MAX: f32 = 0.150;
 /// characters back from the cursor."* Diagnosed twice on glass (v0.76.0 and
 /// m15's main): not holes — every "gap" cell held the SAME relative
 /// luminance as the vivid cells beside it; what read as black was chroma.
-/// This floor is the crossing's half of that. The green→blue crossing is
-/// authored at `S 0.53` ([`crate::spectrum::SPECTRUM_CROSSING_ROOF`],
-/// tapering in from `0.65` / `0.72` knots) for the cyan true-peak bound of
-/// the census the owner retired on 2026-09-01, and once the bed scales it
-/// onto the bar it composites as `(45, 92, 93)` — `S 0.52`, the greyest cell
-/// on the line, a teal-grey notch between an `S 0.97` green and an `S 0.81`
-/// blue. **`1.0`**: the seven anchors all carry `S 1.0` (each has a zero
-/// channel) and every table entry outside the crossing's flanks sits at
-/// `S ≥ 0.98`, so the floor asks nothing of any stop but the crossing, and
-/// there it asks for exactly what its neighbours have. Hue and value are
-/// untouched, so the crossing's hue PACING — the thing the roof still owns
-/// — is exactly as authored. Measured: the crossing composites `(3, 95, 95)`
-/// at the same `Y`. Pinned by
-/// `the_crossing_composites_no_greyer_than_its_flanks`.
+/// This floor is the crossing's half of that. The green→blue crossing WAS
+/// authored at `S 0.53` — a roof tapering in from `0.65` / `0.72` pacing
+/// knots, sized for the cyan true-peak bound of the census the owner retired
+/// on 2026-09-01 — and once the bed scaled it onto the bar it composited as
+/// `(45, 92, 93)`: `S 0.52`, the greyest cell on the line, a teal-grey notch
+/// between an `S 0.97` green and an `S 0.81` blue. This floor answered that
+/// at the bed's own read (`(3, 95, 95)` at the same `Y`).
+///
+/// **THE ARC ITSELF STOPPED DIPPING ON 2026-09-15** ([`crate::spectrum`]'s
+/// `SPECTRUM_CROSSING_SEG`): the roof and its taper were the retired ruling's
+/// last machinery and are deleted, so `SPECTRUM_LUT` is `S 1.00` end to end
+/// and this floor is the identity on every read of the arc. **`1.0`** is kept
+/// because it is a floor on a PRODUCER'S INPUT and [`bed_ink`] is public — a
+/// guard with nothing to do is not the same as a guard that is wrong, and the
+/// measurement above is why it exists. Hue and value are untouched. Pinned by
+/// `the_crossing_composites_no_greyer_than_its_flanks` and, for the identity,
+/// `spectrum::min_saturation::the_floor_is_the_identity_on_every_entry_of_the_shipped_arc`.
 pub const BED_SAT_FLOOR: f32 = 1.0;
 
 // There is deliberately NO floor for the bed against the GROUND. One was
@@ -1479,6 +1484,14 @@ pub struct Cell {
     /// cell's level into `cov0` (R6's frozen ramp). `None` for a cell born
     /// from dark on the ordinary attack.
     pub rearm: Option<(Instant, f32)>,
+    /// **A PARTIAL RELEASE'S STAMP** (2026-09-16): the instant a release that
+    /// named only part of this cell's cohort stamped it onto the retract
+    /// ([`Ribbon::release_cells`]). `retract_at` carries the same instant
+    /// and does the leaving; this says WHY, so an identical redraw inside
+    /// the melt can lift exactly these stamps again
+    /// ([`Ribbon::restore_releases`]) and the content witness can keep
+    /// reading the cell for that restore while it is leaving.
+    pub released_at: Option<Instant>,
 }
 
 impl Cell {
@@ -1606,6 +1619,10 @@ struct ReleaseClock {
     phase: Phase,
     rejoinable: bool,
     cells: usize,
+    /// `Some(at)` for a release that named only PART of the cohort: its
+    /// cells were stamped onto the retract at `at` and the cohort's clock
+    /// was not touched; a restore lifts those stamps instead of the abandon.
+    partial: Option<Instant>,
 }
 
 impl Cohort {
@@ -2372,7 +2389,10 @@ impl BedInkLut {
         self.seen.reserve(BED_INK_LUT_LEN);
         for i in 0..BED_INK_LUT_LEN {
             let x = i as f32 / (BED_INK_LUT_LEN - 1) as f32;
-            let arc = spectrum(x);
+            // THE TABLE IS INDEXED BY THE WALK AND FILLED FROM THE ARC
+            // ([`WALK_PACE`]): every reader keeps `sample`'s one lerp, and
+            // the pace costs nothing per frame.
+            let arc = spectrum(walk_pace(x));
             let bed = if cfg.dark_theme {
                 bed_ink(arc, budget)
             } else {
@@ -2450,6 +2470,183 @@ impl BedInkLut {
 // ===========================================================================
 // The walk (C2)
 // ===========================================================================
+
+/// **THE STRETCH OF THE ARC THE WALK RE-PACES**, in table entries — the
+/// GREEN→BLUE LEG AND NOTHING ELSE, less a guard at each of its own
+/// anchors ([`CROSS_GUARD`]).
+///
+/// **THE OWNER NAMED ONE LEG** (2026-09-15, *"some blending smoothness in
+/// green to blue where the gradient sometimes looked blocky"*), so one leg
+/// is what moves. The window's first cut reached from entry 240 — inside
+/// yellow→green — up to INDIGO's anchor, and paid for the crossing's cells
+/// out of its NEIGHBOURS: measured over a thousand walk phases, the share
+/// of phases with a cell within ten entries of a named anchor fell green
+/// 62.7 % → 10.0 %, blue 62.7 % → 16.4 %, indigo 62.8 % → 50.0 %, and
+/// yellow→green's mean bed step rose 8.73 → 11.45 on a leg the report had
+/// called untouched. His settled taste is not this lane's to move.
+///
+/// Outside the window the walk is the IDENTITY, and the guard makes that
+/// bite: red→orange, orange→yellow, yellow→green, blue→indigo and
+/// indigo→violet keep EVERY per-cell step they shipped with, bit for bit
+/// (`legpace`: 0 steps changed of 1508, 2479, 3639, 2415 and 1692), and all
+/// seven anchors keep the residency they shipped with (62.7 %, 62.8 %,
+/// 62.7 %, 62.7 %, 62.7 %, 62.8 %, 62.7 %). The owner's standing ruling
+/// that he must SEE YELLOW on the rail (2026-09-13, *"I don't see much
+/// yellow? that's confusing"*) is therefore untouched: the cells the
+/// crossing gains come from its OWN leg's two flanks.
+const CROSS_LUT0: usize = crate::spectrum::SPECTRUM_ANCHOR_AT[3] + CROSS_GUARD;
+/// The top of [`CROSS_LUT0`]'s window — BLUE's anchor, less the same guard.
+const CROSS_LUT1: usize = crate::spectrum::SPECTRUM_ANCHOR_AT[4] - CROSS_GUARD;
+
+/// **THE GUARD EITHER SIDE OF THE LEG'S OWN ANCHORS**, in spectrum entries.
+///
+/// A cell that lands within this of GREEN or of BLUE is on the stop the
+/// shipped walk gave it, to the bit. Twenty-four is wider than the ten
+/// entries an anchor's RESIDENCY is judged on and wider than half a shipped
+/// cell's reach across an anchor (a cell is 31.9 entries, so a step whose
+/// midpoint lies in yellow→green has both its ends below `258 + 16`), which
+/// is why the two neighbouring legs keep not just their anchors but every
+/// one of their steps, unchanged to the last bit — measured, `legpace`.
+const CROSS_GUARD: usize = 24;
+/// [`CROSS_LUT0`] as a share of the arc.
+const CROSS_ARC0: f32 = CROSS_LUT0 as f32 / (crate::spectrum::SPECTRUM_LUT_LEN - 1) as f32;
+/// [`CROSS_LUT1`] as a share of the arc.
+const CROSS_ARC1: f32 = CROSS_LUT1 as f32 / (crate::spectrum::SPECTRUM_LUT_LEN - 1) as f32;
+
+/// **THE WALK'S PACE ACROSS THE GREEN→BLUE LEG**, `@generated` — where a
+/// walk position lands between [`CROSS_ARC0`] and [`CROSS_ARC1`], as `u16`
+/// shares of the whole arc at 65 evenly spaced walk positions across the
+/// window. The window's cell BUDGET is unchanged, so one pass of the arc is
+/// still [`WALK_FAST_CELLS`] cells: this moves cells WITHIN one leg, it
+/// does not lengthen the walk and it takes no cell from another leg.
+///
+/// **THE ARC IS DRAWN AT ONE PACE AND READ AT ANOTHER** (2026-09-15, the
+/// owner: *"some blending smoothness in green to blue where the gradient
+/// sometimes looked blocky"*). [`crate::spectrum`]'s table WAS paced per
+/// ENTRY over the authored path with the GREEN→BLUE CROSSING LIFTED OUT of
+/// that pacing — its doc said the crossing "is the one place the arc is
+/// supposed to be fast", and it spent its 39 entries slot for slot. That was
+/// a statement about the PATH. **A ribbon reads ONE ENTRY PER CELL**: `1/16`
+/// of `t` was 31.9 entries, so the whole authored handoff — approach 140°,
+/// on-ramp 156°, the S 0.53 roof, off-ramp 209°, exit 216° — was **1.22
+/// CELLS wide**, and whether a cell landed inside it at all depended on the
+/// cohort's walk origin. That is why the owner saw it SOMETIMES. Measured on
+/// glass before this (`rbe/c7_long`, a 69-cell band): one cyan cell between
+/// a green and a blue, per-cell steps of 42.88 and 69.90 against 8.35–20.72
+/// everywhere else on the band.
+///
+/// **THE EXEMPTION IS GONE AT THE SOURCE SINCE 2026-09-15** (the same day,
+/// later): the crossing's roof, its pacing knots and its exemption were the
+/// retired no-cyan ruling's machinery and were deleted, so the arc already
+/// arrives here evenly spent. What this table still buys is the part the
+/// spectrum's pace cannot see — it paces the RAW table, this paces the
+/// COMPOSITED bed and rail on a real ground — and that is now the whole of
+/// its margin: worst bed step `65.3 → 59.8`, worst rail `50.1 → 44.0`,
+/// against the `109.5 / 164.5` the exemption used to leave behind
+/// (`the_crossing_is_smoothed_out_of_its_own_legs_cells_and_nothing_else_moves`).
+///
+/// So the crossing and the two flanks OF ITS OWN LEG are paced by the thing
+/// the eye actually reads — the COMPOSITED BED under the letters plus the
+/// VIVID RAIL below the row, in equal parts — and every cell the crossing
+/// gains comes from inside green→blue.
+///
+/// Measured on his Nord ground over a thousand walk phases × the sixteen
+/// cells of a pass, per leg, mean/max of the composited bed and of the rail
+/// (`targo --unverified run -p aterm-effects --example legpace`):
+///
+/// | leg | bed shipped | bed paced | rail shipped | rail paced |
+/// |---|---|---|---|---|
+/// | red→orange    | 19.38 / 21.42 | 19.38 / 21.42 | 23.54 / 29.51 | 23.54 / 29.51 |
+/// | orange→yellow | 13.48 / 18.96 | 13.48 / 18.96 | 25.77 / 30.59 | 25.77 / 30.59 |
+/// | yellow→green  |  8.73 / 11.87 |  8.73 / 11.87 | 16.35 / 22.75 | 16.35 / 22.75 |
+/// | **green→blue**| **40.71 / 109.50** | **40.77 / 73.25** | **47.90 / 164.54** | **48.45 / 129.19** |
+/// | blue→indigo   | 11.42 / 23.33 | 11.42 / 23.33 | 12.63 / 18.46 | 12.63 / 18.46 |
+/// | indigo→violet |  8.07 / 20.35 |  8.07 / 20.35 |  6.40 / 14.77 |  6.40 / 14.77 |
+///
+/// Five of the six legs are the identity to the bit. On the sixth the worst
+/// step a cell can be asked to carry goes `109.5 → 73.3` on the bed and
+/// `164.5 → 129.2` on the rail.
+///
+/// **AND THAT IS AS FAR AS ONE LEG GOES.** The crossing's whole authored
+/// handoff has to be crossed by the three or four cells that land inside
+/// this leg, so equal spacing over the leg is the floor: it cannot reach
+/// the 52 / 63 the first cut got, because the first cut was spending
+/// green→blue's neighbours' cells. Smoothing it further means moving the
+/// legs either side of it, and the owner asked for one leg.
+///
+/// The band is still QUANTISED INTO FLAT SLABS — the owner's ruling,
+/// untouched — the bed still keeps its 5.25:1 legibility bar and the rail
+/// its full-value spectrum: this moves WHERE each slab sits inside one leg,
+/// not what a slab is.
+///
+/// The table is a MEASUREMENT, not a shape:
+/// `the_walk_s_pace_is_the_arc_s_own_perceptual_step` re-derives it from
+/// `bed_ink`/`rail_ink` and this module's own constants, so a change to
+/// either ink is caught rather than quietly left behind. It is very nearly
+/// ground-independent — the bed's luma budget SCALES its inks and barely
+/// bends their geometry — so one table serves every theme.
+const CROSS_PACE: [u16; CROSS_PACE_KNOTS] = [
+    33539, 33818, 34076, 34375, 34679, 35026, 35233, 35530, 35828, 36087, 36381, 36642, 36900,
+    37159, 37456, 37760, 38011, 38231, 38537, 38825, 39085, 39343, 39598, 39897, 40189, 40573,
+    40831, 41141, 41399, 41696, 41916, 42169, 42470, 42683, 42939, 43158, 43336, 43542, 43795,
+    43969, 44174, 44364, 44569, 44782, 44996, 45199, 45337, 45554, 45715, 45896, 46035, 46197,
+    46409, 46552, 46712, 46840, 47051, 47224, 47523, 47738, 47952, 48208, 48423, 48553, 48830,
+];
+
+/// Knots in [`CROSS_PACE`].
+pub const CROSS_PACE_KNOTS: usize = 65;
+
+/// **THE ARC POSITION OF A WALK POSITION** — [`meteor::tri`]'s fold through
+/// [`walk_pace`]. Every reader of a rainbow-kitty walk `t` goes through this
+/// one function, which is what keeps C2 true by construction: the caret, the
+/// band's bed, the vivid rail, the hot edge, the meteor's train and a star's
+/// halo all read the same number and land on the same stop.
+#[must_use]
+pub fn walk_arc(t: f32) -> f32 {
+    walk_pace(clamp01(tri(t)))
+}
+
+/// **WHERE A WALK POSITION LANDS ON THE ARC** — the identity outside the
+/// middle of the arc, [`CROSS_PACE`] inside it. Monotone, and `0 ↦ 0`,
+/// `1 ↦ 1` and both window edges exactly fixed.
+#[must_use]
+pub fn walk_pace(x: f32) -> f32 {
+    let x = clamp01(x);
+    if x <= CROSS_ARC0 || x >= CROSS_ARC1 {
+        return x;
+    }
+    let f = (x - CROSS_ARC0) / (CROSS_ARC1 - CROSS_ARC0) * (CROSS_PACE_KNOTS - 1) as f32;
+    let i = (f as usize).min(CROSS_PACE_KNOTS - 2);
+    let (a, b) = (f32::from(CROSS_PACE[i]), f32::from(CROSS_PACE[i + 1]));
+    (a + (b - a) * (f - i as f32)) / 65535.0
+}
+
+/// **THE WALK POSITION THAT SHOWS A GIVEN STOP** — [`walk_pace`]'s inverse,
+/// for the readers that start from a NAMED colour (the rail's yellow, the
+/// landing's seven anchors, the crossing's own seam) rather than from a
+/// cell.
+#[must_use]
+pub fn walk_of_arc(a: f32) -> f32 {
+    let a = clamp01(a);
+    if a <= CROSS_ARC0 || a >= CROSS_ARC1 {
+        return a;
+    }
+    let want = a * 65535.0;
+    let mut f = (CROSS_PACE_KNOTS - 1) as f32;
+    for i in 1..CROSS_PACE_KNOTS {
+        let (lo, hi) = (f32::from(CROSS_PACE[i - 1]), f32::from(CROSS_PACE[i]));
+        if want <= hi {
+            f = i as f32 - 1.0
+                + if hi > lo {
+                    (want - lo) / (hi - lo)
+                } else {
+                    0.0
+                };
+            break;
+        }
+    }
+    CROSS_ARC0 + f / (CROSS_PACE_KNOTS - 1) as f32 * (CROSS_ARC1 - CROSS_ARC0)
+}
 
 /// **THE CLASSIC WALK**, `t` at `d` cells from the mark's first cell: `d/16`
 /// over the first [`WALK_FAST_CELLS`] cells so a short word already shows
@@ -2732,6 +2929,19 @@ pub struct Ribbon {
     /// last frame's profile — the distance the mark's lower edge closes as
     /// the spine releases ([`Ribbon::settle_step_s`]).
     wedge_px: f32,
+    /// **THE BAND ALREADY FOLLOWED ITS TEXT THIS TICK** — set by
+    /// [`Ribbon::translate_scroll`] and its band twin, cleared at the end of
+    /// [`Ribbon::plan`]. A bottom-pinned composer growing a row UP scrolls
+    /// the screen in the very repaint that re-lays the box, so the scroll
+    /// and the repaint's caret excursion land on ONE tick: the scroll moved
+    /// all of the row's cells up with their glyphs, and the backward caret
+    /// the repaint's home pass shows a tick later is therefore NOT a stale
+    /// line to drain ([`Ribbon::re_anchor`]). Measured (2026-09-15,
+    /// `rbu-trace` gui 1177-1186): `translate_scroll rows=1 cells=75` then
+    /// `re_anchor (12,77)->(12,2)` then `retract_suffix … live_on_row=75`
+    /// — the whole first row of a wrapped input put into a 0.40 s retract
+    /// one event after it had correctly followed its text.
+    scroll_followed: bool,
     /// Erases the hand has made whose RETREAT the ribbon has not yet seen.
     /// An `Erase` is replayed against the tick's caret; when its echo lands
     /// on a LATER tick that caret still stands past the erased glyph and
@@ -2741,6 +2951,44 @@ pub struct Ribbon {
     /// typed-licensed same-row retreat, which retracts from ITS landing; a
     /// typed lay clears it.
     pending_erase: u16,
+    /// **THE PEN** — `(row, col)` where the ribbon's own last HAND event
+    /// left the caret, and the one thing [`Ribbon::typed_landing`] calls
+    /// "where the hand is". Not [`Ribbon::caret`]: that is the app's
+    /// MIRROR, re-planted out of `Ctx::caret` by every [`Ribbon::plan`],
+    /// reading `(0, 0)` before any caret has been observed and drifting
+    /// with an idle frame train. Worse, the `Move` arm plants the mirror
+    /// UNCONDITIONALLY, before [`Ribbon::hand_changed_row`] has ruled on
+    /// the move — so a repaint's parking pass writes itself into the mirror
+    /// even as the sibling law refuses to call that pass a gesture, and the
+    /// next key then finds `mirror == park`, reads it as "the hand's own
+    /// row" and lays the stray
+    /// ([`a_repaints_home_pass_poisons_the_mirror_and_the_pen_still_holds_the_hand`]).
+    /// The pen moves on the three things that ARE the hand — a typed lay
+    /// (to the landing [`Ribbon::typed_landing`] gave it), a Backspace or a
+    /// kill (to the caret [`Ribbon::erase`] was replayed against), a
+    /// nav/return/synthetic move (the hand deliberately relocating) — and
+    /// on nothing else. An ECHOED move never touches it: those are the
+    /// carets under suspicion. It rides a scroll and a band move with the
+    /// light it belongs to, exactly as `Ribbon::last_space` does, and it is
+    /// dropped with the coordinate space by [`Ribbon::curtain`] and
+    /// [`Ribbon::reset`]. It is `None` until the hand has acted at all.
+    ///
+    /// WHAT IS AND IS NOT PINNED (measured 2026-09-15 by mutation over the
+    /// whole `aterm-effects` package): the typed-lay update is held by five
+    /// tests, the `Erase` update by
+    /// [`a_parking_pass_after_the_row_was_backspaced_empty_still_finds_the_hand`],
+    /// and the `!licence.is_echo()` guard by
+    /// [`a_repaints_home_pass_poisons_the_mirror_and_the_pen_still_holds_the_hand`]
+    /// from BOTH sides (drop the update and
+    /// [`a_nav_moves_the_pen_so_a_fold_after_it_still_lays_where_it_folded`]
+    /// goes red; make it unconditional and the poison test does). The
+    /// `Kill` update and the four coordinate-space clauses — the scroll
+    /// ride, the band ride, the curtain drop and the reset drop — are held
+    /// by NOTHING: each can be deleted with the package still green, because
+    /// no fixture types a key into a parking pass AFTER a scroll, a band
+    /// move, a curtain or a reset. They are stated from `last_space`'s law
+    /// and from what the coordinate space means, not from a measurement.
+    pen: Option<(u16, u16)>,
     /// The cell of the last typed Space, `(row, col)` — what tells a
     /// re-anchor how long the word an app moved to the next row was.
     last_space: Option<(u16, u16)>,
@@ -3012,8 +3260,23 @@ impl Ribbon {
                 // the grace this key priced.
                 self.note_key(at);
                 self.pending_erase = 0;
+                // **A KEY LAYS WHERE THE HAND IS, NOT WHERE A REPAINT
+                // PARKED THE CURSOR** ([`Ribbon::typed_landing`]).
+                let landing = self.typed_landing(
+                    ctx.caret,
+                    cells,
+                    u16::try_from(ctx.geom.cols).unwrap_or(u16::MAX),
+                );
+                // THE PEN FOLLOWS THE RIBBON'S OWN LAY, not the tick's
+                // caret: what the next key is brought back to is where THIS
+                // key actually put its glyph.
+                self.pen = Some(landing);
+                let ctx = &Ctx {
+                    caret: landing,
+                    ..*ctx
+                };
                 if class == TypedClass::Space {
-                    let (row, col_end) = ctx.caret;
+                    let (row, col_end) = landing;
                     self.last_space = col_end.checked_sub(1).map(|c| (row, c));
                 }
                 self.lay(cells, at, ctx);
@@ -3037,8 +3300,15 @@ impl Ribbon {
             // 0 and 1 both give `last = far.unwrap_or(col).max(col)`, so a
             // Backspace-shaped kill retracts exactly what it did here; and
             // `pending_erase` took `cells.max(1)` on both sides already.
-            Event::Erase => self.erase(ctx.caret, 1, RETRACT_FADE_S, at),
+            Event::Erase => {
+                // A BACKSPACE IS THE HAND (see [`Ribbon::pen`]): the caret
+                // `erase` is replayed against is the one the ribbon acts
+                // on, so it is the one the next key is brought back to.
+                self.pen = Some(ctx.caret);
+                self.erase(ctx.caret, 1, RETRACT_FADE_S, at);
+            }
             Event::Kill { cells, scope } => {
+                self.pen = Some(ctx.caret);
                 self.erase(ctx.caret, cells.max(1), kill_span_s(cells), at);
                 // A line kill ends the phrase, as a Return does: what is
                 // typed next is a new line.
@@ -3050,6 +3320,15 @@ impl Ribbon {
                 from, to, licence, ..
             } => {
                 self.caret = Some(to);
+                // THE HAND DELIBERATELY RELOCATING moves the pen; an ECHOED
+                // move does not ([`Ribbon::pen`]). A repaint's parking pass
+                // reaches the ribbon under an echo licence — letting it move
+                // the pen would hand [`Ribbon::typed_landing`] the very
+                // caret it exists to refuse, which is precisely what the
+                // line above does to the MIRROR.
+                if !licence.is_echo() {
+                    self.pen = Some(to);
+                }
                 let same_row = to.0 == from.0;
                 if licence.is_echo() {
                     // A typed echo's own FORWARD motion is inert here: the
@@ -3061,7 +3340,25 @@ impl Ribbon {
                     // ribbon used to ignore, and each left light where the
                     // hand no longer was.
                     if !same_row {
-                        self.leave_row(from, to, at, licence);
+                        // **A REPAINT'S HOME IS NOT A GESTURE** (2026-09-15,
+                        // the owner: *"awkward transitions when going to a
+                        // new line"*, *"odd logic of drawing a part of the
+                        // trail when moving the cursor and editing text"*).
+                        // A bottom-pinned composer repaints by homing to the
+                        // box's top-left, clearing to the end of the screen
+                        // and rewriting; the host observes those intermediate
+                        // carets per tick and a fresh type hint licenses them
+                        // `Typed` (`cursor_glow::v2_licence`: the typed test
+                        // wins before any distance or row test). Only a move
+                        // the HAND could have made is a row change
+                        // ([`Ribbon::hand_changed_row`]); anything else under
+                        // an echo licence moves the caret mirror and nothing
+                        // else. Measured on glass before this: every one of
+                        // the ten `leave_row` calls in five composer takes
+                        // was the repaint's home, not a gesture.
+                        if Self::hand_changed_row(from, to) {
+                            self.leave_row(from, to, at, licence);
+                        }
                     } else if to.1 < from.1 {
                         if self.pending_erase > 0 {
                             // THE ERASE'S RETREAT: the erased cells are the
@@ -3069,7 +3366,7 @@ impl Ribbon {
                             // the `Erase` itself was replayed on.
                             self.retract_suffix(to.0, to.1, from.1 - to.1, at, RETRACT_FADE_S);
                             self.pending_erase = 0;
-                        } else if licence == Licence::Typed {
+                        } else if licence == Licence::Typed && !self.scroll_followed {
                             self.re_anchor(from, to, at);
                         }
                     } else if to.1 > from.1 {
@@ -3176,6 +3473,10 @@ impl Ribbon {
     /// clock. The phrase ends with the space.
     pub fn curtain(&mut self, at: Instant) {
         self.phrase_open = None;
+        // THE PEN BELONGS TO THE COORDINATE SPACE THAT IS ENDING: where the
+        // hand was before a full-screen program took the glass is not a
+        // place a key in the new space can be brought back to.
+        self.pen = None;
         if self.cells.is_empty() || self.curtain.is_some() {
             return;
         }
@@ -3415,7 +3716,61 @@ impl Ribbon {
     /// phrase, and it re-prices the grace at the rest in force, which the
     /// bare row hold could not). "Hold the row's light" above is still
     /// exactly what happens; the phrase only says WHICH cohorts of that row.
+    ///
+    /// **WHAT THE 2026-09-15 EDIT ROUND LEARNED HERE, AND WHY THIS IS STILL
+    /// THE SUFFIX.** The model-level argument against the suffix is sound:
+    /// a Backspace removes ONE glyph and every glyph right of the caret
+    /// moves one column LEFT, so an erase should take what it erased and
+    /// close the gap — `retract_span` of the erased cells plus a
+    /// `shift_left` of the rest of the row, each slid cell re-reading
+    /// `Cohort::t_at` at its new column so the run stays one walk. That is
+    /// what this lane built and then MEASURED, on glass, one clean release
+    /// build against itself with only this law switched:
+    ///
+    /// `c8_bs_mid` — the owner's own gesture, a wrapped composer with the
+    /// caret moved back into the text and an eight-key Backspace run
+    /// mid-word — six runs each, the hand's own row:
+    ///
+    /// | | mean band cells | lit frames |
+    /// |---|---|---|
+    /// | the slide | 31.8 (29.2–33.9) | 780 |
+    /// | THIS, the suffix | 31.1 (29.2–32.1) | 760 |
+    /// | v0.86.0 entire | 27.2 (25.4–27.9) | 762 |
+    ///
+    /// The slide's 0.7 cells sit inside a 2-cell run-to-run scatter, and
+    /// the +4 cells over v0.86.0 belong to the OTHER laws of that round
+    /// (the repaint's home, the fold, the witness's blanks) — the suffix
+    /// arm carries them all. The defect the rewrite was written for — "by
+    /// the fourth key the ribbon was `cells=0 cohorts=0`" — could not be
+    /// reproduced on a clean build at all: v0.86.0's band never fell below
+    /// 25 mean cells in any of those runs. The original comparison had a
+    /// TRACE build on one side and a clean one on the other.
+    ///
+    /// So the rewrite is not here. Its own cost was visible: a slid live
+    /// cell shares its landing column with the retracting cell it slid
+    /// onto, which is two bodies on one column for the retract's length.
+    /// If a later lane takes the argument up again, that is the thing to
+    /// price, and `c8_bs_mid`'s mean band cells is the number to move.
     fn erase(&mut self, caret: (u16, u16), cells: u16, span_s: f32, at: Instant) {
+        // **AN ERASE TAKES WHAT IT ERASED AND CLOSES THE GAP** (2026-09-15,
+        // the owner: *"when backspacing in 0.86 the rainbow cursor trail
+        // breaks a part"*). A Backspace removes ONE glyph and every glyph
+        // right of the caret moves one column LEFT — in a shell line at the
+        // end of the text there is no such glyph and this is exactly the
+        // shipped suffix drain (`far = col`, one cell); in a wrapped
+        // composer the caret sits INSIDE the paragraph and the old law's
+        // "every live cell at or right of the caret" is most of the band.
+        // Measured before this (`rbt2/c8_bs_mid`, an 8-key run mid-word,
+        // mid-line): the ribbon held 12 cells, the FIRST key stamped TEN of
+        // them into a 0.24 s retract (`retract_suffix … live_on_row=10`),
+        // and by the fourth the ribbon was `cells=0 cohorts=0` and stayed
+        // dark through 1.4 s of further keys.
+        //
+        // The band follows its text instead, which is what keeps the run
+        // whole AND keeps the content witness matched: a cell left standing
+        // over the letter that slid out from under it is retired by the
+        // witness on the next walk, and that is the other half of the same
+        // break-up.
         self.retract_suffix(caret.0, caret.1, cells, at, span_s);
         self.pending_erase = self.pending_erase.saturating_add(cells);
         self.hold_phrase(at, caret.0);
@@ -3495,10 +3850,36 @@ impl Ribbon {
     /// whose echo landed a frame late (the key was HELD, not laid, on the
     /// frame it was typed — [`Ribbon::hold_typed`] — so its cell comes
     /// from this sweep alone).
+    ///
+    /// **THE HAND TYPES OVER OLD LIGHT** (2026-09-16 — the owner: *"there
+    /// is still this gapping issue … it seems to happen when doing backword
+    /// and editing"*). "Owned" used to mean any live cell: a key typed INTO
+    /// a lit band — the first key of a mid-line insert, the caret hopped
+    /// back over the band's own text — landed on a cell an earlier key had
+    /// laid, the sweep left that cell "exactly as it was", and the key
+    /// never got a cell of its own. The old cell kept the old glyph's
+    /// identity, so the content witness read the new glyph under it as
+    /// replaced text and melted it with the shifted suffix: one dark column
+    /// at the insert point for the rest of the line's life. Measured on
+    /// glass with real Codex (`docs/design/repro/glass_codex.py`, the g1
+    /// gesture) and reproduced by `tests/codex_particle_replay.rs`: the 'r'
+    /// typed at column 30 laid nothing, column 30 melted at the echo and
+    /// stood dark while 'e', 'a', 'l', 'l', 'y' lit 31..36 beside it.
+    ///
+    /// A live cell born BEFORE this key is an earlier key's glyph the hand
+    /// has just typed over, and the column is re-laid as this key's own —
+    /// a fresh identity for the witness, the light it had kept
+    /// ([`Ribbon::place`]'s monotone re-wet). A live cell born AT OR AFTER
+    /// `at` is this key's own, laid by the tick's replay, and is left
+    /// exactly as it was, as before.
     fn sweep(&mut self, row: u16, col0: u16, col1: u16, at: Instant, ctx: &Ctx<'_>) {
         let cols = u16::try_from(ctx.geom.cols).unwrap_or(u16::MAX);
         for col in col0..col1.min(cols) {
-            if !self.owned(row, col, at) {
+            let own = self
+                .cells
+                .iter()
+                .any(|c| c.row == row && c.col == col && c.born >= at && self.alive_at(c, at));
+            if !own {
                 self.lay_cell(row, col, at, ctx, true);
             }
         }
@@ -3607,6 +3988,254 @@ impl Ribbon {
         life.max(swoosh_life_s(self.rest_s()))
     }
 
+    /// **WHICH ROW CHANGES THE HAND COULD HAVE MADE**, under an echo
+    /// licence — a typed key's or a delivered insert's own motion.
+    ///
+    /// Text flows left to right and down. A key can carry the caret ONE row
+    /// down (the fold, or a composer's continuation row), and a Backspace
+    /// can carry it ONE row UP — back through the fold, onto that row's
+    /// RIGHT end, which is the only way up there is. Every other echoed row
+    /// change is an app repainting: a home to `(row − 1, 0)`, a two-row hop
+    /// to `(row − 2, 0)`, a clear-and-rewrite's parking pass. Measured
+    /// 2026-09-15 across five composer takes: `(13,46)->(12,0)`,
+    /// `(13,54)->(12,0)`, `(13,13)->(11,0)`, `(13,6)->(12,0)` — four
+    /// excursions, none of them a gesture, each one abandoning the row the
+    /// hand was typing on.
+    ///
+    /// Stated on the MOVE and not on a column threshold on purpose: a
+    /// repaint's home can be sampled anywhere along the row it is writing,
+    /// so "is the landing near column 0" is not a fact about the app. "Did
+    /// the caret go UP and to the RIGHT" is.
+    #[must_use]
+    fn hand_changed_row(from: (u16, u16), to: (u16, u16)) -> bool {
+        if to.0 == from.0.saturating_add(1) {
+            return true;
+        }
+        from.0 == to.0.saturating_add(1) && to.1 > from.1
+    }
+
+    /// **WHERE A TYPED KEY LANDS** — the caret the tick reports, unless
+    /// laying there would write the key's glyph on a row the key cannot
+    /// have written on. Then it is a repaint's PARKING PASS, and the key
+    /// lands at the PEN — where the ribbon's own last hand event left it —
+    /// `cells` on.
+    ///
+    /// **THE DEFECT.** An input box (Claude Code's composer, Codex's)
+    /// repaints by homing the cursor to the box's top-left, clearing to the
+    /// end of the screen and rewriting. The host observes those intermediate
+    /// carets per tick and a fresh type hint licenses them `Typed`
+    /// (`cursor_glow::v2_licence`), so a keystroke's echo can be replayed on
+    /// a tick whose caret is the repaint's parking pass rather than the
+    /// key's own landing. **A REPAINT'S HOME IS NOT A GESTURE** taught
+    /// [`Ribbon::hand_changed_row`] not to ABANDON a row on those carets
+    /// (2026-09-15). It did not teach the LAY: the key still laid its cell
+    /// at the park, and [`Ribbon::lay`]'s fold arithmetic walked it back off
+    /// the pane's first column onto the END OF THE ROW ABOVE. Measured on
+    /// glass (2026-09-15, `c2_bs`, twelve runs of twenty on this branch):
+    /// `ev Typed cells=1 class=Space caret=(12, 0)` with the hand on
+    /// `(13, 18)` — the Space's cell landed at `(11, 79)`, a stray on a row
+    /// the hand has never been on, and column 18 of the hand's own row
+    /// stayed dark for the rest of the run. That is the one-cell hole the
+    /// band was breaking up into, and it is also in v0.86.0: there the same
+    /// repaint abandoned the whole row a beat later, so the missing cell
+    /// went out with everything else and could not be seen.
+    ///
+    /// **THE PEN, NOT THE MIRROR.** "Where the hand is" is [`Ribbon::pen`]
+    /// and NOT [`Ribbon::caret`]. The caret field is the app's MIRROR —
+    /// [`Ribbon::plan`] re-plants it out of `Ctx::caret` every frame, so it
+    /// reads `(0, 0)` until a caret has ever been observed
+    /// (`Engine::caret_known` is the flag that says so, and the ribbon is
+    /// not given it), it drifts with an idle frame train, and after any run
+    /// it holds wherever that run ended however long ago. Worse, and this
+    /// is what makes the mirror unable to carry this law at all: the `Move`
+    /// arm plants `self.caret = Some(to)` UNCONDITIONALLY, before
+    /// [`Ribbon::hand_changed_row`] rules on the move. On the measured
+    /// shape the mirror is therefore set BY THE PARKING PASS ITSELF, and
+    /// the next key finds `mirror == park`, is exempted by the same-row
+    /// clause below as "the hand's own row", and lays the stray — a
+    /// predicate that passes every other test in this package and
+    /// reproduces the owner's screenshot verbatim
+    /// ([`a_repaints_home_pass_poisons_the_mirror_and_the_pen_still_holds_the_hand`]).
+    /// The pen is the ribbon's OWN memory: the landing this function gave
+    /// the last typed lay, the caret the last Backspace or kill was
+    /// replayed against, the caret a NAV move deliberately relocated the
+    /// hand to. An echoed move never moves it. It is `None` until the hand
+    /// has acted at all, so a cold session names nothing to bring a key
+    /// back to, which is what
+    /// [`a_cold_caret_mirror_is_not_a_hand_a_key_can_be_brought_back_to`]
+    /// pins.
+    ///
+    /// **THE LAW IS ABOUT THE ROW ABOVE, NOT ABOUT THE DISTANCE.**
+    /// (2026-09-15 — the spelling that does not decide the question by
+    /// POSITION.) Three earlier cuts asked *could the hand have got from
+    /// the pen to this caret* and re-homed whenever the answer was no.
+    /// That question cannot be answered, and the tree contains the proof:
+    /// with the hand at `(13, 18)` a parking pass at `(15, 0)` is TWO rows
+    /// down and must be re-homed
+    /// ([`a_repaint_that_parks_below_the_hand_does_not_take_the_key_with_it`]),
+    /// while with the hand at `(2, 22)` a run that simply BEGINS at
+    /// `(5, 3)` is THREE rows down and must be taken as it comes
+    /// ([`a_backspace_run_begun_after_the_rest_snaps_the_band_back_and_runs_the_tail_from_it`]).
+    /// Same direction, same shape, further away is the legitimate one:
+    /// distance is not the fact, and neither is the column (a repaint homes
+    /// and then REWRITES, so the host samples the pass anywhere along the
+    /// row — [`Ribbon::hand_changed_row`]'s own doc says so — and a fresh
+    /// run legitimately begins at low columns too).
+    ///
+    /// What IS a fact is what [`Ribbon::lay`] is about to DO with the
+    /// landing. `lay` resolves a landing into the cells
+    /// `[caret.col − cells, caret.col)` and walks every one of them that
+    /// falls left of the pane's first column onto the END OF THE ROW ABOVE.
+    /// So a landing can put a key's glyph on a row that is not its own —
+    /// and there is exactly one row it may legitimately reach back to,
+    /// **the pen's**, because that is the hand's own line continuing across
+    /// the wrap (a pending-wrap glyph at the pane's last column; five
+    /// delivered glyphs echoing at `(14, 2)` of which three belong at
+    /// `117..120` on row 13,
+    /// [`a_delivered_burst_that_wraps_keeps_the_cells_it_left_on_the_row_above`];
+    /// the licensed script's `(2, 36) → (3, 0)`).
+    ///
+    /// **A FOLD THAT STOPS SHORT OF THE HAND IS FICTION.** Its cells land
+    /// on a row nobody has been on — `lay` inventing a row for a caret that
+    /// was never a landing — and it is fiction in BOTH halves of the
+    /// owner's report at once: the stray it stamps on that row, and the
+    /// hole it leaves where the key's own cell belonged. That is the whole
+    /// downward clause: [`Ribbon::fold_top_row`] is the topmost row `lay`
+    /// would write on, and a landing is the hand's own when that row is the
+    /// landing's own (nothing folded) or the pen's (the line wrapped) — and
+    /// a park's, `(15, 0)` under a pen at `(13, 18)`, is neither: it is row
+    /// 14. A downward caret that does not fold is taken as it comes,
+    /// however far below.
+    ///
+    /// **TEXT GROWS DOWN, AND A REPAINT HOMES UP** is the asymmetry the
+    /// UPWARD clause is stated on. Downward is where text legitimately goes
+    /// — the fold, the continuation row, the next prompt, a run that starts
+    /// lower. UPWARD there is exactly one thing a key can do, the Backspace
+    /// back through the fold ([`Ribbon::hand_changed_row`]); every other
+    /// upward caret under an echo is an app homing, which is the shape all
+    /// four measured excursions have (`(13,46)->(12,0)`, `(13,54)->(12,0)`,
+    /// `(13,13)->(11,0)`, `(13,6)->(12,0)`) — and an upward park is caught
+    /// at EVERY column it can be sampled at, not only at the box home
+    /// ([`a_parking_pass_is_caught_at_every_column_it_can_be_sampled_at`]).
+    ///
+    /// The re-homing also has to have a RUN to re-home onto: the pen's row
+    /// must still carry a band cell, or "the row the hand is typing on" is
+    /// not a fact about anything and the key would be inventing a cell on a
+    /// bare row. The evidence asked for is a CELL, not a LIVE cell:
+    /// [`Ribbon::erase`] stamps `retract_at` on the whole suffix it takes,
+    /// so at the moment the hand is most demonstrably on its row — a held
+    /// Backspace in a wrapped composer, the owner's own reported gesture —
+    /// that row can carry nothing but retracting cells, and asking for a
+    /// live one puts the stray straight back
+    /// ([`a_parking_pass_after_the_row_was_backspaced_empty_still_finds_the_hand`]).
+    ///
+    /// **THAT LAST CLAUSE IS THE WEAKEST THING HERE, AND THIS SAYS SO.**
+    /// Measured 2026-09-15 by mutation over the whole `aterm-effects`
+    /// package: its SPELLING is pinned — add `&& !c.leaving()` back and one
+    /// test goes red — but its EXISTENCE is not. Delete the clause outright
+    /// and all 2 267 tests still pass. Under the mirror it did real work (a
+    /// cold mirror reads `(0, 0)`, which names row 0 of a ribbon that holds
+    /// nothing); under the pen that job is done by `pen == None`, and what
+    /// is left is a guard on a shape no fixture reaches — a pen whose row
+    /// has lost every cell to expiry, or a nav onto a bare row, followed by
+    /// a parking pass. It is kept because inventing a cell on a row the
+    /// ribbon can see nothing on is not something this function should ever
+    /// do, but the next reader should know it is reasoned and not measured.
+    ///
+    /// The upward exemption, by contrast, IS measured, though not from this
+    /// module: `else if false` in its place leaves the whole lib green and
+    /// reddens `ribbon_row_hold_conformance::
+    /// typing_and_erase_renew_only_their_own_row_and_conform` — the
+    /// Backspace back up through the fold, in an integration fixture.
+    #[must_use]
+    fn typed_landing(&self, caret: (u16, u16), cells: u16, cols: u16) -> (u16, u16) {
+        // A PEN THE HAND HAS NEVER HELD NAMES NOTHING.
+        let Some(pen) = self.pen else {
+            return caret;
+        };
+        // A key that lays nothing has no landing to argue about
+        // ([`Ribbon::lay`] returns on `n == 0`).
+        if cells == 0 {
+            return caret;
+        }
+        // THE PEN'S OWN ROW IS NOT IN QUESTION. The clauses below are about
+        // a landing on a row the pen does not name; a caret ON the pen's row
+        // is the hand's by construction, whatever `lay` then does with it.
+        // MEASURED 2026-09-15, both ways, over the whole package: DELETE
+        // this clause and seventeen tests go red — ten `cursor_glow` credit
+        // and seam laws, six ribbon witness/index laws, and
+        // `abandoned_ribbon::the_box_growth_wrap_melts_the_old_band_at_once_…`
+        // — because a same-row caret then falls through to the re-home.
+        // Replace it with the UNIFORM spelling instead, asking the fold
+        // question on the pen's own row too (`if caret.0 >= pen.0`), and the
+        // package stays green: nothing in the tree forces the separation.
+        // It is kept as its own clause on the law, not on the measurement —
+        // a same-row landing left of the pane is the engine's HELD-key
+        // phantom ([`Ribbon::hold_typed`]), which has its own law and its
+        // own goldens, and this function does not get to re-open it.
+        if caret.0 == pen.0 {
+            return caret;
+        }
+        if caret.0 > pen.0 {
+            // DOWNWARD IS THE HAND'S OWN DIRECTION — unless `lay`'s fold
+            // would put the key's cells on a row that is NEITHER the
+            // landing's own nor the pen's ([`Ribbon::fold_top_row`]).
+            let top = self.fold_top_row(caret, cells, cols);
+            if top == i32::from(caret.0) || top == i32::from(pen.0) {
+                return caret;
+            }
+        } else if Self::hand_changed_row(pen, caret) {
+            // UP it can carry the caret exactly one row, onto that row's
+            // right end (a Backspace back through the fold), which is the
+            // only way up there is ([`Ribbon::hand_changed_row`]).
+            return caret;
+        }
+        // …AND THE RE-HOMING MUST HAVE A RUN TO RE-HOME ONTO: a cell on the
+        // pen's row, leaving or not. See this function's doc for why the
+        // liveness of that cell is not asked.
+        if !self.cells.iter().any(|c| c.row == pen.0) {
+            return caret;
+        }
+        (pen.0, pen.1.saturating_add(cells.max(1)))
+    }
+
+    /// The pane the fold wraps at, as [`Ribbon::lay`] resolves it: the
+    /// FOCUSED pane's own first column and width, or the grid's when no
+    /// pane is set. One spelling, read by [`Ribbon::fold_top_row`] and by
+    /// nothing else.
+    #[must_use]
+    fn fold_pane(&self, cols: u16) -> (i32, i32) {
+        let (c0, w) = self.pane.unwrap_or((0, cols));
+        (i32::from(c0), i32::from(w).max(1))
+    }
+
+    /// **THE TOPMOST ROW [`Ribbon::lay`] WOULD WRITE ON** for this landing
+    /// — `caret.0` when nothing folds, and one row higher for every pane
+    /// width the landing's leftmost cell runs off the left edge by.
+    ///
+    /// `lay` resolves a landing into the cells `[caret.col − cells,
+    /// caret.col)` and walks each one that falls left of the pane's first
+    /// column onto the END OF THE ROW ABOVE (`while c < pane_col0 { r -= 1;
+    /// c += pane_cols }`). The LEFTMOST cell is the one that reaches
+    /// highest, so this is that same walk, closed into one division —
+    /// `div_euclid` is the loop: `−1 / 120` floors to `−1`, `−121` to `−2`.
+    /// Returned as `i32` because the walk is allowed to run off the top of
+    /// the grid, exactly as `lay`'s own `r < 0` arm expects.
+    #[must_use]
+    fn fold_top_row(&self, caret: (u16, u16), cells: u16, cols: u16) -> i32 {
+        let (pane_col0, pane_cols) = self.fold_pane(cols);
+        let left = i32::from(caret.1) - i32::from(cells) - pane_col0;
+        i32::from(caret.0) + left.div_euclid(pane_cols).min(0)
+    }
+
+    /// The hand's own FOLD: an echoed move exactly one row down — a wrap, or
+    /// a composer's next continuation row. [`Ribbon::leave_row`]'s one
+    /// non-abandoning shape.
+    #[must_use]
+    fn folded_down(from: (u16, u16), to: (u16, u16), licence: Licence) -> bool {
+        licence.is_echo() && to.0 == from.0.saturating_add(1)
+    }
+
     /// **THE HAND LEFT THE ROW** (2026-09-13, the owner: "the rainbow cursor
     /// streak doesn't follow the new line down in claude code and codex.
     /// it's persistent on the screen"): a typed or delivered move onto
@@ -3627,13 +4256,55 @@ impl Ribbon {
     /// ([`Relocate`]); a landing at the pane's edge is a plain fold, whose
     /// cells the host's fold sweep already lays.
     fn leave_row(&mut self, from: (u16, u16), to: (u16, u16), at: Instant, licence: Licence) {
-        self.abandon_row(from.0, at, Some(from.1));
-        self.pending_erase = 0;
+        // **A FOLD IS NOT A DEPARTURE** (2026-09-15, the owner: *"awkward
+        // transitions when going to a new line"*). Wrapping is the SAME
+        // logical input continuing — the glyphs the hand typed are still on
+        // glass, unchanged, one row up — so the row it wrapped off keeps the
+        // life it had and leaves through ITS OWN SWOOSH, which is exactly
+        // what [`Cohort::alive_at`] already promises ("a wrapped paragraph's
+        // earlier row keeps the life it had when the hand left it and leaves
+        // through its own swoosh while the hand types on the next"). The
+        // abandon rewinds that clock to the retract's start instead, and it
+        // is what made the owner's first row BARE while the second carried
+        // colour: measured on glass at a shell fold, row 1's band 30 cells
+        // to 0 in 264 ms (`rbe/z1_wrap_bs`), and in a composer 67 cells to 3
+        // in 262 ms (`rbe/c2_bs` frames 0416-0431).
+        //
+        // The 2026-09-13 ruling this qualifies — *"the rainbow cursor streak
+        // doesn't follow the new line down … it's persistent on the screen"*
+        // — is kept whole by the HOLD, not by the abandon: `Ribbon::place`'s
+        // row clause (`OnlyOwnerRenews`) means no key on the new row renews
+        // the old one, so it still goes out. It goes out at its own tempo
+        // instead of being yanked.
+        //
+        // A real departure still abandons: a Return, an arrow's row change,
+        // a program's cascade, a backspace back through the fold — every
+        // row change that is not one row DOWN under the hand's own echo.
+        //
+        // **WHAT THE WRAP MOVED GOES WITH ITS TEXT, AND NOTHING ELSE
+        // DOES.** A composer's re-wrap takes the row's last word — and the
+        // space the wrap ate — off the end of the old row and puts it under
+        // the caret, which is exactly the span [`Ribbon::begin_relocate`]
+        // re-lays on the new row. Those `w + 1` cells retract here, so the
+        // light leaves the old row with the glyphs it was laid under and
+        // arrives on the new row with them. A PLAIN terminal fold lands ON
+        // the pane's first column and moves no glyph at all: it takes
+        // nothing, and the row keeps every cell it has.
+        let pane_col0 = self.pane.map_or(0, |(c0, _)| c0);
         let w = self.moved_word_len(from);
+        let re_wrapped = licence == Licence::Typed && to.1 > pane_col0.saturating_add(1);
+        if Self::folded_down(from, to, licence) {
+            if re_wrapped && w > 0 {
+                let moved = (w + 1).min(from.1.saturating_sub(pane_col0));
+                self.retract_span(from.0, from.1 - moved, moved, at, RETRACT_FADE_S);
+            }
+        } else {
+            self.abandon_row(from.0, at, Some(from.1));
+        }
+        self.pending_erase = 0;
         self.last_space = None;
         self.relocate = None;
-        let pane_col0 = self.pane.map_or(0, |(c0, _)| c0);
-        if licence == Licence::Typed && to.1 > pane_col0.saturating_add(1) {
+        if re_wrapped {
             self.begin_relocate(to, w, at);
         }
     }
@@ -3766,6 +4437,7 @@ impl Ribbon {
                 edge_cells: like.map_or(HOT_EDGE_CELLS, |c| c.edge_cells),
                 layer: Layer::Base,
                 rearm: None,
+                released_at: None,
             };
             self.place(idx, cell, at, row);
         }
@@ -3985,6 +4657,11 @@ impl Ribbon {
         let birth_disp = Self::birth_price(ctx);
         let cov0 = BODY_COLD_SHARE + (1.0 - BODY_COLD_SHARE) * birth_disp;
         let idx = self.join_cohort(row, col, at);
+        let idx = if typing {
+            self.fold_wakes_into_band(idx, row, col, at)
+        } else {
+            idx
+        };
         let cohort = self.cohorts[idx];
         // THE WALK IS A FUNCTION OF POSITION (C2, §4): the cell takes the stop
         // its column has in its cohort, from the cohort's immutable origin.
@@ -4022,6 +4699,7 @@ impl Ribbon {
             edge_cells: edge_cells(ctx.surge, ctx.flow.heat),
             layer: Layer::Base,
             rearm: None,
+            released_at: None,
         };
         self.place(idx, cell, at, ctx.caret.0);
     }
@@ -4340,6 +5018,7 @@ impl Ribbon {
                 edge_cells: HOT_EDGE_CELLS,
                 layer: Layer::Over,
                 rearm,
+                released_at: None,
             };
             self.place(idx, cell, at, row);
         }
@@ -4542,6 +5221,147 @@ impl Ribbon {
         self.mint_cohort(row, col, col, t0, at, false)
     }
 
+    /// **THE HAND TAKES THE WAKE IT BRIDGED** (2026-09-16 — the owner, on
+    /// Codex: *"there is still this gapping issue that arises in codex, it
+    /// seems to happen when doing backword and editing"*). A word hop across
+    /// DARK ground — the suffix a mid-line edit retired — lays a wake cohort
+    /// ([`Ribbon::wake`]) that touches the typed band the hop left; a key
+    /// typed at the hop's landing joined THAT wake ([`Ribbon::join_cohort`]
+    /// takes the first cohort beside the column), so the row carried two
+    /// cohorts under one contiguous band, each with its own swoosh. Measured
+    /// in the Codex replay (`tests/codex_particle_replay.rs`): the typed
+    /// cohort at columns 2–36 and the ex-wake at 37–48, both released by the
+    /// same last key, each draining FARTHEST-FIRST over its OWN span — a hole
+    /// opening at column 37 and widening to three cells while the band to
+    /// its left still stood.
+    ///
+    /// And the other way round (the adversarial review of the first cut):
+    /// when the landing lies INSIDE the typed cohort's bounds — which never
+    /// shrink when the witness retires the cells under them, so a line's
+    /// original extent stays its bounds — `join_cohort` hands the key the
+    /// TYPED cohort and the wake at the landing stays a wake, un-held by the
+    /// hand's keys (a wake is no phrase's), and its cells expire on the
+    /// hop's 0.55 s while the hand types on: `###########..########`, the
+    /// owner's hole under a typing hand, 540 ms after the hop. The fixture's
+    /// own hops only passed because they landed past the line's old end.
+    ///
+    /// So a typed key folds EVERY wake on its row that contains or abuts the
+    /// cell it lays into the typed band that key belongs to — the cohort the
+    /// key joined when that is a typed one, else a typed cohort the wake
+    /// touches. The wake's cells take the band's id and the band's walk at
+    /// their column (the wake was minted on the band's own origin —
+    /// [`Ribbon::wake_origin`] — so the number does not move), are priced
+    /// like the band's newest glyph as [`Ribbon::relay_word`] prices a
+    /// relocated word, the band's bounds grow over them, and the wake cohort
+    /// is gone: one band, one cohort, one drain, so
+    /// [`Ribbon::retract_suffix`]'s "CONTIGUOUS at every frame" holds through
+    /// the swoosh too. Where the wake was laid over the band's own spent but
+    /// resident cells, those cells go and the wake's stand — the newer
+    /// writer of a column wins ([`Ribbon::heal_seams`]), and
+    /// [`Ribbon::place`]'s one-owner-per-column law is kept.
+    ///
+    /// **A BAND ON ITS WAY OUT IS NOT TAKEN BACK BY A KEY IN A WAKE.** The
+    /// wake-to-band direction folds only into a typed cohort still LAYING or
+    /// in its grace: a key typed inside a hop's wake beside a band already
+    /// reaching, retracting or fading would, through the fold and the hold
+    /// that follows every lay, bring that band back from spent to full in one
+    /// frame — the exact defect [`Ribbon::scrub`]'s phase guard was written
+    /// against. Such a key keeps the wake it landed in, as before.
+    fn fold_wakes_into_band(&mut self, idx: usize, row: u16, col: u16, at: Instant) -> usize {
+        let fresh = |t: Instant| at.saturating_duration_since(t).as_secs_f32() <= CHAIN_GAP_MAX;
+        let joined = self.cohorts[idx];
+        let band_id = if joined.wake {
+            let Some(j) = self.cohorts.iter().position(|c| {
+                c.id != joined.id
+                    && c.row == row
+                    && !c.wake
+                    && !c.abandoned
+                    && c.retract_col.is_none()
+                    && !matches!(c.phase, Phase::Reaching | Phase::Retracting | Phase::Fading)
+                    && fresh(c.alive_at)
+                    && c.col1 >= joined.col0
+                    && joined.col1 >= c.col0
+            }) else {
+                return idx;
+            };
+            self.cohorts[j].id
+        } else {
+            joined.id
+        };
+        while let Some(w) = self.cohorts.iter().position(|c| {
+            c.wake
+                && c.id != band_id
+                && c.row == row
+                && !c.abandoned
+                && fresh(c.alive_at)
+                && col.saturating_add(1) >= c.col0
+                && col <= c.col1
+        }) {
+            let wake = self.cohorts[w];
+            let Some(b) = self.cohorts.iter().position(|c| c.id == band_id) else {
+                break;
+            };
+            let band = self.cohorts[b];
+            let like = self
+                .cells
+                .iter()
+                .filter(|c| c.row == band.row && c.cohort == band.id && c.typing)
+                .max_by(|a, b| a.born.cmp(&b.born))
+                .copied();
+            // The newer writer of a column wins: the band's own cells under
+            // the wake's go, so no column carries two owners of one cohort.
+            let wake_cols: Vec<u16> = self
+                .cells
+                .iter()
+                .filter(|c| c.cohort == wake.id)
+                .map(|c| c.col)
+                .collect();
+            self.cells
+                .retain(|c| !(c.cohort == band.id && c.row == row && wake_cols.contains(&c.col)));
+            for cell in &mut self.cells {
+                if cell.cohort == wake.id {
+                    cell.cohort = band.id;
+                    cell.t = band.t_at(cell.col);
+                    if let Some(like) = like {
+                        cell.life_s = cell.life_s.max(like.life_s);
+                        cell.cov0 = cell.cov0.max(like.cov0);
+                        cell.birth_disp = cell.birth_disp.max(like.birth_disp);
+                        cell.edge_cells = like.edge_cells;
+                    }
+                }
+            }
+            self.cohorts[b].col0 = band.col0.min(wake.col0);
+            self.cohorts[b].col1 = band.col1.max(wake.col1);
+            self.cohorts.remove(w);
+        }
+        self.cohorts
+            .iter()
+            .position(|c| c.id == band_id)
+            .unwrap_or(idx.min(self.cohorts.len().saturating_sub(1)))
+    }
+
+    /// **RETRACT EXACTLY WHAT WENT** — the `min_cells` columns from `col`,
+    /// farthest-first inside `span_s`, and nothing past them.
+    ///
+    /// [`Ribbon::retract_suffix`]'s bounded twin, for the one caller that
+    /// knows EXACTLY which cells went and must not touch the rest of the
+    /// row: a re-wrap's moved word ([`Ribbon::leave_row`]), which is `w + 1`
+    /// cells off the old row's end and nothing else. The erase is still the
+    /// suffix — see [`Ribbon::erase`] for what the 2026-09-15 round measured
+    /// when it was not.
+    fn retract_span(&mut self, row: u16, col: u16, min_cells: u16, at: Instant, span_s: f32) {
+        let last = col.saturating_add(min_cells.max(1) - 1);
+        let n = f32::from(last - col + 1);
+        let step = span_s / n;
+        for cell in &mut self.cells {
+            if cell.row != row || cell.col < col || cell.col > last || cell.leaving() {
+                continue;
+            }
+            let rank = f32::from(last - cell.col);
+            cell.retract_at = at.checked_add(std::time::Duration::from_secs_f32(rank * step));
+        }
+    }
+
     /// Retract the SUFFIX of `row` from `col` on — every live cell at or right
     /// of the caret, and at least `min_cells` columns — FARTHEST-FIRST inside
     /// `span_s`, each cell then spending [`RETRACT_FADE_S`] to reach exactly
@@ -4721,19 +5541,89 @@ impl Ribbon {
     /// `retire_cells` — which is why the witness keeps their records and
     /// reports such re-verdicts, and `Engine::witness_rows` counts each
     /// cell once. Off the frame path's steady state: a release is an event.
+    ///
+    /// **THAT IS THE WHOLE RELEASE.** A release naming only PART of a
+    /// cohort's standing cells (2026-09-16) takes exactly that part: the
+    /// named cells are stamped onto the retract at `at` — `retract_at` and
+    /// [`Cell::released_at`] both — and counted, the cohort's clock is
+    /// untouched, and a [`ReleaseClock`] with `partial` set remembers the
+    /// stamp so the identical redraw a frame later lifts it again
+    /// ([`Ribbon::restore_releases`]). See the body for the measurements
+    /// on both sides of that law.
     pub fn release_cells(&mut self, cells: &[(u16, u16, Instant)], at: Instant) -> usize {
         let Some(rewound) = at.checked_sub(std::time::Duration::from_secs_f32(RETRACT_START_S))
         else {
             return 0;
         };
         let mut n = 0;
-        for i in 0..self.cells.len() {
-            let cell = self.cells[i];
-            if cell.leaving() || !cells.contains(&(cell.row, cell.col, cell.born)) {
+        // The cohorts something was named in, each once.
+        let mut touched: Vec<u32> = Vec::new();
+        for cell in &self.cells {
+            if !cell.leaving()
+                && cells.contains(&(cell.row, cell.col, cell.born))
+                && !touched.contains(&cell.cohort)
+            {
+                touched.push(cell.cohort);
+            }
+        }
+        for id in touched {
+            // **A RELEASE OF PART OF A RUN TAKES EXACTLY THAT PART** (2026-09-16
+            // — the owner: *"you need to be fixing in general"*). A release
+            // is text that went; abandoning the WHOLE cohort for a release
+            // that names some of its cells drained every letter still
+            // standing on the row for one cell that went blank under an
+            // app's own repaint — measured in the Codex replay as the band
+            // falling from 33 lit cells to 9 in 600 ms of plain typing, and
+            // the same amplifier waits under any program that clears one
+            // cell of a lit line. Leaving the part standing is wrong the
+            // other way (measured by the adversarial review of the first
+            // cut: light over a cleared suffix AHEAD of a typing hand, and a
+            // later whole clear no longer honoured because its held records
+            // are never named again). So the part LEAVES as an erase's
+            // suffix leaves — stamped onto the retract, counted — and the
+            // cohort's clock is untouched; `released_at` remembers the stamp
+            // so the identical redraw a frame later lifts exactly it
+            // ([`Ribbon::restore_releases`]). A release that names every
+            // standing cell is the text gone whole, and the cohort leaves
+            // as it always did.
+            let whole = self
+                .cells
+                .iter()
+                .filter(|c| c.cohort == id && !c.leaving())
+                .all(|c| cells.contains(&(c.row, c.col, c.born)));
+            let count = self.cells.iter().filter(|c| c.cohort == id).count();
+            if !whole {
+                for cell in &mut self.cells {
+                    if cell.cohort == id
+                        && !cell.leaving()
+                        && cells.contains(&(cell.row, cell.col, cell.born))
+                    {
+                        cell.retract_at = Some(at);
+                        cell.released_at = Some(at);
+                        n += 1;
+                    }
+                }
+                if let Some(coh) = self.cohorts.iter_mut().find(|c| c.id == id)
+                    && !coh.abandoned
+                    && coh.release_clock.is_none()
+                {
+                    coh.release_clock = Some(ReleaseClock {
+                        alive_at: coh.alive_at,
+                        retract_col: coh.retract_col,
+                        phase: coh.phase,
+                        rejoinable: coh.rejoinable,
+                        cells: count,
+                        partial: Some(at),
+                    });
+                }
                 continue;
             }
-            n += 1;
-            let Some(coh) = self.cohorts.iter_mut().find(|c| c.id == cell.cohort) else {
+            n += self
+                .cells
+                .iter()
+                .filter(|c| c.cohort == id && !c.leaving())
+                .count();
+            let Some(coh) = self.cohorts.iter_mut().find(|c| c.id == id) else {
                 continue;
             };
             if !coh.abandoned {
@@ -4742,7 +5632,8 @@ impl Ribbon {
                     retract_col: coh.retract_col,
                     phase: coh.phase,
                     rejoinable: coh.rejoinable,
-                    cells: self.cells.iter().filter(|c| c.cohort == coh.id).count(),
+                    cells: count,
+                    partial: None,
                 });
             }
             coh.rejoinable = false;
@@ -4779,8 +5670,22 @@ impl Ribbon {
             if candidates[i].1 != saved.cells {
                 continue;
             }
-            // Recover the exact saved clock; no new life or birth is earned.
             coh.release_clock = None;
+            if let Some(stamp) = saved.partial {
+                // A PARTIAL release's restore lifts exactly the stamps it
+                // laid: the cells are still resident inside their melt, and
+                // the cohort's clock was never touched.
+                let id = coh.id;
+                for cell in &mut self.cells {
+                    if cell.cohort == id && cell.released_at == Some(stamp) {
+                        cell.retract_at = None;
+                        cell.released_at = None;
+                    }
+                }
+                accepted.push(id);
+                continue;
+            }
+            // Recover the exact saved clock; no new life or birth is earned.
             coh.alive_at = saved.alive_at;
             coh.retract_col = saved.retract_col;
             coh.phase = saved.phase;
@@ -4873,6 +5778,9 @@ impl Ribbon {
         self.retire(ctx);
         self.heal_seams();
         self.build(ctx);
+        // The scroll's tick is over: the next tick's backward caret is the
+        // hand's own again ([`Ribbon::scroll_followed`]).
+        self.scroll_followed = false;
     }
 
     /// Drive the exit choreography and lay the reach's extension cells.
@@ -4980,6 +5888,7 @@ impl Ribbon {
             edge_cells: tail.edge_cells,
             layer: tail.layer,
             rearm: tail.rearm,
+            released_at: None,
         });
         if let Some(coh) = self.cohorts.iter_mut().find(|c| c.id == cohort) {
             coh.col0 = coh.col0.min(col);
@@ -6461,7 +7370,7 @@ impl Ribbon {
     #[must_use]
     pub fn head_rgb(&self, cfg: &Config) -> Option<u32> {
         self.caret?;
-        let arc = spectrum(clamp01(tri(self.field_at_caret())));
+        let arc = spectrum(walk_arc(self.field_at_caret()));
         Some(if cfg.dark_theme {
             arc
         } else {
@@ -6810,6 +7719,7 @@ impl Ribbon {
         self.cells
             .retain(|c| self.cohorts.iter().any(|coh| coh.id == c.cohort));
         self.caret = self.caret.map(|(row, col)| (row.saturating_sub(rows), col));
+        self.pen = self.pen.map(|(row, col)| (row.saturating_sub(rows), col));
         // The re-anchor's bookkeeping rides the scroll with its text: a
         // composer at the screen's bottom grows a row UP by scrolling the
         // screen in the very repaint that moves the word down.
@@ -6824,6 +7734,9 @@ impl Ribbon {
         self.index.translate(rows);
         self.plan.clear();
         self.runs.clear();
+        // The band has followed its text on this tick; a backward caret from
+        // the same repaint is not a stale line ([`Ribbon::scroll_followed`]).
+        self.scroll_followed = true;
     }
 
     /// **A ROW BAND CARRIES ITS RIBBON WITH ITS TEXT** (seam point 12, the
@@ -6881,6 +7794,13 @@ impl Ribbon {
         self.caret = self
             .caret
             .map(|(row, col)| (band_pos(row, top, bottom, delta), col));
+        // The pen is the HAND, not a position the host will re-observe on
+        // its next move: a pen carried past the band's edge is DROPPED, as
+        // `last_space` is, and not saturated onto an edge row nobody typed
+        // this light on.
+        self.pen = self
+            .pen
+            .and_then(|(row, col)| band_row(row, top, bottom, delta).map(|row| (row, col)));
         self.last_space = self
             .last_space
             .and_then(|(row, col)| band_row(row, top, bottom, delta).map(|row| (row, col)));
@@ -6890,6 +7810,7 @@ impl Ribbon {
         self.index.translate_band(top, bottom, delta);
         self.plan.clear();
         self.runs.clear();
+        self.scroll_followed = true;
     }
 
     /// Drop everything — style switch, layout change, `Engine::reset`.
@@ -6905,6 +7826,7 @@ impl Ribbon {
         self.ember_at = None;
         self.rearm = None;
         self.pending_erase = 0;
+        self.pen = None;
         self.last_space = None;
         self.relocate = None;
         self.last_walk = None;
@@ -7574,14 +8496,18 @@ mod tests {
 
     #[test]
     fn the_crossing_composites_no_greyer_than_its_flanks() {
-        // The other "gap": the green→blue crossing carried the arc's authored
-        // S 0.53 (`SPECTRUM_CROSSING_ROOF`, the retired cyan census's bound)
-        // and composited `(45, 92, 93)` on Nord — the greyest cell on a typed
-        // line. `BED_SAT_FLOOR` gives the seam its neighbours' chroma back at
-        // the bed's own read; the arc's hue pacing is untouched.
-        use crate::spectrum::{spectrum_crossing_position, spectrum_crossing_width};
+        // The other "gap": the green→blue crossing used to carry the arc's
+        // authored S 0.53 (the retired cyan census's blend bound) and composited
+        // `(45, 92, 93)` on Nord — the greyest cell on a typed line. The arc's
+        // own crossing is S 1.00 since the roof was deleted, and `BED_SAT_FLOOR`
+        // holds any read that is not.
+        use crate::spectrum::{spectrum_crossing_position, spectrum_crossing_span};
         let mid = spectrum_crossing_position();
-        let half = spectrum_crossing_width();
+        // A QUARTER OF THE GREEN→BLUE LEG: the scan below covers `mid ± half`
+        // and reads its flanks at `mid ± 2·half`, which is the leg's own two
+        // anchors. The exempt crossing span this used to be a width of is
+        // deleted with the roof that authored it.
+        let half = 0.25 * spectrum_crossing_span();
         for (name, fg, bg) in [
             ("Nord", NORD_FG, NORD_BG),
             ("default", DEFAULT_FG, DEFAULT_BG),
@@ -7606,7 +8532,7 @@ mod tests {
             );
             assert!(
                 worst >= 0.90,
-                "{name}: the crossing's least saturated composite is S {worst:.3} (#{px:06X}) — the roof's S 0.53 is showing through the bed"
+                "{name}: the crossing's least saturated composite is S {worst:.3} (#{px:06X}) — a chroma dip is showing through the bed"
             );
             // And the arc's hue through the seam is the table's own: the
             // floor moves S, never H.
@@ -7727,7 +8653,7 @@ mod tests {
     #[test]
     #[ignore = "a table for the record, not a pin"]
     fn the_bed_and_hot_edge_ink_table() {
-        use crate::spectrum::{SPECTRUM_ANCHORS, SPECTRUM_CROSSING_ROOF};
+        use crate::spectrum::{SPECTRUM_ANCHORS, SPECTRUM_LUT, SPECTRUM_LUT_LEN};
         let old_bed = |rgb: u32, budget: f32| {
             if relative_luminance(rgb) > budget {
                 solve_for_luma(|k| scale_rgb(rgb, k), budget)
@@ -7758,8 +8684,15 @@ mod tests {
             .zip(SPECTRUM_ANCHORS)
             .map(|(n, c)| ((*n).to_string(), c))
             .collect();
-        for (i, &c) in SPECTRUM_CROSSING_ROOF.iter().enumerate() {
-            stops.push((format!("roof[{i}]"), c));
+        // …and eight samples off the green→blue crossing itself, which since
+        // 2026-09-15 is the drawn arc rather than an authored roof.
+        for i in 0..8 {
+            let t = 0.5 + 0.5 * (i as f32 + 0.5) / 8.0;
+            let at = (t * (SPECTRUM_LUT_LEN - 1) as f32) as usize;
+            stops.push((
+                format!("cross[{i}]"),
+                SPECTRUM_LUT[at.min(SPECTRUM_LUT_LEN - 1)],
+            ));
         }
         println!();
         for (theme, fg, bg) in [
@@ -8014,6 +8947,437 @@ mod tests {
     }
 
     // -- §4 / C2: the classic walk -----------------------------------------
+
+    /// CIE-Lab distance between two sRGB colours — the step the per-cell
+    /// pace is measured in.
+    fn lab_de(a: u32, b: u32) -> f32 {
+        let lab = |c: u32| {
+            let ch = |sh: u32| ((c >> sh) & 0xff) as f32 / 255.0;
+            let lin = |v: f32| {
+                if v <= 0.040_45 {
+                    v / 12.92
+                } else {
+                    ((v + 0.055) / 1.055).powf(2.4)
+                }
+            };
+            let (r, g, bl) = (lin(ch(16)), lin(ch(8)), lin(ch(0)));
+            let (x, y, z) = (
+                0.4124 * r + 0.3576 * g + 0.1805 * bl,
+                0.2126 * r + 0.7152 * g + 0.0722 * bl,
+                0.0193 * r + 0.1192 * g + 0.9505 * bl,
+            );
+            let f = |t: f32| {
+                if t > 0.008_856 {
+                    t.cbrt()
+                } else {
+                    7.787 * t + 16.0 / 116.0
+                }
+            };
+            let (fx, fy, fz) = (f(x / 0.950_47), f(y), f(z / 1.088_83));
+            (116.0 * fy - 16.0, 500.0 * (fx - fy), 200.0 * (fy - fz))
+        };
+        let (l1, a1, b1) = lab(a);
+        let (l2, a2, b2) = lab(b);
+        ((l1 - l2).powi(2) + (a1 - a2).powi(2) + (b1 - b2).powi(2)).sqrt()
+    }
+
+    /// The step the pace equalises: the composited BED under the letters
+    /// plus the VIVID RAIL below the row, in equal parts.
+    fn arc_step(a: f32, b: f32, budget: f32) -> (f32, f32) {
+        let bed = |t: f32| bed_ink(spectrum(t), budget);
+        (
+            lab_de(bed(a), bed(b)),
+            lab_de(rail_ink(spectrum(a)), rail_ink(spectrum(b))),
+        )
+    }
+
+    /// **THE GREEN→BLUE CROSSING IS SMOOTHED OUT OF ITS OWN LEG'S CELLS**
+    /// (2026-09-15, the owner: *"some blending smoothness in green to blue
+    /// where the gradient sometimes looked blocky"* — ONE leg).
+    ///
+    /// The band is read ONE ARC ENTRY PER CELL, so what the eye judges is
+    /// the step from one flat slab to the next. Under the identity walk the
+    /// whole authored green→blue handoff is 1.22 cells wide and one cell
+    /// carries up to 110 CIE-Lab units of it against 9–21 everywhere else —
+    /// and whether a cell lands inside it at all depends on the cohort's
+    /// walk origin, which is why the owner saw it SOMETIMES. So the bound is
+    /// taken over EVERY PHASE of the walk, not one, and against the SAME
+    /// walk's own identity rather than an absolute number.
+    ///
+    /// **AND NOTHING ELSE MOVES.** Every step whose shipped midpoint is
+    /// outside green→blue is unchanged to the bit, and every named anchor
+    /// keeps the phases that land within ten entries of it. That is the
+    /// clause the first cut of this fix broke — it paid for the crossing out
+    /// of yellow→green and blue→indigo — and it is the clause the owner's
+    /// settled taste depends on.
+    ///
+    /// THE TWINS, both live: make `walk_pace` the identity and the worst
+    /// step goes straight back (the ratio bound); widen [`CROSS_GUARD`] past
+    /// its own leg and the neighbours move (the identity bound).
+    #[test]
+    fn the_crossing_is_smoothed_out_of_its_own_legs_cells_and_nothing_else_moves() {
+        let budget = bed_luma_budget(NORD_FG);
+        let span = (crate::spectrum::SPECTRUM_LUT_LEN - 1) as f32;
+        let green = crate::spectrum::SPECTRUM_ANCHOR_AT[3] as f32 / span;
+        let blue = crate::spectrum::SPECTRUM_ANCHOR_AT[4] as f32 / span;
+        // Ten entries: the window an anchor's RESIDENCY is judged on, under
+        // which the identity walk resides on every named anchor 62.7 % of
+        // the time (`legpace`).
+        let win = 10.0 / span;
+        let (mut worst_bed, mut worst_rail) = (0.0f32, 0.0f32);
+        let (mut was_bed, mut was_rail) = (0.0f32, 0.0f32);
+        let (mut at_bed, mut moved_off_leg) = (0.0f32, 0usize);
+        let mut res = [(0usize, 0usize); crate::spectrum::SPECTRUM_STOPS];
+        let mut all = Vec::new();
+        // 64 phases of the cohort's own walk origin × 16 cells of a pass.
+        for p in 0..64 {
+            let t0 = p as f32 / 64.0 / WALK_FAST_CELLS;
+            let arc = |d: i32| walk_arc(t0 + walk_t(d as f32));
+            let was = |d: i32| clamp01(tri(t0 + walk_t(d as f32)));
+            for (i, &at) in crate::spectrum::SPECTRUM_ANCHOR_AT.iter().enumerate() {
+                let a = at as f32 / span;
+                res[i].0 += usize::from((0..=16).any(|d| (was(d) - a).abs() <= win));
+                res[i].1 += usize::from((0..=16).any(|d| (arc(d) - a).abs() <= win));
+            }
+            for d in 0..16 {
+                let (db, dr) = arc_step(arc(d), arc(d + 1), budget);
+                let (wb, wr) = arc_step(was(d), was(d + 1), budget);
+                all.push(db);
+                if db > worst_bed {
+                    worst_bed = db;
+                    at_bed = 0.5 * (arc(d) + arc(d + 1));
+                }
+                worst_rail = worst_rail.max(dr);
+                was_bed = was_bed.max(wb);
+                was_rail = was_rail.max(wr);
+                // OFF THE NAMED LEG: a step the shipped walk placed outside
+                // green→blue must be the shipped step, to the bit.
+                let mid = 0.5 * (was(d) + was(d + 1));
+                if !(green..=blue).contains(&mid)
+                    && ((db - wb).abs() > 1e-4 || (dr - wr).abs() > 1e-4)
+                {
+                    moved_off_leg += 1;
+                }
+            }
+        }
+        all.sort_by(f32::total_cmp);
+        let median = all[all.len() / 2];
+        println!(
+            "walk step over 64 phases: median {median:.1}, worst bed {worst_bed:.1} (was {was_bed:.1}, arc {at_bed:.3}), worst rail {worst_rail:.1} (was {was_rail:.1})"
+        );
+        println!("anchor residency (shipped, paced) of 64: {res:?}");
+        // MEASURED 2026-09-15 over all 64 phases, on the arc as first shipped
+        // that day: worst bed 109.5 → 73.3, worst rail 164.5 → 129.2.
+        //
+        // **THE RATIOS MOVED THE SAME DAY, AND UPWARD, BECAUSE THE DEFECT MOVED
+        // UPSTREAM.** `crate::spectrum` used to LIFT the green→blue crossing out
+        // of its own perceptual pacing; deleting that exemption (the retired
+        // no-cyan ruling's last machinery) means the ARC now arrives at this
+        // window already evenly spent, and the walk-level re-pace here is left
+        // with only what the COMPOSITED ink adds — which the spectrum's pace
+        // cannot see, because it paces the raw table and this paces `bed_ink`
+        // and `rail_ink` on a real ground.
+        //
+        // **AND THEY MOVED AGAIN ON 2026-09-16, BECAUSE THE ARC GAVE THE TABLE
+        // BACK.** `crate::spectrum::SPECTRUM_CROSSING_SHARE_CAP` holds the
+        // crossing to `167` of the `510` steps so that YELLOW keeps its share
+        // of the arc, and a leg with fewer entries arrives here carrying more
+        // per cell. Re-measured on the capped arc: worst bed 77.9 → 73.0
+        // (`0.937`), worst rail 63.5 → 56.5 (`0.890`). The bounds below are
+        // what the composited step alone can still buy; the identity walk
+        // still fails them, which is what keeps them a test.
+        assert!(
+            worst_bed <= 0.95 * was_bed,
+            "the crossing still carries {worst_bed:.1} of the bed at arc {at_bed:.3} against the identity walk's {was_bed:.1} — it is a block, not a step"
+        );
+        assert!(
+            worst_rail <= 0.92 * was_rail,
+            "the crossing still carries {worst_rail:.1} of the RAIL against the identity walk's {was_rail:.1} — it is a block below the row too"
+        );
+        // **AND THE SIZE, ABSOLUTELY.** A ratio alone would pass on an arc that
+        // had got worse in both terms together, which is exactly what the cap
+        // trades in. So the step is pinned against the SHIPPED v0.86.0 arc's
+        // own numbers on this same census — bed `73.3`, rail `129.2` — and the
+        // honest reading of the two is that the rail is where this round was
+        // won and the bed's WORST cell is not: `56.5` against `129.2` is a
+        // `2.3 ×` fall, while `73.0` against `73.3` is a tail that the cap
+        // handed back to buy yellow's share. The bed's BODY did move and
+        // `cyancensus` is where that is read: its median over the same leg is
+        // `27.9` against the shipped arc's `42.7`.
+        assert!(
+            worst_bed <= 76.0,
+            "the crossing carries {worst_bed:.1} of the bed at arc {at_bed:.3} — worse than the shipped v0.86.0 arc's own 73.3, so the cap has overpaid"
+        );
+        assert!(
+            worst_rail <= 60.0,
+            "the crossing carries {worst_rail:.1} of the RAIL — the shipped v0.86.0 arc read 129.2 here and the cyan route must keep most of that fall"
+        );
+        assert_eq!(
+            moved_off_leg, 0,
+            "the re-pace reached outside green→blue: {moved_off_leg} steps the shipped walk put on another leg moved"
+        );
+        for (i, (was, now)) in res.iter().enumerate() {
+            assert_eq!(
+                was, now,
+                "anchor {i} lost its residency: {was} phases of 64 land within ten entries of it on the shipped walk, {now} on this one"
+            );
+        }
+        // …and the WARM end is untouched: red, orange and yellow sit on
+        // exactly the cells they always did.
+        for d in 0..=4u16 {
+            let t = walk_t(f32::from(d));
+            assert!(
+                (walk_arc(t) - clamp01(tri(t))).abs() < 1e-6,
+                "cell {d} moved off its shipped stop: the re-pace reached the warm end"
+            );
+        }
+    }
+
+    /// **THE CROSSING SHARE CAP'S TRADE, SWEPT** — what each candidate
+    /// [`crate::spectrum::SPECTRUM_CROSSING_SHARE_CAP`] costs YELLOW and buys
+    /// the crossing, measured on the two inks the owner judges by.
+    ///
+    /// Every row regenerates the WHOLE arc at that cap, re-derives
+    /// [`CROSS_PACE`] for it by the rule
+    /// `the_walk_s_pace_is_the_arc_s_own_perceptual_step` checks, and then
+    /// walks the arc. Nothing is transcribed.
+    ///
+    /// The columns, in the order a decision needs them:
+    ///
+    /// * `p1` — YELLOW'S CELLS OF THE WALK'S FIRST FULL PASS, of seventeen.
+    ///   The owner's ruling ("I don't see much yellow? that's confusing") in
+    ///   the unit he sees it in: flat slabs on one typed word.
+    /// * `≤1%` — the share of walk phases whose sixteen-cell pass shows one
+    ///   yellow slab or none. The same ruling as a worst case rather than a
+    ///   mean, and the column with a CLIFF in it.
+    /// * `yel%`, `warm%`, `g+b%` — the nearest-anchor REGIONS, in midpoint
+    ///   arithmetic over the table's 510 steps: how much of the arc is nearest
+    ///   to yellow, to red-orange-yellow together, and to green and blue
+    ///   together.
+    /// * the crossing's own per-cell step against the worst of the other five
+    ///   legs, and the table's own saturation, value and byte-chord bounds.
+    ///
+    /// ```text
+    /// targo --unverified test -p aterm-effects --lib the_crossing_share_cap_trade \
+    ///     -- --ignored --nocapture
+    /// ```
+    #[test]
+    #[ignore = "a trade curve for the record, not a pin"]
+    fn the_crossing_share_cap_trade() {
+        let budget = bed_luma_budget(NORD_FG);
+        let span = (crate::spectrum::SPECTRUM_LUT_LEN - 1) as f32;
+        println!();
+        println!(
+            "    cap   g>b%   p1  <=1%  hue<=1  yel%  warm%   g+b%   CROSS bed med/MAX vs oth   CROSS rail med/MAX vs oth  minS  minV  ch  anchors"
+        );
+        for n in (SWEEP_LO..=SWEEP_HI).step_by(SWEEP_STEP) {
+            let cap = (f64::from(n) + 0.5) / span as f64;
+            let t = crate::spectrum::spectrum_table_at_cap(cap);
+            let read = |x: f32| {
+                let x = x.clamp(0.0, 1.0) * span;
+                let i = (x as usize).min(crate::spectrum::SPECTRUM_LUT_LEN - 1);
+                let j = (i + 1).min(crate::spectrum::SPECTRUM_LUT_LEN - 1);
+                lerp_rgb(t.lut[i], t.lut[j], x - i as f32)
+            };
+            // THIS CANDIDATE'S OWN `CROSS_PACE`, by the shipped rule.
+            let (w0, w1) = (
+                (t.anchor_at[3] + CROSS_GUARD) as f32 / span,
+                (t.anchor_at[4] - CROSS_GUARD) as f32 / span,
+            );
+            const N: usize = 4096;
+            let mut cum = [0.0f32; N + 1];
+            for i in 1..=N {
+                let a = w0 + (w1 - w0) * (i - 1) as f32 / N as f32;
+                let b = w0 + (w1 - w0) * i as f32 / N as f32;
+                let st = lab_de(bed_ink(read(a), budget), bed_ink(read(b), budget))
+                    + lab_de(rail_ink(read(a)), rail_ink(read(b)));
+                cum[i] = cum[i - 1] + st.max(0.005);
+            }
+            let total = cum[N];
+            let mut knots = [0.0f32; CROSS_PACE_KNOTS];
+            let mut j = 0usize;
+            for (k, kn) in knots.iter_mut().enumerate() {
+                let want = k as f32 / (CROSS_PACE_KNOTS - 1) as f32 * total;
+                while j < N && cum[j + 1] < want {
+                    j += 1;
+                }
+                let sp = (cum[j + 1] - cum[j]).max(1e-9);
+                let f = ((want - cum[j]) / sp).clamp(0.0, 1.0);
+                *kn = w0 + (w1 - w0) * (j as f32 + f) / N as f32;
+            }
+            let pace = |x: f32| {
+                let x = clamp01(x);
+                if x <= w0 || x >= w1 {
+                    return x;
+                }
+                let f = (x - w0) / (w1 - w0) * (CROSS_PACE_KNOTS - 1) as f32;
+                let i = (f as usize).min(CROSS_PACE_KNOTS - 2);
+                knots[i] + (knots[i + 1] - knots[i]) * (f - i as f32)
+            };
+            let glass = |ink: u32| {
+                let a = u8::try_from(UNDER_COV_CAP.clamp(0.0, 255.0) as u16).unwrap_or(255);
+                over_premul(NORD_BG, premul_rgb(ink, a), a)
+            };
+            // WHICH NAME A CELL SHOWS: the nearest of the seven anchors to
+            // where the cell lands, which is what the eye names a flat slab by.
+            let name_of = |a: f32| {
+                let x = a.clamp(0.0, 1.0) * span;
+                let mut best = 0usize;
+                for k in 1..7 {
+                    if (x - t.anchor_at[k] as f32).abs() < (x - t.anchor_at[best] as f32).abs() {
+                        best = k;
+                    }
+                }
+                best
+            };
+            // THE WALK'S FIRST FULL PASS: seventeen cells, phase zero.
+            let p1 = (0..=16)
+                .filter(|&d| name_of(pace(clamp01(tri(walk_t(f32::from(d as u8)))))) == 2)
+                .count();
+            // EVERY PHASE, sixteen cells: the per-leg step and yellow's worst case.
+            let mut bedv: Vec<Vec<f32>> = vec![Vec::new(); 6];
+            let mut railv: Vec<Vec<f32>> = vec![Vec::new(); 6];
+            let mut lone = 0usize;
+            let mut hlone = 0usize;
+            const PH: usize = 8000;
+            for p in 0..PH {
+                let t0 = p as f32 / PH as f32 / 16.0;
+                let a: Vec<f32> = (0..=16)
+                    .map(|d| pace(clamp01(tri(t0 + walk_t(d as f32)))))
+                    .collect();
+                let mut ycells = 0usize;
+                let mut hcells = 0usize;
+                for d in 0..16 {
+                    let mid = 0.5 * (a[d] + a[d + 1]) * span;
+                    let mut l = 5usize;
+                    for i in 0..6 {
+                        if mid >= t.anchor_at[i] as f32 && mid <= t.anchor_at[i + 1] as f32 {
+                            l = i;
+                            break;
+                        }
+                    }
+                    bedv[l].push(lab_de(
+                        glass(bed_ink(read(a[d]), budget)),
+                        glass(bed_ink(read(a[d + 1]), budget)),
+                    ));
+                    railv[l].push(lab_de(rail_ink(read(a[d])), rail_ink(read(a[d + 1]))));
+                    if name_of(a[d]) == 2 {
+                        ycells += 1;
+                    }
+                    let h = crate::spectrum::spectrum_hsv(rail_ink(read(a[d]))).0;
+                    if (45.0..=75.0).contains(&h) {
+                        hcells += 1;
+                    }
+                }
+                if ycells <= 1 {
+                    lone += 1;
+                }
+                if hcells <= 1 {
+                    hlone += 1;
+                }
+            }
+            let pick = |v: &mut Vec<f32>, q: f32| {
+                v.sort_by(f32::total_cmp);
+                v[((v.len() - 1) as f32 * q) as usize]
+            };
+            let (mut obed, mut orail) = (0.0f32, 0.0f32);
+            for i in 0..6 {
+                if i != 3 {
+                    obed = obed.max(pick(&mut bedv[i], 1.0));
+                    orail = orail.max(pick(&mut railv[i], 1.0));
+                }
+            }
+            // THE NEAREST-ANCHOR REGIONS, in midpoint arithmetic over the 510
+            // steps — the share of the arc that is nearest each name.
+            let mid = |i: usize| 0.5 * (t.anchor_at[i] + t.anchor_at[i + 1]) as f32;
+            let (yel, warm, gb) = (
+                (mid(2) - mid(1)) / span,
+                mid(2) / span,
+                (mid(4) - mid(2)) / span,
+            );
+            let (mut gs, mut gv) = (1.0f64, 1.0f64);
+            for &c in &t.lut[t.anchor_at[3]..=t.anchor_at[4]] {
+                let (_, sa, va) = crate::spectrum::spectrum_hsv(c);
+                gs = gs.min(sa);
+                gv = gv.min(va);
+            }
+            let chord = (0..crate::spectrum::SPECTRUM_LUT_LEN - 1)
+                .map(|i| {
+                    [16u32, 8, 0]
+                        .into_iter()
+                        .map(|sh| {
+                            (((t.lut[i] >> sh) & 0xff) as i32
+                                - ((t.lut[i + 1] >> sh) & 0xff) as i32)
+                                .abs()
+                        })
+                        .max()
+                        .unwrap_or(0)
+                })
+                .max()
+                .unwrap_or(0);
+            println!(
+                "  {:.4} {:5.1} {p1:>4} {:5.2}{:6.2}  {:5.1}  {:5.1}  {:5.1}   {:6.2}/{:6.2} vs{:6.2}   {:6.2}/{:6.2} vs{:6.2}  {gs:.3} {gv:.3} {chord:>3}  {:?}",
+                cap,
+                100.0 * (t.anchor_at[4] - t.anchor_at[3]) as f32 / span,
+                100.0 * lone as f32 / PH as f32,
+                100.0 * hlone as f32 / PH as f32,
+                100.0 * yel,
+                100.0 * warm,
+                100.0 * gb,
+                pick(&mut bedv[3], 0.5),
+                pick(&mut bedv[3], 1.0),
+                obed,
+                pick(&mut railv[3], 0.5),
+                pick(&mut railv[3], 1.0),
+                orail,
+                t.anchor_at
+            );
+        }
+    }
+
+    /// The sweep's range, in ENTRIES of the crossing leg — the unit a cap
+    /// actually resolves to.
+    const SWEEP_LO: u32 = 135;
+    const SWEEP_HI: u32 = 215;
+    /// How coarsely [`the_crossing_share_cap_trade`] walks that range.
+    const SWEEP_STEP: usize = 4;
+
+    /// [`CROSS_PACE`] IS A MEASUREMENT: re-derived here from `bed_ink` and
+    /// `rail_ink` by the same rule that generated it — equal composited step
+    /// per knot across the window — so a change to either ink is caught
+    /// rather than quietly left behind. Tolerance is two knots' worth of the
+    /// window, which is the integration's own resolution.
+    #[test]
+    fn the_walk_s_pace_is_the_arc_s_own_perceptual_step() {
+        let budget = bed_luma_budget(NORD_FG);
+        const N: usize = 4096;
+        let (w0, w1) = (CROSS_ARC0, CROSS_ARC1);
+        let mut cum = [0.0f32; N + 1];
+        for i in 1..=N {
+            let a = w0 + (w1 - w0) * (i - 1) as f32 / N as f32;
+            let b = w0 + (w1 - w0) * i as f32 / N as f32;
+            let (db, dr) = arc_step(a, b, budget);
+            cum[i] = cum[i - 1] + (db + dr).max(0.005);
+        }
+        let total = cum[N];
+        let mut j = 0usize;
+        let mut worst = 0.0f32;
+        for (k, &baked) in CROSS_PACE.iter().enumerate() {
+            let want = k as f32 / (CROSS_PACE_KNOTS - 1) as f32 * total;
+            while j < N && cum[j + 1] < want {
+                j += 1;
+            }
+            let span = (cum[j + 1] - cum[j]).max(1e-9);
+            let f = ((want - cum[j]) / span).clamp(0.0, 1.0);
+            let a = w0 + (w1 - w0) * (j as f32 + f) / N as f32;
+            let got = f32::from(baked) / 65535.0;
+            worst = worst.max((a - got).abs());
+        }
+        assert!(
+            worst <= 2.0 * (CROSS_ARC1 - CROSS_ARC0) / (CROSS_PACE_KNOTS - 1) as f32,
+            "the baked pace is {worst:.5} of the arc off the ink's own step — re-generate it"
+        );
+    }
 
     #[test]
     fn the_walk_lays_a_sixteenth_per_cell_for_sixteen_cells_then_a_thirty_sixth() {
@@ -8448,7 +9812,7 @@ mod tests {
             }
         };
         let t = rib.field_at(2, 17).expect("the head cell is laid");
-        let stop = spectrum(clamp01(tri(t)));
+        let stop = spectrum(walk_arc(t));
         assert_eq!(
             dominant(head.color),
             dominant(stop),
@@ -12194,8 +13558,11 @@ mod tests {
             let mut lut = BedInkLut::default();
             lut.sync(&c);
             let mut rows = Vec::new();
+            // Twelve stops of the ARC (`walk_of_arc`, 2026-09-15): the law
+            // is about the arc's colours, and since the re-pace an even
+            // sweep of the WALK is no longer an even sweep of the arc.
             for i in 0..12u32 {
-                let t = i as f32 / 12.0;
+                let t = walk_of_arc(i as f32 / 12.0);
                 rows.push((t, lut.at(t), lut.seen_floor_at(t)));
             }
             let lo = rows.iter().map(|r| r.2).fold(f32::INFINITY, f32::min);
@@ -12993,9 +14360,11 @@ mod tests {
         let (cw, ch) = (g.cw as f32, g.ch as f32);
         let row_top = f32::from(g.origin_y) + 2.0 * ch;
         let row_bottom = row_top + ch;
-        // Yellow's anchor on the walk — the arc is perceptually paced, so it
-        // is `SPECTRUM_ANCHOR_AT[2]`, not `2/6`.
-        let t_yellow = SPECTRUM_ANCHOR_AT[2] as f32 / (SPECTRUM_LUT_LEN - 1) as f32;
+        // Yellow's anchor on the WALK — the arc is perceptually paced and so
+        // is the walk that reads it ([`WALK_PACE`]), so the walk position
+        // that shows yellow is `walk_of_arc` of `SPECTRUM_ANCHOR_AT[2]`,
+        // neither `2/6` nor the anchor's own share of the table.
+        let t_yellow = walk_of_arc(SPECTRUM_ANCHOR_AT[2] as f32 / (SPECTRUM_LUT_LEN - 1) as f32);
         let seg = rib
             .plan_segments()
             .iter()
@@ -13381,7 +14750,7 @@ mod tests {
                 (t - walk_t(5.0)).abs() < 1e-5,
                 "the caret's own cell is the field"
             );
-            let arc = spectrum(clamp01(tri(t)));
+            let arc = spectrum(walk_arc(t));
             let got = rib.head_rgb(c).expect("a cursor has been observed");
             if c.dark_theme {
                 assert_eq!(got, arc, "dark themes hand the companion the AUTHORED stop");
@@ -14085,6 +15454,993 @@ mod tests {
         );
     }
 
+    // -- 2026-09-15: the owner's edit round ----------------------------------
+
+    /// Lit (non-leaving) columns of `row`, for the two landing pins below.
+    fn landing_lit(rib: &Ribbon, row: u16) -> Vec<u16> {
+        let mut v: Vec<u16> = rib
+            .cells()
+            .iter()
+            .filter(|l| l.row == row && !l.leaving())
+            .map(|l| l.col)
+            .collect();
+        v.sort_unstable();
+        v.dedup();
+        v
+    }
+
+    /// EVERY cell of `row`, leaving or not — a stray is a stray while it
+    /// fades.
+    fn landing_any(rib: &Ribbon, row: u16) -> Vec<u16> {
+        let mut v: Vec<u16> = rib
+            .cells()
+            .iter()
+            .filter(|l| l.row == row)
+            .map(|l| l.col)
+            .collect();
+        v.sort_unstable();
+        v.dedup();
+        v
+    }
+
+    /// **A PARKING PASS IS A PARKING PASS DOWNWARD TOO** (2026-09-15, the
+    /// owner's edit round, re-widening [`Ribbon::typed_landing`]'s
+    /// direction clause).
+    ///
+    /// The clause that read "every caret at or below the pen is the hand's
+    /// own" was stated on the asymmetry *text grows down, a repaint homes
+    /// up*. The asymmetry is real for where TEXT goes; it is not real for
+    /// what [`Ribbon::lay`] DOES with a landing at the pane's first column.
+    /// `lay`'s fold arithmetic walks a cell at `pane_col0` back onto the END
+    /// OF THE ROW ABOVE whichever row it was parked on — so a repaint that
+    /// homes DOWN to the pane's first column (a box's third line, the hint
+    /// row under a composer, any `\r\n` sampled between the newline and the
+    /// writes) makes the identical artefact the upward clause exists to
+    /// stop: a stray on a row the hand has never been on, and a one-cell
+    /// hole at the head of the band.
+    ///
+    /// Measured in-tree: with the hand at `(13, 18)` and a parking pass at
+    /// `(15, 0)`, the key's cell was laid at `(14, 119)` and column 18 of
+    /// the hand's own row stayed dark.
+    ///
+    /// The fix is not to drop the direction clause — a run that simply
+    /// BEGINS lower must lay where the tick says, which is why it was added.
+    /// RESTATED 2026-09-15 IN THE ANSWER LANE: this test first carried the
+    /// clause as the key's own REACH (`1 + cells / width`), and that
+    /// spelling is refuted by the tree it landed in —
+    /// `a_backspace_run_begun_after_the_rest_…` starts a run THREE rows
+    /// below its mirror and must be taken as it comes, while the park pinned
+    /// here is TWO rows below and must not, so no bound on the distance
+    /// separates them ([`a_downward_landing_is_questioned_only_where_lay_would_write_above_it`]
+    /// states the pair side by side). The clause is stated on the FOLD
+    /// instead ([`Ribbon::fold_top_row`]): a landing is the hand's own when
+    /// the topmost row `lay` would write on is the landing's own row or the
+    /// pen's. Every assertion below is unchanged; only the reason is.
+    ///
+    /// THE TWIN (run 2026-09-15 in this worktree, `--lib --no-fail-fast`):
+    /// take the downward clause out — `if caret.0 > pen.0 { return caret; }`
+    /// — and the first assertion goes red with the band's column 18 dark
+    /// (`left [2..=17]`, `right [2..=18]`) and the stray back at
+    /// `(14, 119)`; this test and
+    /// [`a_downward_landing_is_questioned_only_where_lay_would_write_above_it`]
+    /// go red together and nothing else in the package does. A SECOND TWIN
+    /// for the fixture's second half: drop the `top == i32::from(caret.0)`
+    /// disjunct — refuse every downward fold — and the `(14, 1)` leg goes
+    /// red (among fourteen tests, including the shipped
+    /// `a_key_lays_on_the_hands_row_when_a_repaint_has_parked_the_cursor`
+    /// and three `cursor_glow::ink_wrap_seam` laws).
+    #[test]
+    fn a_repaint_that_parks_below_the_hand_does_not_take_the_key_with_it() {
+        let c = cfg(true, true);
+        let g = geom();
+        let t0 = Instant::now();
+        let mut rib = Ribbon::new();
+        type_keys(
+            &mut rib,
+            t0,
+            Keys {
+                g,
+                row: 13,
+                col0: 2,
+                n: 16,
+                period_ms: 60,
+                disp: 0.7,
+            },
+            &c,
+        );
+        assert_eq!(rib.caret(), Some((13, 18)));
+        assert_eq!(
+            landing_lit(&rib, 13),
+            (2..=17).collect::<Vec<_>>(),
+            "fixture: the hand's band is standing on its own row"
+        );
+        let now = at(t0, 16 * 60);
+        let cx = ctx_in(now, &c, (15, 0), 0.7, g);
+        rib.on_event(&typed(), now, &cx);
+        rib.plan(&cx);
+        assert_eq!(
+            landing_lit(&rib, 13),
+            (2..=18).collect::<Vec<_>>(),
+            "the key did not land on the hand's own row, next to its last cell"
+        );
+        assert!(
+            landing_any(&rib, 14).is_empty(),
+            "a stray was laid on the row above the parking pass: {:?}",
+            landing_any(&rib, 14)
+        );
+        // …and the key's OWN reach is still taken as it comes: a fold onto
+        // the next row lays there.
+        let t0 = Instant::now();
+        let mut rib = Ribbon::new();
+        type_keys(
+            &mut rib,
+            t0,
+            Keys {
+                g,
+                row: 13,
+                col0: 2,
+                n: 16,
+                period_ms: 60,
+                disp: 0.7,
+            },
+            &c,
+        );
+        let now = at(t0, 16 * 60);
+        let cx = ctx_in(now, &c, (14, 1), 0.7, g);
+        rib.on_event(&typed(), now, &cx);
+        rib.plan(&cx);
+        assert_eq!(
+            landing_lit(&rib, 14),
+            vec![0],
+            "the hand's own fold stopped laying on the row it folded onto"
+        );
+    }
+
+    /// **A BAND ON ITS WAY OUT IS STILL THE HAND'S ROW** (2026-09-15, the
+    /// owner's edit round, widening [`Ribbon::typed_landing`]'s evidence
+    /// clause).
+    ///
+    /// The clause that keeps [`Ribbon::typed_landing`] from re-homing a key
+    /// onto a row the ribbon holds nothing on asks whether it holds a cell
+    /// there. It asked for a LIVE one — and the owner's own reported gesture
+    /// empties that test: hold Backspace back through the line and every
+    /// cell on the row is retracting, so the row reads as "not a row the
+    /// hand is typing on" at exactly the moment the hand is most
+    /// demonstrably on it. The next key's echo, replayed on a tick the
+    /// composer's repaint has parked at the box home, then lays at
+    /// `(11, 119)` — the stray on a row nobody has been on that
+    /// [`Ribbon::typed_landing`] exists to prevent, with the band
+    /// mid-backspace right underneath it.
+    ///
+    /// Measured in-tree: hand at `(13, 2)` after sixteen Backspaces (row 13
+    /// live cells `[]`, retracting cells `[2..=8]`), parking pass at
+    /// `(12, 0)` → cell at `(11, 119)`.
+    ///
+    /// A retracting band is the LOUDEST evidence there is that the hand is
+    /// on that row, so the clause reads every cell, leaving or not. A cold
+    /// session still names nothing: [`Ribbon::pen`] is `None` until the hand
+    /// has acted at all, which is what
+    /// [`a_cold_caret_mirror_is_not_a_hand_a_key_can_be_brought_back_to`]
+    /// pins.
+    ///
+    /// THIS TEST ALSO CARRIES THE BACKSPACE HALF OF THE PEN. A Backspace
+    /// moves [`Ribbon::pen`] to the caret `erase` was replayed against, so
+    /// after this run the hand's row is RECORDED and not deduced from what
+    /// is still lit — the candidate lane that took the pen carried a second
+    /// short-word fixture for the same law
+    /// (`a_row_backspaced_down_to_its_retract_is_still_the_hands_row`); it
+    /// was dropped into this one, because both twins below redden this test
+    /// and that one identically and neither reaches a state the other does
+    /// not.
+    ///
+    /// THE TWIN (run 2026-09-15 in this worktree, `--lib --no-fail-fast`):
+    /// put `&& !c.leaving()` back on the evidence clause and THIS TEST
+    /// ALONE goes red — `left []`, `right [2]`, the key laid at
+    /// `(11, 119)` instead of on the hand's row. A SECOND TWIN, for the
+    /// Backspace's pen update: drop `self.pen = Some(ctx.caret)` from the
+    /// `Erase` arm and this test alone goes red again, this time with the
+    /// key at column 18 (`left [18]`) — brought back to where the TYPING
+    /// stopped rather than to where the Backspaces got to.
+    #[test]
+    fn a_parking_pass_after_the_row_was_backspaced_empty_still_finds_the_hand() {
+        let c = cfg(true, true);
+        let g = geom();
+        let t0 = Instant::now();
+        let mut rib = Ribbon::new();
+        type_keys(
+            &mut rib,
+            t0,
+            Keys {
+                g,
+                row: 13,
+                col0: 2,
+                n: 16,
+                period_ms: 60,
+                disp: 0.7,
+            },
+            &c,
+        );
+        let mut ms = 16 * 60;
+        for i in 0..16u16 {
+            ms += 40;
+            let now = at(t0, ms);
+            let cx = ctx_in(now, &c, (13, 17 - i), 0.7, g);
+            rib.on_event(&Event::Erase, now, &cx);
+            rib.plan(&cx);
+        }
+        assert_eq!(rib.caret(), Some((13, 2)));
+        assert!(
+            landing_lit(&rib, 13).is_empty() && !landing_any(&rib, 13).is_empty(),
+            "fixture: the held Backspace left row 13 entirely in retract, \
+             live {:?} / all {:?}",
+            landing_lit(&rib, 13),
+            landing_any(&rib, 13)
+        );
+        ms += 40;
+        let now = at(t0, ms);
+        let cx = ctx_in(now, &c, (12, 0), 0.7, g);
+        rib.on_event(&typed(), now, &cx);
+        rib.plan(&cx);
+        assert_eq!(
+            landing_lit(&rib, 13),
+            vec![2],
+            "the key after the Backspace run did not land on the hand's own row"
+        );
+        assert!(
+            landing_any(&rib, 11).is_empty(),
+            "a stray was laid on the row above the box home: {:?}",
+            landing_any(&rib, 11)
+        );
+    }
+
+    /// **A PARKING PASS IS NOT SAMPLED AT ONE COLUMN** (2026-09-15, the
+    /// owner's edit round, deleting the third clause of
+    /// [`Ribbon::typed_landing`]).
+    ///
+    /// The integration cut required the parked caret to sit at the pane's
+    /// FIRST COLUMN, on the evidence that all four measured excursions did
+    /// (`(13,46)->(12,0)`, …). But [`Ribbon::hand_changed_row`]'s own doc
+    /// says why that is not a fact about the app: *"a repaint's home can be
+    /// sampled anywhere along the row it is writing, so 'is the landing near
+    /// column 0' is not a fact about the app"* — the host samples the caret
+    /// on its own clock, and a repaint that homes and then rewrites is
+    /// sampled mid-rewrite as often as at the home.
+    ///
+    /// With the column clause in, a parking pass sampled at `(12, 5)` while
+    /// the hand is at `(13, 18)` laid its cell at `(12, 4)` — a stray on a
+    /// row the hand has never typed on — and column 18 of the hand's own row
+    /// stayed dark. That is the owner's defect, verbatim, still reachable.
+    /// The upward clause already excludes every typed echo (a key's caret
+    /// sits one past the glyph it laid, so it is never UP from the pen
+    /// except through the fold, which is [`Ribbon::hand_changed_row`]), at
+    /// every column — so the column clause subtracted from a set that was
+    /// already sound.
+    ///
+    /// THE TWIN (run 2026-09-15 in this worktree, `--lib --no-fail-fast`):
+    /// let every upward caret through — `else if true` in place of the
+    /// upward clause — and column 0 of this loop fails first (`left
+    /// [2..=17]`, `right [2..=18]`), with the stray on row 12 or 11 behind
+    /// it at every one of the five columns. Four tests go red on that
+    /// mutation and no others: this one,
+    /// [`a_parking_pass_after_the_row_was_backspaced_empty_still_finds_the_hand`],
+    /// [`a_repaints_home_pass_poisons_the_mirror_and_the_pen_still_holds_the_hand`]
+    /// and the shipped
+    /// [`a_key_lays_on_the_hands_row_when_a_repaint_has_parked_the_cursor`].
+    #[test]
+    fn a_parking_pass_is_caught_at_every_column_it_can_be_sampled_at() {
+        let c = cfg(true, true);
+        let g = geom();
+        let t0 = Instant::now();
+        let mut rib = Ribbon::new();
+        type_keys(
+            &mut rib,
+            t0,
+            Keys {
+                g,
+                row: 13,
+                col0: 2,
+                n: 16,
+                period_ms: 60,
+                disp: 0.7,
+            },
+            &c,
+        );
+        assert_eq!(rib.caret(), Some((13, 18)));
+        let lit = |rib: &Ribbon, row: u16| {
+            let mut v: Vec<u16> = rib
+                .cells()
+                .iter()
+                .filter(|l| l.row == row && !l.leaving())
+                .map(|l| l.col)
+                .collect();
+            v.sort_unstable();
+            v.dedup();
+            v
+        };
+        assert_eq!(lit(&rib, 13), (2..=17).collect::<Vec<_>>());
+        // The repaint homes to the box top-left and starts rewriting; the
+        // host samples it at the home, and four columns into the rewrite,
+        // and nine. The key is the hand's either way.
+        for park in [0u16, 1, 5, 9, 17] {
+            let mut rib = rib.clone();
+            let now = at(t0, 16 * 60);
+            let cx = ctx_in(now, &c, (12, park), 0.7, g);
+            rib.on_event(&typed(), now, &cx);
+            rib.plan(&cx);
+            assert_eq!(
+                lit(&rib, 13),
+                (2..=18).collect::<Vec<_>>(),
+                "a parking pass sampled at column {park} took the key off the hand's row"
+            );
+            assert!(
+                lit(&rib, 12).is_empty() && lit(&rib, 11).is_empty(),
+                "a stray was laid off the hand's row for a pass sampled at column {park}: \
+                 row 12 {:?}, row 11 {:?}",
+                lit(&rib, 12),
+                lit(&rib, 11)
+            );
+        }
+    }
+
+    /// **THE MIRROR IS POISONED BY THE VERY PASS THE SIBLING LAW REFUSES**
+    /// (2026-09-15, the answer lane — why [`Ribbon::typed_landing`] asks
+    /// [`Ribbon::pen`] and not [`Ribbon::caret`]).
+    ///
+    /// The measured shape is not one event, it is TWO. A repaint's home
+    /// reaches the ribbon as a `Move` the seam licences `Typed` — that is
+    /// the event
+    /// [`a_repaints_home_pass_does_not_abandon_the_row_the_hand_is_typing_on`]
+    /// is about, and [`Ribbon::hand_changed_row`] correctly refuses to
+    /// ABANDON the hand's row on it. But the `Move` arm plants `self.caret =
+    /// Some(to)` UNCONDITIONALLY before any of that: the CARET MIRROR takes
+    /// the park even though the law has just ruled the park is not a
+    /// gesture. The key's own echo arrives on the next tick with the same
+    /// parked caret — and a predicate that asks the mirror where the hand is
+    /// finds `hand == caret`, is exempted by its own same-row clause as "the
+    /// hand's own row", and lays the cell at the park. [`Ribbon::lay`]'s
+    /// fold arithmetic then walks a landing at the pane's first column onto
+    /// the END OF THE ROW ABOVE.
+    ///
+    /// So the mirror cannot carry this law: the app writes to it, and the
+    /// thing it writes is exactly the excursion under suspicion. No spelling
+    /// of the predicate can fix that, because by the time the predicate runs
+    /// the park IS the mirror. The PEN can carry it, because an ECHOED move
+    /// never moves the pen — only a typed lay, an erase, or a nav the hand
+    /// actually made.
+    ///
+    /// NO OTHER TEST IN THIS PACKAGE COVERS THIS. It is the defect that
+    /// forced the pen, and it is invisible to every fixture that reaches the
+    /// park straight through `ctx.caret` without the repaint's own `Move`
+    /// arriving first.
+    ///
+    /// THE TWIN (run 2026-09-15 in this worktree): read `self.caret`
+    /// instead of `self.pen` in [`Ribbon::typed_landing`] — the pen binding
+    /// becomes `let Some(pen) = self.caret` — and this test alone goes red,
+    /// the cell laid at `(11, 119)` with column 18 of the band dark: the
+    /// owner's screenshot, verbatim, through a predicate that passes every
+    /// other test in the package.
+    #[test]
+    fn a_repaints_home_pass_poisons_the_mirror_and_the_pen_still_holds_the_hand() {
+        let c = cfg(true, true);
+        let g = geom();
+        let t0 = Instant::now();
+        let mut rib = Ribbon::new();
+        type_keys(
+            &mut rib,
+            t0,
+            Keys {
+                g,
+                row: 13,
+                col0: 2,
+                n: 16,
+                period_ms: 60,
+                disp: 0.7,
+            },
+            &c,
+        );
+        assert_eq!(rib.caret(), Some((13, 18)));
+        // (1) the repaint's home, licensed `Typed` — the sibling law's own
+        // event, which must not abandon the row…
+        let now = at(t0, 16 * 60);
+        let cx = ctx_in(now, &c, (12, 0), 0.7, g);
+        rib.on_event(&typed_move((13, 18), (12, 0)), now, &cx);
+        rib.plan(&cx);
+        assert_eq!(
+            rib.caret(),
+            Some((12, 0)),
+            "the fixture's whole point: the MIRROR took the park"
+        );
+        assert!(
+            rib.cohorts().iter().all(|k| !k.abandoned),
+            "fixture: and the sibling law kept the hand's row"
+        );
+        // (2) …and now the key's own echo, on a tick still showing it.
+        let now = at(t0, 17 * 60);
+        let cx = ctx_in(now, &c, (12, 0), 0.7, g);
+        rib.on_event(&typed(), now, &cx);
+        rib.plan(&cx);
+        assert_eq!(
+            landing_lit(&rib, 13),
+            (2..=18).collect::<Vec<_>>(),
+            "the key did not land on the hand's own row"
+        );
+        assert!(
+            landing_any(&rib, 12).is_empty() && landing_any(&rib, 11).is_empty(),
+            "a stray was laid off the hand's row: 11={:?} 12={:?}",
+            landing_any(&rib, 11),
+            landing_any(&rib, 12)
+        );
+    }
+
+    /// **A NAV IS THE HAND, SO IT MOVES THE PEN** (2026-09-15, the answer
+    /// lane — the residual false positive in [`Ribbon::typed_landing`]'s
+    /// downward fold clause, closed).
+    ///
+    /// The downward clause says a landing whose fold reaches a row that is
+    /// neither its own nor the PEN'S is not a typed caret. It is therefore
+    /// only as good as the pen: if the hand can get somewhere the pen does
+    /// not follow, a legitimate FOLD from there reaches a row the pen does
+    /// not name and is re-homed onto a row the hand left long ago — the very
+    /// stray this function exists to prevent, made by the function itself.
+    ///
+    /// There is exactly one such way: the hand moving the caret without
+    /// typing — an arrow key, a word hop, a click — which reaches the ribbon
+    /// as a `Move` under a NAV licence. So a nav moves the pen, and a
+    /// typed/delivered ECHO never does (an echo is where the parking passes
+    /// come from). Here: sixteen keys on row 13, a nav to the last column of
+    /// row 20, then one key that wraps onto row 21 at column 0. Its glyph
+    /// belongs at the last column of row 20 — the fold arithmetic doing
+    /// exactly the job it exists for — and not on row 13.
+    ///
+    /// THE TWIN (run 2026-09-15 in this worktree): drop the
+    /// `!licence.is_echo()` pen update in the `Move` arm and the wrap key is
+    /// re-homed to the landing `(13, 19)`, which `lay` resolves to a cell at
+    /// `(13, 18)`, eight rows up from the hand — row 20 left empty.
+    #[test]
+    fn a_nav_moves_the_pen_so_a_fold_after_it_still_lays_where_it_folded() {
+        let c = cfg(true, true);
+        let g = geom();
+        let t0 = Instant::now();
+        let mut rib = Ribbon::new();
+        type_keys(
+            &mut rib,
+            t0,
+            Keys {
+                g,
+                row: 13,
+                col0: 2,
+                n: 16,
+                period_ms: 60,
+                disp: 0.7,
+            },
+            &c,
+        );
+        // The hand hops to the end of row 20 — a nav, not an echo.
+        let last = u16::try_from(g.cols).expect("cols") - 1;
+        let now = at(t0, 16 * 60);
+        let cx = ctx_in(now, &c, (20, last), 0.7, g);
+        rib.on_event(
+            &Event::Move {
+                from: (13, 18),
+                to: (20, last),
+                licence: Licence::Nav,
+                dir: Dir::Right,
+            },
+            now,
+            &cx,
+        );
+        rib.plan(&cx);
+        // …and types one key there, which WRAPS: the echo's caret is the
+        // next row's first column, which is exactly the shape a downward
+        // park has.
+        let now = at(t0, 17 * 60);
+        let cx = ctx_in(now, &c, (21, 0), 0.7, g);
+        rib.on_event(&typed(), now, &cx);
+        rib.plan(&cx);
+        // The wrap key's own glyph is the LAST COLUMN OF ROW 20 — that is
+        // what `Ribbon::lay`'s fold arithmetic is FOR, and it is right here:
+        // the caret really did wrap off that cell. What must not happen is
+        // the landing being taken for a park and walked back to the row the
+        // nav left.
+        assert_eq!(
+            landing_any(&rib, 20),
+            vec![last],
+            "the hand's own fold after a nav did not lay on the row it folded off"
+        );
+        assert!(
+            !landing_any(&rib, 13).contains(&18),
+            "the wrap key was dragged back onto the row the nav left: {:?}",
+            landing_any(&rib, 13)
+        );
+    }
+
+    /// **THE FOLD IS THE FACT, NOT THE DISTANCE** (2026-09-15, the answer
+    /// lane — [`Ribbon::typed_landing`]'s downward clause, and the
+    /// discriminator that decides it).
+    ///
+    /// The constraint set this round had to satisfy contains a pair that NO
+    /// positional predicate can separate, and this test states the pair side
+    /// by side so the next reader does not have to rediscover it:
+    ///
+    /// * pen `(13, 18)`, pass at `(15, 0)` — TWO rows down — is a repaint's
+    ///   park and must be caught
+    ///   ([`a_repaint_that_parks_below_the_hand_does_not_take_the_key_with_it`]);
+    /// * pen `(2, 22)`, key at `(5, 3)` — THREE rows down — is a run that
+    ///   simply begins lower and must be taken as it comes
+    ///   ([`a_backspace_run_begun_after_the_rest_snaps_the_band_back_and_runs_the_tail_from_it`]).
+    ///
+    /// Same direction; the legitimate one is FURTHER away and at a HIGHER
+    /// column. Distance cannot decide it, the column cannot decide it, and
+    /// the phrase clock cannot either (both gaps — 60 ms and 100 ms — are
+    /// far inside the 900 ms rest, so the phrase is open on both). What
+    /// decides it is what [`Ribbon::lay`] would DO: at `(15, 0)` the fold
+    /// walks the key's cell onto the END OF ROW 14, a row the hand has never
+    /// been on; at `(5, 3)` nothing folds and the cell lands under the
+    /// hand's own finger.
+    ///
+    /// So the law is *a typed key never writes ABOVE its own landing row
+    /// unless the row it reaches is the pen's*, and the price of it is
+    /// pinned here too: a park sampled three columns further into the
+    /// rewrite, `(15, 3)`, is NOT caught — it is byte-identical to a run
+    /// beginning at `(5, 3)` and C2 owns that shape. The law buys the whole
+    /// of the owner's measured defect (every excursion is a column-0 home)
+    /// and declines to guess at the rest.
+    ///
+    /// THE TWIN (run 2026-09-15 in this worktree, `--lib --no-fail-fast`):
+    /// take the downward clause out — `if caret.0 > pen.0 { return caret; }`
+    /// — and leg (a) goes red, `left [2..=17]` against `right [2..=18]`:
+    /// column 18 of the band dark and the stray back on row 14. This test
+    /// and [`a_repaint_that_parks_below_the_hand_does_not_take_the_key_with_it`]
+    /// go red together on that mutation and nothing else does. THE OTHER
+    /// SIDE of the same clause — refusing a downward fold that DOES reach
+    /// the pen — is held by
+    /// [`a_delivered_burst_that_wraps_keeps_the_cells_it_left_on_the_row_above`],
+    /// which is the only test in the package that fails when the
+    /// `top == i32::from(pen.0)` disjunct is dropped. Leg (b) has no twin
+    /// and cannot have one: it is the price, not a law — it asserts that the
+    /// landing is TAKEN, so every mutation that widens the refusal reddens
+    /// it and none that narrows it does.
+    #[test]
+    fn a_downward_landing_is_questioned_only_where_lay_would_write_above_it() {
+        let c = cfg(true, true);
+        let g = geom();
+        let seat = |t0: Instant| {
+            let mut rib = Ribbon::new();
+            type_keys(
+                &mut rib,
+                t0,
+                Keys {
+                    g,
+                    row: 13,
+                    col0: 2,
+                    n: 16,
+                    period_ms: 60,
+                    disp: 0.7,
+                },
+                &c,
+            );
+            assert_eq!(rib.caret(), Some((13, 18)));
+            rib
+        };
+        // (a) The park the fold would betray: caught, and the band's own
+        // next column is lit instead of a stray on row 14.
+        let t0 = Instant::now();
+        let mut rib = seat(t0);
+        let now = at(t0, 16 * 60);
+        let cx = ctx_in(now, &c, (15, 0), 0.7, g);
+        rib.on_event(&typed(), now, &cx);
+        rib.plan(&cx);
+        assert_eq!(landing_lit(&rib, 13), (2..=18).collect::<Vec<_>>());
+        assert!(landing_any(&rib, 14).is_empty() && landing_any(&rib, 15).is_empty());
+        // (b) The same distance and direction, three columns over: nothing
+        // folds, so nothing about it is a fact, and the key lays where the
+        // tick says — the C2 shape, stated as a price and not as a win.
+        let t0 = Instant::now();
+        let mut rib = seat(t0);
+        let now = at(t0, 16 * 60);
+        let cx = ctx_in(now, &c, (15, 3), 0.7, g);
+        rib.on_event(&typed(), now, &cx);
+        rib.plan(&cx);
+        assert_eq!(
+            landing_lit(&rib, 15),
+            vec![2],
+            "a downward caret that does not fold is the hand's own, however far"
+        );
+        assert_eq!(landing_lit(&rib, 13), (2..=17).collect::<Vec<_>>());
+    }
+
+    /// **THE ONE FOLD THAT IS REAL: THE ONE THAT REACHES THE HAND**
+    /// (2026-09-15, the answer lane — [`Ribbon::fold_top_row`]).
+    ///
+    /// A delivered burst wraps. Five glyphs committed with the hand at
+    /// `(13, 117)` of a 120-column grid echo at `(14, 2)`, and three of
+    /// their cells belong at `117..120` on row 13 — through exactly the fold
+    /// arithmetic [`Ribbon::typed_landing`]'s downward clause questions. The
+    /// difference between this fold and a park's is not the direction, the
+    /// distance or the column: it is WHICH ROW THE FOLD REACHES. This one
+    /// reaches row 13, the pen's own, so it is the hand's line continuing
+    /// across the wrap. A park's stops short: from `(15, 0)` under a pen at
+    /// `(13, 18)` the walk reaches row 14, and nobody is on row 14.
+    ///
+    /// THE TWIN (run 2026-09-15 in this worktree, `--lib --no-fail-fast`):
+    /// drop the `top == i32::from(pen.0)` disjunct — refuse every downward
+    /// fold — and THIS TEST ALONE goes red: the burst is re-homed to the
+    /// landing `(13, 122)`, whose two rightmost cells `lay` clips at the
+    /// pane's right margin, so row 13 happens to come out unchanged
+    /// (`112..=119`, the three folded cells arriving by the other road) and
+    /// ROW 14 IS EMPTY — `left []`, `right [0, 1]`. The wrap's own two
+    /// cells are the whole loss, and they are the only thing in the package
+    /// that holds this half of the clause. Drop the OTHER disjunct instead
+    /// and fourteen tests go red — including
+    /// [`a_repaint_that_parks_below_the_hand_does_not_take_the_key_with_it`]
+    /// with its stray at `(14, 119)` — and this one stays green: the two
+    /// halves of the clause are each pinned by tests the other does not
+    /// hold.
+    #[test]
+    fn a_delivered_burst_that_wraps_keeps_the_cells_it_left_on_the_row_above() {
+        let c = cfg(true, true);
+        let g = geom();
+        let t0 = Instant::now();
+        let mut rib = Ribbon::new();
+        type_keys(
+            &mut rib,
+            t0,
+            Keys {
+                g,
+                row: 13,
+                col0: 112,
+                n: 5,
+                period_ms: 60,
+                disp: 0.7,
+            },
+            &c,
+        );
+        assert_eq!(
+            rib.caret(),
+            Some((13, 117)),
+            "fixture: the hand is five from the margin"
+        );
+        let now = at(t0, 5 * 60);
+        let cx = ctx_in(now, &c, (14, 2), 0.7, g);
+        rib.on_event(
+            &Event::Typed {
+                cells: 5,
+                shifted: false,
+                class: TypedClass::Glyph,
+            },
+            now,
+            &cx,
+        );
+        rib.plan(&cx);
+        assert_eq!(
+            landing_lit(&rib, 13),
+            (112..=119).collect::<Vec<_>>(),
+            "the burst's first three cells finished the hand's own row"
+        );
+        assert_eq!(
+            landing_lit(&rib, 14),
+            vec![0, 1],
+            "…and the other two went on over the wrap"
+        );
+    }
+
+    /// **A MIRROR IS NOT A HAND** (2026-09-15, the same round's own re-bake
+    /// — [`Ribbon::typed_landing`]'s guard).
+    ///
+    /// [`Ribbon::caret`] is seeded by [`Ribbon::plan`] out of the engine's
+    /// caret MIRROR, and that mirror reads `(0, 0)` until a caret has
+    /// actually been observed (`Engine::caret_known` is the flag that says
+    /// so, and the ribbon is not given it). Read as a hand it makes row 0 a
+    /// row "the hand is typing on", and the redirect above then sends the
+    /// FIRST key of a session there.
+    ///
+    /// Found by decomposing this round's golden re-bake, not by reading:
+    /// traced on `cursor_glow`'s deletion script, the first key arrived
+    /// with `caret=(2, 5)` against a mirror of `(0, 0)` and its cell was
+    /// laid at `(0, 1)` — a stray on a row nobody has been on, and a hole
+    /// at the head of the band on the row it was typed on. That is the
+    /// defect [`Ribbon::typed_landing`] exists to prevent, reproduced by
+    /// [`Ribbon::typed_landing`].
+    ///
+    /// THE TWIN: drop the `self.cells` guard and the key goes to row 0
+    /// again.
+    #[test]
+    fn a_cold_caret_mirror_is_not_a_hand_a_key_can_be_brought_back_to() {
+        let c = cfg(true, true);
+        let g = geom();
+        let t0 = Instant::now();
+        let mut rib = Ribbon::new();
+        // The engine's first plan of a session runs on its caret MIRROR,
+        // which is `(0, 0)` and names nothing.
+        let cold = ctx_in(t0, &c, (0, 0), 0.7, g);
+        rib.plan(&cold);
+        assert_eq!(rib.caret(), Some((0, 0)));
+        assert!(
+            rib.cells().is_empty(),
+            "a cold ribbon holds no cell — there is no hand's row yet"
+        );
+        // The first real key of the session, on row 2.
+        let now = at(t0, 80);
+        let cx = ctx_in(now, &c, (2, 5), 0.7, g);
+        rib.on_event(&typed(), now, &cx);
+        rib.plan(&cx);
+        let lit = |rib: &Ribbon, row: u16| {
+            let mut v: Vec<u16> = rib
+                .cells()
+                .iter()
+                .filter(|l| l.row == row)
+                .map(|l| l.col)
+                .collect();
+            v.sort_unstable();
+            v.dedup();
+            v
+        };
+        assert_eq!(
+            lit(&rib, 2),
+            vec![4],
+            "the first key of the session did not land on the row the host reported"
+        );
+        assert!(
+            lit(&rib, 0).is_empty(),
+            "the cold mirror was read as a hand and took the key to row 0: {:?}",
+            lit(&rib, 0)
+        );
+    }
+
+    /// **A KEY LAYS WHERE THE HAND IS, NOT WHERE A REPAINT PARKED THE
+    /// CURSOR** (2026-09-15, [`Ribbon::typed_landing`]).
+    ///
+    /// A bottom-pinned composer repaints by homing to the box's top-left,
+    /// clearing to the end of the screen and rewriting. When a key's echo
+    /// is replayed on a tick whose caret is that home, the key used to lay
+    /// its cell THERE — and at column 0 of a pane [`Ribbon::lay`]'s fold
+    /// arithmetic walks the cell back onto the END OF THE ROW ABOVE. The
+    /// hand's own row keeps a one-cell hole where the key went, and a stray
+    /// cell appears on a row the hand has never typed on.
+    ///
+    /// Measured on glass 2026-09-15 (`c2_bs`, this branch): twelve runs of
+    /// twenty punched at least one such hole, up to 43 % of the band's
+    /// frames, and the hole stood for the rest of the run.
+    ///
+    /// THE TWIN: take the correction out (`typed_landing` returns the
+    /// tick's caret) and the hole and the stray both come back.
+    #[test]
+    fn a_key_lays_on_the_hands_row_when_a_repaint_has_parked_the_cursor() {
+        let c = cfg(true, true);
+        let g = geom();
+        let t0 = Instant::now();
+        let mut rib = Ribbon::new();
+        type_keys(
+            &mut rib,
+            t0,
+            Keys {
+                g,
+                row: 13,
+                col0: 2,
+                n: 16,
+                period_ms: 60,
+                disp: 0.7,
+            },
+            &c,
+        );
+        // The hand is at (13, 18): sixteen cells, columns 2..=17.
+        assert_eq!(rib.caret(), Some((13, 18)));
+        let lit = |rib: &Ribbon, row: u16| {
+            let mut v: Vec<u16> = rib
+                .cells()
+                .iter()
+                .filter(|l| l.row == row && !l.leaving())
+                .map(|l| l.col)
+                .collect();
+            v.sort_unstable();
+            v.dedup();
+            v
+        };
+        assert_eq!(lit(&rib, 13), (2..=17).collect::<Vec<_>>());
+        // The next key's echo is replayed on a tick the repaint has parked
+        // at the box's top-left. Nothing else about the key is unusual.
+        let now = at(t0, 16 * 60);
+        let cx = ctx_in(now, &c, (12, 0), 0.7, g);
+        rib.on_event(&typed(), now, &cx);
+        rib.plan(&cx);
+        assert_eq!(
+            lit(&rib, 13),
+            (2..=18).collect::<Vec<_>>(),
+            "the key did not land on the hand's own row, next to its last cell"
+        );
+        assert!(
+            lit(&rib, 11).is_empty(),
+            "a stray cell was laid on the row above's right end: {:?}",
+            lit(&rib, 11)
+        );
+        // …and a LEGITIMATE row change is still taken as it comes: a fresh
+        // hand, typing to the pane's edge, folds onto the next row and lays
+        // there.
+        let t0 = Instant::now();
+        let mut rib = Ribbon::new();
+        type_keys(
+            &mut rib,
+            t0,
+            Keys {
+                g,
+                row: 13,
+                col0: 2,
+                n: 16,
+                period_ms: 60,
+                disp: 0.7,
+            },
+            &c,
+        );
+        let now = at(t0, 16 * 60);
+        let cx = ctx_in(now, &c, (14, 1), 0.7, g);
+        rib.on_event(&typed(), now, &cx);
+        rib.plan(&cx);
+        assert_eq!(
+            lit(&rib, 14),
+            vec![0],
+            "the hand's own fold stopped laying on the row it folded onto"
+        );
+        // …and so is a run that simply BEGINS somewhere else: the caret
+        // mirror is the last PLANNED tick's caret, not the hand, so a first
+        // key struck against a mirror the app left far up the screen — a
+        // fresh prompt below, a footer, the `(0, 0)` a session starts at —
+        // must lay where the tick says. This is the clause the first cut of
+        // `typed_landing` did not have: it asked only whether the hand
+        // could have made the move, and dragged every such run back onto
+        // the stale row.
+        let t0 = Instant::now();
+        let mut rib = Ribbon::new();
+        let cx = ctx_in(t0, &c, (0, 0), 0.0, g);
+        rib.plan(&cx);
+        assert_eq!(rib.caret, Some((0, 0)), "fixture: the mirror is the app's");
+        let now = at(t0, 60);
+        let cx = ctx_in(now, &c, (13, 1), 0.7, g);
+        rib.on_event(&typed(), now, &cx);
+        rib.plan(&cx);
+        assert_eq!(
+            lit(&rib, 13),
+            vec![0],
+            "a run that began below the mirror was dragged back up to it"
+        );
+        assert!(
+            lit(&rib, 0).is_empty(),
+            "a phantom cell was laid on the mirror's own row: {:?}",
+            lit(&rib, 0)
+        );
+    }
+
+    /// **A REPAINT'S HOME IS NOT A GESTURE** (the owner, on 0.86: *"odd
+    /// logic of drawing a part of the trail when moving the cursor and
+    /// editing text"*). A bottom-pinned composer repaints by homing to the
+    /// box's top-left and rewriting; the host observes that intermediate
+    /// caret and a fresh type hint licenses it `Typed`. The hand cannot
+    /// type its way UP the screen and to the LEFT, so the ribbon must not
+    /// read it as leaving the row. Measured 2026-09-15 across five composer
+    /// takes: `(13,46)->(12,0)`, `(13,54)->(12,0)`, `(13,13)->(11,0)`,
+    /// `(13,6)->(12,0)` — four excursions, every one of them abandoning the
+    /// row the hand was still typing on.
+    ///
+    /// THE TWIN: call `leave_row` unconditionally again and the first
+    /// assertion goes red — the band the hand is typing into is abandoned
+    /// by a caret it never put there.
+    #[test]
+    fn a_repaints_home_pass_does_not_abandon_the_row_the_hand_is_typing_on() {
+        let c = cfg(true, true);
+        let g = geom();
+        for (excursion, what) in [
+            ((12u16, 0u16), "the row above, column 0"),
+            ((11, 0), "two rows above, column 0"),
+        ] {
+            let t0 = Instant::now();
+            let mut rib = Ribbon::new();
+            type_keys(
+                &mut rib,
+                t0,
+                Keys {
+                    g,
+                    row: 13,
+                    col0: 2,
+                    n: 20,
+                    period_ms: 60,
+                    disp: 0.7,
+                },
+                &c,
+            );
+            let ms = 19 * 60 + 60;
+            // The repaint's home, licensed `Typed` by the key in flight.
+            let now = at(t0, ms);
+            let cx = ctx_in(now, &c, excursion, 0.7, g);
+            rib.on_event(&typed_move((13, 22), excursion), now, &cx);
+            rib.plan(&cx);
+            assert!(
+                rib.cohorts().iter().all(|k| !k.abandoned),
+                "{what}: the repaint's home abandoned the band"
+            );
+            assert_eq!(
+                rib.cells()
+                    .iter()
+                    .filter(|l| l.row == 13 && !l.leaving())
+                    .count(),
+                20,
+                "{what}: the band lost cells to a caret the hand never put there"
+            );
+            // …and the hand's real backspace back through a fold still is a
+            // row change: up ONE row, to the row's right END.
+            let now = at(t0, ms + 60);
+            let cx = ctx_in(now, &c, (12, 79), 0.7, g);
+            rib.on_event(&typed_move((13, 2), (12, 79)), now, &cx);
+            rib.plan(&cx);
+            assert!(
+                rib.cohorts().iter().any(|k| k.row == 13 && k.abandoned),
+                "{what}: a backspace back through the fold stopped being a row change"
+            );
+        }
+    }
+
+    /// **A SCROLL HAS ALREADY TOLD THE RIBBON** (the owner, on 0.86:
+    /// *"awkward transitions when going to a new line"*). A composer at the
+    /// screen's bottom grows a row UP by scrolling the screen inside the
+    /// very repaint that re-lays the box, so `translate_scroll` has already
+    /// carried every cell of the row up WITH ITS GLYPHS — and the backward
+    /// caret the same repaint shows a moment later is not a stale line to
+    /// drain. Measured before this (`rbu-trace` gui 1177-1186):
+    /// `translate_scroll rows=1 cells=75`, then `re_anchor (12,77)->(12,2)`,
+    /// then `retract_suffix … live_on_row=75` — all 75 cells of the first
+    /// row of a wrapped input stamped into a 0.40 s retract.
+    ///
+    /// THE TWIN: drop the `scroll_followed` guard and every cell of the row
+    /// comes back retracting.
+    #[test]
+    fn a_re_anchor_inside_the_scroll_that_moved_the_band_drains_nothing() {
+        let c = cfg(true, true);
+        let g = geom();
+        let t0 = Instant::now();
+        let mut rib = Ribbon::new();
+        type_keys(
+            &mut rib,
+            t0,
+            Keys {
+                g,
+                row: 13,
+                col0: 2,
+                n: 20,
+                period_ms: 60,
+                disp: 0.7,
+            },
+            &c,
+        );
+        // The box grows a row up: the screen scrolls and the band follows.
+        rib.translate_scroll(1);
+        assert_eq!(
+            rib.cells().iter().filter(|l| l.row == 12).count(),
+            20,
+            "the band followed its text up"
+        );
+        // The same repaint's home pass, on the same tick.
+        let now = at(t0, 19 * 60 + 60);
+        let cx = ctx_in(now, &c, (13, 3), 0.7, g);
+        rib.on_event(&typed_move((12, 22), (12, 2)), now, &cx);
+        assert!(
+            rib.cells().iter().all(|l| l.retract_at.is_none()),
+            "the re-anchor drained the row the scroll had just carried: {:?}",
+            rib.cells()
+                .iter()
+                .filter(|l| l.retract_at.is_some())
+                .map(|l| l.col)
+                .collect::<Vec<_>>()
+        );
+        rib.plan(&cx);
+        // …and the guard is one TICK wide: a backward typed move on the next
+        // tick is the hand's own re-anchor again.
+        let now = at(t0, 19 * 60 + 120);
+        let cx = ctx_in(now, &c, (12, 2), 0.7, g);
+        rib.on_event(&typed_move((12, 22), (12, 2)), now, &cx);
+        assert!(
+            rib.cells().iter().any(|l| l.retract_at.is_some()),
+            "the scroll guard outlived its own tick"
+        );
+    }
+
     // -- 2026-09-13: the owner's gaps ----------------------------------------
 
     /// A typed echo licensed as one move — `from` → `to` on the same row.
@@ -14403,11 +16759,17 @@ mod tests {
         assert_eq!(rib.pending_erase, 0);
     }
 
-    /// THE HAND LEFT THE ROW: a typed move onto the next row abandons the
-    /// row it left into the point it left at, and keys on the new row do
-    /// not hold it — it is gone well inside the swoosh.
+    /// **A FOLD IS NOT A DEPARTURE** (2026-09-15, re-ruling the 2026-09-13
+    /// abandon): a typed move onto the next row is the same input
+    /// continuing, so the row it wrapped off keeps its own clock and leaves
+    /// through its own swoosh — it is NOT abandoned — and keys on the new
+    /// row still do not hold it (`OnlyOwnerRenews`), so it is gone well
+    /// inside the swoosh rather than persisting under the hand.
+    ///
+    /// THE TWIN: put `abandon_row` back on the fold and the first assertion
+    /// goes red immediately, and the "still lit 1 s later" one with it.
     #[test]
-    fn a_typed_row_change_lets_the_old_row_leave_toward_the_wrap_point() {
+    fn a_typed_row_change_lets_the_old_row_leave_on_its_own_clock() {
         let c = cfg(true, true);
         let t0 = Instant::now();
         let mut rib = Ribbon::new();
@@ -14430,11 +16792,18 @@ mod tests {
             .iter()
             .find(|k| k.row == 2)
             .expect("the old row");
-        assert!(old.abandoned, "the old row was not abandoned");
+        let last_key_on_the_old_row = old.alive_at;
+        assert!(
+            !old.abandoned,
+            "a fold abandoned the row the wrap came off: the band is killed at every wrap"
+        );
         assert_eq!(
-            old.retract_col,
-            Some(120),
-            "it retracts into the wrap point"
+            old.retract_col, None,
+            "nothing froze the old row's retract target: it has not entered one"
+        );
+        assert!(
+            last_key_on_the_old_row >= at(t0, 19 * 60),
+            "the old row keeps the life its last key gave it"
         );
         // Keys on the new row: the old row is not held.
         let keys = Keys {
@@ -14446,11 +16815,23 @@ mod tests {
             disp: 0.9,
         };
         type_keys(&mut rib, at(now, 60), keys, &c);
+        // THE BAND SPANS THE FOLD: a second after the wrap, with the hand
+        // typing below, the row it wrapped off is STILL LIT. Under the
+        // abandon it was empty by ~0.7 s — the owner's bare first row.
         let cx = ctx(at(now, 1000), &c, (3, 12), 0.9);
+        rib.plan(&cx);
+        assert_eq!(
+            rib.cells().iter().filter(|l| l.row == 2).count(),
+            20,
+            "the row the wrap came off went dark under the hand: the band does not span the fold"
+        );
+        // AND IT IS NOT PERSISTENT: measured 2026-09-15, the pool is empty
+        // between +1.6 s and +1.8 s — its own swoosh, not the hand's.
+        let cx = ctx(at(now, 2000), &c, (3, 12), 0.9);
         rib.plan(&cx);
         assert!(
             !rib.cells().iter().any(|l| l.row == 2),
-            "the old row is still lit 1 s after the hand left it"
+            "the old row is still lit 2 s after the hand left it"
         );
         assert!(rib.cells().iter().any(|l| l.row == 3), "the new row is lit");
     }
@@ -14504,7 +16885,25 @@ mod tests {
             .iter()
             .find(|k| k.row == 2)
             .expect("the old row");
-        assert!(old.abandoned && old.retract_col == Some(75));
+        // The old row is not abandoned by its own wrap; what leaves it is
+        // exactly the cells the wrap MOVED — the space at 72 and `cd` at
+        // 73..74 — which are the cells relaid on the new row above.
+        assert!(!old.abandoned, "the wrap abandoned the row it came off");
+        for col in 72..75u16 {
+            assert!(
+                rib.cells()
+                    .iter()
+                    .any(|l| l.row == 2 && l.col == col && l.retract_at.is_some()),
+                "the moved word's cell {col} did not leave the old row with its glyph"
+            );
+        }
+        assert!(
+            rib.cells()
+                .iter()
+                .filter(|l| l.row == 2 && l.col < 72)
+                .all(|l| l.retract_at.is_none()),
+            "the wrap took light the app did not move"
+        );
         // TWO MOVES: the caret parks at the inset first; the seam refuses
         // the second half; the next key's licensed echo settles it.
         let mut rib = Ribbon::new();

@@ -10,6 +10,9 @@
 # Features enabled:
 # - Directory tracking (OSC 7): tab title updates, "Open Terminal Here" support
 # - Command tracking (OSC 133): command history indexing, timing, notifications
+# - The managed dirs, LIVE: an already-running session shell resolves claude/codex
+#   to atpkg's <prefix>/agents twins the moment atpkg lays them - no new tab
+#   (owner ask 2026-09-16; see LIVE below)
 #
 # Compatible with: Windows PowerShell 5.1 and PowerShell 7+ (pwsh) on any OS.
 # ASCII only: aterm writes this file without a BOM, and Windows PowerShell 5.1
@@ -46,12 +49,7 @@ if ($HOME) {
 # profile that dot-sources this file itself is re-fronted only at that point.
 # Asserted before the reroute block, so PATH reads reroute, agents, ... - the spawn
 # seam's own order. Inert when the variable is unset or names no directory.
-if ($env:ATPKG_AGENTS -and (Test-Path -LiteralPath $env:ATPKG_AGENTS -PathType Container)) {
-    $__aterm_sep = [string][System.IO.Path]::PathSeparator
-    $__aterm_rest = @(($env:PATH -split [regex]::Escape($__aterm_sep)) | Where-Object { $_ -ne $env:ATPKG_AGENTS })
-    $env:PATH = (@($env:ATPKG_AGENTS) + $__aterm_rest) -join $__aterm_sep
-}
-
+#
 # The reroute directory, FIRST. $env:ATERM_REROUTE_DIR is set by aterm's spawn
 # seam: the session-scoped directory of stubs for the upstream Rust names
 # (aterm help reroute), which the seam already put first on the PATH it handed
@@ -62,10 +60,108 @@ if ($env:ATPKG_AGENTS -and (Test-Path -LiteralPath $env:ATPKG_AGENTS -PathType C
 # is move-to-front: every existing occurrence is removed by equality, then the
 # directory is prepended. Inert outside a session (variable unset) and on
 # Windows, where no stubs are laid and the directory does not exist.
-if ($env:ATERM_REROUTE_DIR -and (Test-Path -LiteralPath $env:ATERM_REROUTE_DIR -PathType Container)) {
+#
+# Both moves live in one function so the LIVE hot path below can repeat them; it
+# also records, in $Global:__aterm_managed_want, the dirs it put in front (in
+# order), which the hot path compares the head of PATH against.
+$Global:__aterm_managed_want = @()
+$Global:__aterm_managed_agents_on = $false
+$Global:__aterm_managed_reroute_on = $false
+function Global:__aterm_reroute_path_front {
+    $Global:__aterm_managed_want = @()
+    $Global:__aterm_managed_agents_on = $false
+    $Global:__aterm_managed_reroute_on = $false
+    if ($env:ATPKG_AGENTS -and (Test-Path -LiteralPath $env:ATPKG_AGENTS -PathType Container)) {
+        $__aterm_sep = [string][System.IO.Path]::PathSeparator
+        $__aterm_rest = @(($env:PATH -split [regex]::Escape($__aterm_sep)) | Where-Object { $_ -ne $env:ATPKG_AGENTS })
+        $env:PATH = (@($env:ATPKG_AGENTS) + $__aterm_rest) -join $__aterm_sep
+        $Global:__aterm_managed_want = @($env:ATPKG_AGENTS)
+        $Global:__aterm_managed_agents_on = $true
+    }
+    if ($env:ATERM_REROUTE_DIR -and (Test-Path -LiteralPath $env:ATERM_REROUTE_DIR -PathType Container)) {
+        $__aterm_sep = [string][System.IO.Path]::PathSeparator
+        $__aterm_rest = @(($env:PATH -split [regex]::Escape($__aterm_sep)) | Where-Object { $_ -ne $env:ATERM_REROUTE_DIR })
+        $env:PATH = (@($env:ATERM_REROUTE_DIR) + $__aterm_rest) -join $__aterm_sep
+        $Global:__aterm_managed_want = @($env:ATERM_REROUTE_DIR) + $Global:__aterm_managed_want
+        $Global:__aterm_managed_reroute_on = $true
+    }
+}
+__aterm_reroute_path_front
+
+# --- LIVE: the tab that is ALREADY OPEN picks the managed dirs up the moment atpkg lays them ---
+#
+# Owner, 2026-09-16: "aterm atpkg DID install the latest but it didn't make them
+# available for me. instead, it is telling me to open a new tab. NO! all the
+# latest and best MUST WORK IN THE SAME TAB with live update!" Measured on macOS:
+# a shell (pid 1784) spawned 10:44:24 by the previous app build and adopted across
+# the seamless update (app 10:44:32) never saw the agents/ dir and shell.d hooks
+# the new build created at 10:46 - the one assert above runs at load only. The
+# same policy as the zsh/bash/fish scripts, best effort here: re-asserted from the
+# prompt function and from the PSReadLine submit shim (the only preexec seam), the
+# hook ~/.aterm/shell.d/00-atpkg.ps1 (crates/atpkg/src/hooks.rs) dot-sourced when
+# $env:ATPKG_AGENTS is unset or its LastWriteTimeUtc moved since it was last
+# sourced (a .NET call, no process), $env:ATERM_REROUTE_DIR derived as the
+# sibling <dir of ATPKG_AGENTS>/reroute unless ATERM_NO_REROUTE is engaged
+# (non-empty and not '0'), a dir that was absent when the front was last laid
+# re-probed until it appears, and PATH re-fronted only when its head is not
+# already reroute, agents. Gated on being inside an aterm session (ATERM_CHILD=1 or
+# ATERM_SESSION_ID), never on ATERM_REROUTE_DIR, which the adopted shell lacks.
+$Global:__aterm_atpkg_hook = $null
+if ($HOME) { $Global:__aterm_atpkg_hook = Join-Path $HOME '.aterm/shell.d/00-atpkg.ps1' }
+$Global:__aterm_atpkg_hook_seen = $null
+$Global:__aterm_managed_live = [bool]($env:ATERM_CHILD -or $env:ATERM_SESSION_ID)
+if ($Global:__aterm_managed_live -and $env:ATPKG_AGENTS -and $Global:__aterm_atpkg_hook -and [System.IO.File]::Exists($Global:__aterm_atpkg_hook)) {
+    $Global:__aterm_atpkg_hook_seen = [System.IO.File]::GetLastWriteTimeUtc($Global:__aterm_atpkg_hook).Ticks
+}
+
+function Global:__aterm_managed_derive_reroute {
+    if ($env:ATERM_REROUTE_DIR -or -not $env:ATPKG_AGENTS) { return }
+    if ($env:ATERM_NO_REROUTE -and ($env:ATERM_NO_REROUTE -ne '0')) { return }
+    $__aterm_parent = Split-Path -Parent $env:ATPKG_AGENTS
+    if (-not $__aterm_parent) { return }
+    $__aterm_dir = Join-Path $__aterm_parent 'reroute'
+    if (Test-Path -LiteralPath $__aterm_dir -PathType Container) { $env:ATERM_REROUTE_DIR = $__aterm_dir }
+}
+
+function Global:__aterm_managed_path_live {
+    if (-not $Global:__aterm_managed_live -or -not $Global:__aterm_atpkg_hook) { return }
+    # 1. The hook.
+    if ([System.IO.File]::Exists($Global:__aterm_atpkg_hook)) {
+        $__aterm_stamp = [System.IO.File]::GetLastWriteTimeUtc($Global:__aterm_atpkg_hook).Ticks
+        if ((-not $env:ATPKG_AGENTS) -or ($__aterm_stamp -ne $Global:__aterm_atpkg_hook_seen)) {
+            $Global:__aterm_atpkg_hook_seen = $__aterm_stamp
+            . $Global:__aterm_atpkg_hook
+            __aterm_managed_derive_reroute
+            __aterm_reroute_path_front
+            return
+        }
+    }
+    # 2. A dir that was absent when the front was last laid: probe it again (only
+    #    in that degraded state), and front it the moment it appears.
+    $__aterm_refront = $false
+    if ((-not $Global:__aterm_managed_agents_on) -and $env:ATPKG_AGENTS -and (Test-Path -LiteralPath $env:ATPKG_AGENTS -PathType Container)) { $__aterm_refront = $true }
+    if (-not $Global:__aterm_managed_reroute_on) {
+        if ($env:ATERM_REROUTE_DIR) {
+            if (Test-Path -LiteralPath $env:ATERM_REROUTE_DIR -PathType Container) { $__aterm_refront = $true }
+        } else {
+            __aterm_managed_derive_reroute
+            if ($env:ATERM_REROUTE_DIR) { $__aterm_refront = $true }
+        }
+    }
+    if ($__aterm_refront) { __aterm_reroute_path_front; return }
+    # 3. The order: re-front only on a mismatch.
+    $__aterm_n = $Global:__aterm_managed_want.Count
+    if ($__aterm_n -eq 0) { return }
     $__aterm_sep = [string][System.IO.Path]::PathSeparator
-    $__aterm_rest = @(($env:PATH -split [regex]::Escape($__aterm_sep)) | Where-Object { $_ -ne $env:ATERM_REROUTE_DIR })
-    $env:PATH = (@($env:ATERM_REROUTE_DIR) + $__aterm_rest) -join $__aterm_sep
+    $__aterm_head = @(($env:PATH -split [regex]::Escape($__aterm_sep)) | Select-Object -First $__aterm_n)
+    if ($__aterm_head.Count -eq $__aterm_n) {
+        $__aterm_same = $true
+        for ($__aterm_i = 0; $__aterm_i -lt $__aterm_n; $__aterm_i++) {
+            if ($__aterm_head[$__aterm_i] -cne $Global:__aterm_managed_want[$__aterm_i]) { $__aterm_same = $false; break }
+        }
+        if ($__aterm_same) { return }
+    }
+    __aterm_reroute_path_front
 }
 
 # Capture the capability nonce into a PowerShell variable so we can
@@ -143,6 +239,8 @@ function Global:Prompt {
     $__aterm_ok = $global:?
     $__aterm_exit = $global:LASTEXITCODE
     Set-StrictMode -Off
+    # The managed dirs, live (see LIVE above).
+    __aterm_managed_path_live
     $__aterm_esc = [char]27
     $__aterm_bel = [char]7
     $__aterm_suffix = __aterm_id_suffix
@@ -214,6 +312,8 @@ if (Get-Module -Name PSReadLine) {
     $Global:__aterm_original_readline = $function:PSConsoleHostReadLine
     function Global:PSConsoleHostReadLine {
         $__aterm_line = [string]($Global:__aterm_original_readline.Invoke())
+        # The managed dirs, live - BEFORE this line executes (see LIVE above).
+        __aterm_managed_path_live
         if ($__aterm_line -and $__aterm_line.Trim()) {
             $__aterm_esc = [char]27
             $__aterm_bel = [char]7

@@ -174,8 +174,18 @@ mod tests {
     /// Every test here needs a GPU. A machine without one (a VM, a sandbox that
     /// denies the device) should SKIP rather than fail, but a machine WITH one
     /// must actually run the checks — so the skip is loud.
+    ///
+    /// It is [`Device::preferred`], the device the metal arm renders on, not the
+    /// system default: on a dual-GPU Mac the system default is the discrete GPU
+    /// while the wgpu arm these rows compare against asks for the low-power one
+    /// (`power_preference_from_env`), and two GPUs round a blended channel
+    /// differently. Measured on an Intel HD 630 + Radeon Pro 560 MacBook Pro
+    /// (macOS 13.7.8): with the system default here and in `MetalBlit::new`
+    /// (whose only caller is this harness), eight byte-for-byte rows were red
+    /// by a max channel delta of 1. Four more went red the same way through
+    /// renderer.rs's three differential helpers, which take `preferred` too.
     fn device() -> Option<Device> {
-        let d = Device::system_default();
+        let d = Device::preferred();
         if d.is_none() {
             crate::stderr_line!("SKIP: no Metal device on this machine");
         }
@@ -2576,7 +2586,7 @@ mod tests {
         let atlas_tex = mint
             .texture_2d(PixelFormat::Rgba8Unorm, AW, AH, TEXTURE_USAGE_SHADER_READ)
             .expect("RGBA atlas");
-        // SAFETY: fresh 2-D shared Rgba8Unorm texture of exactly AW x AH;
+        // SAFETY: fresh 2-D Managed Rgba8Unorm texture of exactly AW x AH;
         // `atlas_bytes` is AW*AH*4 bytes at a tight AW*4 stride.
         unsafe {
             atlas_tex.upload(MtlRegion::full_2d(AW, AH), &atlas_bytes, AW * 4);
@@ -2831,7 +2841,7 @@ mod tests {
         let atlas_tex = mint
             .texture_2d(PixelFormat::R8Unorm, AW, AH, TEXTURE_USAGE_SHADER_READ)
             .expect("R8 atlas");
-        // SAFETY: fresh 2-D shared R8Unorm texture of exactly AW x AH;
+        // SAFETY: fresh 2-D Managed R8Unorm texture of exactly AW x AH;
         // `atlas_bytes` is AW*AH bytes at a tight AW-byte stride.
         unsafe {
             atlas_tex.upload(MtlRegion::full_2d(AW, AH), &atlas_bytes, AW);
@@ -3766,6 +3776,71 @@ mod tests {
         crate::stderr_line!(
             "armed pipelining: {N} frames byte-identical; Submit A held in \
              flight each frame; staging awaited exactly N-1 priors"
+        );
+    }
+
+    /// THE PIPELINING WAIT POLLS BEFORE IT PARKS, AND ANY PARK IS PRICED.
+    ///
+    /// `await_frame_slot` resolves to `waitUntilCompleted`, which takes NO
+    /// timeout: on a contended GPU the UI thread sits in it before a single
+    /// instance stream is staged, and that wait lands INSIDE the present's work
+    /// timer — so it reached the frontend as `frame_render`, counted against
+    /// `slow_frames`, and fed the load-shed latch as if compose were the
+    /// producer. The wait itself is load-bearing (the shared-storage rewrite
+    /// discipline: resident buffers may not be rewritten under a live Submit
+    /// A), so it STAYS. What changed is that it polls first and clocks whatever
+    /// park remains.
+    ///
+    /// On a steady armed loop the prior Submit A is long terminal by the next
+    /// frame's staging — the readback between them is ordered behind it on the
+    /// one queue — so every staging wait must take the poll arm and book ZERO
+    /// park. NON-VACUITY: `awaited` proves the wait really ran and really
+    /// consumed each prior, so the zero reads "polled and found terminal", not
+    /// "never waited".
+    #[test]
+    fn the_staging_wait_polls_first_and_books_no_park_on_a_steady_loop() {
+        const N: usize = 4;
+        if device().is_none() {
+            return;
+        }
+        let mut armed = match GpuRenderer::new(18.0, Theme::default()) {
+            Ok(g) => g,
+            Err(e) => {
+                crate::stderr_line!("SKIP: no renderer/font: {e}");
+                return;
+            }
+        };
+        armed.arm_metal_for_test();
+        armed.debug_block_on_lazy_fallbacks();
+        let mut win = WindowGpu::new();
+        for i in 0..N {
+            let mut term = Terminal::new(ROWS as u16, COLS as u16);
+            term.process(format!("$ park frame {i}\r\n").as_bytes());
+            let input = term.cell_frame(ROWS, COLS);
+            let _ = armed.render_input(&mut win, &input, None);
+            let (slot_park_ns, ring_park_ns) = armed.metal_park_probe_for_test();
+            let (_, awaited) = armed.metal_pipeline_probe_for_test();
+            assert_eq!(
+                awaited, i as u64,
+                "frame {i}: the staging wait must have consumed exactly the \
+                 prior frames' submits — without that the park ledger is vacuous"
+            );
+            assert_eq!(
+                ring_park_ns, 0,
+                "frame {i}: the offscreen path presents nothing, so the pending \
+                 ring must never drain (booked {ring_park_ns} ns)"
+            );
+            assert_eq!(
+                slot_park_ns, 0,
+                "frame {i}: the prior Submit A was already terminal, so the \
+                 staging wait must have taken the poll arm and booked no park \
+                 (booked {slot_park_ns} ns)"
+            );
+        }
+        crate::stderr_line!(
+            "armed park ledger: {N} frames; the staging wait consumed {} priors \
+             and booked 0 ns of park",
+            N - 1
         );
     }
 
@@ -5267,7 +5342,7 @@ mod tests {
         let half = mint
             .texture_2d(PixelFormat::Rgba8Unorm, BW, BH, TEXTURE_USAGE_SHADER_READ)
             .expect("half-res source");
-        // SAFETY: fresh shared texture, tight stride.
+        // SAFETY: fresh managed texture, tight stride.
         unsafe { ffi::texture_upload(half.obj(), MtlRegion::full_2d(BW, BH), &src, BW * 4) };
         let dst = mint
             .texture_2d(PixelFormat::Rgba8Unorm, W, H, usage)
@@ -5416,7 +5491,7 @@ mod tests {
         let scratch_tex = mint
             .texture_2d(PixelFormat::Rgba8Unorm, W, H, TEXTURE_USAGE_SHADER_READ)
             .expect("scratch");
-        // SAFETY: fresh shared texture, tight stride.
+        // SAFETY: fresh managed texture, tight stride.
         unsafe {
             ffi::texture_upload(scratch_tex.obj(), MtlRegion::full_2d(W, H), &scratch, W * 4);
         }
@@ -5640,7 +5715,7 @@ mod tests {
                 .expect("the crown row builds");
             let texel = fmt.bytes_per_texel();
             let dst = mint.texture_2d(fmt, W, H, usage).expect("target");
-            // SAFETY: fresh shared texture, tight stride.
+            // SAFETY: fresh managed texture, tight stride.
             unsafe { ffi::texture_upload(dst.obj(), MtlRegion::full_2d(W, H), seed, W * texel) };
             #[expect(clippy::cast_precision_loss, reason = "test extents")]
             let cu = CrownU {
@@ -5783,7 +5858,7 @@ mod tests {
         let card_tex = mint
             .texture_2d(PixelFormat::Rgba8Unorm, PW, PH, TEXTURE_USAGE_SHADER_READ)
             .expect("card");
-        // SAFETY: fresh shared texture, tight stride.
+        // SAFETY: fresh managed texture, tight stride.
         unsafe { ffi::texture_upload(card_tex.obj(), MtlRegion::full_2d(PW, PH), &card, PW * 4) };
         let dst = mint
             .texture_2d(

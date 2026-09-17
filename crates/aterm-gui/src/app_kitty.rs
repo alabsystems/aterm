@@ -487,6 +487,79 @@ mod tests {
         }
     }
 
+    /// **TIER-1 BINDING FOR `CompanionTenureFlicker`** — the REAL gate, driven
+    /// through a flicker storm beside the model.
+    ///
+    /// The model (aterm-spec's `companion_tenure_flicker_model`, discharged by
+    /// `derived_companion_tenure_flicker_proves_and_catches_a_flapping_cat`)
+    /// proves that across a whole alternating storm the worn identity never
+    /// changes. That is a statement about THIS gate, so this is where it is
+    /// held to it: the same alternation, at a cadence far below `TENURE`, with
+    /// `worn()` read after every single observation.
+    ///
+    /// The mechanism is the `_` arm of `observe`, which is easy to read past:
+    /// any observation that does not match the standing candidate RESTARTS it
+    /// at `now`. A pane that alternates therefore never accumulates dwell. This
+    /// is the shape a command block opening and closing puts on the gate, and
+    /// it is the first thing to check when someone says the cat is flickering:
+    /// if this law ever broke, the cat would change identity on every block.
+    #[test]
+    fn companion_tenure_flicker_conformance_real_gate_holds_the_cat_still() {
+        let m = aterm_spec::derive::companion_tenure_flicker_model();
+        let mut st = m.init_state();
+        let mut gate = KittyTenure::default();
+        let claude = ident("claude");
+        let t0 = Instant::now();
+        // A cadence well inside TENURE, so the storm is a storm and not six
+        // separate tenures served back to back.
+        let beat = TENURE / 8;
+
+        for k in 0..3u32 {
+            assert!(
+                m.fire("SeeProgram", &mut st),
+                "the model admits the block opening"
+            );
+            let worn = gate.observe(Some(&claude), t0 + beat * (2 * k)).cloned();
+            assert!(
+                worn.is_none(),
+                "beat {k}: a program that has not dwelled cannot take the cursor"
+            );
+            assert_eq!(st.get("worn"), Some(&0), "and the model agrees");
+
+            assert!(
+                m.fire("SeeNone", &mut st),
+                "the model admits the block closing"
+            );
+            let worn = gate.observe(None, t0 + beat * (2 * k + 1)).cloned();
+            assert!(worn.is_none(), "beat {k}: still the base cat");
+            assert_eq!(st.get("worn"), Some(&0));
+            assert!(m.check_invariant("FlickerNeverLands", &st));
+        }
+        assert_eq!(
+            st.get("changes"),
+            Some(&0),
+            "six flickers and the model counted no identity change"
+        );
+        assert!(
+            gate.worn().is_none(),
+            "and the real gate is still on the base cat"
+        );
+
+        // THE NEGATIVE CONTROL, so the law above is not merely "nothing ever
+        // lands": the same program, observed STEADILY across TENURE, does take
+        // the cursor. A gate that never landed would satisfy the invariant and
+        // be useless.
+        let mut steady = KittyTenure::default();
+        assert!(steady.observe(Some(&claude), t0).is_none());
+        assert_eq!(
+            steady
+                .observe(Some(&claude), t0 + TENURE)
+                .map(|i| i.id.clone()),
+            Some("claude".to_owned()),
+            "a program that really holds the pane lands at TENURE"
+        );
+    }
+
     /// The RAW claim: prompt-side states claim nothing (the base cat, not a
     /// "shell" cat), a nested shell claims nothing, and an `Executing` block
     /// with a commandline hands the pane to the named program.

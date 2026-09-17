@@ -135,6 +135,33 @@ pub fn exclude_from_backup(dir: &Path) {
     let Ok(path) = std::ffi::CString::new(dir.as_os_str().as_bytes()) else {
         return; // an interior NUL cannot name a real path
     };
+    // READ BEFORE WRITING. A `setxattr(2)` that stores the very value already there still
+    // moves the directory's `st_ctime` (measured on APFS, 2026-09-15), and this runs on the
+    // prefix at every store-lock acquisition — every `repair`, `gc`, install and update
+    // pass. tippy snapshots the ctime of every ancestor of the executable it runs, and the
+    // prefix is one for the store and for every exec root, so the re-write aborted every
+    // tippy in flight ("ancestor … changed identity or contents", measured in a hermetic
+    // prefix the same day). An attribute that already holds the value is left alone.
+    #[cfg(target_os = "macos")]
+    {
+        let mut have = [0u8; 64];
+        // SAFETY: `path` and `ATTR` are NUL-terminated C strings that outlive the call, and
+        // `have` is a writable buffer of the stated length; `getxattr` writes at most that
+        // many bytes and returns how many it wrote, or -1.
+        let n = unsafe {
+            libc::getxattr(
+                path.as_ptr(),
+                ATTR.as_ptr().cast::<libc::c_char>(),
+                have.as_mut_ptr().cast::<libc::c_void>(),
+                have.len(),
+                0,
+                0,
+            )
+        };
+        if usize::try_from(n).is_ok_and(|n| have.get(..n) == Some(TRUE_BPLIST)) {
+            return;
+        }
+    }
     // SAFETY: `path` and `ATTR` are NUL-terminated C strings that outlive the call, the
     // value pointer/length describe a `'static` slice, and the return value is ignored
     // because failure is explicitly acceptable here.
@@ -213,7 +240,7 @@ pub fn spotlight_query(scope: &Path, filename: &str) -> Option<bool> {
 /// ```
 ///
 /// Handed the deep path its caller has (`verify`'s scope is a repo's parent directory),
-/// the byte scan below finds neither "disabled" nor "enabled" and this answers `None` on
+/// the status-line read ([`mdutil_index_state`]) finds no state and this answers `None` on
 /// every realistic input — which made the `IndexingDisabled` refinement dead code, and
 /// told a user who had just run the documented remedy `mdutil -i off /System/Volumes/Data`
 /// to "re-run on a less busy machine" after a 20 s wait. The mount point comes from
@@ -241,7 +268,7 @@ pub fn spotlight_query(scope: &Path, filename: &str) -> Option<bool> {
 ///
 /// Non-macOS: `None`.
 #[must_use]
-pub fn spotlight_indexing_enabled(path: &Path) -> Option<bool> {
+pub fn spotlight_index_state(path: &Path) -> Option<crate::platform::IndexState> {
     #[cfg(target_os = "macos")]
     {
         let volume = mount_point_of(path);
@@ -249,24 +276,54 @@ pub fn spotlight_indexing_enabled(path: &Path) -> Option<bool> {
         let mut cmd = Command::new("/usr/bin/mdutil");
         cmd.arg("-s").arg(asked.as_os_str());
         let stdout = bounded_stdout(&mut cmd)?;
-        // `mdutil -s` answers for the volume in one line: "Indexing enabled.",
-        // "Indexing disabled." or "Indexing and searching disabled." DISABLED is tested
-        // first because all three lines begin "Indexing", so a leading-word match would
-        // read the third as enabled — and the direction of that mistake is the one that
-        // tells a user their build output is hidden when it is being indexed.
-        if contains_ascii_ci(&stdout, b"disabled") {
-            return Some(false);
-        }
-        if contains_ascii_ci(&stdout, b"enabled") {
-            return Some(true);
-        }
-        None
+        mdutil_index_state(&stdout)
     }
     #[cfg(not(target_os = "macos"))]
     {
         let _ = path;
         None
     }
+}
+
+/// What one `mdutil -s <volume>` answer says — the one question
+/// [`spotlight_index_state`]'s caller has (a probe it planted never showed up in the
+/// index; is that the volume's state, or a busy machine?).
+///
+/// The answer is the STATUS LINE after the volume's name (`<volume>:` on its own line,
+/// then one tab-indented line): "Indexing enabled.", "Indexing disabled.", "Indexing
+/// and searching disabled." — and "Index is read-only." (measured 2026-09-16 on the
+/// owner's data volume, macOS 26.6.2, at 96% full: mds's low-disk-space hold — the index
+/// stands and answers searches, but takes no new entries, so a planted probe never
+/// arrives; it lifts when space is freed). Only the status line is read — the volume's
+/// name is echoed above it and a volume called `disabled-drive` must not read as a
+/// state — and an `Error:` line is no state at all, whatever path it quotes
+/// (`mdutil -s /no/such` prints `Error: invalid path `/no/such'.` on ONE line, with no
+/// name line above it — the shape the no-mount-point fallback gets). Within the status
+/// line "disabled" is matched by substring, so the third answer reads as disabled
+/// whichever word it leads with.
+#[cfg(target_os = "macos")]
+fn mdutil_index_state(stdout: &[u8]) -> Option<crate::platform::IndexState> {
+    use crate::platform::IndexState;
+    let text = String::from_utf8_lossy(stdout);
+    let status = text
+        .lines()
+        .map(str::trim)
+        .filter(|l| !l.is_empty())
+        .find(|l| !l.ends_with(':'))?;
+    if status.starts_with("Error") {
+        return None;
+    }
+    let status = status.as_bytes();
+    if contains_ascii_ci(status, b"read-only") {
+        return Some(IndexState::ReadOnly);
+    }
+    if contains_ascii_ci(status, b"disabled") {
+        return Some(IndexState::Disabled);
+    }
+    if contains_ascii_ci(status, b"enabled") {
+        return Some(IndexState::Enabled);
+    }
+    None
 }
 
 /// The `defaults(1)` domain of macOS Universal Control, per-host (`-currentHost`).
@@ -282,16 +339,30 @@ pub const UNIVERSAL_CONTROL_KEYS: [&str; 2] = ["Disable", "DisableMagicEdges"];
 /// READ-ONLY. `/usr/bin/defaults` is named absolutely, never through `PATH`, like the
 /// Spotlight probes above. Non-macOS: `[None, None]`.
 #[must_use]
-pub fn universal_control_state() -> [Option<bool>; 2] {
+pub fn universal_control_state() -> [crate::machine::KeyRead; 2] {
     #[cfg(target_os = "macos")]
     {
         let read = |key: &str| {
+            use crate::machine::KeyRead;
             let mut cmd = Command::new("/usr/bin/defaults");
             cmd.arg("-currentHost")
                 .arg("read")
                 .arg(UNIVERSAL_CONTROL_DOMAIN)
                 .arg(key);
-            bounded_stdout(&mut cmd).and_then(|out| crate::machine::parse_defaults_bool(&out))
+            // ABSENT IS AN ANSWER; UNUSABLE IS NOT. `defaults read` of a key that is not
+            // set exits 1 with EMPTY stdout — that is macOS saying "the OS default", and
+            // it is the shape this feature is normally looking at. Anything else (the
+            // binary would not run, the deadline killed it, a nonzero exit that still
+            // printed something, or output this module cannot parse) taught us nothing,
+            // and must not be folded into the same `None` the OS default arrives as.
+            match bounded_exit_and_stdout(&mut cmd) {
+                Some((true, out)) => match crate::machine::parse_defaults_bool(&out) {
+                    Some(value) => KeyRead::Value(value),
+                    None => KeyRead::Unusable,
+                },
+                Some((false, out)) if out.is_empty() => KeyRead::Absent,
+                Some((false, _)) | None => KeyRead::Unusable,
+            }
         };
         [
             read(UNIVERSAL_CONTROL_KEYS[0]),
@@ -300,7 +371,12 @@ pub fn universal_control_state() -> [Option<bool>; 2] {
     }
     #[cfg(not(target_os = "macos"))]
     {
-        [None, None]
+        // Not macOS: there is no domain to read, which is a measured absence of the
+        // feature, not a failed read.
+        [
+            crate::machine::KeyRead::Absent,
+            crate::machine::KeyRead::Absent,
+        ]
     }
 }
 
@@ -331,7 +407,7 @@ pub fn universal_control_disable() -> bool {
 
 /// The mount point of the volume holding `path` (`statfs(2)`'s `f_mntonname`), or `None`
 /// when `statfs` failed — a path that does not exist, or a name too long to make a
-/// `CString`. The one caller ([`spotlight_indexing_enabled`]) falls back to `path` itself,
+/// `CString`. The one caller ([`spotlight_index_state`]) falls back to `path` itself,
 /// which is no worse than the behaviour before this existed.
 #[cfg(target_os = "macos")]
 fn mount_point_of(path: &Path) -> Option<PathBuf> {
@@ -380,8 +456,27 @@ fn mount_point_of(path: &Path) -> Option<PathBuf> {
 /// Reading stdout only after the child exits cannot deadlock on a full pipe here: both
 /// callers ask a question whose answer is one unique probe token or one `mdutil` line, so
 /// it is far inside the pipe buffer.
+/// [`bounded_stdout`], but keeping the child's SUCCESS bit instead of folding a nonzero
+/// exit into `None`.
+///
+/// `defaults read` uses exit 1 with empty output to mean "this key is not set", which is
+/// a real answer about the machine; the caller needs to tell it apart from a read that
+/// did not happen.
+#[cfg(target_os = "macos")]
+fn bounded_exit_and_stdout(cmd: &mut Command) -> Option<(bool, Vec<u8>)> {
+    bounded_stdout_inner(cmd)
+}
+
 #[cfg(target_os = "macos")]
 fn bounded_stdout(cmd: &mut Command) -> Option<Vec<u8>> {
+    match bounded_stdout_inner(cmd)? {
+        (true, out) => Some(out),
+        (false, _) => None,
+    }
+}
+
+#[cfg(target_os = "macos")]
+fn bounded_stdout_inner(cmd: &mut Command) -> Option<(bool, Vec<u8>)> {
     use std::io::Read as _;
     use std::process::Stdio;
     const CEILING: std::time::Duration = std::time::Duration::from_secs(5);
@@ -408,19 +503,16 @@ fn bounded_stdout(cmd: &mut Command) -> Option<Vec<u8>> {
             Err(_) => return None,
         }
     };
-    if !status.success() {
-        return None;
-    }
     let mut stdout = Vec::new();
     if let Some(mut pipe) = child.stdout.take() {
         let _ = pipe.read_to_end(&mut stdout);
     }
-    Some(stdout)
+    Some((status.success(), stdout))
 }
 
 /// Case-insensitive ASCII substring test over raw bytes — enough to read `mdutil`'s
-/// one-line answer without decoding it, and without a dependency. `needle` is a non-empty
-/// byte-string literal at both call sites; `windows(0)` would panic.
+/// status line, without a dependency. `needle` is a non-empty byte-string literal at
+/// every call site ([`mdutil_index_state`]); `windows(0)` would panic.
 #[cfg(target_os = "macos")]
 fn contains_ascii_ci(haystack: &[u8], needle: &[u8]) -> bool {
     haystack.len() >= needle.len()
@@ -448,7 +540,11 @@ pub fn ensure_shared_dir(dir: &Path) -> std::io::Result<()> {
         ));
     }
     std::fs::create_dir_all(dir)?;
-    std::fs::set_permissions(dir, std::fs::Permissions::from_mode(0o755))?;
+    // Only a mode that differs is written: a same-mode `chmod(2)` still moves `st_ctime`,
+    // which tippy's ancestor check reads (see `aterm_update_core::ensure_private_dir`).
+    if !std::fs::symlink_metadata(dir).is_ok_and(|m| m.mode() & 0o7777 == 0o755) {
+        std::fs::set_permissions(dir, std::fs::Permissions::from_mode(0o755))?;
+    }
     Ok(())
 }
 
@@ -531,6 +627,18 @@ pub fn set_mode(path: &Path, mode: u32) -> io::Result<()> {
     fs::set_permissions(path, Permissions::from_mode(mode))
 }
 
+/// Set an OPEN file's permission bits to `mode`: `fchmod(2)` on the handle, which std
+/// lowers `File::set_permissions` to.
+///
+/// The same bits as [`set_mode`], for a caller that still holds the file it just wrote
+/// ([`crate::extract::write_capped`]): no second resolution of the path — which for a
+/// staged toolchain is a deep `<prefix>/store/<program>/<build>.incoming-<pid>/lib/...`
+/// walk paid once per file — and the mode lands on the inode we wrote by construction
+/// rather than on whatever the name resolves to now.
+pub fn set_mode_on(f: &File, mode: u32) -> io::Result<()> {
+    f.set_permissions(Permissions::from_mode(mode))
+}
+
 /// Open `path` for a fresh (create+truncate) write with initial permission `mode`.
 pub fn open_create_write(path: &Path, mode: u32) -> io::Result<File> {
     OpenOptions::new()
@@ -539,6 +647,37 @@ pub fn open_create_write(path: &Path, mode: u32) -> io::Result<File> {
         .truncate(true)
         .mode(mode)
         .open(path)
+}
+
+/// Push ONE open file's contents out of the page cache: a plain `fsync(2)`.
+///
+/// **Deliberately not [`File::sync_all`].** On Apple targets std lowers BOTH `sync_all`
+/// and `sync_data` to `fcntl(F_FULLFSYNC)` — a full device-cache flush, a barrier of
+/// milliseconds each however few bytes the file holds. The caller
+/// ([`crate::store::sync_tree`]) flushes an entire staged toolchain, tens of thousands of
+/// files for the ~3.4 GB `trust` member, so a drive flush per file would add minutes to
+/// every install and buy only the difference between "the drive acknowledged the write"
+/// and "the drive's cache is on platter". `fsync(2)` buys the property the store actually
+/// needs and cannot do without: the tree's DATA reaches the filesystem before the renames
+/// and the completeness marker that vouch for it become durable, so no crash can leave a
+/// build marked installed over zero-length files.
+///
+/// `EINTR` is retried rather than reported, exactly as std's own `cvt_r` does: an
+/// interrupted call is not a flush that failed.
+pub fn sync_file_contents(f: &File) -> io::Result<()> {
+    use std::os::unix::io::AsRawFd as _;
+    loop {
+        // SAFETY: `f` is a live, open `File` borrowed for the whole call, so its raw fd is
+        // valid; `fsync` takes that fd BY VALUE and dereferences no pointer.
+        let rc = unsafe { libc::fsync(f.as_raw_fd()) };
+        if rc == 0 {
+            return Ok(());
+        }
+        let e = io::Error::last_os_error();
+        if e.kind() != io::ErrorKind::Interrupted {
+            return Err(e);
+        }
+    }
 }
 
 /// A file's permission bits (`st_mode`), as read by the tree-root hash and doctor.
@@ -631,15 +770,53 @@ pub fn install_shim_to_env(
 /// in-process or through the untracked launchd job when this process is
 /// provenance-tracked — so a shim on the user's PATH is never briefly absent, never
 /// half-written, and never a tagged script that tracks the tool it execs.
+///
+/// ROUTED WHEN AN EXEC ROOT STANDS. The body carries the guard line of
+/// `platform::sh_shim_content_routed` exactly when [`crate::compat::route_for_shim`]
+/// finds a complete exec root for the trust build `target` lies in — `stat` only, and
+/// `None` for every other program, every build without a root and every target outside
+/// this shim's prefix. Deciding it HERE, in the one function every shim writer renders
+/// through (`install_tools_env`, the alias and agents reconciles, flow's restore,
+/// linkmode's unlink), is what keeps a writer from laying a plain shim beside a root
+/// that the next reconcile would have to route again; with no root the body is today's
+/// shim byte for byte.
 pub fn shim_executable_to_env(
     shim: &Path,
     target: &Path,
     env: &crate::shim_env::ShimEnv,
 ) -> io::Result<crate::lay::Executable> {
+    let route = crate::compat::route_for_shim(shim, target);
     Ok(crate::lay::Executable::new(
         shim,
-        super::sh_shim_content_env(target, env),
+        super::sh_shim_content_routed(target, env, route.as_deref()),
     ))
+}
+
+/// The `agents/` twin's shim: [`shim_executable_to_env`] with the landing `prelude`
+/// ([`super::sh_landing_prelude`]) ahead of its exports — the same route decision, the
+/// same writer. `prelude` empty is byte for byte the `bin/` shim.
+pub fn twin_executable_to_env(
+    shim: &Path,
+    target: &Path,
+    env: &crate::shim_env::ShimEnv,
+    prelude: &str,
+) -> io::Result<crate::lay::Executable> {
+    let route = crate::compat::route_for_shim(shim, target);
+    Ok(crate::lay::Executable::new(
+        shim,
+        super::sh_shim_content_twin(target, env, route.as_deref(), prelude),
+    ))
+}
+
+/// Lay the `agents/` twin [`twin_executable_to_env`] renders.
+pub fn install_twin_to_env(
+    shim: &Path,
+    target: &Path,
+    env: &crate::shim_env::ShimEnv,
+    prelude: &str,
+) -> io::Result<()> {
+    let file = twin_executable_to_env(shim, target, env, prelude)?;
+    crate::lay::lay_executables(&[file])
 }
 
 /// Wrap `s` in single quotes for safe embedding in a `/bin/sh` script, escaping any embedded
@@ -722,12 +899,57 @@ pub fn exec_or_run(command: &mut Command) -> io::Error {
 mod tests {
     use super::*;
 
+    /// The four answers `mdutil -s` gives, and the one it gives when it cannot say.
+    /// "Index is read-only." (2026-09-16) is its own state: the volume takes no new
+    /// entries, so a planted probe never arrives, but it is mds's low-disk-space hold,
+    /// not a setting — the verify's refinement must say that rather than blame a busy
+    /// machine OR tell the reader nothing needs migrating. Only the status line is
+    /// read: a volume whose NAME carries a state word is not that state.
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn every_mdutil_state_line_is_read() {
+        use crate::platform::IndexState;
+        assert_eq!(
+            mdutil_index_state(b"/System/Volumes/Data:\n\tIndexing enabled.\n"),
+            Some(IndexState::Enabled)
+        );
+        assert_eq!(
+            mdutil_index_state(b"/System/Volumes/Data:\n\tIndexing disabled.\n"),
+            Some(IndexState::Disabled)
+        );
+        assert_eq!(
+            mdutil_index_state(b"/System/Volumes/Data:\n\tIndexing and searching disabled.\n"),
+            Some(IndexState::Disabled)
+        );
+        assert_eq!(
+            mdutil_index_state(b"/System/Volumes/Data:\n\tIndex is read-only.\n"),
+            Some(IndexState::ReadOnly)
+        );
+        assert_eq!(
+            mdutil_index_state(b"/Users//x/aterm:\n\tError: unknown indexing state.\n"),
+            None
+        );
+        assert_eq!(
+            mdutil_index_state(b"/Volumes/disabled-drive:\n\tIndexing enabled.\n"),
+            Some(IndexState::Enabled),
+            "the echoed volume name is not the state"
+        );
+        assert_eq!(
+            mdutil_index_state(b"Error: invalid path `/Users//x/enabled-things/repo'.\n"),
+            None,
+            "an error line is no state, whatever path it quotes"
+        );
+        assert_eq!(mdutil_index_state(b""), None);
+    }
+
     /// `mdutil` answers for a VOLUME. Handed the deep path its caller has, it prints
     /// "Error: unknown indexing state." and this layer answers `None` — which made
     /// `noindex`'s `IndexingDisabled` refinement dead code on every realistic input.
     /// Measured 2026-09-02 on macOS 26.6.2 (25G83):
     ///   mdutil -s /System/Volumes/Data       -> Indexing enabled.
     ///   mdutil -s /Users//example/aterm        -> Error: unknown indexing state.
+    /// The same volume answered "Index is read-only." on 2026-09-16 (its low-disk-space
+    /// hold), which is why the probe reads a three-state answer now.
     #[test]
     fn the_indexing_switch_is_asked_at_the_mount_point_not_at_a_deep_path() {
         let deep = std::fs::canonicalize(std::env::temp_dir()).unwrap();
@@ -752,11 +974,95 @@ mod tests {
         // `IndexingDisabled` refinement was unreachable and a user who had just run
         // `mdutil -i off /System/Volumes/Data` was told to re-run on a less busy machine.
         assert!(
-            spotlight_indexing_enabled(&deep).is_some(),
-            "the volume switch must be READABLE for a deep path; `None` here means the \
-             refinement is dead code again"
+            spotlight_index_state(&deep).is_some(),
+            "the volume's index state must be READABLE for a deep path; `None` here means \
+             the refinement is dead code again"
         );
         // A path that does not exist has no volume, and the caller falls back to it.
         assert_eq!(mount_point_of(Path::new("/no/such/path/here")), None);
+    }
+
+    /// A SHARED DIRECTORY ALREADY `0755` IS NOT REWRITTEN. `ensure_shared_dir` runs on
+    /// every store-lock acquisition over a system prefix, and a same-mode `chmod(2)` still
+    /// moves `st_ctime` — which tippy's ancestor check reads, so a `repair` or `gc` aborted
+    /// every tippy running from that store. A second call moves no stamp; a drifted mode
+    /// (too tight, group-writable, a sticky bit) is still forced to `0755`; a symlink at
+    /// the name is refused and the directory it names left as it was. (A reviewer showed
+    /// the whole lib suite green with the mode check removed, 2026-09-15.)
+    #[test]
+    fn a_shared_dir_already_0755_is_not_rewritten_and_a_drifted_one_is_forced() {
+        let root = std::env::temp_dir().join(format!("atpkg-shared-dir-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&root);
+        fs::create_dir_all(&root).unwrap();
+        let dir = root.join("prefix");
+        let stamp = |p: &Path| {
+            let m = fs::symlink_metadata(p).unwrap();
+            (
+                m.mode() & 0o7777,
+                m.ctime(),
+                m.ctime_nsec(),
+                m.mtime(),
+                m.mtime_nsec(),
+            )
+        };
+        ensure_shared_dir(&dir).unwrap();
+        let first = stamp(&dir);
+        assert_eq!(first.0, 0o755, "created shared: {:o}", first.0);
+        std::thread::sleep(std::time::Duration::from_millis(20));
+        ensure_shared_dir(&dir).unwrap();
+        assert_eq!(
+            stamp(&dir),
+            first,
+            "an unchanged 0755 directory was written"
+        );
+        for drifted in [0o700, 0o775, 0o1755] {
+            fs::set_permissions(&dir, Permissions::from_mode(drifted)).unwrap();
+            ensure_shared_dir(&dir).unwrap();
+            assert_eq!(stamp(&dir).0, 0o755, "{drifted:o} not forced to 0755");
+        }
+        let link = root.join("link");
+        std::os::unix::fs::symlink(&dir, &link).unwrap();
+        fs::set_permissions(&dir, Permissions::from_mode(0o700)).unwrap();
+        let refused = ensure_shared_dir(&link);
+        let named = stamp(&dir).0;
+        let _ = fs::remove_dir_all(&root);
+        assert_eq!(
+            refused.map_err(|e| e.kind()),
+            Err(io::ErrorKind::PermissionDenied)
+        );
+        assert_eq!(named, 0o700, "the refused link's target was chmodded");
+    }
+
+    /// THE FAIL-CLOSED KEYSTONE, MEASURED ON THE MACHINE RUNNING THE TEST.
+    ///
+    /// `account_home()` decides whether the `[machine]` settings apply at all: a
+    /// `None` here means "the account could not be resolved", which the guard reads as
+    /// a synthetic machine and refuses. So any regression in the FFI — a buffer too
+    /// small for a long gecos (ERANGE), a changed passwd binding, an empty `pw_dir` —
+    /// silently turns the default-on doctor OFF for every user, on every launch, with
+    /// no failing test anywhere. Nothing else asserts it resolves.
+    #[test]
+    fn the_account_home_resolves_on_the_machine_running_this_test() {
+        let account = account_home().expect(
+            "getpwuid_r must resolve this account's home; a None here disables the \
+             [machine] doctor everywhere",
+        );
+        assert!(
+            account.is_absolute(),
+            "a passwd home is an absolute path: {}",
+            account.display()
+        );
+        assert!(
+            !account.as_os_str().is_empty(),
+            "an empty pw_dir is not a home"
+        );
+        assert!(
+            account.is_dir(),
+            "the account home must exist: {}",
+            account.display()
+        );
+        // Called twice, it answers the same: the buffer is sized once per call and a
+        // partial read would show up here as a truncated second answer.
+        assert_eq!(account_home(), Some(account));
     }
 }

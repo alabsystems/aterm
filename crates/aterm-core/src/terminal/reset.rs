@@ -114,8 +114,9 @@ pub(super) fn reset_common_fields(
     // RIS resets SGR first, so cursor template is default (no BCE bg).
     grid.set_cursor_template(crate::grid::Cell::EMPTY, None);
     grid.erase_screen();
-    // RIS must clear DECDWL/DECDHL line attributes (erase_screen preserves them
-    // per VT spec, but a full reset must clear everything) (#7497).
+    // RIS must clear DECDWL/DECDHL line attributes. ED 2 now resets the rows it
+    // erases, so this repeats it; it stays because RIS owes the reset by its own
+    // spec text and must not inherit it from whichever erase it calls (#7497).
     grid.clear_line_attributes();
     grid.set_cursor(0, 0);
     grid.reset_tab_stops();

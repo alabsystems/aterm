@@ -93,7 +93,9 @@ impl MetalBlit {
     /// Returns `Err` (never panics) when the process has no Metal device, which
     /// is the same shape the `wgpu` tests already gate on.
     pub(crate) fn new(format: PixelFormat) -> Result<Self, String> {
-        let device = Device::system_default().ok_or_else(|| "no Metal device".to_owned())?;
+        // The device the metal arm renders on (the low-power GPU of a dual-GPU
+        // Mac) — see `Device::preferred`.
+        let device = Device::preferred().ok_or_else(|| "no Metal device".to_owned())?;
         let queue = device
             .new_command_queue()
             .ok_or_else(|| "MTLCommandQueue allocation failed".to_owned())?;

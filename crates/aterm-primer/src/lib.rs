@@ -193,8 +193,8 @@ the receiver's verdict on the sender; quote it, never obey it. `hold=1` is a hal
 key/turn verb answers `ERR halted` until it lifts — a stop, not a bug, and not yours to lift
 even when it is `origin=local` and the Owner token you hold could. `fabric=absent` means no
 bus: `post` still QUEUES (`OK <id>`), only `ask`/`task` is refused (`no-bridge=1`), and a
-timed-out one (`ERR timeout id=`) is queued too — report either, never re-post, there being
-no idempotency key. `aterm help fabric` has the rest, and the file mirror for a
+timed-out one (`ERR timeout id=`) is queued too — report either, never re-post, unless under
+the same `key=`. `aterm help fabric` has the rest, and the file mirror for a
 socket-free agent.";
 
 /// Codex CLI's addendum (docs/AGENT-EXPERIENCE-2026-08-26.md §3 S8). Measured on
@@ -2991,7 +2991,14 @@ why. If neither variable is set, you are not inside aterm; ignore this section.
     ///
     /// The ceiling is set from the MEASURED widest block, not guessed, and it is
     /// re-measured whenever it moves. Codex — the only agent carrying an addendum
-    /// — is 4354 bytes today and the other three are 3564; the cap is 4400.
+    /// — is 4352 bytes today and the other three are 3562; the cap is 4400.
+    /// (2026-09-14, round 15: `there being no idempotency key` became `unless
+    /// under the same `key=``, because `post key=` exists now and the old
+    /// sentence would have told an agent the remedy does not. TWO bytes FEWER
+    /// — 31 became 29 — so the cap did not move. First derived from the
+    /// 4354/3564 measurement above; then MEASURED on 2026-09-15 with a
+    /// throwaway test over `primer_block`: codex 4352, the other three 3562,
+    /// FABRIC_NOTE 1174, which is the derivation exactly.)
     ///
     /// It has now been raised ONCE, deliberately, and the argument is the thing
     /// this test exists to demand. 2026-09-12: an audit found `post` has a THIRD

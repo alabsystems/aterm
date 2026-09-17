@@ -1,0 +1,27 @@
+# Copyright 2026 Andrew Yates
+# SPDX-License-Identifier: Apache-2.0
+
+[package]
+name = "aterm-winsign"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+publish = false
+description = "aterm-winsign — Authenticode signing and verification of the shipped Windows exe, behind `cargo winsign` (Tier WINDOWS)"
+
+[[bin]]
+name = "aterm-winsign"
+path = "src/main.rs"
+
+[lib]
+name = "aterm_winsign"
+path = "src/lib.rs"
+
+[dependencies]
+# The committed anchor (`pins::WINDOWS_SIGNING_PUBLISHER`) is the whole tier
+# switch, exactly as `pins::APPLE_TEAM_ID` is for the mac lane.
+aterm-update-core = { workspace = true }
+
+[lints]
+workspace = true

@@ -109,6 +109,16 @@ A flag given on the command line wins.
                          transcript text. minimal is attention= alone and never
                          reads a screen. Without the flag, `[fabric] presence`
                          in aterm.toml, else meta.
+  --receipts             `serve` only: publish a RECEIPT (R8) when one of this
+                         node's sessions runs `inbox seen <id> handled|refused|
+                         deferred` on an ask or task — `kind=ack re=<off>
+                         verdict=<v>` onto the SENDER's inbox lane, so their
+                         `post --wait-ack` returns, their `await inbox re=<off>`
+                         latches and their `inbox` row reads `ack … verdict=`.
+                         A note earns none; a session that only --peeks acks
+                         nothing. `--no-receipts` turns it off. Without either
+                         flag, `[fabric] receipts` in aterm.toml (`aterm fabric
+                         on` writes `receipts = true`), else off.
   --attention            `ls` only: keep only rows carrying an `attention=` (§9.3)
 
 `ls` prints §7's row — <node> <host> <sid> state= inc= role= detail= driving=
@@ -210,6 +220,12 @@ fn run(args: &[String], serve: bool) -> ExitCode {
         if !parsed.presence_given {
             cfg.presence = crate::fabric::presence_from_config();
         }
+        // AND `[fabric] receipts`, by the same argument: a knob on what the
+        // bridge publishes about its own sessions' decisions, not on which
+        // broker it reaches.
+        if !parsed.receipts_given {
+            cfg.receipts = crate::fabric::receipts_from_config();
+        }
         match Bridge::new(cfg).and_then(Bridge::run) {
             Ok(()) => ExitCode::SUCCESS,
             Err(e) => {
@@ -237,6 +253,9 @@ pub(crate) struct Parsed {
     /// Whether `--presence` was on the command line — else `serve` reads
     /// `[fabric] presence` from aterm.toml ([`crate::fabric::presence_from_config`]).
     pub(crate) presence_given: bool,
+    /// Whether `--receipts`/`--no-receipts` was on the command line — else
+    /// `serve` reads `[fabric] receipts` ([`crate::fabric::receipts_from_config`]).
+    pub(crate) receipts_given: bool,
 }
 
 /// One printed column, made safe and made a single token.
@@ -383,6 +402,7 @@ fn row(subject: &str, body: &crate::body::Body) -> (String, bool) {
 pub(crate) fn parse(args: &[String]) -> Result<Parsed, String> {
     let mut attention = false;
     let mut presence_given = false;
+    let mut receipts_given = false;
     let mut cfg = Config {
         fleet: String::new(),
         broker: String::new(),
@@ -394,6 +414,7 @@ pub(crate) fn parse(args: &[String]) -> Result<Parsed, String> {
         sock: None,
         token: None,
         presence: crate::presence::Mode::Meta,
+        receipts: false,
     };
     let mut token_file: Option<String> = None;
     let mut tcp = false;
@@ -435,6 +456,14 @@ pub(crate) fn parse(args: &[String]) -> Result<Parsed, String> {
                 cfg.presence = crate::presence::Mode::parse(&v)
                     .ok_or_else(|| format!("--presence {v}: `meta` or `minimal`"))?;
                 presence_given = true;
+            }
+            "--receipts" => {
+                cfg.receipts = true;
+                receipts_given = true;
+            }
+            "--no-receipts" => {
+                cfg.receipts = false;
+                receipts_given = true;
             }
             "--sock" => cfg.sock = Some(value()?),
             "--token-file" => token_file = Some(value()?),
@@ -503,6 +532,7 @@ pub(crate) fn parse(args: &[String]) -> Result<Parsed, String> {
         cfg,
         attention,
         presence_given,
+        receipts_given,
     })
 }
 

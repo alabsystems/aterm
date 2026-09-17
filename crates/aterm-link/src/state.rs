@@ -19,6 +19,10 @@
 //! | `halt-acked` | the highest fleet-halt offset this node has answered | the node re-acks a barrier it already answered: one extra retained row, never a new subject |
 //! | `feeding` | the ONE `term/in` whose feed is in flight, and its idempotency key | losing it IS the silent loss §6.5 names — a keystroke that may or may not have been typed and nothing that can tell |
 //! | `term-off` | the drive-face offset already handled | the face resumes at the head, which is A3's silent loss for the records in between and never worse |
+//! | `sent/<sid>.<id>` | the producer sequence reserved for one queued post, and whether a `key=` table entry chose it | a fresh sequence is a second copy — this one IS load-bearing, and it is written BEFORE the publish |
+//! | `keys/<sid>` | `post key=` → the producer sequence it reserved, newest [`KEYS_KEEP`] per session | a re-post under a lost key is a second record; the bound is stated and the newest keys are the ones a retry names |
+//! | `acks/<sid>.<rid>` | the producer sequence reserved for one OWED receipt (R8), written BEFORE the publish, removed at retirement | a fresh sequence is a second `ack` on the sender's lane after a crash between the publish and the retirement |
+//! | `deadlines` | every `ask`/`task` this node published with `dl=` and has not seen answered, newest [`DEADLINES_KEEP`] | a lost table records no `expired` for those asks — the bus is checked before any verdict is published, so it can never record a false one |
 
 use std::collections::BTreeMap;
 use std::io::{self, Write};
@@ -130,6 +134,73 @@ impl FeedIntent {
         })
     }
 }
+
+/// One outstanding deadline: an `ask` or `task` this node published with
+/// `dl=`, and has not yet seen an `answer`, `report` or `ack` for.
+///
+/// §6.4 / R8: "the ASKER's own bridge" records `expired re=<off> dl=<ms>` when
+/// the deadline passes — the broker holds no timers. This is the list that
+/// bridge checks on its tick. `at` is the ABSOLUTE deadline (the publish clock
+/// plus `dl`), so a relaunched bridge does not restart the clock.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Deadline {
+    /// The bus offset of the ask (what a reply carries back as `re=`).
+    pub off: u64,
+    /// The asking session.
+    pub sid: String,
+    /// When it expires, in `now_ms()`.
+    pub at: u64,
+    /// The advisory `dl=` the ask carried, echoed onto the verdict.
+    pub dl: u64,
+}
+
+impl Deadline {
+    /// The one line this deadline is stored as.
+    #[must_use]
+    pub fn render(&self) -> String {
+        format!(
+            "off={} sid={} at={} dl={}",
+            self.off, self.sid, self.at, self.dl
+        )
+    }
+
+    /// Parse one back. TOTAL, and partial is `None`: a half line is not a
+    /// deadline this bridge should publish a verdict for.
+    #[must_use]
+    pub fn parse(line: &str) -> Option<Self> {
+        let (mut off, mut sid, mut at, mut dl) = (None, None, None, None);
+        for tok in line.split_whitespace() {
+            match tok.split_once('=') {
+                Some(("off", v)) => off = v.parse().ok(),
+                Some(("sid", v)) => sid = Some(v.to_string()),
+                Some(("at", v)) => at = v.parse().ok(),
+                Some(("dl", v)) => dl = v.parse().ok(),
+                _ => {}
+            }
+        }
+        let sid: String = sid?;
+        if sid.is_empty() {
+            return None;
+        }
+        Some(Self {
+            off: off?,
+            sid,
+            at: at?,
+            dl: dl?,
+        })
+    }
+}
+
+/// How many `post key=` reservations one session keeps, newest last.
+///
+/// The bound R7 states for the broker's own dedup window, applied to the table
+/// that rides on it. The 4097th key evicts the oldest, and a re-post under an
+/// evicted key is a NEW record — stated, and pinned by a test, rather than
+/// "never".
+pub const KEYS_KEEP: usize = 4096;
+
+/// How many outstanding deadlines the node keeps, newest offset last.
+pub const DEADLINES_KEEP: usize = 4096;
 
 /// How many TOFU pins the table keeps, oldest-first-out.
 ///
@@ -459,19 +530,34 @@ impl StateDir {
     /// the sequence to the POST rather than to a counter makes the retry
     /// byte-identical, so the broker answers `deduped` and hands back the
     /// ORIGINAL offset — which is the offset the sender's `--wait` was promised.
+    ///
+    /// The second half is WHERE THE NUMBER CAME FROM: `true` when a `post key=`
+    /// table entry an EARLIER post reserved chose it (see [`StateDir::key_seq`]),
+    /// which is what makes the retirement say `dup=1`. It is persisted beside
+    /// the sequence so a bridge that dies between the publish and the
+    /// retirement answers the same `dup=1` after its relaunch that it would have
+    /// answered before.
     #[must_use]
-    pub fn post_seq(&self, sid: &str, id: u64) -> Option<u64> {
-        self.read(&format!("sent/{sid}.{id}"))
-            .and_then(|s| s.parse().ok())
+    pub fn post_seq(&self, sid: &str, id: u64) -> Option<(u64, bool)> {
+        let line = self.read(&format!("sent/{sid}.{id}"))?;
+        let mut toks = line.split_whitespace();
+        let seq = toks.next()?.parse().ok()?;
+        Some((seq, toks.next() == Some("key")))
     }
 
     /// Reserve a sequence for one outbound post, durably, BEFORE it is published.
+    /// `via_key` says a `post key=` entry chose it (see [`StateDir::post_seq`]).
     ///
     /// # Errors
     ///
     /// Any I/O failure — and the caller must not publish if this fails.
-    pub fn set_post_seq(&self, sid: &str, id: u64, seq: u64) -> io::Result<()> {
-        self.write(&format!("sent/{sid}.{id}"), &seq.to_string())
+    pub fn set_post_seq(&self, sid: &str, id: u64, seq: u64, via_key: bool) -> io::Result<()> {
+        let line = if via_key {
+            format!("{seq} key")
+        } else {
+            seq.to_string()
+        };
+        self.write(&format!("sent/{sid}.{id}"), &line)
     }
 
     /// Forget a retired post's sequence. Called only after the endpoint has
@@ -479,6 +565,125 @@ impl StateDir {
     /// it could still be needed.
     pub fn clear_post_seq(&self, sid: &str, id: u64) {
         let _ = std::fs::remove_file(self.path(&format!("sent/{sid}.{id}")));
+    }
+
+    /// The producer sequence this bridge RESERVED for one OWED RECEIPT — the
+    /// `receipt sid=<sid> rid=<rid> …` line an endpoint lists on its `outbox`
+    /// peek from a session's `inbox seen <id> handled|refused|deferred` until
+    /// the bridge retires it (R8) — if it has reserved one.
+    ///
+    /// [`StateDir::post_seq`]'s rule, for the other thing the peek carries out.
+    /// A bridge that dies between publishing the `ack` and the endpoint's
+    /// retirement re-reads the same receipt after its relaunch, and
+    /// republishing it at a FRESH sequence would put a second `ack` on the
+    /// sender's lane; at THIS sequence the broker answers `deduped` and
+    /// appends nothing. One file per receipt, holding only the number, removed
+    /// once the endpoint has taken the retirement.
+    #[must_use]
+    pub fn receipt_seq(&self, sid: &str, rid: u64) -> Option<u64> {
+        self.read(&format!("acks/{sid}.{rid}"))?.parse().ok()
+    }
+
+    /// Reserve a sequence for one owed receipt, durably, BEFORE it is
+    /// published. See [`StateDir::receipt_seq`].
+    ///
+    /// # Errors
+    ///
+    /// Any I/O failure — and the caller must not publish if this fails.
+    pub fn set_receipt_seq(&self, sid: &str, rid: u64, seq: u64) -> io::Result<()> {
+        self.write(&format!("acks/{sid}.{rid}"), &seq.to_string())
+    }
+
+    /// Forget a retired receipt's sequence. Called only after the endpoint has
+    /// taken the retirement.
+    pub fn clear_receipt_seq(&self, sid: &str, rid: u64) {
+        let _ = std::fs::remove_file(self.path(&format!("acks/{sid}.{rid}")));
+    }
+
+    /// The producer sequence a session's `post key=<key>` RESERVED, if any post
+    /// under that key ever did.
+    ///
+    /// ## What makes `post key=` exactly once (R7, §6.5)
+    ///
+    /// [`StateDir::post_seq`] pins a sequence to a POST ID, which survives a
+    /// bridge crash but not a RE-POST: `ERR timeout` leaves the sender holding
+    /// a post id it cannot tell landed from lost, and posting again mints a new
+    /// id — a new sequence, a second record. This table pins the sequence to
+    /// the CALLER'S key instead. A re-post under the same key finds it here,
+    /// publishes at the same `(producer_id, producer_seq)`, and the broker's own
+    /// dedup — rebuilt from the log on a broker restart — answers `deduped` with
+    /// the ORIGINAL offset and appends nothing. The endpoint's `outbox` carries
+    /// the key on every drain, so a relaunched bridge reads the same key from
+    /// the same queued row.
+    ///
+    /// FIRST WINS, like a pin: the sequence a key reserved is the sequence it
+    /// keeps, because a later number would be a later record. One file per
+    /// session, newest last, bounded at [`KEYS_KEEP`].
+    #[must_use]
+    pub fn key_seq(&self, sid: &str, key: &str) -> Option<u64> {
+        self.key_lines(sid)
+            .iter()
+            .filter_map(|l| l.split_once(' '))
+            .find(|(k, _)| *k == key)
+            .and_then(|(_, seq)| seq.parse().ok())
+    }
+
+    /// The key file's lines IN RESERVATION ORDER, which is the order
+    /// [`KEYS_KEEP`] evicts in.
+    fn key_lines(&self, sid: &str) -> Vec<String> {
+        self.read(&format!("keys/{sid}"))
+            .map(|s| {
+                s.lines()
+                    .filter(|l| l.contains(' '))
+                    .map(str::to_string)
+                    .collect()
+            })
+            .unwrap_or_default()
+    }
+
+    /// Reserve `seq` for `key`, durably, BEFORE the publish — and only if the
+    /// key has none yet (first wins; see [`StateDir::key_seq`]). Answers the
+    /// sequence the key holds afterwards, which is `seq` unless it already had
+    /// one.
+    ///
+    /// # Errors
+    ///
+    /// Any I/O failure — and the caller must not publish if this fails.
+    pub fn set_key_seq(&self, sid: &str, key: &str, seq: u64) -> io::Result<u64> {
+        let mut lines = self.key_lines(sid);
+        if let Some(have) = lines
+            .iter()
+            .filter_map(|l| l.split_once(' '))
+            .find(|(k, _)| *k == key)
+            .and_then(|(_, s)| s.parse().ok())
+        {
+            return Ok(have);
+        }
+        lines.push(format!("{key} {seq}"));
+        let over = lines.len().saturating_sub(KEYS_KEEP);
+        self.write(&format!("keys/{sid}"), &lines[over..].join("\n"))?;
+        Ok(seq)
+    }
+
+    /// Every deadline this node still owes a verdict on, oldest offset first.
+    #[must_use]
+    pub fn deadlines(&self) -> Vec<Deadline> {
+        self.read("deadlines")
+            .map(|s| s.lines().filter_map(Deadline::parse).collect())
+            .unwrap_or_default()
+    }
+
+    /// Replace the deadline table, keeping the newest [`DEADLINES_KEEP`] by
+    /// offset. Written whole because it is small and changes rarely: once per
+    /// ask with a `dl=`, once per reply to one.
+    ///
+    /// # Errors
+    ///
+    /// Any I/O failure.
+    pub fn set_deadlines(&self, list: &[Deadline]) -> io::Result<()> {
+        let over = list.len().saturating_sub(DEADLINES_KEEP);
+        let lines: Vec<String> = list[over..].iter().map(Deadline::render).collect();
+        self.write("deadlines", &lines.join("\n"))
     }
 
     /// The `term/in` this bridge is FEEDING right now, if it is feeding one.
@@ -643,16 +848,155 @@ mod tests {
         let dir = scratch("postseq");
         let st = StateDir::open(&dir).expect("open");
         assert_eq!(st.post_seq("s-a", 1), None);
-        st.set_post_seq("s-a", 1, 0x0000_0002_0000_0007)
+        st.set_post_seq("s-a", 1, 0x0000_0002_0000_0007, false)
             .expect("reserve");
         assert_eq!(
             StateDir::open(&dir).expect("reopen").post_seq("s-a", 1),
-            Some(0x0000_0002_0000_0007)
+            Some((0x0000_0002_0000_0007, false))
         );
         // A DIFFERENT post keeps its own, and a retirement forgets one.
         assert_eq!(st.post_seq("s-a", 2), None);
         st.clear_post_seq("s-a", 1);
         assert_eq!(st.post_seq("s-a", 1), None);
+        // WHERE THE NUMBER CAME FROM survives with it: a sequence a `key=`
+        // entry chose reads back as one, so the relaunched bridge's retirement
+        // says `dup=1` exactly as the dead one's would have.
+        st.set_post_seq("s-a", 3, 0x0000_0002_0000_0009, true)
+            .expect("reserve via key");
+        assert_eq!(
+            StateDir::open(&dir).expect("reopen").post_seq("s-a", 3),
+            Some((0x0000_0002_0000_0009, true))
+        );
+        // And a file from before the marker existed reads as a plain pin.
+        std::fs::write(dir.join("sent/s-a.4"), "17\n").expect("write");
+        assert_eq!(st.post_seq("s-a", 4), Some((17, false)));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// **AN OWED RECEIPT'S SEQUENCE IS PINNED TO `(sid, rid)`, SURVIVES A
+    /// REOPEN, AND IS FORGOTTEN AT RETIREMENT.** The durable half of a receipt
+    /// being exactly once: a bridge that dies between the `ack` publish and the
+    /// endpoint's retirement republishes under the SAME sequence after its
+    /// relaunch, which the broker dedups.
+    #[test]
+    fn a_receipt_pins_its_sequence_until_it_is_retired() {
+        let dir = scratch("acks");
+        let st = StateDir::open(&dir).expect("open");
+        assert_eq!(st.receipt_seq("s-a", 1), None);
+        st.set_receipt_seq("s-a", 1, 77).expect("reserve");
+        st.set_receipt_seq("s-a", 2, 78).expect("reserve");
+        st.set_receipt_seq("s-b", 1, 79).expect("reserve");
+        let again = StateDir::open(&dir).expect("reopen");
+        assert_eq!(again.receipt_seq("s-a", 1), Some(77), "survives a reopen");
+        assert_eq!(again.receipt_seq("s-a", 2), Some(78));
+        assert_eq!(again.receipt_seq("s-b", 1), Some(79), "per session");
+        again.clear_receipt_seq("s-a", 1);
+        assert_eq!(again.receipt_seq("s-a", 1), None, "retired");
+        assert_eq!(again.receipt_seq("s-a", 2), Some(78), "the others stand");
+        assert!(
+            std::fs::read_to_string(dir.join("acks/s-a.2"))
+                .expect("the pin file")
+                .trim()
+                .parse::<u64>()
+                .is_ok(),
+            "a pin holds the number and nothing else"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// **A `post key=` PINS ITS SEQUENCE TO THE KEY, FIRST WINS, AND THE TABLE
+    /// IS BOUNDED AT [`KEYS_KEEP`] — the 4097th key evicts the oldest.** A
+    /// re-post under a key the table still holds is byte-identical on the wire
+    /// (`(producer_id, producer_seq)`), so the broker dedups it; one under an
+    /// evicted key is a new record, and this test states where that line is.
+    #[test]
+    fn a_key_pins_its_sequence_first_wins_and_the_4097th_evicts_the_oldest() {
+        let dir = scratch("keys");
+        let st = StateDir::open(&dir).expect("open");
+        assert_eq!(st.key_seq("s-a", "k-1"), None);
+        assert_eq!(st.set_key_seq("s-a", "k-1", 41).expect("reserve"), 41);
+        assert_eq!(
+            StateDir::open(&dir).expect("reopen").key_seq("s-a", "k-1"),
+            Some(41),
+            "the reservation survives a reopen"
+        );
+        // FIRST WINS: reserving again under the same key answers the sequence
+        // the key already holds and writes nothing new.
+        assert_eq!(st.set_key_seq("s-a", "k-1", 99).expect("re-reserve"), 41);
+        assert_eq!(st.key_seq("s-a", "k-1"), Some(41));
+        // PER SESSION: another session's identical key is its own reservation.
+        assert_eq!(st.key_seq("s-b", "k-1"), None);
+        assert_eq!(st.set_key_seq("s-b", "k-1", 7).expect("reserve"), 7);
+        assert_eq!(st.key_seq("s-a", "k-1"), Some(41));
+
+        // THE BOUND. Seed a full table as one file (the write is whole-file, so
+        // filling it a line at a time would be quadratic), then add one more.
+        let full: Vec<String> = (0..KEYS_KEEP).map(|n| format!("k-{n} {n}")).collect();
+        st.write("keys/s-c", &full.join("\n"))
+            .expect("seed a full table");
+        assert_eq!(st.key_seq("s-c", "k-0"), Some(0));
+        assert_eq!(
+            st.key_seq("s-c", &format!("k-{}", KEYS_KEEP - 1)),
+            Some(KEYS_KEEP as u64 - 1)
+        );
+        assert_eq!(
+            st.set_key_seq("s-c", "k-newest", 1_000_000)
+                .expect("the 4097th"),
+            1_000_000
+        );
+        assert_eq!(st.key_seq("s-c", "k-0"), None, "the oldest key is evicted");
+        assert_eq!(st.key_seq("s-c", "k-1"), Some(1), "the next-oldest stands");
+        assert_eq!(st.key_seq("s-c", "k-newest"), Some(1_000_000));
+        assert_eq!(st.key_lines("s-c").len(), KEYS_KEEP, "the table is capped");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// THE DEADLINE TABLE ROUND-TRIPS, IS BOUNDED, AND A DAMAGED LINE READS AS
+    /// NOTHING — a half-parsed deadline would be a verdict published for the
+    /// wrong ask.
+    #[test]
+    fn deadlines_round_trip_are_bounded_and_a_damaged_line_reads_as_nothing() {
+        let dir = scratch("deadlines");
+        let st = StateDir::open(&dir).expect("open");
+        assert!(st.deadlines().is_empty());
+        let one = Deadline {
+            off: 90_312,
+            sid: "s-abcdef0123456789".to_string(),
+            at: 1_700_000_240_123,
+            dl: 240_000,
+        };
+        st.set_deadlines(std::slice::from_ref(&one)).expect("write");
+        assert_eq!(
+            StateDir::open(&dir).expect("reopen").deadlines(),
+            vec![one.clone()]
+        );
+        st.set_deadlines(&[]).expect("clear");
+        assert!(st.deadlines().is_empty());
+        for damaged in [
+            "",
+            "off=1 sid=s-a at=2",      // no dl
+            "off=1 sid=s-a dl=3",      // no at
+            "sid=s-a at=2 dl=3",       // no offset
+            "off=1 at=2 dl=3",         // no sid
+            "off=1 sid= at=2 dl=3",    // an empty sid
+            "off=x sid=s-a at=2 dl=3", // an offset that is not one
+        ] {
+            assert_eq!(Deadline::parse(damaged), None, "{damaged:?}");
+        }
+        assert_eq!(Deadline::parse(&one.render()), Some(one));
+        // BOUNDED: the newest by position survive.
+        let many: Vec<Deadline> = (0..DEADLINES_KEEP as u64 + 3)
+            .map(|n| Deadline {
+                off: n,
+                sid: "s-a".to_string(),
+                at: n,
+                dl: 1,
+            })
+            .collect();
+        st.set_deadlines(&many).expect("write many");
+        let kept = st.deadlines();
+        assert_eq!(kept.len(), DEADLINES_KEEP);
+        assert_eq!(kept[0].off, 3, "the three oldest are gone");
         let _ = std::fs::remove_dir_all(&dir);
     }
 

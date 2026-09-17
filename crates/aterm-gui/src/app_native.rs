@@ -2646,6 +2646,21 @@ impl App {
         let Some((instance, active_view)) = self.active_native_view(wid) else {
             return false;
         };
+        // THE KEYPAD IS ITS MAIN-BLOCK TWIN ON A NATIVE PAGE. The seam hands
+        // this reducer the same engine key it hands the PTY encoder, and since
+        // `keymap::build_key_input` began keeping the keypad identity (so
+        // DECKPAM and kitty disambiguate can tell KP_5 from 5) that key is
+        // `Numpad5`, `NumpadEnter`, `NumpadEnd` — which the lowering below
+        // matched as nothing: KP_5 into a focused Settings field typed
+        // nothing, a NumLock-off KP_1 in the editor moved nowhere. No page
+        // needs the keypad identity, so a keypad digit COMMITS its glyph and
+        // the keypad's Enter/arrows/Home/End/Page/Insert/Delete drive the
+        // main-block arms. `InputEvent::keypad_folded` is the one fold, shared
+        // with the seam's press classifier; a controller's `key kpenter` takes
+        // the same road. (KP_Begin has no twin and lowers to nothing, as it
+        // always did.)
+        let folded = event.keypad_folded();
+        let event = folded.as_ref().unwrap_or(event);
         let editor_active = self
             .native_runtime
             .app(instance)
@@ -2884,7 +2899,7 @@ impl App {
         if !editor_active
             && !self.native_text_field_has_focus(wid)
             && let InputEvent::Key {
-                key: Key::Named(key @ (NamedKey::Enter | NamedKey::NumpadEnter | NamedKey::Space)),
+                key: Key::Named(key @ (NamedKey::Enter | NamedKey::Space)),
                 event_type: KeyEventType::Press,
                 ..
             } = event
@@ -2896,10 +2911,11 @@ impl App {
             // DEFAULT button (the highlighted Primary — "Update to Latest Now",
             // "Copy Build Information"), the native default-button convention.
             // Space never does; on macOS it only activates the focused control.
-            // NumpadEnter only ever arrives from a controller (`key kpenter`);
-            // winit folds the physical keypad key to Enter before this seam.
-            if matches!(key, NamedKey::Enter | NamedKey::NumpadEnter)
-                && self.activate_native_default(wid).unwrap_or(false)
+            // KP_Enter — the physical key, which `keymap::build_key_input`
+            // delivers as `NumpadEnter`, or a controller's `key kpenter` — was
+            // folded onto Enter at the top of this function, so it activates
+            // the default button as Return does.
+            if matches!(key, NamedKey::Enter) && self.activate_native_default(wid).unwrap_or(false)
             {
                 return true;
             }
@@ -3177,7 +3193,7 @@ impl App {
                                 crate::native_editor::EditorCommand::MoveLineEnd,
                             ))
                         }
-                        Key::Named(NamedKey::Enter | NamedKey::NumpadEnter) => {
+                        Key::Named(NamedKey::Enter) => {
                             Some(AppEvent::TextInput(TextInputEvent::Submit))
                         }
                         Key::Named(NamedKey::Escape) => {
@@ -4786,6 +4802,10 @@ impl App {
         let spawn = std::thread::Builder::new()
             .name("aterm-packages-verb".into())
             .spawn(move || {
+                // A package verb: the SAME lane, store and children as the
+                // six-hourly pass, on a click. Nobody is blocked on it, and a
+                // role does not reach a thread from its creator (see qos.rs).
+                crate::qos::set_self(crate::qos::Role::Background);
                 // atpkg records detailed durable status in status.toml. Keep
                 // the process result separately: the old status may predate a
                 // failed launch/non-zero exit and must never be presented as
@@ -4804,6 +4824,7 @@ impl App {
                 // ends the sequence with its own sentence rather than a second dialog.
                 let mut command = PackagesCommandOutcome::Succeeded { operation: busy };
                 let mut machine_verdict: Option<String> = None;
+                let mut machine_state: Option<atpkg::machine::MachineState> = None;
                 for verb in &processes {
                     // NO STDIN: a windowed child inherits whatever the app was launched
                     // with (a Terminal's tty when run from one), and atpkg's door reads a
@@ -4818,11 +4839,21 @@ impl App {
                     // Security card both want) and one verdict sentence — so those are
                     // captured and fed through the same marker parser the launch pass
                     // uses (`spawn_machine_settings_once`).
-                    let mut child = std::process::Command::new(&atpkg);
+                    // A PASS APPLIES THE HOST SETTINGS TOO, so its stdout is worth
+                    // reading. `packages/check` (an update pass) and the default-set
+                    // install run `apply_machine_settings` at their top like every
+                    // other pass — and with stdout nulled, the `machine-settings:`
+                    // marker they print went nowhere: the card never learned about a
+                    // change a Settings-initiated pass had just made, and the pull-down
+                    // row never appeared.
+                    let reads_stdout = machine_apply || busy.applies_machine_settings();
+                    // Upstream's QoS-classed spawner, kept: a background pass must not
+                    // compete with the window for the scheduler.
+                    let mut child = crate::qos::command(crate::qos::Role::Background, &atpkg);
                     child
                         .args(verb)
                         .stdin(std::process::Stdio::null())
-                        .stdout(if machine_apply {
+                        .stdout(if reads_stdout {
                             std::process::Stdio::piped()
                         } else {
                             std::process::Stdio::null()
@@ -4834,20 +4865,44 @@ impl App {
                             .env("PATH", crate::spawn::atpkg_child_path());
                     }
                     if machine_apply {
-                        let result = machine_command_output(
+                        let result = machine_command_output_bounded(
                             &mut child,
                             "atpkg machine apply",
                             std::time::Duration::from_secs(60),
+                            // A mutating child is never killed for a flood — see
+                            // `Overflow`. Only the deadline can stop it.
+                            Overflow::Truncate,
                         );
-                        (command, machine_verdict) = machine_apply_completion(result, |event| {
+                        let read = machine_apply_completion(result, |event| {
                             let _ = proxy.send_event(event);
                         });
+                        command = read.0;
+                        machine_verdict = read.1;
+                        machine_state = read.2;
                         if matches!(command, PackagesCommandOutcome::Failed { .. }) {
                             break;
                         }
                         continue;
                     }
                     let result = child.output();
+                    if reads_stdout && let Ok(out) = result.as_ref() {
+                        // The pass's own machine lines, through the same reader the
+                        // launch lanes use, so one parser serves every lane. NOT the
+                        // pass's `machine-state:` record: this lane collects stdout at
+                        // exit, and the pass measured the machine at its top — minutes
+                        // earlier for an update that waited on the lock or downloaded —
+                        // so that record is not the newest state and must not be taken
+                        // as one (review 2026-09-16). The completion re-reads instead,
+                        // and its read closes the expectation the change line opens.
+                        crate::read_seed_markers(
+                            std::io::BufReader::new(out.stdout.as_slice()),
+                            |event| {
+                                if !matches!(event, Wake::PkgMachineState(_)) {
+                                    let _ = proxy.send_event(event);
+                                }
+                            },
+                        );
+                    }
                     let said = result
                         .as_ref()
                         .ok()
@@ -4864,7 +4919,8 @@ impl App {
                 }
                 let report = crate::packages_screen::collect_packages_status(true);
                 let completion = PackagesWorkerCompletion::command(report, command)
-                    .with_machine_verdict(machine_verdict);
+                    .with_machine_verdict(machine_verdict)
+                    .with_machine_state(machine_state);
                 let _ = proxy.send_event(Wake::NativePackagesFinished {
                     sequence,
                     completion,
@@ -4965,21 +5021,31 @@ impl App {
 
     /// Main-thread half of the packages worker protocol (the packages analogue
     /// of [`Self::finish_native_update_check`]): stale sequences are inert. A
-    /// finished verb that ran atpkg's machine pass — `update`, `install
-    /// --default-set` and `machine apply` itself
-    /// ([`PackagesBusy::applies_machine_settings`]) — re-reads the machine so the
-    /// card confirms rather than assumes.
+    /// finished verb that ran atpkg's machine pass ([`PackagesBusy::applies_machine_settings`])
+    /// re-reads the machine so the card confirms rather than assumes — except
+    /// `machine apply` itself when its completion carries the apply's own
+    /// `machine-state:` record (2026-09-16: a short child whose record is printed
+    /// last; the reducer took it as the newest state, so nothing is left to
+    /// confirm). The collected lanes (`update`, every `install`) hand their stdout
+    /// over at exit, minutes after the pass measured the machine at its top, so their
+    /// record is never posted and the completion's read stays; that read — one read,
+    /// which is why the apply lane's sorter posts no record-missing fallback of its
+    /// own — is what closes the expectation their change line opened.
     pub(crate) fn finish_native_packages(
         &mut self,
         sequence: u64,
         completion: crate::packages_screen::PackagesWorkerCompletion,
     ) {
         let finished = self.native_packages_service.busy();
+        let confirmed_by_its_record =
+            finished == Some(PackagesBusy::MachineApply) && completion.machine_state.is_some();
         if !self.native_packages_service.finish(sequence, completion) {
             return;
         }
         self.publish_native_packages_state();
-        if finished.is_some_and(PackagesBusy::applies_machine_settings) {
+        if finished.is_some_and(PackagesBusy::applies_machine_settings) && !confirmed_by_its_record
+        {
+            let _ = self.native_packages_service.take_record_expectation();
             self.start_native_machine_refresh();
         }
     }
@@ -5222,8 +5288,6 @@ impl App {
             self.native_stage_imported_at = Some(std::time::Instant::now());
         }
         self.publish_native_update_state();
-        #[cfg(test)]
-        self.update_screen_refresh();
 
         // Facts parked while THIS check was active were observed BEFORE it staged
         // anything: replaying them now would compare the stage the check just
@@ -5349,6 +5413,16 @@ impl App {
         let spawned = std::thread::Builder::new()
             .name("aterm-update-preverify".to_string())
             .spawn(move || {
+                // NO `qos::set_self` HERE, DELIBERATELY. This is the one worker of
+                // the update lane that keeps the class it inherits. It publishes
+                // into `handoff_preverified`, a mutex the UI thread takes with a
+                // blocking `lock()` (`cached_handoff_preverification`), so qos.rs's
+                // port-time floor rule forbids demoting it below `Responsive`: a
+                // descheduled holder there is a priority inversion. Promoting it is
+                // not right either — it is one ~0.3 s `codesign` per staged
+                // candidate, hoisted out of the parked window precisely so nothing
+                // waits on it, and a miss just re-verifies inline on the handoff
+                // worker. DEFAULT sits between the two, which is what it wants.
                 let passed = if installed_activation {
                     aterm_update::preverify_installed_for_handoff(current_build, build, &commit)
                 } else {
@@ -7685,7 +7759,7 @@ fn spawn_native_machine_read(
 /// spawner pid and the atpkg child PATH. Both output streams are bounded; only
 /// the stdout state line is the measured contract.
 fn read_machine_state(atpkg: &std::path::Path) -> Result<atpkg::machine::MachineState, String> {
-    let mut command = std::process::Command::new(atpkg);
+    let mut command = crate::qos::command(crate::qos::Role::Background, atpkg);
     command
         .arg("machine")
         .env(atpkg::cli::SPAWNER_PID_ENV, std::process::id().to_string())
@@ -7711,11 +7785,50 @@ fn read_machine_state(atpkg: &std::path::Path) -> Result<atpkg::machine::Machine
 /// pipe reads avoid a reader thread or a wait for a descendant's inherited stdout.
 /// Cleanup spends only the reserved tail of the original budget and reports an
 /// unconfirmed reap instead of waiting indefinitely after a failed kill.
-#[cfg(unix)]
+///
+/// NOT GATED, AND THE SPLIT IS ONE FUNCTION DEEP (2026-09-16). This wrapper and
+/// [`Overflow`] used to be `#[cfg(unix)]` with a hand-written `#[cfg(not(unix))]`
+/// twin of the wrapper alone, and the twin was one item short: a packages-screen
+/// call site that reached for `machine_command_output_bounded(.., Overflow::Truncate)`
+/// left the Windows build of THIS crate failing to compile with E0433 on the type
+/// and E0425 on the function — invisible from a Unix box, because a mirror only
+/// drifts on the side you cannot see. So there is now ONE `Overflow` and ONE
+/// wrapper for every target, and the only thing a `cfg` still chooses is the BODY
+/// of [`machine_command_output_bounded`], whose two arms carry the same signature.
 fn machine_command_output(
     command: &mut std::process::Command,
     operation: &str,
     limit: std::time::Duration,
+) -> Result<std::process::Output, String> {
+    machine_command_output_bounded(command, operation, limit, Overflow::Fail)
+}
+
+/// What a flood of output means for this child.
+///
+/// A CHILD THAT IS CHANGING THE MACHINE IS NOT KILLED FOR TALKING TOO MUCH (2026-09-15).
+/// The 64 KiB cap exists to bound THIS process's memory, and the only reason to stop
+/// early is that nothing more can be learned. For a read that is true — the record is one
+/// line, and a reader that floods is broken. For `atpkg machine apply` it is false and
+/// dangerous: the apply narrates two lines per migrated directory, so a machine with
+/// enough repositories crosses 64 KiB legitimately, and the old arm answered that by
+/// SIGKILLing the child — possibly between the `rename` and the symlink that keeps the
+/// build working. Truncation costs the tail of a narration nobody parses (the state is
+/// re-read afterwards anyway); a kill costs the user a repository.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Overflow {
+    /// Stop with an error, and stop the child with it.
+    Fail,
+    /// Keep the first 64 KiB, go on draining so the child never blocks on a full
+    /// pipe, and let it finish its work.
+    Truncate,
+}
+
+#[cfg(unix)]
+fn machine_command_output_bounded(
+    command: &mut std::process::Command,
+    operation: &str,
+    limit: std::time::Duration,
+    overflow: Overflow,
 ) -> Result<std::process::Output, String> {
     use std::io::ErrorKind;
     use std::os::fd::AsRawFd as _;
@@ -7778,11 +7891,19 @@ fn machine_command_output(
                         Ok(0) => *eof = true,
                         Ok(n) => {
                             if bytes.len() + n > MAX_OUTPUT {
-                                return Err(format!(
-                                    "{operation} output exceeded 64 KiB per stream"
-                                ));
+                                if overflow == Overflow::Fail {
+                                    return Err(format!(
+                                        "{operation} output exceeded 64 KiB per stream"
+                                    ));
+                                }
+                                // Keep the head, drop this chunk, keep reading: the
+                                // point of the loop from here on is that the child's
+                                // pipe never fills, so it runs to completion.
+                                let room = MAX_OUTPUT.saturating_sub(bytes.len());
+                                bytes.extend_from_slice(&chunk[..room.min(n)]);
+                            } else {
+                                bytes.extend_from_slice(&chunk[..n]);
                             }
-                            bytes.extend_from_slice(&chunk[..n]);
                         }
                         Err(error)
                             if matches!(
@@ -7844,11 +7965,17 @@ fn stop_machine_read_child(child: &mut std::process::Child, deadline: std::time:
     }
 }
 
+/// The other arm of the ONE split, with the SAME signature as the Unix one above
+/// — `Overflow` included, so every caller the Unix side accepts type-checks here
+/// too and a new argument cannot land on one arm only. Nothing off Unix has the
+/// nonblocking-pipe machinery the real body is built from, and no platform but
+/// macOS has machine settings to apply, so this refuses before spawning anything.
 #[cfg(not(unix))]
-fn machine_command_output(
+fn machine_command_output_bounded(
     _command: &mut std::process::Command,
     _operation: &str,
     _limit: std::time::Duration,
+    _overflow: Overflow,
 ) -> Result<std::process::Output, String> {
     Err("machine settings commands require macOS".into())
 }
@@ -7867,7 +7994,11 @@ pub(crate) fn parse_machine_state_output(stdout: &str) -> Option<atpkg::machine:
 fn machine_apply_completion(
     output: Result<std::process::Output, String>,
     mut emit: impl FnMut(Wake),
-) -> (PackagesCommandOutcome, Option<String>) {
+) -> (
+    PackagesCommandOutcome,
+    Option<String>,
+    Option<atpkg::machine::MachineState>,
+) {
     let operation = PackagesBusy::MachineApply;
     let output = match output {
         Ok(output) => output,
@@ -7879,6 +8010,7 @@ fn machine_apply_completion(
                         "{message}; changes may be partial — refresh This Mac before retrying"
                     ),
                 },
+                None,
                 None,
             );
         }
@@ -7898,7 +8030,7 @@ fn machine_apply_completion(
         Some(message) => PackagesCommandOutcome::Failed { operation, message },
         None => PackagesCommandOutcome::Succeeded { operation },
     };
-    (command, read.verdict)
+    (command, read.verdict, read.record)
 }
 
 /// What an `atpkg machine apply` child's stdout said, sorted for the worker.
@@ -7914,6 +8046,10 @@ pub(crate) struct MachineApplyStdout {
     /// home that is not the account's), or `MACHINE_APPLY_FAILED_PREFIX`: a write
     /// failed. Either is a failure even when the command exits successfully.
     pub(crate) refusal: Option<String>,
+    /// The apply's own `machine-state:` record, parsed (2026-09-16) — carried on the
+    /// completion rather than posted as an event, so it is this verb's and no other
+    /// lane's that confirms the card.
+    pub(crate) record: Option<atpkg::machine::MachineState>,
 }
 
 /// Sort an `atpkg machine apply` stdout into marker events, the verdict sentence and
@@ -7929,6 +8065,7 @@ pub(crate) fn machine_apply_stdout(stdout: &str) -> MachineApplyStdout {
         events: Vec::new(),
         verdict: None,
         refusal: None,
+        record: None,
     };
     for line in stdout.lines() {
         let line = line.trim_end();
@@ -7940,9 +8077,18 @@ pub(crate) fn machine_apply_stdout(stdout: &str) -> MachineApplyStdout {
         } else if let Some(sentence) = line.strip_prefix(MACHINE_VERDICT_PREFIX) {
             read.verdict = Some(sentence.trim().to_string());
         } else if let Some(event) = crate::parse_seed_line(line) {
-            read.events.push(event);
+            match event {
+                // The record rides the completion (see `record`); the last one wins.
+                Wake::PkgMachineState(body) => {
+                    read.record = atpkg::machine::parse_machine_state(&body).or(read.record);
+                }
+                event => read.events.push(event),
+            }
         }
     }
+    // No record-missing fallback here: the completion this stdout belongs to re-reads
+    // the machine whenever it carries no record (`finish_native_packages`), and that
+    // read takes the expectation the change line opened — one read, not two.
     read
 }
 
@@ -8098,19 +8244,34 @@ mod packages_argv_tests {
         // re-spelling there is red here.
         let nothing_changed = format!(
             "{MACHINE_VERDICT_PREFIX}nothing changed — already applied, switched off in \
-             [machine], or a change that did not land (the lines above say which)"
+             [machine], or a change that did not land; `aterm pkg machine` lists what is \
+             still open"
         );
+        // The apply prints its own `machine-state:` record behind the change line
+        // (2026-09-16); the worker hands it on as the event the card takes as the
+        // newest state, so the completion has nothing to confirm by a read.
         let applied = machine_apply_stdout(&format!(
             "atpkg noindex: /Users//x/ay/target: renamed target.noindex\n\
              atpkg: {MACHINE_SETTINGS_MARKER}spotlight-noindex 1 dir(s) migrated; universal-control disabled\n\
-             {MACHINE_VERDICT_PREFIX}applied — spotlight-noindex 1 dir(s) migrated; universal-control disabled\n"
+             atpkg: {}universal-control=disabled; policy=off; noindex=true; \
+             spotlight-exposed=0; spotlight-hidden=9; spotlight-migratable=0; \
+             scan=complete; home=account\n\
+             {MACHINE_VERDICT_PREFIX}applied — spotlight-noindex 1 dir(s) migrated; universal-control disabled\n",
+            atpkg::cli::MACHINE_STATE_MARKER
         ));
-        assert_eq!(applied.events.len(), 1);
+        assert_eq!(applied.events.len(), 1, "{:?}", applied.events);
         assert!(matches!(
             &applied.events[0],
             Wake::PkgMachineSettings(body)
                 if body == "spotlight-noindex 1 dir(s) migrated; universal-control disabled"
         ));
+        assert!(
+            applied
+                .record
+                .as_ref()
+                .is_some_and(|s| s.hidden == 9 && s.exposed == 0),
+            "the record rides the completion, not the event stream"
+        );
         assert_eq!(
             applied.verdict.as_deref(),
             Some("applied — spotlight-noindex 1 dir(s) migrated; universal-control disabled")
@@ -8123,7 +8284,7 @@ mod packages_argv_tests {
             nothing.verdict.as_deref(),
             Some(
                 "nothing changed — already applied, switched off in [machine], or a change \
-                 that did not land (the lines above say which)"
+                 that did not land; `aterm pkg machine` lists what is still open"
             )
         );
         assert!(nothing.refusal.is_none());
@@ -8286,8 +8447,9 @@ mod packages_argv_tests {
 
     /// The host re-reads the machine record after exactly the verbs whose atpkg
     /// pass runs `apply_machine_settings` first — derived from the pinned argv
-    /// table, so the list mirrors atpkg's (`update`, `install --default-set`,
-    /// `machine apply`; NOT `uninstall --all` / `install <name>`).
+    /// table, so the list mirrors atpkg's `verb_applies_machine_settings` (`update`,
+    /// every `install`, `machine apply`; NOT `uninstall --all`). `install <name>`
+    /// joined on 2026-09-16: atpkg's edge applies for it and the host never re-read.
     #[test]
     fn a_pass_that_applies_the_machine_settings_rereads_the_record() {
         let requests = [
@@ -8311,7 +8473,7 @@ mod packages_argv_tests {
                 .unwrap_or_default();
             let atpkg_applies = matches!(
                 first.as_slice(),
-                ["update"] | ["install", "--default-set"] | ["machine", "apply"]
+                ["update"] | ["install", ..] | ["machine", "apply"]
             );
             assert_eq!(
                 packages_busy(&request).applies_machine_settings(),
@@ -8320,7 +8482,43 @@ mod packages_argv_tests {
             );
             rereads += usize::from(atpkg_applies);
         }
-        assert_eq!(rereads, 3, "update, install --default-set, machine apply");
+        assert_eq!(
+            rereads, 5,
+            "update, install --default-set, install <name> (extra and admin), machine apply"
+        );
+    }
+
+    /// THE COLLECTED LANES NEVER POST A RECORD (2026-09-16). The worker hands a pass's
+    /// stdout over at exit, so the `machine-state:` line it holds was measured at the
+    /// pass's top; posting it would make a minutes-old measurement the card's newest
+    /// state and supersede a fresher read. Pinned on the worker's own closure, and on
+    /// the apply lane's sorter carrying the record on the completion instead.
+    #[test]
+    fn the_collected_lanes_never_post_the_passes_record() {
+        let src = include_str!("app_native.rs");
+        let start = src
+            .find("let result = child.output();")
+            .expect("the collected lane");
+        let end = src[start..]
+            .find("let said = result")
+            .map_or(src.len(), |i| start + i);
+        assert!(
+            src[start..end].contains("!matches!(event, Wake::PkgMachineState(_))"),
+            "the collected lane's closure must drop PkgMachineState"
+        );
+        let sorter = src.find("\npub(crate) fn machine_apply_stdout(").unwrap();
+        let sorter_end = src[sorter..]
+            .find("\n}\n")
+            .map_or(src.len(), |i| sorter + i);
+        assert!(
+            src[sorter..sorter_end].contains("Wake::PkgMachineState(body) =>")
+                && src[sorter..sorter_end].contains("read.record ="),
+            "the apply lane's sorter carries the record on the completion"
+        );
+        assert!(
+            !src[sorter..sorter_end].contains("PkgMachineRecordMissing"),
+            "…and posts no fallback: the completion re-reads without a record"
+        );
     }
 
     /// A name that could change the verb's meaning never reaches a child: flags,
@@ -8394,6 +8592,413 @@ mod packages_argv_tests {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Every byte of `src` that is CODE. Comments, string literals (raw ones
+    /// included) and character literals become spaces; newlines survive, so a
+    /// byte offset into the answer still names the line it named in the file.
+    /// A prose mention of a Unix-only name — and this file has several — must
+    /// not read as a call to one.
+    fn seam_code_only(src: &str) -> Vec<u8> {
+        let b = src.as_bytes();
+        let mut out: Vec<u8> = b
+            .iter()
+            .map(|&c| if c == b'\n' { b'\n' } else { b' ' })
+            .collect();
+        let mut i = 0;
+        while i < b.len() {
+            if b[i] == b'/' && b.get(i + 1) == Some(&b'/') {
+                while i < b.len() && b[i] != b'\n' {
+                    i += 1;
+                }
+                continue;
+            }
+            if b[i] == b'/' && b.get(i + 1) == Some(&b'*') {
+                let mut depth = 1usize;
+                i += 2;
+                while i < b.len() && depth > 0 {
+                    if b[i] == b'/' && b.get(i + 1) == Some(&b'*') {
+                        depth += 1;
+                        i += 2;
+                    } else if b[i] == b'*' && b.get(i + 1) == Some(&b'/') {
+                        depth -= 1;
+                        i += 2;
+                    } else {
+                        i += 1;
+                    }
+                }
+                continue;
+            }
+            if b[i] == b'r' && (b.get(i + 1) == Some(&b'"') || b.get(i + 1) == Some(&b'#')) {
+                let mut hash = i + 1;
+                while b.get(hash) == Some(&b'#') {
+                    hash += 1;
+                }
+                if b.get(hash) == Some(&b'"') {
+                    let hashes = hash - i - 1;
+                    let mut j = hash + 1;
+                    while j < b.len() {
+                        if b[j] == b'"'
+                            && b.len() - (j + 1) >= hashes
+                            && b[j + 1..j + 1 + hashes].iter().all(|&c| c == b'#')
+                        {
+                            j += 1 + hashes;
+                            break;
+                        }
+                        j += 1;
+                    }
+                    i = j.min(b.len());
+                    continue;
+                }
+            }
+            if b[i] == b'"' {
+                i += 1;
+                while i < b.len() {
+                    if b[i] == b'\\' {
+                        i += 2;
+                        continue;
+                    }
+                    if b[i] == b'"' {
+                        i += 1;
+                        break;
+                    }
+                    i += 1;
+                }
+                continue;
+            }
+            // A CHARACTER LITERAL, NEVER A LIFETIME. `'x'` and `'\n'` close;
+            // the `'a` in `&'a str` does not, and swallowing it would blank the
+            // rest of the file up to the next quote.
+            if b[i] == b'\'' && (b.get(i + 1) == Some(&b'\\') || b.get(i + 2) == Some(&b'\'')) {
+                i += 1;
+                while i < b.len() {
+                    if b[i] == b'\\' {
+                        i += 2;
+                        continue;
+                    }
+                    if b[i] == b'\'' {
+                        i += 1;
+                        break;
+                    }
+                    i += 1;
+                }
+                continue;
+            }
+            out[i] = b[i];
+            i += 1;
+        }
+        out
+    }
+
+    fn seam_first_word(s: &str) -> &str {
+        let end = s
+            .find(|c: char| !(c.is_alphanumeric() || c == '_'))
+            .unwrap_or(s.len());
+        &s[..end]
+    }
+
+    /// The name an item DECLARATION line binds, if it binds one. `impl` and
+    /// `use` bind nothing new, so they answer `None` rather than handing back
+    /// the first identifier that follows them — `impl Drop for X` must not
+    /// enter the Unix-only set as `Drop`.
+    fn seam_item_name(line: &str) -> Option<&str> {
+        let mut rest = line.trim_start();
+        loop {
+            if let Some(after) = rest.strip_prefix("pub(") {
+                rest = after[after.find(')')? + 1..].trim_start();
+                continue;
+            }
+            let word = seam_first_word(rest);
+            if word.is_empty() {
+                return None;
+            }
+            let tail = rest[word.len()..].trim_start();
+            match word {
+                "pub" | "default" | "unsafe" | "async" => rest = tail,
+                "extern" => {
+                    rest = match tail.strip_prefix('"') {
+                        Some(abi) => abi[abi.find('"')? + 1..].trim_start(),
+                        None => tail,
+                    };
+                }
+                // `const fn` is a function; `const NAME` is a constant.
+                "const" if matches!(seam_first_word(tail), "fn" | "unsafe") => rest = tail,
+                "fn" | "enum" | "struct" | "trait" | "type" | "const" | "static" | "union"
+                | "mod" => {
+                    let name = seam_first_word(tail);
+                    return (!name.is_empty()).then_some(name);
+                }
+                _ => return None,
+            }
+        }
+    }
+
+    /// One `#[cfg(…unix…)]` and the whole construct it gates, as a byte range.
+    struct SeamRegion {
+        negated: bool,
+        name: Option<String>,
+        start: usize,
+        end: usize,
+    }
+
+    fn seam_line_at(src: &str, idx: usize) -> &str {
+        let start = src[..idx].rfind('\n').map_or(0, |n| n + 1);
+        let end = src[idx..].find('\n').map_or(src.len(), |n| idx + n);
+        &src[start..end]
+    }
+
+    /// Every `unix`-axis `cfg` region in one Rust source. The end is found by
+    /// BRACE DEPTH from the construct's first byte: an item ends when its body
+    /// closes or at a `;`, a field or match arm at the `,` that terminates it.
+    /// That is what makes "outside every region" below mean what it says.
+    fn seam_unix_regions(src: &str, code: &[u8]) -> Vec<SeamRegion> {
+        let mut regions = Vec::new();
+        let mut i = 0;
+        while let Some(attr) = code
+            .get(i..)
+            .and_then(|tail| tail.windows(6).position(|w| w == b"#[cfg(").map(|p| p + i))
+        {
+            i = attr + 6;
+            let mut depth = 1usize;
+            let mut j = i;
+            while j < code.len() && depth > 0 {
+                match code[j] {
+                    b'(' => depth += 1,
+                    b')' => depth -= 1,
+                    _ => {}
+                }
+                j += 1;
+            }
+            if code.get(j) != Some(&b']') {
+                continue;
+            }
+            let predicate: String = String::from_utf8_lossy(&code[i..j - 1])
+                .chars()
+                .filter(|c| !c.is_whitespace())
+                .collect();
+            if !predicate
+                .split(|c: char| !(c.is_alphanumeric() || c == '_'))
+                .any(|w| w == "unix")
+            {
+                continue;
+            }
+            // The construct itself: the next code byte past the item's other
+            // attributes.
+            let mut k = j + 1;
+            loop {
+                while code.get(k).is_some_and(u8::is_ascii_whitespace) {
+                    k += 1;
+                }
+                if code.get(k) == Some(&b'#') {
+                    let mut brackets = 0usize;
+                    while k < code.len() {
+                        match code[k] {
+                            b'[' => brackets += 1,
+                            b']' => {
+                                brackets -= 1;
+                                if brackets == 0 {
+                                    k += 1;
+                                    break;
+                                }
+                            }
+                            _ => {}
+                        }
+                        k += 1;
+                    }
+                    continue;
+                }
+                break;
+            }
+            if k >= code.len() {
+                continue;
+            }
+            let line = seam_line_at(src, k).trim_start();
+            let name = seam_item_name(line).map(str::to_string);
+            let item_like = name.is_some() || line.starts_with("impl") || line.starts_with("use ");
+            let (mut depth, mut body, mut end) = (0usize, false, k);
+            let mut q = k;
+            while q < code.len() {
+                match code[q] {
+                    b'(' | b'[' => depth += 1,
+                    b'{' => {
+                        body |= depth == 0;
+                        depth += 1;
+                    }
+                    b')' | b']' | b'}' => {
+                        depth = depth.saturating_sub(1);
+                        if depth == 0 && body {
+                            end = q;
+                            break;
+                        }
+                    }
+                    b';' if depth == 0 => {
+                        end = q;
+                        break;
+                    }
+                    b',' if depth == 0 && !body && !item_like => {
+                        end = q;
+                        break;
+                    }
+                    _ => {}
+                }
+                q += 1;
+                end = q.min(code.len().saturating_sub(1));
+            }
+            regions.push(SeamRegion {
+                negated: predicate.contains("not(unix)"),
+                name,
+                start: attr,
+                end,
+            });
+        }
+        regions
+    }
+
+    /// The names a source defines ONLY behind `unix`, and every 1-based line on
+    /// which ungated code names one of them.
+    fn seam_unix_only(src: &str) -> (Vec<String>, Vec<(usize, String)>) {
+        let code = seam_code_only(src);
+        let regions = seam_unix_regions(src, &code);
+        let gated = |idx: usize| regions.iter().any(|r| r.start <= idx && idx <= r.end);
+        let mut only: std::collections::BTreeSet<String> = regions
+            .iter()
+            .filter(|r| !r.negated)
+            .filter_map(|r| r.name.clone())
+            .collect();
+        for region in regions.iter().filter(|r| r.negated) {
+            if let Some(name) = region.name.as_deref() {
+                only.remove(name);
+            }
+        }
+        // A name this file ALSO defines with no `cfg` at all is not Unix-only.
+        // Read from the BLANKED bytes, not the source: this very module quotes a
+        // `fn stop_machine_read_child` inside the plant below, and a declaration
+        // inside a string literal declares nothing.
+        let mut offset = 0;
+        for line in code.split_inclusive(|&c| c == b'\n') {
+            if !gated(offset) {
+                let text = String::from_utf8_lossy(line);
+                if let Some(name) = seam_item_name(&text) {
+                    only.remove(name);
+                }
+            }
+            offset += line.len();
+        }
+        let mut hits = Vec::new();
+        let mut at = 0;
+        while at < code.len() {
+            if !(code[at].is_ascii_alphabetic() || code[at] == b'_') {
+                at += 1;
+                continue;
+            }
+            let mut end = at;
+            while end < code.len() && (code[end].is_ascii_alphanumeric() || code[end] == b'_') {
+                end += 1;
+            }
+            if !gated(at) {
+                let word = String::from_utf8_lossy(&code[at..end]).into_owned();
+                if only.contains(&word) {
+                    hits.push((src[..at].matches('\n').count() + 1, word));
+                }
+            }
+            at = end;
+        }
+        (only.into_iter().collect(), hits)
+    }
+
+    /// AN UNGATED CALL SITE MAY NOT NAME A `#[cfg(unix)]`-ONLY ITEM (2026-09-16).
+    ///
+    /// THE DEFECT THIS EXISTS FOR, and it shipped. `Overflow` and
+    /// `machine_command_output_bounded` were `#[cfg(unix)]`; the `#[cfg(not(unix))]`
+    /// block mirrored only the narrower `machine_command_output`; and the packages
+    /// screen's `machine apply` branch — which carries no `cfg` — called the bounded
+    /// form with `Overflow::Truncate`. On this box that is a clean build. For
+    /// `x86_64-pc-windows-msvc` it is `E0433: cannot find type Overflow` and
+    /// `E0425: cannot find function machine_command_output_bounded`, and aterm-gui —
+    /// the shipped Windows binary's own crate — did not compile at all. Nobody
+    /// working on a Unix machine could see it, and nothing in the crate's own test
+    /// suite could either: a `#[cfg(not(unix))]` test compiles OUT here, which is
+    /// the same blindness wearing a test's clothes.
+    ///
+    /// SO THE CHECK READS THE SOURCE, and runs on every host. It does not replace
+    /// `xtask gate cells --cell win`, which puts a real compiler on the real triple
+    /// and is the only thing that proves the crate builds; it is the cheap half that
+    /// runs under `cargo test` on the machine somebody is actually typing on.
+    ///
+    /// SCOPED TO THIS FILE ON PURPOSE. The same scan over the rest of the crate is
+    /// not sound without knowing which MODULES are themselves `#[cfg(unix)]` — much
+    /// of aterm-gui's Unix code lives in files declared that way, where every name
+    /// is legitimately Unix-only and every mention is legitimately inside the gate.
+    /// `app_native.rs` is not one of those, so within it the law is exact.
+    #[test]
+    fn no_ungated_line_here_names_a_unix_only_item() {
+        let (only, hits) = seam_unix_only(include_str!("app_native.rs"));
+        assert!(
+            hits.is_empty(),
+            "ungated code names a `#[cfg(unix)]`-only item, so this file cannot compile off \
+             Unix — app_native.rs {hits:?}"
+        );
+        // NON-VACUITY. A scan that found no Unix-only names at all would pass the
+        // assertion above while proving nothing, so name one the file really gates.
+        assert!(
+            only.iter().any(|n| n == "stop_machine_read_child"),
+            "the scan must find this file's Unix-only items; it found {only:?}"
+        );
+        // THE SHAPE OF THE FIX, pinned so a later edit cannot re-split them: ONE
+        // `Overflow` and ONE `machine_command_output` for every target, and two arms
+        // of `machine_command_output_bounded` that differ only in their body.
+        for shared in [
+            "Overflow",
+            "machine_command_output",
+            "machine_command_output_bounded",
+        ] {
+            assert!(
+                !only.iter().any(|n| n == shared),
+                "`{shared}` is Unix-only again; every target this crate ships for needs it — \
+                 {only:?}"
+            );
+        }
+    }
+
+    /// The guard above can go RED. A checker nobody has seen fail is a checker
+    /// nobody knows the shape of, so this plants the 2026-09-16 defect in
+    /// miniature and demands the scan name its line — and demands the comment
+    /// one line above it stay unnamed.
+    #[test]
+    fn the_unix_only_scan_goes_red_on_a_planted_ungated_call() {
+        const PLANT: &str = r#"
+#[cfg(unix)]
+enum Overflow {
+    Fail,
+}
+
+#[cfg(unix)]
+fn bounded(_c: &mut Command, _o: Overflow) -> Result<(), String> {
+    Ok(())
+}
+
+#[cfg(unix)]
+fn stop_machine_read_child() {}
+
+fn apply(c: &mut Command) {
+    // A prose mention of bounded() and Overflow must not count; the call does.
+    let _ = bounded(c, Overflow::Fail);
+}
+"#;
+        let (only, hits) = seam_unix_only(PLANT);
+        assert_eq!(
+            only,
+            vec![
+                "Overflow".to_string(),
+                "bounded".to_string(),
+                "stop_machine_read_child".to_string()
+            ]
+        );
+        assert_eq!(
+            hits,
+            vec![(17, "bounded".to_string()), (17, "Overflow".to_string())],
+            "the planted ungated call site, and only it"
+        );
+    }
 
     #[cfg(unix)]
     struct MachineChildFixture(std::path::PathBuf);
@@ -8535,7 +9140,8 @@ mod tests {
         command.arg("30");
         let result =
             machine_command_output(&mut command, "owned apply", Duration::from_millis(250));
-        let (outcome, verdict) = machine_apply_completion(result, |_| panic!("no marker emitted"));
+        let (outcome, verdict, _) =
+            machine_apply_completion(result, |_| panic!("no marker emitted"));
         assert!(
             matches!(&outcome, PackagesCommandOutcome::Failed { operation: PackagesBusy::MachineApply, message }
             if message.contains("timed out") && message.contains("may be partial"))
@@ -8572,14 +9178,18 @@ mod tests {
             stderr: Vec::new(),
         };
         let mut events = Vec::new();
-        let (outcome, verdict) =
+        let (outcome, verdict, record) =
             machine_apply_completion(Ok(output(stdout.as_bytes().to_vec())), |event| {
                 events.push(event)
             });
+        assert!(record.is_none(), "no record was printed");
         assert!(
             matches!(&outcome, PackagesCommandOutcome::Failed { message, .. } if message == "preference write did not land")
         );
-        assert_eq!(events.len(), 1);
+        // The change alone: no `machine-state:` record rode this stdout, and the
+        // completion carrying none is what makes the host re-read (2026-09-16) — no
+        // record-missing event is posted here, so that read is the only one.
+        assert_eq!(events.len(), 1, "{events:?}");
         assert!(
             matches!(&events[0], Wake::PkgMachineSettings(body) if body == "spotlight-noindex 1 dir(s) migrated")
         );
@@ -8592,7 +9202,7 @@ mod tests {
             .filter(|line| !line.starts_with(atpkg::cli::MACHINE_APPLY_FAILED_PREFIX))
             .collect::<Vec<_>>()
             .join("\n");
-        let (old, _) = machine_apply_completion(Ok(output(historical.into_bytes())), |_| {});
+        let (old, _, _) = machine_apply_completion(Ok(output(historical.into_bytes())), |_| {});
         assert!(
             matches!(old, PackagesCommandOutcome::Succeeded { .. }),
             "ignoring the failed-write marker would falsely report success"
@@ -14169,6 +14779,92 @@ mod tests {
         assert!(
             state.search_input.preedit().is_none(),
             "Return is Submit for a focused text field, not generic activation"
+        );
+    }
+
+    /// THE KEYPAD ON A NATIVE PAGE, through the real key path (`App::on_key`
+    /// -> `on_key_native_mode` -> `keymap::build_key_input` -> `App::input`
+    /// -> `native_input_event`): a physical KP_5 reaches the reducer as
+    /// `Numpad5` — the identity the PTY encoders need — and the reducer folds
+    /// it onto `5`, so a focused Settings search field types the digit. A
+    /// NumLock-off KP_Decimal (`Delete` at the keypad location, `NumpadDelete`
+    /// to the engine) is a forward delete. Before the fold both fell to the
+    /// lowering's `_ => None` arm: nothing typed, nothing deleted.
+    #[test]
+    fn keypad_digit_and_delete_reach_a_focused_settings_field() {
+        use winit::event::{ElementState, KeyEvent};
+        use winit::keyboard::{
+            Key as WinitKey, KeyCode, KeyLocation, NamedKey as WinitNamed, PhysicalKey, SmolStr,
+        };
+
+        let mut app = App::headless_for_test();
+        let wid = WindowId(0);
+        assert!(app.open_settings_tab(crate::native_settings::SettingsRoute::Appearance));
+        app.dispatch_native_event(
+            wid,
+            AppEvent::Action(crate::native_app::ActionInvocation {
+                id: crate::native_ui::ActionId::new("settings/search"),
+                value: None,
+            }),
+        )
+        .unwrap();
+        let (_, view) = app.active_native_view(wid).unwrap();
+        let search_value = |app: &App| {
+            let Some(crate::native_app::AppViewState::Settings(state)) =
+                app.native_runtime.view_state(view)
+            else {
+                panic!("Settings view");
+            };
+            state.search_input.value().to_string()
+        };
+        // A keypad press exactly as the desktop backends deliver it: the
+        // keypad in `location`, the layout's glyph (or NumLock-off name) in
+        // `logical_key`, the glyph's text alongside a `Character`.
+        let keypad = |code: KeyCode, logical: WinitKey| {
+            let text = match &logical {
+                WinitKey::Character(s) => Some(s.clone()),
+                _ => None,
+            };
+            KeyEvent::synthetic_for_test(
+                PhysicalKey::Code(code),
+                logical,
+                text,
+                KeyLocation::Numpad,
+                ElementState::Pressed,
+                false,
+            )
+        };
+
+        app.on_key(
+            wid,
+            keypad(KeyCode::Numpad5, WinitKey::Character(SmolStr::new("5"))),
+        );
+        assert_eq!(
+            search_value(&app),
+            "5",
+            "KP_5 types its glyph into the focused field"
+        );
+        app.on_key(
+            wid,
+            keypad(KeyCode::Numpad1, WinitKey::Character(SmolStr::new("1"))),
+        );
+        assert_eq!(search_value(&app), "51");
+
+        // Caret to the start, then the NumLock-off decimal key: a forward
+        // delete of the `5`.
+        app.dispatch_native_event(
+            wid,
+            AppEvent::TextInput(TextInputEvent::Home { extend: false }),
+        )
+        .unwrap();
+        app.on_key(
+            wid,
+            keypad(KeyCode::NumpadDecimal, WinitKey::Named(WinitNamed::Delete)),
+        );
+        assert_eq!(
+            search_value(&app),
+            "1",
+            "NumLock-off KP_Decimal is a forward delete"
         );
     }
 

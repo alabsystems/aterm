@@ -515,17 +515,6 @@ pub fn apply_staged_if_ready_preserving_fds_exact(
     )
 }
 
-/// Overlap-handoff PRE-PARK verification: authenticate the staged candidate
-/// (codesign policy + sealed build/commit rebinding, bound to the authorized
-/// artifact identity) AND prove the bundle it would replace can become the
-/// swap's rollback source — both while the calling process's PTY readers are
-/// all still live. The handoff child re-runs the complete gate at swap time —
-/// this call only moves the FIRST verdict out of the activity-sensitive parked
-/// window so a doomed candidate never parks a reader. See
-/// `install::preverify_staged_handoff_candidate` for the exact obligations, and
-/// `install::preverify_installed_rollback_source` for why the second half is
-/// not optional.
-#[cfg(target_os = "macos")]
 /// The one law for "this refusal is a person's to clear": the INSTALLED bundle
 /// cannot be the swap's rollback source (`install::rollback_source_refusal`), so
 /// no lane can apply anything until the bundle is changed (2026-09-14).
@@ -540,6 +529,17 @@ pub fn refusal_needs_person(_reason: &str) -> bool {
     false
 }
 
+/// Overlap-handoff PRE-PARK verification: authenticate the staged candidate
+/// (codesign policy + sealed build/commit rebinding, bound to the authorized
+/// artifact identity) AND prove the bundle it would replace can become the
+/// swap's rollback source — both while the calling process's PTY readers are
+/// all still live. The handoff child re-runs the complete gate at swap time —
+/// this call only moves the FIRST verdict out of the activity-sensitive parked
+/// window so a doomed candidate never parks a reader. See
+/// `install::preverify_staged_handoff_candidate` for the exact obligations, and
+/// `install::preverify_installed_rollback_source` for why the second half is
+/// not optional.
+#[cfg(target_os = "macos")]
 pub fn preverify_staged_for_handoff(
     current_build: u64,
     current_commit: Option<&str>,

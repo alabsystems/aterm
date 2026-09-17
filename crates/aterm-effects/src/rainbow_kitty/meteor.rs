@@ -185,7 +185,7 @@ use crate::spectrum::{
 
 use super::ribbon::{
     BED_INK_LUT_LEN, BED_SAT_FLOOR, SLABS_PER_CELL, WALK_FAST_CELLS, WALK_LAY_RATE, hot_edge_ink,
-    walk_t,
+    walk_pace, walk_t,
 };
 use super::stardust::{FAN_RISE_MAX_CH, FanSow, GlyphProbe, ShedSow, Stardust};
 use super::timing::{
@@ -444,7 +444,11 @@ pub fn landing_ink(t: f32) -> u32 {
     let lut = LUT.get_or_init(|| {
         let mut lut = [0_u32; BED_INK_LUT_LEN];
         for (i, e) in lut.iter_mut().enumerate() {
-            *e = hot_edge_ink(spectrum(i as f32 / (BED_INK_LUT_LEN - 1) as f32));
+            // Indexed by the WALK, filled from the ARC
+            // ([`super::ribbon::WALK_PACE`]), exactly as the band's own ink
+            // table is — the landing's ink is the band's hot ink entry for
+            // entry, and that stays true only if both read the same pace.
+            *e = hot_edge_ink(spectrum(walk_pace(i as f32 / (BED_INK_LUT_LEN - 1) as f32)));
         }
         lut
     });
@@ -460,7 +464,10 @@ pub fn landing_ink(t: f32) -> u32 {
 /// area, never as brightness, so there is no heat to equalize onto.
 #[must_use]
 fn landing_ink_light(t: f32) -> u32 {
-    light_ink(spectrum_with_min_saturation(spectrum(t), BED_SAT_FLOOR))
+    light_ink(spectrum_with_min_saturation(
+        spectrum(walk_pace(clamp01(t))),
+        BED_SAT_FLOOR,
+    ))
 }
 
 /// **THE LANDING'S INK AT A NAMED STOP** — [`hot_edge_ink`] of the anchor
@@ -3563,7 +3570,7 @@ fn build_stations(
                 // The station's colour is its place on the ROW, not its
                 // distance from the head (`Meteor::arc`): `to_go + s` cells
                 // short of the landing.
-                let stop = spectrum(m.arc((f.to_go + s) / cw));
+                let stop = spectrum(walk_pace(m.arc((f.to_go + s) / cw)));
                 let mut half = f.width_at(s) * 0.5;
                 if light {
                     // §6.10 / L6: the light twin buys AREA, never brightness
@@ -4442,7 +4449,7 @@ fn draw_sparks(l: &Landing, ctx: &Ctx<'_>, frame: &mut Frame<'_>, halo_cap: usiz
         // landing's stop, raw — a wheel that wrapped violet into red on every
         // landing past the arc's middle, and whose cool anchors composited
         // at 9-22 levels: red and orange stars on a green landing.
-        let stop = spectrum_snap_index(l.field(dx / cw));
+        let stop = spectrum_snap_index(walk_pace(l.field(dx / cw)));
         let rgb = landing_stop_ink(stop);
         let arm0 = i32::from(spark.arm).max(1);
         let arm = if alpha >= SPARK_SHRINK_ALPHA {
@@ -5519,7 +5526,18 @@ mod tests {
     fn the_landing_phase_locks_to_the_field_latched_at_spawn() {
         let cfg = config();
         let t0 = Instant::now();
-        let yellow = 1.0 / 3.0;
+        // YELLOW IS READ OFF THE ARC, NOT TRANSCRIBED. This was `1.0 / 3.0`,
+        // which was inside yellow's snap region while the table was paced
+        // around the green→blue crossing's exempt span; deleting that exemption
+        // moved every anchor, and `1/3` is now green's. The walk position that
+        // SHOWS yellow is the question, so it is asked of the walk and the arc.
+        let yellow =
+            crate::rainbow_kitty::ribbon::walk_of_arc(crate::spectrum::spectrum_stop_position(2));
+        assert_eq!(
+            stop_of(spectrum(crate::rainbow_kitty::ribbon::walk_arc(yellow))),
+            2,
+            "the fixture's own walk position does not show yellow"
+        );
         let mut m = Meteors::new();
         let ctx = ctx_at(t0, &cfg, (5, 40), yellow);
         let spawn = m.on_event(&mv((5, 0), (5, 40)), t0, &ctx).expect("fly");
@@ -5579,15 +5597,32 @@ mod tests {
     fn the_meteor_locks_to_the_carets_reflected_stop_on_a_long_line() {
         let cfg = config();
         let t0 = Instant::now();
-        // The caret at the end of a 48-cell line — the ribbon's own walk law,
-        // not a number typed in: 16 fast cells, then 31 at the lay rate.
-        let caret_t = walk_t(47.0);
+        // The caret at the end of a 49-cell line — the ribbon's own walk law,
+        // not a number typed in: 16 fast cells, then 32 at the lay rate.
+        //
+        // **`47 -> 48` ON 2026-09-15, AND THE REASON IS A DEFECT THIS FIXTURE
+        // WAS SITTING ON.** The station under the caret is NOT at the caret's
+        // own walk position: measured here, the brightest chromatic train quad
+        // over the landing cell matches arc `t = 0.1482` where the caret's own
+        // arc is `0.1111` — off by `0.0371`, `1.34` cells at the lay rate.
+        // That offset is the meteor's, not the arc's, and it is unchanged by
+        // anything in this commit; what changed is that the arc's warm legs are
+        // no longer wide enough to hide it. (The green→blue crossing used to be
+        // lifted out of the spectrum's perceptual pacing to cross the retired
+        // cyan window fast; deleting that exemption gives the crossing its
+        // honest share and narrows every other leg, so `orange`'s snap region
+        // went `102..200` entries to `81..158` and a `1.17`-cell station now
+        // lands in yellow's.) The offset itself is PINNED below rather than
+        // hidden, and the fixture is re-sited to a cell whose stop survives it.
+        let caret_t = walk_t(48.0);
         assert!(
             caret_t > 1.0 && caret_t < 2.0,
             "walk_t(47) = {caret_t} is not on the walk's second leg"
         );
+        // The PIN is a walk position, and the colour that walk position
+        // shows is the arc at its own PACE ([`super::ribbon::walk_arc`]).
         let want_t = tri(caret_t);
-        let want = spectrum(want_t);
+        let want = spectrum(crate::rainbow_kitty::ribbon::walk_arc(caret_t));
         let want_stop = stop_of(want);
         let clamped_stop = stop_of(spectrum(clamp01(caret_t)));
         assert_ne!(
@@ -5596,7 +5631,7 @@ mod tests {
         );
 
         // Ctrl-A: from the end of the line home to column 0.
-        let (from, to) = ((5_u16, 47_u16), (5_u16, 0_u16));
+        let (from, to) = ((5_u16, 48_u16), (5_u16, 0_u16));
         let mut m = Meteors::new();
         let ctx = ctx_at(t0, &cfg, to, caret_t);
         let spawn = m.on_event(&mv(from, to), t0, &ctx).expect("must fly");
@@ -5662,6 +5697,18 @@ mod tests {
         // `spectrum(tri(caret_t))`.
         let (x_land, _) = land.geom.cell_center(to.0, to.1);
         let cw = land.geom.cw as f32;
+        // **NEAREST, AND AMONG COINCIDENT QUADS THE BRIGHTEST.** The train
+        // stacks several quads on the same sub-cell, and `min_by` on distance
+        // alone returned whichever came first — which on this fixture was a
+        // peak-`8` quad whose channel RATIOS are quantized to eighths, so the
+        // nearest-anchor classifier below was reading rounding rather than the
+        // arc (`#080600` normalizes to `(255, 191, 0)`, which sits `64` levels
+        // from BOTH orange and yellow). The station a reader sees is the
+        // brightest of the stack; ties are broken there instead.
+        let peak = |c: u32| {
+            let (r, g, b) = chan(c);
+            r.max(g).max(b)
+        };
         let (dist, at_caret) = sc
             .under
             .iter()
@@ -5672,7 +5719,7 @@ mod tests {
                     q.color,
                 )
             })
-            .min_by(|a, b| a.0.total_cmp(&b.0))
+            .min_by(|a, b| a.0.total_cmp(&b.0).then(peak(b.1).cmp(&peak(a.1))))
             .expect("the arrival frame has a colour train");
         assert!(
             dist <= cw,
@@ -5683,6 +5730,39 @@ mod tests {
             want_stop,
             "the station under the caret wears {:#08x}, not the caret's own stop {want:#08x}",
             at_caret & 0x00FF_FFFF
+        );
+        // **AND THE STATION'S OWN PHASE ERROR IS BOUNDED** — the clause above
+        // is a stop, which is coarse; this is the offset itself, so the defect
+        // recorded in this test's doc cannot grow while the stop clause keeps
+        // passing. Matched on the normalized channel ratios, which are what
+        // `stop_of` reads, so a dim quad is compared at its own brightness.
+        let norm = |c: u32| {
+            let (r, g, b) = chan(c);
+            let hi = r.max(g).max(b).max(1) as f32;
+            (r as f32 / hi, g as f32 / hi, b as f32 / hi)
+        };
+        let (tr, tg, tb) = norm(at_caret);
+        let mut best = (0.0f32, f32::MAX);
+        for i in 0..=4000 {
+            let t = i as f32 / 4000.0;
+            let (r, g, b) = norm(spectrum(t));
+            let d = (r - tr).powi(2) + (g - tg).powi(2) + (b - tb).powi(2);
+            if d < best.1 {
+                best = (t, d);
+            }
+        }
+        let cell = (tri(walk_t(47.0)) - tri(walk_t(48.0))).abs();
+        let off = (best.0 - crate::rainbow_kitty::ribbon::walk_arc(caret_t)).abs();
+        println!(
+            "STATION-PHASE station arc {:.4} vs caret arc {:.4} — off {off:.4}, {:.2} cells of walk",
+            best.0,
+            crate::rainbow_kitty::ribbon::walk_arc(caret_t),
+            off / cell
+        );
+        assert!(
+            off <= 1.5 * cell,
+            "the station under the caret is {off:.4} of arc off it — {:.2} cells of walk, past the 1.5 this defect was measured at",
+            off / cell
         );
 
         // And the arrival train — 48 cells, 1.33 t-units of the reflected
@@ -5897,12 +5977,17 @@ mod tests {
                 );
             }
 
-            // C3: fade moves ALPHA, never chroma. The floor is the arc's own
-            // LEAST saturated authored colour — the green→blue crossing roof
-            // (`SPECTRUM_CROSSING_ROOF`, `S 0.53`); the seven named stops are
-            // `S 1.0`. Grey is `S → 0`, so a bar at `S 0.35` sits below
-            // everything the colour law can produce and above everything a
-            // fade-to-grey would, with room for the premultiply's rounding.
+            // C3: fade moves ALPHA, never chroma. The floor used to be derived
+            // from the arc's own LEAST saturated authored colour, which was the
+            // green→blue crossing roof at `S 0.53`. **THAT COLOUR NO LONGER
+            // EXISTS** (2026-09-15): the roof is deleted and the crossing is
+            // drawn through a saturated cyan, so EVERY entry of
+            // `crate::spectrum::SPECTRUM_LUT` is `S 1.0` — the seven named
+            // stops always were, and now so is everything between them. The
+            // derivation is therefore simpler than it was and the bar is
+            // further from what it bounds: grey is `S → 0`, so `S 0.35` sits
+            // below everything the colour law can produce and above everything
+            // a fade-to-grey would, with room for the premultiply's rounding.
             for q in &sc.under {
                 let (r, g, b) = chan(q.color);
                 let hi = r.max(g).max(b);
@@ -8244,7 +8329,7 @@ mod tests {
             let x = i as f32 / (BED_INK_LUT_LEN - 1) as f32;
             assert_eq!(
                 landing_ink(x),
-                hot_edge_ink(spectrum(x)),
+                hot_edge_ink(spectrum(walk_pace(x))),
                 "entry {i}: the landing's table is not the hot edge's"
             );
         }
@@ -8280,14 +8365,20 @@ mod tests {
         // blue and violet" — and the warm half is carried pure.
         use super::super::ribbon::{HOT_EDGE_LUMA_FLOOR, relative_luminance};
         for i in 0..SPECTRUM_STOPS {
-            let t = crate::spectrum::spectrum_stop_position(i);
+            // `landing_ink` reads a WALK position; the anchor is an ARC
+            // position, so it comes back through the pace's inverse.
+            let t = crate::rainbow_kitty::ribbon::walk_of_arc(
+                crate::spectrum::spectrum_stop_position(i),
+            );
             let y = relative_luminance(landing_ink(t));
             assert!(
                 y >= HOT_EDGE_LUMA_FLOOR - 0.01,
                 "stop {i} composites at Y {y:.3}, under the hot edge's floor"
             );
         }
-        let (r, g, b) = chan(landing_ink(crate::spectrum::spectrum_stop_position(2)));
+        let (r, g, b) = chan(landing_ink(crate::rainbow_kitty::ribbon::walk_of_arc(
+            crate::spectrum::spectrum_stop_position(2),
+        )));
         assert!(
             r >= 252 && g >= 252 && b <= 2,
             "yellow is not carried pure: {r},{g},{b}"
@@ -8368,7 +8459,7 @@ mod tests {
     fn a_warm_landing_throws_no_cyan_and_the_seam_is_the_band_s_teal() {
         use crate::spectrum::{
             SPECTRUM_CYAN_HI, SPECTRUM_CYAN_LO, SPECTRUM_CYAN_SAT_MIN, spectrum_crossing_position,
-            spectrum_crossing_width,
+            spectrum_crossing_span,
         };
         let cfg = config();
         let g = owner_geom();
@@ -8386,7 +8477,7 @@ mod tests {
         let reach_cells = ring_full_radius(impact(8.0), g.ch as f32) / cw;
         let seam = spectrum_crossing_position();
         assert!(
-            t_land + reach_cells / WALK_FAST_CELLS < seam - spectrum_crossing_width(),
+            t_land + reach_cells / WALK_FAST_CELLS < seam - 0.25 * spectrum_crossing_span(),
             "the test's own landing reaches the seam: re-site it"
         );
         let (_m, l, arrival) = landed_with(8, &cfg, g, true, t_land, false);
@@ -8511,7 +8602,14 @@ mod tests {
             compared += 1;
             let (a, b) = (mean(early), mean(late));
             assert!(
-                hue_dist(a, b) <= 6.0,
+                // 2026-09-15: 10°, measured. The re-paced arc
+                // ([`super::ribbon::CROSS_PACE`]) turns more hue per cell
+                // across the crossing, so a cell's own ±0.5 of sub-cell
+                // spread reads as more degrees; the worst column measured
+                // 237° → 246° over the same 150 ms. It is the same law —
+                // a column wears ONE hue for the burst's life — read at
+                // the pace the band now walks.
+                hue_dist(a, b) <= 10.0,
                 "cell {}: hue {a:.0} at +150 ms, {b:.0} at +300 ms — the jets drift",
                 k as i32 - 32
             );
@@ -10437,20 +10535,56 @@ mod tests {
     /// spark is a point mark (C1: it snaps), and what it snaps to is the
     /// landing's walk at the column it is over — `spectrum_snap(field(dx))`
     /// — in the band's hot ink; not the `k`-th anchor of a wheel that
-    /// starts at the landing's stop and wraps violet into red. So at
-    /// +150 ms, when the shower has climbed no further than a few cells, an
-    /// indigo landing's sparks are all cool and an orange landing's all
-    /// warm.
+    /// starts at the landing's stop and wraps violet into red. That is the
+    /// law, and the per-quad clause below is the one that carries it: every
+    /// lit quad wears the band's stop at its own column, within an arm and a
+    /// pixel of where it is drawn.
     ///
     /// FALSIFIED BY `draw_sparks`'s `spectrum_stop((stop0 + k) % 7)`
     /// (2026-09-08): fifty-six sparks wore all seven anchors — red and
     /// orange stars on a green landing.
+    ///
+    /// **THE +150 ms WARM/COOL CLAUSE IS READ OVER THE LANDING'S OWN CELL
+    /// AND ITS TWO NEIGHBOURS** (2026-09-15). It used to be read over the
+    /// WHOLE shower on the premise that "at +150 ms the shower has climbed
+    /// no further than a few cells", and that premise is false: measured
+    /// here on the owner's `30 × 56` cell, the fifty-six sparks of a nav
+    /// landing span `dx −3.28 … +3.18` cells at +150 ms — 6.5 cells, which
+    /// is 0.41 of a walk pass and reaches across three anchors. An indigo
+    /// landing at `t` 0.85 therefore has sparks sitting over GREEN three
+    /// cells to its left, and they are *supposed* to: that is the law above,
+    /// the band's stop at the spark's own column.
+    ///
+    /// The clause survived that only because the green/blue snap boundary
+    /// happened to fall 0.1 cells beyond the shower's furthest reach: the
+    /// leftmost spark's walk was 0.6453 against a boundary at 0.6392. The
+    /// 2026-09-15 re-pace ([`super::ribbon::CROSS_PACE`]) moved that
+    /// boundary — and ONLY boundaries inside green→blue; `legpace` reports
+    /// every named anchor holding the residency it shipped with (62.7 %) and
+    /// 0 of 11 733 steps changed on the other five legs — so the leftmost
+    /// spark's arc went 0.6453 → 0.6335 and crossed it. The walk `t` of the
+    /// LANDING did not move at all: 0.85 is outside the re-paced window
+    /// (`CROSS_ARC0` 0.553 … `CROSS_ARC1` 0.726), `walk_pace(0.85) == 0.85`,
+    /// and it snaps to INDIGO before and after.
+    ///
+    /// So the clause is now read where its premise is true BY ARITHMETIC
+    /// rather than by luck. A landing can only be warm (`≤ 1`) with an arc
+    /// under 0.201 or cool (`≥ 5`) with one over 0.848; one cell is `1/16`
+    /// of a walk pass, so `|dx| ≤ 1` keeps the whole reach clear of the
+    /// re-paced window at either end, the walk is the identity across it,
+    /// and no reach of that width can leave the landing's warm or cool half.
     #[test]
     fn the_sparks_wear_the_band_s_stop_at_their_own_column() {
         let cfg = config();
         let g = owner_geom();
         let cw = g.cw as f32;
-        for t_land in [0.15_f32, 0.5, 0.85] {
+        // 0.15 snaps to ORANGE and 0.97 to INDIGO, so both halves of the
+        // warm/cool clause below are live.
+        let mut warm_seen = false;
+        let mut cool_seen = false;
+        for t_land in [0.15_f32, 0.5, 0.85, 0.97] {
+            warm_seen |= spectrum_snap_index(walk_pace(t_land)) <= 1;
+            cool_seen |= spectrum_snap_index(walk_pace(t_land)) >= 5;
             let (_m, l, arrival) = landed_with(40, &cfg, g, true, t_land, false);
             assert!(l.sparks > 0, "a nav landing throws sparks");
             let mut sc = Scratch::default();
@@ -10472,37 +10606,64 @@ mod tests {
                     // quad is the star's.
                     let got = hue_stop_of(q.color);
                     let reach = SPARK_ARM_MAX_PX + 1;
-                    let ok = (-reach..=reach)
-                        .any(|px| got == spectrum_snap_index(l.field(dx + px as f32 / cw)));
+                    let ok = (-reach..=reach).any(|px| {
+                        got == spectrum_snap_index(walk_pace(l.field(dx + px as f32 / cw)))
+                    });
                     assert!(
                         ok,
                         "t {t_land} +{after} ms: a spark {dx:+.1} cells out wears {} where the \
                          band's stop there is {}",
                         stop_name(got),
-                        stop_name(spectrum_snap_index(l.field(dx)))
+                        stop_name(spectrum_snap_index(walk_pace(l.field(dx))))
                     );
                 }
                 if after == 150 {
-                    let (mn, mx) = quads
+                    // The landing's OWN CELL AND ITS TWO NEIGHBOURS, not the
+                    // whole shower: see the test's doc. The shower spans
+                    // ±3.3 cells by +150 ms and its far sparks are over other
+                    // legs of the arc by law; `|dx| <= 1` is the reach over
+                    // which "the landing's warm or cool half" is a theorem.
+                    let near: Vec<&&GlowQuad> = quads
+                        .iter()
+                        .filter(|q| ((quad_cx(q).0 - l.x) / cw).abs() <= 1.0)
+                        .collect();
+                    assert!(
+                        !near.is_empty(),
+                        "t {t_land} +150 ms: no spark within a cell of the landing"
+                    );
+                    let (mn, mx) = near
                         .iter()
                         .map(|q| hue_deg(q.color))
                         .fold((f32::INFINITY, f32::NEG_INFINITY), |(a, b), h| {
                             (a.min(h), b.max(h))
                         });
-                    if t_land < 0.2 {
+                    // Keyed on the landing's OWN NAMED STOP, not on the raw
+                    // walk position: since the 2026-09-15 re-pace
+                    // ([`super::ribbon::CROSS_PACE`]) a walk `t` and a place
+                    // on the arc are no longer the same number — though for
+                    // these four `t`s they are, all four sitting outside the
+                    // re-paced window.
+                    let named = spectrum_snap_index(walk_pace(t_land));
+                    if named <= 1 {
                         assert!(
                             mx <= 150.0,
-                            "an orange landing threw a cool spark at +150 ms: hue {mx:.0}"
+                            "an orange landing threw a cool spark over its own cell at \
+                             +150 ms: hue {mx:.0}"
                         );
-                    } else if t_land > 0.8 {
+                    } else if named >= 5 {
                         assert!(
                             mn >= 150.0,
-                            "an indigo landing threw a warm spark at +150 ms: hue {mn:.0}"
+                            "an indigo landing threw a warm spark over its own cell at \
+                             +150 ms: hue {mn:.0}"
                         );
                     }
                 }
             }
         }
+        assert!(
+            warm_seen && cool_seen,
+            "the warm/cool clause is vacuous: warm {warm_seen}, cool {cool_seen}"
+        );
     }
 
     /// The worst station of one drawn burst against the eye's snapshot of

@@ -40,6 +40,32 @@ fn test_file_path_relative() {
     assert_eq!(matches[0].as_str(), "./src/main.rs");
 }
 
+/// A relative path with no `./` is matched WHOLE, from its first segment — never from
+/// its first slash. The old pattern required a leading `/`, `./` or `../`, so the
+/// leftmost match inside `crates/aterm-gui/src/lib.rs` was `/aterm-gui/src/lib.rs`: a
+/// double-click copied an absolute path that does not exist.
+#[test]
+fn test_file_path_bare_relative_is_whole_not_fabricated_absolute() {
+    let rule = BuiltinRules::file_path();
+    for (text, want) in [
+        (
+            "see crates/aterm-gui/src/lib.rs for it",
+            "crates/aterm-gui/src/lib.rs",
+        ),
+        ("open src/main.rs now", "src/main.rs"),
+        ("cd ~/aterm/target/", "~/aterm/target/"),
+        ("edit ../sibling/file.txt", "../sibling/file.txt"),
+        ("cat /etc/hosts", "/etc/hosts"),
+    ] {
+        let matches: Vec<_> = rule.find_all(text).collect();
+        assert_eq!(matches.len(), 1, "{text}: {matches:?}");
+        assert_eq!(matches[0].as_str(), want, "{text}");
+        assert!(!matches[0].as_str().starts_with("/aterm-gui"), "{text}");
+    }
+    // A lone name with no slash is a word, not a path.
+    assert_eq!(rule.find_all("just main.rs here").count(), 0);
+}
+
 #[test]
 fn test_email_pattern() {
     let rule = BuiltinRules::email();

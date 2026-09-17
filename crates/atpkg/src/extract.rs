@@ -26,7 +26,9 @@
 //!   [`ExtractReject::Occupied`]) — so a link can never redirect a write, and the tree
 //!   the digest describes is the tree on disk;
 //! * an in-root HARDLINK is admitted only after [`vet_hardlink`] walks BOTH ends through
-//!   the same component vet AND the target is already an extracted regular file — a
+//!   the same component vet, NEITHER path passes through a link laid earlier (`lstat`
+//!   and `link` decline to follow only the LAST component, so the target's ancestors are
+//!   walked too), AND the target is already an extracted regular file — a
 //!   toolchain sysroot dedups identical binaries this way (`cargo`↔`targo`,
 //!   `trustc`↔`rustc`, shared dylibs), and the materialized alias hashes into `tree_root`
 //!   exactly like a regular file; an escaping, absolute, or forward-referencing link
@@ -174,6 +176,24 @@ fn strip_leading(rel: &Path, strip: u32) -> Option<PathBuf> {
     }
 }
 
+/// How many leading `.` components the entry path carries AS WRITTEN (`./x` → 1,
+/// `././x` → 2, `x` → 0) — the count `strip_components` has to spend on them, because
+/// the tar that AUTHORS these rows spends it: measured on bsdtar 3.5.3 (libarchive
+/// 3.7.4), `tar -x --strip-components 1` over an archive of `./top/bin/gh` lays
+/// `top/bin/gh`, having spent the strip on the `.`. [`vet_components`] drops `.` before
+/// anything can count it, so the count is taken from the raw path instead and subtracted
+/// from the budget [`strip_leading`] then spends on the vetted one. Without that, a
+/// `tar -C dir -c .` archive lays one component DEEPER on every client than in the tree
+/// the authoring ceremony staged with the system tar and signed the `tree_root` of — a
+/// row that verifies and then installs nothing.
+fn leading_curdirs(raw: &Path) -> u32 {
+    let n = raw
+        .components()
+        .take_while(|c| matches!(c, Component::CurDir))
+        .count();
+    u32::try_from(n).unwrap_or(u32::MAX)
+}
+
 /// Step 5 of [`vet_entry`]: the join must still be under the root (defence in depth
 /// against any normalization surprise).
 fn join_under(root: &Path, rel: &Path) -> Result<PathBuf, ExtractReject> {
@@ -211,7 +231,9 @@ pub fn vet_entry(root: &Path, raw: &Path, kind: EntryKind) -> Result<PathBuf, Ex
 
 /// [`vet_entry`] with `strip_components`: the FULL raw path is vetted first (so `..` or
 /// an absolute prefix above the strip depth is still refused), THEN the leading
-/// components are dropped. `Ok(None)` when nothing remains — skip the entry.
+/// components are dropped. `Ok(None)` when nothing remains — skip the entry. A leading
+/// `.` is one of the components the strip spends itself on ([`leading_curdirs`]), as it
+/// is for the tar that writes these archives.
 pub fn vet_entry_stripped(
     root: &Path,
     raw: &Path,
@@ -225,7 +247,7 @@ pub fn vet_entry_stripped(
         }
     }
     let rel = vet_components(raw)?;
-    let Some(rel) = strip_leading(&rel, strip) else {
+    let Some(rel) = strip_leading(&rel, strip.saturating_sub(leading_curdirs(raw))) else {
         return Ok(None);
     };
     join_under(root, &rel).map(Some)
@@ -296,7 +318,7 @@ pub fn vet_symlink(
     strip: u32,
 ) -> Result<Option<PathBuf>, ExtractReject> {
     let rel = vet_components(raw)?;
-    let Some(rel) = strip_leading(&rel, strip) else {
+    let Some(rel) = strip_leading(&rel, strip.saturating_sub(leading_curdirs(raw))) else {
         return Ok(None);
     };
     if crate::call1(std::ffi::OsStr::is_empty, target.as_os_str()) {
@@ -332,18 +354,82 @@ pub fn vet_symlink(
 #[derive(Debug)]
 pub enum ExtractError {
     /// An I/O / decompression / container-format error.
-    Io(io::Error),
+    ///
+    /// `op` names the step that failed and `path` the filesystem path it was on —
+    /// the two things a bare errno cannot say. A 508-member toolchain bundle that
+    /// dies at member 300 has to name the member and the destination, because the
+    /// caller then DELETES the partial `dest_root` and nothing else survives to say
+    /// how far it got; and on macOS an `EPERM` is usually privacy consent arriving
+    /// with no dialog, where the whole question is *which path* needs it.
+    ///
+    /// The two travel together: `path: None` (with `op` `""`) is an error that
+    /// arrived from a reader with no path in scope, and renders exactly as it did
+    /// before — `io: <errno>`.
+    Io {
+        /// The underlying error.
+        err: io::Error,
+        /// The operation that failed (`"create_dir_all"`, `"open"`, `"write"`,
+        /// `"set_mode"`, `"hard_link"`, `"symlink"`, `"read"`, `"fstat"`), or `""`.
+        op: &'static str,
+        /// The path the operation was attempted on, when the failing site knew it.
+        path: Option<PathBuf>,
+    },
     /// An entry failed [`vet_entry`] — a tar-slip escape. Carries the offending raw path.
     Rejected(ExtractReject, PathBuf),
-    /// The bundle exceeded the caller-supplied uncompressed-size or entry-count cap
-    /// (decompression-bomb / tar-bomb defence). The cap comes from the *signed*
-    /// `disk_installed`/`size` (§9), never an attacker-chosen header field.
-    TooLarge,
+    /// The bundle tripped one of the decompression-bomb / tar-bomb defences — see
+    /// [`TooLargeReason`] for WHICH one, and on which member. The caps come from the
+    /// *signed* `disk_installed`/`size` (§9), never an attacker-chosen header field.
+    TooLarge(TooLargeReason),
+}
+
+/// WHICH bomb defence refused the bundle.
+///
+/// These are seven unrelated refusals, and the one line they used to share
+/// ("bundle exceeded the signed size/entry cap") described only two of them: an
+/// upstream tarball whose 30 MB archive carries a directory header with a nonzero
+/// size field was refused against a 200 MB cap with a message that sent the operator
+/// to chase `disk_installed` instead of the offending member. Each renders as what it
+/// actually is, and the header-shaped ones carry the raw member path.
+#[derive(Debug)]
+pub enum TooLargeReason {
+    /// The signed uncompressed-content cap (`max_total_bytes`) was reached mid-stream.
+    ContentCap,
+    /// The signed entry-count cap (`max_entries`) was reached.
+    EntryCap,
+    /// One entry's STRUCTURAL reads — its header, its content padding, or a GNU
+    /// longname/longlink or PAX extension body — exceeded the per-entry structural
+    /// budget (`TAR_ENTRY_STRUCTURAL_BUDGET`).
+    StructuralBudget,
+    /// A DIRECTORY member declared a nonzero body size — a skip-bomb the byte cap
+    /// never sees. Carries the offending raw member path.
+    DirectoryWithBody(PathBuf),
+    /// A HARDLINK member declared a nonzero body size. Carries the raw member path.
+    HardlinkWithBody(PathBuf),
+    /// A SYMLINK member declared a nonzero body size. Carries the raw member path.
+    SymlinkWithBody(PathBuf),
+    /// A zip symlink member whose declared target exceeds the 4096-byte link-target
+    /// limit. Carries the raw member path.
+    LinkTargetTooLong(PathBuf),
 }
 
 impl From<io::Error> for ExtractError {
     fn from(e: io::Error) -> Self {
-        ExtractError::Io(e)
+        ExtractError::Io {
+            err: e,
+            op: "",
+            path: None,
+        }
+    }
+}
+
+/// Attach the failing operation and the path it was on to an I/O error — the context a
+/// bare `?` into [`ExtractError::Io`] throws away. Every `Layer` site that touches the
+/// disk goes through this, so a mid-bundle failure names the step and the member.
+fn io_at(err: io::Error, op: &'static str, path: &Path) -> ExtractError {
+    ExtractError::Io {
+        err,
+        op,
+        path: Some(path.to_path_buf()),
     }
 }
 
@@ -355,9 +441,15 @@ impl From<io::Error> for ExtractError {
 impl std::fmt::Display for ExtractError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
-            ExtractError::Io(e) => {
+            ExtractError::Io { err, op, path } => {
                 f.write_str("io: ")?;
-                std::fmt::Display::fmt(e, f)
+                if let Some(p) = path {
+                    f.write_str(op)?;
+                    f.write_str(" ")?;
+                    std::fmt::Debug::fmt(p, f)?;
+                    f.write_str(": ")?;
+                }
+                std::fmt::Display::fmt(err, f)
             }
             ExtractError::Rejected(r, p) => {
                 f.write_str("rejected entry ")?;
@@ -365,12 +457,49 @@ impl std::fmt::Display for ExtractError {
                 f.write_str(": ")?;
                 std::fmt::Debug::fmt(r, f)
             }
-            ExtractError::TooLarge => f.write_str("bundle exceeded the signed size/entry cap"),
+            ExtractError::TooLarge(r) => std::fmt::Display::fmt(r, f),
         }
     }
 }
 
 impl std::error::Error for ExtractError {}
+
+// Hand-rendered for the same reason as [`ExtractError`]'s Display: no `write!`.
+impl std::fmt::Display for TooLargeReason {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            TooLargeReason::ContentCap => {
+                f.write_str("bundle exceeded the signed uncompressed-size cap")
+            }
+            TooLargeReason::EntryCap => f.write_str("bundle exceeded the signed entry-count cap"),
+            TooLargeReason::StructuralBudget => f.write_str(
+                "one entry's header/extension reads exceeded the per-entry structural budget",
+            ),
+            TooLargeReason::DirectoryWithBody(p) => {
+                f.write_str("directory member ")?;
+                std::fmt::Debug::fmt(p, f)?;
+                f.write_str(" declares a nonzero body size")
+            }
+            TooLargeReason::HardlinkWithBody(p) => {
+                f.write_str("hardlink member ")?;
+                std::fmt::Debug::fmt(p, f)?;
+                f.write_str(" declares a nonzero body size")
+            }
+            TooLargeReason::SymlinkWithBody(p) => {
+                f.write_str("symlink member ")?;
+                std::fmt::Debug::fmt(p, f)?;
+                f.write_str(" declares a nonzero body size")
+            }
+            TooLargeReason::LinkTargetTooLong(p) => {
+                f.write_str("symlink member ")?;
+                std::fmt::Debug::fmt(p, f)?;
+                f.write_str(" declares a link target over the 4096-byte limit")
+            }
+        }
+    }
+}
+
+impl std::error::Error for TooLargeReason {}
 
 /// Map a tar entry type to our [`EntryKind`]; anything that is not a plain file,
 /// directory or link is treated as a disallowed kind (refused by [`vet_entry`]).
@@ -408,9 +537,9 @@ fn safe_mode(entry_mode: u32, is_dir: bool) -> u32 {
 const TAR_ENTRY_STRUCTURAL_BUDGET: u64 = 1 << 20;
 
 /// Marker error the [`CappedReader`] raises when the structural budget is exhausted, so
-/// extraction maps it to [`ExtractError::TooLarge`] (not a generic I/O error) no matter
-/// WHERE the over-read happens — a directory skip, or a GNU/PAX extension-header body
-/// read INSIDE the entries iterator, before per-file write-capping can see it.
+/// extraction maps it to `TooLargeReason::StructuralBudget` (not a generic I/O error) no
+/// matter WHERE the over-read happens — a directory skip, or a GNU/PAX extension-header
+/// body read INSIDE the entries iterator, before per-file write-capping can see it.
 #[derive(Debug)]
 struct SizeCapExceeded;
 
@@ -478,9 +607,22 @@ fn map_tar_io(e: io::Error) -> ExtractError {
     if e.get_ref()
         .is_some_and(|inner| inner.is::<SizeCapExceeded>())
     {
-        ExtractError::TooLarge
+        ExtractError::TooLarge(TooLargeReason::StructuralBudget)
     } else {
-        ExtractError::Io(e)
+        ExtractError::Io {
+            err: e,
+            op: "",
+            path: None,
+        }
+    }
+}
+
+/// [`map_tar_io`] with the I/O half attributed to `op` on `path`; the cap half already
+/// carries its own reason, so it passes through untouched.
+fn map_tar_io_at(e: io::Error, op: &'static str, path: &Path) -> ExtractError {
+    match map_tar_io(e) {
+        ExtractError::Io { err, .. } => io_at(err, op, path),
+        other => other,
     }
 }
 
@@ -591,11 +733,12 @@ impl TreeAccumulator {
     /// Record a hardlink at `rel` aliasing the already-extracted `target_rel`.
     ///
     /// Fails CLOSED when the target is not one of the regular files this extraction
-    /// wrote: the caller has already proved a regular file exists at that path on disk,
+    /// wrote: the caller has already proved a regular file exists at that path on disk
+    /// AND that no component of the path is a link it laid ([`Layer::guard_ancestors`]),
     /// so the only way to reach here is a `dest_root` that was not empty when extraction
     /// started — which the staging contract forbids (`verify_and_stage` sweeps and
-    /// re-creates it). Guessing a digest for a file we did not write is precisely what
-    /// this digest is supposed to refuse.
+    /// re-creates it, and `require_empty_destination` enforces it). Guessing a digest
+    /// for a file we did not write is precisely what this digest is supposed to refuse.
     fn record_alias(&mut self, rel: Vec<u8>, target_rel: &[u8]) -> bool {
         let Some(&node) = self.paths.get(target_rel) else {
             return false;
@@ -682,10 +825,7 @@ that would not describe everything under it: ",
                 .map(|e| e.path())
                 .unwrap_or_else(|_| dest_root.to_path_buf()),
         ));
-        return Err(ExtractError::Io(io::Error::new(
-            io::ErrorKind::AlreadyExists,
-            msg,
-        )));
+        return Err(io::Error::new(io::ErrorKind::AlreadyExists, msg).into());
     }
     Ok(())
 }
@@ -723,6 +863,10 @@ struct Layer<'a> {
     /// a sysroot bundle with tens of thousands of files pays nothing for a discipline
     /// it never triggers.
     laid_symlink: bool,
+    /// The parent directory the last laid entry needed, already known to be a directory
+    /// — so a RUN of entries in one directory asks for it once instead of once per
+    /// entry. See [`Layer::ensure_parent`].
+    last_parent: Option<PathBuf>,
 }
 
 impl<'a> Layer<'a> {
@@ -747,6 +891,7 @@ impl<'a> Layer<'a> {
             copy_buf: vec![0u8; 64 * 1024],
             tree: fold.then(TreeAccumulator::new),
             laid_symlink: false,
+            last_parent: None,
         })
     }
 
@@ -754,7 +899,7 @@ impl<'a> Layer<'a> {
     fn next_entry(&mut self) -> Result<(), ExtractError> {
         self.count = self.count.saturating_add(1);
         if self.count > self.max_entries {
-            return Err(ExtractError::TooLarge);
+            return Err(ExtractError::TooLarge(TooLargeReason::EntryCap));
         }
         Ok(())
     }
@@ -802,23 +947,73 @@ impl<'a> Layer<'a> {
         Ok(())
     }
 
+    /// Make sure `dest`'s parent directory exists, remembering the last one so a RUN of
+    /// entries in the same directory pays for it once.
+    ///
+    /// The `create_dir_all` stays — an archive may omit directory members entirely, and
+    /// a file whose parent has no member of its own still has to land. What goes is
+    /// repeating it per FILE: on a parent that already exists `create_dir_all` is not
+    /// free, it is a `mkdir` that fails `EEXIST` plus an `is_dir` `stat`, each
+    /// re-resolving a path as deep as
+    /// `<prefix>/store/trust/<build>.incoming-<pid>/lib/rustlib/...`. The shipped
+    /// `trust` sysroot lays 4114 regular files across 918 directories, so 4114 of those
+    /// pairs where 918 say the same thing. Tar (and zip) members arrive grouped by
+    /// directory because a directory walk wrote them, so remembering ONE path collapses
+    /// the run; an archive that interleaves directories simply pays what it paid before.
+    ///
+    /// Skipping is sound because nothing can turn a directory this extraction already
+    /// made into something else: [`Layer::symlink`] refuses any path anything occupies
+    /// ([`ExtractReject::Occupied`]), and no method here removes a directory. The memo
+    /// therefore only ever elides a call that would have been a no-op.
+    fn ensure_parent(&mut self, dest: &Path) -> Result<(), ExtractError> {
+        let Some(parent) = dest.parent() else {
+            return Ok(());
+        };
+        if self.last_parent.as_deref() == Some(parent) {
+            return Ok(());
+        }
+        std::fs::create_dir_all(parent).map_err(|e| io_at(e, "create_dir_all", parent))?;
+        self.last_parent = Some(parent.to_path_buf());
+        Ok(())
+    }
+
     /// Lay down a directory entry. `declared_size` is the entry's EFFECTIVE body size
     /// — a legitimate directory always declares 0, and a non-zero one is a
     /// decompression-bomb vector the byte cap never sees (the reader skips the body
     /// without writing it), so it is refused on the header alone.
     fn directory(&mut self, raw: &Path, declared_size: u64, mode: u32) -> Result<(), ExtractError> {
         if declared_size != 0 {
-            return Err(ExtractError::TooLarge);
+            return Err(ExtractError::TooLarge(TooLargeReason::DirectoryWithBody(
+                raw.to_path_buf(),
+            )));
         }
-        let Some(dest) = vet_entry_stripped(self.root, raw, EntryKind::Directory, self.strip())
-            .map_err(|r| ExtractError::Rejected(r, raw.to_path_buf()))?
-        else {
+        let vetted = match vet_entry_stripped(self.root, raw, EntryKind::Directory, self.strip()) {
+            Ok(v) => v,
+            // A DIRECTORY member that names the stage root ITSELF — `.`, `./`, `././` —
+            // asks for nothing: the root is already there (`Layer::open` made it), no
+            // `tree_root` line describes it, and no byte lands. So it is the same no-op
+            // as a member the strip consumes, not a refusal. Every archive written as
+            // `tar -C dir -c .` OPENS with exactly this member (bsdtar and GNU tar both
+            // emit it), and the vendor `tar-gz`/`tar-zst` lanes do not get to choose how
+            // an upstream builds its tarball — refusing it aborted the install of an
+            // otherwise honest archive at its first entry. The member's mode is
+            // deliberately NOT applied: the root's bits are the store's, never an
+            // archive's. `EmptyPath` stays a hard refusal everywhere it names no target
+            // at all — regular files, symlinks, and both ends of a hardlink.
+            Err(ExtractReject::EmptyPath) => return Ok(()),
+            Err(r) => return Err(ExtractError::Rejected(r, raw.to_path_buf())),
+        };
+        let Some(dest) = vetted else {
             return Ok(());
         };
         self.guard_ancestors(&dest, raw)?;
         self.refuse_if_link(&dest, raw)?;
-        std::fs::create_dir_all(&dest)?;
-        crate::platform::set_mode(&dest, safe_mode(mode, true))?;
+        std::fs::create_dir_all(&dest).map_err(|e| io_at(e, "create_dir_all", &dest))?;
+        crate::platform::set_mode(&dest, safe_mode(mode, true))
+            .map_err(|e| io_at(e, "set_mode", &dest))?;
+        // A directory member is normally followed by its own files: record it as known
+        // to exist, so the first of them does not re-ask for what we just made.
+        self.last_parent = Some(dest);
         Ok(())
     }
 
@@ -835,9 +1030,7 @@ impl<'a> Layer<'a> {
         };
         self.guard_ancestors(&dest, raw)?;
         self.refuse_if_link(&dest, raw)?;
-        if let Some(parent) = dest.parent() {
-            std::fs::create_dir_all(parent)?;
-        }
+        self.ensure_parent(&dest)?;
         let written = write_capped(
             body,
             &dest,
@@ -856,7 +1049,24 @@ impl<'a> Layer<'a> {
 
     /// Lay down a hardlink: both ends vetted (and stripped), the target already an
     /// extracted REGULAR FILE, the alias recorded against the target's node.
-    fn hardlink(&mut self, raw: &Path, target: &Path) -> Result<(), ExtractError> {
+    /// `declared_size` is the entry's EFFECTIVE body size. A hardlink is a pure alias
+    /// — bsdtar and GNU tar both write 0 — and a non-zero one is the same skip-bomb as
+    /// a directory's or a symlink's, only worse: nothing here reads that body, so the
+    /// reader discards it on its next `next_entry` bounded by the per-entry STRUCTURAL
+    /// budget alone (reset to 1 MiB before every entry), and the signed
+    /// `max_total_bytes` cap never sees a byte of it — slack that scales with
+    /// `max_entries` all over again. Refused on the header, before any body is read.
+    fn hardlink(
+        &mut self,
+        raw: &Path,
+        target: &Path,
+        declared_size: u64,
+    ) -> Result<(), ExtractError> {
+        if declared_size != 0 {
+            return Err(ExtractError::TooLarge(TooLargeReason::HardlinkWithBody(
+                raw.to_path_buf(),
+            )));
+        }
         let Some((dest, target_abs)) = vet_hardlink_stripped(self.root, raw, target, self.strip())
             .map_err(|r| ExtractError::Rejected(r, raw.to_path_buf()))?
         else {
@@ -864,10 +1074,20 @@ impl<'a> Layer<'a> {
         };
         self.guard_ancestors(&dest, raw)?;
         self.refuse_if_link(&dest, raw)?;
+        // …and the TARGET's ancestors, for the same reason and before anything touches
+        // it: `symlink_metadata` and `hard_link` decline to follow only the LAST
+        // component, so a target named through a directory link this archive laid
+        // earlier (`lnk/f`, `lnk -> real`) would be lstat'd as a regular file and
+        // PHYSICALLY LINKED to `real/f` first, with nothing but the fold's
+        // `record_alias` — which cannot find `lnk/f` among the paths it wrote — to
+        // refuse it afterwards (and nothing at all in the write-only lane, which folds
+        // no tree). The vet decides it, lexically, before the link exists.
+        self.guard_ancestors(&target_abs, raw)?;
         // The target must already be an extracted REGULAR FILE: honest
         // archivers emit the file before its links, and linking to a
         // directory/nothing names no valid bundle. `symlink_metadata` so a
-        // symlink at the target is not followed.
+        // symlink AT the target is not followed either — a link is not a regular file,
+        // so the `is_file` check below refuses it.
         let target_meta = std::fs::symlink_metadata(&target_abs).map_err(|_| {
             ExtractError::Rejected(ExtractReject::HardlinkTargetMissing, raw.to_path_buf())
         })?;
@@ -877,12 +1097,11 @@ impl<'a> Layer<'a> {
                 raw.to_path_buf(),
             ));
         }
-        if let Some(parent) = dest.parent() {
-            std::fs::create_dir_all(parent)?;
-        }
-        // A same-inode alias of already-counted bytes: no content stream,
-        // no size-cap charge; the entry COUNT cap still applies.
-        std::fs::hard_link(&target_abs, &dest)?;
+        self.ensure_parent(&dest)?;
+        // A same-inode alias of already-counted bytes: no content stream, no
+        // size-cap charge (a body-carrying alias was refused on the header
+        // above); the entry COUNT cap still applies.
+        std::fs::hard_link(&target_abs, &dest).map_err(|e| io_at(e, "hard_link", &dest))?;
         // …and, for the digest, a same-NODE alias: it reuses the target's already
         // computed (mode, content sha) instead of re-hashing the same inode through
         // a second name, which is what the on-disk walk had to do.
@@ -896,10 +1115,12 @@ impl<'a> Layer<'a> {
         };
         if !aliased {
             // Unreachable for a bundle extracted into the empty scratch dir the
-            // staging contract provides (the target was proved to be a regular file
-            // on disk one statement ago, so it can only be a file THIS extraction
-            // wrote). Fail closed rather than invent a digest for bytes we did not
-            // write.
+            // staging contract provides: every ancestor of the target was just proved
+            // to be a real directory and the target itself a regular file, so the path
+            // names a file THIS extraction wrote. What is left is a `dest_root` that
+            // was not empty when extraction began, which `require_empty_destination`
+            // refuses for every folding lane. Fail closed rather than invent a digest
+            // for bytes we did not write.
             return Err(ExtractError::Rejected(
                 ExtractReject::HardlinkTargetMissing,
                 raw.to_path_buf(),
@@ -927,7 +1148,9 @@ impl<'a> Layer<'a> {
             ));
         }
         if declared_size != 0 {
-            return Err(ExtractError::TooLarge);
+            return Err(ExtractError::TooLarge(TooLargeReason::SymlinkWithBody(
+                raw.to_path_buf(),
+            )));
         }
         let Some(dest) = vet_symlink(self.root, raw, target, self.strip())
             .map_err(|r| ExtractError::Rejected(r, raw.to_path_buf()))?
@@ -941,10 +1164,8 @@ impl<'a> Layer<'a> {
                 raw.to_path_buf(),
             ));
         }
-        if let Some(parent) = dest.parent() {
-            std::fs::create_dir_all(parent)?;
-        }
-        create_symlink(target, &dest)?;
+        self.ensure_parent(&dest)?;
+        create_symlink(target, &dest).map_err(|e| io_at(e, "symlink", &dest))?;
         if let Some(tree) = self.tree.as_mut() {
             let rel = rel_bytes_under(self.root, &dest)?;
             let target_bytes = crate::call1(crate::platform::os_str_bytes, target.as_os_str());
@@ -1108,7 +1329,7 @@ pub(crate) fn extract_zip_tree(
 /// rather than substitute a default — an empty root would be compared against the
 /// signed `tree_root` and refused anyway, but saying so is better than relying on that.
 fn folded(tree: Option<TreeAccumulator>) -> Result<TreeAccumulator, ExtractError> {
-    tree.ok_or_else(|| ExtractError::Io(io::Error::other("extraction produced no tree_root")))
+    tree.ok_or_else(|| io::Error::other("extraction produced no tree_root").into())
 }
 
 /// The one tar extraction body, over an already-decompressed `decoded` stream. `fold`
@@ -1164,7 +1385,7 @@ fn extract_stream(
         // The EFFECTIVE size — the reader's, after any PAX `size` record overrode the
         // header field. Reading `header()` here would let an `x` record declare 0
         // while the ustar field declares gigabytes (or the reverse), which is the
-        // exact reader-disagreement the directory/symlink size guards exist to close.
+        // exact reader-disagreement the hardlink/directory/symlink size guards close.
         let declared = entry.entry_size();
         match kind {
             EntryKind::Hardlink => {
@@ -1175,7 +1396,7 @@ fn extract_stream(
                         ExtractError::Rejected(ExtractReject::DisallowedKind, raw.clone())
                     })?
                     .into_owned();
-                layer.hardlink(&raw, &target)?;
+                layer.hardlink(&raw, &target, declared)?;
             }
             EntryKind::Symlink => {
                 if !opts.in_root_symlinks {
@@ -1242,7 +1463,8 @@ fn write_capped(
     buf: &mut [u8],
     fold: bool,
 ) -> Result<WrittenFile, ExtractError> {
-    let mut f = crate::platform::open_create_write(dest, mode)?;
+    let mut f =
+        crate::platform::open_create_write(dest, mode).map_err(|e| io_at(e, "open", dest))?;
     // One `Option` test per 64 KiB chunk when folding is off — unmeasurable next to the
     // decompress and the write it sits between.
     let mut hasher = fold.then(Sha256::new);
@@ -1250,7 +1472,9 @@ fn write_capped(
     loop {
         // The read flows through the CappedReader (structural budget); map a budget
         // trip to TooLarge rather than a generic I/O error.
-        let n = reader.read(&mut *buf).map_err(map_tar_io)?;
+        let n = reader
+            .read(&mut *buf)
+            .map_err(|e| map_tar_io_at(e, "read", dest))?;
         if n == 0 {
             break;
         }
@@ -1272,7 +1496,7 @@ fn write_capped(
         let take = n;
         let n = n as u64;
         if n > *remaining {
-            return Err(ExtractError::TooLarge);
+            return Err(ExtractError::TooLarge(TooLargeReason::ContentCap));
         }
         // Guarded by the early return just above (`n <= *remaining` here), so the
         // saturation never engages; it carries the no-underflow proof.
@@ -1290,25 +1514,34 @@ fn write_capped(
         if let Some(hasher) = hasher.as_mut() {
             hasher.update(chunk);
         }
-        f.write_all(chunk)?;
+        f.write_all(chunk).map_err(|e| io_at(e, "write", dest))?;
         // Live-progress meter (R5): this is the ONE in-process byte loop of an
         // install, so the extract phase's honest byte source is exactly here. One
         // relaxed atomic load per 64 KiB chunk when no `--progress-file` pass is
         // live — unmeasurable next to the decompress and the write it sits between.
         crate::progress::extract_tick(n);
     }
-    // Force the sanitized mode even if umask or a pre-existing file loosened it.
-    crate::platform::set_mode(dest, mode)?;
+    // Force the sanitized mode even if umask or a pre-existing file loosened it —
+    // through the handle we are still holding (`fchmod`), not by resolving `dest` a
+    // second time. Same bits, same failure mapping, minus one full path walk per file:
+    // the shipped `trust` sysroot lays 4114 of them, each under a
+    // `<prefix>/store/trust/<build>.incoming-<pid>/lib/rustlib/...` path. It is also
+    // the same property the read-back below already relies on — the mode lands on the
+    // inode we wrote, with no second resolution to race.
+    crate::platform::set_mode_on(&f, mode).map_err(|e| io_at(e, "set_mode", dest))?;
     // Read the mode BACK, from the handle still open on the file we just wrote (so this
     // is the inode's stored value, not our request), through the very function the
     // on-disk walk uses. `File::metadata` is an `fstat` — no path resolution, nothing
     // to race, and no second open.
     match hasher {
-        Some(hasher) => Ok(WrittenFile {
-            mode: crate::platform::permission_mode(&f.metadata()?) & 0o7777,
-            content_sha_hex: crate::tree::hex(&hasher.finalize()),
-            len,
-        }),
+        Some(hasher) => {
+            let meta = f.metadata().map_err(|e| io_at(e, "fstat", dest))?;
+            Ok(WrittenFile {
+                mode: crate::platform::permission_mode(&meta) & 0o7777,
+                content_sha_hex: crate::tree::hex(&hasher.finalize()),
+                len,
+            })
+        }
         // Not folding: neither digest field is read, so neither is paid for.
         None => Ok(WrittenFile {
             mode: 0,
@@ -1343,7 +1576,7 @@ fn drain_capped(
         );
         let n = n as u64;
         if n > *remaining {
-            return Err(ExtractError::TooLarge);
+            return Err(ExtractError::TooLarge(TooLargeReason::ContentCap));
         }
         *remaining = remaining.saturating_sub(n);
         len = len.saturating_add(n);
@@ -1725,6 +1958,28 @@ mod tests {
             vet_entry_stripped(&r, Path::new("a/b/c"), EntryKind::Regular, 3).unwrap(),
             None
         );
+        // A leading `.` is a component the strip SPENDS itself on, exactly as the tar
+        // that authors these rows spends it (measured, bsdtar 3.5.3: `--strip-components
+        // 1` over `./top/bin/gh` lays `top/bin/gh`). Anything else and a
+        // `tar -C dir -c .` archive lays a different tree here than the one the
+        // authoring ceremony staged and signed the `tree_root` of.
+        assert_eq!(
+            vet_entry_stripped(&r, Path::new("./top/bin/gh"), EntryKind::Regular, 1).unwrap(),
+            Some(r.join("top/bin/gh"))
+        );
+        assert_eq!(
+            vet_entry_stripped(&r, Path::new("./top/bin/gh"), EntryKind::Regular, 2).unwrap(),
+            Some(r.join("bin/gh"))
+        );
+        assert_eq!(
+            vet_entry_stripped(&r, Path::new("./bin/gh"), EntryKind::Regular, 0).unwrap(),
+            Some(r.join("bin/gh"))
+        );
+        // A symlink member strips by the same accounting.
+        assert_eq!(
+            vet_symlink(&r, Path::new("./top/bin/link"), Path::new("gh"), 1).unwrap(),
+            Some(r.join("top/bin/link"))
+        );
         assert_eq!(
             vet_entry_stripped(&r, Path::new("../x/y"), EntryKind::Regular, 1),
             Err(ExtractReject::ParentTraversal),
@@ -2028,7 +2283,10 @@ mod tests {
         let archive = make_archive(&d, "big", &[("data", b'0', "", &[b'x'; 4096])]);
         // Cap below the 4096-byte payload ⇒ TooLarge.
         let err = extract_tar_zst(&archive, &root, 1024, 10_000).unwrap_err();
-        assert!(matches!(err, ExtractError::TooLarge), "got {err:?}");
+        assert!(
+            matches!(err, ExtractError::TooLarge(TooLargeReason::ContentCap)),
+            "got {err:?}"
+        );
         let _ = std::fs::remove_dir_all(&d);
     }
 
@@ -2075,11 +2333,59 @@ mod tests {
         // A generous 10 MB cap the 50 MiB declared size would blow past only if the bytes
         // were actually decompressed — but we reject on the header alone.
         let err = extract_tar_zst(&path, &root, 10_000_000, 10_000).unwrap_err();
-        assert!(matches!(err, ExtractError::TooLarge), "got {err:?}");
+        assert!(
+            matches!(
+                err,
+                ExtractError::TooLarge(TooLargeReason::DirectoryWithBody(_))
+            ),
+            "got {err:?}"
+        );
         assert!(
             !root.join("payload").exists(),
             "the bomb directory must not be created"
         );
+        let _ = std::fs::remove_dir_all(&d);
+    }
+
+    // A HARDLINK entry that declares a body is the directory bomb wearing a different
+    // typeflag. `Layer::hardlink` writes no content, so the body is left for the tar
+    // reader to discard on its next `next_entry` — through the per-entry STRUCTURAL
+    // budget alone, which is refreshed to 1 MiB before every entry and never charged to
+    // the signed `max_total_bytes`. N such entries would decompress ~1 MiB each while
+    // `remaining` never moved (~4 TB at the production MAX_ENTRIES). Refuse it on the
+    // header, exactly as the body-less directory and symlink kinds are refused.
+    #[test]
+    fn aborts_on_hardlink_entry_declaring_a_body() {
+        let d = dest("hlbomb");
+        // Just under the 1 MiB structural budget, so nothing else refuses it: before
+        // the guard this body decompressed for free, charged to no cap at all.
+        let bomb = vec![0u8; 1_000_000];
+        let archive = make_archive(
+            &d,
+            "hlbomb",
+            &[
+                ("bin/targo", b'0', "", b"the one binary".as_slice()),
+                ("bin/cargo", b'1', "bin/targo", bomb.as_slice()),
+            ],
+        );
+        // A cap far under the declared body and one far over it: both refuse on the
+        // header, since the cap is precisely what this body never reached.
+        for (i, cap) in [64 * 1024, 10_000_000].into_iter().enumerate() {
+            let root = d.join(format!("staging{i}"));
+            std::fs::create_dir_all(&root).unwrap();
+            let err = extract_tar_zst(&archive, &root, cap, 10_000).unwrap_err();
+            assert!(
+                matches!(
+                    err,
+                    ExtractError::TooLarge(TooLargeReason::HardlinkWithBody(_))
+                ),
+                "cap {cap}: {err:?}"
+            );
+            assert!(
+                !root.join("bin/cargo").exists(),
+                "cap {cap}: the aliasing entry must not be laid down"
+            );
+        }
         let _ = std::fs::remove_dir_all(&d);
     }
 
@@ -2106,7 +2412,13 @@ mod tests {
         // Small signed cap + few entries ⇒ a tight budget; the 8 MiB extension body,
         // though not a regular-file body, must not be readable past it.
         let err = extract_tar_zst(&path, &root, 64 * 1024, 16).unwrap_err();
-        assert!(matches!(err, ExtractError::TooLarge), "got {err:?}");
+        assert!(
+            matches!(
+                err,
+                ExtractError::TooLarge(TooLargeReason::StructuralBudget)
+            ),
+            "got {err:?}"
+        );
         let _ = std::fs::remove_dir_all(&d);
     }
 
@@ -2255,7 +2567,7 @@ mod tests {
         // extraction can never fold a root that omits what is already there.
         let err = extract_tar_zst_rooted(&archive, &root, 10_000_000, 10_000).unwrap_err();
         assert!(
-            matches!(&err, ExtractError::Io(e) if e.kind() == io::ErrorKind::AlreadyExists),
+            matches!(&err, ExtractError::Io { err, .. } if err.kind() == io::ErrorKind::AlreadyExists),
             "got {err:?}"
         );
 
@@ -2462,6 +2774,76 @@ mod tests {
         let _ = std::fs::remove_dir_all(&d);
     }
 
+    /// An upstream tarball written as `tar -C dir -c .` — the shape both bsdtar and GNU
+    /// tar produce — opens with a root-naming `./` DIRECTORY member and names every path
+    /// `./…`. The authoring ceremony stages such an archive with the SYSTEM tar and signs
+    /// the `tree_root` of what that lays, so the client lanes have to lay the same tree:
+    /// before the fix the first member aborted the lane with `Rejected(EmptyPath, "./")`
+    /// and every install of an otherwise honest row failed.
+    #[test]
+    fn dot_rooted_archives_extract_like_the_tar_that_authored_them() {
+        let d = dest("dot-root");
+        let tar = tar_bytes(&[
+            ("./", b'5', "", b"", 0o755),
+            ("./top/", b'5', "", b"", 0o755),
+            ("./top/bin/", b'5', "", b"", 0o755),
+            ("./top/bin/gh", b'0', "", b"#!/bin/sh\necho gh\n", 0o755),
+            ("./top/LICENSE", b'0', "", b"MIT", 0o644),
+        ]);
+        let gz = d.join("dot.tar.gz");
+        std::fs::write(&gz, gzip_bytes(&tar)).unwrap();
+        let zst = d.join("dot.tar.zst");
+        std::fs::write(&zst, zstd_bytes(&tar)).unwrap();
+
+        // strip 0: `./` is the root itself — a no-op — and the rest lands exactly where
+        // `tar -xzf … -C st` lays it. The fold still equals the on-disk walk.
+        let r0 = d.join("gz0");
+        let root0 = extract_tar_gz_tree(&gz, &r0, 10_000_000, 10_000, vendor(0))
+            .unwrap()
+            .root();
+        assert_eq!(
+            std::fs::read(r0.join("top/bin/gh")).unwrap(),
+            b"#!/bin/sh\necho gh\n"
+        );
+        assert_eq!(std::fs::read(r0.join("top/LICENSE")).unwrap(), b"MIT");
+        assert_eq!(root0, crate::tree::tree_root(&r0).unwrap(), "fold vs walk");
+
+        // strip 1: the leading `.` IS the component the strip spends itself on —
+        // `top/bin/gh`, not `bin/gh` — which is the tree the authoring tar staged.
+        let r1 = d.join("gz1");
+        extract_tar_gz_tree(&gz, &r1, 10_000_000, 10_000, vendor(1)).unwrap();
+        assert!(
+            r1.join("top/bin/gh").is_file(),
+            "the `.` is the stripped component, as it is for the authoring tar"
+        );
+        assert!(!r1.join("bin/gh").exists(), "one component too deep");
+
+        // strip 2 reaches past it, dropping `top` as well.
+        let r2 = d.join("gz2");
+        extract_tar_gz_tree(&gz, &r2, 10_000_000, 10_000, vendor(2)).unwrap();
+        assert!(r2.join("bin/gh").is_file());
+
+        // The zstd lane is the same tar: same tree, same fused root.
+        let rz = d.join("zst0");
+        let rootz = extract_tar_zst_tree(&zst, &rz, 10_000_000, 10_000, vendor(0))
+            .unwrap()
+            .root();
+        assert_eq!(rootz, root0, "zstd and gzip are the same tar");
+
+        // A root-naming member is a no-op ONLY as a directory: as a FILE it still names
+        // no target, and the lane still refuses it.
+        let bad = tar_bytes(&[("./", b'0', "", b"pwned", 0o644)]);
+        let bad_gz = d.join("bad.tar.gz");
+        std::fs::write(&bad_gz, gzip_bytes(&bad)).unwrap();
+        let err = extract_tar_gz_tree(&bad_gz, &d.join("gz-bad"), 10_000_000, 10_000, vendor(0))
+            .unwrap_err();
+        assert!(
+            matches!(&err, ExtractError::Rejected(ExtractReject::EmptyPath, _)),
+            "a regular file naming the root is still EmptyPath: {err:?}"
+        );
+        let _ = std::fs::remove_dir_all(&d);
+    }
+
     /// Slip refusals per lane: `..`, an absolute path, an escaping symlink and an
     /// absolute symlink each abort the gzip AND the zip lane with nothing written outside
     /// the root — and with `strip_components` set, so stripping is proven not to be a
@@ -2649,6 +3031,64 @@ mod tests {
         let _ = std::fs::remove_dir_all(&d);
     }
 
+    /// A hardlink whose TARGET is named through a symlink is refused by the VET, before
+    /// the link is made. `lstat` and `link` decline to follow only the last component,
+    /// so `alias -> lnk/f` (with `lnk -> real` laid earlier in the same archive) was
+    /// once proved "a regular file", physically linked as a second name for `real/f`,
+    /// and only then refused — by the digest fold failing to find `lnk/f` among the
+    /// paths it had written, which is a refusal by accident, in the folding lanes only.
+    #[cfg(unix)]
+    #[test]
+    fn a_hardlink_target_named_through_a_symlink_is_refused_before_the_link_exists() {
+        use std::os::unix::fs::MetadataExt;
+        let d = dest("hl-through-link");
+        let entries: &[(&str, u8, &str, &[u8], u32)] = &[
+            ("real/", b'5', "", b"", 0o755),
+            ("real/f", b'0', "", b"the one copy", 0o644),
+            ("lnk", b'2', "real", b"", 0o777),
+            ("alias", b'1', "lnk/f", b"", 0o644),
+        ];
+        let tar = tar_bytes(entries);
+        let gz = d.join("a.tar.gz");
+        std::fs::write(&gz, gzip_bytes(&tar)).unwrap();
+        let zst = d.join("a.tar.zst");
+        std::fs::write(&zst, zstd_bytes(&tar)).unwrap();
+        let root_gz = d.join("gz");
+        let root_zst = d.join("zst");
+        let lanes = [
+            (
+                "gz",
+                extract_tar_gz_tree(&gz, &root_gz, 10_000_000, 10_000, vendor(0)).map(|_| ()),
+                &root_gz,
+            ),
+            (
+                "zst",
+                extract_tar_zst_tree(&zst, &root_zst, 10_000_000, 10_000, vendor(0)).map(|_| ()),
+                &root_zst,
+            ),
+        ];
+        for (label, got, root) in lanes {
+            let err = got.unwrap_err();
+            assert!(
+                matches!(
+                    &err,
+                    ExtractError::Rejected(ExtractReject::ThroughSymlink, _)
+                ),
+                "{label}: {err:?}"
+            );
+            assert!(
+                std::fs::symlink_metadata(root.join("alias")).is_err(),
+                "{label}: the alias was laid down before the refusal"
+            );
+            assert_eq!(
+                std::fs::metadata(root.join("real/f")).unwrap().nlink(),
+                1,
+                "{label}: the target must keep its single name"
+            );
+        }
+        let _ = std::fs::remove_dir_all(&d);
+    }
+
     /// Two symlinks that each vet in-root cannot ADD UP to one that leaves it: a `..` that
     /// follows a component which is itself a link pops from wherever that link points on
     /// disk, not from where the lexical walk thinks it is. `a/b/c/up -> ../../..` is the
@@ -2735,14 +3175,14 @@ mod tests {
         std::fs::write(&gz, gzip_bytes(&tar)).unwrap();
         let err = extract_tar_gz_tree(&gz, &d.join("gz-cap"), 1024, 10_000, vendor(1)).unwrap_err();
         assert!(
-            matches!(err, ExtractError::TooLarge),
+            matches!(err, ExtractError::TooLarge(TooLargeReason::ContentCap)),
             "gz byte cap: {err:?}"
         );
         // Stripped away entirely (strip 2 > depth) — the body is still charged.
         let err =
             extract_tar_gz_tree(&gz, &d.join("gz-strip-cap"), 1024, 10_000, vendor(2)).unwrap_err();
         assert!(
-            matches!(err, ExtractError::TooLarge),
+            matches!(err, ExtractError::TooLarge(_)),
             "gz stripped-away body cap: {err:?}"
         );
         // Everything stripped away: nothing is written, the fold is the empty root, and
@@ -2774,13 +3214,13 @@ mod tests {
         .unwrap();
         let err = extract_zip_tree(&zip, &d.join("zip-cap"), 1024, 10_000, vendor(1)).unwrap_err();
         assert!(
-            matches!(err, ExtractError::TooLarge),
+            matches!(err, ExtractError::TooLarge(TooLargeReason::ContentCap)),
             "zip byte cap: {err:?}"
         );
         let err =
             extract_zip_tree(&zip, &d.join("zip-strip-cap"), 1024, 10_000, vendor(2)).unwrap_err();
         assert!(
-            matches!(err, ExtractError::TooLarge),
+            matches!(err, ExtractError::TooLarge(_)),
             "zip stripped-away body cap: {err:?}"
         );
 
@@ -2791,7 +3231,7 @@ mod tests {
         let err =
             extract_tar_gz_tree(&gz2, &d.join("gz-entries"), 10_000, 1, vendor(0)).unwrap_err();
         assert!(
-            matches!(err, ExtractError::TooLarge),
+            matches!(err, ExtractError::TooLarge(TooLargeReason::EntryCap)),
             "gz entry cap: {err:?}"
         );
         let zip2 = d.join("two.zip");
@@ -2819,7 +3259,7 @@ mod tests {
         let err =
             extract_zip_tree(&zip2, &d.join("zip-entries"), 10_000, 1, vendor(0)).unwrap_err();
         assert!(
-            matches!(err, ExtractError::TooLarge),
+            matches!(err, ExtractError::TooLarge(TooLargeReason::EntryCap)),
             "zip entry cap: {err:?}"
         );
 
@@ -2838,7 +3278,10 @@ mod tests {
         let err = extract_tar_gz_tree(&gz3, &d.join("gz-linkbomb"), 10_000_000, 10, vendor(0))
             .unwrap_err();
         assert!(
-            matches!(err, ExtractError::TooLarge),
+            matches!(
+                err,
+                ExtractError::TooLarge(TooLargeReason::SymlinkWithBody(_))
+            ),
             "symlink body bomb: {err:?}"
         );
         // A zip symlink whose target is implausibly long is refused before it is read.
@@ -2860,7 +3303,10 @@ mod tests {
         let err = extract_zip_tree(&zip3, &d.join("zip-longlink"), 10_000_000, 10, vendor(0))
             .unwrap_err();
         assert!(
-            matches!(err, ExtractError::TooLarge),
+            matches!(
+                err,
+                ExtractError::TooLarge(TooLargeReason::LinkTargetTooLong(_))
+            ),
             "zip long link: {err:?}"
         );
         let _ = std::fs::remove_dir_all(&d);
@@ -2926,7 +3372,7 @@ mod tests {
             let path = d.join(format!("{label}.zip"));
             std::fs::write(&path, bytes).unwrap();
             let err = extract_zip_tree(&path, &d.join(label), 10_000, 10, vendor(0)).unwrap_err();
-            assert!(matches!(err, ExtractError::Io(_)), "{label}: {err:?}");
+            assert!(matches!(err, ExtractError::Io { .. }), "{label}: {err:?}");
         };
         // Encrypted: flip the general-purpose flag bit 0 in the central record.
         let mut enc = plain.clone();
@@ -3020,7 +3466,7 @@ mod tests {
         );
         // Capped.
         let err = stage_file(&payload[..], &d.join("capped"), 0o755, 4).unwrap_err();
-        assert!(matches!(err, ExtractError::TooLarge));
+        assert!(matches!(err, ExtractError::TooLarge(_)));
         let _ = std::fs::remove_dir_all(&d);
     }
 
@@ -3052,6 +3498,206 @@ mod tests {
         .unwrap();
         tree.record_symlink(b"bin/foo".to_vec(), b"../Foo.app/Contents/MacOS/foo");
         assert_eq!(tree.root(), crate::tree::tree_root(&root).unwrap());
+        let _ = std::fs::remove_dir_all(&d);
+    }
+
+    /// The bomb defences say WHICH one fired, and on which member.
+    ///
+    /// All seven used to render as the single line "bundle exceeded the signed
+    /// size/entry cap", so an upstream tar that puts a size on a directory header —
+    /// some old writers do — was refused with a size-cap message against a cap it was
+    /// nowhere near, sending the operator to chase `disk_installed` instead of the
+    /// offending header. A reason a caller can match on, and a member name in the
+    /// rendered line, is the whole point.
+    #[test]
+    fn a_cap_refusal_names_its_reason_and_its_member() {
+        let d = dest("cap-reasons");
+        let root = d.join("staging");
+        std::fs::create_dir_all(&root).unwrap();
+        // One directory member declaring 50 MiB, under a 10 MB cap the archive itself
+        // is nowhere near: the refusal is the header guard, NOT the byte cap.
+        let mut tar = Vec::new();
+        tar.extend_from_slice(&raw_header("payload/", b'5', "", 50 * 1024 * 1024));
+        tar.resize(tar.len() + 1024, 0);
+        let path = d.join("dirbomb.tar.zst");
+        std::fs::write(&path, zstd_bytes(&tar)).unwrap();
+        let err = extract_tar_zst(&path, &root, 10_000_000, 10_000).unwrap_err();
+        let ExtractError::TooLarge(TooLargeReason::DirectoryWithBody(member)) = &err else {
+            panic!("want DirectoryWithBody, got {err:?}");
+        };
+        assert_eq!(member.as_path(), Path::new("payload/"));
+        let shown = err.to_string();
+        assert!(shown.contains("payload"), "must name the member: {shown}");
+        assert!(
+            !shown.contains("size/entry cap"),
+            "a directory header is not the byte cap: {shown}"
+        );
+
+        // The byte cap and the entry cap are each their own reason, and neither reads
+        // as the other.
+        let big = make_archive(&d, "big", &[("data", b'0', "", &[b'x'; 4096])]);
+        let root2 = d.join("staging2");
+        std::fs::create_dir_all(&root2).unwrap();
+        let err = extract_tar_zst(&big, &root2, 1024, 10_000).unwrap_err();
+        assert!(
+            matches!(err, ExtractError::TooLarge(TooLargeReason::ContentCap)),
+            "{err:?}"
+        );
+        assert!(err.to_string().contains("uncompressed-size"), "{err}");
+        let root3 = d.join("staging3");
+        std::fs::create_dir_all(&root3).unwrap();
+        let err = extract_tar_zst(&big, &root3, 10_000_000, 0).unwrap_err();
+        assert!(
+            matches!(err, ExtractError::TooLarge(TooLargeReason::EntryCap)),
+            "{err:?}"
+        );
+        assert!(err.to_string().contains("entry-count"), "{err}");
+        let _ = std::fs::remove_dir_all(&d);
+    }
+
+    /// A disk failure mid-bundle names the step AND the path it was on.
+    ///
+    /// The caller deletes the partial `dest_root` on any failure, so `io: No space left
+    /// on device (os error 28)` was the entire record of a 508-member bundle that died
+    /// at member 300 — no member, no destination, no read-vs-write. On macOS the same
+    /// bare line covered an `EPERM` that is usually privacy consent arriving with no
+    /// dialog, where the operator's only question is which path needs it. EACCES from a
+    /// write-protected stage root is that shape, without needing a full disk.
+    #[cfg(unix)]
+    #[test]
+    fn an_io_failure_names_the_operation_and_the_path() {
+        let d = dest("io-context");
+        let root = d.join("staging");
+        std::fs::create_dir_all(&root).unwrap();
+        let archive = make_archive(&d, "tool", &[("bin/tool", b'0', "", b"#!/bin/sh\n")]);
+        // Drop write permission on the stage root: laying `bin/` under it is EACCES.
+        std::fs::set_permissions(&root, std::fs::Permissions::from_mode(0o500)).unwrap();
+        let got = extract_tar_zst(&archive, &root, 10_000_000, 10_000);
+        std::fs::set_permissions(&root, std::fs::Permissions::from_mode(0o700)).unwrap();
+        let Err(err) = got else {
+            // Running as root, where the mode bits do not apply: nothing to assert.
+            let _ = std::fs::remove_dir_all(&d);
+            return;
+        };
+        let ExtractError::Io { op, path, .. } = &err else {
+            panic!("want Io, got {err:?}");
+        };
+        assert_eq!(*op, "create_dir_all");
+        assert_eq!(path.as_deref(), Some(root.join("bin").as_path()));
+        let shown = err.to_string();
+        assert!(shown.contains("create_dir_all"), "names the step: {shown}");
+        assert!(shown.contains("bin"), "names the path: {shown}");
+        let _ = std::fs::remove_dir_all(&d);
+    }
+
+    /// `write_capped` forces the sanitized mode through the HANDLE it is still holding.
+    ///
+    /// The chmod used to go by path — `platform::set_mode(dest, mode)`, a full
+    /// resolution of a `<build>.incoming-<pid>/lib/rustlib/...` path — while `f` was
+    /// open and one line away from being `fstat`ed for those very bits, once per file
+    /// (4114 of them in the shipped `trust` sysroot). A reader that unlinks `dest`
+    /// mid-body is the witness that the handle is what gets chmod'd now: the bytes, the
+    /// `fchmod` and the mode read-back all describe the file we wrote, where the path
+    /// form had nothing left to resolve and failed the whole extraction with `ENOENT`.
+    #[cfg(unix)]
+    #[test]
+    fn write_capped_sets_the_mode_through_the_open_handle() {
+        /// Hands the body over in one read, then unlinks `dest` behind the writer.
+        struct UnlinkMidBody<'a> {
+            body: &'a [u8],
+            dest: &'a Path,
+            done: bool,
+        }
+        impl Read for UnlinkMidBody<'_> {
+            fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
+                if self.done {
+                    return Ok(0);
+                }
+                self.done = true;
+                let n = self.body.len().min(buf.len());
+                buf[..n].copy_from_slice(&self.body[..n]);
+                std::fs::remove_file(self.dest)?;
+                Ok(n)
+            }
+        }
+
+        let d = dest("fchmod-handle");
+        let path = d.join("lib/rustlib/aarch64-apple-darwin/lib/libstd.rlib");
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        let body = b"rlib bytes";
+        let budget = Rc::new(Cell::new(TAR_ENTRY_STRUCTURAL_BUDGET));
+        let mut buf = vec![0u8; 64 * 1024];
+        let mut remaining: u64 = 1 << 20;
+        let w = write_capped(
+            UnlinkMidBody {
+                body,
+                dest: &path,
+                done: false,
+            },
+            &path,
+            0o755,
+            &mut remaining,
+            &budget,
+            &mut buf,
+            true,
+        )
+        .unwrap();
+        assert_eq!(w.len, body.len() as u64);
+        // Read back off the same handle: the mode reached the inode we wrote.
+        assert_eq!(w.mode, 0o755);
+        let mut h = Sha256::new();
+        h.update(body);
+        assert_eq!(w.content_sha_hex, crate::tree::hex(&h.finalize()));
+        let _ = std::fs::remove_dir_all(&d);
+    }
+
+    /// ONE `create_dir_all` per run of entries in a directory, not one per entry.
+    ///
+    /// `Layer` used to ask for the parent on every file it laid, and on a parent that
+    /// already exists that is a `mkdir` failing `EEXIST` plus an `is_dir` `stat` — 4114
+    /// times for the 918 directories of the shipped `trust` sysroot, each re-resolving
+    /// a deep `<build>.incoming-<pid>/lib/rustlib/...` path under the store lock.
+    /// Removing the directory behind the extractor's back is the witness that the
+    /// second file of a run no longer re-asks for it; nothing under the staging
+    /// contract can do that (the scratch root is this process's alone, under the store
+    /// lock), which is exactly why the call being skipped could only have been a no-op.
+    #[test]
+    fn a_run_of_files_in_one_directory_creates_it_once() {
+        let d = dest("parent-memo");
+        let root = d.join("staging");
+        let budget = Rc::new(Cell::new(TAR_ENTRY_STRUCTURAL_BUDGET));
+        let mut layer = Layer::open(
+            &root,
+            1 << 20,
+            100,
+            true,
+            ExtractOptions::default(),
+            Rc::clone(&budget),
+        )
+        .unwrap();
+        layer.regular(Path::new("lib/a"), 0o644, &b"a"[..]).unwrap();
+        assert!(root.join("lib/a").is_file());
+
+        std::fs::remove_dir_all(root.join("lib")).unwrap();
+        let err = layer
+            .regular(Path::new("lib/b"), 0o644, &b"b"[..])
+            .unwrap_err();
+        let ExtractError::Io { op, .. } = &err else {
+            panic!("want Io, got {err:?}");
+        };
+        assert_eq!(
+            *op, "open",
+            "the parent must not be asked for a second time"
+        );
+
+        // ...and exactly ONE directory is remembered: a different parent is created as
+        // before, and switching back re-issues the call for the first one.
+        layer
+            .regular(Path::new("other/c"), 0o644, &b"c"[..])
+            .unwrap();
+        layer.regular(Path::new("lib/d"), 0o644, &b"d"[..]).unwrap();
+        assert!(root.join("other/c").is_file());
+        assert!(root.join("lib/d").is_file());
         let _ = std::fs::remove_dir_all(&d);
     }
 }

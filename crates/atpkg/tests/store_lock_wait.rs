@@ -242,6 +242,38 @@ const ANNOUNCE_WITHIN: Duration = Duration::from_secs(15);
 /// wait (naming THIS fixture's lock path, never the real store's), and — once the
 /// holder lets go — runs its verb and exits 0, with its normal output AFTER the
 /// announcement and nothing on stderr about the lock.
+/// Every stdout line a REFUSED pass may still carry.
+///
+/// The `[machine]` settings are applied at the dispatch edge, ABOVE the store lock
+/// (they take none: `defaults` writes a per-host preference domain and the Spotlight
+/// migration renames directories under `$HOME`), so a pass the lock refuses has already
+/// reported what it did to the host — including, in this fixture, the synthetic-home
+/// refusal, because the spawned child runs with a temp `HOME` and per-host preferences
+/// follow the ACCOUNT, not `HOME`. What must NOT be here is a PROGRESS marker: those
+/// are the window's channel, and a typed verb earns none.
+fn no_progress_marker(stdout: &[String]) {
+    for line in stdout {
+        assert!(
+            line.starts_with("atpkg: machine")
+                || line.starts_with("atpkg machine:")
+                || line.starts_with("atpkg noindex:")
+                || line.starts_with("atpkg: Universal Control"),
+            "a refused pass prints only what it did to the host: {line:?}"
+        );
+    }
+    for marker in [
+        atpkg::cli::LOCK_WAITING_MARKER,
+        atpkg::cli::SEED_STARTING_MARKER,
+        atpkg::cli::SEED_INSTALLED_MARKER,
+        atpkg::cli::SEED_FAILED_MARKER,
+    ] {
+        assert!(
+            !stdout.iter().any(|l| l.contains(marker)),
+            "no {marker:?} for a typed verb: {stdout:?}"
+        );
+    }
+}
+
 #[test]
 fn a_waiting_seed_proceeds_once_the_holder_releases() {
     let fx = Fixture::new("proceeds");
@@ -380,7 +412,7 @@ fn a_typed_seed_stays_fail_fast_with_exit_75() {
         elapsed < Duration::from_secs(2),
         "fail-fast, not a wait: {elapsed:?}"
     );
-    assert!(stdout.is_empty(), "no marker for a typed verb: {stdout:?}");
+    no_progress_marker(&stdout);
     // The refusal names the door the host settings still have (they take no lock).
     assert!(stderr.contains("aterm pkg machine apply"), "{stderr}");
     assert!(
@@ -403,7 +435,7 @@ fn an_unwritable_prefix_never_waits_and_keeps_exit_1() {
         elapsed < Duration::from_secs(2),
         "no wait on Io: {elapsed:?}"
     );
-    assert!(stdout.is_empty(), "{stdout:?}");
+    no_progress_marker(&stdout);
     assert!(stderr.contains("cannot take the store lock"), "{stderr}");
     assert!(stderr.contains("aterm pkg machine apply"), "{stderr}");
 }
@@ -632,6 +664,35 @@ fn a_wait_that_ends_inside_the_grace_is_never_announced_nor_answered() {
         stdout.iter().any(|l| l.contains(DECLINED_SENTENCE)),
         "the verb ran: {stdout:?}"
     );
+    // THE GUARD IS WHAT KEEPS THIS SUITE OFF THE DEVELOPER'S REAL MACHINE. Every
+    // spawn here runs a pass with a temp `HOME`, and a pass applies the `[machine]`
+    // settings first thing — but `defaults` writes the ACCOUNT's per-host domain and
+    // ignores `$HOME` (measured 2026-09-14), so without the synthetic-home refusal this
+    // very test would disable Universal Control on whatever Mac ran it. Nothing else
+    // asserts the refusal fires at the process edge rather than only in a unit test.
+    #[cfg(target_os = "macos")]
+    {
+        let refusals: Vec<&String> = stdout
+            .iter()
+            .filter(|l| l.starts_with(atpkg::cli::MACHINE_NOT_APPLIED_PREFIX))
+            .collect();
+        assert_eq!(
+            refusals.len(),
+            1,
+            "a temp-HOME pass must refuse the machine settings exactly once: {stdout:?}"
+        );
+        assert!(
+            refusals[0].contains("synthetic machine"),
+            "and say why: {:?}",
+            refusals[0]
+        );
+        assert!(
+            !stdout
+                .iter()
+                .any(|l| l.contains(atpkg::machine::UNIVERSAL_CONTROL_ENTRY)),
+            "nothing was written to the real machine: {stdout:?}"
+        );
+    }
 }
 
 /// No contention, no marker: the flag changes nothing about an uncontended pass.

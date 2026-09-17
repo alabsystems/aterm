@@ -40,6 +40,7 @@ pub mod sink;
 pub use proxy::EventLoopProxy;
 use sink::EventSink;
 
+use super::clipboard::WaylandClipboard;
 use super::state::{WindowCompositorUpdate, WinitState};
 use super::window::state::FrameCallbackState;
 use super::{logical_to_physical_rounded, DeviceId, WaylandError, WindowId};
@@ -57,6 +58,9 @@ pub struct EventLoop<T: 'static> {
 
     /// Sender of user events.
     user_events_sender: calloop::channel::Sender<T>,
+
+    /// The clipboard handle (see `clipboard.rs`); `clipboard()` clones it out.
+    clipboard: WaylandClipboard,
 
     // XXX can't remove RefCell out of here, unless we can plumb generics into the `Window`, which
     // we don't really want, since it'll break public API by a lot.
@@ -138,6 +142,24 @@ impl<T: 'static> EventLoop<T> {
             .map_err(|error| error.error);
         map_err!(result, WaylandError::Calloop)?;
 
+        // The clipboard's request channel: any thread posts, the loop thread
+        // (which owns the seats, their serials and the data devices) answers.
+        let (clipboard_sender, clipboard_channel) = calloop::channel::channel();
+        let clipboard = WaylandClipboard::new(
+            clipboard_sender,
+            winit_state.clipboard.shared(),
+            std::thread::current().id(),
+        );
+        let result = event_loop
+            .handle()
+            .insert_source(clipboard_channel, |event, _, winit_state: &mut WinitState| {
+                if let calloop::channel::Event::Msg(request) = event {
+                    winit_state.handle_clipboard_request(request);
+                }
+            })
+            .map_err(|error| error.error);
+        map_err!(result, WaylandError::Calloop)?;
+
         // An event's loop awakener to wake up for window events from winit's windows.
         let (event_loop_awakener, event_loop_awakener_source) = map_err!(
             calloop::ping::make_ping()
@@ -172,6 +194,7 @@ impl<T: 'static> EventLoop<T> {
             connection,
             wayland_dispatcher,
             user_events_sender,
+            clipboard,
             pending_user_events,
             event_loop,
             window_target: RootActiveEventLoop {
@@ -182,6 +205,11 @@ impl<T: 'static> EventLoop<T> {
         };
 
         Ok(event_loop)
+    }
+
+    /// A clone of the clipboard handle (see `clipboard.rs`).
+    pub fn clipboard(&self) -> WaylandClipboard {
+        self.clipboard.clone()
     }
 
     pub fn run_on_demand<F>(&mut self, mut event_handler: F) -> Result<(), EventLoopError>

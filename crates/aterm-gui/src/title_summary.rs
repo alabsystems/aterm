@@ -43,6 +43,10 @@ pub(crate) use redaction::{
     endpoint_has_query_or_fragment, endpoint_is_credential_free_absolute_url,
     looks_like_raw_credential,
 };
+// The strip label's projection onto a surface that paints it whole (the native
+// toolbar, the tooltip / menu header, the a11y tab item): the cap the strip
+// itself no longer takes, applied by the consumers that need it.
+pub(crate) use description::{whole_label, whole_labels};
 
 const MAX_COMMAND_CHARS: usize = 320;
 const MAX_CONTEXT_LINE_CHARS: usize = 512;
@@ -531,9 +535,51 @@ impl Worker {
 /// A literal in either place would let the two drift silently, and the drift
 /// would show up as chips painting `…a command` again.
 ///
-/// The WINDOW titlebar composes with `" — "` instead; that flavour is not this
-/// constant, and nothing reads it apart.
+/// The WINDOW titlebar composes with `" — "` instead
+/// ([`ChromeSurface::WindowTitle`]); that flavour is not this constant, and
+/// nothing reads it apart.
 pub(crate) const TAB_LABEL_SEPARATOR: &str = " · ";
+
+/// Which chrome surface a label is composed FOR — the flavour the per-session
+/// compose cache keys on, as a type, so the two things a flavour decides (the
+/// separator its halves are joined with, and whether the title is capped
+/// before they are joined) are stated once and cannot drift apart at a call
+/// site.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub(crate) enum ChromeSurface {
+    /// A tab-strip chip: joined with [`TAB_LABEL_SEPARATOR`] and handed to the
+    /// strip WHOLE — no title cap — because the strip fits every label itself,
+    /// by display cells and sibling-aware (`tab_bar::distinct_chip_labels`),
+    /// and a fixed cut taken first is sibling-blind: it collapses tabs that
+    /// differ only inside the region it discards
+    /// ([`description::MAX_CHROME_TITLE_GRAPHEMES`] tells the whole story). A
+    /// strip label that leaves the strip for a surface with no fit of its own
+    /// goes through [`whole_label`] there.
+    TabStrip,
+    /// The window titlebar: joined with `" — "` (a sentence, not a chip;
+    /// nothing reads it apart) and painted whole, so the title takes
+    /// [`description::MAX_CHROME_TITLE_GRAPHEMES`] by the middle cut.
+    WindowTitle,
+}
+
+impl ChromeSurface {
+    /// The string this surface's two halves are joined with.
+    pub(crate) const fn separator(self) -> &'static str {
+        match self {
+            Self::TabStrip => TAB_LABEL_SEPARATOR,
+            Self::WindowTitle => " — ",
+        }
+    }
+
+    /// The title's grapheme cap on this surface — `None` where the surface
+    /// fits the label itself.
+    const fn title_cap(self) -> Option<usize> {
+        match self {
+            Self::TabStrip => None,
+            Self::WindowTitle => Some(description::MAX_CHROME_TITLE_GRAPHEMES),
+        }
+    }
+}
 
 /// Strip a `"<state> in <place>"` description down to `"<state>"` when `title`
 /// already names that place. Textual and cheap: the state sentence is built by
@@ -1215,8 +1261,9 @@ impl Coordinator {
     /// as [`Self::compose_label_into`]; per-frame paths that own a reusable slot
     /// should prefer that method to avoid the return-value allocation.
     ///
-    /// TAB flavour callers pass [`TAB_LABEL_SEPARATOR`], the string the tab strip
-    /// also reads a composed label back APART with.
+    /// `surface` names the flavour ([`ChromeSurface`]): the tab strip reads a
+    /// composed label back APART with [`TAB_LABEL_SEPARATOR`] and receives the
+    /// title uncapped; the window titlebar takes the grapheme cap.
     #[must_use]
     pub(crate) fn compose(
         &self,
@@ -1225,7 +1272,7 @@ impl Coordinator {
         authored_description: Option<&str>,
         format: TitleFormat,
         config: &Config,
-        separator: &str,
+        surface: ChromeSurface,
     ) -> String {
         let mut label = raw_title.to_string();
         self.compose_label_into(
@@ -1233,7 +1280,7 @@ impl Coordinator {
             authored_description,
             format,
             config,
-            separator,
+            surface,
             &mut label,
         );
         label
@@ -1244,23 +1291,27 @@ impl Coordinator {
     ///
     /// Per-frame contract (the tab strip re-labels every tab on every redraw):
     /// - CLEAN FAST PATH: with no description to merge and a title the chrome
-    ///   sanitizer would pass through unchanged, the raw title IS the label —
-    ///   no sanitize/grapheme pass, no allocation, no cache traffic.
+    ///   sanitizer (and the surface's cap, where it has one) would pass through
+    ///   unchanged, the raw title IS the label — no sanitize/grapheme pass, no
+    ///   allocation, no cache traffic.
     /// - CACHE HIT: an unchanged (title, description) pair for this session and
-    ///   format/separator flavor reuses the stored `String` via `clone_from`
+    ///   format/surface flavor reuses the stored `String` via `clone_from`
     ///   into the resident slot — no fresh allocation after warmup.
-    /// - CACHE MISS: sanitize + grapheme-cap + compose once, then store. Tab
-    ///   (`" · "`) and window (`" — "`) flavors occupy separate keys so the two
-    ///   per-frame callers cannot evict each other.
+    /// - CACHE MISS: sanitize + grapheme-cap (the window surface only — the
+    ///   strip fits its own labels, [`ChromeSurface::TabStrip`]) + compose
+    ///   once, then store. Tab and window flavors occupy separate keys so the
+    ///   two per-frame callers cannot evict each other.
     pub(crate) fn compose_label_into(
         &self,
         session: Option<u64>,
         authored_description: Option<&str>,
         format: TitleFormat,
         config: &Config,
-        separator: &str,
+        surface: ChromeSurface,
         slot: &mut String,
     ) {
+        let separator = surface.separator();
+        let title_cap = surface.title_cap();
         let activity = session
             .and_then(|id| self.activity(id, config))
             .unwrap_or_default();
@@ -1275,13 +1326,16 @@ impl Coordinator {
         // `…in aterm` while the informative half was cut away. Where the title
         // already answers "where", the description keeps only the state word.
         let description = shed_place_already_in_title(slot, description);
-        if description.is_empty() && !slot.is_empty() && title_is_presentation_clean(slot) {
+        if description.is_empty()
+            && !slot.is_empty()
+            && title_is_presentation_clean(slot, title_cap)
+        {
             return;
         }
         let Some(session) = session else {
             // Session-less chrome (native surfaces, tests) has no stable cache
             // identity; compose directly.
-            let composed = compose_presentation(slot, description, format, separator);
+            let composed = compose_presentation(slot, description, format, separator, title_cap);
             #[cfg(test)]
             self.compose_runs.fetch_add(1, Ordering::Relaxed);
             slot.clone_from(&composed);
@@ -1293,7 +1347,7 @@ impl Coordinator {
         let input_hash = input.finish();
         let mut flavor = std::collections::hash_map::DefaultHasher::new();
         format.as_str().hash(&mut flavor);
-        separator.hash(&mut flavor);
+        surface.hash(&mut flavor);
         let key = (session, flavor.finish());
         let mut cache = self
             .compose_cache
@@ -1307,7 +1361,7 @@ impl Coordinator {
         }
         #[cfg(test)]
         self.compose_runs.fetch_add(1, Ordering::Relaxed);
-        let composed = compose_presentation(slot, description, format, separator);
+        let composed = compose_presentation(slot, description, format, separator, title_cap);
         slot.clone_from(&composed);
         cache.insert(
             key,
@@ -1595,13 +1649,12 @@ impl Coordinator {
                 .is_some_and(|deadline| now >= deadline)
                 .then_some(*session)
         }));
+        // Retained queue members are already admitted to this batch. Remove
+        // them from the due set as we retain them, leaving only newly due
+        // sessions without allocating and hashing a second queue-sized set.
         self.due_observation_queue
-            .retain(|session| due.contains(session));
-        let queued: HashSet<u64> = self.due_observation_queue.iter().copied().collect();
-        let mut newly_due: Vec<u64> = due
-            .into_iter()
-            .filter(|session| !queued.contains(session))
-            .collect();
+            .retain(|session| due.remove(session));
+        let mut newly_due: Vec<u64> = due.into_iter().collect();
         newly_due.sort_unstable();
         // Active-session priority applies only when beginning a fresh batch. Once a
         // batch exists, its remainder retains position and therefore makes progress.
@@ -1767,19 +1820,23 @@ impl App {
             .frontmost_window
             .and_then(|window| self.focused_session_id(window));
         if smart_titles_enabled(&self.config) {
-            let mut missing: Vec<u64> = self
-                .pool
-                .iter()
-                .map(|session| session.id)
-                .filter(|session| !self.title_summaries.tracks_session(*session))
-                .collect();
-            missing.sort_unstable();
-            if let Some(active) = active
-                && let Some(position) = missing.iter().position(|session| *session == active)
-            {
-                missing.swap(0, position);
-            }
-            if let Some(session) = missing.first().copied() {
+            // Only one missing session can be observed this turn. Prefer the
+            // live active session, otherwise select the lowest id directly;
+            // sorting every restored tab just to take its first id costs work
+            // on each turn of a large restore without changing admission.
+            let missing = active
+                .filter(|session| {
+                    self.pool.get(*session).is_some()
+                        && !self.title_summaries.tracks_session(*session)
+                })
+                .or_else(|| {
+                    self.pool
+                        .iter()
+                        .map(|session| session.id)
+                        .filter(|session| !self.title_summaries.tracks_session(*session))
+                        .min()
+                });
+            if let Some(session) = missing {
                 // Central discovery covers initial, newly-created, restored, and
                 // seamlessly adopted quiet sessions. It shares the same one-snapshot
                 // per event-loop-turn budget as periodic refreshes.
@@ -2538,45 +2595,202 @@ mod tests {
                 Some("Authored project notes"),
                 TitleFormat::Description,
                 &Config::default(),
-                " · ",
+                ChromeSurface::TabStrip,
             ),
             "Authored project notes",
             "authored metadata must outrank generated activity"
         );
     }
 
+    /// The cap is a MIDDLE cut on grapheme boundaries: `max - max / 2` head
+    /// clusters, the mark, `max / 2` tail clusters — 97 graphemes for a cap
+    /// of 96, the `…` seated at index 48 with a WHOLE cluster on either side
+    /// of it (no split combining mark, no split ZWJ sequence, at either end).
     #[test]
     fn chrome_projection_caps_authored_text_on_grapheme_boundaries() {
         use aterm_grapheme::GraphemeClusters as _;
 
+        // Where the mark sits for a cap of 96: after the 48-cluster head.
+        const MARK: usize = 96 - 96 / 2;
+
         let coordinator = Coordinator::new(None);
-        let long = "x".repeat(1024);
+        // A tail that names itself, so the pin below is about the tail
+        // SURVIVING the cap, not merely about the count.
+        let long = format!("{}TAIL", "x".repeat(1024));
         let projected = coordinator.compose(
             None,
             "shell",
             Some(&long),
             TitleFormat::Description,
             &Config::default(),
-            " · ",
+            ChromeSurface::TabStrip,
         );
         assert_eq!(projected.graphemes().count(), 97);
-        assert!(projected.ends_with('…'));
+        assert_eq!(projected.graphemes().nth(MARK), Some("…"));
+        assert!(projected.starts_with(&"x".repeat(MARK)), "{projected:?}");
+        assert!(projected.ends_with("xTAIL"), "{projected:?}");
 
         let combining = "e\u{301}".repeat(97);
         let projected = chrome_presentation_text(&combining, 96);
         assert_eq!(projected.graphemes().count(), 97);
-        assert_eq!(projected.graphemes().nth(95), Some("e\u{301}"));
-        assert!(projected.ends_with('…'));
+        assert_eq!(projected.graphemes().nth(MARK - 1), Some("e\u{301}"));
+        assert_eq!(projected.graphemes().nth(MARK), Some("…"));
+        assert_eq!(projected.graphemes().nth(MARK + 1), Some("e\u{301}"));
+        assert_eq!(projected.graphemes().last(), Some("e\u{301}"));
+        assert_eq!(
+            projected.graphemes().filter(|g| *g == "e\u{301}").count(),
+            96,
+            "both halves are whole clusters: {projected:?}"
+        );
 
         let family = "👩\u{200d}👩\u{200d}👧\u{200d}👦";
         let projected = chrome_presentation_text(&family.repeat(97), 96);
         assert_eq!(projected.graphemes().count(), 97);
-        assert_eq!(projected.graphemes().nth(95), Some(family));
-        assert!(projected.ends_with('…'));
+        assert_eq!(projected.graphemes().nth(MARK - 1), Some(family));
+        assert_eq!(projected.graphemes().nth(MARK), Some("…"));
+        assert_eq!(projected.graphemes().nth(MARK + 1), Some(family));
+        assert_eq!(projected.graphemes().last(), Some(family));
+        assert_eq!(projected.graphemes().filter(|g| *g == family).count(), 96);
+
+        // The degenerate caps keep the envelope (`max + 1` graphemes at most)
+        // and a text AT the cap is identity.
+        assert_eq!(chrome_presentation_text("abc", 0), "…");
+        assert_eq!(chrome_presentation_text("abc", 1), "a…");
+        assert_eq!(chrome_presentation_text("abc", 2), "a…c");
+        assert_eq!(chrome_presentation_text("abc", 3), "abc");
         assert_eq!(
             chrome_presentation_text("  one\n\u{00ad}\u{200b}\u{202e}two\tthree\u{e0061}  ", 96),
             "one two three"
         );
+    }
+
+    /// THE DEEP-SIBLINGS DEFECT, at the composer. The strip's label used to
+    /// take the chrome cap HERE, before the strip's own sibling-aware pass —
+    /// and any fixed cut is sibling-blind: the head cut collapsed tabs that
+    /// differ only past grapheme 96 (the glass finding), and a middle cut
+    /// collapses tabs that differ only inside `[48, N-48)` (two worktree
+    /// checkouts of one repo, `wf_<id>-10` beside `wf_<id>-25`) that the head
+    /// cut had told apart. So the strip surface caps no title: the composed
+    /// strip label IS the sanitized title — through the cached per-session
+    /// path `App::tab_titles` takes — while the window surface, which paints
+    /// the title whole, still takes the cap.
+    #[test]
+    fn the_strip_surface_composes_the_whole_title_and_the_window_surface_the_capped_one() {
+        use aterm_grapheme::GraphemeClusters as _;
+
+        let coordinator = Coordinator::new(None);
+        let config = Config::default();
+        // One sibling pair per region a fixed cut discards: the leaf, past
+        // the head cut's window; the worktree id, inside the middle cut's.
+        let leaf = (
+            format!("~/{}deep-one", "ab/".repeat(40)),
+            format!("~/{}deep-two", "ab/".repeat(40)),
+        );
+        let worktree = (
+            "~/src/github.com/alabsystems/aterm/.claude/worktrees/lane-bec3123b-89c-10/crates/aterm-gui/src/title_summary/fixtures/model".to_string(),
+            "~/src/github.com/alabsystems/aterm/.claude/worktrees/lane-bec3123b-89c-25/crates/aterm-gui/src/title_summary/fixtures/model".to_string(),
+        );
+        let head_cut = |title: &str| {
+            let head: String = title.graphemes().take(MAX_CHROME_TITLE_GRAPHEMES).collect();
+            format!("{head}…")
+        };
+        let middle_cut = |title: &str| chrome_presentation_text(title, MAX_CHROME_TITLE_GRAPHEMES);
+        // FIXTURE GUARDS, and the two sibling-blind cuts as negative controls:
+        // each collapses a pair the other tells apart.
+        for (one, two) in [&leaf, &worktree] {
+            assert!(
+                one.graphemes().count() > MAX_CHROME_TITLE_GRAPHEMES,
+                "{one:?}"
+            );
+            assert_eq!(one.graphemes().count(), two.graphemes().count());
+        }
+        assert_eq!(
+            head_cut(&leaf.0),
+            head_cut(&leaf.1),
+            "the head cut collapses the leaf pair"
+        );
+        assert_ne!(middle_cut(&leaf.0), middle_cut(&leaf.1));
+        assert_ne!(
+            head_cut(&worktree.0),
+            head_cut(&worktree.1),
+            "the head cut told the worktrees apart"
+        );
+        assert_eq!(
+            middle_cut(&worktree.0),
+            middle_cut(&worktree.1),
+            "the middle cut collapses the worktree pair"
+        );
+
+        for (session, (one, two)) in [(1, &leaf), (3, &worktree)] {
+            let a = coordinator.compose(
+                Some(session),
+                one,
+                None,
+                TitleFormat::Title,
+                &config,
+                ChromeSurface::TabStrip,
+            );
+            let b = coordinator.compose(
+                Some(session + 1),
+                two,
+                None,
+                TitleFormat::Title,
+                &config,
+                ChromeSurface::TabStrip,
+            );
+            assert_eq!(&a, one, "the strip receives the whole title");
+            assert_eq!(&b, two, "the strip receives the whole title");
+        }
+        // Through the COMPOSED path too (a title the clean fast path declines
+        // — a combining mark on the leaf): the sanitizer runs, the cache
+        // fills, and the title is still whole.
+        let accented = format!("{}\u{301}", leaf.0);
+        let runs = coordinator.compose_runs();
+        let a = coordinator.compose(
+            Some(5),
+            &accented,
+            None,
+            TitleFormat::Title,
+            &config,
+            ChromeSurface::TabStrip,
+        );
+        assert_eq!(a, accented);
+        assert_eq!(
+            coordinator.compose_runs(),
+            runs + 1,
+            "composed, not fast-pathed"
+        );
+        let again = coordinator.compose(
+            Some(5),
+            &accented,
+            None,
+            TitleFormat::Title,
+            &config,
+            ChromeSurface::TabStrip,
+        );
+        assert_eq!(again, accented);
+        assert_eq!(coordinator.compose_runs(), runs + 1, "and cached");
+
+        // The window surface paints the title whole, so it keeps the cap:
+        // `head…tail`, the mark seated after 48 clusters, the leaf surviving.
+        let window = coordinator.compose(
+            Some(1),
+            &leaf.0,
+            None,
+            TitleFormat::Title,
+            &config,
+            ChromeSurface::WindowTitle,
+        );
+        assert_eq!(window, middle_cut(&leaf.0));
+        assert_eq!(window.graphemes().count(), MAX_CHROME_TITLE_GRAPHEMES + 1);
+        assert_eq!(
+            window
+                .graphemes()
+                .nth(MAX_CHROME_TITLE_GRAPHEMES - MAX_CHROME_TITLE_GRAPHEMES / 2),
+            Some("…")
+        );
+        assert!(window.starts_with("~/ab/"), "{window:?}");
+        assert!(window.ends_with("deep-one"), "{window:?}");
     }
 
     #[test]
@@ -3871,7 +4085,7 @@ mod tests {
             None,
             TitleFormat::TitleDescription,
             &config,
-            " · ",
+            ChromeSurface::TabStrip,
         );
         assert_eq!(first, "make · Compiling the release build");
         let runs = coordinator.compose_runs();
@@ -3882,7 +4096,7 @@ mod tests {
             None,
             TitleFormat::TitleDescription,
             &config,
-            " · ",
+            ChromeSurface::TabStrip,
         );
         assert_eq!(second, first);
         assert_eq!(
@@ -3899,7 +4113,7 @@ mod tests {
             None,
             TitleFormat::TitleDescription,
             &config,
-            " — ",
+            ChromeSurface::WindowTitle,
         );
         assert_eq!(window_first, "make — Compiling the release build");
         let warm = coordinator.compose_runs();
@@ -3909,7 +4123,7 @@ mod tests {
             None,
             TitleFormat::TitleDescription,
             &config,
-            " · ",
+            ChromeSurface::TabStrip,
         );
         let window_again = coordinator.compose(
             Some(7),
@@ -3917,7 +4131,7 @@ mod tests {
             None,
             TitleFormat::TitleDescription,
             &config,
-            " — ",
+            ChromeSurface::WindowTitle,
         );
         assert_eq!(tab_again, first);
         assert_eq!(window_again, window_first);
@@ -3934,7 +4148,7 @@ mod tests {
             None,
             TitleFormat::TitleDescription,
             &config,
-            " · ",
+            ChromeSurface::TabStrip,
         );
         assert_eq!(retitled, "make check · Compiling the release build");
         assert_eq!(coordinator.compose_runs(), warm + 1);
@@ -3945,7 +4159,7 @@ mod tests {
             None,
             TitleFormat::TitleDescription,
             &config,
-            " · ",
+            ChromeSurface::TabStrip,
         );
         assert_eq!(redescribed, "make check · Linking objects");
         assert_eq!(coordinator.compose_runs(), warm + 2);
@@ -3962,17 +4176,14 @@ mod tests {
     }
 
     /// The clean-title fast path must be indistinguishable from the full
-    /// sanitize/grapheme composition, and must reject every title the
-    /// sanitizer would actually rewrite.
+    /// sanitize/grapheme composition on BOTH surfaces, and must reject every
+    /// title the sanitizer — or the surface's cap — would actually rewrite.
     #[test]
     fn clean_title_fast_path_matches_full_composition() {
         let coordinator = Coordinator::new(None);
         let config = Config::default();
         let long_clean = "x".repeat(MAX_CHROME_TITLE_GRAPHEMES);
         let clean = ["vim", "cargo build --release", "a b c", long_clean.as_str()];
-        for title in clean {
-            assert!(title_is_presentation_clean(title), "{title:?}");
-        }
         let over_cap = "y".repeat(MAX_CHROME_TITLE_GRAPHEMES + 1);
         let dirty = [
             " padded ",
@@ -3980,27 +4191,80 @@ mod tests {
             "tab\there",
             "combining e\u{301}",
             "bidi \u{202e}spoof",
-            over_cap.as_str(),
         ];
-        for title in dirty {
-            assert!(!title_is_presentation_clean(title), "{title:?}");
+        for surface in [ChromeSurface::TabStrip, ChromeSurface::WindowTitle] {
+            let cap = surface.title_cap();
+            for title in clean {
+                assert!(
+                    title_is_presentation_clean(title, cap),
+                    "{title:?} on {surface:?}"
+                );
+            }
+            for title in dirty {
+                assert!(
+                    !title_is_presentation_clean(title, cap),
+                    "{title:?} on {surface:?}"
+                );
+            }
         }
-        for title in clean.iter().copied().chain(dirty.iter().copied()) {
-            let composed = coordinator.compose(
-                None,
-                title,
-                None,
-                TitleFormat::TitleDescription,
-                &config,
-                " · ",
+        // The cap is the SURFACE's: one past it is dirty for the window
+        // title, which paints it whole, and clean for the strip, which fits
+        // the label itself and must see every grapheme.
+        assert!(!title_is_presentation_clean(
+            &over_cap,
+            ChromeSurface::WindowTitle.title_cap()
+        ));
+        assert!(title_is_presentation_clean(
+            &over_cap,
+            ChromeSurface::TabStrip.title_cap()
+        ));
+        // The cap itself, pinned at its named width: AT the cap is identity,
+        // one past it is `max + 1` graphemes with the mark after the head.
+        {
+            use aterm_grapheme::GraphemeClusters as _;
+            assert_eq!(
+                chrome_presentation_text(&long_clean, MAX_CHROME_TITLE_GRAPHEMES),
+                long_clean
             );
-            let expected = compose_parts(
-                &chrome_presentation_text(title, MAX_CHROME_TITLE_GRAPHEMES),
-                "",
-                TitleFormat::TitleDescription,
-                " · ",
+            let projected = chrome_presentation_text(&over_cap, MAX_CHROME_TITLE_GRAPHEMES);
+            assert_eq!(
+                projected.graphemes().count(),
+                MAX_CHROME_TITLE_GRAPHEMES + 1
             );
-            assert_eq!(composed, expected, "{title:?}");
+            assert_eq!(
+                projected
+                    .graphemes()
+                    .nth(MAX_CHROME_TITLE_GRAPHEMES - MAX_CHROME_TITLE_GRAPHEMES / 2),
+                Some("…")
+            );
+        }
+        for surface in [ChromeSurface::TabStrip, ChromeSurface::WindowTitle] {
+            for title in clean
+                .iter()
+                .chain(dirty.iter())
+                .copied()
+                .chain([over_cap.as_str()])
+            {
+                let composed = coordinator.compose(
+                    None,
+                    title,
+                    None,
+                    TitleFormat::TitleDescription,
+                    &config,
+                    surface,
+                );
+                let projected = match surface.title_cap() {
+                    Some(max_graphemes) => chrome_presentation_text(title, max_graphemes),
+                    None => canonical_single_line(title),
+                };
+                let expected = compose_parts(
+                    &projected,
+                    "",
+                    TitleFormat::TitleDescription,
+                    surface.separator(),
+                );
+                assert_eq!(composed, expected, "{title:?} on {surface:?}");
+            }
         }
         let empty = coordinator.compose(
             None,
@@ -4008,9 +4272,55 @@ mod tests {
             None,
             TitleFormat::TitleDescription,
             &config,
-            " · ",
+            ChromeSurface::TabStrip,
         );
         assert_eq!(empty, "aterm", "an empty title still resolves the fallback");
+    }
+
+    /// A strip label on its way to a surface that paints it WHOLE takes the
+    /// cap there, half by half on the strip's own seam: the subject and the
+    /// state clause each middle-cut at the cap, so the envelope is exactly
+    /// what composing with the cap produced; a label within it is borrowed.
+    #[test]
+    fn a_whole_label_caps_each_half_on_the_strips_seam_and_borrows_the_rest() {
+        use std::borrow::Cow;
+
+        let x = |n: usize| "x".repeat(n);
+        let short = "vim · Editing release notes";
+        assert!(matches!(whole_label(short), Cow::Borrowed(_)));
+        assert!(matches!(
+            whole_label(&x(MAX_CHROME_TITLE_GRAPHEMES)),
+            Cow::Borrowed(_)
+        ));
+        // The subject past the cap, the clause kept whole.
+        let label = format!("{} · Ready", x(200));
+        let projected = whole_label(&label);
+        let expected = format!("{}…{} · Ready", x(48), x(48));
+        assert_eq!(&*projected, expected.as_str());
+        // Idempotent in value.
+        assert_eq!(&*whole_label(&projected), &*projected);
+        // Both halves past the cap (the description-title format leads with
+        // the state), each cut on its own.
+        let label = format!("{} · {}", "y".repeat(100), x(200));
+        let expected = format!(
+            "{}…{} · {}…{}",
+            "y".repeat(48),
+            "y".repeat(48),
+            x(48),
+            x(48)
+        );
+        assert_eq!(&*whole_label(&label), expected.as_str());
+        // No clause: the whole label is the subject.
+        let expected = format!("{}…{}", x(48), x(48));
+        assert_eq!(&*whole_label(&x(200)), expected.as_str());
+        // A strip's worth: borrowed while every label is within the cap.
+        let labels = vec![short.to_string(), "aterm".to_string()];
+        assert!(matches!(whole_labels(&labels), Cow::Borrowed(_)));
+        let labels = vec![short.to_string(), x(200)];
+        let projected = whole_labels(&labels);
+        assert!(matches!(projected, Cow::Owned(_)));
+        assert_eq!(projected[0], short);
+        assert_eq!(projected[1], expected);
     }
 
     #[test]
@@ -4301,6 +4611,37 @@ mod tests {
         snapshot.capture_recent_output(&term, 3);
         assert!(snapshot.recent_output.contains("old-history"));
         assert!(snapshot.recent_output.contains("new-visible"));
+    }
+
+    /// The REAL daemon command starts BELOW the typing band (2026-09-15). It used to
+    /// start at pri 31, the program-being-typed-into's band, whatever the worker
+    /// thread's role. `/bin/sh` stands in for the binary: the command stages
+    /// `serve` in the private home, so `sh` runs a `serve` script there that writes
+    /// its own `ps` priority beside itself.
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn managed_ollama_command_starts_in_the_darwin_background_band() {
+        let home = create_private_managed_home().unwrap();
+        std::fs::write(home.join("serve"), "/bin/ps -o pri= -p $$ > pri\n").unwrap();
+        let status = managed_ollama_command(
+            std::path::Path::new("/bin/sh"),
+            "127.0.0.1:1",
+            std::path::Path::new("/tmp/aterm-models"),
+            &home,
+        )
+        .status()
+        .unwrap();
+        let written = std::fs::read_to_string(home.join("pri")).unwrap_or_default();
+        cleanup_private_managed_home(Some(&home));
+        assert!(status.success(), "the stand-in daemon failed: {status}");
+        let pri: i32 = written
+            .trim()
+            .parse()
+            .unwrap_or_else(|_| panic!("no priority in {written:?}"));
+        assert!(
+            pri <= 4,
+            "the managed daemon ran at pri {pri}, not the background band (4)"
+        );
     }
 
     #[test]

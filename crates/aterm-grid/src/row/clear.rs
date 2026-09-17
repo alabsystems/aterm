@@ -22,9 +22,12 @@ impl Row {
 
     /// Erase all cell content but preserve DEC line attributes (DECDWL/DECDHL).
     ///
-    /// Per VT420/VT510 spec and xterm, erase operations (ED/EL) clear
-    /// character positions but do not change line attributes. Use this
-    /// instead of `clear()` in erase code paths (#7497).
+    /// Per VT420/VT510 spec and xterm, a PARTIAL erase clears character
+    /// positions but does not change line attributes. Use this instead of
+    /// `clear()` in erase code paths (#7497). A COMPLETE-row erase is the
+    /// exception — the VT510 ED page makes those lines single-height and
+    /// single-width, as xterm's `ClearBufRows` does — so `Grid::erase_screen`
+    /// and `Grid::clear_rows` reach for `reset_with()` instead.
     #[inline]
     pub fn erase(&mut self) {
         self.cells.fill(Cell::EMPTY);
@@ -35,7 +38,9 @@ impl Row {
     /// Erase with BCE fill cell, preserving DEC line attributes (#7522).
     ///
     /// Like `erase()` but fills cells with `fill` instead of `Cell::EMPTY`,
-    /// supporting BCE (Background Color Erase) per VT420/xterm spec.
+    /// supporting BCE (Background Color Erase) per VT420/xterm spec. Partial
+    /// erases and EL only: a complete-row ED uses `reset_with()`, which is this
+    /// same pass with the line attributes dropped.
     #[inline]
     pub fn erase_with(&mut self, fill: Cell) {
         self.cells.fill(fill);
@@ -56,7 +61,9 @@ impl Row {
     /// (cells = `fill`, len per BCE rule, flags = DIRTY with line attributes
     /// dropped) but writes each cell exactly once. Used by the scroll path
     /// when recycling ring-buffer rows, where the old content and line
-    /// attributes are always discarded.
+    /// attributes are always discarded, and by the ED paths that erase a
+    /// COMPLETE row — xterm's `ClearBufRows`, "clearing the whole row resets
+    /// the doublesize characters".
     #[inline]
     pub fn reset_with(&mut self, fill: Cell) {
         self.cells.fill(fill);

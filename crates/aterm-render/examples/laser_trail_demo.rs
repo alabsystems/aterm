@@ -65,7 +65,6 @@ fn main() {
         beam: true,
         head_dx: 0.5,
         pack: None,
-        wake_persist_s: aterm_effects::cursor_glow::RAINBOW_WAKE_PERSIST,
         dark_theme: true,
         // `theme` is in scope here, so render the TRUTH rather than a
         // stand-in: these demos exist to be looked at.

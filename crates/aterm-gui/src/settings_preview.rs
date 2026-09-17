@@ -221,10 +221,6 @@ pub(crate) struct CursorPreviewSpec {
     pub(crate) intensity: f32,
     pub(crate) radius: f32,
     pub(crate) ring: bool,
-    /// Seconds of recent travel the rainbow kitty TYPING WAKE shows — the settings dial's
-    /// value, carried here so the live preview lengthens and shortens the plume
-    /// exactly as the real terminal will. `0` = wake off.
-    pub(crate) wake_persist_s: f32,
 }
 
 impl Default for CursorPreviewSpec {
@@ -243,7 +239,6 @@ impl Default for CursorPreviewSpec {
             intensity: 1.0,
             radius: 0.6,
             ring: true,
-            wake_persist_s: aterm_effects::cursor_glow::RAINBOW_WAKE_PERSIST,
         }
     }
 }
@@ -274,9 +269,6 @@ impl CursorPreviewSpec {
             intensity: finite_or(self.intensity, 0.0).clamp(0.0, 1.0),
             radius: finite_or(self.radius, 0.0).clamp(0.0, 2.0),
             ring: self.ring,
-            // Same fail-OFF posture the engine takes: a non-finite dial value
-            // must disable the wake, never leak into its length math.
-            wake_persist_s: finite_or(self.wake_persist_s, 0.0).clamp(0.0, 1.5),
         }
     }
 
@@ -378,7 +370,6 @@ impl CursorPreviewSpec {
                 intensity: self.intensity,
                 radius: self.radius,
                 ring: self.ring,
-                wake_persist_s: self.wake_persist_s,
             },
             presentation,
             theme.cursor,

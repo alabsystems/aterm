@@ -44,12 +44,20 @@ pub(crate) enum PackagesBusy {
 
 impl PackagesBusy {
     /// Whether the verb runs atpkg's `apply_machine_settings` at the top of its pass
-    /// — mirrors atpkg's static list (`update`, `install --default-set`, `seed`, and
-    /// `machine apply` itself; NOT `install <name>` or `uninstall --all`), pinned on
+    /// — mirrors atpkg's `verb_applies_machine_settings` (`update`, every form of
+    /// `install`, `seed`, and `machine apply` itself; NOT `uninstall --all`), pinned on
     /// the atpkg side by its source-scan test. The host re-reads the machine record
-    /// when such a verb finishes, so the card confirms rather than assumes.
+    /// when such a verb finishes, so the card confirms rather than assumes. `install
+    /// <name>` was left out until 2026-09-16 although atpkg's edge applies for it too.
     pub(crate) fn applies_machine_settings(self) -> bool {
-        matches!(self, Self::Check | Self::Install | Self::MachineApply)
+        matches!(
+            self,
+            Self::Check
+                | Self::Install
+                | Self::InstallExtra
+                | Self::InstallAdmin
+                | Self::MachineApply
+        )
     }
 
     fn completed_headline(self) -> &'static str {
@@ -127,6 +135,12 @@ pub(crate) struct PackagesWorkerCompletion {
     /// so the card and the feedback line can quote what the pass said rather than a
     /// generic headline. `None` for every other worker.
     pub(crate) machine_verdict: Option<String>,
+    /// The `machine-state:` record a [`PackagesBusy::MachineApply`] worker read off the
+    /// child's stdout (2026-09-16): the apply's own measurement, printed last by a
+    /// short child, so it confirms the card without a read. `None` for every other
+    /// worker — the collected lanes' record was measured at their pass's top, minutes
+    /// before it reaches the host, and is never taken as the newest state.
+    pub(crate) machine_state: Option<atpkg::machine::MachineState>,
 }
 
 impl PackagesWorkerCompletion {
@@ -135,6 +149,7 @@ impl PackagesWorkerCompletion {
             report,
             command: None,
             machine_verdict: None,
+            machine_state: None,
         }
     }
 
@@ -144,9 +159,19 @@ impl PackagesWorkerCompletion {
         self
     }
 
+    /// Attach the machine-apply record (see `machine_state`).
+    pub(crate) fn with_machine_state(
+        mut self,
+        state: Option<atpkg::machine::MachineState>,
+    ) -> Self {
+        self.machine_state = state;
+        self
+    }
+
     pub(crate) fn command(report: PackagesStatusReport, command: PackagesCommandOutcome) -> Self {
         Self {
             machine_verdict: None,
+            machine_state: None,
             report,
             command: Some(command),
         }
@@ -538,6 +563,215 @@ pub(crate) fn admin_step_caption(names: &[String]) -> String {
     )
 }
 
+/// How many lines one program's reason may take on the Packages page: enough for a
+/// real diagnosis, bounded so a pathological ledger string cannot stretch the programs
+/// card without limit (the posture of the Update page's outcome bound). A `fix:`
+/// clause is exempt — it is shown whole, and the bound yields to it.
+pub(crate) const MAX_REASON_LINES: usize = 4;
+
+/// The narrowest row [`reason_lines`] wraps to: the bare `…(NNN more)` marker (11
+/// characters) must fit on a line of its own.
+const MIN_REASON_WIDTH: usize = 12;
+
+/// atpkg's remedy marker, as its own text spells it (`lay::tracked_refusal`,
+/// `provenance::REMEDY`, `doctor::provenance_bundle_line`).
+const FIX_MARKER: &str = "fix:";
+
+/// The lines a program's `state` line paints on the Packages page, each at most
+/// `width` characters.
+///
+/// 2026-09-14 incident: atpkg's install pass recorded a ~700-character `error: stage:
+/// this process is provenance-tracked … fix: unset ATPKG_REFUSE_TRACKED_INSTALL …`
+/// state whose `fix:` clause came LAST, and the row painted it as one ellipsized line
+/// — the part the user needed was exactly the part cut. atpkg spells every remedy
+/// `fix: …`, so the marker is a contract this reader relies on:
+///
+/// * a reason that fits `width` comes back unchanged, one line — the common case, so
+///   the canonical `atpkg::state` spellings paint exactly as they always did;
+/// * a long reason with a `fix:` clause puts the fix FIRST and whole (every wrapped
+///   line of it, past [`MAX_REASON_LINES`] if it must), then the diagnosis,
+///   word-wrapped and bounded;
+/// * a long reason without one is word-wrapped and bounded.
+///
+/// When the bound hides diagnosis lines, `…(N more)` is folded into the last visible
+/// line in place of its trailing words (the Update page's `bound_outcome_lines`
+/// posture), N counting the wrapped lines hidden entirely — and only ever after the
+/// fix is complete; a fix that alone fills the bound is followed by the marker on a
+/// line of its own, one past the bound. A token longer than `width` (a path) is
+/// broken at `width`, so no line exceeds it: the painter's ellipsis is never the
+/// layout. Pure — character counts, no font measurement — so the compact and wide
+/// pages agree on the row count they budget for.
+pub(crate) fn reason_lines(state: &str, width: usize) -> Vec<String> {
+    let width = width.max(MIN_REASON_WIDTH);
+    if fits(state, width) {
+        return vec![state.to_string()];
+    }
+    let (diagnosis, fix) = match fix_marker(state) {
+        Some(at) => {
+            let fix = state[at + FIX_MARKER.len()..].trim();
+            // The sentence that led into the marker ends with its own punctuation
+            // (`…: <what it breaks>. fix: …`, `…; fix: …`); the diagnosis keeps none
+            // of it, since the fix no longer follows.
+            let diagnosis = state[..at]
+                .trim_end()
+                .trim_end_matches(['.', ';', ',', ':', '—', '–', '-'])
+                .trim_end();
+            if fix.is_empty() {
+                (state, None)
+            } else {
+                (diagnosis, Some(fix))
+            }
+        }
+        None => (state, None),
+    };
+    let mut lines = match fix {
+        Some(fix) => wrap_words(&format!("{FIX_MARKER} {fix}"), width),
+        None => Vec::new(),
+    };
+    let rest = wrap_words(diagnosis, width);
+    let room = MAX_REASON_LINES.saturating_sub(lines.len());
+    if rest.len() <= room {
+        lines.extend(rest);
+    } else if room == 0 {
+        lines.push(more_marker(rest.len()));
+    } else {
+        lines.extend(bound_with_marker(rest, room, width));
+    }
+    lines
+}
+
+fn more_marker(hidden: usize) -> String {
+    format!("\u{2026}({hidden} more)")
+}
+
+/// The first `room` of `lines`, the last of them giving up trailing words to the
+/// `…(N more)` marker until it fits `width`. N counts the lines hidden entirely; a
+/// boundary line that loses ALL its words to the marker counts as hidden too, so the
+/// number never understates.
+fn bound_with_marker(lines: Vec<String>, room: usize, width: usize) -> Vec<String> {
+    debug_assert!(room >= 1 && lines.len() > room);
+    let hidden = lines.len() - room;
+    let mut kept: Vec<String> = lines.into_iter().take(room).collect();
+    let Some(last) = kept.pop() else {
+        return kept;
+    };
+    let mut words: Vec<&str> = last.split_whitespace().collect();
+    loop {
+        let candidate = if words.is_empty() {
+            more_marker(hidden + 1)
+        } else {
+            format!("{} {}", words.join(" "), more_marker(hidden))
+        };
+        if fits(&candidate, width) || words.is_empty() {
+            kept.push(candidate);
+            return kept;
+        }
+        words.pop();
+    }
+}
+
+/// The byte offset of the `fix:` marker in `state`, when it carries one: the word
+/// `fix:` at a word boundary and followed by whitespace or the end — `prefix:` and
+/// `suffix:` are not remedies, and `fix:` glued to a path segment is not one either.
+fn fix_marker(state: &str) -> Option<usize> {
+    state.match_indices(FIX_MARKER).find_map(|(at, _)| {
+        let boundary_before = state[..at]
+            .chars()
+            .next_back()
+            .is_none_or(|c| !(c.is_alphanumeric() || c == '_'));
+        let boundary_after = state[at + FIX_MARKER.len()..]
+            .chars()
+            .next()
+            .is_none_or(char::is_whitespace);
+        (boundary_before && boundary_after).then_some(at)
+    })
+}
+
+/// Greedy word wrap to `width` characters. Whitespace of every kind is a break (a
+/// recorded error may carry a newline); a token longer than a whole line is broken
+/// at `width` so every line fits. Character counts (Unicode scalars): the reasons are
+/// atpkg's ASCII-and-em-dash prose, and a measured wrap would need the font this
+/// pure projection does not have.
+fn wrap_words(text: &str, width: usize) -> Vec<String> {
+    let mut lines = Vec::new();
+    let mut current = String::new();
+    let mut used = 0usize;
+    let budget = width * ADVANCE_UNIT;
+    for word in text.split_whitespace() {
+        let len = advance(word);
+        if used > 0 && used + ADVANCE_UNIT + len <= budget {
+            current.push(' ');
+            current.push_str(word);
+            used += ADVANCE_UNIT + len;
+            continue;
+        }
+        if used > 0 {
+            lines.push(std::mem::take(&mut current));
+        }
+        if len <= budget {
+            current.push_str(word);
+            used = len;
+            continue;
+        }
+        // A token wider than the row is broken where its advance fills it.
+        let mut chunk = String::new();
+        let mut chunk_used = 0usize;
+        for c in word.chars() {
+            let a = glyph_advance(c);
+            if chunk_used + a > budget && !chunk.is_empty() {
+                lines.push(std::mem::take(&mut chunk));
+                chunk_used = 0;
+            }
+            chunk.push(c);
+            chunk_used += a;
+        }
+        current = chunk;
+        used = chunk_used;
+    }
+    if used > 0 {
+        lines.push(current);
+    }
+    lines
+}
+
+/// The wrap's unit: one average lowercase glyph, in the sub-unit [`glyph_advance`]
+/// counts in. The row budget `width` is in these units.
+const ADVANCE_UNIT: usize = 20;
+
+/// An approximate advance for `c` in a proportional UI face, in twentieths of an
+/// average lowercase glyph (2026-09-15): the wrap used to count CHARACTERS, and a
+/// line of 64 characters holding `ATPKG_REFUSE_TRACKED_INSTALL` — 28 capitals and
+/// underscores — measured 405pt against a 402pt row at the compact width and
+/// overflowed into the painter's ellipsis, the very thing the wrap exists to prevent.
+/// The weights were fitted against the painter's own measurements of four incident
+/// lines (844, 873, 149 and 969pt): capitals, `_`, `—` and `@#%&` 1.2 glyphs, `m`/`w`
+/// 1.5, the narrow glyphs and most punctuation 0.65, digits and the rest one — which
+/// holds the spread of pt-per-unit across those lines to 7% (0.325–0.35), and the row
+/// budgets ([`super::native_settings`]' `packages_reason_wrap_chars`) are set from
+/// the widest of them. Coarse on purpose — the paint audit in `native_settings`' tests
+/// measures the result with the real face, and this table only has to keep a row
+/// under its budget.
+fn glyph_advance(c: char) -> usize {
+    match c {
+        'A'..='Z' | '_' | '\u{2014}' | '\u{2013}' | '@' | '#' | '%' | '&' => 24,
+        'm' | 'w' => 30,
+        'i' | 'j' | 'l' | 't' | 'f' | 'r' | '\'' | '"' | '`' | '.' | ',' | ':' | ';' | '!'
+        | '|' | '(' | ')' | '[' | ']' | '{' | '}' | '/' | '\\' | '-' | ' ' => 13,
+        _ => ADVANCE_UNIT,
+    }
+}
+
+/// The advance of `word`, summed over its glyphs ([`glyph_advance`]).
+fn advance(word: &str) -> usize {
+    word.chars().map(glyph_advance).sum()
+}
+
+/// Whether `text` fits a row of `width` units — the one predicate the short-state
+/// pass-through, the wrap and the marker's tail share.
+fn fits(text: &str, width: usize) -> bool {
+    advance(text) <= width * ADVANCE_UNIT
+}
+
 /// Facts about the co-located package manager, collected entirely OFF the
 /// event loop by one worker pass. Bounded and owned, suitable for a typed
 /// event-loop wake.
@@ -641,6 +875,32 @@ impl PackagesStatusReport {
                     group: RowGroup::Default,
                     facts: None,
                     annotation,
+                });
+            }
+        }
+        // A rustup seam the last pass REFUSED to re-assert (`refused:rustup:<name>: <why>`
+        // in the record's `seams`, written by `atpkg::seam::reassert`) is a row of its
+        // own: the toolchain is installed, and `cargo +trust` still runs something else
+        // — the record carried it, `doctor` printed it, and this page never read it
+        // (audit 2026-09-14).
+        if let Some(status) = status {
+            for key in &status.seams {
+                let Some(rest) = key.strip_prefix("refused:rustup:") else {
+                    continue;
+                };
+                let (name, why) = rest.split_once(": ").unwrap_or((rest, ""));
+                programs.push(PackagesProgramRow {
+                    name: format!("rustup:{name}"),
+                    installed_build: None,
+                    state: if why.is_empty() {
+                        "rustup seam refused".to_string()
+                    } else {
+                        format!("rustup seam refused: {why}")
+                    },
+                    kind: ProgramStateKind::Other,
+                    group: RowGroup::Default,
+                    facts: None,
+                    annotation: Some("cargo +trust does not run the managed toolchain".to_string()),
                 });
             }
         }
@@ -823,6 +1083,25 @@ pub(crate) struct MachinePosture {
     /// started before an apply and would land as a pre-apply record, so it is
     /// followed by another read rather than joined.
     pub(crate) rerun: bool,
+    /// A pass printed a `machine-settings:` change and its own `machine-state:`
+    /// record is expected to follow on the same stream (2026-09-16): the card reads
+    /// as refreshing meanwhile, and NO read is spawned — the pass measured the
+    /// machine already. Cleared by the record, or by the stream ending without one
+    /// ([`Self::take_record_expectation`] then spawns the read as the fallback).
+    pub(crate) awaiting_record: bool,
+    /// A worker read is running and a NEWER record — a pass's own, measured after
+    /// its apply — landed while it ran. The worker's answer is older than what the
+    /// card shows and is dropped when it arrives, so a read that started before an
+    /// apply can never overwrite the state the apply reported.
+    pub(crate) superseded: bool,
+    /// Reads started so far — bumped when one is spawned (a request admitted, or a
+    /// queued rerun handed back to be spawned). One read is in flight at a time, so
+    /// the read that completes is the one this counted last.
+    pub(crate) reads_started: u64,
+    /// `reads_started` when the open expectation was opened: a read that STARTED
+    /// before the change cannot answer for it (it measured the machine the change
+    /// then changed), so only a read counted after this closes the expectation.
+    pub(crate) expectation_read_gen: u64,
 }
 
 /// Scalar projection used only by Tier-1 conformance. Every field is read from
@@ -890,6 +1169,7 @@ impl PackagesService {
             return false;
         }
         self.machine.refreshing = true;
+        self.machine.reads_started = self.machine.reads_started.saturating_add(1);
         self.revision = self.revision.saturating_add(1);
         true
     }
@@ -908,6 +1188,26 @@ impl PackagesService {
         self.machine.observed = true;
         let rerun = std::mem::take(&mut self.machine.rerun);
         self.machine.refreshing = rerun;
+        // A completed read answers an open expectation — when it STARTED after the
+        // change that opened it. One that was already running measured the machine
+        // the change then changed, and must not stand under "Last change" as if it
+        // confirmed it; the expectation stays for the record, the fallback, or the
+        // next read (2026-09-16 review).
+        let completed_gen = self.machine.reads_started;
+        if self.machine.awaiting_record && completed_gen > self.machine.expectation_read_gen {
+            self.machine.awaiting_record = false;
+        }
+        if rerun {
+            // The caller spawns the queued read now: count it as started.
+            self.machine.reads_started = self.machine.reads_started.saturating_add(1);
+        }
+        // Superseded: a pass's own record landed while this read ran, so the card
+        // already shows a newer state than this read measured. The answer is dropped
+        // — a read error included, since the newer record is not in error.
+        if std::mem::take(&mut self.machine.superseded) {
+            self.revision = self.revision.saturating_add(1);
+            return rerun;
+        }
         match result {
             Ok(state) => {
                 self.machine.state = Some(state);
@@ -927,6 +1227,61 @@ impl PackagesService {
     /// this process saw it.
     pub(crate) fn note_machine_change(&mut self, body: String, at: std::time::SystemTime) {
         self.machine.last_change = Some((body, at));
+        self.revision = self.revision.saturating_add(1);
+    }
+
+    /// A pass printed a change; its own `machine-state:` record follows on the same
+    /// stream. The card reads as refreshing (Apply disabled) until it lands, and no
+    /// read is spawned for it.
+    pub(crate) fn expect_machine_record(&mut self) {
+        if self.machine.awaiting_record {
+            return;
+        }
+        self.machine.awaiting_record = true;
+        self.machine.expectation_read_gen = self.machine.reads_started;
+        self.revision = self.revision.saturating_add(1);
+    }
+
+    /// Reduce a record a PASS printed after its apply: the newest measurement there
+    /// is. It answers the expectation a change opened, satisfies any rerun queued
+    /// meanwhile (the rerun asked for a state newer than a running read; this is
+    /// one), and marks a read still running as superseded so its older answer is
+    /// dropped on arrival.
+    pub(crate) fn note_machine_record(&mut self, state: atpkg::machine::MachineState) {
+        self.machine.observed = true;
+        self.machine.state = Some(state);
+        self.machine.read_error = None;
+        self.machine.awaiting_record = false;
+        self.machine.rerun = false;
+        if self.machine.refreshing {
+            self.machine.superseded = true;
+        }
+        self.revision = self.revision.saturating_add(1);
+    }
+
+    /// The pass's stream ended (or its record did not parse) while a record was
+    /// still expected: `true` ⇒ the caller must spawn the read after all — the
+    /// fallback that keeps the card from sitting under a change it predates.
+    #[must_use = "an open expectation must be answered by a spawned read"]
+    pub(crate) fn take_record_expectation(&mut self) -> bool {
+        if !self.machine.awaiting_record {
+            return false;
+        }
+        self.machine.awaiting_record = false;
+        self.revision = self.revision.saturating_add(1);
+        true
+    }
+
+    /// Remember that a pass REFUSED to apply the settings, or FAILED to.
+    ///
+    /// The launch lanes stream a pass's stdout through the marker reader, which until
+    /// now kept only the change marker — so a launch that printed
+    /// `machine settings not applied — …` or `machine settings failed — …` left the
+    /// card showing the last successful record with nothing to say that the most recent
+    /// attempt had come to nothing. This is the same slot an explicit Apply now writes,
+    /// so the card has one place to look and the newest answer wins.
+    pub(crate) fn note_machine_verdict(&mut self, verdict: String) {
+        self.machine.last_verdict = Some(verdict);
         self.revision = self.revision.saturating_add(1);
     }
 
@@ -1030,8 +1385,26 @@ impl PackagesService {
         if completion.command.is_some() {
             self.last_command = completion.command;
         }
-        if completion.machine_verdict.is_some() {
-            self.machine.last_verdict = completion.machine_verdict;
+        if let Some(state) = completion.machine_state {
+            // The apply's own record: the newest measurement, as a streamed pass's
+            // record is — it closes the expectation its change line opened.
+            self.note_machine_record(state);
+        }
+        if let Some(verdict) = completion.machine_verdict {
+            // A FAILED APPLY IS NOT REMEMBERED AS A SUCCESS. The child's verdict is
+            // whatever it printed before it fell over — for a pass whose Spotlight half
+            // landed and whose Universal Control write did not, that is literally
+            // `applied — spotlight-noindex 1 dir(s) migrated`. Rendered alone beside a
+            // failure message it reads as a contradiction; carried WITH it, it is the
+            // useful half of the truth.
+            self.machine.last_verdict = Some(match self.last_command.as_ref() {
+                Some(PackagesCommandOutcome::Failed { operation, message })
+                    if operation.applies_machine_settings() =>
+                {
+                    format!("failed — {message}; earlier in the pass: {verdict}")
+                }
+                _ => verdict,
+            });
         }
         self.revision = self.revision.saturating_add(1);
         true
@@ -1348,13 +1721,18 @@ impl PackagesState {
                         "at the OS default — the cursor roams to other Macs and iPads"
                     }
                     UcPosture::Partial => "partly disabled",
-                    UcPosture::Unknown => "unknown",
+                    // NOT "unknown" bare: the reader needs to know the machine was not
+                    // measured, and why that is not the same as "off".
+                    UcPosture::Unknown => "could not be read on this Mac",
                 };
                 let policy = match (s.policy, s.universal_control) {
                     (UniversalControlPolicy::Leave, UcPosture::Disabled)
                     | (UniversalControlPolicy::Off, _) => "",
+                    // NOT `= "leave"`: any spelling the parser does not know resolves
+                    // to Leave, so quoting the file back at the user could quote a word
+                    // they never wrote.
                     (UniversalControlPolicy::Leave, _) => {
-                        " · left alone ([machine] universal_control = \"leave\")"
+                        " · left alone ([machine] universal_control is not \"off\")"
                     }
                 };
                 format!("Universal Control: {word}{policy}{prior}")
@@ -1401,6 +1779,15 @@ impl PackagesState {
         };
         let reason = if let Some(error) = posture.read_error.as_deref() {
             Some(format!("Could not read the machine state: {error}"))
+        } else if state.is_some_and(|s| s.config_unreadable) {
+            // The refusal the owner can fix, and the one that must not read as a
+            // measurement: both `[machine]` defaults ACT, so a file that does not parse
+            // cannot be treated as "no opt-outs were set".
+            Some(
+                "Not applied here: aterm.toml does not parse, so the [machine] switches \
+                 could not be read. Fix the file and the next pass applies them."
+                    .to_string(),
+            )
         } else {
             match state.map(|s| s.home) {
                 Some(HomePosture::Mismatch) => Some(
@@ -1451,7 +1838,7 @@ impl PackagesState {
         // the "Saved since the last read" line). None on any home but the
         // account's, exactly as `MachineState::next`.
         let next = state.and_then(|s| {
-            (s.home == HomePosture::Account)
+            (s.home == HomePosture::Account && !s.config_unreadable)
                 .then(|| {
                     atpkg::machine::machine_next(
                         s.universal_control,
@@ -1466,6 +1853,7 @@ impl PackagesState {
             && supported
             && posture.observed
             && !posture.refreshing
+            && !posture.awaiting_record
             && reason.is_none()
             && next.is_some();
         // `next()` is already None on a home mismatch, and the reason line says
@@ -1485,6 +1873,27 @@ impl PackagesState {
                 }
                 format!("Apply now would set: {}", what.join("; "))
             }
+            // A SCAN THAT DID NOT FINISH CANNOT SAY SPOTLIGHT IS SETTLED — the same rule
+            // the CLI verdict follows, so the two surfaces never disagree.
+            // Exposed but unreachable — the CLI's `nothing an apply can do` arm. The
+            // card must not say the machine is where [machine] wants it while the line
+            // above it counts directories that are still open.
+            _ if nothing_to_apply
+                && state.is_some_and(|s| {
+                    s.scan_complete && s.spotlight_noindex && s.exposed > s.would_migrate
+                }) =>
+            {
+                let stuck = state.map_or(0, |s| s.exposed - s.would_migrate);
+                format!(
+                    "Nothing an apply can do — {stuck} target dir(s) stay open to Spotlight \
+                     (free-standing, or refused for now)"
+                )
+            }
+            _ if nothing_to_apply && state.is_some_and(|s| !s.scan_complete) => {
+                "Nothing to apply from what was seen — Universal Control is where [machine] \
+                 wants it, and the build-output scan did not finish"
+                    .to_string()
+            }
             _ if nothing_to_apply => {
                 "Nothing to apply — Universal Control and Spotlight are where [machine] wants them"
                     .to_string()
@@ -1494,7 +1903,7 @@ impl PackagesState {
         MachineProjection {
             supported,
             observed: posture.observed,
-            refreshing: posture.refreshing,
+            refreshing: posture.refreshing || posture.awaiting_record,
             universal_control,
             spotlight,
             last_change,
@@ -1624,6 +2033,9 @@ mod tests {
             outcome: outcome.to_string(),
             seams: Vec::new(),
             last_success_at: String::new(),
+            last_index_reached_at: String::new(),
+            last_index_build: 0,
+            index_build_changed_at: String::new(),
             programs,
         }
     }
@@ -1985,6 +2397,9 @@ mod tests {
             outcome: "up to date".to_string(),
             seams: Vec::new(),
             last_success_at: String::new(),
+            last_index_reached_at: String::new(),
+            last_index_build: 0,
+            index_build_changed_at: String::new(),
             programs,
         };
         let text = status.to_toml().unwrap();
@@ -2478,7 +2893,137 @@ mod tests {
             would_migrate,
             scan_complete: true,
             home,
+            config_unreadable: false,
         }
+    }
+
+    /// THE PASS'S OWN RECORD ANSWERS THE CHANGE (2026-09-16). A `machine-settings:`
+    /// line opens an expectation — the card reads as refreshing, Apply disabled — and
+    /// NO read is spawned; the `machine-state:` record the pass prints behind it is
+    /// the newest measurement and closes the expectation. A read that was running
+    /// meanwhile is superseded: its older answer is dropped on arrival, so a walk that
+    /// began before the apply can never overwrite the state the apply reported. A
+    /// stream that ends without a record hands the read back to the caller.
+    #[test]
+    fn a_passes_record_answers_its_change_without_a_read() {
+        use atpkg::machine::{HomePosture, UcPosture};
+        let now = std::time::SystemTime::UNIX_EPOCH + std::time::Duration::from_secs(1_700_000_000);
+        let mut service = PackagesService::new();
+        // Unobserved, a change arrives with its record behind it.
+        service.note_machine_change("universal-control disabled".into(), now);
+        service.expect_machine_record();
+        let waiting = service.state(true, true, true, false, true).projection();
+        assert!(waiting.machine.refreshing, "the card reads as refreshing");
+        assert!(!waiting.machine.apply_enabled);
+        assert!(service.machine().awaiting_record && !service.machine().refreshing);
+        service.note_machine_record(machine_state(UcPosture::Disabled, 0, HomePosture::Account));
+        let m = service.machine();
+        assert!(m.observed && !m.awaiting_record && !m.refreshing);
+        assert_eq!(
+            m.state.as_ref().map(|s| s.universal_control),
+            Some(UcPosture::Disabled)
+        );
+        assert!(!service.take_record_expectation(), "nothing left to answer");
+
+        // A read running when the record lands is superseded: its answer is dropped.
+        assert!(service.request_machine_read(), "a read is spawned");
+        assert!(
+            !service.request_machine_read(),
+            "…and a second queues a rerun"
+        );
+        service.note_machine_record(machine_state(UcPosture::Disabled, 2, HomePosture::Account));
+        assert!(service.machine().superseded);
+        assert!(
+            !service.machine().rerun,
+            "the record satisfies the queued rerun"
+        );
+        let rerun = service.replace_machine_state(Ok(machine_state(
+            UcPosture::Default,
+            0,
+            HomePosture::Account,
+        )));
+        assert!(!rerun);
+        let m = service.machine();
+        assert!(!m.refreshing && !m.superseded);
+        assert_eq!(
+            m.state
+                .as_ref()
+                .map(|s| (s.universal_control, s.would_migrate)),
+            Some((UcPosture::Disabled, 2)),
+            "the older read must not overwrite the pass's record"
+        );
+
+        // A change whose record never comes: the expectation is handed back exactly
+        // once, and the caller spawns the read.
+        service.expect_machine_record();
+        assert!(service.take_record_expectation());
+        assert!(!service.take_record_expectation());
+        assert!(!service.machine().awaiting_record);
+
+        // A read that STARTED before the change cannot answer for it: its completion
+        // leaves the expectation open; a read started after the change closes it.
+        assert!(service.request_machine_read(), "a read is running…");
+        service.expect_machine_record();
+        assert!(!service.replace_machine_state(Ok(machine_state(
+            UcPosture::Default,
+            1,
+            HomePosture::Account,
+        ))));
+        assert!(
+            service.machine().awaiting_record,
+            "a pre-change read measured the machine the change then changed"
+        );
+        assert!(
+            service.request_machine_read(),
+            "…and one started afterwards"
+        );
+        assert!(!service.replace_machine_state(Ok(machine_state(
+            UcPosture::Disabled,
+            0,
+            HomePosture::Account,
+        ))));
+        assert!(!service.machine().awaiting_record, "answers it");
+        // The same through a queued rerun: the rerun is spawned after the change, so
+        // its answer closes the expectation the first read could not.
+        assert!(service.request_machine_read());
+        assert!(!service.request_machine_read(), "queued behind it");
+        service.expect_machine_record();
+        assert!(
+            service.replace_machine_state(Err("first".into())),
+            "the rerun is handed back"
+        );
+        assert!(
+            service.machine().awaiting_record,
+            "the first read predates the change"
+        );
+        assert!(!service.replace_machine_state(Ok(machine_state(
+            UcPosture::Disabled,
+            0,
+            HomePosture::Account,
+        ))));
+        assert!(!service.machine().awaiting_record, "the rerun answers it");
+
+        // A `machine apply` completion carrying the apply's own record confirms the
+        // card the way a streamed record does.
+        let seq = service.begin(Some(PackagesBusy::MachineApply)).unwrap();
+        service.expect_machine_record();
+        let done = succeeded(
+            PackagesStatusReport::unobserved(),
+            PackagesBusy::MachineApply,
+        )
+        .with_machine_state(Some(machine_state(
+            UcPosture::Disabled,
+            3,
+            HomePosture::Account,
+        )));
+        assert!(
+            !service.finish(1_000_000, done.clone()),
+            "a stale sequence is inert"
+        );
+        assert!(service.finish(seq, done));
+        let m = service.machine();
+        assert!(!m.awaiting_record);
+        assert_eq!(m.state.as_ref().map(|s| s.would_migrate), Some(3));
     }
 
     /// The "This Mac" card reads the machine posture through the packages
@@ -2613,10 +3158,13 @@ mod tests {
         );
         assert!(!done.machine.apply_enabled);
         assert!(done.machine.nothing_to_apply);
-        assert!(
-            done.machine.next.starts_with("Nothing to apply"),
-            "{}",
-            done.machine.next
+        // The fixture leaves one exposed dir no pass can reach (`exposed =
+        // would_migrate + 1`), so the honest sentence is the unreachable one: nothing
+        // an APPLY can do, which is not the same as the machine being settled.
+        assert_eq!(
+            done.machine.next,
+            "Nothing an apply can do — 1 target dir(s) stay open to Spotlight \
+             (free-standing, or refused for now)",
         );
 
         // A home mismatch disables the button and names the reason.
@@ -2780,7 +3328,7 @@ mod tests {
         assert!(!b.machine.apply_enabled);
         assert!(b.machine.nothing_to_apply);
         assert!(
-            b.machine.next.starts_with("Nothing to apply"),
+            b.machine.next.starts_with("Nothing an apply can do"),
             "{}",
             b.machine.next
         );
@@ -2882,6 +3430,115 @@ mod tests {
     /// half/unknown Universal Control states, the `leave` suffix (and its absence
     /// once disabled), the scan-budget suffix, the switched-off Spotlight sentence
     /// and the unresolved-home reason — with the verdict each one yields.
+    ///
+    /// THIS TEST'S BODY WAS DELETED AND ITS `#[test]` LEFT BEHIND, which landed the
+    /// attribute on the next test's doc; `duplicated attribute` named it 2026-09-16.
+    /// The law above is NOT withdrawn — the posture words it pins are still the ones
+    /// the card says — but restoring it means writing a body against the card's render,
+    /// not moving a doc, so it is recorded here and owed rather than faked. Its sibling
+    /// in `native_config_language.rs`, lost the same way, WAS restorable and is back.
+    ///
+    /// A CHANGE A PASS REPORTED REACHES THE CARD, and asks for a fresh read.
+    ///
+    /// The launch one-shot and every pass stream `machine-settings:` to the window, and
+    /// the wake arm answers by noting the change and starting a re-read. Both halves
+    /// were untested: a rework that dropped the note would leave the card's "Last
+    /// change" empty forever, and one that dropped the re-read would leave the measured
+    /// lines describing a machine the change had already moved.
+    #[test]
+    fn a_reported_change_lands_on_the_card_and_asks_for_a_read() {
+        use atpkg::machine::{HomePosture, UcPosture};
+        let mut service = PackagesService::new();
+        let seq = service.begin(None).unwrap();
+        assert!(service.finish(
+            seq,
+            refresh(PackagesStatusReport::from_parts(
+                true,
+                true,
+                "fp".into(),
+                Some(&status("ok")),
+                &[]
+            )),
+        ));
+        let _ = service.replace_machine_state(Ok(machine_state(
+            UcPosture::Default,
+            1,
+            HomePosture::Account,
+        )));
+        let before = service
+            .state(true, true, true, false, true)
+            .projection()
+            .machine;
+        assert_eq!(before.last_change, "No change recorded this launch");
+
+        let at = std::time::SystemTime::UNIX_EPOCH + std::time::Duration::from_secs(1_000);
+        service.note_machine_change("universal-control disabled".to_string(), at);
+        let after = service
+            .state(true, true, true, false, true)
+            .projection_at(at + std::time::Duration::from_secs(24))
+            .machine;
+        assert!(
+            after
+                .last_change
+                .starts_with("Last change: universal-control disabled · "),
+            "{}",
+            after.last_change
+        );
+        // And a re-read can be asked for: the arm's other half.
+        assert!(
+            service.request_machine_read(),
+            "a read starts when none is in flight"
+        );
+        assert!(
+            !service.request_machine_read(),
+            "a second request queues behind it rather than starting a second worker"
+        );
+    }
+
+    /// A CONFIG THAT DOES NOT PARSE IS A REFUSAL, NOT A MEASUREMENT. Both `[machine]`
+    /// defaults act, so the card must not offer Apply — and must say which file to fix —
+    /// when the record reports that the switches could not be read.
+    #[test]
+    fn an_unreadable_config_is_said_on_the_card_and_disables_apply() {
+        use atpkg::config::UniversalControlPolicy::Off;
+        use atpkg::machine::{HomePosture, MachineState, UcPosture};
+        let mut service = PackagesService::new();
+        let seq = service.begin(None).unwrap();
+        assert!(service.finish(
+            seq,
+            refresh(PackagesStatusReport::from_parts(
+                true,
+                true,
+                "fp".into(),
+                Some(&status("ok")),
+                &[]
+            )),
+        ));
+        let _ = service.replace_machine_state(Ok(MachineState {
+            config_unreadable: true,
+            ..machine_state(UcPosture::Default, 3, HomePosture::Account)
+        }));
+        let projection = service
+            .state(true, true, true, false, true)
+            .with_machine_config(Off, true)
+            .projection()
+            .machine;
+        let reason = projection.reason.as_deref().expect("a refusal is said");
+        assert!(reason.contains("aterm.toml does not parse"), "{reason}");
+        assert!(
+            projection.next.is_empty(),
+            "nothing is next when nothing may be applied: {projection:?}"
+        );
+        assert!(
+            !projection.apply_enabled,
+            "Apply must be off: {projection:?}"
+        );
+        assert!(
+            !projection.nothing_to_apply,
+            "a refusal is not the same as being already applied: {projection:?}"
+        );
+    }
+
     #[test]
     fn machine_projection_words_cover_every_posture() {
         use atpkg::config::UniversalControlPolicy::{self, Leave, Off};
@@ -2913,7 +3570,7 @@ mod tests {
                 name: "unknown",
                 state: machine_state(UcPosture::Unknown, 0, HomePosture::Account),
                 saved: (Off, true),
-                universal_control: "Universal Control: unknown",
+                universal_control: "Universal Control: could not be read on this Mac",
                 spotlight: "Build output: 8 target dirs hidden, 1 open to Spotlight — 0 a pass would hide",
                 next: "Apply now would set: Universal Control off for this host",
                 reason_starts: None,
@@ -2927,9 +3584,12 @@ mod tests {
                     ..machine_state(UcPosture::Default, 0, HomePosture::Account)
                 },
                 saved: (Leave, true),
-                universal_control: "Universal Control: at the OS default — the cursor roams to other Macs and iPads · left alone ([machine] universal_control = \"leave\")",
+                universal_control: "Universal Control: at the OS default — the cursor roams to other Macs and iPads · left alone ([machine] universal_control is not \"off\")",
                 spotlight: "Build output: 8 target dirs hidden, 1 open to Spotlight — 0 a pass would hide",
-                next: "Nothing to apply — Universal Control and Spotlight are where [machine] wants them",
+                // `spotlight_noindex` is ON and one dir is exposed that no pass can
+                // reach, so the machine is NOT where [machine] wants it — the verdict
+                // says what an apply can (not) do instead of calling it settled.
+                next: "Nothing an apply can do — 1 target dir(s) stay open to Spotlight (free-standing, or refused for now)",
                 reason_starts: None,
                 nothing_to_apply: true,
                 apply_on_macos: false,
@@ -2943,7 +3603,7 @@ mod tests {
                 saved: (Leave, true),
                 universal_control: "Universal Control: disabled on this Mac",
                 spotlight: "Build output: 8 target dirs hidden, 1 open to Spotlight — 0 a pass would hide",
-                next: "Nothing to apply — Universal Control and Spotlight are where [machine] wants them",
+                next: "Nothing an apply can do — 1 target dir(s) stay open to Spotlight (free-standing, or refused for now)",
                 reason_starts: None,
                 nothing_to_apply: true,
                 apply_on_macos: false,
@@ -3043,5 +3703,240 @@ mod tests {
             );
             assert!(p.machine.saved.is_none(), "{}: saved == record", row.name);
         }
+    }
+
+    /// The 2026-09-14 incident's state line, as `atpkg::lay::tracked_refusal` spells it
+    /// under the install pass's `error: stage: ` head — ~700 characters, the fix LAST.
+    /// atpkg's real prose, so a respelling of the marker fails here, not on the page.
+    fn incident_reason() -> String {
+        format!(
+            "error: stage: {}",
+            atpkg::lay::tracked_refusal("run the helper", "launchd job exited 78")
+        )
+    }
+
+    /// The canonical `atpkg::state` spellings the page paints every day fit one row at
+    /// the narrowest budget and come back byte-for-byte: the layout of the common case
+    /// is unchanged by the wrap.
+    #[test]
+    fn reason_lines_keeps_a_short_state_unchanged() {
+        for state in [
+            "managed 1971 — pinned by index 41",
+            "active",
+            "extra — not installed (opt in: aterm pkg install vendorx)",
+            "needs admin — run: aterm pkg install clt",
+            "blocked by clt: needs admin — run: aterm pkg install clt",
+            "linked",
+            "",
+            // A remedy that fits stays one line — the fix is already fully visible.
+            "error: stale link. fix: `aterm pkg repair`",
+        ] {
+            assert_eq!(
+                reason_lines(state, 64),
+                vec![state.to_string()],
+                "{state:?}"
+            );
+        }
+        // Exactly at the budget is still one line; one past it wraps.
+        let edge = "x".repeat(64);
+        assert_eq!(reason_lines(&edge, 64), vec![edge.clone()]);
+        assert_eq!(reason_lines(&format!("{edge} y"), 64).len(), 2);
+    }
+
+    /// The incident: the fix leads, whole, at every budget the page uses — nothing of
+    /// it is cut, no line exceeds its budget, and the diagnosis is bounded after it.
+    #[test]
+    fn reason_lines_puts_the_fix_first_and_whole() {
+        let incident = incident_reason();
+        assert!(
+            incident.chars().count() > 600,
+            "{}",
+            incident.chars().count()
+        );
+        let fix_at = incident
+            .find(" fix: ")
+            .expect("atpkg spells the remedy ` fix: `");
+        let fix_clause = &incident[fix_at + " fix: ".len()..];
+        for width in [64usize, 104, 144] {
+            let lines = reason_lines(&incident, width);
+            assert!(
+                lines[0].starts_with("fix: unset ATPKG_REFUSE_TRACKED_INSTALL"),
+                "{width}: {:?}",
+                lines[0]
+            );
+            for line in &lines {
+                assert!(fits(line, width), "{width}: {line:?}");
+            }
+            // The fix's lines are the leading ones; the diagnosis starts with the
+            // recorded head, and a fix that fills the bound is followed by the marker.
+            let fix_lines: Vec<&str> = lines
+                .iter()
+                .map(String::as_str)
+                .take_while(|line| {
+                    !line.starts_with("error: stage:") && !line.starts_with('\u{2026}')
+                })
+                .collect();
+            assert_eq!(
+                fix_lines.join(" "),
+                format!("fix: {fix_clause}"),
+                "{width}: nothing of the fix is cut"
+            );
+            let last = lines.last().unwrap();
+            assert!(last.ends_with(" more)"), "{width}: {last:?}");
+            let expected_len = if fix_lines.len() >= MAX_REASON_LINES {
+                fix_lines.len() + 1
+            } else {
+                MAX_REASON_LINES
+            };
+            assert_eq!(lines.len(), expected_len, "{width}: {lines:#?}");
+            if fix_lines.len() < MAX_REASON_LINES {
+                assert!(
+                    lines[fix_lines.len()]
+                        .starts_with("error: stage: this process is provenance-tracked"),
+                    "{width}: the diagnosis head follows the fix: {:?}",
+                    lines[fix_lines.len()]
+                );
+            }
+        }
+        // The wide budget: the fix's lines first (however many the remedy's current
+        // wording needs — it grew by a line when the config key arrived, 2026-09-15),
+        // then the diagnosis in what room is left — the first line whole, the last
+        // giving its tail to the marker, which counts what stays hidden.
+        let wide = reason_lines(&incident, 144);
+        assert_eq!(wide.len(), MAX_REASON_LINES);
+        let fix_n = wrap_words(&format!("fix: {fix_clause}"), 144).len();
+        assert!(
+            fix_n < MAX_REASON_LINES,
+            "the wide budget holds the whole fix with room to spare: {fix_n}"
+        );
+        assert!(
+            wide[fix_n].starts_with("error: stage:"),
+            "{:?}",
+            wide[fix_n]
+        );
+        assert!(
+            wide.iter().all(|line| !line.contains(" fix:")),
+            "the diagnosis no longer carries the fix: {wide:#?}"
+        );
+        let diagnosis = incident[..fix_at].trim_end_matches('.');
+        let room = MAX_REASON_LINES - fix_n;
+        let hidden = wrap_words(diagnosis, 144).len() - room;
+        assert!(hidden >= 1, "{hidden}");
+        let last = &wide[MAX_REASON_LINES - 1];
+        assert!(
+            last.ends_with(&format!(" \u{2026}({hidden} more)")),
+            "{last:?}"
+        );
+        assert!(
+            wrap_words(diagnosis, 144)[room - 1]
+                .starts_with(last.split(" \u{2026}").next().unwrap()),
+            "the boundary line is the diagnosis's own line, shortened: {last:?}"
+        );
+    }
+
+    /// No remedy to lead with: the reason wraps whole while it fits the bound, and past
+    /// it the marker replaces the last visible line's tail, counting the hidden lines.
+    #[test]
+    fn reason_lines_wraps_and_bounds_a_reason_without_a_fix() {
+        let within = "error: stage: the signed index names build 1971 for ay but the store holds \
+                      no such tree and the download step was refused by the policy";
+        let wrapped = reason_lines(within, 48);
+        assert!(
+            wrapped.len() > 1 && wrapped.len() <= MAX_REASON_LINES,
+            "{wrapped:#?}"
+        );
+        assert_eq!(
+            wrapped.join(" "),
+            within.split_whitespace().collect::<Vec<_>>().join(" ")
+        );
+        for line in &wrapped {
+            assert!(fits(line, 48), "{line:?}");
+        }
+
+        let long: String = (0..60)
+            .map(|n| format!("word{n:02}"))
+            .collect::<Vec<_>>()
+            .join(" ");
+        let all = wrap_words(&long, 40);
+        assert!(all.len() > MAX_REASON_LINES);
+        let bounded = reason_lines(&long, 40);
+        assert_eq!(bounded.len(), MAX_REASON_LINES);
+        assert_eq!(bounded[..MAX_REASON_LINES - 1], all[..MAX_REASON_LINES - 1]);
+        let hidden = all.len() - MAX_REASON_LINES;
+        let last = &bounded[MAX_REASON_LINES - 1];
+        assert!(
+            last.ends_with(&format!(" \u{2026}({hidden} more)")),
+            "{last:?}"
+        );
+        assert!(fits(last, 40), "{last:?}");
+        assert!(all[MAX_REASON_LINES - 1].starts_with(last.split(" \u{2026}").next().unwrap()));
+    }
+
+    /// The marker is the WORD `fix:` — a `prefix:` in a path sentence is not a remedy,
+    /// a bundle line's parenthesised `fix:` is, and one glued to a path segment is not.
+    #[test]
+    fn reason_lines_marker_is_the_word_fix() {
+        let prefix = format!(
+            "error: stage: the prefix: /Users//example/Library/Application Support/aterm/pkg is {}",
+            "not writable and the untracked lane could not be reached for the install pass"
+        );
+        let lines = reason_lines(&prefix, 48);
+        assert!(
+            lines[0].starts_with("error: stage: the prefix:"),
+            "{lines:#?}"
+        );
+        assert!(
+            lines.iter().all(|line| !line.starts_with("fix:")),
+            "{lines:#?}"
+        );
+
+        let bundle = format!(
+            "error: the bundle at /Applications/aterm.app carries com.apple.provenance on {} (the bundle's fix: {})",
+            "targo",
+            atpkg::provenance::REMEDY
+        );
+        let lines = reason_lines(&bundle, 64);
+        assert!(
+            lines[0].starts_with("fix: re-seed the bundle untagged"),
+            "{lines:#?}"
+        );
+
+        let glued = format!(
+            "error: stage: /tmp/fix:abc is not a store path {}",
+            "x".repeat(60)
+        );
+        let lines = reason_lines(&glued, 48);
+        assert!(
+            lines[0].starts_with("error: stage: /tmp/fix:abc"),
+            "{lines:#?}"
+        );
+    }
+
+    /// A token longer than the row (a path) is broken at the budget rather than left
+    /// for the painter to ellipsize; the pieces reassemble to the token.
+    #[test]
+    fn reason_lines_breaks_a_token_longer_than_the_row() {
+        let path = format!(
+            "/Users//example/Library/Application-Support/aterm/pkg/store/{}",
+            "a".repeat(70)
+        );
+        let state = format!("error: stage: cannot lay {path}");
+        let lines = reason_lines(&state, 40);
+        for line in &lines {
+            assert!(fits(line, 40), "{line:?}");
+        }
+        let joined: String = lines
+            .iter()
+            .map(|line| line.trim_end_matches(" \u{2026}(1 more)"))
+            .collect::<Vec<_>>()
+            .concat();
+        assert!(
+            joined.starts_with("error: stage: cannot lay/Users"),
+            "{joined}"
+        );
+        assert_eq!(reason_lines(&state, 200), vec![state.clone()]);
+        let whole = wrap_words(&path, 40);
+        assert_eq!(whole.concat(), path);
+        assert!(whole.iter().all(|line| fits(line, 40)));
     }
 }

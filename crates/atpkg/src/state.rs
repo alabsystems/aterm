@@ -23,6 +23,10 @@
 //!   ([`crate::manifest::Program::requires`]) and `<dep>` is not installed, system-
 //!   satisfied or installed through its protocol; the tail is the DEPENDENCY's own row,
 //!   so the line says whose act unblocks it. Deferred, retried every pass, never a fault.
+//! * `held: pinned build <N> is not published for <target>; staying on build <current>` —
+//!   an INSTALLED member whose coherence group's new pin carries no artifact for this
+//!   target (a sibling's row names the member: `held: <owner>'s pinned build …`); the tuple
+//!   stays whole on its current builds. Deferred, retried every pass, never a fault.
 //!
 //! Every constructor here is the ONLY place its spelling lives; the parsers beside them
 //! (`system_path`, `managed_pin`, …) read the same words back so `doctor` and `which` can
@@ -61,6 +65,9 @@ pub const TOMBSTONED_PIN: &str = "tombstoned: pin yanked/below floor";
 /// Distinct from the `blocked:` FAULT prefix `doctor` matches (`blocked: no build for this
 /// architecture`, the toolset-wide verdict): a space, not a colon, follows the word.
 pub const BLOCKED_PREFIX: &str = "blocked by ";
+/// The head of an installed member held on its current build because its coherence
+/// group's new pin is not published for this target: `held: …`.
+pub const HELD_PREFIX: &str = "held: ";
 
 /// `managed <build> — pinned by index <N>`.
 #[must_use]
@@ -94,6 +101,90 @@ pub fn shadowed(build: u64, path: &Path) -> String {
     s.push_str(&crate::dec_u64(build));
     s.push_str(" — SHADOWED by ");
     s.push_str(&path.display().to_string());
+    s
+}
+
+/// The tail of an AGENT PROGRAM's shell-local shadow row: `managed <build> — SHADOWED in
+/// this shell by <path>…` ([`agent_shadowed_in_shell`]). Distinct from [`shadowed`]'s
+/// ` — SHADOWED by ` on purpose: [`shadowed_by`] must never read this row as the
+/// machine-wide state, because it is not one.
+pub const AGENT_SHADOWED_IN_SHELL: &str = " — SHADOWED in this shell by ";
+
+/// `managed <build> — SHADOWED in this shell by <path>: its PATH has no <agents_dir> (a
+/// shell that has not sourced the atpkg hook) — \`<remedy>\` here picks the managed copy
+/// up; a tab opened on this build puts agents/ first on its own` — or, with `agents_on_path`, `…: its PATH has
+/// <agents_dir> behind <path's dir> — \`<remedy>\` here moves it to the front; …`.
+///
+/// The AGENT PROGRAMS' shadow row (2026-09-16). For `claude`/`codex` aterm's copy IS what
+/// runs (owner decision 2026-09-10) — through `agents/` first on every session `PATH` — so
+/// a foreign copy ahead of it is not the machine's state but ONE SHELL's: a tab adopted
+/// across the update that introduced `agents/`, or opened before the seed pass created it.
+/// Owner, 2026-09-16: *"it is telling me to open a new tab. NO! all the latest and best
+/// MUST WORK IN THE SAME TAB"* — so the remedy named is in-place, never a new tab, and
+/// never "remove or reorder that copy". `remedy` is the command the CALLER has checked is
+/// true for this machine (`cli::shell_remedy_command`): the hook sourced in place —
+/// `. ~/.aterm/shell.d/00-atpkg.zsh` (`source …fish`, `. …ps1`) — wherever that hook
+/// file exists, the same sentence the window's status row says, and a `PATH` line in
+/// the shell's dialect only where it does not. NEVER `exec $SHELL`: measured the same day,
+/// a re-exec'd shell inside an aterm tab loses the tab's shell integration (the zsh
+/// wrapper consumes `ATERM_ORIGINAL_ZDOTDIR`; bash rides `--rcfile`), while the source
+/// heals `PATH` and keeps it. The cause is stated as what is KNOWN — this shell has not run
+/// the hook — not as a guess about when it was opened. NEVER RECORDED: `status.toml` and
+/// the Packages row keep the machine-wide `managed <build> — pinned by index <N>` for
+/// such a program.
+#[must_use]
+pub fn agent_shadowed_in_shell(
+    build: u64,
+    path: &Path,
+    agents_dir: &Path,
+    agents_on_path: bool,
+    remedy: &str,
+) -> String {
+    let mut s = String::from(MANAGED_PREFIX);
+    s.push_str(&crate::dec_u64(build));
+    s.push_str(" — ");
+    s.push_str(&agent_shell_shadow_tail(
+        path,
+        agents_dir,
+        agents_on_path,
+        remedy,
+    ));
+    s
+}
+
+/// The tail of [`agent_shadowed_in_shell`] after `managed <build> — `: `SHADOWED in this
+/// shell by <path>: its PATH has …; a tab opened on this build puts agents/ first on its own`. For a shell a
+/// user is in (`doctor`, `which`) — the pass's own `PATH` is no user's shell, and
+/// `cli::reconcile_shadowed` prints its own words for it.
+#[must_use]
+pub fn agent_shell_shadow_tail(
+    path: &Path,
+    agents_dir: &Path,
+    agents_on_path: bool,
+    remedy: &str,
+) -> String {
+    let mut s = String::from(AGENT_SHADOWED_IN_SHELL.trim_start_matches(" — "));
+    s.push_str(&path.display().to_string());
+    s.push_str(": its PATH has ");
+    if agents_on_path {
+        s.push_str(&agents_dir.display().to_string());
+        s.push_str(" behind ");
+        s.push_str(
+            &path
+                .parent()
+                .map_or_else(|| path.display().to_string(), |d| d.display().to_string()),
+        );
+        s.push_str(" — `");
+        s.push_str(remedy);
+        s.push_str("` here moves it to the front");
+    } else {
+        s.push_str("no ");
+        s.push_str(&agents_dir.display().to_string());
+        s.push_str(" (a shell that has not sourced the atpkg hook) — `");
+        s.push_str(remedy);
+        s.push_str("` here picks the managed copy up");
+    }
+    s.push_str("; a tab opened on this build puts agents/ first on its own");
     s
 }
 
@@ -172,6 +263,29 @@ pub fn blocked_by(state: &str) -> Option<(&str, &str)> {
         return None;
     }
     Some((dep, dep_state))
+}
+
+/// `held: pinned build <N> is not published for <target>; staying on build <current>` —
+/// or, on a sibling's row, `held: <owner>'s pinned build <N> is not published for <target>;
+/// staying on build <current>`. The update lane's row for an INSTALLED member whose tuple
+/// cannot move on this target because `owner`'s new pin (the row's own program when `owner`
+/// is `None`) carries no artifact for it, so the whole group stays on its current builds.
+/// A per-program DEFERRED state, not a fault: nothing downloads, and the pass that finds
+/// the build published moves the group.
+#[must_use]
+pub fn held_unpublished(owner: Option<&str>, build: u64, target: &str, current: u64) -> String {
+    let mut s = String::from(HELD_PREFIX);
+    if let Some(owner) = owner {
+        s.push_str(owner);
+        s.push_str("'s ");
+    }
+    s.push_str("pinned build ");
+    s.push_str(&crate::dec_u64(build));
+    s.push_str(" is not published for ");
+    s.push_str(target);
+    s.push_str("; staying on build ");
+    s.push_str(&crate::dec_u64(current));
+    s
 }
 
 /// The `<path>` of a `system: <path> — not managed by aterm…` state, or `None` for any
@@ -307,6 +421,63 @@ mod tests {
         );
     }
 
+    /// The agent programs' shell-local shadow row (2026-09-16): the in-place remedy,
+    /// never a new tab, never "remove that copy"; and NOT a `SHADOWED by` row to the
+    /// parser, because it is one shell's state, not the machine's.
+    #[test]
+    fn the_agent_shadow_row_names_the_in_place_remedy_and_is_never_the_machine_state() {
+        let agents = Path::new("/Users//dev/Library/Application Support/aterm/pkg/agents");
+        let absent = agent_shadowed_in_shell(
+            2_026_091_601,
+            Path::new("/Users//dev/.local/bin/claude"),
+            agents,
+            false,
+            ". ~/.aterm/shell.d/00-atpkg.zsh",
+        );
+        assert_eq!(
+            absent,
+            "managed 2026091601 — SHADOWED in this shell by /Users//dev/.local/bin/claude: its \
+             PATH has no /Users//dev/Library/Application Support/aterm/pkg/agents (a shell \
+             that has not sourced the atpkg hook) — `. ~/.aterm/shell.d/00-atpkg.zsh` here \
+             picks the managed copy up; a tab opened on this build puts agents/ first on its own"
+        );
+        let behind = agent_shadowed_in_shell(
+            2_026_091_601,
+            Path::new("/opt/homebrew/bin/codex"),
+            agents,
+            true,
+            "source ~/.aterm/shell.d/00-atpkg.fish",
+        );
+        assert_eq!(
+            behind,
+            "managed 2026091601 — SHADOWED in this shell by /opt/homebrew/bin/codex: its PATH \
+             has /Users//dev/Library/Application Support/aterm/pkg/agents behind \
+             /opt/homebrew/bin — `source ~/.aterm/shell.d/00-atpkg.fish` here moves it to \
+             the front; a tab opened on this build puts agents/ first on its own"
+        );
+        // The cause is what is known, never a guess about when the shell was opened.
+        assert!(!absent.contains("before the install"), "{absent}");
+        for row in [&absent, &behind] {
+            assert!(is_managed(row), "{row}");
+            assert_eq!(shadowed_by(row), None, "not the machine-wide row: {row}");
+            assert_eq!(managed_pin(row), None, "{row}");
+            assert!(!row.contains("new tab"), "never a new tab: {row}");
+            assert!(
+                !row.contains("remove"),
+                "never the user's copy to remove: {row}"
+            );
+            for fault in [
+                "error:",
+                "unavailable:",
+                "blocked:",
+                "aborted:",
+                "tombstoned:",
+            ] {
+                assert!(!row.starts_with(fault), "{row}");
+            }
+        }
+    }
+
     #[test]
     fn the_parsers_read_back_exactly_what_the_constructors_wrote() {
         let plain = system(Path::new("/opt/homebrew/bin/gh"), None);
@@ -365,6 +536,8 @@ mod tests {
             &unavailable("t", ""),
             &installed_via("pkg", Path::new("/p")),
             &blocked("clt", &needs_admin("clt")),
+            &held_unpublished(None, 6, "t", 5),
+            &held_unpublished(Some("tb"), 6, "t", 3),
         ] {
             assert_eq!(system_path(other), None, "{other}");
             assert_eq!(managed_pin(other), None, "{other}");
@@ -389,6 +562,8 @@ mod tests {
             needs_admin("brew"),
             unavailable("t", "h"),
             blocked("clt", &needs_admin("clt")),
+            held_unpublished(None, 6, "t", 5),
+            held_unpublished(Some("tb"), 6, "t", 3),
         ] {
             for fault in [
                 "error:",

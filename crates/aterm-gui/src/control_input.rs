@@ -1239,7 +1239,8 @@ pub(crate) fn parse_tab(rest: &str) -> Option<TabAction> {
 }
 
 /// `tab new | <N> | next | prev | close [N] | move <from> <to>` -> DRIVE the FRONT window's tabs and reply
-/// `OK <active_index> <tab_count>`.
+/// `OK <active_index> <tab_count>` when the action HAPPENED, or `ERR <why>` when
+/// it did not — an index no tab holds, or a host that declined the close.
 ///
 /// MAIN-THREAD HOP (mirrors [`cmd_chrome`]): mutating `App` (its tabs) may ONLY
 /// happen on the event loop, but this runs on a background control thread. So we
@@ -1253,7 +1254,10 @@ pub(crate) fn cmd_tab(proxy: &EventLoopProxy<Wake>, rest: &str) -> String {
         return "ERR usage: tab <new|N|next|prev|close [N]|move <from> <to>>\n".to_string();
     };
     match super::control_media::call_main(proxy, |reply| Wake::TabCmd { action, reply }) {
-        Ok((active, count)) => format!("OK {active} {count}\n"),
+        Ok(Ok((active, count))) => format!("OK {active} {count}\n"),
+        // A REFUSED action says so, in the same vocabulary the aimed twin
+        // (`cmd_tab_aimed`) and the sibling `@<sid> close` verb already use.
+        Ok(Err(why)) => format!("ERR {why}\n"),
         Err(error) => format!("ERR tab command failed: {error}\n"),
     }
 }

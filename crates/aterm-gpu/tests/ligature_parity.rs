@@ -23,9 +23,16 @@ mod common;
 use common::{backends, max_channel_delta_frame as max_channel_delta};
 
 // Layout-independent ligature font discovery, and the SINGLE point where
-// $ATERM_FONT is exported to both renderers. Order: (a) $ATERM_FONT if already
-// set and readable; (b) the committed fixture in the sibling aterm-render crate
+// $ATERM_FONT is exported to both renderers. Order: (a) $ATERM_LIGATURE_TEST_FONT
+// if set and readable; (b) the committed fixture in the sibling aterm-render crate
 // (present in both canonical and vendored layouts).
+//
+// DISCOVERY DOES NOT READ $ATERM_FONT, only WRITES it. $ATERM_FONT is a
+// production setting that outranks `font_family` in config, so reading it here
+// let a developer's own font preference displace the committed fixture and
+// redden tests that hard-assert fixture-specific ligature behaviour. The
+// override is the dedicated var; the export below is unchanged, because pointing
+// both renderers at the resolved font is this helper's actual job.
 //
 // Every test in this binary wants the SAME font, but libtest runs the #[test]
 // fns on PARALLEL threads — a per-test set_var would race a sibling test's
@@ -37,7 +44,7 @@ use common::{backends, max_channel_delta_frame as max_channel_delta};
 fn ligature_test_font() -> Option<&'static std::path::Path> {
     static FONT: std::sync::OnceLock<Option<std::path::PathBuf>> = std::sync::OnceLock::new();
     FONT.get_or_init(|| {
-        let found = std::env::var("ATERM_FONT")
+        let found = std::env::var("ATERM_LIGATURE_TEST_FONT")
             .ok()
             .map(std::path::PathBuf::from)
             .filter(|p| p.exists())
@@ -68,7 +75,9 @@ fn ligature_font_gpu_matches_cpu() {
     // Points BOTH renderers at the ligature font: resolves AND exports $ATERM_FONT,
     // once per process (see ligature_test_font).
     if ligature_test_font().is_none() {
-        eprintln!("SKIP: no ligature test font (set ATERM_FONT or add the repo fixture)");
+        eprintln!(
+            "SKIP: no ligature test font (set ATERM_LIGATURE_TEST_FONT or add the repo fixture)"
+        );
         return;
     }
 
@@ -131,7 +140,9 @@ fn ligature_selection_gpu_matches_cpu() {
 
     // Resolves AND exports $ATERM_FONT, once per process (see ligature_test_font).
     if ligature_test_font().is_none() {
-        eprintln!("SKIP: no ligature test font (set ATERM_FONT or add the repo fixture)");
+        eprintln!(
+            "SKIP: no ligature test font (set ATERM_LIGATURE_TEST_FONT or add the repo fixture)"
+        );
         return;
     }
 
@@ -197,7 +208,9 @@ fn cursor_cutout_gpu_matches_cpu() {
 
     // Resolves AND exports $ATERM_FONT, once per process (see ligature_test_font).
     if ligature_test_font().is_none() {
-        eprintln!("SKIP: no ligature test font (set ATERM_FONT or add the repo fixture)");
+        eprintln!(
+            "SKIP: no ligature test font (set ATERM_LIGATURE_TEST_FONT or add the repo fixture)"
+        );
         return;
     }
 
@@ -271,7 +284,9 @@ fn ligature_ink_gpu_matches_cpu() {
 
     // Resolves AND exports $ATERM_FONT, once per process (see ligature_test_font).
     if ligature_test_font().is_none() {
-        eprintln!("SKIP: no ligature test font (set ATERM_FONT or add the repo fixture)");
+        eprintln!(
+            "SKIP: no ligature test font (set ATERM_LIGATURE_TEST_FONT or add the repo fixture)"
+        );
         return;
     }
 

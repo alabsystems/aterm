@@ -95,3 +95,69 @@ fn a_width_reflow_advances_the_history_renumber_epoch_and_a_rows_only_resize_doe
          absolute-keyed cache on an ordinary height drag"
     );
 }
+
+/// THE HALF THE BUMP SITES COULD NOT SEE: a width reflow with an EMPTY
+/// scrollback.
+///
+/// The bump used to live only where a rewrap CROSSES the live/history boundary
+/// — `prepend_ring_scrollback_lines`, the deficit pullback,
+/// `note_bottom_end_renumbered` — and every one of those early-returns when
+/// there is nothing to splice. A fresh tab, or any session right after `clear`
+/// whose output still fits on screen, has no off-screen history at all: the
+/// rewrap touches only the live grid, so the epoch stood still while the SAME
+/// logical lines moved from four rows to eight and absolute row N started
+/// naming different text. That is a renumbering by every definition this stamp
+/// carries, and `content_gen`/`absolute_row_revision` cannot see it either
+/// (the first says "content changed", not "keys moved"; the second only ever
+/// moves on a protected-footer splice).
+///
+/// Measured consequence before the repair: the find bar's highlight-all tint,
+/// which fails closed on this stamp, replayed its cached `(row, col, len)` onto
+/// a soft-wrap continuation row while the real hit sat untinted further down
+/// and the bar still read the query.
+#[test]
+fn a_width_reflow_with_no_scrollback_still_advances_the_renumber_epoch() {
+    // Three full-width lines in a TWELVE-row viewport: three rows at width 20,
+    // six at width 10 — both totals fit, so nothing is ever pushed off the top
+    // and the rewrap has no history to splice.
+    let mut grid = Grid::with_scrollback(12, 20, 200);
+    for row in 0..3u16 {
+        for (col, ch) in format!("row {row} text that wraps")
+            .chars()
+            .take(20)
+            .enumerate()
+        {
+            grid.set_cursor(row, u16::try_from(col).unwrap_or(0));
+            grid.write_char(ch);
+        }
+    }
+    assert_eq!(
+        grid.scrollback_lines(),
+        0,
+        "fixture: the whole point is a rewrap with nothing in history"
+    );
+    let epoch_before = grid.history_renumber_epoch();
+
+    grid.resize(12, 10);
+    assert_eq!(
+        grid.scrollback_lines(),
+        0,
+        "fixture: the rewrap still spliced nothing into history — this is the \
+         case the boundary-crossing bump sites cannot reach"
+    );
+    assert!(
+        grid.history_renumber_epoch() > epoch_before,
+        "a width rewrap renumbers rows whether or not a history row moved; \
+         consumers holding a cached absolute row get no other signal"
+    );
+
+    // CONTROL, restated for this fixture: rows-only still renumbers nothing
+    // that a reveal/demote relabel does not already account for.
+    let epoch_after_width = grid.history_renumber_epoch();
+    grid.resize(12, 10);
+    assert_eq!(
+        grid.history_renumber_epoch(),
+        epoch_after_width,
+        "a resize to the SAME dimensions rewraps nothing and must not bump"
+    );
+}

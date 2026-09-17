@@ -41,7 +41,6 @@ fn wrapped_columns(coalesced: bool, glyph_width: u16, boundary_class: TypedClass
         beam: false,
         head_dx: 0.5,
         pack: None,
-        wake_persist_s: 1.2,
     };
     let mut glow = CursorGlow::default();
     let mut quads = Vec::new();

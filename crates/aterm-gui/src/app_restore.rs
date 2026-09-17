@@ -969,9 +969,12 @@ impl App {
         #[cfg(test)]
         if self.proxy.is_none() && self.headless {
             // The adoption `spawn_session` performs below, as far as a stub can:
-            // the id it records from the `Adopted` handle.
+            // the id it records from the `Adopted` handle, and whether the shell's
+            // PATH is frozen (2026-09-16) — what `register_session` marks on the
+            // registry, so a test can pin that adoption reaches the count.
             let mut session = crate::stub_session(id);
             session.handoff_local_id = Some(adopted.local_id);
+            session.frozen_path = adopted.frozen_path;
             return Ok(session);
         }
         let proxy = self
@@ -1639,10 +1642,13 @@ impl App {
         if self.proxy.is_none() && self.headless {
             let mut session = crate::stub_session(id);
             // The adoption `spawn_session` performs below, as far as a stub can:
-            // the same match, and the id it records from the `Adopted` handle.
-            session.handoff_local_id =
-                take_handed_off_shell(&mut self.seamless_adopt, terminal.local_id)
-                    .map(|shell| shell.local_id);
+            // the same match, the id it records from the `Adopted` handle, and
+            // whether the shell's PATH is frozen (2026-09-16).
+            if let Some(shell) = take_handed_off_shell(&mut self.seamless_adopt, terminal.local_id)
+            {
+                session.handoff_local_id = Some(shell.local_id);
+                session.frozen_path = shell.frozen_path;
+            }
             self.carry_restored_identity(terminal, FillingShell::Unregistered(&session), ids);
             let view = self
                 .view_store
@@ -4426,6 +4432,147 @@ mod tests {
         assert_eq!(registry_meta(&new, placed[1][0]), worker);
     }
 
+    /// A FROZEN SHELL'S ADOPTION REACHES THE REGISTRY'S COUNT (2026-09-16), end to
+    /// end through the spawn seam: `seamless::take_incoming` decides
+    /// `Adopted::frozen_path` (the manifest's `outgoing_build` absent, or the
+    /// record's own flag), `spawn_session` copies it onto `Session::frozen_path`,
+    /// and `App::register_session` marks it on the store — where
+    /// `SessionStore::frozen_path_tabs` counts it for the managed row's "N tabs
+    /// from before this update" note and the seed pill's narrowing. Both adoption
+    /// paths are driven: the restore of a leaf naming the shell, and the orphan
+    /// net. Dropping `Session::frozen_path` (or the copy in either path) fails
+    /// this, and with it the note that keeps the "this one too" claim honest.
+    #[test]
+    fn a_frozen_shells_adoption_reaches_the_registrys_frozen_tab_count() {
+        let frozen_shell = |local_id: u64| {
+            let mut shell = handed_off_shell(local_id);
+            shell.frozen_path = true;
+            shell
+        };
+        let frozen_sessions = |app: &App| -> Vec<(Option<u64>, bool, bool)> {
+            let store = app.store.read().unwrap();
+            let mut rows: Vec<_> = app
+                .pool
+                .sessions
+                .iter()
+                .map(|(&session, pooled)| {
+                    (
+                        pooled.session.handoff_local_id,
+                        pooled.session.frozen_path,
+                        store.has_frozen_path(session),
+                    )
+                })
+                .collect();
+            rows.sort_unstable();
+            rows
+        };
+
+        // The restore path: tab B's leaf names shell 3, handed across frozen; tab A
+        // is a stand-in (no shell adopted, never frozen).
+        let mut new = App::headless_for_test();
+        new.handoff_successor = true;
+        new.seamless_adopt = vec![frozen_shell(3)];
+        new.restore_into_window(WindowId(0), window_of(vec![leaf_naming(0), leaf_naming(3)]));
+        assert!(new.seamless_adopt.is_empty(), "the leaf adopted shell 3");
+        assert_eq!(
+            frozen_sessions(&new),
+            vec![(None, false, false), (Some(3), true, true)],
+            "the session adopted from shell 3 is frozen on the session AND the registry"
+        );
+        assert_eq!(new.store.read().unwrap().frozen_path_tabs(), 1);
+
+        // The orphan net: shell 1 frozen, shell 2 not — each counted as it came.
+        let mut new = App::headless_for_test();
+        new.handoff_successor = true;
+        new.restore_into_window(WindowId(0), window_of(vec![leaf_naming(0)]));
+        new.seamless_adopt = vec![frozen_shell(1), handed_off_shell(2)];
+        new.adopt_orphan_shells_as_tabs(&[]);
+        assert!(new.seamless_adopt.is_empty(), "the net placed every orphan");
+        assert_eq!(
+            frozen_sessions(&new),
+            vec![
+                (None, false, false),
+                (Some(1), true, true),
+                (Some(2), false, false)
+            ]
+        );
+        assert_eq!(new.store.read().unwrap().frozen_path_tabs(), 1);
+    }
+
+    /// THE ROW BUILT BEFORE THE ADOPTION NAMES THE FROZEN TAB (review,
+    /// 2026-09-16). The atpkg launch pass starts from `main_entry` before the
+    /// event loop, and on a warm machine prints `managed-current:` within tens
+    /// of milliseconds — before the first park after first paint adopts the
+    /// handed-off shells (`apply_pending_restore`). Counted from the registry
+    /// alone, that first row read "this one too" in exactly the tab the owner
+    /// had complained about, and the honest row came seconds later (a double
+    /// post) or six hours later. `App::frozen_path_tabs` counts the pending
+    /// adoptees, so the marker that arrives first is built right; the restore's
+    /// refresh (`StatusBars::refresh_managed_current`) then finds the registry
+    /// agreeing and posts nothing — one row, the true one.
+    #[test]
+    fn a_managed_row_built_before_the_adoption_counts_the_frozen_shell_and_reposts_nothing() {
+        use std::time::{Duration, Instant};
+        let wire = "claude 2.1.273 (build 2026091601); codex 0.154.0 (build 2026091001)";
+        let now = Instant::now();
+        let mut new = App::headless_for_test();
+        new.handoff_successor = true;
+        let mut frozen = handed_off_shell(3);
+        frozen.frozen_path = true;
+        new.seamless_adopt = vec![frozen, handed_off_shell(4)];
+        // Before the adoption: the registry knows nothing, the count is 1.
+        assert_eq!(new.store.read().unwrap().frozen_path_tabs(), 0);
+        assert_eq!(new.frozen_path_tabs(), 1, "the pending adoptee is counted");
+        // The marker lands now — what `Wake::PkgManagedCurrent` does.
+        let frozen_tabs = new.frozen_path_tabs();
+        let hooked = new.this_tab_hooked();
+        new.status_bars
+            .toolchain_managed_current(wire, frozen_tabs, hooked, now);
+        let (_, bar) = new.status_bars.bars().next().expect("the row posts");
+        assert!(
+            bar.text.detail.ends_with(
+                "\u{00b7} 1 tab from before this update picks them up with \
+                 `. ~/.aterm/shell.d/00-atpkg.zsh`"
+            ) && !bar.text.detail.contains("this one too"),
+            "{}",
+            bar.text.detail
+        );
+        // The adoption: the leaf places shell 3, the net places shell 4.
+        new.restore_into_window(WindowId(0), window_of(vec![leaf_naming(0), leaf_naming(3)]));
+        new.adopt_orphan_shells_as_tabs(&[]);
+        assert!(new.seamless_adopt.is_empty());
+        assert_eq!(new.store.read().unwrap().frozen_path_tabs(), 1);
+        assert_eq!(new.frozen_path_tabs(), 1, "registered now, counted once");
+        // The refresh the restore runs: the count agrees, nothing posts.
+        let frozen_tabs = new.frozen_path_tabs();
+        assert!(
+            !new.status_bars
+                .refresh_managed_current(frozen_tabs, hooked, now),
+            "the row built before the adoption was already the true one"
+        );
+        assert_eq!(
+            new.status_bars.rows(),
+            1,
+            "one row, not a false-then-true pair"
+        );
+        // The backstop: an adoptee counted but never registered (dropped by the
+        // net) is settled by the refresh — the count went down, the row reposts.
+        let mut new = App::headless_for_test();
+        new.handoff_successor = true;
+        let mut frozen = handed_off_shell(5);
+        frozen.frozen_path = true;
+        new.seamless_adopt = vec![frozen];
+        new.status_bars
+            .toolchain_managed_current(wire, new.frozen_path_tabs(), true, now);
+        new.seamless_adopt.clear();
+        assert_eq!(new.frozen_path_tabs(), 0);
+        assert!(new.status_bars.refresh_managed_current(
+            new.frozen_path_tabs(),
+            true,
+            now + Duration::from_secs(1)
+        ));
+    }
+
     /// A shell the outgoing process handed across as `local_id`, the way
     /// `seamless::take_incoming` gives it to `main_entry`. A headless restore
     /// reads only the id: the stub spawn never touches the fd or the pid.
@@ -4438,6 +4585,7 @@ mod tests {
             nonce: aterm_session::LaunchNonce::generate(),
             checkpoint: None,
             control: None,
+            frozen_path: false,
         }
     }
 

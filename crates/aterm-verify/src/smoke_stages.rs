@@ -16,6 +16,17 @@
 //!    under 15 ms. Skips automatically without a WindowServer session (CI/SSH), or
 //!    with `ATERM_SKIP_GUI_SMOKE=1`.
 //!
+//!    It drives TWO bursts. The controller burst (`ctl key`) is born already
+//!    dequeued: it never arms the key-arrival stamp, so it cannot see OS event-queue
+//!    residence, never books `key->write`, and a press-path stall that runs before
+//!    its mid-handler `note_input()` is invisible to it. The hardware burst
+//!    (`ctl hwkey`) posts real NSEvents into the app's own queue, so the keys take
+//!    winit's `KeyboardInput` arm like a physical press. It is gated per slice from
+//!    `metrics percentiles`, so a failure names who owes the time: aterm's
+//!    `key->write`, the press's terminal-mutex wait, the drawable acquire, and the
+//!    queue-inclusive input->present. The child's echo round trip is reported and
+//!    never gated, because it is not aterm's cost.
+//!
 //! TWO RULES THAT LOOK LIKE DETAILS AND ARE NOT:
 //!  * BUILD BOTH BINARIES SYNCHRONOUSLY, THEN DRIVE THE BINARIES — never `targo
 //!    run`. (1) Timing: the test stage links `aterm-gui`'s dev-deps with
@@ -76,6 +87,46 @@ pub mod pattern {
 const BURST_KEYS: usize = 30;
 const BURST_GAP: Duration = Duration::from_millis(50);
 const SETTLE: Duration = Duration::from_secs(1);
+
+/// The input->present ceiling both bursts share: ~10x the healthy margin and still
+/// far under the 2026-07-05 incident's 300-530 ms worst case.
+const INPUT_PRESENT_CEILING_MS: u64 = 250;
+/// Hardware keys that must reach the `KeyboardInput` arm (`n_key_write`) before
+/// any hardware slice verdict means anything: half the burst, the frames floor's
+/// ratio. Below it the burst measured nothing, and that is a FAIL, not a pass.
+const HW_KEY_WRITE_FLOOR: u64 = 15;
+/// `key->write` p99 ceiling, OS queue residence included. The release build wrote
+/// each key at p99 6.29 ms while a whole gate compiled beside it; 40 ms is more than
+/// two 60 Hz frames, so a change that adds 40 ms of UI-thread work to every key
+/// fails here whatever the healthy baseline, where the 250 ms input->present
+/// ceiling let it through.
+const KEY_WRITE_P99_CEILING_MS: u64 = 40;
+/// Worst wait for the terminal mutex at the key-press site (presses AND releases,
+/// which `key->write` does not sample). The P63 handoff gives a waiting press the
+/// lock at the reader's next slice boundary, and the smoke's shell echoes one byte
+/// per key; a 25 ms wait means some holder stopped honouring the handoff.
+const TERM_WAIT_PRESS_MAX_CEILING_MS: u64 = 25;
+/// Drawable-acquire p99 ceiling: three 60 Hz frames. Live windows read 3.4-5.24 ms
+/// p99 (max 15.32 ms on a loaded machine). Gated only when acquires happened (a
+/// CPU backend books none).
+const ACQUIRE_P99_CEILING_MS: u64 = 50;
+/// Present->glass p99 ceiling: the COMPOSITOR leg, `presentDrawable:` registration
+/// -> the drawable's `presentedTime`. EVERY other ceiling on this list stops at
+/// application present-return, so until this row a change that made the window
+/// server hold frames -- re-enabling `displaySyncEnabled`, a deeper compositor
+/// queue -- moved no gated number at all: the present call still returned at once
+/// and `key->write`, the press lock, acquire and `input->present` all stayed green
+/// while the owner waited longer for every keystroke to appear.
+///
+/// Three 60 Hz refreshes, the budget `ACQUIRE_P99_CEILING_MS` already spends. The
+/// shipped macOS present is `Immediate` and WindowServer still composites at the
+/// display refresh, so ONE refresh of wait is healthy here; this is therefore a bar
+/// on a compositor holding frames for 3+ refreshes, not on a single added frame.
+/// Pinning it tighter needs a measured per-refresh-rate baseline the idle-only
+/// smoke cannot supply. Gated only when the leg was SAMPLED (`n_present_glass > 0`):
+/// a CPU backend, a non-macOS present and a process that installs no sink register
+/// no presented handler at all, and an absent slice is not a slow one.
+const PRESENT_GLASS_P99_CEILING_MS: u64 = 50;
 /// The socket-bind budget: 100 polls at 100 ms.
 const SOCKET_POLLS: usize = 100;
 const POLL_GAP: Duration = Duration::from_millis(100);
@@ -556,6 +607,166 @@ fn gui_measurements(ctx: &Ctx, r: &mut Report, sb: &mut Sandbox, ctl_bin: &Path)
             "gui smoke: sync timeout-releases during plain typing [{got}]"
         ));
     }
+
+    hardware_key_slices(ctx, r, sb, ctl_bin, pid);
+}
+
+/// `hwkey x count=30 interval=50`: the controller burst's keys and pacing, posted
+/// as real NSEvents so they are dequeued, routed and translated by the code a
+/// physical keypress runs, including the queue-age backdate `ctl key` never arms.
+#[must_use]
+pub fn hwkey_burst_args() -> Vec<String> {
+    vec![
+        "hwkey".into(),
+        "x".into(),
+        format!("count={BURST_KEYS}"),
+        format!("interval={}", BURST_GAP.as_millis()),
+    ]
+}
+
+/// The hardware-key burst and its per-slice verdict.
+fn hardware_key_slices(ctx: &Ctx, r: &mut Report, sb: &Sandbox, ctl_bin: &Path, pid: u32) {
+    // Posted keys go to the KEY window, so the test window must still be frontmost;
+    // re-assert it rather than trust the activation from before the first burst.
+    if !crate::smoke::activate_macos_gui_pid(pid) {
+        r.skip("gui smoke: hardware keys (could not keep the test window frontmost)");
+        return;
+    }
+    let got = ctl(ctx, sb, ctl_bin, &["metrics", "reset"]);
+    if !glob_match(pattern::OK, &got) {
+        r.fail(format!(
+            "gui smoke: metrics reset before hardware keys -> {}",
+            or_no_reply(&got)
+        ));
+        return;
+    }
+    let args = hwkey_burst_args();
+    let argv: Vec<&str> = args.iter().map(String::as_str).collect();
+    // Blocks while it paces the burst (~1.5 s); `OK posted=<n>` says only that the
+    // OS queue took them. What arrived is read from the percentiles below.
+    let got = ctl(ctx, sb, ctl_bin, &argv);
+    let Some(posted) = metric_u64(&got, "posted").filter(|_| glob_match(pattern::OK, &got)) else {
+        r.fail(format!(
+            "gui smoke: hardware key injection -> {}",
+            or_no_reply(&got)
+        ));
+        return;
+    };
+    std::thread::sleep(SETTLE);
+    let got = ctl(ctx, sb, ctl_bin, &["metrics", "percentiles"]);
+    match hardware_key_verdict(posted, &got) {
+        Ok(line) => r.pass(line),
+        Err(bad) => r.fail(bad),
+    }
+}
+
+/// The text of `<name>=<value>` in a metrics reply (the LAST occurrence, as the
+/// numeric helpers read it), for a verdict line; `?` when absent.
+fn reply_field<'a>(reply: &'a str, name: &str) -> &'a str {
+    let needle = format!(" {name}=");
+    reply
+        .rfind(needle.as_str())
+        .and_then(|at| reply[at + needle.len()..].split_whitespace().next())
+        .unwrap_or("?")
+}
+
+/// The hardware burst's `metrics percentiles` reply, slice by slice: `Ok` is the
+/// pass line, `Err` the failure. Extracted so the thresholds are testable.
+///
+/// # Errors
+/// A reply that cannot be parsed, a burst that never reached the `KeyboardInput`
+/// arm, or any gated slice at or over its ceiling.
+pub fn hardware_key_verdict(posted: u64, reply: &str) -> Result<String, String> {
+    let whole = |name: &str| metric_ms_whole(reply, name);
+    let (
+        Some(n_key_write),
+        Some(key_write),
+        Some(press_max),
+        Some(n_acquire),
+        Some(acquire),
+        Some(n_input),
+        Some(input),
+        Some(n_present_glass),
+        Some(glass),
+    ) = (
+        metric_u64(reply, "n_key_write"),
+        whole("key_write_p99_ms"),
+        whole("max_term_wait_press_ms"),
+        metric_u64(reply, "n_acquire"),
+        whole("acquire_p99_ms"),
+        metric_u64(reply, "n_input"),
+        whole("input_p99_ms"),
+        metric_u64(reply, "n_present_glass"),
+        whole("present_glass_p99_ms"),
+    )
+    else {
+        return Err(format!(
+            "gui smoke: could not parse hardware-key percentiles -> {}",
+            or_no_reply(reply)
+        ));
+    };
+    let f = |name: &str| reply_field(reply, name);
+    if n_key_write < HW_KEY_WRITE_FLOOR {
+        return Err(format!(
+            "gui smoke: hardware keys never reached the KeyboardInput arm — \
+             n_key_write={n_key_write} of posted={posted} (< {HW_KEY_WRITE_FLOOR}), so \
+             key→write, the queue-age backdate and the press lock wait measured nothing \
+             [{reply}]"
+        ));
+    }
+    if key_write >= KEY_WRITE_P99_CEILING_MS {
+        return Err(format!(
+            "gui smoke: hardware key→write — p99 {key_write}ms (>= {KEY_WRITE_P99_CEILING_MS}), \
+             aterm's own dispatch with OS queue residence; press lock wait max {}ms, \
+             acquire p99 {}ms, child echo p99 {}ms [{reply}]",
+            f("max_term_wait_press_ms"),
+            f("acquire_p99_ms"),
+            f("echo_p99_ms"),
+        ));
+    }
+    if press_max >= TERM_WAIT_PRESS_MAX_CEILING_MS {
+        return Err(format!(
+            "gui smoke: key-press terminal-mutex wait — max {press_max}ms \
+             (>= {TERM_WAIT_PRESS_MAX_CEILING_MS}) over n={} [{reply}]",
+            f("n_term_wait_press"),
+        ));
+    }
+    if n_acquire > 0 && acquire >= ACQUIRE_P99_CEILING_MS {
+        return Err(format!(
+            "gui smoke: drawable acquire — p99 {acquire}ms (>= {ACQUIRE_P99_CEILING_MS}) \
+             over n={n_acquire}, max {}ms [{reply}]",
+            f("max_acquire_wait_ms"),
+        ));
+    }
+    if n_present_glass > 0 && glass >= PRESENT_GLASS_P99_CEILING_MS {
+        return Err(format!(
+            "gui smoke: present→glass — p99 {glass}ms \
+             (>= {PRESENT_GLASS_P99_CEILING_MS}) over n={n_present_glass}, the compositor \
+             leg AFTER present-return that every slice above stops short of; max {}ms, \
+             {} drawable(s) never shown [{reply}]",
+            f("max_present_glass_ms"),
+            f("present_glass_skipped"),
+        ));
+    }
+    if n_input > 0 && input >= INPUT_PRESENT_CEILING_MS {
+        return Err(format!(
+            "gui smoke: hardware input→present — p99 {input}ms (>= {INPUT_PRESENT_CEILING_MS}), \
+             OS queue residence included [{reply}]"
+        ));
+    }
+    Ok(format!(
+        "gui smoke: hardware keys n_key_write={n_key_write}/{posted} key_write_p99={}ms \
+         max_term_wait_press={}ms acquire_p99={}ms (n={n_acquire}) input_p99={}ms \
+         present_glass_p99={}ms (n={n_present_glass}, {} never shown); \
+         echo_p99={}ms is the child's round trip (reported, not gated)",
+        f("key_write_p99_ms"),
+        f("max_term_wait_press_ms"),
+        f("acquire_p99_ms"),
+        f("input_p99_ms"),
+        f("present_glass_p99_ms"),
+        f("present_glass_skipped"),
+        f("echo_p99_ms"),
+    ))
 }
 
 /// The pacing thresholds, extracted so they are readable and testable.
@@ -570,9 +781,10 @@ pub fn pacing_verdict(frames: u64, max_input_present_ms: u64, reply: &str) -> Op
             "gui smoke: present starvation — frames={frames} (< 15) [{reply}]"
         ));
     }
-    if max_input_present_ms >= 250 {
+    if max_input_present_ms >= INPUT_PRESENT_CEILING_MS {
         return Some(format!(
-            "gui smoke: input→present latency — max {max_input_present_ms}ms (>= 250) [{reply}]"
+            "gui smoke: input→present latency — max {max_input_present_ms}ms \
+             (>= {INPUT_PRESENT_CEILING_MS}) [{reply}]"
         ));
     }
     if !glob_match(pattern::NO_RETRIES_OR_DROPS, reply) {
@@ -702,6 +914,264 @@ mod tests {
         );
     }
 
+    /// A `metrics percentiles` reply in the verb's own field order, with the slices
+    /// the hardware verdict reads set per case.
+    fn percentiles(
+        n_key_write: u64,
+        key_write: &str,
+        press_max: &str,
+        acquire: &str,
+        input: &str,
+    ) -> String {
+        format!(
+            "OK n_input=30 input_p50_ms=9.11 input_p95_ms=12.30 input_p99_ms={input} \
+             n_present=31 present_p50_ms=8.20 present_p95_ms=10.10 present_p99_ms=11.40 \
+             n_key_write={n_key_write} key_write_p50_ms=1.10 key_write_p95_ms=2.30 \
+             key_write_p99_ms={key_write} n_pre_present=31 pre_present_p50_ms=0.90 \
+             n_acquire=31 acquire_p50_ms=0.02 acquire_p95_ms=1.10 acquire_p99_ms={acquire} \
+             last_acquire_wait_ms=0.02 max_acquire_wait_ms=4.80 \
+             n_term_wait_redraw_a=40 term_wait_redraw_a_p99_ms=0.02 max_term_wait_redraw_a_ms=0.10 \
+             n_term_wait_press=60 term_wait_press_p50_ms=0.00 term_wait_press_p95_ms=0.01 \
+             term_wait_press_p99_ms=0.02 max_term_wait_press_ms={press_max} \
+             n_echo=30 echo_p50_ms=3.10 echo_p95_ms=40.20 echo_p99_ms=150.04 echo_max_ms=160.00 \
+             n_present_glass=31 present_glass_p50_ms=6.10 present_glass_p95_ms=8.20 \
+             present_glass_p99_ms=8.90 last_present_glass_ms=6.00 max_present_glass_ms=12.40 \
+             present_glass_skipped=0\n"
+        )
+    }
+
+    /// A healthy reply with the compositor leg's sample count and p99 replaced.
+    fn with_glass(n: u64, p99: &str) -> String {
+        percentiles(30, "6.00", "0.10", "1.00", "10.00")
+            .replace("n_present_glass=31", &format!("n_present_glass={n}"))
+            .replace(
+                "present_glass_p99_ms=8.90",
+                &format!("present_glass_p99_ms={p99}"),
+            )
+    }
+
+    #[test]
+    fn the_hardware_burst_is_the_controller_burst_through_the_os_queue() {
+        assert_eq!(
+            hwkey_burst_args(),
+            ["hwkey", "x", "count=30", "interval=50"],
+            "same keys, same count, same pacing as the `ctl key` burst"
+        );
+    }
+
+    #[test]
+    fn a_40ms_press_path_regression_passes_the_controller_gate_and_fails_the_hardware_gate() {
+        // The finding's scenario: 40 ms of new UI-thread work on every keystroke.
+        // Through `ctl key` the echo still presents in ~50 ms and the only latency
+        // ceiling (250 ms input→present) passes it.
+        let controller = "OK frames=41 max_input_present_ms=52.100 redraw_retry_gated=0 present_drops=0 sync_rel_timeout=0 ";
+        assert_eq!(pacing_verdict(41, 52, controller), None, "the blind spot");
+
+        // The hardware burst books every key's key→write, and it fails.
+        let hw = percentiles(30, "46.13", "0.10", "5.24", "58.00");
+        let bad = hardware_key_verdict(30, &hw).expect_err("a finding");
+        assert!(
+            bad.contains("hardware key→write — p99 46ms (>= 40)"),
+            "{bad}"
+        );
+        assert!(
+            bad.contains("press lock wait max 0.10ms, acquire p99 5.24ms, child echo p99 150.04ms"),
+            "the failure names who owes the time: {bad}"
+        );
+    }
+
+    #[test]
+    fn a_healthy_hardware_burst_passes_and_the_childs_echo_is_never_gated() {
+        // echo p99 150.04 ms is the gate-load measurement of a child waiting behind
+        // compiles: reported, and not aterm's to fail on.
+        let hw = percentiles(30, "6.29", "0.10", "5.24", "14.20");
+        let ok = hardware_key_verdict(30, &hw).expect("a pass");
+        assert_eq!(
+            ok,
+            "gui smoke: hardware keys n_key_write=30/30 key_write_p99=6.29ms \
+             max_term_wait_press=0.10ms acquire_p99=5.24ms (n=31) input_p99=14.20ms \
+             present_glass_p99=8.90ms (n=31, 0 never shown); \
+             echo_p99=150.04ms is the child's round trip (reported, not gated)"
+        );
+    }
+
+    #[test]
+    fn a_burst_that_never_reached_the_keyboard_arm_is_a_failure_not_a_pass() {
+        // Exactly what a `ctl key`-driven burst reports: every slice healthy, and
+        // `n_key_write=0` because nothing armed the key-arrival stamp.
+        let controller_shaped = percentiles(0, "0.00", "0.00", "0.02", "9.00");
+        let bad = hardware_key_verdict(30, &controller_shaped).expect_err("a finding");
+        assert!(
+            bad.contains("never reached the KeyboardInput arm — n_key_write=0 of posted=30 (< 15)"),
+            "{bad}"
+        );
+        assert!(hardware_key_verdict(30, &percentiles(14, "1.00", "0.0", "1.0", "9.0")).is_err());
+        assert!(hardware_key_verdict(30, &percentiles(15, "1.00", "0.0", "1.0", "9.0")).is_ok());
+    }
+
+    #[test]
+    fn the_hardware_slice_ceilings_are_exact_and_separately_attributed() {
+        let v = |kw: &str, press: &str, acq: &str, inp: &str| {
+            hardware_key_verdict(30, &percentiles(30, kw, press, acq, inp))
+        };
+        assert!(
+            v("39.99", "0.10", "1.00", "10.00").is_ok(),
+            "39 ms key→write passes"
+        );
+        assert!(
+            v("40.00", "0.10", "1.00", "10.00").is_err(),
+            "40 ms key→write fails"
+        );
+
+        assert!(
+            v("6.00", "24.90", "1.00", "10.00").is_ok(),
+            "24 ms press wait passes"
+        );
+        let press = v("6.00", "25.00", "1.00", "10.00").expect_err("press wait");
+        assert!(
+            press.contains("key-press terminal-mutex wait — max 25ms (>= 25) over n=60"),
+            "{press}"
+        );
+
+        assert!(
+            v("6.00", "0.10", "49.90", "10.00").is_ok(),
+            "49 ms acquire passes"
+        );
+        let acq = v("6.00", "0.10", "50.00", "10.00").expect_err("acquire");
+        assert!(
+            acq.contains("drawable acquire — p99 50ms (>= 50) over n=31, max 4.80ms"),
+            "{acq}"
+        );
+
+        assert!(
+            v("6.00", "0.10", "1.00", "249.90").is_ok(),
+            "249 ms input→present passes"
+        );
+        let inp = v("6.00", "0.10", "1.00", "250.00").expect_err("input→present");
+        assert!(
+            inp.contains("hardware input→present — p99 250ms (>= 250)"),
+            "{inp}"
+        );
+
+        // A CPU backend books no acquires; an absent slice is not a slow one.
+        let cpu =
+            percentiles(30, "6.00", "0.10", "0.00", "10.00").replace("n_acquire=31", "n_acquire=0");
+        assert!(hardware_key_verdict(30, &cpu).is_ok());
+    }
+
+    #[test]
+    fn a_compositor_that_holds_frames_fails_while_every_present_return_slice_stays_green() {
+        // THE FINDING'S SCENARIO: a change adds a frame of compositor queue --
+        // `displaySyncEnabled` re-enabled, a deeper queue. `presentDrawable:` still
+        // RETURNS at once, so key->write, the press lock, acquire and input->present
+        // are all healthy, and until the present->glass row EVERY published number
+        // stayed green while the owner waited an extra frame for each keystroke.
+        let held = with_glass(31, "92.00");
+        assert!(
+            hardware_key_verdict(30, &with_glass(31, "8.90")).is_ok(),
+            "the same reply with a healthy compositor leg passes"
+        );
+        for (slice, healthy) in [
+            ("key_write_p99_ms", 6u64),
+            ("acquire_p99_ms", 1),
+            ("input_p99_ms", 10),
+        ] {
+            assert_eq!(
+                metric_ms_whole(&held, slice),
+                Some(healthy),
+                "{slice} is untouched by a compositor regression"
+            );
+        }
+        let bad = hardware_key_verdict(30, &held).expect_err("a finding");
+        assert!(
+            bad.contains("present→glass — p99 92ms (>= 50) over n=31"),
+            "{bad}"
+        );
+        assert!(
+            bad.contains("AFTER present-return") && bad.contains("0 drawable(s) never shown"),
+            "the failure names the leg that owes the time: {bad}"
+        );
+    }
+
+    #[test]
+    fn the_compositor_leg_ceiling_is_exact_and_an_unsampled_leg_is_not_a_slow_one() {
+        assert!(
+            hardware_key_verdict(30, &with_glass(31, "49.90")).is_ok(),
+            "49 ms present->glass passes"
+        );
+        assert!(
+            hardware_key_verdict(30, &with_glass(31, "50.00")).is_err(),
+            "50 ms present->glass fails"
+        );
+        // No sink, no handler: a CPU backend and every non-macOS present book none,
+        // and an absent slice must never be read as a slow one.
+        assert!(
+            hardware_key_verdict(30, &with_glass(0, "900.00")).is_ok(),
+            "an unsampled compositor leg is not a slow one"
+        );
+    }
+
+    #[test]
+    fn an_unparsable_hardware_reply_fails_closed() {
+        let bad = hardware_key_verdict(30, "").expect_err("no reply");
+        assert_eq!(
+            bad,
+            "gui smoke: could not parse hardware-key percentiles -> <no reply>"
+        );
+        // The summary line (what `metrics` answers) lacks the slices: never a pass.
+        let summary =
+            "OK frames=41 max_input_present_ms=8.100 last_key_write_ms=0.00 max_key_write_ms=0.00 ";
+        assert!(hardware_key_verdict(30, summary).is_err());
+    }
+
+    #[test]
+    fn the_fields_the_hardware_verdict_reads_are_the_ones_aterm_gui_publishes() {
+        // The verdict fails closed on a renamed field; this catches the rename at
+        // test time instead of on the next gate run.
+        let gui = Path::new(env!("CARGO_MANIFEST_DIR")).join("../aterm-gui/src");
+        let read = |f: &str| std::fs::read_to_string(gui.join(f)).expect("aterm-gui source");
+        let query = read("control_query.rs");
+        for spelled in [
+            "n_input={} input_p50_ms={:.2} input_p95_ms={:.2} input_p99_ms={:.2}",
+            "n_key_write={} key_write_p50_ms={:.2} key_write_p95_ms={:.2}",
+            "key_write_p99_ms={:.2}",
+            "n_acquire={} acquire_p50_ms={:.2} acquire_p95_ms={:.2} acquire_p99_ms={:.2}",
+            "max_acquire_wait_ms={:.2}",
+            " n_term_wait_{label}={}",
+            "max_term_wait_{label}_ms={:.2}",
+            "text_term_wait_fields(),",
+            "crate::echo_rtt::percentile_fields_text(),",
+        ] {
+            assert!(
+                query.contains(spelled),
+                "control_query.rs no longer spells `{spelled}`"
+            );
+        }
+        assert!(read("metrics.rs").contains("Self::Press => \"press\","));
+        assert!(read("echo_rtt.rs").contains("echo_p99_ms={:.2}"));
+        // The compositor leg: published by `metrics.rs`, appended to the reply by
+        // `control_query.rs`. The verdict fails closed on a rename of either half.
+        let metrics_rs = read("metrics.rs");
+        for spelled in [
+            "n_present_glass={} present_glass_p50_ms={:.2} present_glass_p95_ms={:.2}",
+            "present_glass_p99_ms={:.2} last_present_glass_ms={:.2}",
+            "max_present_glass_ms={:.2} present_glass_skipped={}",
+        ] {
+            assert!(
+                metrics_rs.contains(spelled),
+                "metrics.rs no longer spells `{spelled}`"
+            );
+        }
+        assert!(query.contains("crate::metrics::present_glass_fields_text(),"));
+        assert!(read("control.rs").contains("\"hwkey\" => control_input::cmd_hwkey(proxy, rest),"));
+        let hwkey = read("hwkey.rs");
+        assert!(
+            hwkey.contains("strip_prefix(\"count=\")")
+                && hwkey.contains("strip_prefix(\"interval=\")")
+        );
+        assert!(read("control_input.rs").contains("format!(\"OK posted={n}\\n\")"));
+    }
+
     #[test]
     fn an_empty_reply_is_reported_as_no_reply_never_as_a_pass() {
         assert_eq!(or_no_reply(""), "<no reply>");
@@ -747,16 +1217,23 @@ mod tests {
     #[test]
     fn the_sandbox_is_private_and_short_enough_for_a_unix_socket() {
         let mut sb = Sandbox::new("ats").expect("sandbox");
-        use std::os::unix::fs::PermissionsExt;
-        let mode = std::fs::metadata(&sb.rundir)
-            .expect("stat")
-            .permissions()
-            .mode()
-            & 0o777;
-        assert_eq!(
-            mode, 0o700,
-            "the same-uid control-socket check depends on 0700"
-        );
+        // THE MODE ASSERTION IS THE ONLY UNIX PART, so it is the only part
+        // gated: the socket-name length, the layout and the teardown below are
+        // the same law everywhere, and gating the whole test would have made
+        // them unpinned off unix rather than merely unmeasured.
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let mode = std::fs::metadata(&sb.rundir)
+                .expect("stat")
+                .permissions()
+                .mode()
+                & 0o777;
+            assert_eq!(
+                mode, 0o700,
+                "the same-uid control-socket check depends on 0700"
+            );
+        }
         assert!(sb.sock().as_os_str().len() < crate::smoke::SUN_LEN);
         assert!(sb.rundir.join("aterm").is_dir());
 

@@ -301,6 +301,86 @@ impl Grid {
                 }
             }
         }
+
+        // LAST: mirror each wide lead's rendition-valued extras onto its
+        // continuation spacer, reading what every restore above just wrote.
+        self.mirror_wide_spacer_extras(row_idx);
+    }
+
+    /// Give every wide lead's continuation spacer the lead's rendition-valued
+    /// EXTRAS — the deferred-fill twin of `scroll_materialize`'s
+    /// `mirror_wide_spacer_extras`, which carries the full argument.
+    ///
+    /// In one sentence: `CellFlags::wide_continuation_of` gives the re-derived
+    /// spacer the lead's rendition FLAGS, and those flags SELECT two values that
+    /// do not fit in the flag word — the truecolor fg/bg (the `PackedColor` is
+    /// only a "look in the overflow table" sentinel) and the SGR 58 underline
+    /// colour. `fill_row_cells` emits both for the lead's column alone
+    /// (`DeferredExtra::RgbFg`/`RgbBg` take `col`), so without this a checkpoint
+    /// restore, a Kitty unscroll and a reflow pullback would each disagree with
+    /// the materializer about the right half of the same character.
+    ///
+    /// Two passes over at most `cols` columns, O(1) each: collect the
+    /// `(lead, spacer)` pairs while the row is borrowed, then write while the
+    /// extras are. `cell_extra_mut` sets HAS_EXTRAS as it creates the entry —
+    /// the LIVE render path gates its map probe on that bit, unlike the
+    /// materialized-history path, so a write without the flag would be invisible.
+    fn mirror_wide_spacer_extras(&mut self, row_idx: u16) {
+        let Some(idx) = self.storage.row_index(row_idx) else {
+            return;
+        };
+        let Some(r) = self.storage.rows.get(idx) else {
+            return;
+        };
+        // The SAME predicate the scroll-off extractor uses to DROP a spacer
+        // column, so the columns healed here are exactly the columns it drops.
+        let cells = r.as_slice();
+        let mut pairs: aterm_alloc::SmallVec<(u16, u16), 4> = aterm_alloc::SmallVec::new();
+        for i in 1..cells.len() {
+            if !super::scroll_convert::is_spacer(cells, i) {
+                continue;
+            }
+            let (Ok(lead), Ok(spacer)) = (u16::try_from(i - 1), u16::try_from(i)) else {
+                break;
+            };
+            pairs.push((lead, spacer));
+        }
+
+        for (lead, spacer) in pairs {
+            // Ring-aware reads: `fill_row_from_line` writes RGB into the map, but
+            // a row it fills can already hold ring entries, and these are the
+            // accessors the extractor itself reads through.
+            let fg = self.storage.extras.fg_rgb_for(row_idx, lead);
+            let bg = self.storage.extras.bg_rgb_for(row_idx, lead);
+            let underline = self
+                .storage
+                .extras
+                .get(CellCoord::new(row_idx, lead))
+                .and_then(crate::CellExtra::underline_color_u32);
+            if fg.is_none() && bg.is_none() && underline.is_none() {
+                continue;
+            }
+            // Copy only where the spacer has nothing of its own, so a span that
+            // already covers the pair keeps its value and the pass is idempotent.
+            let have_fg = self.storage.extras.fg_rgb_for(row_idx, spacer).is_some();
+            let have_bg = self.storage.extras.bg_rgb_for(row_idx, spacer).is_some();
+            let have_underline = self
+                .storage
+                .extras
+                .get(CellCoord::new(row_idx, spacer))
+                .and_then(crate::CellExtra::underline_color_u32)
+                .is_some();
+            let dst = self.storage.cell_extra_mut(row_idx, spacer);
+            if fg.is_some() && !have_fg {
+                dst.set_fg_rgb(fg);
+            }
+            if bg.is_some() && !have_bg {
+                dst.set_bg_rgb(bg);
+            }
+            if underline.is_some() && !have_underline {
+                dst.set_underline_color_u32(underline);
+            }
+        }
     }
 }
 
@@ -466,9 +546,12 @@ fn set_cell(row: &mut Row, col: u16, cols: u16, c: char, s: &LineCellStyle, is_w
     };
     if is_wide && col + 1 < cols {
         row.set(col, Cell::with_style(c, s.fg, s.bg, flags));
+        // The spacer inherits the lead's rendition (`wide_continuation_of` carries
+        // the law and the measurement). This is the deferred scrollback fill; a
+        // bare role bit here would un-highlight wide glyphs on scroll-back only.
         row.set(
             col + 1,
-            Cell::with_style(' ', s.fg, s.bg, CellFlags::WIDE_CONTINUATION),
+            Cell::with_style(' ', s.fg, s.bg, flags.wide_continuation_of()),
         );
         col.saturating_add(2)
     } else if is_wide {
@@ -504,7 +587,7 @@ fn set_complex_cell(
         row.set(col, cell);
         row.set(
             col + 1,
-            Cell::with_style(' ', s.fg, s.bg, CellFlags::WIDE_CONTINUATION),
+            Cell::with_style(' ', s.fg, s.bg, flags.wide_continuation_of()),
         );
         (
             col.saturating_add(2),

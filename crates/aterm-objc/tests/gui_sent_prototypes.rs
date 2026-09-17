@@ -115,7 +115,12 @@ fn token(t: &str) -> &'static str {
     match t {
         "v" => "v",
         "id" => "@",
-        "bool" => "B",
+        // `Bool::ENCODING` is the crate's own arch-dependent answer — `B` on
+        // arm64, `c` on x86_64 where `BOOL` is `signed char` — exactly as the
+        // winit census spells it. A hard-coded `B` made this census disagree
+        // with the runtime on every `send_bool` row on an Intel Mac
+        // (`-[NSWindow isVisible]` is `c@:` there; measured 2026-09-06).
+        "bool" => <aterm_objc::Bool as aterm_objc::Encode>::ENCODING,
         "isize" => "q",
         "usize" => "Q",
         // The UNSIGNED short. `-[NSEvent keyCode]` is `unsigned short`, and it

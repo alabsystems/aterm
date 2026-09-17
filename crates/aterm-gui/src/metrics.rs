@@ -30,14 +30,52 @@
 //!   millisecond in which nothing presented is inside the reading, bounded only
 //!   by a 5 s discard. A multi-second value means "nothing presented for that
 //!   long", not "a frame took that long".
+//! - `present_glass` (`metrics percentiles`: `n_present_glass`,
+//!   `present_glass_p*_ms`, `last_/max_present_glass_ms`, `present_glass_skipped`)
+//!   — the leg AFTER application present-return: `presentDrawable:` registration
+//!   → the drawable's `presentedTime` (`aterm_gpu::present_glass`), process-wide
+//!   over every window. A slow `present_latency` with a fast `present_glass` was
+//!   the main thread; a slow `present_glass` was the compositor. A drawable never
+//!   shown counts in `present_glass_skipped`, not in the distribution.
 //! - `last_/max_frame_render_ns` — causal CPU wall time: compose plus CPU
 //!   raster/copy, or time spent encoding GPU commands and calling `queue.submit`,
 //!   most recent and worst-since-reset. This is not completed GPU execution;
 //!   surface acquisition and final-present pacing are deliberately excluded.
+//! - `last_/max_gpu_park_ms` — the OTHER main-thread GPU block on the armed
+//!   Metal arm: the Submit-A pipelining wait plus the pending-ring drain, both
+//!   `waitUntilCompleted` with no timeout. It is completed GPU execution, so it
+//!   is excluded from `frame_render` (which used to absorb the frame-slot half
+//!   and price a contention stall as slow compose) and published here instead.
+//!   A large `gpu_park` with a small `frame_render` is the GPU or WindowServer,
+//!   not the compose path.
 //! - `slow_frames` — frames whose render time blew the [`SLOW_FRAME_THRESHOLD_NS`]
 //!   (~30 fps) budget. A rising count is the lag signature — most often the CPU
 //!   rasterizer redrawing heavy colour output (the "GPU was off" trap), so
 //!   `backend=cpu` + climbing `slow_frames`/`max_frame_render_ms` is what to watch.
+//! - `max_wake_late_ms` / `max_deadline_late_ms`, each with the OWNER that
+//!   produced it and an `_at_ms` instant — the worst event-loop wake and
+//!   deadline lateness since reset. `wake_late_ms`/`deadline_late_ms` beside
+//!   them are LAST-WRITER readings that the next wake (or the next arm) erases
+//!   within a frame, so only these can report a late timer after the fact.
+//! - `max_present_latency_at_ms` / `max_input_present_at_ms` and
+//!   `max_present_latency_gap_ms` — WHEN the worst sample happened, on the same
+//!   process clock as `first_present_ms` and anchored by `metrics_now_ms`, plus
+//!   the present→present gap of the frame that set the present max: a gap the
+//!   size of the reading means nothing presented for that long (an open
+//!   interval), a far smaller one means frames kept coming while that output
+//!   waited.
+//! - `max_turn_ms` / `max_turn_owner` / `max_turn_at_ms`, with `last_turn_ms`,
+//!   `turns` and `long_turns` — the MAIN-LOOP TURN census
+//!   (`crate::watchdog`): how long the main thread spent in one winit root, and
+//!   which root. Everything else here prices the redraw or a wake's lateness, so
+//!   a 100–600 ms park in a NON-redraw handler — the `Wake::Output` arm's status
+//!   observation, title drift and search refresh all run before the redraw
+//!   fan-out — used to leave no attributable trace at all between a slow frame
+//!   and the 5 s release stall watchdog, while still being charged to
+//!   `present_latency` and `input_present`. Read `max_turn_ms` AGAINST
+//!   `max_redraw_total_ms`: both large is a slow frame, a large `max_turn_ms`
+//!   with a small `max_redraw_total_ms` is a park outside the redraw, named by
+//!   its owner.
 //! - `backend_gpu` — `true` when the live renderer is the GPU (Metal) path.
 //!
 //! A driver detects lag without OS profilers: `metrics reset`, drive the workload,
@@ -73,6 +111,14 @@ static LAST_FRAME_RENDER_NS: AtomicU64 = AtomicU64::new(0);
 // Swapchain-acquire wait: the drawable-park slice. See `note_acquire_wait`.
 static LAST_ACQUIRE_WAIT_NS: AtomicU64 = AtomicU64::new(0);
 static MAX_ACQUIRE_WAIT_NS: AtomicU64 = AtomicU64::new(0);
+// Drawable-worker QUEUE: request admitted -> worker scheduled to start it.
+// See `note_acquire_queue`.
+static LAST_ACQUIRE_QUEUE_NS: AtomicU64 = AtomicU64::new(0);
+static MAX_ACQUIRE_QUEUE_NS: AtomicU64 = AtomicU64::new(0);
+// Armed-Metal GPU park: the UI thread blocked in `waitUntilCompleted` — the
+// Submit-A pipelining wait plus the pending-ring drain. See `note_gpu_park`.
+static LAST_GPU_PARK_NS: AtomicU64 = AtomicU64::new(0);
+static MAX_GPU_PARK_NS: AtomicU64 = AtomicU64::new(0);
 static OFFSCREEN_RASTERS: AtomicU64 = AtomicU64::new(0);
 static LAST_OFFSCREEN_RASTER_NS: AtomicU64 = AtomicU64::new(0);
 static MAX_OFFSCREEN_RASTER_NS: AtomicU64 = AtomicU64::new(0);
@@ -156,12 +202,32 @@ static SHED_TRANSITIONS: AtomicU64 = AtomicU64::new(0);
 // password prompts, an ignoring app) must not poison the metric when unrelated
 // output arrives minutes later — a slice older than `INPUT_SLICE_CAP_NS` is
 // DISCARDED at consume time, and `reset` drops any pending stamp. (2) The slice
-// closes on the next content present, which under CONCURRENT streaming output
-// (`tail -f` while typing) may be a log-line frame rather than the keystroke's
-// echo — the metric then reads LOW, never high. It is a starvation detector
-// (the smoke drives keys with no background stream), not an echo-attribution
-// profiler.
+// closes on the next content present OF THE WINDOW THE KEY WAS TYPED INTO.
+//
+// PER-WINDOW ATTRIBUTION. A keystroke routed to a window (every key that reaches
+// `App::input_to_session`, hardware or controller) arms that window's
+// [`PendingInputStamp`], and only that window's content present closes it. This
+// used to be one process-wide stamp closed by ANY window's content present: with
+// the owner typing into window 0 while a streaming session presented in window 1,
+// window 1's log-line frame closed the key's slice at a few ms and window 0's real
+// echo, presented ~90 ms later, found no stamp and recorded nothing — `input_p99`
+// under-reported precisely during the lag episode. The distributions and scalars
+// below stay process-global: they are a max-fold over every window's attributed
+// slices.
+//
+// `INPUT_STAMP_NS` survives only for input that names a SESSION, not a window (a
+// control `send`/`feed` to a background session, a controller host write): which
+// window presents that session is not known at the stamp, so any window's content
+// present closes it and, under concurrent output elsewhere, it can still read LOW,
+// never high. Within one window, concurrent streaming output in the SAME window
+// can still close the slice on a log-line frame rather than the echo (the same
+// low-never-high bound); the cross-window case is the one this split removes.
 static INPUT_STAMP_NS: AtomicU64 = AtomicU64::new(0);
+/// `now_ns` at the last [`reset`]. A window's [`PendingInputStamp`] lives in its
+/// `WindowState`, not here, so `reset` cannot clear it; a stamp ARMED before this
+/// instant is discarded at consume time instead, so a pre-reset key never books
+/// its wait into the fresh measurement window.
+static INPUT_RESET_AT_NS: AtomicU64 = AtomicU64::new(0);
 static LAST_INPUT_PRESENT_NS: AtomicU64 = AtomicU64::new(0);
 static MAX_INPUT_PRESENT_NS: AtomicU64 = AtomicU64::new(0);
 
@@ -251,6 +317,52 @@ static LAST_DEADLINE_OWNER: AtomicU64 = AtomicU64::new(0);
 static LAST_DEADLINE_DUE_NS: AtomicU64 = AtomicU64::new(0);
 static LAST_DEADLINE_LATE_NS: AtomicU64 = AtomicU64::new(0);
 static PAST_DEADLINE_ARMS: AtomicU64 = AtomicU64::new(0);
+
+// LATENESS THAT SURVIVES THE NEXT WAKE, AND A MAX THAT SAYS WHEN (2026-09-15
+// attribution audit). The two lateness facts above are LAST-WRITER ONLY: a
+// `Timer` wake stores `now - due` into `LAST_WAKE_LATE_NS` and the very next
+// reader wake — a `WaitCancelled`, which arrives at PTY-output rate — stores 0
+// over it; `LAST_DEADLINE_LATE_NS` is a plain store. So a 400 ms late timer,
+// the exact shape a main thread starved by a compile produces, is erased
+// milliseconds after it happens and is long gone by the time anyone runs
+// `aterm ctl metrics`.
+//
+// THE READING THAT COULD NOT BE ATTRIBUTED. A live line carried
+// `max_present_latency_ms=560.54` beside `wake_late_ms=0.00
+// deadline_late_ms=0.00`, with every slice INSIDE the redraw bounded
+// (`max_redraw_total_ms=13.84`, `max_pre_present_ms=7.32`,
+// `max_acquire_wait_ms=15.32`). Nothing published could say whether those
+// 560 ms were a late wake, a late deadline, or simply an OPEN INTERVAL in
+// which nothing needed to present — the reading `present_latency` actually is
+// (see the module header) — and `max_present_latency_ms` carried no time of
+// occurrence, so it could not even be separated from a spike in a different
+// hour of the same process lifetime.
+//
+// So each lateness now keeps a MAX, the OWNER that produced it, and WHEN it
+// happened (the `now_ns` process clock, published beside `metrics_now_ms` so a
+// reader can say "that was 47 minutes ago"), and the worst present latency
+// keeps its instant AND the present→present GAP of the frame that set it. That
+// gap is the discriminator the open interval otherwise hides: a gap the size of
+// the latency means nothing presented for that long, a gap far smaller means
+// frames kept coming while this one's output waited.
+//
+// NO HISTOGRAM. These are per-wake facts on the hottest loop in the process,
+// and the question they exist to answer — how bad, whose, and when — is one a
+// max answers and a percentile structurally cannot: one 400 ms timer among a
+// million on-time wakes cannot move a p99.
+static MAX_WAKE_LATE_NS: AtomicU64 = AtomicU64::new(0);
+static MAX_WAKE_LATE_OWNER: AtomicU64 = AtomicU64::new(0);
+static MAX_WAKE_LATE_AT_NS: AtomicU64 = AtomicU64::new(0);
+static MAX_DEADLINE_LATE_NS: AtomicU64 = AtomicU64::new(0);
+static MAX_DEADLINE_LATE_OWNER: AtomicU64 = AtomicU64::new(0);
+static MAX_DEADLINE_LATE_AT_NS: AtomicU64 = AtomicU64::new(0);
+static MAX_PRESENT_LATENCY_AT_NS: AtomicU64 = AtomicU64::new(0);
+static MAX_PRESENT_LATENCY_GAP_NS: AtomicU64 = AtomicU64::new(0);
+static MAX_INPUT_PRESENT_AT_NS: AtomicU64 = AtomicU64::new(0);
+/// When the last slow-present breadcrumb was written (`now_ns`), so a stall
+/// episode costs ONE line per [`SLOW_PRESENT_LOG_MIN_GAP_NS`] instead of one
+/// per frame. 0 = none since process start or the last [`reset`].
+static LAST_SLOW_PRESENT_LOG_NS: AtomicU64 = AtomicU64::new(0);
 
 // PER-OWNER ARM ATTRIBUTION (responsiveness audit, item 6). WHY: the two facts
 // above are structurally unable to name a spin's producer. `past_deadline_arms`
@@ -434,7 +546,12 @@ const RESIZE_SLICE_CAP_NS: u64 = 2_000_000_000;
 /// input→present stamps). Saturates far beyond any session length.
 static PROCESS_START: OnceLock<Instant> = OnceLock::new();
 
-fn now_ns() -> u64 {
+/// Crate-visible because the main-loop turn census
+/// (`crate::watchdog::turn_census`) prices its spans and stamps its
+/// `max_turn_at_ms` on THIS clock: an `_at_ms` on a different clock could not be
+/// read against `metrics_now_ms`, which is the one subtraction that turns a
+/// stamp into "how long ago".
+pub(crate) fn now_ns() -> u64 {
     let start = *PROCESS_START.get_or_init(Instant::now);
     u64::try_from(start.elapsed().as_nanos()).unwrap_or(u64::MAX)
 }
@@ -1407,8 +1524,9 @@ static STARTUP_PRESENT: OnceLock<StartupPresentSample> = OnceLock::new();
 // (FASTER_THAN_GHOSTTY_PLAN.md §4/LAT-3). Three log-linear histograms record
 // every sample the scalars already see — same funnel, no new stamps, so the
 // honesty bounds documented on the scalars apply to the distributions too.
-// KNOWN LIMIT (PERF_GYM §2.4, unchanged by this slice): the single
-// `INPUT_STAMP_NS` CAS keeps only the OLDEST edge of a coalesced input burst,
+// KNOWN LIMIT (PERF_GYM §2.4, unchanged by this slice): each window's
+// `PendingInputStamp` (like the session-routed `INPUT_STAMP_NS` CAS) keeps only
+// the OLDEST edge of a coalesced input burst,
 // so burst percentiles are conservative-high per group, and unmeasured
 // keystrokes inside a group are simply absent (coordinated omission is NOT
 // corrected here — the full edge-ring is a later slice).
@@ -1509,8 +1627,12 @@ static H_PRESENT_LATENCY: Histogram = Histogram::new();
 static H_PRESENT_LATENCY_TAINTED: Histogram = Histogram::new();
 static H_FRAME_RENDER: Histogram = Histogram::new();
 static H_KEY_WRITE: Histogram = Histogram::new();
+/// The OS-EVENT-QUEUE leg [`H_KEY_WRITE`] is BACKDATED by, kept apart so the
+/// total can be split back into its two causes. See [`key_queue_distribution`].
+static H_KEY_QUEUE: Histogram = Histogram::new();
 static H_PRE_PRESENT: Histogram = Histogram::new();
 static H_ACQUIRE_WAIT: Histogram = Histogram::new();
+static H_ACQUIRE_QUEUE: Histogram = Histogram::new();
 /// UI-thread TERMINAL-MUTEX wait, per acquiring site — see [`TermWaitSite`].
 static H_TERM_WAIT: [Histogram; TermWaitSite::COUNT] =
     [const { Histogram::new() }; TermWaitSite::COUNT];
@@ -1535,6 +1657,49 @@ pub fn distributions() -> (&'static Histogram, &'static Histogram, &'static Hist
 #[must_use]
 pub fn key_write_distribution() -> &'static Histogram {
     &H_KEY_WRITE
+}
+
+/// The NSEvent-QUEUE RESIDENCE that [`key_write_distribution`] is BACKDATED by:
+/// how long each hardware key sat in the OS event queue before the loop
+/// dispatched it.
+///
+/// WHY IT IS PUBLISHED APART. [`note_key_arrival_queued`] stamps the arrival at
+/// `now - queue_ns` deliberately, so `key_write` and `input_present` both price
+/// a parked event loop — the slice the touch-to-glass audit proved every
+/// instrument was blind to. Keeping ONLY that backdated stamp, though, left the
+/// two causes indistinguishable afterwards: a `max_key_write_ms=18.13` beside a
+/// `key_write_p99_ms=6.29` is a main thread parked somewhere ELSE (a present, a
+/// `term_lock` hold, a compose) if the key waited 17 ms to be dequeued, and
+/// aterm's own press path if it waited none. Opposite fixes, one number. With
+/// this leg published, `key_write - key_queue` at matching percentiles is the
+/// pure UI-DISPATCH slice, and a large `key_queue` against a small `acquire`
+/// says the loop was parked somewhere the slow-present breadcrumb can name.
+///
+/// READ IT WITH ITS COUNT. Every PRESSED key reaching the winit arm books a
+/// sample here, while only a key that WRITES books one in `key_write`, so
+/// `n_key_queue >= n_key_write` by construction. A sample is the backdate that
+/// was actually APPLIED, which is why an unmeasurable age (no `NSApp`
+/// `currentEvent`, a synthesized event, any non-macOS build — see
+/// `platform::current_event_queue_age_ns`) books `0` rather than nothing: zero
+/// is the honest statement that nothing was added to that key's `key_write`.
+#[must_use]
+pub fn key_queue_distribution() -> &'static Histogram {
+    &H_KEY_QUEUE
+}
+
+/// The key-QUEUE `(last, max)` pair in nanoseconds, on the same rule as
+/// [`acquire_queue_last_max_ns`]: one key that waited 17 ms behind a parked loop
+/// cannot move a p99 taken over thousands of promptly dispatched keys, and the
+/// max is the only field that reports it — which is exactly the reading this
+/// split exists to explain. Read straight off the statics by the `percentiles`
+/// verb; deliberately NOT carried on [`Snapshot`], as the summary verb does not
+/// publish them.
+#[must_use]
+pub fn key_queue_last_max_ns() -> (u64, u64) {
+    (
+        LAST_KEY_QUEUE_NS.load(Ordering::Relaxed),
+        MAX_KEY_QUEUE_NS.load(Ordering::Relaxed),
+    )
 }
 
 /// Window-bounds-change → first submitted frame at the new size. The live-drag
@@ -1729,6 +1894,75 @@ pub fn note_acquire_wait(ns: u64) {
     MAX_ACQUIRE_WAIT_NS.fetch_max(ns, Ordering::Relaxed);
 }
 
+/// Drawable-acquire QUEUE distribution — the span from a drawable request
+/// being admitted to the `aterm-drawable-acquire` worker being SCHEDULED to
+/// start it, which is a different cause from the wait above.
+///
+/// [`acquire_wait_distribution`] starts its clock inside the worker, around
+/// `nextDrawable` alone, so it is structurally blind to this leg: it reports
+/// the ~0.02 ms the acquisition cost once the worker was running, however long
+/// the worker took to get there. That gap is not idle time — a frame that
+/// found no prefetched drawable has already returned `AcquirePending` and its
+/// main thread is parked until the worker posts `GpuSurfaceReady` — so it is
+/// keystroke→glass latency that, until this slice existed, was stamped nowhere
+/// and could only surface as unexplained `input_present`.
+///
+/// It is also the direct readout on the worker's QoS: the thread is declared
+/// `USER_INTERACTIVE` precisely so this distribution stays flat while the
+/// machine is saturated, and a regression that drops it back to the compilers'
+/// band shows up here first.
+#[must_use]
+pub fn acquire_queue_distribution() -> &'static Histogram {
+    &H_ACQUIRE_QUEUE
+}
+
+/// The acquire-QUEUE `(last, max)` pair in nanoseconds — the scalars the
+/// distribution cannot express, on the same rule as
+/// [`acquire_wait_last_max_ns`]: one descheduled worker among thousands of
+/// promptly served requests cannot move a p99, and the max is the only field
+/// that reports the frame that actually stalled.
+///
+/// Read straight off the statics by the `percentiles` verb, which builds no
+/// [`Snapshot`]. Deliberately NOT carried on `Snapshot` as the acquire-wait
+/// pair is: the summary verb does not publish these, so a snapshot field would
+/// be written every sample and read by nobody.
+#[must_use]
+pub fn acquire_queue_last_max_ns() -> (u64, u64) {
+    (
+        LAST_ACQUIRE_QUEUE_NS.load(Ordering::Relaxed),
+        MAX_ACQUIRE_QUEUE_NS.load(Ordering::Relaxed),
+    )
+}
+
+/// Record one completed acquisition's queue span. Booked from the same
+/// completion as [`note_acquire_wait`], so the two legs of one acquisition are
+/// always readable together and `n_acquire_queue` tracks `n_acquire`.
+pub fn note_acquire_queue(ns: u64) {
+    H_ACQUIRE_QUEUE.record(ns);
+    LAST_ACQUIRE_QUEUE_NS.store(ns, Ordering::Relaxed);
+    MAX_ACQUIRE_QUEUE_NS.fetch_max(ns, Ordering::Relaxed);
+}
+
+/// Record one armed present's GPU PARK: the wall time its UI thread spent
+/// blocked in `waitUntilCompleted` waiting for the GPU to finish EARLIER work —
+/// the Submit-A pipelining wait before the frame's shared buffers may be
+/// rewritten, plus the pending-ring drain past depth 3. Neither wait has a
+/// timeout.
+///
+/// This exists because the frame-slot half used to be charged to
+/// `frame_render`: it runs inside the renderer's present work timer, so a GPU
+/// or WindowServer contention stall arrived at `record_present` as CPU render
+/// cost, counted against `slow_frames`, and fed the load-shed latch — while the
+/// ring drain, which runs before that timer starts, was invisible except as
+/// `redraw_total` slack. Same rule as the acquire park: a wait on the GPU is
+/// not compose work, so it is excluded from the causal cost and gets its own
+/// published last/max. The max is the point — one long park among thousands of
+/// zero ones is the stall, and only a max can see it.
+pub fn note_gpu_park(ns: u64) {
+    LAST_GPU_PARK_NS.store(ns, Ordering::Relaxed);
+    MAX_GPU_PARK_NS.fetch_max(ns, Ordering::Relaxed);
+}
+
 /// A frame whose causal compose+raster/encode-submit CPU work exceeds a ~30 fps
 /// (33.3 ms)
 /// budget — the floor below which interaction visibly stutters. `slow_frames` counts
@@ -1743,10 +1977,15 @@ pub const SLOW_FRAME_THRESHOLD_NS: u64 = 33_333_333; // 1/30 s
 /// or time spent encoding GPU commands and calling `queue.submit`. It is not
 /// completed GPU execution and excludes surface acquisition and final-present
 /// pacing.
+///
+/// `window_input` is the PRESENTING window's pending input stamp (`None` when the
+/// window state is gone). Only it — plus the session-routed global stamp — can be
+/// closed by this present; another window's pending key is untouched.
 pub(crate) fn record_present(
     latency_ns: u64,
     render_ns: u64,
     startup_timing: StartupPresentTiming,
+    window_input: Option<&mut PendingInputStamp>,
 ) {
     // First startup-metrics publication point inside the successful-present
     // finalizer (see `mark_process_start`). Capture one end Instant and derive
@@ -1806,11 +2045,29 @@ pub(crate) fn record_present(
             MAX_TAINTED_PRESENT_LATENCY_NS.fetch_max(latency_ns, Ordering::Relaxed);
             H_PRESENT_LATENCY_TAINTED.record(latency_ns);
         } else {
+            // WHEN, AND AGAINST WHAT. The max alone cannot be told apart from a
+            // spike in another hour of the same process, and the reading is an
+            // OPEN interval, so the present→present gap of the frame that set
+            // it is captured with it: gap ≈ latency means nothing presented for
+            // that long; gap ≪ latency means frames kept coming and this
+            // frame's output waited. Single-writer (the UI thread), so
+            // "the `fetch_max` that won also writes its stamps" needs no CAS.
+            let at = now_ns();
+            let previous_present = LAST_PRESENT_STAMP_NS.load(Ordering::Relaxed);
+            let since_previous_present = if previous_present == 0 {
+                0
+            } else {
+                at.saturating_sub(previous_present)
+            };
             LAST_PRESENT_LATENCY_NS.store(latency_ns, Ordering::Relaxed);
-            MAX_PRESENT_LATENCY_NS.fetch_max(latency_ns, Ordering::Relaxed);
+            if MAX_PRESENT_LATENCY_NS.fetch_max(latency_ns, Ordering::Relaxed) < latency_ns {
+                MAX_PRESENT_LATENCY_AT_NS.store(at, Ordering::Relaxed);
+                MAX_PRESENT_LATENCY_GAP_NS.store(since_previous_present, Ordering::Relaxed);
+            }
             H_PRESENT_LATENCY.record(latency_ns);
+            note_slow_present(latency_ns, since_previous_present, at);
         }
-        // A CONTENT present: close the pending
+        // A CONTENT present: close THIS window's pending
         // input→application-present-return slice, if any. A latency of 0
         // (blink/selection repaint) leaves the stamp pending — no attributed
         // content present has completed yet.
@@ -1820,16 +2077,21 @@ pub(crate) fn record_present(
         // and input→present already carries its own honesty bound: a keystroke
         // typed into an occluded window is a real keystroke that really waited.
         // Only the OUTPUT slice above measures an interval nobody asked for.
+        let now = now_ns();
+        let reset_at = INPUT_RESET_AT_NS.load(Ordering::Relaxed);
+        if let Some(d) = window_input.and_then(|pending| pending.take_slice(now, reset_at)) {
+            book_input_present(d);
+        }
+        // The session-routed stamp (no window known at arm time): any content
+        // present closes it, as before.
         let stamp = INPUT_STAMP_NS.swap(0, Ordering::Relaxed);
         if stamp != 0 {
-            let d = now_ns().saturating_sub(stamp);
+            let d = now.saturating_sub(stamp);
             // A slice past the cap means the keystroke never echoed (see the
             // HONESTY BOUNDS above) — recording it would peg the max with a
             // latency that never happened.
             if d <= INPUT_SLICE_CAP_NS {
-                LAST_INPUT_PRESENT_NS.store(d, Ordering::Relaxed);
-                MAX_INPUT_PRESENT_NS.fetch_max(d, Ordering::Relaxed);
-                H_INPUT_PRESENT.record(d);
+                book_input_present(d);
             }
         }
     }
@@ -1847,6 +2109,64 @@ pub(crate) fn record_present(
     if prev_stamp != 0 {
         MAX_FRAME_GAP_NS.fetch_max(now.saturating_sub(prev_stamp), Ordering::Relaxed);
     }
+}
+
+/// An `output→application-present-return` reading big enough to be what a user
+/// calls lag: THREE slow-frame budgets (100 ms). Well above the ~33 ms budget a
+/// single heavy frame can legitimately spend, so an ordinary slow frame never
+/// writes a line.
+const SLOW_PRESENT_LOG_THRESHOLD_NS: u64 = SLOW_FRAME_THRESHOLD_NS * 3;
+
+/// At most one breadcrumb per this interval. A stall episode is a RUN of slow
+/// presents: a line per frame would bury `aterm.log` and spend main-thread time
+/// inside the very stall it describes.
+const SLOW_PRESENT_LOG_MIN_GAP_NS: u64 = 10_000_000_000;
+
+/// Whether this sample earns a line. Pure, so the threshold and the rate limit
+/// are testable without the process globals or a real stall — the same rule
+/// [`wake_owner`] is kept pure for.
+const fn should_log_slow_present(latency_ns: u64, last_log_ns: u64, at_ns: u64) -> bool {
+    latency_ns > SLOW_PRESENT_LOG_THRESHOLD_NS
+        && (last_log_ns == 0 || at_ns.saturating_sub(last_log_ns) >= SLOW_PRESENT_LOG_MIN_GAP_NS)
+}
+
+/// ONE UNGATED BREADCRUMB PER SLOW-PRESENT EPISODE, with the scheduler facts
+/// that name it.
+///
+/// WHY IT EXISTS. The only per-spike line aterm had ran behind
+/// `$ATERM_TRACE_LATENCY`, so a shipped binary wrote nothing; the main-thread
+/// stall watchdog is the other fallback and its release threshold is 5 SECONDS,
+/// far above a 560 ms spike. Six hours of `aterm.log` around the reading that
+/// opened this block therefore contained not one frame, present or latency
+/// line — the counters knew the worst number and the log could not say when it
+/// happened or what the loop was doing. The maxima above make the summary
+/// answer "how bad and when"; this line is what lets `aterm.log` answer "what
+/// happened at 08:31" after the fact, without a driver having been attached.
+///
+/// Every field is a `last_` reading at the moment the slow frame closed, and is
+/// labelled that way: this is a breadcrumb, not an attribution proof.
+fn note_slow_present(latency_ns: u64, since_previous_present_ns: u64, at_ns: u64) {
+    if !should_log_slow_present(
+        latency_ns,
+        LAST_SLOW_PRESENT_LOG_NS.load(Ordering::Relaxed),
+        at_ns,
+    ) {
+        return;
+    }
+    LAST_SLOW_PRESENT_LOG_NS.store(at_ns, Ordering::Relaxed);
+    let ms = |ns: u64| ns as f64 / 1e6;
+    aterm_log::info!(
+        "slow output->present: {:.1} ms at t+{:.1} s, {:.1} ms since the previous present.          IT IS AN OPEN INTERVAL: a gap that size means nothing presented for that long, a          much smaller one means frames kept coming while this output waited. At the close:          last wake={} late {:.1} ms, last deadline owner={} late {:.1} ms, last acquire          {:.1} ms. (one line per {} s; see max_wake_late_ms/max_present_latency_at_ms on          `aterm ctl metrics`)",
+        ms(latency_ns),
+        at_ns as f64 / 1e9,
+        ms(since_previous_present_ns),
+        EventWakeKind::from_raw(LAST_WAKE_KIND.load(Ordering::Relaxed)).as_str(),
+        ms(LAST_WAKE_LATE_NS.load(Ordering::Relaxed)),
+        DeadlineOwner::from_raw(LAST_DEADLINE_OWNER.load(Ordering::Relaxed)).as_str(),
+        ms(LAST_DEADLINE_LATE_NS.load(Ordering::Relaxed)),
+        ms(LAST_ACQUIRE_WAIT_NS.load(Ordering::Relaxed)),
+        SLOW_PRESENT_LOG_MIN_GAP_NS / 1_000_000_000,
+    );
 }
 
 /// An OFFSCREEN rasterization (`image` / `window` / `snapshot` introspection) —
@@ -1872,9 +2192,210 @@ pub fn record_offscreen_raster(render_ns: u64) {
     MAX_OFFSCREEN_RASTER_NS.fetch_max(render_ns, Ordering::Relaxed);
 }
 
-/// Stamp the arrival of user input bound for the PTY (a keystroke or a control
-/// `send`/`key`). Keeps the OLDEST unpresented arrival — the worst case is the
-/// honest one — so a burst does not shrink the measured slice.
+// PRESENT → GLASS ledger, fed on a framework thread by the sink installed in
+// `install_present_glass_sink` (lock-free: bucket increments and `fetch_max`).
+static H_PRESENT_GLASS: Histogram = Histogram::new();
+static LAST_PRESENT_GLASS_NS: AtomicU64 = AtomicU64::new(0);
+static MAX_PRESENT_GLASS_NS: AtomicU64 = AtomicU64::new(0);
+static PRESENT_GLASS_SKIPPED: AtomicU64 = AtomicU64::new(0);
+
+/// Install this ledger as `aterm_gpu`'s present→glass sink, once per process at
+/// GUI entry. Until it runs no presented handler is registered at all.
+pub fn install_present_glass_sink() {
+    let _ = aterm_gpu::present_glass::install_sink(note_present_glass);
+}
+
+/// Book one presented-handler sample (runs on a Metal/CoreAnimation thread).
+fn note_present_glass(sample: aterm_gpu::present_glass::GlassSample) {
+    match sample {
+        aterm_gpu::present_glass::GlassSample::OnGlass { ns } => {
+            H_PRESENT_GLASS.record(ns);
+            LAST_PRESENT_GLASS_NS.store(ns, Ordering::Relaxed);
+            MAX_PRESENT_GLASS_NS.fetch_max(ns, Ordering::Relaxed);
+        }
+        aterm_gpu::present_glass::GlassSample::Skipped => {
+            PRESENT_GLASS_SKIPPED.fetch_add(1, Ordering::Relaxed);
+        }
+    }
+}
+
+/// The present→glass fields of `metrics percentiles`, text form.
+#[must_use]
+pub fn present_glass_fields_text() -> String {
+    let h = &H_PRESENT_GLASS;
+    let ms = |ns: u64| ns as f64 / 1e6;
+    let p = |q: f64| ms(h.percentile(q).unwrap_or(0));
+    format!(
+        " n_present_glass={} present_glass_p50_ms={:.2} present_glass_p95_ms={:.2} \
+         present_glass_p99_ms={:.2} last_present_glass_ms={:.2} \
+         max_present_glass_ms={:.2} present_glass_skipped={}",
+        h.count(),
+        p(0.50),
+        p(0.95),
+        p(0.99),
+        ms(LAST_PRESENT_GLASS_NS.load(Ordering::Relaxed)),
+        ms(MAX_PRESENT_GLASS_NS.load(Ordering::Relaxed)),
+        PRESENT_GLASS_SKIPPED.load(Ordering::Relaxed),
+    )
+}
+
+/// Field-for-field JSON twin of [`present_glass_fields_text`].
+#[must_use]
+pub fn present_glass_fields_json() -> String {
+    let h = &H_PRESENT_GLASS;
+    let ms = |ns: u64| ns as f64 / 1e6;
+    let p = |q: f64| ms(h.percentile(q).unwrap_or(0));
+    format!(
+        ",\"n_present_glass\":{},\"present_glass_p50_ms\":{:.2},\
+         \"present_glass_p95_ms\":{:.2},\"present_glass_p99_ms\":{:.2},\
+         \"last_present_glass_ms\":{:.2},\"max_present_glass_ms\":{:.2},\
+         \"present_glass_skipped\":{}",
+        h.count(),
+        p(0.50),
+        p(0.95),
+        p(0.99),
+        ms(LAST_PRESENT_GLASS_NS.load(Ordering::Relaxed)),
+        ms(MAX_PRESENT_GLASS_NS.load(Ordering::Relaxed)),
+        PRESENT_GLASS_SKIPPED.load(Ordering::Relaxed),
+    )
+}
+
+/// The WHEN-AND-WHOSE fields of the `metrics` summary, text form.
+///
+/// Spliced as one fragment (the [`present_glass_fields_text`] discipline) so
+/// the text and JSON summaries cannot drift apart and neither giant `format!`
+/// grows ten more positional holes.
+///
+/// Every `*_at_ms` is on the `now_ns` PROCESS clock — monotonic nanoseconds
+/// since GUI entry, the clock `first_present_ms` already uses — and
+/// `metrics_now_ms` is that clock read at this instant, so a reader converts a
+/// stamp to "N ms ago" with one subtraction and never has to guess which hour
+/// of a long-lived process a max belongs to.
+#[must_use]
+pub fn lateness_fields_text() -> String {
+    let ms = |ns: u64| ns as f64 / 1e6;
+    format!(
+        " max_wake_late_ms={:.2} max_wake_late_owner={} max_wake_late_at_ms={:.2} \
+         max_deadline_late_ms={:.2} max_deadline_late_owner={} \
+         max_deadline_late_at_ms={:.2} max_present_latency_at_ms={:.2} \
+         max_present_latency_gap_ms={:.2} max_input_present_at_ms={:.2} \
+         metrics_now_ms={:.2}",
+        ms(MAX_WAKE_LATE_NS.load(Ordering::Relaxed)),
+        DeadlineOwner::from_raw(MAX_WAKE_LATE_OWNER.load(Ordering::Relaxed)).as_str(),
+        ms(MAX_WAKE_LATE_AT_NS.load(Ordering::Relaxed)),
+        ms(MAX_DEADLINE_LATE_NS.load(Ordering::Relaxed)),
+        DeadlineOwner::from_raw(MAX_DEADLINE_LATE_OWNER.load(Ordering::Relaxed)).as_str(),
+        ms(MAX_DEADLINE_LATE_AT_NS.load(Ordering::Relaxed)),
+        ms(MAX_PRESENT_LATENCY_AT_NS.load(Ordering::Relaxed)),
+        ms(MAX_PRESENT_LATENCY_GAP_NS.load(Ordering::Relaxed)),
+        ms(MAX_INPUT_PRESENT_AT_NS.load(Ordering::Relaxed)),
+        ms(now_ns()),
+    )
+}
+
+/// Field-for-field JSON twin of [`lateness_fields_text`].
+#[must_use]
+pub fn lateness_fields_json() -> String {
+    let ms = |ns: u64| ns as f64 / 1e6;
+    format!(
+        ",\"max_wake_late_ms\":{:.2},\"max_wake_late_owner\":\"{}\",\
+         \"max_wake_late_at_ms\":{:.2},\"max_deadline_late_ms\":{:.2},\
+         \"max_deadline_late_owner\":\"{}\",\"max_deadline_late_at_ms\":{:.2},\
+         \"max_present_latency_at_ms\":{:.2},\"max_present_latency_gap_ms\":{:.2},\
+         \"max_input_present_at_ms\":{:.2},\"metrics_now_ms\":{:.2}",
+        ms(MAX_WAKE_LATE_NS.load(Ordering::Relaxed)),
+        DeadlineOwner::from_raw(MAX_WAKE_LATE_OWNER.load(Ordering::Relaxed)).as_str(),
+        ms(MAX_WAKE_LATE_AT_NS.load(Ordering::Relaxed)),
+        ms(MAX_DEADLINE_LATE_NS.load(Ordering::Relaxed)),
+        DeadlineOwner::from_raw(MAX_DEADLINE_LATE_OWNER.load(Ordering::Relaxed)).as_str(),
+        ms(MAX_DEADLINE_LATE_AT_NS.load(Ordering::Relaxed)),
+        ms(MAX_PRESENT_LATENCY_AT_NS.load(Ordering::Relaxed)),
+        ms(MAX_PRESENT_LATENCY_GAP_NS.load(Ordering::Relaxed)),
+        ms(MAX_INPUT_PRESENT_AT_NS.load(Ordering::Relaxed)),
+        ms(now_ns()),
+    )
+}
+
+/// One attributed input→present slice into the process-global max-fold.
+fn book_input_present(d: u64) {
+    LAST_INPUT_PRESENT_NS.store(d, Ordering::Relaxed);
+    // Same rule as the present max: a worst case with no time of occurrence
+    // cannot be correlated with anything else that happened in the process.
+    if MAX_INPUT_PRESENT_NS.fetch_max(d, Ordering::Relaxed) < d {
+        MAX_INPUT_PRESENT_AT_NS.store(now_ns(), Ordering::Relaxed);
+    }
+    H_INPUT_PRESENT.record(d);
+}
+
+/// One window's pending input→present stamp: the arrival of the OLDEST
+/// unpresented keystroke routed to that window. Owned by the window's state (UI
+/// thread only, so plain integers), armed by [`note_window_input`] and closed by
+/// that window's own content present in [`record_present`] — never by another
+/// window's. See the PER-WINDOW ATTRIBUTION note on `INPUT_STAMP_NS`.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub(crate) struct PendingInputStamp {
+    /// The key's arrival (`now_ns` clock, possibly backdated by NSEvent queue
+    /// age); 0 = nothing pending.
+    arrival_ns: u64,
+    /// When the stamp was armed — compared against the last [`reset`], because a
+    /// backdated arrival can precede a reset the key itself followed.
+    armed_ns: u64,
+}
+
+impl PendingInputStamp {
+    /// Keep-oldest arm: a burst does not shrink the measured slice.
+    fn arm(&mut self, arrival_ns: u64, armed_ns: u64) {
+        if self.arrival_ns == 0 {
+            self.arrival_ns = arrival_ns.max(1);
+            self.armed_ns = armed_ns;
+        }
+    }
+
+    /// Whether a keystroke in this window is still waiting on a content present.
+    #[cfg(test)]
+    const fn is_pending(self) -> bool {
+        self.arrival_ns != 0
+    }
+
+    /// Consume the stamp at a content present of THIS window. `None` when nothing
+    /// was pending, when it was armed before the last reset (`reset_at_ns`), or
+    /// when it aged past `INPUT_SLICE_CAP_NS` (a keystroke that never echoed).
+    fn take_slice(&mut self, now_ns: u64, reset_at_ns: u64) -> Option<u64> {
+        let taken = std::mem::take(self);
+        if taken.arrival_ns == 0 || taken.armed_ns < reset_at_ns {
+            return None;
+        }
+        let d = now_ns.saturating_sub(taken.arrival_ns);
+        (d <= INPUT_SLICE_CAP_NS).then_some(d)
+    }
+}
+
+/// The arrival a PTY-bound input stamps: the pending TRUE key arrival when one is
+/// fresh (see [`note_input`]), else `now`.
+fn input_arrival_ns(now: u64) -> u64 {
+    let key = LAT_KEY_NS.load(Ordering::Relaxed);
+    if key != 0 && now.saturating_sub(key) < 500_000_000 {
+        key
+    } else {
+        now
+    }
+}
+
+/// Stamp the arrival of a keystroke routed to ONE window (the
+/// `App::input_to_session` seam, hardware keys and controller `key` alike) into
+/// that window's [`PendingInputStamp`], so only that window's content present
+/// closes the slice. Same arrival and keep-oldest rules as [`note_input`].
+pub(crate) fn note_window_input(pending: &mut PendingInputStamp) {
+    let now = now_ns();
+    pending.arm(input_arrival_ns(now), now);
+    note_typing_hot();
+}
+
+/// Stamp the arrival of user input bound for the PTY that names a SESSION but no
+/// window (a control `send`/`feed` to a background session, a controller host
+/// write). Keeps the OLDEST unpresented arrival — the worst case is the honest
+/// one — so a burst does not shrink the measured slice. Any window's content
+/// present closes it; window-routed keys use [`note_window_input`] instead.
 ///
 /// INHERITS the pending TRUE key arrival when one is armed (macOS backdates it
 /// by the NSEvent queue age — see [`note_key_arrival_queued`]), so
@@ -1884,13 +2405,7 @@ pub fn record_offscreen_raster(render_ns: u64) {
 /// PTY (a UI shortcut leaves its stamp unconsumed — `note_pty_write` never runs)
 /// must not lend its stale arrival to a later control-verb `send`.
 pub fn note_input() {
-    let now = now_ns();
-    let key = LAT_KEY_NS.load(Ordering::Relaxed);
-    let stamp = if key != 0 && now.saturating_sub(key) < 500_000_000 {
-        key
-    } else {
-        now
-    };
+    let stamp = input_arrival_ns(now_ns());
     let _ = INPUT_STAMP_NS.compare_exchange(0, stamp, Ordering::Relaxed, Ordering::Relaxed);
     note_typing_hot();
 }
@@ -1980,14 +2495,23 @@ pub(crate) fn interactive_input_deadline_ns() -> u64 {
 // `note_input` now runs BEFORE encode/write, so `input_present` already spans the
 // full key-arrival → content-present path (including encode and the PTY write).
 // This trace keeps an independently useful key→write slice: it identifies UI
-// dispatch/encoding/lock/write stalls inside a high end-to-end sample. Do NOT add
-// it to `input_present`; it is a contained component of that total. Logging is
-// env-gated; the cheap metrics atomics remain always on.
+// dispatch/encoding/lock/write stalls inside a high end-to-end sample — but it
+// starts at the BACKDATED hardware arrival, so the OS event queue's share is
+// inside it too, and a high reading ALONE cannot say which of the two it was.
+// That share is published apart as `key_queue_*` (see `key_queue_distribution`),
+// and `key_write - key_queue` is the UI-dispatch slice this trace is named for.
+// Do NOT add it to `input_present`; it is a contained component of that total.
+// Logging is env-gated; the cheap metrics atomics remain always on.
 static LAT_TRACE_ON: OnceLock<bool> = OnceLock::new();
 static LAT_KEY_NS: AtomicU64 = AtomicU64::new(0);
 // Rolling worst-case key->write (µs) since the last `metrics` read, for the verb.
 static MAX_KEY_WRITE_NS: AtomicU64 = AtomicU64::new(0);
 static LAST_KEY_WRITE_NS: AtomicU64 = AtomicU64::new(0);
+// The OS-EVENT-QUEUE share of that reading: the backdate `note_key_arrival_queued`
+// applied, kept so `key->write` splits back into "waited to be dequeued" and
+// "aterm's own dispatch". See `key_queue_distribution`.
+static LAST_KEY_QUEUE_NS: AtomicU64 = AtomicU64::new(0);
+static MAX_KEY_QUEUE_NS: AtomicU64 = AtomicU64::new(0);
 
 fn lat_trace_on() -> bool {
     *LAT_TRACE_ON.get_or_init(|| std::env::var_os("ATERM_LATENCY_TRACE").is_some())
@@ -2012,6 +2536,13 @@ pub fn now_us() -> u64 {
 /// write, never accumulating across keys.
 pub fn note_key_arrival_queued(queue_ns: u64) {
     LAT_KEY_NS.store(now_ns().saturating_sub(queue_ns).max(1), Ordering::Relaxed);
+    // AND PUBLISH THE BACKDATE ITSELF. The stamp above folds the queue wait into
+    // every downstream total; this is the only record of how much it folded in,
+    // and without it `key_write` cannot be split back into the parked loop and
+    // aterm's own dispatch. See [`key_queue_distribution`].
+    H_KEY_QUEUE.record(queue_ns);
+    LAST_KEY_QUEUE_NS.store(queue_ns, Ordering::Relaxed);
+    MAX_KEY_QUEUE_NS.fetch_max(queue_ns, Ordering::Relaxed);
 }
 
 /// Disarm the key-arrival stamp: called after a key's dispatch ends WITHOUT a
@@ -2091,8 +2622,10 @@ pub fn note_pty_write_at(key: u64) {
     H_KEY_WRITE.record(d);
     if lat_trace_on() {
         crate::logging::stderr_line!(
-            "KEYWRITE key->write={:.2}ms (UI encode + term_locks + blocking WriteFile)",
-            d as f64 / 1_000_000.0
+            "KEYWRITE key->write={:.2}ms (last OS queue {:.2}ms + UI encode + term_locks \
+             + blocking WriteFile)",
+            d as f64 / 1_000_000.0,
+            LAST_KEY_QUEUE_NS.load(Ordering::Relaxed) as f64 / 1_000_000.0
         );
     }
 }
@@ -2395,6 +2928,13 @@ pub fn record_deadline(
     LAST_DEADLINE_OWNER.store(owner as u64, Ordering::Relaxed);
     LAST_DEADLINE_DUE_NS.store(due, Ordering::Relaxed);
     LAST_DEADLINE_LATE_NS.store(late, Ordering::Relaxed);
+    // The same last-writer erasure as the wake lateness: every event-loop turn
+    // arms a deadline, so this store is overwritten within a frame. Keep the
+    // worst, the owner that asked for it, and when it was asked.
+    if late != 0 && MAX_DEADLINE_LATE_NS.fetch_max(late, Ordering::Relaxed) < late {
+        MAX_DEADLINE_LATE_OWNER.store(owner as u64, Ordering::Relaxed);
+        MAX_DEADLINE_LATE_AT_NS.store(clock_now, Ordering::Relaxed);
+    }
     armed
 }
 
@@ -2558,14 +3098,19 @@ pub fn note_event_wake(kind: EventWakeKind) {
         EventWakeKind::Timer => {
             TIMER_WAKES.fetch_add(1, Ordering::Relaxed);
             let due = LAST_DEADLINE_DUE_NS.load(Ordering::Relaxed);
-            LAST_WAKE_LATE_NS.store(
-                if due == 0 {
-                    0
-                } else {
-                    now_ns().saturating_sub(due)
-                },
-                Ordering::Relaxed,
-            );
+            let at = now_ns();
+            let late = if due == 0 { 0 } else { at.saturating_sub(due) };
+            LAST_WAKE_LATE_NS.store(late, Ordering::Relaxed);
+            // …AND THE WORST ONE, WHICH THE NEXT WAKE MAY NOT ERASE. The store
+            // above is exactly how a 400 ms late timer used to vanish: the
+            // `WaitCancelled` behind it — one per PTY output burst — stores 0
+            // over it before anyone can read it. Single writer (the event
+            // loop), so whichever sample wins the fold stamps its own owner
+            // and instant.
+            if late != 0 && MAX_WAKE_LATE_NS.fetch_max(late, Ordering::Relaxed) < late {
+                MAX_WAKE_LATE_OWNER.store(owner as u64, Ordering::Relaxed);
+                MAX_WAKE_LATE_AT_NS.store(at, Ordering::Relaxed);
+            }
         }
         EventWakeKind::WaitCancelled => {
             WAIT_CANCELLED_WAKES.fetch_add(1, Ordering::Relaxed);
@@ -2615,6 +3160,12 @@ pub fn backend_gpu() -> bool {
 pub fn reset() {
     FRAMES_PRESENTED.store(0, Ordering::Relaxed);
     MAX_PRESENT_LATENCY_NS.store(0, Ordering::Relaxed);
+    // A max's instant, the frame gap that qualifies it, and the breadcrumb's
+    // rate limiter are all observations OF THE WINDOW: they clear with it, so a
+    // fresh window's first spike is logged and never carries a stale stamp.
+    MAX_PRESENT_LATENCY_AT_NS.store(0, Ordering::Relaxed);
+    MAX_PRESENT_LATENCY_GAP_NS.store(0, Ordering::Relaxed);
+    LAST_SLOW_PRESENT_LOG_NS.store(0, Ordering::Relaxed);
     MAX_FRAME_RENDER_NS.store(0, Ordering::Relaxed);
     SLOW_FRAMES.store(0, Ordering::Relaxed);
     SYNC_HOLDS_ARMED.store(0, Ordering::Relaxed);
@@ -2622,6 +3173,7 @@ pub fn reset() {
     SYNC_RELEASES_TIMEOUT.store(0, Ordering::Relaxed);
     SHED_TRANSITIONS.store(0, Ordering::Relaxed);
     MAX_INPUT_PRESENT_NS.store(0, Ordering::Relaxed);
+    MAX_INPUT_PRESENT_AT_NS.store(0, Ordering::Relaxed);
     MAX_KEY_WRITE_NS.store(0, Ordering::Relaxed);
     WAKE_HEALS.store(0, Ordering::Relaxed);
     MAX_REDRAW_TOTAL_NS.store(0, Ordering::Relaxed);
@@ -2657,6 +3209,15 @@ pub fn reset() {
     WAIT_CANCELLED_WAKES.store(0, Ordering::Relaxed);
     POLL_WAKES.store(0, Ordering::Relaxed);
     PAST_DEADLINE_ARMS.store(0, Ordering::Relaxed);
+    // The lateness maxima are window stats like every other `max_`: a driver
+    // that resets, drives a workload and reads must see THIS workload's worst
+    // wake, not the launch storm's.
+    MAX_WAKE_LATE_NS.store(0, Ordering::Relaxed);
+    MAX_WAKE_LATE_OWNER.store(0, Ordering::Relaxed);
+    MAX_WAKE_LATE_AT_NS.store(0, Ordering::Relaxed);
+    MAX_DEADLINE_LATE_NS.store(0, Ordering::Relaxed);
+    MAX_DEADLINE_LATE_OWNER.store(0, Ordering::Relaxed);
+    MAX_DEADLINE_LATE_AT_NS.store(0, Ordering::Relaxed);
     for slot in 0..DEADLINE_OWNER_SLOTS {
         DEADLINE_ARMS_BY_OWNER[slot].store(0, Ordering::Relaxed);
         PAST_DEADLINE_ARMS_BY_OWNER[slot].store(0, Ordering::Relaxed);
@@ -2679,7 +3240,9 @@ pub fn reset() {
     MAX_FRAME_GAP_NS.store(0, Ordering::Relaxed);
     LAST_PRESENT_STAMP_NS.store(0, Ordering::Relaxed);
     // A stale no-echo stamp must not leak a bogus slice into the fresh window.
+    // Per-window stamps live in `WindowState`; the epoch discards them at consume.
     INPUT_STAMP_NS.store(0, Ordering::Relaxed);
+    INPUT_RESET_AT_NS.store(now_ns(), Ordering::Relaxed);
     // Likewise a bounds change whose present never came: it must not book its
     // whole pre-reset wait against the first present of the new window.
     RESIZE_STAMP_NS.store(0, Ordering::Relaxed);
@@ -2698,7 +3261,12 @@ pub fn reset() {
     MAX_OFFSCREEN_RASTER_NS.store(0, Ordering::Relaxed);
     LAST_ACQUIRE_WAIT_NS.store(0, Ordering::Relaxed);
     MAX_ACQUIRE_WAIT_NS.store(0, Ordering::Relaxed);
+    LAST_ACQUIRE_QUEUE_NS.store(0, Ordering::Relaxed);
+    MAX_ACQUIRE_QUEUE_NS.store(0, Ordering::Relaxed);
+    LAST_GPU_PARK_NS.store(0, Ordering::Relaxed);
+    MAX_GPU_PARK_NS.store(0, Ordering::Relaxed);
     H_ACQUIRE_WAIT.reset();
+    H_ACQUIRE_QUEUE.reset();
     for site in TermWaitSite::ALL {
         H_TERM_WAIT[site as usize].reset();
         MAX_TERM_WAIT_NS[site as usize].store(0, Ordering::Relaxed);
@@ -2707,6 +3275,8 @@ pub fn reset() {
     LAST_RESIZE_PRESENT_NS.store(0, Ordering::Relaxed);
     LAST_RESIZE_REFLOW_NS.store(0, Ordering::Relaxed);
     LAST_KEY_WRITE_NS.store(0, Ordering::Relaxed);
+    LAST_KEY_QUEUE_NS.store(0, Ordering::Relaxed);
+    MAX_KEY_QUEUE_NS.store(0, Ordering::Relaxed);
     LAST_PRESENT_LATENCY_NS.store(0, Ordering::Relaxed);
     LAST_FRAME_RENDER_NS.store(0, Ordering::Relaxed);
     LAST_REDRAW_TOTAL_NS.store(0, Ordering::Relaxed);
@@ -2715,9 +3285,18 @@ pub fn reset() {
     H_PRESENT_LATENCY.reset();
     H_FRAME_RENDER.reset();
     H_KEY_WRITE.reset();
+    H_KEY_QUEUE.reset();
     H_PRE_PRESENT.reset();
     H_RESIZE_PRESENT.reset();
     H_RESIZE_REFLOW.reset();
+    H_PRESENT_GLASS.reset();
+    LAST_PRESENT_GLASS_NS.store(0, Ordering::Relaxed);
+    MAX_PRESENT_GLASS_NS.store(0, Ordering::Relaxed);
+    PRESENT_GLASS_SKIPPED.store(0, Ordering::Relaxed);
+    // The main-loop turn census is a window stat like every other `max_` on this
+    // line: a driver that resets, drives a workload and reads must see THAT
+    // workload's worst main-thread turn, not the launch storm's.
+    crate::watchdog::reset_turn_census();
     // Gauges (`SYNC_HOLDING`, `PERF_REDUCED`), legacy momentary `last_*`
     // readings, and `first_present` (a startup FACT, not a window stat) survive
     // a reset, like `backend`. Redraw-audit last/drop fields intentionally reset
@@ -2791,6 +3370,11 @@ pub struct Snapshot {
     /// cannot miss it.
     pub last_acquire_wait_ns: u64,
     pub max_acquire_wait_ns: u64,
+    /// Armed-Metal GPU park — the LAST sample and the WORST one in this
+    /// measurement window. See [`note_gpu_park`]. Zero on every arm that never
+    /// blocks the UI thread on GPU completion.
+    pub last_gpu_park_ns: u64,
+    pub max_gpu_park_ns: u64,
     pub present_drops: u64,
     /// Output→present samples diverted to the TAINTED ledger because the window
     /// was occluded/parked or a capture was pacing presents. A non-zero value
@@ -3031,6 +3615,8 @@ pub fn snapshot() -> Snapshot {
         max_pre_present_ns: MAX_PRE_PRESENT_NS.load(Ordering::Relaxed),
         last_acquire_wait_ns: LAST_ACQUIRE_WAIT_NS.load(Ordering::Relaxed),
         max_acquire_wait_ns: MAX_ACQUIRE_WAIT_NS.load(Ordering::Relaxed),
+        last_gpu_park_ns: LAST_GPU_PARK_NS.load(Ordering::Relaxed),
+        max_gpu_park_ns: MAX_GPU_PARK_NS.load(Ordering::Relaxed),
         present_drops: PRESENT_DROPS.load(Ordering::Relaxed),
         tainted_present_samples: TAINTED_PRESENT_SAMPLES.load(Ordering::Relaxed),
         last_tainted_present_latency_ns: LAST_TAINTED_PRESENT_LATENCY_NS.load(Ordering::Relaxed),
@@ -4181,5 +4767,408 @@ mod histogram_tests {
             "an unpaired close saturates at zero instead of wrapping"
         );
         assert!(present_latency_tainted(), "the closing tail is still armed");
+    }
+}
+
+#[cfg(test)]
+mod present_glass_tests {
+    use super::{
+        H_PRESENT_GLASS, MAX_PRESENT_GLASS_NS, PRESENT_GLASS_SKIPPED, SCHEDULER_STATE,
+        note_present_glass, present_glass_fields_json, present_glass_fields_text, reset,
+    };
+    use aterm_gpu::present_glass::GlassSample;
+    use std::sync::atomic::Ordering;
+
+    /// The compositor leg is published beside the application-side slices: an
+    /// on-glass sample lands in the distribution and the max, a skipped drawable
+    /// only in its own counter, and `reset` clears all three.
+    #[test]
+    fn glass_samples_book_on_glass_and_skipped_apart_and_reset_clears_them() {
+        let _serial = SCHEDULER_STATE
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        reset();
+        note_present_glass(GlassSample::OnGlass { ns: 7_000_000 });
+        note_present_glass(GlassSample::Skipped);
+        assert_eq!(H_PRESENT_GLASS.count(), 1, "a skip is not a duration");
+        assert_eq!(MAX_PRESENT_GLASS_NS.load(Ordering::Relaxed), 7_000_000);
+        assert_eq!(PRESENT_GLASS_SKIPPED.load(Ordering::Relaxed), 1);
+        let text = present_glass_fields_text();
+        assert!(text.contains(" n_present_glass=1 "), "{text}");
+        assert!(text.contains(" max_present_glass_ms=7.00 "), "{text}");
+        assert!(text.ends_with(" present_glass_skipped=1"), "{text}");
+        let json = present_glass_fields_json();
+        assert!(json.contains("\"n_present_glass\":1,"), "{json}");
+        assert!(json.contains("\"present_glass_skipped\":1"), "{json}");
+        reset();
+        assert_eq!(H_PRESENT_GLASS.count(), 0);
+        assert_eq!(MAX_PRESENT_GLASS_NS.load(Ordering::Relaxed), 0);
+        assert_eq!(PRESENT_GLASS_SKIPPED.load(Ordering::Relaxed), 0);
+    }
+}
+
+#[cfg(test)]
+mod window_input_attribution_tests {
+    use super::{INPUT_SLICE_CAP_NS, PendingInputStamp};
+
+    /// The two-window streaming scenario: a key typed into window A must not be
+    /// closed by window B's content present. Each window's present can only take
+    /// its OWN stamp, so B's log-line frame leaves A armed, and A's echo frame
+    /// books the whole wait.
+    #[test]
+    fn another_windows_present_cannot_close_this_windows_key() {
+        let mut typed_into = PendingInputStamp::default();
+        let mut streaming = PendingInputStamp::default();
+        typed_into.arm(1_000, 1_000);
+
+        // Window B presents its own streaming output 3 ms later.
+        assert_eq!(streaming.take_slice(4_000_000, 0), None);
+        assert!(
+            typed_into.is_pending(),
+            "window B's frame closed window A's keystroke: the slice would read LOW"
+        );
+
+        // Window A's real echo, 90 ms after the key.
+        let echo_at = 1_000 + 90_000_000;
+        assert_eq!(typed_into.take_slice(echo_at, 0), Some(90_000_000));
+        assert!(
+            !typed_into.is_pending(),
+            "a content present consumes the stamp"
+        );
+        assert_eq!(typed_into.take_slice(echo_at + 1, 0), None, "consumed once");
+    }
+
+    #[test]
+    fn a_burst_keeps_its_oldest_arrival() {
+        let mut pending = PendingInputStamp::default();
+        pending.arm(10, 10);
+        pending.arm(20, 20);
+        assert_eq!(pending.take_slice(110, 0), Some(100));
+    }
+
+    #[test]
+    fn a_stamp_armed_before_reset_is_discarded_not_booked() {
+        let mut pending = PendingInputStamp::default();
+        pending.arm(50, 60);
+        assert_eq!(
+            pending.take_slice(10_000, 61),
+            None,
+            "armed before the reset"
+        );
+        assert!(!pending.is_pending(), "discarded, not left armed");
+
+        // Armed at the reset instant or later counts, even if the backdated
+        // arrival precedes it (the key sat in the OS queue across the reset).
+        pending.arm(50, 61);
+        assert_eq!(pending.take_slice(10_050, 61), Some(10_000));
+    }
+
+    #[test]
+    fn a_keystroke_that_never_echoed_ages_out() {
+        let mut pending = PendingInputStamp::default();
+        pending.arm(1, 1);
+        assert_eq!(pending.take_slice(1 + INPUT_SLICE_CAP_NS + 1, 0), None);
+        pending.arm(1, 1);
+        assert_eq!(
+            pending.take_slice(1 + INPUT_SLICE_CAP_NS, 0),
+            Some(INPUT_SLICE_CAP_NS)
+        );
+    }
+}
+
+#[cfg(test)]
+mod lateness_attribution_tests {
+    use super::{
+        DeadlineOwner, EventWakeKind, LAST_PRESENT_STAMP_NS, LAST_WAKE_LATE_NS,
+        MAX_DEADLINE_LATE_AT_NS, MAX_DEADLINE_LATE_NS, MAX_DEADLINE_LATE_OWNER,
+        MAX_PRESENT_LATENCY_AT_NS, MAX_PRESENT_LATENCY_GAP_NS, MAX_PRESENT_LATENCY_NS,
+        MAX_WAKE_LATE_AT_NS, MAX_WAKE_LATE_NS, MAX_WAKE_LATE_OWNER, PRESENT_TAINT_UNTIL_NS,
+        SCHEDULER_STATE, SLOW_PRESENT_LOG_MIN_GAP_NS, SLOW_PRESENT_LOG_THRESHOLD_NS,
+        StartupPresentTiming, clear_key_arrival, key_queue_distribution, key_queue_last_max_ns,
+        lateness_fields_json, lateness_fields_text, note_event_wake, note_key_arrival_queued,
+        now_ns, record_deadline, record_present, reset, should_log_slow_present,
+    };
+    use std::sync::atomic::Ordering;
+    use std::time::{Duration, Instant};
+
+    const LATE_NS: u64 = 400_000_000;
+
+    /// `record_deadline` stamps `due = now - late` on the PROCESS clock, and a
+    /// saturated `due` of 0 is read as "no deadline armed". Wait that clock past
+    /// the lateness this test fabricates rather than racing it — a no-op once a
+    /// test binary is warm, and a sleep rather than a spin so it costs no CPU.
+    fn wait_out_the_process_clock() {
+        while now_ns() < LATE_NS + 50_000_000 {
+            std::thread::sleep(Duration::from_millis(5));
+        }
+    }
+
+    /// THE ERASURE THIS FIXES. A 400 ms late timer wake is recorded, and the
+    /// very next reader wake — the `WaitCancelled` a PTY output burst produces,
+    /// milliseconds later — stores 0 over it. That is not a bug in itself
+    /// (`wake_late_ms` is documented as the LAST reading), but until these
+    /// maxima existed it meant the terminal could report
+    /// `max_present_latency_ms=560.54 wake_late_ms=0.00 deadline_late_ms=0.00`
+    /// and no reader could tell a starved main thread from an idle stretch.
+    ///
+    /// The last-writer semantics are pinned here too: this must ADD a surviving
+    /// worst case, not change what `wake_late_ms` means.
+    #[test]
+    fn a_late_timer_survives_the_reader_wake_that_erases_the_last_reading() {
+        let _serial = SCHEDULER_STATE
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        wait_out_the_process_clock();
+        reset();
+        let now = Instant::now();
+        let stale = now - Duration::from_nanos(LATE_NS);
+        // One offence from one owner: no heal clamps it (that needs a streak),
+        // so the arm passes through and books its lateness as-asked.
+        assert_eq!(
+            record_deadline(DeadlineOwner::FrameCap, Some(stale), now),
+            Some(stale)
+        );
+        note_event_wake(EventWakeKind::Timer);
+        assert!(
+            LAST_WAKE_LATE_NS.load(Ordering::Relaxed) >= LATE_NS,
+            "the timer wake must book its lateness at all"
+        );
+
+        // The erasing wake: one output burst is all it takes.
+        note_event_wake(EventWakeKind::WaitCancelled);
+        assert_eq!(
+            LAST_WAKE_LATE_NS.load(Ordering::Relaxed),
+            0,
+            "`wake_late_ms` is still the LAST reading — that contract is unchanged"
+        );
+
+        // …and the worst case outlives it, named and timed.
+        assert!(
+            MAX_WAKE_LATE_NS.load(Ordering::Relaxed) >= LATE_NS,
+            "a 400 ms late timer must not be erased by the next wake"
+        );
+        assert_eq!(
+            DeadlineOwner::from_raw(MAX_WAKE_LATE_OWNER.load(Ordering::Relaxed)),
+            DeadlineOwner::FrameCap,
+            "a number that cannot name its producer cannot end an investigation"
+        );
+        assert!(
+            MAX_WAKE_LATE_AT_NS.load(Ordering::Relaxed) != 0,
+            "the worst wake must say WHEN it happened"
+        );
+        assert!(
+            MAX_DEADLINE_LATE_NS.load(Ordering::Relaxed) >= LATE_NS
+                && MAX_DEADLINE_LATE_AT_NS.load(Ordering::Relaxed) != 0,
+            "the deadline lateness keeps its worst case on the same rule"
+        );
+        assert_eq!(
+            DeadlineOwner::from_raw(MAX_DEADLINE_LATE_OWNER.load(Ordering::Relaxed)),
+            DeadlineOwner::FrameCap
+        );
+
+        // And it is PUBLISHED — in both forms, with the owner spelled.
+        let text = lateness_fields_text();
+        assert!(
+            text.contains(" max_wake_late_owner=frame_cap "),
+            "the text fragment must name the owner: {text}"
+        );
+        assert!(
+            text.contains(" metrics_now_ms="),
+            "an instant with no anchor cannot be read as `how long ago`: {text}"
+        );
+        let json = lateness_fields_json();
+        assert!(
+            json.contains("\"max_deadline_late_owner\":\"frame_cap\""),
+            "the JSON twin must carry the same owner: {json}"
+        );
+
+        // A reset clears the window's worst case with the rest of the window.
+        reset();
+        assert_eq!(MAX_WAKE_LATE_NS.load(Ordering::Relaxed), 0);
+        assert_eq!(MAX_DEADLINE_LATE_NS.load(Ordering::Relaxed), 0);
+
+        // Leave no streak behind for the other scheduler tests.
+        let _ = record_deadline(
+            DeadlineOwner::FrameCap,
+            Some(now + Duration::from_millis(5)),
+            now,
+        );
+    }
+
+    /// The worst output→present reading is an OPEN interval, so "560 ms" alone
+    /// cannot say whether the main thread stalled or simply had nothing to
+    /// draw. The frame that sets the max therefore also records WHEN it
+    /// happened and how long it had been since the previous present: a gap the
+    /// size of the reading is an idle stretch, a far smaller one is output that
+    /// waited while frames kept coming.
+    #[test]
+    fn the_worst_present_latency_records_its_instant_and_its_frame_gap() {
+        let _serial = SCHEDULER_STATE
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        wait_out_the_process_clock();
+        reset();
+        // This sample must reach the on-glass ledger, not the tainted twin.
+        PRESENT_TAINT_UNTIL_NS.store(0, Ordering::Relaxed);
+        // A present 300 ms after the previous one, closing a 500 ms slice: a
+        // stall that is NOT explained by an idle stretch.
+        let gap_ns = 300_000_000;
+        let latency_ns = 500_000_000;
+        LAST_PRESENT_STAMP_NS.store(now_ns().saturating_sub(gap_ns), Ordering::Relaxed);
+        record_present(
+            latency_ns,
+            1_000_000,
+            StartupPresentTiming::collapsed(Instant::now()),
+            None,
+        );
+
+        assert_eq!(MAX_PRESENT_LATENCY_NS.load(Ordering::Relaxed), latency_ns);
+        assert!(
+            MAX_PRESENT_LATENCY_AT_NS.load(Ordering::Relaxed) != 0,
+            "the worst present must say when it happened"
+        );
+        let gap = MAX_PRESENT_LATENCY_GAP_NS.load(Ordering::Relaxed);
+        assert!(
+            (gap_ns..gap_ns + 1_000_000_000).contains(&gap),
+            "the frame gap of the winning sample is what separates a stall from an \
+             idle stretch; got {gap} ns"
+        );
+        assert!(
+            gap < latency_ns,
+            "a gap well under the reading is the `output waited` signature"
+        );
+
+        // A smaller sample cannot overwrite the winner's stamps.
+        let at = MAX_PRESENT_LATENCY_AT_NS.load(Ordering::Relaxed);
+        record_present(
+            1_000_000,
+            1_000_000,
+            StartupPresentTiming::collapsed(Instant::now()),
+            None,
+        );
+        assert_eq!(MAX_PRESENT_LATENCY_AT_NS.load(Ordering::Relaxed), at);
+        assert_eq!(MAX_PRESENT_LATENCY_GAP_NS.load(Ordering::Relaxed), gap);
+        reset();
+    }
+
+    /// The breadcrumb is the half of this that reaches `aterm.log` in a SHIPPED
+    /// binary, so both of its bounds matter: an ordinary slow frame must not
+    /// write a line, and a stall episode must not write one per frame inside
+    /// the stall it is describing.
+    #[test]
+    fn the_slow_present_breadcrumb_is_thresholded_and_rate_limited() {
+        let at = 60_000_000_000;
+        assert!(
+            !should_log_slow_present(SLOW_PRESENT_LOG_THRESHOLD_NS, 0, at),
+            "a frame at the threshold is a slow frame, not an episode"
+        );
+        assert!(
+            should_log_slow_present(SLOW_PRESENT_LOG_THRESHOLD_NS + 1, 0, at),
+            "the first spike of a process must always be recorded"
+        );
+        assert!(
+            should_log_slow_present(SLOW_PRESENT_LOG_THRESHOLD_NS + 1, 0, 1),
+            "…including one in the first seconds, where `now - 0` is under the gap"
+        );
+        assert!(
+            !should_log_slow_present(
+                SLOW_PRESENT_LOG_THRESHOLD_NS * 5,
+                at,
+                at + SLOW_PRESENT_LOG_MIN_GAP_NS - 1
+            ),
+            "a run of slow presents is ONE episode, not one line per frame"
+        );
+        assert!(
+            should_log_slow_present(
+                SLOW_PRESENT_LOG_THRESHOLD_NS * 5,
+                at,
+                at + SLOW_PRESENT_LOG_MIN_GAP_NS
+            ),
+            "a still-live stall must keep saying so"
+        );
+    }
+
+    /// THE CONFLATION THIS FIXES. `note_key_arrival_queued` backdates the arrival
+    /// stamp by the NSEvent queue age and used to keep ONLY the backdated stamp,
+    /// so the queue residence went into `key_write` and `input_present` and was
+    /// published nowhere apart. A `max_key_write_ms=18.13` therefore could not be
+    /// told from a parked event loop (fix: present pacing) or 18 ms spent inside
+    /// `on_key`/`input_to_session` (fix: the press path).
+    ///
+    /// Drives the real recorder and pins what the fix adds: the backdate lands in
+    /// a reading of its own, a `0` is a SAMPLE rather than a silence, a key that
+    /// never writes still books its wait (which is why `n_key_queue` may exceed
+    /// `n_key_write`), and the whole leg clears with the measurement window.
+    ///
+    /// SCOPED TO STATE THIS TEST OWNS, DELIBERATELY. `LAT_KEY_NS`,
+    /// `LAST_KEY_WRITE_NS` and `H_KEY_WRITE` are process-global and the press-path
+    /// tests in `app_input` drive real `InputEvent::Key` presses through the seam,
+    /// so they arm and consume the arrival stamp too — and they cannot take this
+    /// module's `SCHEDULER_STATE` lock, which guards only the metrics scheduler
+    /// state. An earlier cut of this test asserted `LAST_KEY_WRITE_NS` and was
+    /// SCHEDULE-DEPENDENT because of it: green under a `metrics` filter, red under
+    /// a `key_write` one, where `failed_inline_key_write_revokes_every_new_movement_licence`
+    /// runs alongside and swapped the stamp out from under it (measured: 0.3 ms
+    /// booked against a 17 ms wait). The queue statics below have exactly one
+    /// writer, `note_key_arrival_queued`, so they are assertable; that `key_write`
+    /// CONTAINS this leg is structural — both clocks start at the same backdated
+    /// stamp — and is pinned where it is observable, on the published line.
+    /// Each arm is disarmed before the next, so no stale arrival leaks into
+    /// another test's `note_input`.
+    #[test]
+    fn the_os_queue_share_of_key_write_is_published_apart_from_it() {
+        let _serial = SCHEDULER_STATE
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        reset();
+        assert_eq!(
+            key_queue_last_max_ns(),
+            (0, 0),
+            "a fresh measurement window starts with no queue reading"
+        );
+        assert_eq!(key_queue_distribution().count(), 0);
+
+        // A key that waited 17 ms behind a parked event loop.
+        let parked_ns = 17_000_000;
+        note_key_arrival_queued(parked_ns);
+        clear_key_arrival();
+
+        assert_eq!(
+            key_queue_last_max_ns(),
+            (parked_ns, parked_ns),
+            "the backdate is now a reading of its own, not just a moved stamp"
+        );
+        assert_eq!(key_queue_distribution().count(), 1);
+        let queue_p99 = key_queue_distribution().percentile(0.99).unwrap();
+        assert!(
+            (parked_ns..parked_ns + parked_ns / 4).contains(&queue_p99),
+            "the queue distribution reports the wait it was handed, as a bucket \
+             upper edge; got {queue_p99} ns"
+        );
+
+        // A key that waited NOTHING books a real `0`: the max keeps the worst key,
+        // `last` reports this one, and the count moves — so "no queueing" can
+        // never be read as "not measured", which is also what an unmeasurable age
+        // (any non-macOS build) books.
+        note_key_arrival_queued(0);
+        clear_key_arrival();
+        assert_eq!(
+            key_queue_last_max_ns(),
+            (0, parked_ns),
+            "a 0 is this key's reading; the worst key still owns the max"
+        );
+        assert_eq!(key_queue_distribution().count(), 2);
+
+        // A key that never writes (a UI shortcut) still books its queue wait, which
+        // is why `n_key_queue >= n_key_write` rather than equal.
+        note_key_arrival_queued(parked_ns);
+        clear_key_arrival();
+        assert_eq!(key_queue_distribution().count(), 3);
+        assert_eq!(key_queue_last_max_ns(), (parked_ns, parked_ns));
+
+        // A window stat, cleared by `reset` like the total it qualifies.
+        reset();
+        assert_eq!(key_queue_last_max_ns(), (0, 0));
+        assert_eq!(key_queue_distribution().count(), 0);
     }
 }

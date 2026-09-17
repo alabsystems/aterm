@@ -4,18 +4,12 @@
 //! The subtle TRANSIENT NOTICE: a small floating [`DrawPrim`] card near the top of the
 //! window that slides in, holds, then lifts away over a few seconds — used for the
 //! non-disruptive update moments:
-//!   * [`NoticeKind::UpdateReady`] — a strictly-newer build just STAGED. "Update ready"
-//!     (accent badge + a trailing chevron, the two marks that say "this one is a
-//!     button"); CLICKING it APPLIES the update in one gesture
-//!     (`App::apply_update_or_details` — details-overlay fallback when nothing is
-//!     actually staged). The persistent affordances (version-menu ⬆️ on macOS /
-//!     tab-strip ↻ elsewhere) stay after it fades.
 //!   * [`NoticeKind::LevelUp`] — the app just TOOK OVER as a newer build (a seamless
 //!     handoff set `$ATERM_UPDATED_FROM`). A quiet, cursor-themed "leveled-up" flourish
 //!     ("Updated to build N") that celebrates the swap, then fades — the "level up" analog
 //!     the design asked for, without literally saying "level up" or blocking the flow.
 //!   * [`NoticeKind::UpdateStatus`] — the background lane reporting for itself. Quiet by
-//!     construction: a HOLLOW badge, no chevron, not clickable-to-apply.
+//!     construction: a HOLLOW badge, not clickable-to-apply.
 //!
 //! One decoration borrows the widget wholesale: ROBI's tip bubble
 //! ([`NoticeKind::RobiTip`], anchored over the speaker).
@@ -97,13 +91,6 @@ const SLIDE_CELLS: f32 = 0.42;
 /// Which update moment the notice marks.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) enum NoticeKind {
-    /// A strictly-newer build staged and is ready to install. Clickable → APPLY (one
-    /// click; see `App::notice_click`).
-    #[allow(
-        dead_code,
-        reason = "retired producer (2026-09-07): the update lane announces on the status bar; the kind and its chevron painter remain the widget's regression fixture"
-    )]
-    UpdateReady { version: String, build: u64 },
     /// The app took over as a newer build (post-update celebration).
     #[allow(
         dead_code,
@@ -218,22 +205,6 @@ pub(crate) struct TransientNotice {
 }
 
 impl TransientNotice {
-    /// RETIRED PRODUCER (2026-09-07): a newly staged build is announced by the
-    /// update STATUS BAR (`status_bars`), whose row is the click-to-apply
-    /// affordance; nothing in the shipping tree raises this card any more. The
-    /// kind and its painter (the accent badge + chevron) stay as the widget's
-    /// regression fixture until those tests migrate — the same arrangement the
-    /// retired Software Update modal has.
-    #[cfg(test)]
-    pub(crate) fn update_ready(version: String, build: u64, now: Instant) -> Self {
-        Self {
-            kind: NoticeKind::UpdateReady { version, build },
-            spawned: now,
-            anchor: None,
-            ttl: TTL,
-        }
-    }
-
     /// RETIRED PRODUCER (2026-09-07): the landed build is announced by the
     /// update STATUS BAR ("Updated — now on vX") and celebrated by the upgrade
     /// surge's landing burst (`level_up`); nothing in the shipping tree raises
@@ -387,8 +358,7 @@ impl TransientNotice {
                     || (elapsed >= self.ttl.saturating_sub(FADE)
                         && self.alpha(now) < CLICK_MIN_ALPHA)
             }
-            NoticeKind::UpdateReady { .. }
-            | NoticeKind::LevelUp { .. }
+            NoticeKind::LevelUp { .. }
             | NoticeKind::SessionConnection { .. }
             | NoticeKind::AdminStep { .. }
             | NoticeKind::MacosAccess
@@ -441,11 +411,6 @@ impl TransientNotice {
     /// by a decoration).
     pub(crate) fn is_robi_tip(&self) -> bool {
         matches!(self.kind, NoticeKind::RobiTip { .. })
-    }
-
-    /// Whether this notice is `UpdateReady` (the clickable variant).
-    pub(crate) fn is_update_ready(&self) -> bool {
-        matches!(self.kind, NoticeKind::UpdateReady { .. })
     }
 
     /// Whether this is the post-update decorative flourish. Serious mode may
@@ -541,11 +506,6 @@ impl TransientNotice {
         use std::hash::{Hash, Hasher};
         let mut h = std::collections::hash_map::DefaultHasher::new();
         match &self.kind {
-            NoticeKind::UpdateReady { version, build } => {
-                0u8.hash(&mut h);
-                version.hash(&mut h);
-                build.hash(&mut h);
-            }
             NoticeKind::LevelUp { build } => {
                 1u8.hash(&mut h);
                 build.hash(&mut h);
@@ -603,24 +563,13 @@ impl TransientNotice {
     /// way a predicate that silently flips has to fail.
     pub(crate) fn text(&self) -> String {
         match &self.kind {
-            // A staged build can share the running build's display version (the
-            // updater orders by build number — see `menu::staged_apply_label`), so
-            // naming only the version would announce the version already running.
-            NoticeKind::UpdateReady { version, build } => {
-                if version == crate::build_info::version_display() {
-                    format!("\u{2191} Update ready \u{2014} build {build}")
-                } else {
-                    format!("\u{2191} Update ready \u{2014} v{version}")
-                }
-            }
             // THE VERSION, NOT THE BUILD NUMBER. A build number is a claimed monotonic
             // integer seeded from the unix epoch, so this line read "now on build
             // 1786471542" — ten digits that mean nothing to the person reading them, in
             // the one notice whose whole job is to feel like a small reward. We are
-            // already RUNNING the new build here (unlike `UpdateReady`, which must
-            // disambiguate a staged build that shares the running version), so the
-            // running version is the honest and legible thing to name. The build number
-            // stays reachable in the Version menu and the log for anyone who needs it.
+            // already RUNNING the new build here, so the running version is the honest
+            // and legible thing to name. The build number stays reachable in the Version
+            // menu and the log for anyone who needs it.
             NoticeKind::LevelUp { build } => {
                 let version = crate::build_info::version_display();
                 if version.is_empty() {
@@ -733,11 +682,11 @@ pub(crate) fn caption_parts(text: &str) -> CaptionParts {
 }
 
 /// How loud the badge is. The hierarchy IS the information: only an actionable notice
-/// gets a filled accent badge and a chevron, so "there is something to press" is legible
-/// before a single word is read.
+/// gets a filled accent badge, so "there is something to press" is legible before a
+/// single word is read.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 enum Tone {
-    /// Actionable: filled accent badge + chevron.
+    /// Actionable (a card carrying controls): filled accent badge.
     Action,
     /// The post-update flourish: filled badge in the live cursor colour.
     Celebrate,
@@ -750,7 +699,6 @@ enum Tone {
 impl Tone {
     fn of(kind: &NoticeKind, marker: Option<&str>) -> Self {
         match kind {
-            NoticeKind::UpdateReady { .. } => Self::Action,
             NoticeKind::LevelUp { .. } => Self::Celebrate,
             // A status pill is never clickable, so it never wears the actionable badge
             // however its caption is marked — except a ✓ completion, which has earned a
@@ -819,17 +767,6 @@ fn on_fill(fill: [u8; 3]) -> [u8; 3] {
 /// The minimum luminance gap (0..255) the badge must hold against the card surface.
 const BADGE_CONTRAST: f32 = 52.0;
 
-/// The WCAG floor a non-text UI mark owes its background — the chevron on the
-/// clickable notice is the card's only affordance, so it is held to it against
-/// the card's OWN surface (`elevated`), not against the page the card floats on.
-/// `chevron_ink_clears_the_ui_floor_on_every_forced_side` pins it.
-const CHEVRON_INK_FLOOR: f64 = 3.0;
-/// The chevron's stroke width. A 1.5 px hairline spends most of its coverage on
-/// anti-aliasing, so the ratio the [`CHEVRON_INK_FLOOR`] math promises is not
-/// the ratio the eye gets; 1.75 px puts a full-strength core inside the stroke
-/// without turning the mark into a caret.
-const CHEVRON_STROKE: f32 = 1.75;
-
 /// `fill` pushed away from `surface` until the two can be told apart.
 ///
 /// (It was `pub(crate)` for the provisioning progress card, whose rainbow
@@ -885,7 +822,6 @@ struct Pill {
     title: String,
     title_x: f32,
     detail: Option<(String, f32)>,
-    chevron_cx: Option<f32>,
     /// The two controls of a card that carries them (the admin card, the macOS
     /// access card); `None` on every other kind.
     buttons: Option<CardControls>,
@@ -948,21 +884,7 @@ fn layout(
     let pad_x = s * 0.80;
     let gap_badge = s * 0.52;
     let gap_detail = s * 0.46;
-    // The chevron's own gap has to beat the gap INSIDE the sentence, or the
-    // affordance joins the sentence. At 0.62 em it cleared the detail by
-    // 0.62 - arm/2 = 0.48 em of ink-to-ink air against the 0.46 em that
-    // separates the title from the detail — a two-hundredths-of-an-em
-    // difference, i.e. none, so "Update ready v0.48.0 ›" read as one text run
-    // with a stray glyph on the end rather than a caption and a control (the
-    // 2026-08 cold visual audit's collision). At 1.15 em the ink gap is
-    // 1.01 em: better than double the word gap, which is what makes the eye
-    // parse the chevron as a separate, pressable thing.
-    let (chev_w, chev_gap) = if n.is_update_ready() {
-        (s * 0.30, s * 1.15)
-    } else {
-        (0.0, 0.0)
-    };
-    // A two-control card's controls ride the trailing edge in place of the chevron:
+    // A two-control card's controls ride the trailing edge:
     // the primary ("Install" / "Open Settings") as a filled accent capsule, "Not now"
     // as a quiet outlined one. They are never dropped by the fit order below — a card
     // whose only exits have been elided is a trap — so the sentence gives way first.
@@ -992,7 +914,7 @@ fn layout(
     // The card may not exceed the tray minus a cell of air on each side.
     let max_w = (tray_w - 2.0 * cw).max(0.0);
     let lead = pad_x + 2.0 * badge_r + gap_badge;
-    let trail = chev_gap + chev_w + buttons_w + pad_x;
+    let trail = buttons_w + pad_x;
 
     let title_w = |t: &str| ui_text_width_for(TextFace::UiBold, t, s);
     let detail_w = |t: &str| ui_text_width_for(TextFace::Ui, t, s);
@@ -1044,7 +966,6 @@ fn layout(
     let title_x = x + lead;
     let detail_x = title_x + title_w(&title) + gap_detail;
     let detail = detail.map(|d| (d, detail_x));
-    let chevron_cx = n.is_update_ready().then_some(x + w - pad_x - chev_w * 0.5);
     let buttons = (with_controls && w > 0.0).then(|| {
         let bh = s * 1.55;
         let not_now_x = x + w - pad_x - not_now_w;
@@ -1072,7 +993,6 @@ fn layout(
         title,
         title_x,
         detail,
-        chevron_cx,
         buttons,
         primary_label,
         baseline: row_baseline(y, h, s),
@@ -1425,44 +1345,6 @@ pub(crate) fn notice_tray(
             rgba(r.text_secondary, sa(0xE6)),
         ));
     }
-    // The chevron: two round-capped strokes, the standard "this row goes somewhere" mark.
-    // Only the clickable notice gets one, so the affordance is honest.
-    //
-    // Its ink is floored against the surface it ACTUALLY lands on. `text_tertiary`
-    // is conditioned to 3.0 against `surface` — the PAGE — and this card is not
-    // the page: it is `elevated`, a step further from the ink on both sides, so
-    // the chevron arrived at 2.76:1 on the forced-light chrome and 3.27:1 on the
-    // forced-dark one, i.e. under (or inside the anti-aliasing margin of) the 3:1
-    // floor a non-text UI mark owes — on the ONE notice that is a button. This is
-    // the same discipline `chrome_band::band_colors` states for the band's inks
-    // and `tab_bar::strip_colors` for the strip's: every ink floored against its
-    // own surface, never against a single notional background. `text_tertiary`
-    // stays the SEED, so the chevron keeps its place under the caption in the
-    // hierarchy — the floor only stops it from falling out of sight.
-    if let Some(cx) = p.chevron_cx {
-        let arm = p.size.get() * 0.28;
-        let cy = p.badge_cy;
-        let color = rgba(
-            crate::chrome_band::ensure_contrast(r.text_tertiary, r.elevated, CHEVRON_INK_FLOOR),
-            sa(0xFF),
-        );
-        prims.push(DrawPrim::Line {
-            x1: cx - arm * 0.5,
-            y1: cy - arm,
-            x2: cx + arm * 0.5,
-            y2: cy,
-            width: CHEVRON_STROKE,
-            color,
-        });
-        prims.push(DrawPrim::Line {
-            x1: cx + arm * 0.5,
-            y1: cy,
-            x2: cx - arm * 0.5,
-            y2: cy + arm,
-            width: CHEVRON_STROKE,
-            color,
-        });
-    }
     // A two-control card's controls: the primary (Install / Open Settings) as a filled
     // accent capsule with contrast-picked ink, Not now as a hairline-outlined quiet one.
     // Same accent the badge wears, so the card reads as one thing asking for one
@@ -1538,7 +1420,6 @@ mod tests {
         let names = vec!["clt".to_string(), "brew".to_string()];
         let n = TransientNotice::admin_step(names.clone(), t0);
         assert!(n.is_admin_step());
-        assert!(!n.is_update_ready());
         assert_eq!(n.admin_step_names(), Some(names.as_slice()));
         let text = n.text();
         assert!(
@@ -1648,103 +1529,6 @@ mod tests {
         }
     }
 
-    /// The chevron is the clickable notice's ONLY affordance, and it lands on the
-    /// card's `elevated` surface, not on the page `text_tertiary` is conditioned
-    /// against. Before it was floored here it measured 2.76:1 on the forced-light
-    /// chrome and 2.79:1 on a light terminal theme — under the 3:1 a non-text UI
-    /// mark owes its background, on the one pill a user is meant to press.
-    ///
-    /// Walks the same four appearance states the 2026-08 cold visual audit did:
-    /// both forced chrome palettes, and both sides reached automatically.
-    #[test]
-    fn chevron_ink_clears_the_ui_floor_on_every_forced_side() {
-        use super::{CHEVRON_INK_FLOOR, Roles};
-        use aterm_render::Theme;
-
-        let terminal_dark = Theme::default();
-        let terminal_light = Theme {
-            fg: 0x0065_7B83,
-            bg: 0x00FD_F6E3,
-            cursor: 0x0085_9900,
-            selection: 0x00EE_E8D5,
-        };
-        for (label, theme) in [
-            (
-                "forced-light",
-                crate::native_appearance::forced_chrome_theme(terminal_dark, false),
-            ),
-            (
-                "forced-dark",
-                crate::native_appearance::forced_chrome_theme(terminal_light, true),
-            ),
-            ("auto-dark", terminal_dark),
-            ("auto-light", terminal_light),
-        ] {
-            let r = Roles::from_theme(theme);
-            let ink =
-                crate::chrome_band::ensure_contrast(r.text_tertiary, r.elevated, CHEVRON_INK_FLOOR);
-            let got = crate::chrome_band::contrast(ink, r.elevated);
-            assert!(
-                got >= CHEVRON_INK_FLOOR,
-                "{label}: chevron {ink:?} on card {:?} is {got:.2}:1, under the \
-                 {CHEVRON_INK_FLOOR}:1 UI floor",
-                r.elevated,
-            );
-            // The floor lifts the seed; it must never INVERT the hierarchy by
-            // pushing the chevron past the caption it sits under.
-            let caption = crate::chrome_band::contrast(r.text_secondary, r.elevated);
-            assert!(
-                got <= caption,
-                "{label}: chevron ({got:.2}:1) outshouts the detail caption ({caption:.2}:1)"
-            );
-        }
-    }
-
-    /// The chevron must read as a CONTROL beside the caption, not as the last
-    /// glyph of it: its air has to beat the gap that separates the title from the
-    /// detail inside the same sentence. It used to clear it by 0.02 em.
-    #[test]
-    fn the_chevron_stands_off_the_subtitle_further_than_the_words_stand_off_each_other() {
-        use super::{SettingsGeom, TransientNotice, layout};
-        use std::time::Instant;
-
-        let g = SettingsGeom {
-            cw: 8.0,
-            ch: 17.0,
-            font_px: 14.0,
-            cols: 150,
-            panel_rows: 40,
-        };
-        let now = Instant::now();
-        let n = TransientNotice::update_ready("0.48.0".to_string(), 1_234_567, now);
-        let p = layout(&n, &g, now, 1.0, 0.0);
-        let s = p.size.get();
-        let (detail, detail_x) = p.detail.clone().expect("the ready pill carries a version");
-        let detail_end = detail_x
-            + crate::tray_raster::ui_text_width_for(crate::widget::TextFace::Ui, &detail, s);
-        let chevron_cx = p.chevron_cx.expect("the ready pill is the clickable one");
-        // Half the drawn chevron's horizontal reach — the arms span `arm` total.
-        let chevron_left = chevron_cx - s * 0.28 * 0.5;
-        let word_gap = detail_x
-            - (p.title_x
-                + crate::tray_raster::ui_text_width_for(
-                    crate::widget::TextFace::UiBold,
-                    &p.title,
-                    s,
-                ));
-        let chevron_gap = chevron_left - detail_end;
-        assert!(
-            chevron_gap >= word_gap * 2.0,
-            "the chevron sits {chevron_gap:.2}px off the subtitle against a {word_gap:.2}px \
-             word gap — it reads as part of the sentence"
-        );
-        // ...and it still fits inside the card it is measured into.
-        assert!(
-            chevron_cx + s * 0.28 * 0.5 <= p.x + p.w,
-            "the chevron overflows the pill"
-        );
-    }
-
     /// The gesture-failure card's text contract: one line, elided at 160
     /// chars — a raw io::Error must never stretch or wrap the card; the full
     /// error belongs to the paired stderr line.
@@ -1842,7 +1626,7 @@ mod tests {
     #[test]
     fn alpha_ramps_in_holds_then_ramps_out() {
         let now = t0();
-        let n = TransientNotice::update_ready("0.5.15".into(), 830, now);
+        let n = TransientNotice::update_status("\u{2191} Update ready \u{2014} v0.5.15", now);
         // The entrance is a real ramp, not a pop.
         assert_eq!(n.alpha(now), 0.0, "invisible at spawn");
         let opening = n.alpha(now + ENTER / 2);
@@ -1890,7 +1674,7 @@ mod tests {
     #[test]
     fn reduced_motion_pins_the_card_to_its_rest_position() {
         let now = t0();
-        let n = TransientNotice::update_ready("0.5.15".into(), 830, now);
+        let n = TransientNotice::update_status("\u{2191} Update ready \u{2014} v0.5.15", now);
         let g = geom();
         let rest = REST_Y_CELLS * g.ch;
         for ms in [0_u64, 100, 1_000, 5_000] {
@@ -1941,7 +1725,7 @@ mod tests {
     #[test]
     fn every_frame_of_the_ramps_is_a_distinct_fingerprint_step() {
         let now = t0();
-        let n = TransientNotice::update_ready("0.5.15".into(), 830, now);
+        let n = TransientNotice::update_status("\u{2191} Update ready \u{2014} v0.5.15", now);
         let sample = |ms: u64| n.fingerprint(now + Duration::from_millis(ms), true);
         let enter_steps = (0..ENTER.as_millis() as u64)
             .step_by(FRAME.as_millis() as usize)
@@ -1957,7 +1741,7 @@ mod tests {
     #[test]
     fn deadline_wakes_per_frame_while_moving_and_sleeps_through_the_hold() {
         let now = t0();
-        let n = TransientNotice::update_ready("0.5.15".into(), 830, now);
+        let n = TransientNotice::update_status("\u{2191} Update ready \u{2014} v0.5.15", now);
         assert_eq!(n.deadline(now, true), now + FRAME, "entrance animates");
         let held = now + ENTER + Duration::from_millis(100);
         assert_eq!(
@@ -1970,17 +1754,6 @@ mod tests {
             n.deadline(leaving, true),
             leaving + FRAME,
             "the exit animates"
-        );
-    }
-
-    #[test]
-    fn update_ready_is_clickable_level_up_is_not() {
-        let now = t0();
-        assert!(TransientNotice::update_ready("0.5.15".into(), 830, now).is_update_ready());
-        assert!(!TransientNotice::level_up(830, now).is_update_ready());
-        assert!(
-            !TransientNotice::update_status("Update paused", now).is_update_ready(),
-            "automatic status notices never trigger another apply attempt"
         );
     }
 
@@ -2027,7 +1800,10 @@ mod tests {
     #[test]
     fn tray_paints_badge_title_and_detail_inside_the_card() {
         let now = t0();
-        let n = TransientNotice::update_ready("0.5.15".into(), 830, now + Duration::ZERO);
+        let n = TransientNotice::update_status(
+            "\u{2191} Update ready \u{2014} v0.5.15",
+            now + Duration::ZERO,
+        );
         let g = geom();
         let at = now + ENTER; // settled, so the rect is the rest rect
         let t = notice_tray(&n, &g, chrome(false), at, 1.0, 0.0);
@@ -2053,13 +1829,7 @@ mod tests {
             assert!(*tx >= x, "{s:?} starts inside the card");
             assert!(*tx + *tw <= x + w + 0.5, "{s:?} ends inside the card");
         }
-        // The clickable notice wears a chevron; the quiet ones must not.
-        let lines = t
-            .prims
-            .iter()
-            .filter(|p| matches!(p, DrawPrim::Line { .. }))
-            .count();
-        assert_eq!(lines, 2, "the actionable notice gets a chevron");
+        // A status pill advertises no click: it paints no stroked mark at all.
         let quiet =
             TransientNotice::update_status("\u{2191} Update paused \u{2014} see Version menu", at);
         let qt = notice_tray(&quiet, &g, chrome(false), at + ENTER, 1.0, 0.0);
@@ -2126,7 +1896,7 @@ mod tests {
     #[test]
     fn the_card_stays_inside_even_absurdly_narrow_trays() {
         let now = t0();
-        let n = TransientNotice::update_ready("0.5.15".into(), 830, now);
+        let n = TransientNotice::update_status("\u{2191} Update ready \u{2014} v0.5.15", now);
         let mut saw_a_card = false;
         for cols in [1_usize, 2, 3, 5, 8, 13, 21, 40, 200] {
             let g = SettingsGeom { cols, ..geom() };
@@ -2169,7 +1939,7 @@ mod tests {
     #[test]
     fn the_card_clears_the_in_grid_chrome_it_is_given() {
         let now = t0();
-        let n = TransientNotice::update_ready("0.5.15".into(), 830, now);
+        let n = TransientNotice::update_status("\u{2191} Update ready \u{2014} v0.5.15", now);
         let g = geom();
         let at = now + ENTER;
         for clear_rows in [0.0_f32, 1.0, 2.0, 3.0] {
@@ -2227,12 +1997,6 @@ mod tests {
     /// accent, and a background status stays quiet however its caption is marked.
     #[test]
     fn tone_matches_what_the_notice_can_actually_do() {
-        let ready = NoticeKind::UpdateReady {
-            version: "1".into(),
-            build: 1,
-        };
-        assert_eq!(Tone::of(&ready, Some("\u{2191}")), Tone::Action);
-        assert!(Tone::of(&ready, Some("\u{2191}")).filled());
         assert_eq!(
             Tone::of(&NoticeKind::LevelUp { build: 1 }, None),
             Tone::Celebrate
@@ -2474,7 +2238,6 @@ mod tests {
         assert!(card.is_macos_access());
         assert!(card.is_macos_access_owned());
         assert_eq!(card.primary_control_label(), Some(OPEN_SETTINGS_LABEL));
-        assert!(!card.is_update_ready());
         assert!(!card.is_admin_step());
         assert!(!card.is_robi_tip());
         assert!(!card.is_level_up());
@@ -2693,7 +2456,6 @@ mod tests {
         );
         assert!(held.yields_to_disclosure(t0 + ADMIN_STEP_TTL));
         for holder in [
-            TransientNotice::update_ready("9.9.9".to_string(), 7, t0),
             TransientNotice::level_up(7, t0),
             TransientNotice::session_connection("first use".to_string(), t0),
             TransientNotice::admin_step(vec!["clt".to_string()], t0),

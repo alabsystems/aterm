@@ -380,6 +380,19 @@ impl Grid {
         // That moves the reader off the anchored line but stays in bounds — the
         // same degradation the offset arm has always had. `Damage::Full` below
         // subsumes the primitive's targeted damage.
+        //
+        // On the OFFLOADED width path this `min()` is not the final word and must
+        // not be read as one: `resize_offloading_scrollback` has already lifted all
+        // three history layers into the job, so `scrollback_lines()` here counts
+        // only what the visible rewrap just pushed back — usually nothing — and the
+        // clamp lands at 0 no matter how deep the reader was. Re-attach restores
+        // them from `prev_offset`, and it can tell this clamp apart from a reader who
+        // chose the live bottom because THIS write is machine motion: a bare store
+        // assignment, invisible to `reader_live_bottom_gen`, which only the reader's
+        // own scroll primitives advance — see `scrollback_offload`'s audit-#7 guard.
+        // The anchor arm below is equally invisible, and structurally so: the
+        // `display_offset = 0` above runs before any of this, so the re-anchor can
+        // only raise the offset, never descend to the live bottom.
         match prev_anchor {
             Some(anchor) if new_cols == old_cols => self.scroll_to_absolute_row(anchor),
             _ => self.storage.display_offset = prev_offset.min(self.storage.scrollback_lines()),
@@ -391,6 +404,40 @@ impl Grid {
         // `mark_content_*` wrapper — bump the content generation so a cached
         // search index (and cross-session change poll) invalidates correctly.
         self.storage.content_gen += 1;
+        // A WIDTH REWRAP RENUMBERS ROWS WHOLESALE — say so for EVERY width
+        // reflow, not only for the ones that spliced a row back into history.
+        //
+        // The three older bump sites all sit where the rewrap CROSSES the
+        // live/history boundary — `prepend_ring_scrollback_lines`
+        // (`scrollback_reflow.rs`), the deficit pullback
+        // (`reflow_pullback.rs`) and `note_bottom_end_renumbered` — and each
+        // early-returns when there is nothing to splice. So a narrowing with an
+        // EMPTY scrollback (a fresh tab, or anything right after `clear`, whose
+        // output still fits on screen) raised nothing at all, while still
+        // rewrapping every visible logical line: the SAME lines occupy a
+        // different number of rows afterwards, so absolute row N names
+        // different text than it did a moment ago. That is the renumbering, and
+        // `absolute_row_revision` cannot see it (only a protected-footer splice
+        // moves that) while `content_gen` says only that content changed, never
+        // that keys moved.
+        // Measured consequence: the find overlay's highlight-all tint, which
+        // fails closed on this stamp, replayed its cached `(row, col, len)` onto
+        // a dash continuation row while the real hit sat untinted further down.
+        //
+        // Raised here rather than at the splice sites because this is the one
+        // place that knows a width reflow HAPPENED. A width reflow that also
+        // splices history now bumps more than once; the epoch is a monotonic
+        // "did it move" counter, never an amount, so a double bump reads the
+        // same as a single one. The cost of a bump is at most one extra rebuild
+        // of the absolute-row-keyed caches (the viewport row cache, the
+        // terminal's search index) — both of which a width change already
+        // invalidates by dims — which is the trade this stamp is documented to
+        // make: a spurious rebuild is harmless, a missed one is silently wrong
+        // results.
+        if new_cols != old_cols && reflow {
+            self.storage.history_renumber_epoch =
+                self.storage.history_renumber_epoch.saturating_add(1);
+        }
     }
 
     /// Copy every VISIBLE complex cell's ring-stored codepoint into the persistent

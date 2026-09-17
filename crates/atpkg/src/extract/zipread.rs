@@ -57,7 +57,7 @@ use std::rc::Rc;
 
 use super::{
     EntryKind, ExtractError, ExtractOptions, ExtractReject, Layer, TAR_ENTRY_STRUCTURAL_BUDGET,
-    TreeAccumulator, folded,
+    TooLargeReason, TreeAccumulator, folded,
 };
 
 const SIG_EOCD: u32 = 0x0605_4b50;
@@ -492,7 +492,9 @@ pub(super) fn extract(
                     return Err(ExtractError::Rejected(ExtractReject::DisallowedKind, raw));
                 }
                 if rec.uncomp_size > MAX_LINK_TARGET {
-                    return Err(ExtractError::TooLarge);
+                    return Err(ExtractError::TooLarge(TooLargeReason::LinkTargetTooLong(
+                        raw.clone(),
+                    )));
                 }
                 let body = open_body(&mut file, &rec, cd.offset)?;
                 let mut target = Vec::new();

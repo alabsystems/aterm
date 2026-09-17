@@ -623,11 +623,28 @@ impl Toolchain {
 mod tests {
     use super::*;
     use std::fs;
-    use std::os::unix::fs::PermissionsExt;
+
+    /// `chmod +x`, where an execute bit exists. A no-op elsewhere BY DESIGN and
+    /// not by neglect: [`is_executable_file`](crate::is_executable_file) is
+    /// existence off unix, so a stub that was merely WRITTEN already satisfies
+    /// every discovery predicate these tests drive. Keeping the helper (rather
+    /// than gating each test) is what lets the discovery ORDER — store before
+    /// from-source, sealed before live — stay pinned on a target with no mode.
+    fn make_runnable(path: &Path) {
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            fs::set_permissions(path, fs::Permissions::from_mode(0o755)).expect("chmod");
+        }
+        #[cfg(not(unix))]
+        {
+            let _ = path;
+        }
+    }
 
     fn exec_stub(path: &Path) {
         fs::write(path, b"#!/bin/sh\nexit 0\n").expect("write");
-        fs::set_permissions(path, fs::Permissions::from_mode(0o755)).expect("chmod");
+        make_runnable(path);
     }
 
     /// A stub that answers `--print sysroot` like a real driver, with the
@@ -643,7 +660,7 @@ mod tests {
             format!("#!/bin/sh\necho '{}'\n", sysroot.display()).as_bytes(),
         )
         .expect("write");
-        fs::set_permissions(path, fs::Permissions::from_mode(0o755)).expect("chmod");
+        make_runnable(path);
     }
 
     #[test]
@@ -698,6 +715,9 @@ mod tests {
         assert!(label.contains("store/trust/current/bin"), "{label}");
     }
 
+    /// Unix-pinned on the `current` SYMLINK, which is the shape `aterm pkg
+    /// install trust` really lays down on the platforms that carry a store.
+    #[cfg(unix)]
     #[test]
     fn the_atpkg_store_is_probed_ahead_of_the_from_source_default() {
         // `aterm pkg install trust` lays the toolchain down at
@@ -860,6 +880,11 @@ mod tests {
         fs::remove_dir_all(&tmp).ok();
     }
 
+    /// Unix-pinned: the defect is a `build/host` DIRECTORY SYMLINK, and
+    /// planting one off unix is `std::os::windows::fs::symlink_dir` behind a
+    /// privilege the runner may not hold. `fs::canonicalize` — the fix under
+    /// test — is portable and is exercised by the sibling tests everywhere.
+    #[cfg(unix)]
     #[test]
     fn a_symlinked_stage2_resolves_to_its_physical_path() {
         // Trust's drivers reject a symlinked toolchain path, so `build/host` —

@@ -498,6 +498,42 @@ pub const fn update_channel_signing_pubkey() -> &'static str {
 // and the notarytool credential is stored under keychain profile "notary".
 pub const APPLE_TEAM_ID: &str = "A66A9P66Z7";
 
+/// The Windows code-signing **publisher** for the optional Tier WINDOWS anchor —
+/// the Windows twin of [`APPLE_TEAM_ID`], read by `cargo winsign`
+/// (`crates/aterm-winsign`).
+///
+/// # This one line is the whole switch
+///
+/// Empty (as committed) → Tier WINDOWS is INACTIVE: `cargo winsign sign` signs
+/// when a lane is configured and reports honestly when none is, and nothing
+/// fails a build over a missing or self-signed signature. Set → ACTIVE: every
+/// shipped `aterm.exe` must be signed, timestamped, chain to a root the default
+/// Authenticode policy trusts, and its leaf certificate must be issued to
+/// EXACTLY this string — or `cargo winsign` refuses. The value is the leaf's
+/// subject Common Name as `signtool verify /v` prints it after `Issued to:`
+/// (the `Publisher` an MSIX manifest carries is the full DN; this is its CN).
+///
+/// # Why a signature at all, and why not a self-signed one
+///
+/// Windows 11 with Smart App Control ON runs an unsigned exe only while the
+/// reputation service happens to allow it, and Code Integrity refuses it
+/// (event 3077, "did not meet the Enterprise signing level requirements")
+/// whenever that changes — measured on 2026-09-15 on an installed
+/// `aterm-gui.exe` that had run the day before. Only a publicly trusted chain
+/// clears that policy: Azure Trusted Signing (the lane Microsoft recommends for
+/// exactly this) or a CA-issued code-signing certificate. A self-signed
+/// certificate, however widely trusted locally, does not, so it is not a lane.
+///
+/// # ACTIVATION CHECKLIST — turning Tier WINDOWS on
+///
+/// 1. Obtain the identity (apps/aterm-win/SIGNING.md walks both lanes).
+/// 2. Sign a build with it while the anchor is still empty and read the
+///    `Issued to:` line `cargo winsign verify` prints back — THAT string, byte for
+///    byte, is the value to commit here.
+/// 3. Commit it. From that commit on, an unsigned or wrongly signed Windows
+///    exe is refused by the tool, never shipped by accident.
+pub const WINDOWS_SIGNING_PUBLISHER: &str = "";
+
 /// Whether an anchor is active. Fail-closed: an empty anchor is never active.
 ///
 /// Unlike the `pin_active` it replaces, this takes NO opt-out environment variable.
@@ -592,6 +628,21 @@ mod tests {
     fn empty_anchor_is_never_active() {
         assert!(!anchor_active(""));
         assert!(anchor_active("any-nonempty-value"));
+    }
+
+    /// The Windows anchor is the leaf certificate's subject CN exactly as
+    /// `signtool verify /v` prints it after `Issued to:` — never a full DN
+    /// (`CN=…, O=…`), never padded. `cargo winsign` compares it byte for byte,
+    /// so a DN or stray whitespace would refuse every correctly signed build.
+    #[test]
+    fn the_windows_anchor_is_a_bare_common_name_or_empty() {
+        let a = WINDOWS_SIGNING_PUBLISHER;
+        assert_eq!(a, a.trim(), "no leading/trailing whitespace");
+        assert!(!a.contains('\n') && !a.contains('\r'));
+        assert!(
+            !a.starts_with("CN=") && !a.contains(", O=") && !a.contains(",O="),
+            "commit the CN as signtool prints it, not the distinguished name"
+        );
     }
 
     // (The unset-anchor tripwire that stood here was deleted 2026-08-15 as part of the

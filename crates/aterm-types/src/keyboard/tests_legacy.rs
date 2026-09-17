@@ -418,6 +418,31 @@ fn legacy_encode_f12() {
     assert_eq!(result, b"\x1b[24~");
 }
 
+/// Shift+F10 is a REAL legacy sequence — `CSI 21;2 ~`, terminfo `kf22` (xterm
+/// numbers Shift+F1..F12 as F13..F24) — which is why a host chord may not
+/// claim it by default: an application binds it expecting these bytes.
+#[test]
+fn legacy_encode_shift_f10_is_terminfo_kf22() {
+    // F10: CSI 21 ~
+    assert_eq!(
+        encode_key(
+            &Key::Named(NamedKey::F10),
+            Modifiers::empty(),
+            KeyboardMode::empty(),
+        ),
+        b"\x1b[21~"
+    );
+    // Shift+F10: CSI 21;2 ~ — kf22
+    assert_eq!(
+        encode_key(
+            &Key::Named(NamedKey::F10),
+            Modifiers::SHIFT,
+            KeyboardMode::empty(),
+        ),
+        b"\x1b[21;2~"
+    );
+}
+
 // =========================================================================
 // Legacy encoding: editing keys
 // =========================================================================
@@ -521,13 +546,59 @@ fn legacy_encode_numpad_enter_app_keypad() {
 
 #[test]
 fn legacy_encode_numpad_enter_app_keypad_shift_cancels() {
-    // Shift cancels application keypad mode — NumpadEnter reverts to CR (#7558).
+    // Shift cancels application keypad mode (#7558) — and what is left is the
+    // main Shift+Enter, aterm's LF imposition, NOT a bare CR: a physical
+    // Shift+KP_Enter typed LF before the keypad seam told KP_Enter apart, and
+    // the keypad's Enter is a second Return to the hand on it.
     let result = encode_key(
         &Key::Named(NamedKey::NumpadEnter),
         Modifiers::SHIFT,
         KeyboardMode::APP_KEYPAD,
     );
-    assert_eq!(result, vec![0x0d]);
+    assert_eq!(result, vec![0x0a]);
+}
+
+/// Outside application keypad mode KP_Enter is the main Enter byte for byte:
+/// plain CR, Shift's LF, Ctrl's CR, Alt's ESC CR — the same table
+/// `encode_control_named_legacy` keeps for Return, so the two cannot drift.
+#[test]
+fn legacy_numpad_enter_outside_app_keypad_is_the_main_enter() {
+    for mods in [
+        Modifiers::empty(),
+        Modifiers::SHIFT,
+        Modifiers::CTRL,
+        Modifiers::ALT,
+        Modifiers::SHIFT | Modifiers::CTRL,
+        Modifiers::SHIFT | Modifiers::ALT,
+    ] {
+        assert_eq!(
+            encode_key(
+                &Key::Named(NamedKey::NumpadEnter),
+                mods,
+                KeyboardMode::empty()
+            ),
+            encode_key(&Key::Named(NamedKey::Enter), mods, KeyboardMode::empty()),
+            "{mods:?}: KP_Enter and Return differ outside DECKPAM"
+        );
+    }
+    assert_eq!(
+        encode_key(
+            &Key::Named(NamedKey::NumpadEnter),
+            Modifiers::SHIFT,
+            KeyboardMode::empty()
+        ),
+        vec![0x0a],
+        "the witness: Shift+KP_Enter is the LF imposition"
+    );
+    // Application mode keeps its own forms — SS3 M, and ESC ? M under VT52.
+    assert_eq!(
+        encode_key(
+            &Key::Named(NamedKey::NumpadEnter),
+            Modifiers::empty(),
+            KeyboardMode::APP_KEYPAD | KeyboardMode::VT52_MODE
+        ),
+        b"\x1b?M"
+    );
 }
 
 #[test]
@@ -915,5 +986,99 @@ fn legacy_special_modifiers_off_strips_numlock() {
             mode,
         ),
         vec![0x1b, b'a']
+    );
+}
+
+/// THE CENTRE KEY NEVER TYPES A DIGIT. KP_Begin is the NumLock-off centre of
+/// the keypad: xterm's `kb2`, `CSI E` in normal mode and `SS3 E` under DECKPAM
+/// — which this arm's own comment always said, while it emitted a bare `5`.
+/// Nothing could reach it until the winit seam gave the GUI a road to
+/// `NumpadBegin`; shipping the road and the digit together would have started
+/// typing a stray `5` at the shell prompt where a NumLock-off KP_5 wrote
+/// nothing before. The key has no glyph at all — that is why xkb calls it
+/// `Unidentified` and why `main_block_twin` refuses it.
+#[test]
+fn legacy_numpad_begin_is_the_xterm_letter_form_never_a_digit() {
+    let begin = Key::Named(NamedKey::NumpadBegin);
+    assert_eq!(
+        encode_key(&begin, Modifiers::empty(), KeyboardMode::empty()),
+        b"\x1b[E",
+        "outside application keypad mode KP_Begin is CSI E"
+    );
+    assert_eq!(
+        encode_key(&begin, Modifiers::empty(), KeyboardMode::APP_KEYPAD),
+        b"\x1bOE"
+    );
+    // Shift cancels application keypad mode, as it does for every keypad key.
+    assert_eq!(
+        encode_key(&begin, Modifiers::SHIFT, KeyboardMode::APP_KEYPAD),
+        b"\x1b[E"
+    );
+    // ALT is `altSendsEscape` on the sequence the key would otherwise send.
+    assert_eq!(
+        encode_key(&begin, Modifiers::ALT, KeyboardMode::empty()),
+        b"\x1b\x1b[E"
+    );
+    // VT52 application keypad keeps its keypad-character form.
+    assert_eq!(
+        encode_key(
+            &begin,
+            Modifiers::empty(),
+            KeyboardMode::APP_KEYPAD | KeyboardMode::VT52_MODE
+        ),
+        b"\x1b?5"
+    );
+    // The legacy byte and the kitty letter form agree, which is the point.
+    assert_eq!(
+        encode_key(
+            &begin,
+            Modifiers::empty(),
+            KeyboardMode::DISAMBIGUATE_ESC_CODES
+        ),
+        b"\x1b[E"
+    );
+}
+
+/// NUMLOCK DOES NOT CANCEL DECKPAM — decided, not inherited. NumLock is a LOCK,
+/// not a chord: `encode_named_legacy` already masks it out of the modifier
+/// parameter (xterm's `numLock` resource does the same), and it must not reach
+/// into application keypad mode either. The alternative was tried on paper and
+/// refutes itself: a physical keypad only ever produces DIGITS while NumLock is
+/// ON (with it off the keys are End/Down/PageDown/…), so "NumLock cancels
+/// application mode" would put DECKPAM's `SS3 p..y` permanently out of reach of
+/// a keyboard — reinstating the exact unreachability this change removes.
+///
+/// The visible consequence, accepted: inside a program that sets DECKPAM
+/// (`smkx` — vim, less, tmux) the keypad digits now send `SS3 p..y` instead of
+/// `0..9`. vim translates unmapped `<k0>`..`<k9>` back to their digits, so it
+/// is unaffected; `less` does not, so a line number typed on the keypad no
+/// longer reaches it. That is what xterm does with the same key, and the SS3
+/// forms are what an application asked for when it set the mode.
+#[test]
+fn legacy_numpad_digit_under_app_keypad_ignores_num_lock() {
+    let kp5 = Key::Named(NamedKey::Numpad5);
+    assert_eq!(
+        encode_key(&kp5, Modifiers::NUM_LOCK, KeyboardMode::APP_KEYPAD),
+        b"\x1bOu",
+        "NumLock must not demote DECKPAM's SS3 form to a digit"
+    );
+    assert_eq!(
+        encode_key(&kp5, Modifiers::empty(), KeyboardMode::APP_KEYPAD),
+        b"\x1bOu",
+        "…and the lock bit changes nothing either way"
+    );
+    assert_eq!(
+        encode_key(&kp5, Modifiers::NUM_LOCK, KeyboardMode::empty()),
+        b"5",
+        "with no application keypad mode the keypad still types its glyph"
+    );
+    // SHIFT remains the one thing that cancels application keypad mode.
+    assert_eq!(
+        encode_key(
+            &kp5,
+            Modifiers::NUM_LOCK | Modifiers::SHIFT,
+            KeyboardMode::APP_KEYPAD
+        ),
+        b"5"
     );
 }

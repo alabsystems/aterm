@@ -4,12 +4,16 @@
 
 //! Lock-free mirror of the terminal's INPUT-ENCODING modes.
 //!
-//! [`Terminal::keyboard_mode`](super::Terminal::keyboard_mode) and
-//! [`Terminal::mouse_mode`](super::Terminal::mouse_mode) are pure folds of state
-//! that only `process()` (on the PTY reader thread) and a handful of host
-//! mutators change. The input seam used to take the terminal mutex ON EVERY KEY
-//! PRESS solely to read that fold — a second queue position behind the reader's
-//! `process()` slice for a value the reader had just finished publishing.
+//! [`Terminal::keyboard_mode`](super::Terminal::keyboard_mode),
+//! [`Terminal::mouse_mode`](super::Terminal::mouse_mode) and
+//! [`Terminal::focus_reporting_enabled`](super::Terminal::focus_reporting_enabled)
+//! are pure folds of state that only `process()` (on the PTY reader thread) and
+//! a handful of host mutators change. The input seam used to take the terminal
+//! mutex ON EVERY KEY PRESS solely to read that fold — a second queue position
+//! behind the reader's `process()` slice for a value the reader had just
+//! finished publishing. The DEC 1004 gate joined the word for the same reason
+//! one step further out: its reader is the window's tab/pane re-stabilization
+//! point, which is forbidden to take the engine mutex at all.
 //!
 //! The mirror is that fold, published as atomics the seam reads WITHOUT the
 //! mutex. It is refreshed under the lock at the end of every `process()` batch
@@ -28,7 +32,7 @@
 //! on read, so a reader that observes the new word also observes everything
 //! the batch that produced it wrote before it.
 
-use std::sync::atomic::{AtomicU8, AtomicU16, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU8, AtomicU16, Ordering};
 
 use aterm_types::keyboard::KeyboardMode;
 use aterm_types::mouse::MouseMode;
@@ -40,6 +44,8 @@ pub struct ModeMirror {
     keyboard: AtomicU16,
     /// [`MouseMode`] discriminant (`repr(u8)`, `None = 0`).
     mouse: AtomicU8,
+    /// DEC 1004 (focus reporting) — `modes.focus_reporting`.
+    focus: AtomicBool,
 }
 
 impl ModeMirror {
@@ -62,10 +68,25 @@ impl ModeMirror {
         self.mouse.load(Ordering::Acquire) != 0
     }
 
+    /// Lock-free twin of `Terminal::focus_reporting_enabled()` (DEC 1004).
+    ///
+    /// The focus report is written from the WINDOW's re-stabilization point —
+    /// a tab switch, a pane-focus move — which runs on the winit thread and
+    /// states as its own law that it must never take an engine mutex (a
+    /// flooding pane's reader holds that mutex for a whole `process()` slice).
+    /// Reading the armed bit here is what keeps that true: the common case is
+    /// no session anywhere having asked for DEC 1004, and the old gate paid a
+    /// blocking acquisition per holder move to learn it.
+    #[must_use]
+    pub fn focus_reporting_enabled(&self) -> bool {
+        self.focus.load(Ordering::Acquire)
+    }
+
     /// Publish a fresh fold. Called only by the terminal, under its mutex.
-    pub(crate) fn publish(&self, keyboard: KeyboardMode, mouse: MouseMode) {
+    pub(crate) fn publish(&self, keyboard: KeyboardMode, mouse: MouseMode, focus: bool) {
         self.keyboard.store(keyboard.bits(), Ordering::Release);
         self.mouse.store(mouse as u8, Ordering::Release);
+        self.focus.store(focus, Ordering::Release);
     }
 }
 
@@ -91,11 +112,15 @@ impl super::Terminal {
     }
 
     /// Re-publish the fold. Every mutation site that can move an input of
-    /// `keyboard_mode()` / `mouse_mode()` outside `process()` calls this;
-    /// `process_at` calls it once per batch after the parser has run.
+    /// `keyboard_mode()` / `mouse_mode()` / `focus_reporting_enabled()` outside
+    /// `process()` calls this; `process_at` calls it once per batch after the
+    /// parser has run.
     pub(crate) fn refresh_mode_mirror(&self) {
-        self.mode_mirror
-            .publish(self.keyboard_mode(), self.mouse_mode());
+        self.mode_mirror.publish(
+            self.keyboard_mode(),
+            self.mouse_mode(),
+            self.focus_reporting_enabled(),
+        );
     }
 
     /// The obligation: the published word equals the live fold. Asserted at the
@@ -113,6 +138,11 @@ impl super::Terminal {
             self.mode_mirror.mouse_mode(),
             self.mouse_mode(),
             "mouse-mode mirror out of sync: a mutation site forgot refresh_mode_mirror()"
+        );
+        debug_assert_eq!(
+            self.mode_mirror.focus_reporting_enabled(),
+            self.focus_reporting_enabled(),
+            "focus-report mirror out of sync: a mutation site forgot refresh_mode_mirror()"
         );
     }
 }
@@ -138,6 +168,11 @@ mod tests {
             m.mouse_tracking_enabled(),
             term.mouse_tracking_enabled(),
             "tracking after {what}"
+        );
+        assert_eq!(
+            m.focus_reporting_enabled(),
+            term.focus_reporting_enabled(),
+            "focus reporting after {what}"
         );
     }
 
@@ -170,6 +205,12 @@ mod tests {
             ("mouse 1003", b"\x1b[?1003h"),
             ("mouse 9 (x10)", b"\x1b[?9h"),
             ("mouse off", b"\x1b[?1003l\x1b[?9l"),
+            // DEC 1004 — the focus-report gate the window's tab/pane lane reads
+            // lock-free. Both edges, because the gate is a bool and a mirror
+            // that only ever latched TRUE would still pass a set-only walk.
+            ("focus reporting on", b"\x1b[?1004h"),
+            ("focus reporting off", b"\x1b[?1004l"),
+            ("focus reporting on again", b"\x1b[?1004h"),
             (
                 "enter alt screen with own kitty state",
                 b"\x1b[?1049h\x1b[>2u",
@@ -196,6 +237,13 @@ mod tests {
         );
         term.process(b"\x1b[?1000h");
         assert_eq!(term.mode_mirror().mouse_mode(), MouseMode::Normal);
+        // ... and the focus gate really is readable without the mutex: this is
+        // the exact word `input::seam_egress`'s Focus arm now consults from the
+        // winit thread instead of blocking on the engine lock.
+        term.process(b"\x1b[?1004h");
+        assert!(term.mode_mirror().focus_reporting_enabled());
+        term.process(b"\x1b[?1004l");
+        assert!(!term.mode_mirror().focus_reporting_enabled());
     }
 
     #[test]
@@ -213,17 +261,39 @@ mod tests {
         );
         term.set_kitty_keyboard_enabled(true);
         assert_in_sync(&term, "set_kitty_keyboard_enabled(true)");
+        // THE HOST IS A MUTATION SITE: `apply_config` arms DEC 1004 through
+        // `apply_negotiated_mode`, outside `process()`. Without the republish at
+        // the end of `apply_config` the lock-free word the focus seam reads goes
+        // stale here, and the obligation assert below fires on the next output
+        // byte rather than at the site that broke it.
+        let mut config = crate::config::TerminalConfig::default();
+        config.focus_reporting = true;
+        let _ = term.apply_config(&config);
+        assert!(term.focus_reporting_enabled(), "the host armed DEC 1004");
+        assert_in_sync(&term, "apply_config(focus_reporting = true)");
+        term.process(b"x");
+        assert_in_sync(&term, "one output byte after apply_config");
+        term.process(b"\x1b[?1004h");
+        assert_in_sync(&term, "focus reporting armed");
         term.reset();
         assert_in_sync(&term, "reset()");
         assert_eq!(term.mode_mirror().mouse_mode(), MouseMode::None);
+        assert!(
+            !term.mode_mirror().focus_reporting_enabled(),
+            "a reset disarms DEC 1004 in the lock-free word too"
+        );
 
         // Checkpoint hydration, both paths.
         let mut source = Terminal::new(24, 80);
-        source.process(b"\x1b[>1u\x1b[?1002h\x1b[?1h");
+        source.process(b"\x1b[>1u\x1b[?1002h\x1b[?1h\x1b[?1004h");
         let cp = source.checkpoint();
         let fresh = Terminal::from_checkpoint(&cp, super::super::HostBindings::default());
         assert_in_sync(&fresh, "from_checkpoint");
         assert_eq!(fresh.mode_mirror().mouse_mode(), MouseMode::ButtonEvent);
+        assert!(
+            fresh.mode_mirror().focus_reporting_enabled(),
+            "a hydrated terminal carries DEC 1004 into the lock-free word"
+        );
         let mut live = Terminal::new(24, 80);
         live.restore_checkpoint(&cp);
         assert_in_sync(&live, "restore_checkpoint");

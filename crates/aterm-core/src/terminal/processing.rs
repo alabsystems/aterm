@@ -120,7 +120,15 @@ impl Terminal {
         // grid whose offset was pinned here — see the re-pin below.
         let was_alt = self.modes.alternate_screen;
         if pinned_offset > 0 {
-            self.grid.scroll_to_bottom();
+            // `pin_viewport_to_live_for_output_batch`, not `scroll_to_bottom`: the
+            // motion is identical, but this half of the dance is the MACHINE forcing
+            // a precondition it undoes at the epilogue, and the grid's
+            // `reader_live_bottom_gen` must not record it as the reader pressing End.
+            // Something downstream reads that generation to decide whether a 0
+            // display_offset was chosen or inflicted (the reflow-offload window's
+            // audit-#7 guard), and with the reader's entry point here every batch of
+            // output arriving under a scrolled-back reader would file a gesture.
+            self.grid.pin_viewport_to_live_for_output_batch();
         }
         // PRESS CUSTODY, site 1 of 3 is `pinned_offset` above — the pre-batch reading
         // position, read one statement before the line that forces it to 0. It is the

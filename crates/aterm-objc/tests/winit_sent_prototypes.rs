@@ -610,7 +610,7 @@ const CLASS_ROWS: &[(&str, &str, &str)] = &[
 /// strength. It is a separate table so that a reader who greps for the name in
 /// `aterm-objc` and finds nothing is not left wondering.
 ///
-/// `window_delegate.rs:837` declares
+/// `window_delegate.rs:876` declares
 /// `unsafe extern "C-unwind" fn(Id, Sel, CGRect, usize, usize, Bool) -> Id`.
 const MSG_POINTER_ROWS: &[(&str, &str, &str)] = &[
     (
@@ -770,8 +770,8 @@ fn every_sent_selector_encodes_the_way_its_helper_spells_it() {
 /// nothing checked it against the FORK. Its only coverage-shaped assertion,
 /// `checked >= 183`, counts the table's own rows — so a new `sel!` in a ported
 /// file with no row here was invisible, and four of them were: `cursor.rs:103`'s
-/// ten-argument `-initWithBitmapDataPlanes:…`, `window_delegate.rs:840`'s
-/// `-initWithContentRect:…`, and `view.rs:1585` and `event.rs:386`'s two
+/// ten-argument `-initWithBitmapDataPlanes:…`, `window_delegate.rs:886`'s
+/// `-initWithContentRect:…`, and `view.rs:1665` and `event.rs:386`'s two
 /// `+[NSEvent …]` factories. All four were MEASURED correct when pass 14 finally
 /// asked the runtime — the defect was in the guard, not the code, which is
 /// exactly the shape that survives a wave.
@@ -911,9 +911,9 @@ fn every_selector_the_fork_sends_has_a_census_row() {
     // sends through a raw `aterm_objc::msg()` cast instead, and the walk was
     // measurably blind to two of them:
     //
-    //   app_state.rs:376        conformsToProtocol:                  not seen
-    //   window_delegate.rs:840  initWithContentRect:styleMask:…      not seen
-    //   app_state.rs:307        isKindOfClass:                       seen ONLY
+    //   app_state.rs:404        conformsToProtocol:                  not seen
+    //   window_delegate.rs:886  initWithContentRect:styleMask:…      not seen
+    //   app_state.rs:329        isKindOfClass:                       seen ONLY
     //                           because cursor.rs also sends it via `send_bool_cls`
     //
     // Either of those could have been excused in `NOT_SENT` and this arm would

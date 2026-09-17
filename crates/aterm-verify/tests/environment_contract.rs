@@ -13,6 +13,20 @@
 //!
 //! Every fixture writes its own ignore rules: nothing here may depend on the
 //! workspace's `.gitignore`.
+//!
+//! UNIX-PINNED, AT THE TARGET RATHER THAN PER TEST. Every fixture in this file
+//! is a `#!/bin/sh` script made runnable with `chmod 0755`, an unreadable file
+//! minted with `chmod 0000`, or a `std::os::unix::fs::symlink` — the shapes a
+//! POSIX gate is ABOUT. There is no Windows spelling of "the tree changed under
+//! a 14-hour run" that these fixtures would still be testing: `PATHEXT` has no
+//! 0755, an ACL-denied read is not `chmod 0000`, and a symlink there needs a
+//! privilege the test runner does not have. Without this attribute the file did
+//! not COMPILE for a non-unix target, which cost the whole `aterm-verify` test
+//! binary — this crate ships inside `aterm-cli`, so the loss was every one of
+//! this crate's laws on Windows, not this file's. `xtask gate cells` now
+//! type-checks every cell's test targets, which is what makes that statement
+//! checkable from a machine that is not Windows.
+#![cfg(unix)]
 
 use std::fs;
 use std::os::unix::fs::PermissionsExt;
@@ -129,7 +143,10 @@ impl Fixture {
             "tools/verify.sh",
             "tools/test-install-channel.sh",
             "tools/test-atpkg-vendor-tooling.sh",
+            "tools/test-atpkg-mirror-extras.sh",
             "tools/test-atpkg-auto-vendor.sh",
+            "tools/test-atpkg-target-pins.sh",
+            "tools/test-linux-auto-atpkg.sh",
             "tools/test-atpkg-pack-one-compiler.sh",
             "tools/test-trust-gate-verdict.sh",
             "tools/test-trust-contract-probe.sh",

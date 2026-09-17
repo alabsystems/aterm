@@ -113,16 +113,32 @@ pub(super) const LANE_CADENCE: u8 = 8;
 /// [`CASCADE_EXCLUSIVE_MS`] window — the cascade never stacks.
 pub(super) const LANE_CASCADE: u8 = 9;
 /// THE GRAFTS — the voices that hang off a key without being a step: the
-/// bare Shift's pickup, the shifted key's ring, the `?` rise, the bracket
-/// tink, the `=` fifth (§10.4, the owner's request of 2026-09-10). Cap 2,
-/// FADE-STEAL: a graft is an identity (the capital's ring is what says
-/// "capital"), so an identity is never dropped — the most-decayed graft
-/// yields over [`LANE_FADE_STEAL_S`] and [`lane_drops_the_newcomer`] stays
-/// `GLINT | BLOOM`. Cap 2 because a pickup and the ring it resolves into
-/// overlap by design, and at 12 cps SHOUT two rings are live at once
-/// (measured: steals 0, vmax 10). Formerly `LANE_SHIFT`, cap 1 — the lift
-/// alone; same lane number, so nothing in the wire format moved.
+/// shifted key's ring, the `?` rise, the bracket tink, the `=` fifth (§10.4,
+/// the owner's request of 2026-09-10). Cap 2, FADE-STEAL: a graft is an
+/// identity (the capital's ring is what says "capital"), so an identity is
+/// never dropped — the most-decayed graft yields over [`LANE_FADE_STEAL_S`]
+/// and [`lane_drops_the_newcomer`] stays `GLINT | BLOOM`. Cap 2 because at
+/// 12 cps SHOUT two rings are live at once (measured: steals 0, vmax 10),
+/// and a shifted mark's ring and its graft (`?`'s rise, `(`'s tink, `+`'s
+/// fifth) are live together by design. Formerly `LANE_SHIFT`, cap 1 — the
+/// lift alone; same lane number, so nothing in the wire format moved. The
+/// bare Shift's pickup lived here from 2026-09-10 until the ting got its own
+/// lane ([`LANE_TING`]).
 pub(super) const LANE_GRAFT: u8 = 10;
+/// THE TING — the bare Shift's bell ([`TING_LEVEL`]), alone. Cap 1: a
+/// second Shift replaces the first (`v2_shift` damps it explicitly, and the
+/// cap says the same thing), and nothing else can touch it.
+///
+/// It was a GRAFT until the review of 2026-09-16 measured what cap 2 does to
+/// a ting under a SHIFTED MARK: Shift, then `?` 60 ms on, puts the `?`'s
+/// rise (60 ms behind the key) AND the capital's ring (60 ms behind the key)
+/// into GRAFT beside the ting — three voices, cap 2, and the lane's
+/// fade-steal takes the OLDEST, which is the ting, ~120 ms after the Shift at
+/// ~0.24 of its peak: cut under the key it announced, the very mechanism the
+/// ting was built to escape (`the_ting_rings_through_the_next_key` renders
+/// Shift then `?` / `(` / `+` and pins it). In its own lane the ting can
+/// neither be stolen by a graft nor steal one.
+pub(super) const LANE_TING: u8 = 11;
 
 /// FADE-STEAL / DAMP RAMP, seconds. §9.5 law 2: a damp is a ramp, never a cut.
 /// It IS the shipped [`super::SPACE_DAMP_S`] — an alias, not a second 0.012,
@@ -171,14 +187,16 @@ pub(super) const LANE_AGE_GUARD_S: f32 = 0.040;
 ///
 /// **The arithmetic, so nobody re-derives it wrong:** TUNE 4 + BLOOM 2 + BASS
 /// 1 + BREATH 1 + GLINT 3 + METEOR 3 + RAIN 3 + CADENCE 1 + CASCADE 4 + GRAFT
-/// 2 = **24**; + POOF 2 = **26 of 28**. `MAX_VOICES` stays 28 (growing it
-/// would expose the v1 oracle), so GRAFT's second slot (2026-09-10: the lift
-/// lane grew from cap 1 to hold the pickup and the ring together) came out
-/// of the headroom §14 had booked to the PEDAL lane that is not built: PEDAL's
-/// booking drops from 3 to **2**, and CASCADE's three extra slots are still
-/// the rest of what §14 books to it. The day a pedal lane lands it needs 3:
-/// CASCADE must give one back, or `MAX_VOICES` must grow to 29 — either way
-/// the 28-slot argument has to be re-made, not assumed.
+/// 2 + TING 1 = **25**; + POOF 2 = **27 of 28**. `MAX_VOICES` stays 28
+/// (growing it would expose the v1 oracle), so GRAFT's second slot
+/// (2026-09-10: the lift lane grew from cap 1 to hold the pickup and the
+/// ring together) and the ting's own slot (2026-09-16: the ting left GRAFT,
+/// see [`LANE_TING`]) came out of the headroom §14 had booked to the PEDAL
+/// lane that is not built: PEDAL's booking drops from 3 to **1**, and
+/// CASCADE's three extra slots are still the rest of what §14 books to it.
+/// The day a pedal lane lands it needs 3: CASCADE must give two back, or
+/// `MAX_VOICES` must grow to 30 — either way the 28-slot argument has to be
+/// re-made, not assumed.
 /// `the_lanes_hold_their_caps_and_steals_are_zero` runs §14's worst case
 /// against this table.
 pub(super) fn lane_cap(lane: u8) -> usize {
@@ -186,8 +204,9 @@ pub(super) fn lane_cap(lane: u8) -> usize {
         LANE_TUNE | LANE_CASCADE => 4,
         LANE_BLOOM | LANE_GRAFT => 2,
         LANE_GLINT | LANE_METEOR | LANE_RAIN => 3,
-        // BASS, BREATH, CADENCE — and anything unnamed, which cannot occur
-        // but must not silently become unbounded.
+        // BASS, BREATH, CADENCE, TING — and anything unnamed, which cannot
+        // occur but must not silently become unbounded.
+        LANE_BASS | LANE_BREATH | LANE_CADENCE | LANE_TING => 1,
         _ => 1,
     }
 }
@@ -1311,15 +1330,41 @@ const BASS_DECAY_S: f32 = 0.111;
 /// 111.
 const BASS_DUR_S: f32 = TAIL_DUR_PER_TAU * BASS_DECAY_S;
 const BASS_ROOF_HZ: f32 = 900.0;
-/// Root −6 dB re the step, the fifth (0.22 / 0.32 under it) at −9 — §22's
-/// A/B item 5, "felt, not heard", in place of §11's −3 / −6.
+/// **THE DOWNBEAT'S LEVEL — RE-RULED 2026-09-16.** The owner, verbatim:
+/// *"i don't always hear the space bar? get some kind of musical sound for
+/// multiple spaces in addition to the soft word separator"*. That sentence
+/// is the newer instruction over §22's A/B item 5 of 2026-09-10 ("felt, not
+/// heard": root −6 / fifth −9 / dur 300), which this constant carried at
+/// 0.501 (−6 dB re the step) with the roof at [`BASS_ROOF_HZ`] — and which
+/// MEASURED, on the bench's isolated `Space` probe (vol 0.4, 2026-09-16,
+/// before this change): −30.82 dBFS against the Typed letter's −22.10 —
+/// **8.7 dB under a keystroke**, centroid 303 Hz, energy over 2 kHz
+/// **0.000**. A dark dyad an octave under the tune with nothing above
+/// 2 kHz is precisely what a laptop speaker rolls off, and "i don't always
+/// hear the space bar" is the literal report of that spectrum.
 ///
-/// Taken on the capture-after measurement: the downbeat was ≈ 32 % of the
-/// prose mix's energy (Σ gain²·τ over the bench's 60 s at 10 cps: BASS 0.673
-/// × 160 ms against TUNE 3.66 × ≈ 55 ms), and the mix sat +1.7 dB over v1's
-/// RMS. Half the level and two thirds the ring take the dyad to ≈ 11 % of the
-/// mix — a floor you feel under the tune, not a second voice beside it.
-const BASS_LEVEL: f32 = 0.501_187_2;
+/// The head is now HEARD, and still never over the letter: −4 dB re the
+/// step on the dyad (this constant, +2 dB on the 2026-09-10 fit) and a
+/// TWINKLE on the head's breath ([`SPACE_TWINKLE_LEVEL`]) that puts top on
+/// it — v1's own repair of 2026-08-30/31 (`super::SPACE_AIR_LEVEL`, the
+/// word boundary's twinkle) on the music box's lattice. The two crest
+/// together (both on an 8 ms attack), which is why the dyad takes +2 dB
+/// and not +4: the rendered head lands **−4..−5 dB re the Typed letter**
+/// — the ting's tier ([`TING_LEVEL`], −2.8) just above it, the indent
+/// steps ([`SPACE_STEP_LEVEL`]) and the breath under it. Measured after,
+/// same probe: see [`SPACE_TWINKLE_LEVEL`]. The ceiling stands: §9.7's
+/// "never louder than a keystroke" is the law the ladder test pins
+/// (`the_ladder_holds_for_the_key_family`, `space <= typed × 1.05`) and
+/// [`a_space_head_is_heard_and_never_over_the_letter`] pins the window.
+///
+/// What the 2026-09-10 fit was protecting — the downbeat's share of the
+/// prose mix (≈ 32 % at the −3 dB original, ≈ 11 % at −6) — is a
+/// different number from the isolated head's audibility, and the rise here
+/// is on the head's PEAK: the dyad's 111 ms τ is untouched, so the ring
+/// under the tune grows by the same 2 dB and no more. The verdict's dyads
+/// keep the old figure on purpose ([`VERDICT_DYAD_LEVEL`]): an exit code is
+/// told once per command, not once per word.
+const BASS_LEVEL: f32 = 0.630_957_3;
 
 /// §9.3's breath — the air a space moves, and the only thing a run's TAIL
 /// says. Band-passed noise falling 900 → 380 Hz.
@@ -1333,6 +1378,162 @@ const BREATH_DECAY_S: f32 = 0.055;
 const BREATH_DUR_S: f32 = TAIL_DUR_PER_TAU * BREATH_DECAY_S;
 /// −16 dB re the step (§11).
 const BREATH_LEVEL: f32 = 0.158_489_3;
+/// **THE BREATH'S ROOF — AND WHY IT HAS ONE (2026-09-16).** §9.3 gives the
+/// breath no roof ("—"), and [`breath`] was built with `lp_cut` left at
+/// `Voice::default()`'s 0.0. The engine's per-voice softening lowpass is
+/// `lp += lp_k · (s − lp)` with `lp_k = clamp(lp_cut · dt · 2π, 0, 1)`,
+/// so a roof of 0 is a coefficient of 0 and the voice's output is
+/// **identically zero**: every breath the music box has spawned since
+/// 2026-09-06 — the space's exhale, the run tail's "breath only", the
+/// stop's 20 ms-late breath — rendered silence. Measured 2026-09-16 (a tail
+/// space alone, 10 ms rendered: peak 0.0, `lp_k` 0). That is one more
+/// reading of "i don't always hear the space bar". An open roof at the
+/// ting's own figure ([`TING_LP_HZ`]): the 900 → 380 Hz band-pass shapes
+/// the exhale, and the head's twinkle passes through it.
+const BREATH_ROOF_HZ: f32 = TING_LP_HZ;
+/// **THE WORD BOUNDARY'S TWINKLE** (owner, 2026-09-16: *"i don't always
+/// hear the space bar?"* — see [`BASS_LEVEL`] for the measurement it
+/// answers). The head's breath carries its three partials silent, as v1's
+/// air voice did until 2026-08-31, so the top the downbeat never had is
+/// free: no new voice, no lane, no draw. Partial 1 is the dyad's ROOT
+/// octave-folded into the STARDUST lane (`[GLINT_LO_HZ, GLINT_HI_HZ)`,
+/// 2800-5600 Hz — the same light every glint is, §13: C4 → 4186, F4 →
+/// 5581, G4 → 3139.5, A4 → 3488 Hz), so it is the chord's own pitch class
+/// and can never beat against the verse; partial 2 is the octave under it
+/// ([`SPACE_TWINKLE_UNDER`]), in LIT, a little body under the sparkle. Both
+/// share the breath's own envelope (8 / 55 / 149 ms — [`BREATH_DUR_S`] is
+/// 2.7 τ, the tail law, not the tine's 3τ + 20): a twinkle, gone with the
+/// exhale.
+///
+/// LEVEL, as a partial level on the breath voice (× [`BREATH_LEVEL`]):
+/// 0.5 × −16 dB = −22 dB re the step on the twinkle, 8 dB under the dyad's
+/// root. FITTED by rendering (`keyboard_song_ab --probes`, vol 0.4, the
+/// settled `Space` probe, 2026-09-16): before, −30.82 dBFS / centroid
+/// 303 Hz / over-2 kHz 0.000. A first fit at 0.8 with the dyad at −2 dB
+/// crested at −23.94 (−1.8 dB re Typed: heard, and too near the letter);
+/// the shipped pair is recorded on
+/// [`a_space_head_is_heard_and_never_over_the_letter`] — the head sits
+/// −4..−5 dB re the Typed letter with real energy above 2 kHz.
+const SPACE_TWINKLE_LEVEL: f32 = 0.5;
+/// The twinkle's octave-under partner, at −8 dB under it.
+const SPACE_TWINKLE_UNDER: f32 = 0.2;
+/// **THE INDENT STEPS** (owner, 2026-09-16: *"i don't always hear the space
+/// bar? get some kind of musical sound for multiple spaces in addition to the
+/// soft word separator"*) — v1's `SPACE_STEP_*` design on the music box's
+/// own harmony. A run's HEAD is still the one downbeat (the dyad, one chord
+/// step); every LATER space of the run now plays a short soft tine beside
+/// its breath, climbing the live chord's LIT degrees (§10.3's `LIT_SET` —
+/// the three verse tones the chord owns, so a step can only ever be a chord
+/// tone: consonant with the dyad under it and the sky pad under that) from
+/// the first lit degree over the dyad's root — +1 lit degree per admitted
+/// step — up to the last one under `4 × BASS_BASE_HZ` (1046 Hz, the top of
+/// the tune's LOWER octave: the verse band is C5..G6, [`TINE_BASE_HZ`]
+/// 523 Hz up, so a step in 523-1046 Hz SHARES the tune's lower octave —
+/// as a chord tone only, so a step and a verse tine can never be a
+/// dissonance — and never reaches the verse's upper octave), and then the
+/// figure STARTS OVER ([`indent_step_hz`]: a cycle, not a fold — the audit
+/// of 2026-09-16 found the fold's input unbounded). The figure climbs from
+/// the bass register through the tune's floor; a four-space indent rises
+/// about an octave and a bit off its root. The steps move NOTHING: not the
+/// chord, not the playhead, not the beat. (The review of 2026-09-16 caught
+/// this sentence claiming the steps "never enter the verse's band"; they
+/// enter its lower octave by design.)
+///
+/// Level: between the breath ([`BREATH_LEVEL`], −16 dB) and the dyad
+/// ([`BASS_LEVEL`], −4 dB since the same day's re-fit; −6 when this was
+/// fitted) — MEASURED on the bench's `Space×4` probe (four spaces at 10
+/// taps/s, vol 0.4, 2026-09-16, the dyad still at −6): the run's peak is
+/// the head's own (−30.75 dBFS against the lone Space's −30.82 — the steps
+/// never out-peak it), the 250 ms body rises −41.96 → −39.49 dBFS RMS, and
+/// the 10 ms envelope shows each step arriving at −36/−37 dB where the tail
+/// used to fall to −44/−49: every step is heard. RE-MEASURED after the
+/// head's re-fit ([`BASS_LEVEL`], [`SPACE_TWINKLE_LEVEL`]): the run's peak
+/// is still the head's own (−26.57 dBFS, both rows), the body −39.66 →
+/// −38.07 dBFS RMS. In [`LANE_GLINT`]:
+/// cap 3, drops the newcomer rather than cutting a voice under 40 ms — a
+/// decoration that did not happen — so a step can never steal the dyad,
+/// the breath or a tine.
+const SPACE_STEP_LEVEL: f32 = 0.35;
+/// The step's τ: a tick that climbs, gone in 155 ms (`3τ + 20 ms`) — under
+/// the 100 ms of a hand tapping at 10/s, so the figure reads as a figure.
+const SPACE_STEP_TAU_S: f32 = 0.045;
+/// The step's OWN gate on the cue clock, against the run's head or the last
+/// admitted step — v1's [`super::SPACE_STEP_MIN_GAP`] in ms: a hand tapping
+/// 3-4 times (80-125 ms apart) hears every tap; a held spacebar at ~30 Hz
+/// auto-repeat gets one step per 75+ ms (every third repeat: measured 10
+/// steps in one second at 33 ms, `a_run_of_spaces_is_one_downbeat_and_a_
+/// rising_figure`) and cannot machine-gun a bell. The music box has no
+/// `MIN_GAP`, so this is the step's only rate law.
+const SPACE_STEP_MIN_GAP_MS: u32 = 75;
+/// The steps' ceiling: two octaves over [`BASS_BASE_HZ`] — the top of the
+/// tune's lower octave. The figure climbs to just under it and STARTS OVER
+/// ([`indent_step_hz`]); no step is ever at or above it.
+const SPACE_STEP_HI_HZ: f32 = BASS_BASE_HZ * 4.0;
+
+/// THE INDENT STEP's pitch — the `n`-th step of the run's rising figure
+/// (`n` is 1 for the first admitted step, [`MelodyV2::space_steps`]).
+///
+/// The figure is the live chord's lit degrees on the keyed lattice, from
+/// the first one strictly above the dyad's `root` up to the last one under
+/// [`SPACE_STEP_HI_HZ`] — that many notes, then the same notes again from
+/// the first: a CYCLE, strictly rising inside each pass. On chord I over
+/// C4 that is E4 G4 C5 E5 G5 (five), on vi over A4 it is C5 E5 A5 (three).
+///
+/// **Why a cycle and not a fold (audit of 2026-09-16).** The first cut
+/// took the step's degree as `k0 + n − 1` with `n` the run's SPACE count
+/// and folded the pitch down by at most sixteen octaves — so the input was
+/// not bounded and the fold was not total: replayed, chord I's step 54 sat
+/// on the ceiling (1046.5 Hz, `>=` the bound the loop tested with `<`),
+/// step 60 was C8 4186 (the stardust band), step 69 was 33.5 kHz (over
+/// Nyquist, an aliased tone), step 255 was 1.5e23 Hz; chord vi one degree
+/// worse (54 → 1744, 66 → 27.9 kHz). Two seconds of a held spacebar
+/// (~30 Hz auto-repeat, every third repeat admitted) reached it, and so did
+/// paging `less` with 55 spaces — and `a_run_of_spaces_is_one_downbeat_and_
+/// a_rising_figure`'s 30-repeat probe (`n ≤ 29`) counted steps without
+/// hearing one. Now the degree is reduced modulo the figure's own length
+/// BEFORE the lattice is read, so every input is a note of the figure and
+/// the promise §9.4 makes for the band is true for every `n` there is;
+/// `the_indent_figure_is_a_cycle_on_every_chord_and_key` replays every
+/// chord × every song key × 300 steps, and the held-spacebar probe now runs
+/// 96 repeats and hears every step. Total: the search is bounded (the
+/// first lit degree two octaves up is over any root the loop allows), the
+/// cycle has at least one note, and the one halving loop runs only when
+/// that one note is itself at the ceiling — a key of +4 over A4 — on a
+/// finite input a few octaves wide.
+fn indent_step_hz(chord: Chord, root: f32, n: u32, key: i32) -> f32 {
+    let mut lit = [0i32; 3];
+    let mut m = 0usize;
+    for d in 0..5 {
+        if chord.lit & (1 << d) != 0 && m < 3 {
+            lit[m] = d;
+            m += 1;
+        }
+    }
+    let m = m.max(1);
+    let hz = |k: usize| penta(BASS_BASE_HZ, 5 * (k / m) as i32 + lit[k % m] + key);
+    // The first lit degree over the root …
+    let mut k0 = 0usize;
+    for _ in 0..64 {
+        if hz(k0) > root * 1.01 {
+            break;
+        }
+        k0 += 1;
+    }
+    // … and how many lit degrees from it lie under the ceiling: the figure.
+    let mut cycle = 0usize;
+    while cycle < 64 && hz(k0 + cycle) < SPACE_STEP_HI_HZ {
+        cycle += 1;
+    }
+    let cycle = cycle.max(1);
+    let k = k0 + (n.saturating_sub(1) as usize) % cycle;
+    let mut f = hz(k);
+    // Only reachable when the figure's one note is the first lit degree and
+    // it is already at the ceiling; `f` is finite and a few octaves wide.
+    while f.is_finite() && f >= SPACE_STEP_HI_HZ {
+        f *= 0.5;
+    }
+    f
+}
 
 // ===========================================================================
 // §10.4 — the class voices: the wood bar (digits)
@@ -1525,60 +1726,80 @@ const NAV_DECAY_S: f32 = 0.030;
 const NAV_DUR_S: f32 = TAIL_DUR_PER_TAU * NAV_DECAY_S;
 const NAV_LEVEL: f32 = 0.063_095_73;
 
-/// **THE BARE SHIFT INHALES** — the pickup (§10.4, §11; the owner,
-/// 2026-09-10: *"a sound effect for the shift key"*, which REVERSES §3.1's
-/// 2026-09-08 ruling "the lift is felt, not pitched"). A bare Shift is an
-/// ANACRUSIS: one P1 sine a step above the walk, rotating through v1's own
-/// [`super::SHIFT_ROTATION`] on v1's own cursor (`TrailSynth::shift_step`) so
-/// the sounding offsets are `+1 +3 +5 +2 +4` (§22 row 9, reinstated — one
-/// table and one cursor for both engines), reflected into the register by
-/// [`reflect_deg`], under a rising breath of air. What it is NOT is a step:
-/// `MelodyV2::on_typed` is never called, walk / steps / playhead /
-/// `since_voice` are untouched, and the pickup RESOLVES — a 12 ms
-/// [`LANE_FADE_STEAL_S`] damp in `push_v2` — into whatever keyed cue the hand
-/// does next (a capital, a lowercase letter, a space, a deletion, a move), so
-/// it is heard as the breath before the note and never as a note of its own.
-/// An aborted Shift (Shift then nothing, Shift+click) rings its 162 ms alone:
-/// the cat lifted its head.
+/// **THE BARE SHIFT IS A TING** (owner, 2026-09-16, verbatim: *"there is no
+/// 'shift' tone for the rainbow cursor trail, it is supposed to be a 'ting'
+/// or something musical to complement the space bar"*). This REPLACES the
+/// 2026-09-10 pickup ("THE BARE SHIFT INHALES": one P1 sine a step above the
+/// walk under a rising breath, −6 dB re the key, 8 ms swell, RESOLVED by a
+/// 12 ms damp into whatever key the hand did next), which itself replaced
+/// 2026-09-08's felt-not-pitched lift. Both were what the owner could not
+/// hear, and the pickup's own design says why: it was built to be *"heard
+/// as the breath before the note and never as a note of its own"* — and
+/// then cut 60 ms in, when the capital landed. A ting is a note of its own.
 ///
-/// WHY −6 dB. The owner heard v1's lift at `SHIFT_KIND_GAIN 0.5` (−6 dB) well
-/// enough to ask it to rotate (2026-08-31); the −17 dB / 6 ms felt mallet
-/// this replaces measured −61 dBFS at 0.4 on the bench and is what he could
-/// not hear. At 8 cps the previous tine's tail is at ≈ −8.7 dB when Shift
-/// lands, so −6 sits above it and under the key. No velocity draw, no
-/// `g_ioi`: a modifier has no IOI, so its level is a constant per press —
-/// §9.6, no decibel bought with speed.
+/// MEASURED on `keyboard_song_ab --probes` (music box, vol 0.4) before this
+/// change: the bare Shift peaked −28.22 dBFS against the key's −22.10
+/// (−6.1 dB), centroid 786 Hz, energy over 2 kHz EXACTLY 0.000 — a dark
+/// sine that the next key's own strike masked outright.
 ///
-/// A swell, not a strike: ≥ 4 ms is §9.5 law 1's floor under 1 kHz (P1 is
-/// 523-1570 Hz) and 8 ms is the breath's own [`BREATH_ATTACK_S`].
-const LIFT_ATTACK_S: f32 = 0.008;
-/// Pitch and loudness need ~50 ms of tone to register; the 40 ms lift was
-/// gone before its capital landed at the host's measured 60 ms lead.
-const LIFT_DECAY_S: f32 = 0.060;
-/// 162 ms, the tail law: [`TAIL_DUR_PER_TAU`] × 60.
-const LIFT_DUR_S: f32 = TAIL_DUR_PER_TAU * LIFT_DECAY_S;
-/// −3 dB as a constant on a lone P1 ([`P1_LVL`] 0.50) = −6.07 dB PEAK re the
-/// Typed probe (measured −28.22 vs −22.15 dBFS at 0.4 on the prototype): the
-/// tine's peak carries P2 + P3 + the mallet, +3 dB over a lone P1, so the
-/// constant sits 3 dB above the peak figure it buys.
-const LIFT_LEVEL: f32 = 0.707_945_8;
+/// WHAT IT IS NOW. The house struck-glass face on the lift's own rotating
+/// degree: the tine's P1 wearing the 3.01 FM strike glint that dies in
+/// ~18 ms, the octave partial at [`P2_LVL`] on its own τ, the tine's felt
+/// mallet — OCTAVE-FOLDED into the ting's register
+/// ([`super::SHIFT_TING_LO_HZ`], E6..E7: over the tune's C5..G6, under the
+/// stardust's 2.8-5.6 kHz), ringing [`TING_DUR_S`]. The degree is still
+/// `walk + LIFT_STEP_DEG + SHIFT_ROTATION[k]` reflected into the register on
+/// v1's own cursor (one table, one cursor for both engines — five distinct
+/// pitches per lap survive the fold, five pentatonic classes being five
+/// notes inside one octave), so every consonance law the pickup had
+/// survives. And it RINGS THROUGH the key it announces: `push_v2` no longer
+/// damps it on the next keyed cue — only a second Shift replaces it (never
+/// two tings). What it is still NOT is a step: `MelodyV2::on_typed` is never
+/// called, walk / steps / playhead / `since_voice` are untouched.
+///
+/// A strike, not a swell: 3 ms. §9.5 law 1's 4 ms floor is stated for
+/// voices UNDER 1 kHz; the ting sits at 1.3-2.6 kHz, where 3 ms is four
+/// cycles.
+const TING_ATTACK_S: f32 = 0.003;
+/// The ring: an 85 ms τ, the same figure as v1's ting ([`super::SHIFT_TING_DECAY_S`]).
+const TING_DECAY_S: f32 = super::SHIFT_TING_DECAY_S;
+/// 430 ms — v1's ting's own life ([`super::SHIFT_TING_DUR_S`]:
+/// [`super::RING_OUT_PER_TAU`] × 85 + the release ramp), so the ting DECAYS
+/// OUT: −40 dB re its own peak at 381 ms, 44 ms before the ramp starts. It
+/// was 230 ms by the tail law ([`TAIL_DUR_PER_TAU`] × 85), which ended it
+/// at −23 dB — measured 2026-09-16 (the audit's third observation): the
+/// ring time to −40 dB and to −60 dB both read 228.6 ms of a 229.5 ms
+/// life, the voice's end, a cut. Pinned by
+/// `the_ting_decays_out_instead_of_being_cut` on both engines.
+const TING_DUR_S: f32 = super::SHIFT_TING_DUR_S;
+/// The strike glint's FM index and life — v1's ting's own.
+const TING_GLINT: f32 = super::SHIFT_TING_GLINT;
+const TING_GLINT_TAU_S: f32 = super::SHIFT_TING_GLINT_TAU_S;
+/// The ting's roof — open, so the glint's sidebands (the "ting") pass; the
+/// pickup's 3 kHz roof was built to keep a breath under the note.
+const TING_LP_HZ: f32 = 9000.0;
+/// The ting's level against `KEY_TINE_TRIM`. FITTED by rendering,
+/// 2026-09-16 (`keyboard_song_ab --probes`, vol 0.4, the settled probe):
+/// −24.89 dBFS against the Typed probe's −22.10 — −2.8 dB, the Space's own
+/// tier — centroid 1763 Hz, energy over 2 kHz 0.081, tonality 955, against
+/// the pickup's −28.22 / 786 Hz / 0.000 / 322. On the isolated-seed ladder
+/// (`the_ladder_holds_for_the_key_family`) it is 0.64 of the keystroke
+/// (−3.9 dB), inside the window that test pins for every voice
+/// ([0.5, 1.05] × Typed): a note you count beside the letter, never over
+/// it. No velocity draw, no `g_ioi`: a modifier has no IOI, so its level is
+/// a constant per press (§9.6, no decibel bought with speed). AUDIT
+/// 2026-09-16: the letter a ting is heard beside spreads across the walk,
+/// so the bench's `ting` verdict now reads the Shift against the WALK-MEAN
+/// Typed over settle 3/6/9/12 (`keyboard_song_ab` `PROBE_WALK_SETTLES`):
+/// −2.42 dB there (the −2.79 above is the one-degree row); the independent
+/// re-measurement over 9 seeds read −2.79..−5.03 (median −3.53) at the
+/// accent slot — pitched (tonality 955..1257), G6/C7, ringing ~216 ms
+/// (the life was 230 ms then; since the audit's follow-up it is 430 —
+/// [`TING_DUR_S`] — and rings to −40 dB at 381 ms).
+const TING_LEVEL: f32 = 0.66;
 /// The step above the walk that [`super::SHIFT_ROTATION`]'s `{0,2,4,1,3}` is
 /// added to — `{1,3,5,2,4}` above the walk, §22 row 9's sounding sequence.
 const LIFT_STEP_DEG: i32 = 1;
-/// THE INHALE: rising air under the pickup. The breath falls 900→380, the
-/// mallet rises 900→3200 in 5 ms (a click), the whoosh's 1600→5200 is the
-/// meteor's alone — 500→1600 over 50 ms is the one noise contour nothing
-/// else owns, and it rises because an inhale does. §9.4: it is a BREATH,
-/// never a sparkle. Q 0.8 is under law 6's 1.6; τ 45 ms dies with the tone.
-const LIFT_AIR_LVL: f32 = 0.45;
-const LIFT_AIR_HZ0: f32 = 500.0;
-const LIFT_AIR_HZ1: f32 = 1600.0;
-const LIFT_AIR_GLIDE_S: f32 = 0.050;
-const LIFT_AIR_Q: f32 = 0.8;
-const LIFT_AIR_TAU_S: f32 = 0.045;
-/// The pickup's roof: under the tine's plain roof, so a breath before the
-/// note is never brighter than the note.
-const LIFT_LP_HZ: f32 = 3000.0;
 /// The TUNE lane's degree span, `C5..G6` = 0..8 (§9.4). The lift folds into
 /// it so a rotation off a high verse note cannot climb out of the register.
 const TUNE_DEG_LO: i32 = 0;
@@ -1755,16 +1976,57 @@ const GLINT_LP_HZ: f32 = 8000.0;
 // §12 — the meteor
 // ===========================================================================
 
-/// Layer 1, TICK: band-passed noise, 4 ms of it, at the origin (§12.2).
+/// Layer 1, TICK: band-passed noise on a 1.5 ms decay, at the origin
+/// (§12.2); its life is [`MET_TICK_DUR_S`].
 const MET_TICK_HZ0: f32 = 3200.0;
 const MET_TICK_HZ1: f32 = 900.0;
 const MET_TICK_GLIDE_S: f32 = 0.004;
 const MET_TICK_Q: f32 = 0.7;
 const MET_TICK_ATTACK_S: f32 = 0.000_3;
 const MET_TICK_DECAY_S: f32 = 0.001_5;
-const MET_TICK_DUR_S: f32 = 0.004;
-/// −24 dB re the step.
-const MET_TICK_LEVEL: f32 = 0.063_095_73;
+/// THE TICK'S LIFE — 12.5 ms: [`super::RING_OUT_PER_TAU`] × 1.5 ms of decay
+/// (−43 dB) and THEN the engine's 5 ms release ramp
+/// ([`super::RELEASE_RAMP_S`]), so the crest at ~0.5 ms is rendered at its
+/// envelope's own height. It was the tail law's 4 ms (2.7 × 1.5), and a 4 ms
+/// voice lives entirely inside a 5 ms ramp: `rel = (dur − t) × 200` starts
+/// at 0.8 and is 0.72 at the crest — that, and not the level, is why the
+/// tick rendered 16 dB under its figure (see [`MET_TICK_LEVEL`]). Nothing
+/// about the noise changed: same band, same glide, same 0.3 / 1.5 ms
+/// envelope — at 4 ms the envelope is at −23 dB either way; the voice just
+/// keeps its slot 8.5 ms longer, well inside `LANE_METEOR`'s cap 3 (tick,
+/// core, whoosh) and the arm's 150 ms ttl.
+const MET_TICK_DUR_S: f32 = super::RING_OUT_PER_TAU * MET_TICK_DECAY_S + super::RELEASE_RAMP_S;
+/// THE TICK'S LEVEL — FITTED (2026-09-16 audit) so the RENDERED peak lands
+/// at §12.2's **−24 dB re the tine step**. It was the figure itself,
+/// `0.063_095_73` = −24 dB as a gain, and a gain is not a rendered peak on
+/// a 4 ms burst of noise: the 0.3 / 1.5 ms envelope crests at 0.58 of
+/// unity, 2 ms of Q-0.7 band-passed noise crests ~8 dB under its input, and
+/// the 4 ms life sat inside the 5 ms release ramp ([`MET_TICK_DUR_S`]).
+/// MEASURED (the tick alone, vol 0.4, ten seeds, peak of its first 10 ms
+/// against the tine step's rendered peak at the module's seed, −19.94
+/// dBFS): at the old gain and life, median **−40.0 dB re step** (−42.4..
+/// −35.9; −59.4 dBFS at the bench's seed — the §34.5 figure); with the
+/// life alone, −36.9 (−39.3..−32.5); at this gain and that life, median
+/// **−24.0** (−26.4..−19.5). The ±3.5 dB around the median is the crest of
+/// noise, seed for seed — one tick is not one number — and the pin
+/// ([`the_meteor_tick_is_heard`]) reads ten seeds inside −24 ± 5 and their
+/// median inside ±1.5. Ruled figure, 13 dB of rendering arithmetic, one
+/// constant: 0.28.
+const MET_TICK_LEVEL: f32 = 0.28;
+/// **THE TICK'S ROOF — AND WHY IT HAS ONE (2026-09-16, the same defect as
+/// [`BREATH_ROOF_HZ`]).** §12.2's row gives the tick no lowpass, and both
+/// tick sites built the voice with `lp_cut` at `Voice::default()`'s 0.0 —
+/// a softening coefficient of 0, an output of exactly zero: every meteor
+/// and every armed pre-cue the music box has played since 2026-09-06 opened
+/// with a transient that was not on the wire. Measured 2026-09-16 (the tick
+/// alone at its own level, vol 0.4, 10 ms rendered): peak **0.0** with the
+/// roof at 0; with the roof here, a peak the pin records
+/// ([`the_meteor_tick_is_heard`]). The figure is the whoosh's own
+/// ([`MET_WHOOSH_LP_HZ`]): the gesture's other noise voice, open enough to
+/// pass the 3200 Hz the tick starts at, so the band-passed noise is what
+/// §12.2 describes and no more. §33.5 of the design records the
+/// repair; no golden carries a meteor, so none moved.
+const MET_TICK_ROOF_HZ: f32 = MET_WHOOSH_LP_HZ;
 
 /// Layer 2, CORE — **the layer that carries direction**. A sine gliding an
 /// octave up (rightward / upward) or down (leftward / downward) over the
@@ -1982,12 +2244,16 @@ const VERDICT_PLAGAL_S: f32 = 0.26;
 /// sings against the minor.** A green verdict parks at [`CHORD_AFTER_ENTER`]
 /// instead, exactly as a keyed Enter does, and the resolution holds.
 const CHORD_AFTER_RED: u8 = 0;
-/// The green dyads' level re the step. [`BASS_LEVEL`]'s own −6 dB, which is
-/// the word downbeat's level, which is the loudest a once-per-command gesture
-/// is permitted to be — stated THROUGH the downbeat's constant rather than as
-/// a fresh number, so the ceiling and the thing it is measured against can
-/// never drift apart.
-const VERDICT_DYAD_LEVEL: f32 = BASS_LEVEL;
+/// The green dyads' level re the step: −6 dB, which WAS the word downbeat's
+/// level ([`BASS_LEVEL`]) when the verdict was fitted, and the loudest a
+/// once-per-command gesture is permitted to be. It was stated THROUGH the
+/// downbeat's constant until 2026-09-16, when the downbeat was re-ruled
+/// heard (−4 dB re the step, the owner's *"i don't always hear the space
+/// bar?"*) and the verdict deliberately did NOT follow it: an exit code is
+/// told once per command, under `the_verdict_is_the_music_boxs_alone_and_
+/// never_louder_than_a_key`'s ceiling, and the fit that put it there is
+/// still the fit. The figure is the old downbeat's, written out.
+const VERDICT_DYAD_LEVEL: f32 = 0.501_187_2;
 /// **THE GESTURE'S VOICE TRIM** — one decibel off EVERY verdict voice (the
 /// bonk's idiom: "the kind gain is not the knob for this"). The levels above
 /// are each stated re the step in the file's own units, but what the ear gets
@@ -2136,6 +2402,18 @@ pub struct MelodyV2 {
     word_pos: u8,
     /// True while inside a whitespace RUN: only its head is a downbeat.
     space_run: bool,
+    /// INDENT STEPS the run has ADMITTED so far (0 at the head; the first
+    /// step past the gate makes it 1) — the step's index into the rising
+    /// figure ([`indent_step_hz`]). Counts the steps that PLAYED, not the
+    /// spaces: a held spacebar's gate drops two repeats in three
+    /// ([`SPACE_STEP_MIN_GAP_MS`]), and the figure climbs by the steps it
+    /// sounds, one lit degree each, rather than skipping the ones it did not
+    /// (the audit of 2026-09-16 found the space count feeding an unbounded
+    /// degree — see [`indent_step_hz`]). Reset at the run's head; saturating.
+    space_steps: u32,
+    /// When the run's head or its last admitted indent step sounded (ms on
+    /// the cue clock): the step's own gate, [`SPACE_STEP_MIN_GAP_MS`].
+    last_step_ms: u32,
     /// THE TIMBRE LADDER'S STOPS (§7 step 3) — which of §3.3's additions
     /// this synth voices. All on in production; the bench pulls them one at a
     /// time so the owner hears one variable per file.
@@ -2209,10 +2487,11 @@ pub struct MelodyV2 {
     lead: Option<(u8, u32)>,
     /// The live bass voice, same addressing (the downbeat is monophonic).
     bass: Option<(u8, u32)>,
-    /// THE LIVE PICKUP — the bare Shift's voice ([`LIFT_LEVEL`]), same
-    /// addressing: `push_v2` resolves it into the next keyed cue and a second
-    /// Shift replaces it. NOT on [`Undo`]: it addresses a voice, not the
-    /// text, and un-singing a key does not un-press the modifier before it.
+    /// THE LIVE TING — the bare Shift's voice ([`TING_LEVEL`]), same
+    /// addressing: it rings through the next keyed cue (2026-09-16) and a
+    /// second Shift replaces it. NOT on [`Undo`]: it addresses a voice, not
+    /// the text, and un-singing a key does not un-press the modifier before
+    /// it.
     lift: Option<(u8, u32)>,
     /// THE CURRENT KEY'S RING — the shifted key's octave ([`CAP_RING_LEVEL`]),
     /// same addressing: a Backspace retires it (unheard if it has not opened,
@@ -2276,6 +2555,8 @@ impl MelodyV2 {
             chord: CHORD_AFTER_ENTER,
             word_pos: 0,
             space_run: false,
+            space_steps: 0,
+            last_step_ms: 0,
             stops: TimbreStops::ALL,
             flow: 0.0,
             glint_k: 0,
@@ -2925,7 +3206,21 @@ impl MelodyV2 {
         // re the step it repeats, so a passing note's tremolo stays a passing
         // note's tremolo and the per-second energy arc (§9.6, A14) does not
         // buy +0.1 dB on the passing notes' re-strikes.
-        let step_level = if lit { 1.0 } else { PASSING_LEVEL };
+        //
+        // **A CAPITAL IS NEVER A PASSING TONE — IN LEVEL** (owner,
+        // 2026-09-16: *"make shifted keys higher in pitch and louder"*).
+        // Measured before this line existed: a capital OPENING a word came
+        // out +2.6 dB over its plain self (v1's [`super::SHIFT_GLYPH_GAIN`]
+        // on the strike), but a capital INSIDE a word only +0.35..+0.75 dB
+        // — its lifted degree lands on an unlit degree two keys in three,
+        // took [`PASSING_LEVEL`]'s −2 dB, and the +2.6 bought back +0.6. The
+        // weight is the capital's identity and must land on EVERY shifted
+        // glyph, so the shifted key's step level is the lit level whatever
+        // the chord says. `lit` itself is untouched: the bloom (Q4's "no
+        // bloom bonus on shifted keys"), the hero request and the roof read
+        // it exactly as before, so this is a decibel and nothing else — and
+        // ×1.0 on every unshifted key, which is every event in the goldens.
+        let step_level = if lit || shifted { 1.0 } else { PASSING_LEVEL };
         let level = if touch == Touch::Step {
             step_level
         } else {
@@ -3171,6 +3466,7 @@ impl MelodyV2 {
             self.chord = (self.chord + 1) % CHORD_LOOP.len() as u8;
             self.word_pos = 0;
             self.space_run = true;
+            self.space_steps = 0;
         }
         self.last_key_ms = at;
         self.seen_key = true;
@@ -3687,8 +3983,56 @@ fn breath(delay: f32) -> Voice {
         n_f1: BREATH_HZ1,
         n_glide: BREATH_GLIDE_S,
         n_q: BREATH_Q,
+        lp_cut: BREATH_ROOF_HZ,
         lane: LANE_BREATH,
         ..Voice::default()
+    }
+}
+
+/// §12.2 layer 1, THE METEOR'S TICK as a prototype voice — band-passed
+/// noise falling 3200 → 900 Hz at the origin on a 1.5 ms decay, living
+/// [`MET_TICK_DUR_S`] so its crest clears the release ramp, under the roof
+/// that lets it sound ([`MET_TICK_ROOF_HZ`]). Field for field the voice
+/// both meteor sites built inline until 2026-09-16, plus the roof and the
+/// life; the arm adds its ttl.
+fn met_tick() -> Voice {
+    Voice {
+        dur: MET_TICK_DUR_S,
+        attack: MET_TICK_ATTACK_S,
+        decay: MET_TICK_DECAY_S,
+        n_lvl: 1.0,
+        n_f0: MET_TICK_HZ0,
+        n_f1: MET_TICK_HZ1,
+        n_glide: MET_TICK_GLIDE_S,
+        n_q: MET_TICK_Q,
+        lp_cut: MET_TICK_ROOF_HZ,
+        lane: LANE_METEOR,
+        ..Voice::default()
+    }
+}
+
+/// **THE HEAD'S BREATH** — the breath with the word boundary's twinkle on
+/// its otherwise-silent partials ([`SPACE_TWINKLE_LEVEL`]): the dyad's
+/// `root` folded into the stardust lane and its octave under, through the
+/// open roof ([`BREATH_ROOF_HZ`]). Only the run's HEAD breathes this way;
+/// a tail space and a stop take [`breath`], the exhale alone.
+fn head_breath(root: f32) -> Voice {
+    let twinkle = fold_into(root, GLINT_LO_HZ, GLINT_HI_HZ);
+    Voice {
+        p: [
+            Partial {
+                lvl: SPACE_TWINKLE_LEVEL,
+                f0: twinkle,
+                ..Partial::default()
+            },
+            Partial {
+                lvl: SPACE_TWINKLE_UNDER,
+                f0: twinkle * 0.5,
+                ..Partial::default()
+            },
+            Partial::default(),
+        ],
+        ..breath(0.0)
     }
 }
 
@@ -4084,26 +4428,15 @@ impl TrailSynth {
         self.since_event = 0.0;
         let at = self.v2_at_ms(meta);
 
-        // THE PICKUP RESOLVES (§9.5 law 2's 12 ms ramp) into whatever the
-        // hand does next — a capital, a lowercase letter, a space, a
-        // deletion, a move, a line: an anacrusis lands on its downbeat
-        // whatever the downbeat is, so a Shift+Arrow leaves no stray note
-        // past the arrow and a Shift before a lowercase letter is the breath
-        // before THAT note. Accompaniments that are not the hand (the cloud's
-        // Poof, a Stardust hero, the arm, the dead Land) leave it ringing; a
-        // second Shift is `v2_shift`'s own business (it replaces the first).
-        // Shift then nothing rings its 162 ms alone — see [`LIFT_LEVEL`].
-        if !matches!(
-            kind,
-            SoundKind::Shift
-                | SoundKind::Poof
-                | SoundKind::Stardust { .. }
-                | SoundKind::MeteorArm { .. }
-                | SoundKind::Land
-        ) {
-            self.v2_damp(self.v2.lift, LANE_FADE_STEAL_S);
-            self.v2.lift = None;
-        }
+        // THE TING RINGS THROUGH whatever the hand does next (2026-09-16 —
+        // see [`TING_LEVEL`]). The 2026-09-10 pickup RESOLVED here: a 12 ms
+        // damp on every keyed cue, so a Shift+letter at the host's measured
+        // 60 ms lead cut the pickup at 0.37 of its peak, under the letter's
+        // own strike — which is the mechanism behind the owner's "there is
+        // no 'shift' tone". A ting is a note of its own: it keeps its 430 ms
+        // over the capital (an octave-folded lattice degree over a lattice
+        // degree — consonant by construction), and only a second Shift
+        // replaces it (`v2_shift`). Its address stays live for that.
 
         match kind {
             SoundKind::Typed => {
@@ -4156,8 +4489,11 @@ impl TrailSynth {
                 self.since_voice = 0.0;
                 self.damp_pending_shimmer();
                 self.v2_mute_tune(ERASE_MUTE_S);
-                // The grafts go with the line they decorated (the pickup was
-                // resolved above, with every other keyed cue).
+                // The grafts go with the line they decorated. The ting does
+                // not: it is in its own lane ([`LANE_TING`]) and rings
+                // through a kill as through every other keyed cue
+                // (2026-09-16 — a note of its own, not a decoration of the
+                // line).
                 self.v2_retire_lane(LANE_GRAFT, ERASE_MUTE_S);
                 self.v2.ring = None;
                 self.v2.graft = None;
@@ -4283,7 +4619,21 @@ impl TrailSynth {
         let vel = self.v2_velocity(vel_db);
         let pan = self.v2_pan(ev.pan);
         let g = g_ioi(ioi_s) * flow_key_headroom(flow);
-        let gain = ev.gain * KEY_TINE_TRIM * plan.level * g * vel;
+        // **A SHIFTED KEY IS LOUDER** (owner, 2026-09-16: "make shifted keys
+        // higher in pitch and louder") — v1's [`super::SHIFT_GLYPH_GAIN`]
+        // (+2.6 dB), one constant for both engines, on the strike's own gain
+        // so the capital's ring ([`CAP_RING_LEVEL`], a fraction of `gain`)
+        // rises with it and the bloom (its own gain, Q4's "no bloom bonus on
+        // shifted keys") does not. Exactly ×1.0 on a plain key, so every
+        // golden (all `shifted: false`) evaluates the operands it always
+        // did. This is a decibel bought with SPELLING, not with speed: §9.6
+        // is about rate, and a capital is the same one strike at every rate.
+        let gain = ev.gain
+            * KEY_TINE_TRIM
+            * plan.level
+            * g
+            * vel
+            * super::shift_gain(ev, SoundKind::Typed);
         // THE CLASS RESHAPES THE ONE TINE (§10.4) — one key, one TUNE voice,
         // whatever the glyph. A DIGIT is the wood bar ([`wood`]) on a blip's
         // τ ([`DIGIT_TAU_MUL`]); a KNOCKING mark ([`knock_class`]) is dead
@@ -4710,15 +5060,17 @@ impl TrailSynth {
         self.v2.graft = None;
         let head = self.v2.on_space(at);
         let g = g_ioi(self.v2.ioi_ms * 0.001);
+        // The live chord's root — the dyad's fundamental, the twinkle's pitch
+        // class and the indent steps' floor. Pure: no draw, no state.
+        let chord = CHORD_LOOP[usize::from(self.v2.chord)];
+        let root = penta(
+            BASS_BASE_HZ * CHORD_ROOT_RATIO[chord.root],
+            self.song_key.into(),
+        );
         if head {
             // Monophonic (§9.3): a new downbeat damps the old one over the
             // shipped 12 ms ramp rather than stacking on it.
             self.v2_damp(self.v2.bass, LANE_FADE_STEAL_S);
-            let chord = CHORD_LOOP[usize::from(self.v2.chord)];
-            let root = penta(
-                BASS_BASE_HZ * CHORD_ROOT_RATIO[chord.root],
-                self.song_key.into(),
-            );
             let partner = root * chord.partner;
             // **THE DOWNBEAT RINGS LONGER IN FLOW** (§22 lever 2): the
             // dyad's decay lerps to [`FLOW_BASS_DECAY_S`] and its `dur`
@@ -4759,23 +5111,55 @@ impl TrailSynth {
             // The bass is CENTRED: §11's stereo rule keeps everything under
             // 436 Hz inside ±0.15, and the downbeat is the floor of the mix.
             self.v2.bass = self.v2_spawn(voice, gain, 0.0);
+            // The head opens the indent step's gate.
+            self.v2.last_step_ms = at;
         }
         let pan = self.v2_pan(ev.pan);
-        self.v2_spawn(breath(0.0), ev.gain * KEY_TINE_TRIM * BREATH_LEVEL * g, pan);
+        // **THE HEAD BREATHES WITH A TWINKLE** (2026-09-16, see
+        // [`SPACE_TWINKLE_LEVEL`]): the word boundary's top rides the
+        // breath's silent partials, so the head's voice count, lanes and
+        // draws are exactly what they were — one breath, one dyad.
+        let exhale = if head { head_breath(root) } else { breath(0.0) };
+        self.v2_spawn(exhale, ev.gain * KEY_TINE_TRIM * BREATH_LEVEL * g, pan);
+        // **THE INDENT STEP** (2026-09-16, see [`SPACE_STEP_LEVEL`]): the
+        // run's tail climbs the live chord's lit degrees over the dyad's
+        // root, one per extra space, on its own gate. Not on the head (the
+        // downbeat is the downbeat), never louder than it, and in the
+        // stardust's drop-the-newcomer lane. Its draws (a pan and a spawn)
+        // land only on tail spaces, so every stream after a WORD boundary is
+        // where it was.
+        if !head && at.saturating_sub(self.v2.last_step_ms) >= SPACE_STEP_MIN_GAP_MS {
+            self.v2.last_step_ms = at;
+            self.v2.space_steps = self.v2.space_steps.saturating_add(1);
+            let f = indent_step_hz(chord, root, self.v2.space_steps, self.song_key.into());
+            let mut step = tine(
+                f,
+                Touch::Step,
+                SPACE_STEP_TAU_S,
+                ROOF_PLAIN_LO_HZ,
+                false,
+                0.0,
+            );
+            step.lane = LANE_GLINT;
+            let pan = self.v2_pan(ev.pan);
+            self.v2_spawn(step, ev.gain * KEY_TINE_TRIM * SPACE_STEP_LEVEL * g, pan);
+        }
     }
 
-    /// **SHIFT** — the bare modifier's PICKUP (§10.4, §11; re-ruled
-    /// 2026-09-10, see [`LIFT_LEVEL`]): one P1 sine at
-    /// `walk + LIFT_STEP_DEG + SHIFT_ROTATION[k]`, reflected into the
-    /// register, under the inhale's rising air — and nothing else. No melody
-    /// step, no beat claimed, no playhead moved: `on_typed` is not called and
-    /// `push_v2` leaves `since_voice` alone for this kind, so a modifier is
-    /// still intent, not authorship — it is just audible intent now. A second
-    /// Shift (left+right, a re-press) REPLACES the first: never two pickups.
-    /// The cursor is v1's `TrailSynth::shift_step`, advanced here exactly as
-    /// `design_shift` advances it — one rotation for both engines. rng: `v2_pan`
-    /// 1 + spawn 4, the felt lift's own five draws, so every seeded stream
-    /// after a Shift is where it was.
+    /// **SHIFT** — THE TING (owner, 2026-09-16; see [`TING_LEVEL`] for the
+    /// design and the measurement it replaces). One struck bell in
+    /// [`LANE_TING`] (its own lane, cap 1 — a graft cannot steal it) at
+    /// `ting_octave(penta(reflect(walk + LIFT_STEP_DEG + SHIFT_ROTATION[k]) + key))`
+    /// — the tine's P1 under the house 3.01 strike glint, its octave on the
+    /// octave's own τ, the felt mallet — ringing [`TING_DUR_S`], and nothing
+    /// else. No melody step, no beat claimed, no playhead moved: `on_typed`
+    /// is not called and `push_v2` leaves `since_voice` alone for this kind,
+    /// so a modifier is still intent, not authorship — it is just a note you
+    /// can hear now. A second Shift (left+right, a re-press) REPLACES the
+    /// first: never two tings. The cursor is v1's `TrailSynth::shift_step`,
+    /// advanced here exactly as `design_shift` advances it — one rotation for
+    /// both engines. rng: `v2_pan` 1 + spawn 4, the pickup's own five draws,
+    /// so every seeded stream after a Shift is where it was.
     fn v2_shift(&mut self, ev: &SoundEvent) {
         self.v2_damp(self.v2.lift, LANE_FADE_STEAL_S);
         let rot = super::SHIFT_ROTATION[usize::from(self.shift_step)];
@@ -4784,32 +5168,40 @@ impl TrailSynth {
         // eight degrees wide (the totality argument at `reflect_deg`).
         let deg =
             reflect_deg(i32::from(self.v2.walk) + LIFT_STEP_DEG + rot) + i32::from(self.song_key);
-        let f = penta(TINE_BASE_HZ, deg);
+        let f = super::ting_octave(penta(TINE_BASE_HZ, deg));
         let voice = Voice {
-            dur: LIFT_DUR_S,
-            attack: LIFT_ATTACK_S,
-            decay: LIFT_DECAY_S,
+            dur: TING_DUR_S,
+            attack: TING_ATTACK_S,
+            decay: TING_DECAY_S,
             p: [
                 Partial {
                     lvl: P1_LVL,
                     f0: f,
+                    fm_ratio: 3.01,
+                    fm_i0: TING_GLINT,
+                    fm_tau: TING_GLINT_TAU_S,
+                    ..Partial::default()
+                },
+                Partial {
+                    lvl: P2_LVL,
+                    f0: f * P2_RATIO,
+                    decay: P2_TAU_S,
                     ..Partial::default()
                 },
                 Partial::default(),
-                Partial::default(),
             ],
-            n_lvl: LIFT_AIR_LVL,
-            n_f0: LIFT_AIR_HZ0,
-            n_f1: LIFT_AIR_HZ1,
-            n_glide: LIFT_AIR_GLIDE_S,
-            n_q: LIFT_AIR_Q,
-            n_decay: LIFT_AIR_TAU_S,
-            lp_cut: LIFT_LP_HZ,
-            lane: LANE_GRAFT,
+            n_lvl: MALLET_LVL,
+            n_f0: MALLET_HZ0,
+            n_f1: MALLET_HZ1,
+            n_glide: MALLET_GLIDE_S,
+            n_q: MALLET_Q,
+            n_decay: MALLET_TAU_S,
+            lp_cut: TING_LP_HZ,
+            lane: LANE_TING,
             ..Voice::default()
         };
         let pan = self.v2_pan(ev.pan);
-        self.v2.lift = self.v2_spawn(voice, ev.gain * KEY_TINE_TRIM * LIFT_LEVEL, pan);
+        self.v2.lift = self.v2_spawn(voice, ev.gain * KEY_TINE_TRIM * TING_LEVEL, pan);
     }
 
     /// **NAV TICK** — the mini-fan's voice (D17, §12.3's floor): the verse
@@ -5366,22 +5758,11 @@ impl TrailSynth {
     /// "pff" — the audio twin of the stray trail the owner vetoed.
     fn v2_meteor_arm(&mut self, ev: &SoundEvent, meta: EventMeta, dir: i8) {
         let pan = meta.pan_from;
-        let tick = Voice {
-            dur: MET_TICK_DUR_S,
-            attack: MET_TICK_ATTACK_S,
-            decay: MET_TICK_DECAY_S,
-            n_lvl: 1.0,
-            n_f0: MET_TICK_HZ0,
-            n_f1: MET_TICK_HZ1,
-            n_glide: MET_TICK_GLIDE_S,
-            n_q: MET_TICK_Q,
-            lane: LANE_METEOR,
-            // Both armed voices carry the ttl (`SoundKind::MeteorArm`); the
-            // tick's 4 ms life ends long before it could expire, but a claim
-            // finds and clears it like the core's.
-            arm_ttl: MET_ARM_TTL_S,
-            ..Voice::default()
-        };
+        let mut tick = met_tick();
+        // Both armed voices carry the ttl (`SoundKind::MeteorArm`); the
+        // tick's 12.5 ms life ends long before it could expire, but a claim
+        // finds and clears it like the core's.
+        tick.arm_ttl = MET_ARM_TTL_S;
         self.v2_spawn(tick, ev.gain * KEY_TINE_TRIM * MET_TICK_LEVEL, pan);
         // A PROVISIONAL flight: `T` is unknown until the echo lands, so the
         // arm takes the maximum, and the claim re-targets it downward.
@@ -5482,7 +5863,7 @@ impl TrailSynth {
             }
             v.arm_ttl = 0.0;
             if v.p[0].lvl <= 0.0 {
-                // The tick — a 4 ms noise burst that has already sounded.
+                // The tick — a 12.5 ms noise burst that has already sounded.
                 // Nothing to re-aim; it simply keeps its ttl-free life.
                 continue;
             }
@@ -5583,21 +5964,9 @@ impl TrailSynth {
 
         let g = ev.gain * KEY_TINE_TRIM;
         if claimed.is_none() {
-            // Layer 1 — THE TICK, at the origin, 4 ms long. The ear
+            // Layer 1 — THE TICK, at the origin, 12.5 ms long. The ear
             // time-stamps a transient, so the gesture must OPEN with one.
-            let tick = Voice {
-                dur: MET_TICK_DUR_S,
-                attack: MET_TICK_ATTACK_S,
-                decay: MET_TICK_DECAY_S,
-                n_lvl: 1.0,
-                n_f0: MET_TICK_HZ0,
-                n_f1: MET_TICK_HZ1,
-                n_glide: MET_TICK_GLIDE_S,
-                n_q: MET_TICK_Q,
-                lane: LANE_METEOR,
-                ..Voice::default()
-            };
-            self.v2_spawn(tick, g * MET_TICK_LEVEL, meta.pan_from);
+            self.v2_spawn(met_tick(), g * MET_TICK_LEVEL, meta.pan_from);
 
             // Layer 2 — THE CORE, carrying direction and travelling.
             let mut core = self.v2_core_voice(dir, t);
@@ -7690,7 +8059,7 @@ for it up front.\n\
     /// lowercase key's ([`KEY_GLINT_SHIFTED_MUL`], an identical draw
     /// sequence). Nothing at the retired echo's 25 ms; the lowercase twin
     /// spawns no GRAFT voice at all. The bare modifier is its own gesture and
-    /// its own pin: [`a_bare_shift_is_a_pitched_pickup_that_never_steps`].
+    /// its own pin: [`a_bare_shift_is_a_ting_that_never_steps`].
     ///
     /// **RE-PINNED ON THE PANEL'S Q4 RULING (2026-09-09).** The lift was
     /// five degrees `.min(TUNE_DEG_HI)` and is three degrees through
@@ -7868,8 +8237,51 @@ for it up front.\n\
     ///   single DFT bin at the key's 2f — by at least 3 dB (measured
     ///   +3.56..+4.10). The ring is HEARD, in the body and not on the crest,
     ///   and it is heard as the octave.
+    ///
+    /// **RE-PINNED 2026-09-16** (the owner: *"likewise make shifted keys
+    /// higher in pitch and louder"*). The peak clauses INVERT: a capital now
+    /// carries v1's [`super::SHIFT_GLYPH_GAIN`] (+2.6 dB) on its strike, so
+    /// its rendered peak must sit +2.0..+4.5 dB OVER its plain self (louder,
+    /// key for key, and still tier 1); and the announced capital's ceiling
+    /// widens for the ting that now rings through it (−3 dB re the key, at
+    /// 0.54 of its peak when the strike crests 52 ms on — a coherent sum of
+    /// up to +2.9 dB over the capital's own +2.6). The BODY clauses are
+    /// unchanged: the ring rides the strike's gain, so it is heard — as the
+    /// octave — by at least the same margins. (Was
+    /// `a_capital_rings_but_never_out_peaks_its_plain_self`; the name
+    /// followed the assertion when the review of 2026-09-16 pointed out the
+    /// old one stated the 2026-09-10 law against the new body.)
+    ///
+    /// **AND MID-WORD, THE SAME DAY.** The first pin measured capitals after
+    /// `"hello "` only — word heads, which land LIT by §3.1 step 6. An
+    /// independent measurement of that build found a capital INSIDE a word
+    /// (after `"hel"`, no Space) only +0.35..+0.75 dB over its plain self:
+    /// the lifted degree landed on an unlit degree and took
+    /// [`PASSING_LEVEL`], which ate the weight. `MelodyV2::on_typed` now
+    /// gives every shifted glyph the lit level, so the test runs BOTH
+    /// contexts, and the pairs are fair in a second way: where the plain key
+    /// is itself passing (−2 dB) and the capital is lit, the exact weight
+    /// is `SHIFT_GLYPH_GAIN / PASSING_LEVEL` (+4.6 dB) and the window slides
+    /// up by the 2 dB the plain key gave away — the capital is measured
+    /// against the note the text actually typed, whatever the chord made of
+    /// it. The floor is the owner's word — **≥ +2.0 dB in every context, on
+    /// every seed** — pinned on the strike's first 80 ms of ENERGY, where a
+    /// seeded phase cannot vote (measured +2.35..+2.51 and +4.84..+4.89 dB,
+    /// against +0.35..+0.75 mid-word before); the sample-peak window keeps
+    /// its old 1.5 dB floor and the 1.9 dB the crest was always allowed to
+    /// wander above the exact weight (the bloom and the scoop are their own
+    /// gains).
+    ///
+    /// ON PITCH, for the record: the music box does NOT lift a capital an
+    /// octave. Its capital is [`CAPITAL_LIFT_DEG`] lattice degrees over the
+    /// derived line where the capital OPENS a word or a shifted run (the
+    /// panel's Q4 ruling of 2026-09-09) and the upward scoop on every
+    /// shifted key; v1's octave lift ([`super::SHIFT_GLYPH_LIFT`]) is the
+    /// eight v1 palettes' law and is pinned there
+    /// (`a_shifted_glyph_lands_an_octave_over_its_plain_self`). The
+    /// 2026-09-16 change to the music box's capital is LOUDNESS only.
     #[test]
-    fn a_capital_rings_but_never_out_peaks_its_plain_self() {
+    fn a_capital_rings_and_out_peaks_its_plain_self_by_its_weight() {
         const SEEDS: [u32; 4] = [SEED, 0x5EED_1234, 0x504F_4F46, 0xCAFE_F00D];
         /// 400 ms: long enough for every "hello " tine to be under its tail
         /// law; whatever remains is identical in both takes.
@@ -7879,16 +8291,37 @@ for it up front.\n\
         /// The body window, in mono samples at 48 kHz: 80-300 ms.
         const BODY: core::ops::Range<usize> = 3_840..14_400;
         const PAIRS_PER_SEED: usize = 6;
-        /// The ring may not buy a decibel on the crest…
-        const CAPITAL_PEAK_CEIL_DB: f32 = 1.5;
-        /// …and the pickup ahead of it is bounded by the coherent sum above.
-        const ANNOUNCED_PEAK_CEIL_DB: f32 = 2.0;
+        /// The capital's weight on the crest: at least +1.5 dB over the
+        /// plain key (louder, unmistakably) …
+        const CAPITAL_PEAK_FLOOR_DB: f32 = 1.5;
+        /// … and no more than the exact weight plus this (tier 1 still: the
+        /// ring buys no decibel of its own, so the crest is the strike's
+        /// weight and nothing else — +4.5 over an equally-lit plain key).
+        /// A SAMPLE PEAK wanders with the partials' seeded phases and the
+        /// shifted key's scoop: measured 2026-09-16, +1.79..+3.54 dB on the
+        /// word-opening pairs around the exact +2.61, +2.23..+2.92 and
+        /// +4.58..+4.97 mid-word around +2.61 / +4.61 — which is why the
+        /// owner's ≥ 2 dB is pinned on the strike's ENERGY below, not here.
+        const CAPITAL_PEAK_SLACK_DB: f32 = 1.9;
+        /// The owner's floor — *"louder"* — on the strike's first 80 ms of
+        /// RMS, where the phase cannot vote: ≥ +2.0 dB in every context …
+        const CAPITAL_ONSET_FLOOR_DB: f32 = 2.0;
+        /// … and within half a decibel of the exact weight (the bloom, its
+        /// own unshifted gain, dilutes the window by 0.1-0.25 dB).
+        const ONSET_DILUTION_DB: f32 = 0.5;
+        /// The ting ahead of it is bounded by the coherent sum above, over
+        /// the same exact weight.
+        const ANNOUNCED_PEAK_SLACK_DB: f32 = 3.4;
         /// The body must carry the ring: broadband, over the bloom's hang…
         const BODY_FLOOR_DB: f32 = 1.5;
         /// …and at the octave, where the ring lives.
         const BODY_2F_FLOOR_DB: f32 = 3.0;
-        let head = |s: &mut TrailSynth| {
-            for (i, ch) in "hello ".chars().enumerate() {
+        /// The two contexts: a WORD HEAD (after `"hello "`) and MID-WORD
+        /// (after `"hel"`, no Space) — the key under test lands at 1 900 ms
+        /// in both.
+        const CONTEXTS: [&str; 2] = ["hello ", "hel"];
+        let head = |s: &mut TrailSynth, ctx: &str| {
+            for (i, ch) in ctx.chars().enumerate() {
                 let kind = if ch == ' ' {
                     SoundKind::Space
                 } else {
@@ -7898,10 +8331,14 @@ for it up front.\n\
             }
         };
         // The fair pairs: the TUNE voice's gain is `level × vel` on a shared
-        // first draw, so equal gain means equal level means equal lit-ness.
-        let tune_gain = |ch: char| -> f32 {
+        // first draw, so the gain ratio IS the level ratio. A pair is fair
+        // when that ratio is exactly the capital's weight (equal lit-ness)
+        // or the weight over PASSING_LEVEL (a passing plain key against its
+        // lit capital); anything else is a re-strike ladder or a different
+        // touch, and is not the comparison.
+        let tune_gain = |ctx: &str, ch: char| -> f32 {
             let mut s = synth();
-            head(&mut s);
+            head(&mut s, ctx);
             let mark = s.born_seq;
             push_ch(&mut s, SoundKind::Typed, 1_900, ch);
             let v = since(&s, mark)
@@ -7910,23 +8347,21 @@ for it up front.\n\
                 .expect("every key is a step");
             (v.gl * v.gl + v.gr * v.gr).sqrt()
         };
-        let pairs: Vec<char> = ('a'..='z')
-            .filter(|&c| {
-                let (lo, hi) = (tune_gain(c), tune_gain(c.to_ascii_uppercase()));
-                (hi / lo - 1.0).abs() < 1e-4
-            })
-            .take(PAIRS_PER_SEED)
-            .collect();
-        assert_eq!(
-            pairs.len(),
-            PAIRS_PER_SEED,
-            "only {pairs:?} land their capital on the lowercase level after \"hello \""
-        );
+        let weight_of = |ctx: &str, c: char| -> Option<f32> {
+            let (lo, hi) = (tune_gain(ctx, c), tune_gain(ctx, c.to_ascii_uppercase()));
+            let ratio = hi / lo;
+            [
+                crate::trail_sound::SHIFT_GLYPH_GAIN,
+                crate::trail_sound::SHIFT_GLYPH_GAIN / PASSING_LEVEL,
+            ]
+            .into_iter()
+            .find(|w| (ratio / w - 1.0).abs() < 1e-4)
+        };
         // One take: the render from the key (or from the Shift ahead of it)
         // and the key's own fundamental, for the octave bin.
-        let take = |seed: u32, ch: char, lead_shift: bool| -> (Vec<f32>, f32) {
+        let take = |seed: u32, ctx: &str, ch: char, lead_shift: bool| -> (Vec<f32>, f32) {
             let mut s = TrailSynth::new(SR, seed);
-            head(&mut s);
+            head(&mut s, ctx);
             let _ = render_mono(&mut s, HEAD_BLOCKS);
             let mut out = Vec::new();
             if lead_shift {
@@ -7953,6 +8388,10 @@ for it up front.\n\
         fn body(x: &[f32]) -> &[f32] {
             &x[x.len() - TAKE_BLOCKS * 480..][BODY]
         }
+        // The onset is the strike: the key's first 80 ms.
+        fn onset(x: &[f32]) -> &[f32] {
+            &x[x.len() - TAKE_BLOCKS * 480..][..BODY.start]
+        }
         // One bin of the DFT at `f`, as a magnitude: the instrument a
         // broadband RMS is not, under the bloom.
         let bin_at = |x: &[f32], f: f32| -> f32 {
@@ -7966,66 +8405,112 @@ for it up front.\n\
                 });
             (re * re + im * im).sqrt() / x.len() as f32
         };
-        for seed in SEEDS {
-            for &ch in &pairs {
-                let cap = ch.to_ascii_uppercase();
-                let (plain, f_plain) = take(seed, ch, false);
-                let (capital, f_cap) = take(seed, cap, false);
-                let (announced, _) = take(seed, cap, true);
-                let (p0, p1, p2) = (
-                    db(peak_of(&plain)),
-                    db(peak_of(&capital)),
-                    db(peak_of(&announced)),
-                );
-                assert!(
-                    p1 <= p0 + CAPITAL_PEAK_CEIL_DB,
-                    "seed {seed:#x} `{cap}`: the capital peaks {p1:.2} dBFS against its plain \
-                     self's {p0:.2} — the ring bought a decibel"
-                );
-                assert!(
-                    p2 <= p0 + ANNOUNCED_PEAK_CEIL_DB,
-                    "seed {seed:#x} Shift+`{cap}`: the announced capital peaks {p2:.2} dBFS \
-                     against the plain {p0:.2} — the pickup and the strike crest together \
-                     beyond the coherent sum"
-                );
-                let (b0, b1) = (db(rms_of(body(&plain))), db(rms_of(body(&capital))));
-                assert!(
-                    b1 >= b0 + BODY_FLOOR_DB,
-                    "seed {seed:#x} `{cap}`: the body after the key is {b1:.2} dB against the \
-                     plain {b0:.2} — the ring is not heard"
-                );
-                // At the octave the plain take holds only P2's 55 ms tail;
-                // the capital holds the ring. Both bins at the CAPITAL's 2f
-                // — the lifted degree is the register's business, and the
-                // plain key's own octave is censused as the control.
-                let (o0, o1) = (
-                    db(bin_at(body(&plain), 2.0 * f_plain)),
-                    db(bin_at(body(&capital), 2.0 * f_cap)),
-                );
-                assert!(
-                    o1 >= o0 + BODY_2F_FLOOR_DB,
-                    "seed {seed:#x} `{cap}`: the octave in the body is {o1:.2} dB against the \
-                     plain key's own octave {o0:.2} — the ring is not heard AS THE OCTAVE"
-                );
+        for ctx in CONTEXTS {
+            let pairs: Vec<(char, f32)> = ('a'..='z')
+                .filter_map(|c| weight_of(ctx, c).map(|w| (c, w)))
+                .take(PAIRS_PER_SEED)
+                .collect();
+            assert_eq!(
+                pairs.len(),
+                PAIRS_PER_SEED,
+                "only {pairs:?} land their capital on a fair level after {ctx:?}"
+            );
+            let mut lo_seen = f32::MAX;
+            let mut hi_seen = f32::MIN;
+            for seed in SEEDS {
+                for &(ch, weight) in &pairs {
+                    let cap = ch.to_ascii_uppercase();
+                    let weight_db = db(weight);
+                    let (plain, f_plain) = take(seed, ctx, ch, false);
+                    let (capital, f_cap) = take(seed, ctx, cap, false);
+                    let (announced, _) = take(seed, ctx, cap, true);
+                    let (p0, p1, p2) = (
+                        db(peak_of(&plain)),
+                        db(peak_of(&capital)),
+                        db(peak_of(&announced)),
+                    );
+                    lo_seen = lo_seen.min(p1 - p0);
+                    hi_seen = hi_seen.max(p1 - p0);
+                    // THE OWNER'S FLOOR, on the strike's ENERGY: the first
+                    // 80 ms of the capital over the first 80 ms of the plain
+                    // key — the weight itself, phase-free. Measured
+                    // 2026-09-16: +2.35..+2.51 dB on every lit pair and
+                    // +4.84..+4.89 on every passing-plain pair, all seeds,
+                    // both contexts — the exact weight less the bloom's
+                    // 0.1-0.25 dB of unshifted dilution.
+                    let (s0, s1) = (db(rms_of(onset(&plain))), db(rms_of(onset(&capital))));
+                    assert!(
+                        s1 >= s0 + CAPITAL_ONSET_FLOOR_DB
+                            && s1 >= s0 + weight_db - ONSET_DILUTION_DB,
+                        "seed {seed:#x} `{cap}` after {ctx:?}: the strike's first 80 ms is \
+                         {s1:.2} dB against the plain {s0:.2} — under the capital's weight \
+                         (exact {weight_db:.2}, floor +{CAPITAL_ONSET_FLOOR_DB})"
+                    );
+                    assert!(
+                        p1 >= p0 + CAPITAL_PEAK_FLOOR_DB
+                            && p1 <= p0 + weight_db + CAPITAL_PEAK_SLACK_DB,
+                        "seed {seed:#x} `{cap}` after {ctx:?}: the capital peaks {p1:.2} dBFS \
+                         against its plain self's {p0:.2} — outside the capital's \
+                         +{CAPITAL_PEAK_FLOOR_DB}..+{:.1} dB weight (exact weight {weight_db:.2})",
+                        weight_db + CAPITAL_PEAK_SLACK_DB
+                    );
+                    assert!(
+                        p2 <= p0 + weight_db + ANNOUNCED_PEAK_SLACK_DB,
+                        "seed {seed:#x} Shift+`{cap}` after {ctx:?}: the announced capital \
+                         peaks {p2:.2} dBFS against the plain {p0:.2} — the ting and the \
+                         strike crest together beyond the coherent sum"
+                    );
+                    let (b0, b1) = (db(rms_of(body(&plain))), db(rms_of(body(&capital))));
+                    assert!(
+                        b1 >= b0 + BODY_FLOOR_DB,
+                        "seed {seed:#x} `{cap}` after {ctx:?}: the body after the key is \
+                         {b1:.2} dB against the plain {b0:.2} — the ring is not heard"
+                    );
+                    // At the octave the plain take holds only P2's 55 ms
+                    // tail; the capital holds the ring. Both bins at the
+                    // CAPITAL's 2f — the lifted degree is the register's
+                    // business, and the plain key's own octave is censused
+                    // as the control.
+                    let (o0, o1) = (
+                        db(bin_at(body(&plain), 2.0 * f_plain)),
+                        db(bin_at(body(&capital), 2.0 * f_cap)),
+                    );
+                    assert!(
+                        o1 >= o0 + BODY_2F_FLOOR_DB,
+                        "seed {seed:#x} `{cap}` after {ctx:?}: the octave in the body is \
+                         {o1:.2} dB against the plain key's own octave {o0:.2} — the ring \
+                         is not heard AS THE OCTAVE"
+                    );
+                }
             }
+            println!(
+                "capital after {ctx:?}: crest +{lo_seen:.2}..+{hi_seen:.2} dB over the plain \
+                 key ({} pairs × {} seeds)",
+                pairs.len(),
+                SEEDS.len()
+            );
         }
     }
 
-    /// **A BARE SHIFT IS A PITCHED PICKUP THAT NEVER STEPS** (§10.4, §11,
-    /// §22 row 9; the owner's 2026-09-10 reversal of "felt, not pitched" —
-    /// see [`LIFT_LEVEL`]).
+    /// **A BARE SHIFT IS A TING THAT NEVER STEPS** (§10.4, §11, §22 row 9;
+    /// re-pinned 2026-09-16 — the owner: *"there is no 'shift' tone for the
+    /// rainbow cursor trail, it is supposed to be a 'ting' or something
+    /// musical to complement the space bar"* — see [`TING_LEVEL`]; it was
+    /// the 2026-09-10 pickup, "a lone P1 … under rising air … −6 dB re the
+    /// keystroke", which is the sound the owner reported as absent).
     ///
     /// Five Shifts after "hello ": each is exactly one voice in
-    /// [`LANE_GRAFT`], a lone P1 at [`P1_LVL`] on
-    /// `penta(reflect(walk + LIFT_STEP_DEG + SHIFT_ROTATION[k]) + key)` —
-    /// five DISTINCT pitches, v1's rotation on v1's cursor — under rising
-    /// air, on the 8 / 60 / 162 ms envelope, at `KEY_TINE_TRIM × LIFT_LEVEL`
-    /// (−6 dB re the keystroke, not a velocity draw in it). And the melody
-    /// has not moved: walk, step count and v1's beat (`since_voice`) are
-    /// what they were before the first Shift. A second Shift 40 ms behind
-    /// the first damps it (12 ms): never two pickups.
+    /// [`LANE_TING`] — P1 at [`P1_LVL`] wearing the 3.01 strike glint, the
+    /// octave at [`P2_LVL`], the felt mallet — on
+    /// `ting_octave(penta(reflect(walk + LIFT_STEP_DEG + SHIFT_ROTATION[k]) + key))`,
+    /// inside the ting's own E6..E7 band: five DISTINCT pitches, v1's
+    /// rotation on v1's cursor, on the 3 / 85 / 430 ms envelope, at
+    /// `KEY_TINE_TRIM × TING_LEVEL` (not a velocity draw in it). And the
+    /// melody has not moved: walk, step count and v1's beat (`since_voice`)
+    /// are what they were before the first Shift. A second Shift 40 ms
+    /// behind the first damps it (12 ms): never two tings.
     #[test]
-    fn a_bare_shift_is_a_pitched_pickup_that_never_steps() {
+    fn a_bare_shift_is_a_ting_that_never_steps() {
         let rotation = crate::trail_sound::SHIFT_ROTATION;
         let mut s = synth();
         for (i, ch) in "hello ".chars().enumerate() {
@@ -8040,7 +8525,7 @@ for it up front.\n\
         let steps = s.v2.steps();
         let since_voice = s.since_voice;
         let key = i32::from(s.song_key);
-        let nominal = VOL * KEY_TINE_TRIM * LIFT_LEVEL;
+        let nominal = VOL * KEY_TINE_TRIM * TING_LEVEL;
         let mut heard: Vec<f32> = Vec::new();
         for (k, rot) in rotation.iter().enumerate() {
             let mark = s.born_seq;
@@ -8053,40 +8538,56 @@ for it up front.\n\
                 lift.len()
             );
             let v = lift[0];
-            assert_eq!(v.lane, LANE_GRAFT, "Shift {k}: the pickup lives in GRAFT");
+            assert_eq!(
+                v.lane, LANE_TING,
+                "Shift {k}: the ting lives in its own lane"
+            );
             assert_eq!(
                 v.p[0].lvl, P1_LVL,
-                "Shift {k}: a lone P1 at the tine's level"
+                "Shift {k}: the body at the tine's level"
             );
             assert!(
-                v.p[1].lvl == 0.0 && v.p[2].lvl == 0.0,
-                "Shift {k}: the pickup has no octave and no strike partial"
+                (v.p[0].fm_ratio - 3.01).abs() < 1e-6 && v.p[0].fm_i0 > 0.0,
+                "Shift {k}: the body wears the house strike glint — a ting is STRUCK"
             );
-            let want = penta(TINE_BASE_HZ, reflect_deg(walk + LIFT_STEP_DEG + rot) + key);
+            assert!(
+                v.p[1].lvl == P2_LVL && (v.p[1].f0 / v.p[0].f0 - 2.0).abs() < 1e-4,
+                "Shift {k}: the octave partial rounds the ting"
+            );
+            let want = crate::trail_sound::ting_octave(penta(
+                TINE_BASE_HZ,
+                reflect_deg(walk + LIFT_STEP_DEG + rot) + key,
+            ));
             assert!(
                 (v.p[0].f0 - want).abs() < SAME_PITCH_HZ,
-                "Shift {k}: the pickup sounded {} Hz, not walk {walk} + {LIFT_STEP_DEG} + \
-                 SHIFT_ROTATION[{k}] = {rot} reflected ({want} Hz)",
+                "Shift {k}: the ting sounded {} Hz, not walk {walk} + {LIFT_STEP_DEG} + \
+                 SHIFT_ROTATION[{k}] = {rot} reflected and folded ({want} Hz)",
                 v.p[0].f0
             );
-            assert_eq!(v.n_lvl, LIFT_AIR_LVL, "Shift {k}: the inhale's air");
+            assert!(
+                (crate::trail_sound::SHIFT_TING_LO_HZ..crate::trail_sound::SHIFT_TING_LO_HZ * 2.0)
+                    .contains(&v.p[0].f0),
+                "Shift {k}: the ting must sit in its own band ({} Hz)",
+                v.p[0].f0
+            );
+            assert_eq!(v.n_lvl, MALLET_LVL, "Shift {k}: the felt mallet");
             assert!(
                 v.n_f0 < v.n_f1,
-                "Shift {k}: the air must RISE ({} → {} Hz) — an inhale, not the breath",
+                "Shift {k}: the mallet's band rises ({} → {} Hz) — a strike, not the breath",
                 v.n_f0,
                 v.n_f1
             );
-            assert_eq!(v.attack, LIFT_ATTACK_S, "Shift {k}: a swell, not a strike");
-            assert_eq!(v.dur, LIFT_DUR_S);
+            assert_eq!(v.attack, TING_ATTACK_S, "Shift {k}: a strike, not a swell");
+            assert_eq!(v.dur, TING_DUR_S);
             assert!(
                 (-v.dur / v.decay).exp() <= 0.07,
-                "Shift {k}: the pickup's tail ends at {:.1} % of peak — over A13's 7 %",
+                "Shift {k}: the ting's tail ends at {:.1} % of peak — over A13's 7 %",
                 (-v.dur / v.decay).exp() * 100.0
             );
             let got = (v.gl * v.gl + v.gr * v.gr).sqrt();
             assert!(
                 (got / nominal - 1.0).abs() < 0.05,
-                "Shift {k}: the pickup is {got} against KEY_TINE_TRIM × LIFT_LEVEL = {nominal}"
+                "Shift {k}: the ting is {got} against KEY_TINE_TRIM × TING_LEVEL = {nominal}"
             );
             heard.push(v.p[0].f0);
         }
@@ -8127,24 +8628,44 @@ for it up front.\n\
         );
         assert_eq!(
             first.damp, LANE_FADE_STEAL_S,
-            "a second Shift must damp the first pickup over 12 ms — never two pickups"
+            "a second Shift must damp the first ting over 12 ms — never two tings"
         );
         assert_ne!(
             s.v2.lift,
             Some((slot, born)),
-            "the second Shift must take over the pickup's address"
+            "the second Shift must take over the ting's address"
         );
     }
 
-    /// **THE PICKUP RESOLVES INTO THE NEXT KEY** — whatever the key is
-    /// (§9.5 law 2; the owner's taste ruling of 2026-09-10). A Shift then,
-    /// 60 ms on (the host's measured lead), a capital, a lowercase letter, a
-    /// Space, a Backspace or an arrow: the pickup is damping over
-    /// [`LANE_FADE_STEAL_S`] and its address is cleared. A Stardust hero in
-    /// the same place is not the hand and leaves it ringing.
+    /// **THE TING RINGS THROUGH THE KEY IT ANNOUNCES** — whatever the key is.
+    ///
+    /// RE-PINNED 2026-09-16. This was "THE PICKUP RESOLVES INTO THE NEXT
+    /// KEY" (§9.5 law 2; the owner's taste ruling of 2026-09-10): a Shift
+    /// then, 60 ms on, any keyed cue damped the pickup over
+    /// [`LANE_FADE_STEAL_S`] and cleared its address. The owner's
+    /// 2026-09-16 report — *"there is no 'shift' tone for the rainbow cursor
+    /// trail"* — is what that resolve sounds like: a 60 ms sine cut under
+    /// the letter's own strike. The ting is a note of its own and KEEPS its
+    /// 430 ms over a capital, a lowercase letter, a Space, a Backspace, an
+    /// arrow and a Stardust hero alike: no damp, and its address stays live
+    /// (so a second Shift can still replace it — the only thing that does).
+    /// (Was `the_pickup_resolves_into_the_next_key`, which pinned the
+    /// opposite.)
+    ///
+    /// **AND THROUGH A SHIFTED MARK'S GRAFTS, RENDERED.** The review of
+    /// 2026-09-16 caught the first ting still being cut — not at push time
+    /// but at the grafts' ONSET: Shift then `?` / `(` / `+` puts the mark's
+    /// deferred graft AND the capital's ring into GRAFT (cap 2) beside a
+    /// ting that lived there too, and the lane's fade-steal took the oldest
+    /// — the ting — ~120 ms in at ~0.24 of its peak. The push-time read
+    /// above is blind to an onset steal, so this test now RENDERS 160 ms
+    /// past the key (every deferred graft has opened by then: the ring at
+    /// 60 ms, the rise at 60 ms, the tink at 45 ms, the fifth at 30 ms) and
+    /// asserts the ting is still on, undamped and at its own address. The
+    /// ting lives in [`LANE_TING`] now, where no graft can reach it.
     #[test]
-    fn the_pickup_resolves_into_the_next_key() {
-        let after = |kind: SoundKind, ch: Option<char>| -> (f32, bool) {
+    fn the_ting_rings_through_the_next_key() {
+        let after = |kind: SoundKind, ch: Option<char>, shifted: bool| -> (f32, bool, bool) {
             let mut s = synth();
             for (i, ch) in "hello ".chars().enumerate() {
                 let kind = if ch == ' ' {
@@ -8157,36 +8678,84 @@ for it up front.\n\
             push(&mut s, SoundKind::Shift, 1_900, 0.0, false);
             let (slot, born) = s.v2.lift.expect("the Shift left its pickup's address");
             match ch {
+                Some(c) if shifted => s.push_meta(
+                    event(kind, 0.0, true),
+                    EventMeta {
+                        at_ms: 1_960,
+                        glyph_class: crate::trail_sound::typed_glyph_class(Some(c)),
+                        rank: crate::trail_sound::typed_glyph_rank(Some(c)),
+                        ..EventMeta::default()
+                    },
+                ),
                 Some(c) => push_ch(&mut s, kind, 1_960, c),
                 None => push(&mut s, kind, 1_960, 0.0, false),
             }
             let v = &s.voices[usize::from(slot)];
             assert!(
                 v.on && v.born == born,
-                "{kind:?}: the pickup's slot was recycled under it"
+                "{kind:?}: the ting's slot was recycled under it"
             );
-            (v.damp, s.v2.lift.is_none())
+            let at_push = v.damp;
+            // 160 ms of audio past the key: every deferred graft has opened
+            // and run its lane census.
+            let mut buf = [0.0f32; 960];
+            for _ in 0..16 {
+                s.render(&mut buf);
+            }
+            let v = &s.voices[usize::from(slot)];
+            let rendered_ok = v.on && v.born == born && v.damp == 0.0;
+            (at_push, rendered_ok, s.v2.lift.is_none())
         };
-        for (kind, ch, what) in [
-            (SoundKind::Typed, Some('W'), "a capital"),
-            (SoundKind::Typed, Some('w'), "a lowercase letter"),
-            (SoundKind::Space, None, "a space"),
-            (SoundKind::Backspace, None, "a deletion"),
-            (SoundKind::Navigation, None, "an arrow"),
+        for (kind, ch, shifted, what) in [
+            (SoundKind::Typed, Some('W'), true, "a capital"),
+            (SoundKind::Typed, Some('w'), false, "a lowercase letter"),
+            (
+                SoundKind::Typed,
+                Some('?'),
+                true,
+                "a shifted `?` (rise + ring)",
+            ),
+            (
+                SoundKind::Typed,
+                Some('('),
+                true,
+                "a shifted `(` (tink + ring)",
+            ),
+            (
+                SoundKind::Typed,
+                Some('+'),
+                true,
+                "a shifted `+` (fifth + ring)",
+            ),
+            (
+                SoundKind::Typed,
+                Some('{'),
+                true,
+                "a shifted `{` (tink + ring)",
+            ),
+            (SoundKind::Space, None, false, "a space"),
+            (SoundKind::Backspace, None, false, "a deletion"),
+            (SoundKind::Navigation, None, false, "an arrow"),
+            (
+                SoundKind::Stardust { twinkle_hz: 9 },
+                None,
+                false,
+                "a Stardust hero",
+            ),
         ] {
-            let (damp, cleared) = after(kind, ch);
+            let (damp, rendered_ok, cleared) = after(kind, ch, shifted);
             assert_eq!(
-                damp, LANE_FADE_STEAL_S,
-                "{what} must resolve the pickup over 12 ms (damp {damp})"
+                damp, 0.0,
+                "{what} must let the ting ring through it (damp {damp}) — the 2026-09-10 \
+                 resolve is the sound the owner could not hear"
             );
-            assert!(cleared, "{what} must clear the pickup's address");
+            assert!(
+                rendered_ok,
+                "{what}: 160 ms on, the ting must still be on, undamped and at its own \
+                 address — a graft's onset must not fade-steal it"
+            );
+            assert!(!cleared, "{what} must leave the ting's address live");
         }
-        let (damp, cleared) = after(SoundKind::Stardust { twinkle_hz: 9 }, None);
-        assert_eq!(
-            damp, 0.0,
-            "a Stardust hero is not the hand: the pickup rings on"
-        );
-        assert!(!cleared, "…and keeps its address");
     }
 
     /// **A DIGIT IS A WOOD BAR THAT COUNTS IN THE STARDUST** (§10.4; the
@@ -9336,7 +9905,20 @@ for it up front.\n\
         /// the authorized mallet octave and sparkle arc changed it upstream.
         /// The incoming baseline and recovered path were rendered separately
         /// and matched exactly, rather than accepting a failing test's output.
-        const LETTER_PATH_FOLD: u64 = 0x1377_c8b9_63c3_47f1;
+        ///
+        /// **RE-BAKED 2026-09-16, from a run, on the space head's re-fit**
+        /// (the owner: *"i don't always hear the space bar?"*). The script
+        /// is `"hello world"`, and its one space is a run HEAD: the
+        /// downbeat rose to [`BASS_LEVEL`] −4 dB, the head's breath grew
+        /// the twinkle ([`SPACE_TWINKLE_LEVEL`]) and every breath got the
+        /// roof that made it audible at all ([`BREATH_ROOF_HZ`]) — a
+        /// different waveform from the space on, by construction. The class
+        /// seam this pin is about did not move: the letters before the
+        /// space render as they did, and the two music-box goldens
+        /// (`music_box_golden::ORACLE_SCRIPT_FOLD`, `BRRRRING_FOLD`, no
+        /// space in either script) are unchanged on the same run.
+        /// Previous: `0x1377_c8b9_63c3_47f1`.
+        const LETTER_PATH_FOLD: u64 = 0x11f9_a5a4_2d77_1774;
         let fold = |x: &[f32]| -> u64 {
             x.iter().fold(0xcbf2_9ce4_8422_2325_u64, |h, s| {
                 (h ^ u64::from(s.to_bits())).wrapping_mul(0x0000_0100_0000_01b3)
@@ -9385,13 +9967,22 @@ for it up front.\n\
             );
         }
         let letters = script("hello world", false);
-        assert_eq!(
+        crate::arm64_pin::deterministic_on_x86_64(
+            "the letter-only script",
+            &fold(&letters),
+            || fold(&script("hello world", false)),
+        );
+        crate::arm64_pin::assert_pinned(
+            "trail_sound::rainbow_kitty_v2::tests::every_class_is_deterministic_and_the_letter_path_is_untouched",
+            "LETTER_PATH_FOLD",
             fold(&letters),
             LETTER_PATH_FOLD,
-            "the LETTER path moved: {} samples folded to {:#018x}, and the base tree \
-             3aa2e825b rendered {LETTER_PATH_FOLD:#018x} — find the leak before changing the pin",
-            letters.len(),
-            fold(&letters)
+            format_args!(
+                "the LETTER path moved: {} samples folded to {:#018x}, and the base tree \
+                 3aa2e825b rendered {LETTER_PATH_FOLD:#018x} — find the leak before changing the pin",
+                letters.len(),
+                fold(&letters)
+            ),
         );
     }
 
@@ -10916,6 +11507,453 @@ for it up front.\n\
         );
     }
 
+    /// **A SPACE HEAD IS HEARD, AND NEVER OVER THE LETTER** (owner,
+    /// 2026-09-16, verbatim: *"i don't always hear the space bar?"* — the
+    /// re-ruling of §22's A/B item 5 of 2026-09-10, "felt, not heard"; see
+    /// [`BASS_LEVEL`] for the measurement that sentence was describing:
+    /// −8.7 dB under a keystroke, centroid 303 Hz, nothing over 2 kHz).
+    ///
+    /// After `"hello"`, one Space against one more letter in the same
+    /// state, rendered from the key, on four seeds:
+    ///
+    /// 1. **the tier** — the head's peak sits in `[−6.5, −2.0]` dB re the
+    ///    letter's (fitted −4..−5: heard beside the letter; the ladder
+    ///    test's `space ≤ typed × 1.05` is the outer ceiling, §9.7's "never
+    ///    louder than a keystroke");
+    /// 2. **top** — the head's 200 ms centroid is over 450 Hz (was 303) and
+    ///    at least a fiftieth of its energy is above 2 kHz (was 0.000): a
+    ///    laptop speaker has something to carry;
+    /// 3. **the anatomy** — still one dyad in [`LANE_BASS`] and one breath
+    ///    in [`LANE_BREATH`], no glint (the twinkle is the breath's own
+    ///    partials, folded into `[GLINT_LO_HZ, GLINT_HI_HZ)` at the dyad's
+    ///    root class, through an open roof), and the dyad's partials are
+    ///    the root and its partner exactly as before;
+    /// 4. **the breath is heard** — a tail space 40 ms behind the head
+    ///    (inside the step gate: breath alone) adds sound to the render,
+    ///    which it never did with `lp_cut` at 0 ([`BREATH_ROOF_HZ`]).
+    #[test]
+    fn a_space_head_is_heard_and_never_over_the_letter() {
+        const SEEDS: [u32; 4] = [SEED, 0x5EED_1234, 0x504F_4F46, 0xCAFE_F00D];
+        const HEAD_BLOCKS: usize = 40;
+        const TAKE_BLOCKS: usize = 60;
+        /// The spectral window: the head's first 200 ms.
+        const SPECTRUM: core::ops::Range<usize> = 0..9_600;
+        const TIER_LO_DB: f32 = -6.5;
+        const TIER_HI_DB: f32 = -2.0;
+        const CENTROID_FLOOR_HZ: f32 = 450.0;
+        const HI_FRACTION_FLOOR: f32 = 0.02;
+        let db = |x: f32| 20.0 * x.log10();
+        let head = |s: &mut TrailSynth| {
+            for (i, ch) in "hello".chars().enumerate() {
+                push_ch(s, SoundKind::Typed, 1_000 + i as u32 * 150, ch);
+            }
+        };
+        // Energy fraction above 2 kHz of a Hann-windowed slice, by the same
+        // naive DFT `centroid_hz` uses.
+        let hi_fraction = |x: &[f32]| -> f32 {
+            let n = x.len();
+            let mut above = 0.0f64;
+            let mut total = 0.0f64;
+            for k in 1..n / 2 {
+                let w = core::f64::consts::TAU * k as f64 / n as f64;
+                let (re, im) = x
+                    .iter()
+                    .enumerate()
+                    .fold((0.0f64, 0.0f64), |(re, im), (i, s)| {
+                        let h = 0.5 * (1.0 - (core::f64::consts::TAU * i as f64 / n as f64).cos());
+                        let v = f64::from(*s) * h;
+                        let a = w * i as f64;
+                        (re + v * a.cos(), im - v * a.sin())
+                    });
+                let e = re * re + im * im;
+                total += e;
+                if k as f64 * f64::from(SR) / n as f64 >= 2_000.0 {
+                    above += e;
+                }
+            }
+            if total <= 0.0 {
+                0.0
+            } else {
+                (above / total) as f32
+            }
+        };
+        for seed in SEEDS {
+            let take = |kind: SoundKind, ch: char| -> (Vec<f32>, Vec<Voice>) {
+                let mut s = TrailSynth::new(SR, seed);
+                head(&mut s);
+                let _ = render_mono(&mut s, HEAD_BLOCKS);
+                let mark = s.born_seq;
+                push_ch(&mut s, kind, 1_900, ch);
+                let born = since(&s, mark);
+                (render_mono(&mut s, TAKE_BLOCKS), born)
+            };
+            let (letter, _) = take(SoundKind::Typed, 'w');
+            let (space, born) = take(SoundKind::Space, ' ');
+            let (p_letter, p_space) = (db(peak_of(&letter)), db(peak_of(&space)));
+            let re_letter = p_space - p_letter;
+            let centroid = centroid_hz(&space[SPECTRUM]);
+            let hi = hi_fraction(&space[SPECTRUM]);
+            println!(
+                "seed {seed:#x}: space head {p_space:.2} dBFS, {re_letter:+.2} dB re the \
+                 letter's {p_letter:.2}; centroid {centroid:.0} Hz; over 2 kHz {hi:.3}"
+            );
+            assert!(
+                (TIER_LO_DB..=TIER_HI_DB).contains(&re_letter),
+                "seed {seed:#x}: the space head is {re_letter:+.2} dB re the letter — \
+                 outside [{TIER_LO_DB}, {TIER_HI_DB}]: heard beside the key, never over it"
+            );
+            assert!(
+                centroid > CENTROID_FLOOR_HZ,
+                "seed {seed:#x}: the head's centroid is {centroid:.0} Hz — the dark dyad the \
+                 owner could not hear sat at 303"
+            );
+            assert!(
+                hi >= HI_FRACTION_FLOOR,
+                "seed {seed:#x}: {hi:.3} of the head's energy is over 2 kHz — a laptop \
+                 speaker has nothing to carry"
+            );
+            // The anatomy.
+            let lanes: Vec<u8> = born.iter().map(|v| v.lane).collect();
+            assert_eq!(
+                lanes,
+                vec![LANE_BASS, LANE_BREATH],
+                "seed {seed:#x}: the head is one dyad and one breath, nothing else"
+            );
+            let (dyad, breath) = (&born[0], &born[1]);
+            assert!(
+                dyad.bass && dyad.p[0].lvl == BASS_ROOT_LVL && dyad.p[1].lvl == BASS_FIFTH_LVL,
+                "seed {seed:#x}: the dyad is the dyad"
+            );
+            let root = dyad.p[0].f0;
+            let twinkle = breath.p[0];
+            assert!(
+                (GLINT_LO_HZ..GLINT_HI_HZ).contains(&twinkle.f0),
+                "seed {seed:#x}: the twinkle at {} Hz is outside the stardust lane",
+                twinkle.f0
+            );
+            assert!(
+                (twinkle.f0 / root).log2().fract().abs() < 1e-4,
+                "seed {seed:#x}: the twinkle ({} Hz) is not the root's ({root} Hz) own class",
+                twinkle.f0
+            );
+            assert_eq!(twinkle.lvl, SPACE_TWINKLE_LEVEL);
+            assert_eq!(breath.p[1].lvl, SPACE_TWINKLE_UNDER);
+            assert_eq!(
+                breath.p[1].f0,
+                twinkle.f0 * 0.5,
+                "the partner is the octave under"
+            );
+            assert!(
+                breath.lp_cut >= GLINT_HI_HZ,
+                "seed {seed:#x}: the breath's roof ({}) would take the twinkle off",
+                breath.lp_cut
+            );
+            assert!(breath.n_lvl > 0.0, "the head's breath still breathes");
+            assert!(
+                twinkle.decay <= 0.0 && breath.p[1].decay <= 0.0,
+                "the twinkle rides the breath's own envelope"
+            );
+            // The breath is heard: a tail space inside the step gate, against
+            // the same take without it.
+            let with_tail = {
+                let mut s = TrailSynth::new(SR, seed);
+                head(&mut s);
+                let _ = render_mono(&mut s, HEAD_BLOCKS);
+                push_ch(&mut s, SoundKind::Space, 1_900, ' ');
+                let mut out = render_mono(&mut s, 4);
+                let mark = s.born_seq;
+                push_ch(&mut s, SoundKind::Space, 1_940, ' ');
+                let tail = since(&s, mark);
+                assert_eq!(
+                    tail.iter().map(|v| v.lane).collect::<Vec<_>>(),
+                    vec![LANE_BREATH],
+                    "seed {seed:#x}: a space 40 ms behind the head is breath alone"
+                );
+                assert!(
+                    tail[0].p.iter().all(|p| p.lvl <= 0.0),
+                    "a tail breath has no twinkle"
+                );
+                out.extend(render_mono(&mut s, TAKE_BLOCKS - 4));
+                out
+            };
+            let added = with_tail
+                .iter()
+                .zip(&space)
+                .fold(0.0f32, |m, (a, b)| m.max((a - b).abs()));
+            assert!(
+                added > 0.0,
+                "seed {seed:#x}: the tail space's breath added nothing to the render — \
+                 the breath is silent again"
+            );
+            assert!(
+                db(added) < p_space,
+                "seed {seed:#x}: the breath ({:.2} dBFS) is not under the head ({p_space:.2})",
+                db(added)
+            );
+        }
+    }
+
+    /// **A RUN OF SPACES IS ONE DOWNBEAT AND A RISING FIGURE** (owner,
+    /// 2026-09-16: *"get some kind of musical sound for multiple spaces in
+    /// addition to the soft word separator"* — see [`SPACE_STEP_LEVEL`]).
+    ///
+    /// After "hello", four spaces 100 ms apart: the FIRST is the downbeat
+    /// (the dyad in [`LANE_BASS`], one chord step, no step voice); each of
+    /// the next three is its breath plus ONE indent step in [`LANE_GLINT`] —
+    /// a lit degree of the live chord, strictly rising, inside
+    /// `[BASS_BASE_HZ, SPACE_STEP_HI_HZ)`, quieter than the downbeat — and
+    /// none of them is a second downbeat or moves the chord. A fifth space
+    /// 40 ms behind the fourth is inside [`SPACE_STEP_MIN_GAP_MS`] and is
+    /// breath alone. A held spacebar at 33 ms auto-repeat for one second
+    /// gets at most 13 steps (measured: 10, one per third repeat; 9 in the
+    /// 96-repeat probe's first 30, whose first repeat is the head) — and,
+    /// since the audit of 2026-09-16 (see [`indent_step_hz`]), the probe
+    /// runs 96 repeats (3.2 s, past the 54th space where the first cut's
+    /// fold ran out) and HEARS every step: each one a lit degree of the live
+    /// chord in `[BASS_BASE_HZ, SPACE_STEP_HI_HZ)`, the figure climbing one
+    /// lit degree per ADMITTED step and starting over under the ceiling.
+    #[test]
+    fn a_run_of_spaces_is_one_downbeat_and_a_rising_figure() {
+        let mag = |v: &Voice| (v.gl * v.gl + v.gr * v.gr).sqrt();
+        let mut s = synth();
+        for (i, ch) in "hello".chars().enumerate() {
+            push_ch(&mut s, SoundKind::Typed, 1_000 + i as u32 * 150, ch);
+        }
+        let mark = s.born_seq;
+        push(&mut s, SoundKind::Space, 2_000, 0.0, false);
+        let head = since(&s, mark);
+        let bass = head
+            .iter()
+            .find(|v| v.lane == LANE_BASS)
+            .expect("the run's head is the downbeat");
+        assert!(
+            head.iter().all(|v| v.lane != LANE_GLINT),
+            "the head is the downbeat, not a step"
+        );
+        let (root, head_gain) = (bass.p[0].f0, mag(bass));
+        let chord = CHORD_LOOP[usize::from(s.v2.chord)];
+        let chord_idx = s.v2.chord;
+        let walk = s.v2.walk();
+        let key = i32::from(s.song_key);
+        let mut last = root;
+        for n in 1..=3u32 {
+            let mark = s.born_seq;
+            push(&mut s, SoundKind::Space, 2_000 + n * 100, 0.0, false);
+            let v = since(&s, mark);
+            assert!(
+                v.iter().all(|v| v.lane != LANE_BASS),
+                "space {n} of the run: a second downbeat"
+            );
+            assert!(
+                v.iter().any(|v| v.lane == LANE_BREATH),
+                "space {n} of the run: the breath is still under the step"
+            );
+            let steps: Vec<&Voice> = v.iter().filter(|v| v.lane == LANE_GLINT).collect();
+            assert_eq!(
+                steps.len(),
+                1,
+                "space {n} of the run: exactly one indent step"
+            );
+            let step = steps[0];
+            let f = step.p[0].f0;
+            assert!(
+                f > last * 1.01,
+                "space {n}: the figure must RISE ({last} -> {f} Hz)"
+            );
+            assert!(
+                (BASS_BASE_HZ..SPACE_STEP_HI_HZ).contains(&f),
+                "space {n}: the step left its two octaves ({f} Hz)"
+            );
+            assert!(
+                (0..20).any(|deg| {
+                    chord.lit & (1 << (deg % 5)) != 0
+                        && (penta(BASS_BASE_HZ, deg + key) - f).abs() < SAME_PITCH_HZ
+                }),
+                "space {n}: {f} Hz is not a lit degree of the live chord"
+            );
+            assert!(
+                mag(step) < head_gain,
+                "space {n}: a step ({}) may not be louder than the downbeat ({head_gain})",
+                mag(step)
+            );
+            last = f;
+        }
+        let mark = s.born_seq;
+        push(&mut s, SoundKind::Space, 2_340, 0.0, false);
+        assert!(
+            since(&s, mark).iter().all(|v| v.lane != LANE_GLINT),
+            "a space inside SPACE_STEP_MIN_GAP_MS of the last step is breath alone"
+        );
+        assert_eq!(s.v2.chord, chord_idx, "the tail moved the chord");
+        assert_eq!(s.v2.walk(), walk, "the tail moved the walk");
+
+        // THE HELD SPACEBAR: 96 repeats at 33 ms — 3.2 s, every step heard.
+        let mut s = synth();
+        push(&mut s, SoundKind::Typed, 1_000, 0.0, false);
+        let mut buf = [0.0f32; 3_168]; // 33 ms
+        let mut heard: Vec<f32> = Vec::new();
+        let mut first_second = 0usize;
+        // The letter's own sparkle is a LANE_GLINT birth too; count from here.
+        let glints_before = s.lane_births[usize::from(LANE_GLINT)];
+        for k in 0..96u32 {
+            let mark = s.born_seq;
+            push(&mut s, SoundKind::Space, 1_200 + k * 33, 0.0, false);
+            s.render(&mut buf);
+            let steps: Vec<Voice> = since(&s, mark)
+                .into_iter()
+                .filter(|v| v.lane == LANE_GLINT)
+                .collect();
+            assert!(
+                steps.len() <= 1,
+                "repeat {k}: {} steps at once",
+                steps.len()
+            );
+            if let Some(step) = steps.first() {
+                heard.push(step.p[0].f0);
+                if k < 30 {
+                    first_second += 1;
+                }
+            }
+        }
+        assert_eq!(
+            (s.lane_births[usize::from(LANE_GLINT)] - glints_before) as usize,
+            heard.len(),
+            "every LANE_GLINT birth of a held spacebar is an indent step"
+        );
+        println!(
+            "held space: {first_second} indent steps in the first second of 33 ms auto-repeat, \
+             {} in 3.2 s: {heard:?}",
+            heard.len()
+        );
+        assert!(
+            (4..=13).contains(&first_second),
+            "a held spacebar minted {first_second} steps/s — the gate admits one per 75+ ms"
+        );
+        assert!(
+            heard.len() >= 30,
+            "3.2 s of auto-repeat minted only {} steps",
+            heard.len()
+        );
+        let chord = CHORD_LOOP[usize::from(s.v2.chord)];
+        let key = i32::from(s.song_key);
+        for (i, f) in heard.iter().enumerate() {
+            assert!(
+                (BASS_BASE_HZ..SPACE_STEP_HI_HZ).contains(f),
+                "held space, step {}: {f} Hz left [{BASS_BASE_HZ}, {SPACE_STEP_HI_HZ}) — the \
+                 first cut's fold ran out at the 54th space",
+                i + 1
+            );
+            assert!(
+                (0..20).any(|deg| {
+                    chord.lit & (1 << (deg % 5)) != 0
+                        && (penta(BASS_BASE_HZ, deg + key) - f).abs() < SAME_PITCH_HZ
+                }),
+                "held space, step {}: {f} Hz is not a lit degree of the live chord",
+                i + 1
+            );
+        }
+        // The figure: strictly rising until it starts over at its first note.
+        let cycle = heard
+            .iter()
+            .skip(1)
+            .position(|f| (f - heard[0]).abs() < SAME_PITCH_HZ)
+            .map(|i| i + 1)
+            .expect("3.2 s of steps never came back to the figure's first note");
+        assert!((2..=6).contains(&cycle), "a figure of {cycle} notes");
+        for (i, f) in heard.iter().enumerate() {
+            let expect = heard[i % cycle];
+            assert!(
+                (f - expect).abs() < SAME_PITCH_HZ,
+                "held space, step {}: {f} Hz, but the figure's note {} is {expect}",
+                i + 1,
+                i % cycle + 1
+            );
+            if i % cycle > 0 {
+                assert!(
+                    *f > heard[i - 1] * 1.01,
+                    "held space, step {}: the figure must RISE inside a pass ({} -> {f})",
+                    i + 1,
+                    heard[i - 1]
+                );
+            }
+        }
+    }
+
+    /// **THE INDENT FIGURE IS A CYCLE ON EVERY CHORD AND KEY** (the audit of
+    /// 2026-09-16; see [`indent_step_hz`] for the unbounded fold it replaces
+    /// — chord I's 54th space on the ceiling, its 69th at 33.5 kHz). The
+    /// pure function, replayed for every chord of [`CHORD_LOOP`], every
+    /// song key the latch can hand it (−3..=4, `latch_song_key`) and
+    /// 300 steps:
+    ///
+    /// 1. every step is under [`SPACE_STEP_HI_HZ`] and strictly above the
+    ///    dyad's root — and at key 0, inside the §9.4 band
+    ///    `[BASS_BASE_HZ, SPACE_STEP_HI_HZ)`;
+    /// 2. every step is a lit degree of the chord on the keyed lattice;
+    /// 3. the figure is periodic from its first note — step `n` is step
+    ///    `n + cycle` — and strictly rising inside a pass;
+    /// 4. steps 1..3 are what the first cut played (the four-space indent
+    ///    the owner hears is unchanged): chord I over C4 is E4 G4 C5 E5 G5.
+    #[test]
+    fn the_indent_figure_is_a_cycle_on_every_chord_and_key() {
+        for (ci, chord) in CHORD_LOOP.iter().enumerate() {
+            for key in -3..=4i32 {
+                let root = penta(BASS_BASE_HZ * CHORD_ROOT_RATIO[chord.root], key);
+                let f: Vec<f32> = (1..=300u32)
+                    .map(|n| indent_step_hz(*chord, root, n, key))
+                    .collect();
+                let cycle = f
+                    .iter()
+                    .skip(1)
+                    .position(|x| (x - f[0]).abs() < SAME_PITCH_HZ)
+                    .map(|i| i + 1)
+                    .unwrap_or_else(|| panic!("chord {ci} key {key}: no cycle in {f:?}"));
+                for (i, x) in f.iter().enumerate() {
+                    let n = i + 1;
+                    assert!(
+                        *x < SPACE_STEP_HI_HZ && *x > root,
+                        "chord {ci} key {key} step {n}: {x} Hz is not in ({root}, {SPACE_STEP_HI_HZ})"
+                    );
+                    if key == 0 {
+                        assert!(
+                            (BASS_BASE_HZ..SPACE_STEP_HI_HZ).contains(x),
+                            "chord {ci} step {n}: {x} Hz left the §9.4 band"
+                        );
+                    }
+                    assert!(
+                        (-20i32..40).any(|deg| {
+                            chord.lit & (1 << deg.rem_euclid(5)) != 0
+                                && (penta(BASS_BASE_HZ, deg + key) - x).abs() < SAME_PITCH_HZ
+                        }),
+                        "chord {ci} key {key} step {n}: {x} Hz is not a lit degree"
+                    );
+                    assert!(
+                        (x - f[i % cycle]).abs() < SAME_PITCH_HZ,
+                        "chord {ci} key {key} step {n}: {x} Hz breaks the {cycle}-note cycle"
+                    );
+                    if i % cycle > 0 {
+                        assert!(
+                            *x > f[i - 1] * 1.01,
+                            "chord {ci} key {key} step {n}: {} -> {x} does not rise",
+                            f[i - 1]
+                        );
+                    }
+                }
+                if ci == 0 && key == 0 {
+                    let want = [327.04, 392.45, 523.26, 654.08, 784.89];
+                    assert_eq!(cycle, want.len(), "chord I over C4: E4 G4 C5 E5 G5");
+                    for (x, w) in f.iter().zip(want) {
+                        assert!((x - w).abs() < SAME_PITCH_HZ, "chord I: {x} vs {w}");
+                    }
+                }
+                println!(
+                    "chord {ci} key {key}: root {root:.1} Hz, {cycle}-note figure {:?}",
+                    &f[..cycle]
+                );
+            }
+        }
+    }
+
     // -- §16: the deltas are identity-defaulted ---------------------------
 
     /// **EVERY ENGINE DELTA DEFAULTS TO THE IDENTITY** (§16's identity
@@ -10968,6 +12006,192 @@ for it up front.\n\
     /// 26 of 28 slots, so a lane under its cap can always be admitted and the
     /// global pool never runs dry — `steals()` reports a real mix defect, and
     /// on v2's own worst case it must report none.
+    /// **THE METEOR'S TICK IS HEARD** (§12.2 layer 1; the repair of
+    /// 2026-09-16 recorded at [`MET_TICK_ROOF_HZ`] — §33.5 of the design
+    /// listed it "not fixed" that morning — and the same day's audit at
+    /// [`MET_TICK_DUR_S`] / [`MET_TICK_LEVEL`], which found it rendering
+    /// but 16 dB under its rule, inside the release ramp). The tick was
+    /// built with no `lp_cut`, which in this engine is a lowpass coefficient
+    /// of 0 and an output of exactly zero — the breath's own defect
+    /// ([`BREATH_ROOF_HZ`]).
+    ///
+    /// 1. The prototype carries the roof, and every tick the two meteor
+    ///    sites spawn (the unarmed meteor's, the armed pre-cue's) is that
+    ///    prototype — found by its downward 3200 → 900 glide, the one
+    ///    noise voice of the gesture that falls;
+    /// 2. the tick ALONE, at its own level, renders sound in its first
+    ///    10 ms — and the same voice with the roof at 0 renders exactly
+    ///    nothing, which is the before;
+    /// 3. AT ITS RULED LEVEL: over ten seeds its rendered peak sits inside
+    ///    **−24 ± 5 dB re the tine step's rendered peak** (the step at the
+    ///    module's seed, −19.94 dBFS) and the ten readings' median inside
+    ///    ±1.5 — measured −26.4..−19.5, median −24.0; before the audit
+    ///    −42.4..−35.9, median −40.0 (−59.4 dBFS at the bench's seed);
+    /// 4. it is a tick, not a bang: under the step on every seed, at −40 dB
+    ///    re its own crest by 10 ms, and exactly silent from 20 ms on —
+    ///    its 12.5 ms life has ended.
+    #[test]
+    fn the_meteor_tick_is_heard() {
+        let tick = met_tick();
+        assert_eq!(tick.lp_cut, MET_TICK_ROOF_HZ);
+        assert!(
+            tick.lp_cut >= MET_TICK_HZ0,
+            "the roof would take the tick's 3200 Hz off"
+        );
+        let is_tick = |v: &Voice| v.n_lvl > 0.0 && v.n_f0 == MET_TICK_HZ0 && v.n_f1 < v.n_f0;
+        // 1. Both sites.
+        let mut s = synth();
+        push(&mut s, SoundKind::Typed, 1_000, 0.0, false);
+        let mark = s.born_seq;
+        meteor(&mut s, 1_100, 50, false);
+        let born = since(&s, mark);
+        let ticks: Vec<&Voice> = born.iter().filter(|v| is_tick(v)).collect();
+        assert_eq!(ticks.len(), 1, "an unarmed meteor opens with one tick");
+        assert_eq!(
+            ticks[0].lp_cut, MET_TICK_ROOF_HZ,
+            "the meteor's tick has no roof"
+        );
+        assert_eq!(ticks[0].lane, LANE_METEOR);
+        let mut s = synth();
+        push(&mut s, SoundKind::Typed, 1_000, 0.0, false);
+        let mark = s.born_seq;
+        arm(&mut s, 1_100);
+        let born = since(&s, mark);
+        let ticks: Vec<&Voice> = born.iter().filter(|v| is_tick(v)).collect();
+        assert_eq!(ticks.len(), 1, "an armed pre-cue opens with one tick");
+        assert_eq!(
+            ticks[0].lp_cut, MET_TICK_ROOF_HZ,
+            "the arm's tick has no roof"
+        );
+        assert_eq!(
+            ticks[0].arm_ttl, MET_ARM_TTL_S,
+            "the arm's tick carries the ttl"
+        );
+        // 2. The tick alone: heard now, silent before. Three windows: the
+        // crest (0-10 ms), the ramp's end (10-20 ms), and after the life.
+        let alone = |seed: u32, roof: f32| -> (f32, f32, f32) {
+            let mut s = TrailSynth::new(SR, seed);
+            let mut v = met_tick();
+            v.lp_cut = roof;
+            s.v2_spawn(v, VOL * KEY_TINE_TRIM * MET_TICK_LEVEL, 0.0);
+            let crest = render_peak(&mut s, 1);
+            let tail = render_peak(&mut s, 1);
+            let rest = render_peak(&mut s, 4);
+            (crest, tail, rest)
+        };
+        let (before, _, _) = alone(SEED, 0.0);
+        assert_eq!(
+            before, 0.0,
+            "with the roof at 0 the tick rendered — the before is gone"
+        );
+        // 3. At its ruled level, against the tine step rendered in the same
+        // frame (one key, 300 ms, the module's seed).
+        const TICK_SEEDS: [u32; 10] = [
+            SEED,
+            0x5EED_1234,
+            0x504F_4F46,
+            0xCAFE_F00D,
+            0xBEEF,
+            0xDEAD_BEEF,
+            0x0000_0001,
+            0x1234_5678,
+            0xFACE_FEED,
+            0x7777_7777,
+        ];
+        const TICK_RE_STEP_DB: f32 = -24.0;
+        const TICK_SEED_TOL_DB: f32 = 5.0;
+        const TICK_MEDIAN_TOL_DB: f32 = 1.5;
+        let step = {
+            let mut s = synth();
+            push(&mut s, SoundKind::Typed, 1_000, 0.0, false);
+            render_peak(&mut s, 30)
+        };
+        let mut re: Vec<f32> = Vec::new();
+        for seed in TICK_SEEDS {
+            let (crest, tail, rest) = alone(seed, MET_TICK_ROOF_HZ);
+            assert!(crest > 0.0, "seed {seed:#x}: the tick is silent again");
+            let db = 20.0 * (crest / step).log10();
+            println!(
+                "meteor tick alone, vol 0.4, seed {seed:#x}: crest {crest:.5} ({:.2} dBFS) = \
+                 {db:+.2} dB re the step ({:.2} dBFS); 10-20 ms {tail:.6}; 20-60 ms {rest}",
+                20.0 * crest.log10(),
+                20.0 * step.log10()
+            );
+            // 4. A tick, not a bang.
+            assert!(
+                crest < step,
+                "seed {seed:#x}: the tick ({crest}) peaks over the tine step ({step})"
+            );
+            assert!(
+                tail <= crest * 0.01,
+                "seed {seed:#x}: 10 ms in, the tick must be −40 dB under its crest ({tail} vs \
+                 {crest})"
+            );
+            assert_eq!(
+                rest, 0.0,
+                "seed {seed:#x}: the tick sounded past its 12.5 ms life"
+            );
+            assert!(
+                (db - TICK_RE_STEP_DB).abs() <= TICK_SEED_TOL_DB,
+                "seed {seed:#x}: the tick's rendered peak must sit at §12.2's {TICK_RE_STEP_DB} \
+                 dB re the step ± {TICK_SEED_TOL_DB} (got {db:+.2})"
+            );
+            re.push(db);
+        }
+        re.sort_by(|a, b| a.partial_cmp(b).expect("finite"));
+        let median = re[re.len() / 2];
+        assert!(
+            (median - TICK_RE_STEP_DB).abs() <= TICK_MEDIAN_TOL_DB,
+            "over {} seeds the tick's median peak must sit at {TICK_RE_STEP_DB} dB re the step \
+             ± {TICK_MEDIAN_TOL_DB} (got {median:+.2}; readings {re:?})",
+            re.len()
+        );
+    }
+
+    /// THE TING DECAYS OUT INSTEAD OF BEING CUT (the 2026-09-16 audit's
+    /// third observation — *"in case the owner hears the ting's tail as
+    /// cut"*). At the tail law's 230 ms the music box's ting ended at
+    /// −23 dB re its own peak: the ring time to −40 dB and to −60 dB both
+    /// read 228.6 ms of a 229.5 ms life, the voice's end — a cut. With
+    /// v1's life ([`TING_DUR_S`], 430 ms) this pins a decay's signature:
+    /// the envelope alone under −40 dB before the end; the rendered −40 dB
+    /// point (381 ms) at least 10 ms before the ramp starts; the −60 dB
+    /// point inside the ramp (429 ms), which closes a tail nobody hears.
+    #[test]
+    fn the_ting_decays_out_instead_of_being_cut() {
+        assert!(
+            (-TING_DUR_S / TING_DECAY_S).exp() <= 0.01,
+            "the ting's envelope must be under −40 dB by its own decay before its life ends"
+        );
+        let life_ms = TING_DUR_S * 1000.0;
+        let ramp_ms = life_ms - crate::trail_sound::RELEASE_RAMP_S * 1000.0;
+        let mut s = synth();
+        push(&mut s, SoundKind::Shift, 1_000, 0.0, false);
+        let m = render_mono(&mut s, 50);
+        let peak = m.iter().fold(0.0f32, |a, x| a.max(x.abs()));
+        let ring = |db: f32| {
+            m.iter()
+                .rposition(|x| x.abs() > peak * 10f32.powf(db / 20.0))
+                .map_or(0.0, |i| i as f32 / 48.0)
+        };
+        let (to40, to60) = (ring(-40.0), ring(-60.0));
+        println!(
+            "music-box ting: peak {:.2} dBFS, −40 dB at {to40:.1} ms, −60 dB at {to60:.1} ms, \
+             ramp at {ramp_ms:.1}, life {life_ms:.1}",
+            20.0 * peak.log10()
+        );
+        assert!(
+            to40 + 10.0 <= ramp_ms,
+            "the ting must reach −40 dB re its peak by decay, at least 10 ms before the ramp \
+             starts ({to40:.1} ms vs the ramp at {ramp_ms:.1})"
+        );
+        assert!(
+            to60 >= ramp_ms && to60 <= life_ms,
+            "the −60 dB point should be the ramp's ({to60:.1} ms, ramp {ramp_ms:.1}..{life_ms:.1}) \
+             — otherwise the −40 dB reading was a cut"
+        );
+    }
+
     #[test]
     fn the_lanes_hold_their_caps_and_steals_are_zero() {
         let mut s = synth();
@@ -11086,6 +12310,7 @@ for it up front.\n\
             LANE_CADENCE,
             LANE_CASCADE,
             LANE_GRAFT,
+            LANE_TING,
         ] {
             let live = s
                 .voices
@@ -11104,7 +12329,7 @@ for it up front.\n\
             // Its age when the ramp was armed: now, less the ramp burnt.
             let age = v.t - (v.damp0 - v.damp);
             assert!(
-                age < 0.0 || age >= LANE_AGE_GUARD_S - 1e-4,
+                !(0.0..LANE_AGE_GUARD_S - 1e-4).contains(&age),
                 "lane {} fade-stole a voice {age} s old — under the 40 ms age guard",
                 v.lane
             );
@@ -11668,7 +12893,7 @@ for it up front.\n\
             let pre: Vec<f32> = before.iter().skip(ch).step_by(2).copied().collect();
             let post: Vec<f32> = after.iter().skip(ch).step_by(2).copied().collect();
             // The sine's own slope over the 20 ms before the claim — past
-            // the tick, which is over by 4 ms.
+            // the tick, which is over by 12.5 ms.
             let slope = pre[pre.len() - 960..]
                 .windows(2)
                 .map(|w| (w[1] - w[0]).abs())
@@ -12001,7 +13226,7 @@ for it up front.\n\
     /// Every laned voice §11 builds has `exp(−dur/decay) ≤ 0.07` — at −23 dB
     /// or below when the engine's 5 ms release ends it — and every damp v2
     /// arms is at least the 12 ms ramp. Gesture by gesture, at the spawn, so
-    /// the tick's 4 ms life and the rain's 76 ms are examined alongside the
+    /// the tick's 12.5 ms life and the rain's 76 ms are examined alongside the
     /// tine's `3τ + 20`.
     #[test]
     fn tails_end_quietly_and_damps_are_ramps() {

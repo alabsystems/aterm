@@ -2001,7 +2001,9 @@ impl App {
     /// that is not there. Labels come from the window's `strip_titles_scratch` and column
     /// spans from its cached `tab_segments` — the very buffers the last paint filled and
     /// the mouse hit-tests against, so the announced tab and the clickable tab are the
-    /// same one by construction.
+    /// same one by construction. The label is announced WHOLE, not as the chip's cut, so
+    /// it takes the whole-string cap the strip itself does not
+    /// (`title_summary::whole_label`).
     #[cfg(a11y_tree)]
     fn grid_a11y_tabs(&self, wid: crate::WindowId) -> Vec<crate::accesskit_tree::GridTab> {
         if self.tab_strip_rows == 0 {
@@ -2025,11 +2027,10 @@ impl App {
                 }
                 Some(crate::accesskit_tree::GridTab {
                     index,
-                    title: ws
-                        .strip_titles_scratch
-                        .get(index)
-                        .cloned()
-                        .unwrap_or_else(|| "aterm".to_string()),
+                    title: ws.strip_titles_scratch.get(index).map_or_else(
+                        || "aterm".to_string(),
+                        |label| crate::title_summary::whole_label(label).into_owned(),
+                    ),
                     selected: active == Some(index),
                     start_col: segment.start_col,
                     end_col: segment.end_col,
@@ -2365,11 +2366,11 @@ impl App {
                 text: notice.text(),
                 detail: None,
                 progress: None,
-                // Only the update pill does anything when clicked, and only while it is
-                // still legible — the exact pair of gates `App::notice_click` applies, so
-                // the tree never offers an action the pixels do not have.
-                activates: notice.is_update_ready()
-                    && notice.alpha(std::time::Instant::now()) >= crate::notice::CLICK_MIN_ALPHA,
+                // No notice kind is a one-press action any more (the update lane's
+                // click-to-apply is the status bar's row, 2026-09-07), so the tree
+                // never offers an action the pixels do not have. The cards that DO
+                // carry controls announce those controls, not the card.
+                activates: false,
                 // A floating card that slides through its whole life is not a place on
                 // the glass; a rectangle here would name where it was one frame ago.
                 bar_row: None,
@@ -2396,7 +2397,9 @@ impl App {
         match message {
             ChromeMessage::Notice => {
                 // `App::notice_click`'s gates, minus its hit test: the card must be on
-                // THIS window's glass and still legible.
+                // THIS window's glass and still legible. No kind carries a one-press
+                // action now (`activates` is false for the card itself), so an activate
+                // that arrives anyway only dismisses.
                 let Some(notice) = self.notice.as_ref() else {
                     return;
                 };
@@ -2408,11 +2411,7 @@ impl App {
                 {
                     return;
                 }
-                let actionable = notice.is_update_ready();
                 self.notice = None;
-                if actionable {
-                    self.apply_update_or_details();
-                }
                 self.request_redraw_all_windows();
             }
             // The band's own click route (`App::on_mouse_button`): open the lane's
@@ -2489,9 +2488,6 @@ impl App {
     /// screen-reader Click):
     /// - **Settings** — node id `field_index + 1`: Focus selects the row, Click activates it
     ///   (toggle / cycle / begin-edit), exactly like a keyboard/mouse activate.
-    /// - **About** — the lone OK button carries Click → close the dialog.
-    /// - **Update** — the button id maps back to its [`crate::update_screen::UpdateHit`]
-    ///   (Close / Check / Install) via [`crate::update_screen::a11y_hit`].
     /// - **Palette** — a filtered row id contains its current target-set epoch and slot:
     ///   Focus moves the cursor, Click selects then activates the command (a disabled row
     ///   carries no Click, and a delayed request from an old tab/generation is rejected).
@@ -2553,31 +2549,6 @@ impl App {
                         self.settings_activate();
                     }
                     _ => {}
-                }
-            }
-            #[cfg(test)]
-            OverlayKind::About => {
-                // Two actionable nodes: the site Link opens the browser; any other
-                // Click (the OK button) closes — matching the pointer's hit map.
-                if req.action == accesskit::Action::Click {
-                    let site = self
-                        .windows
-                        .get(&wid)
-                        .and_then(|ws| ws.about())
-                        .and_then(crate::about::site_node_id);
-                    if site == Some(req.target_node.0) {
-                        self.open_about_site(wid);
-                    } else {
-                        self.about_exit(wid);
-                    }
-                }
-            }
-            #[cfg(test)]
-            OverlayKind::Update => {
-                if req.action == accesskit::Action::Click
-                    && let Some(hit) = crate::update_screen::a11y_hit(req.target_node)
-                {
-                    self.update_screen_click(wid, hit);
                 }
             }
             OverlayKind::Palette => {
@@ -2963,7 +2934,6 @@ mod tests {
         let ws = app.windows.get_mut(&crate::WindowId(0)).expect("window 0");
         ws.next_trail_tick = Some(now + Duration::from_millis(16));
         ws.last_trail_fire = Some(now);
-        ws.last_effect_pump_at = Some(now);
         // The chrome-decoration lane is a scheduler input too, and unlike the
         // cursor engines it is not focus-gated — so arm it here or the native
         // boundary below is only asserted for the effects that never needed it.
@@ -3000,7 +2970,6 @@ mod tests {
         assert!(!ws.deco_anim_frame_active(now));
         assert_eq!(ws.next_trail_tick, None);
         assert_eq!(ws.last_trail_fire, None);
-        assert_eq!(ws.last_effect_pump_at, None);
     }
 
     #[test]
@@ -4087,15 +4056,14 @@ mod a11y_message_wiring_tests {
     /// A SCREEN READER MAY NOT REACH WHAT A CLICK COULD NOT. An action request names a
     /// node from a tree published some frames ago, and the notice card fades and slides
     /// the whole time it is up; `activate_a11y_message` therefore re-asks the very
-    /// question `App::notice_click` asks before it touches the update lane.
+    /// question `App::notice_click` asks before it consumes the card.
     #[test]
     fn activating_a_card_that_is_not_on_this_windows_glass_does_nothing() {
         let mut app = App::headless_for_test();
         let wid = WindowId(0);
         app.prepare_terminal_capture_grid(wid).unwrap();
-        app.notice = Some(crate::notice::TransientNotice::update_ready(
-            "0.64.0".to_string(),
-            42,
+        app.notice = Some(crate::notice::TransientNotice::update_status(
+            "\u{2191} Update ready \u{2014} v0.64.0",
             Instant::now(),
         ));
         // The card is global; this window has not composited one, which is the state a

@@ -3766,10 +3766,6 @@ struct RollbackHandoff<'a> {
 /// install, discard the failed new build + sentinel + staged bundle, and re-exec
 /// the restored OLD binary. A missing/temporarily failing inverse swap preserves
 /// all recovery authority and returns Deferred; NEW may still be installed.
-#[allow(
-    clippy::too_many_arguments,
-    reason = "a private step of the apply; its eight inputs are the apply's own handles, not a public surface"
-)]
 fn revert_to_rollback(
     b: &bundle::Bundle,
     staging: &Staging,

@@ -569,14 +569,24 @@ impl Attribution {
 /// but that crate is outside this change's ownership and a date parser is not worth a
 /// cross-crate edit to share. The duplication is 20 lines of pure arithmetic with a test
 /// on each side, which is the cheap half of the tradeoff.
+///
+/// The `Z` suffix is REQUIRED and the length exact — the same bar the twin sets, so the
+/// two gates cannot disagree about the same string. A zone-offset stamp (`…+05:30`) names
+/// a DIFFERENT instant than the digits ahead of it do, and reading it as UTC would move a
+/// deadline the wrong way: `not_after = "2026-12-31T23:59:59+05:30"` expires at 18:29:59Z,
+/// so a parser that ignored the offset would keep that machine authorizing for another
+/// 5.5 h — up to 14 h at the extreme of the offset range. Fractional seconds and trailing
+/// bytes are refused on the same principle: the producers all emit exactly this shape
+/// (`roster_ops` stamps it), so anything else is a hand-edit this gate must not guess at.
 fn rfc3339_to_unix(s: &str) -> Option<i64> {
     let b = s.as_bytes();
-    if b.len() < 19
+    if b.len() != 20
         || b[4] != b'-'
         || b[7] != b'-'
         || b[10] != b'T'
         || b[13] != b':'
         || b[16] != b':'
+        || b[19] != b'Z'
     {
         return None;
     }
@@ -1043,6 +1053,37 @@ mod tests {
         );
     }
 
+    /// AN OFFSET STAMP IS NOT UTC, and must not be gated as though it were.
+    ///
+    /// `…T23:59:59+05:30` denotes an instant 5.5 hours EARLIER than the same digits read
+    /// as UTC, so reading the digits alone moves the deadline the wrong way: the machine
+    /// would keep authorizing past the expiry the operator wrote, by as much as the 14 h
+    /// the offset range allows. Such a stamp is refused outright instead — `None` ⇒
+    /// lapsed at every caller — which is the verdict `atpkg::flow`'s twin already gives
+    /// the same string, so the two gates agree.
+    #[test]
+    fn an_offset_stamp_is_refused_rather_than_silently_read_as_utc() {
+        // THE MACHINE GATE. True expiry is 2026-12-31T18:29:59Z; well past it, m3 must be
+        // gone from the candidate set rather than live until the 23:59:59Z the digits say.
+        let mut r = roster();
+        r.machines[0].not_after = Some("2026-12-31T23:59:59+05:30".into());
+        let past_the_real_deadline = rfc3339_to_unix("2026-12-31T20:00:00Z").unwrap();
+        assert_eq!(
+            r.machine("m3", past_the_real_deadline),
+            Err(RosterReject::Expired)
+        );
+        assert!(
+            r.live(past_the_real_deadline).iter().all(|m| m.id != "m3"),
+            "an unreadable not_after must not leave the machine in the live set"
+        );
+
+        // THE ROSTER'S OWN WINDOW, read the same way: a deadline that cannot be read as
+        // UTC is lapsed, never open.
+        let mut r = roster();
+        r.valid_until = "2027-02-01T00:00:00+05:30".into();
+        assert_eq!(r.admit(0, NOW), Err(RosterReject::Stale));
+    }
+
     /// The date arithmetic the freshness gate rests on, pinned against hand-checked
     /// values — a wrong epoch here would silently widen or brick every window.
     #[test]
@@ -1057,6 +1098,15 @@ mod tests {
             "2026-13-04T00:00:00Z",
             "2026-08-04T24:00:00Z",
             "20xx-08-04T00:00:00Z",
+            // THE ZONE IS PART OF THE SHAPE. Each of these reads as a plausible date to
+            // a human and must still be refused, because none of them is the UTC instant
+            // the digits ahead of the suffix would claim.
+            "2026-08-04T00:00:00+05:30", // an offset denotes an EARLIER instant
+            "2026-08-04T00:00:00-08:00", // ...and this one a later instant
+            "2026-08-04T00:00:00",       // bare, no zone at all
+            "2026-08-04T00:00:00.500Z",  // fractional seconds
+            "2026-08-04T00:00:00Z ",     // trailing byte
+            "2026-08-04T00:00:00Zjunk",
         ] {
             assert_eq!(rfc3339_to_unix(bad), None, "{bad:?} must not parse");
         }

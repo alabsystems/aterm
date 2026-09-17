@@ -98,6 +98,14 @@ pub const ERRNO_EPERM: i32 = 1;
 /// is not ours" when the responsibility SPI returns `-1`.
 pub const ERRNO_ESRCH: i32 = 3;
 
+/// `ENOENT` — "no such file or directory". On a path that TCC guards, this is
+/// the answer you only get once the guard let you look: tccd decides before
+/// the lookup reports the missing name, so a denial arrives as [`ERRNO_EPERM`]
+/// and never as this. That asymmetry is what lets
+/// [`Folder::absent_means_allowed`] read it as a permission answer for the one
+/// item whose probe path is not guaranteed to exist.
+pub const ERRNO_ENOENT: i32 = 2;
+
 /// The user's TCC store, relative to `$HOME`. Reaching it requires Full Disk
 /// Access; its contents are never read.
 const TCC_DB_RELATIVE: &str = "Library/Application Support/com.apple.TCC/TCC.db";
@@ -876,11 +884,33 @@ pub enum Folder {
     Desktop,
     /// `~/Downloads` — `kTCCServiceSystemPolicyDownloadsFolder`.
     Downloads,
+    /// Another application's own data — `kTCCServiceSystemPolicyAppData`,
+    /// whose dialog reads "would like to access data from other apps."
+    ///
+    /// NOT a folder of the human's, which is why it is last in [`ALL`](Self::ALL)
+    /// and carries its own [`label`](Self::label): the thing being asked about
+    /// is every other app's container, and a terminal reaches them constantly —
+    /// a script that reads another app's settings, a build that walks a cache.
+    /// It joins this roster because it is promptable, resettable and
+    /// warm-up-able exactly as the three folders are, so one gesture can ask
+    /// for all four and one panel can report them side by side.
+    ///
+    /// Its probe path is one first-party container ([`path`](Self::path)) — a
+    /// stable name that needs no directory listing to choose, because choosing
+    /// one by listing would be a guarded access performed wherever the list was
+    /// built. It may legitimately not exist, which is what
+    /// [`absent_means_allowed`](Self::absent_means_allowed) is for.
+    AppData,
 }
 
 impl Folder {
     /// Every folder this module knows, in the order the warm-up walks them.
-    pub const ALL: &'static [Self] = &[Self::Documents, Self::Desktop, Self::Downloads];
+    pub const ALL: &'static [Self] = &[
+        Self::Documents,
+        Self::Desktop,
+        Self::Downloads,
+        Self::AppData,
+    ];
 
     /// The configuration / report name (`documents`).
     #[must_use]
@@ -889,6 +919,7 @@ impl Folder {
             Self::Documents => "documents",
             Self::Desktop => "desktop",
             Self::Downloads => "downloads",
+            Self::AppData => "app-data",
         }
     }
 
@@ -900,6 +931,7 @@ impl Folder {
             Self::Documents => "SystemPolicyDocumentsFolder",
             Self::Desktop => "SystemPolicyDesktopFolder",
             Self::Downloads => "SystemPolicyDownloadsFolder",
+            Self::AppData => "SystemPolicyAppData",
         }
     }
 
@@ -911,6 +943,10 @@ impl Folder {
             "documents" => Some(Self::Documents),
             "desktop" => Some(Self::Desktop),
             "downloads" => Some(Self::Downloads),
+            // Three spellings for the one item whose name is not a single
+            // word: a config file written by hand should not have to guess
+            // which separator this roster chose.
+            "app-data" | "app_data" | "appdata" => Some(Self::AppData),
             _ => None,
         }
     }
@@ -922,9 +958,71 @@ impl Folder {
             Self::Documents => home.join("Documents"),
             Self::Desktop => home.join("Desktop"),
             Self::Downloads => home.join("Downloads"),
+            // ONE FIRST-PARTY CONTAINER, NAMED RATHER THAN DISCOVERED. Any
+            // other app's container raises the same `kTCCServiceSystemPolicyAppData`
+            // question, so the probe needs exactly one — and picking "whichever
+            // one is there" would mean listing the container root to choose,
+            // which is itself the guarded access, performed on whatever thread
+            // built the list. A fixed name is a pure function of `home`, so the
+            // only guarded access in the pass is the warm-up worker's own.
+            Self::AppData => home
+                .join("Library")
+                .join("Containers")
+                .join(APP_DATA_PROBE_BUNDLE),
+        }
+    }
+
+    /// The display name, so every surface spells it the same way and none of
+    /// them derives a human sentence from the config token.
+    ///
+    /// The three folders answer their own name; the fourth is not a folder and
+    /// says what it is.
+    #[must_use]
+    pub const fn label(self) -> &'static str {
+        match self {
+            Self::Documents => "Documents",
+            Self::Desktop => "Desktop",
+            Self::Downloads => "Downloads",
+            Self::AppData => "Other applications' data",
+        }
+    }
+
+    /// The noun a sentence about this item uses: "this folder" for the three,
+    /// "this data" for the fourth. Denial copy is per-item for that reason.
+    #[must_use]
+    pub const fn noun(self) -> &'static str {
+        match self {
+            Self::Documents | Self::Desktop | Self::Downloads => "folder",
+            Self::AppData => "data",
+        }
+    }
+
+    /// Whether a missing probe path is a PERMISSION answer rather than a
+    /// failure.
+    ///
+    /// The three folders are created by macOS at account setup and their
+    /// absence is a broken home, not a verdict — [`ERRNO_ENOENT`] there means
+    /// "could not be read". The app-data probe names one app's container, and
+    /// an account that has never opened that app does not have it: there,
+    /// `ENOENT` is proof the access was PERMITTED, because a TCC refusal
+    /// answers [`ERRNO_EPERM`] before the lookup can report a missing name.
+    #[must_use]
+    pub const fn absent_means_allowed(self) -> bool {
+        match self {
+            Self::Documents | Self::Desktop | Self::Downloads => false,
+            Self::AppData => true,
         }
     }
 }
+
+/// The bundle whose container stands for every other app's data.
+///
+/// Notes ships with macOS and is not removable, so the name resolves on any
+/// account; whether the container EXISTS is irrelevant to the question being
+/// asked (see [`Folder::absent_means_allowed`]). Nothing about the choice is
+/// specific to Notes: TCC keys the grant to the SERVICE, so one container
+/// answers for all of them.
+const APP_DATA_PROBE_BUNDLE: &str = "com.apple.Notes";
 
 /// Resolve configured folder names to `(folder, absolute path)` pairs, in the
 /// order given, skipping names this module does not know.
@@ -2488,6 +2586,12 @@ mod tests {
                 "SystemPolicyDownloadsFolder",
                 "/Users//a/Downloads",
             ),
+            (
+                Folder::AppData,
+                "app-data",
+                "SystemPolicyAppData",
+                "/Users//a/Library/Containers/com.apple.Notes",
+            ),
         ];
         for (folder, name, service, path) in cases {
             assert_eq!(folder.as_str(), name);
@@ -2498,7 +2602,50 @@ mod tests {
         }
         assert_eq!(Folder::parse("pictures"), None);
         assert_eq!(Folder::parse(""), None);
-        assert_eq!(Folder::ALL.len(), 3);
+        assert_eq!(Folder::ALL.len(), 4);
+        assert_eq!(*Folder::ALL.last().expect("non-empty"), Folder::AppData);
+    }
+
+    /// The app-data item answers to the three spellings a hand-written config
+    /// might use, and to nothing else.
+    #[test]
+    fn the_app_data_item_answers_to_every_spelling_of_its_name() {
+        for spelling in ["app-data", "app_data", "appdata", "APP-DATA", " App_Data "] {
+            assert_eq!(
+                Folder::parse(spelling),
+                Some(Folder::AppData),
+                "spelling {spelling:?}"
+            );
+        }
+        assert_eq!(Folder::parse("app data"), None);
+        assert_eq!(Folder::parse("apps"), None);
+    }
+
+    /// Every item says what it is and what noun a sentence about it takes, and
+    /// no two share a label — the panel prints these side by side.
+    #[test]
+    fn every_item_has_its_own_label_and_noun() {
+        let mut labels: Vec<&str> = Folder::ALL.iter().map(|f| f.label()).collect();
+        labels.sort_unstable();
+        labels.dedup();
+        assert_eq!(labels.len(), Folder::ALL.len(), "labels are distinct");
+        assert_eq!(Folder::Documents.label(), "Documents");
+        assert_eq!(Folder::Documents.noun(), "folder");
+        assert_eq!(Folder::AppData.label(), "Other applications' data");
+        assert_eq!(Folder::AppData.noun(), "data");
+    }
+
+    /// A MISSING PATH IS A VERDICT FOR EXACTLY ONE ITEM. The three folders are
+    /// made by macOS at account setup, so their absence is a broken home; the
+    /// app-data probe names one app's container, which an account that never
+    /// opened that app does not have — and being told it is missing means the
+    /// look was allowed, since a TCC refusal answers EPERM first.
+    #[test]
+    fn only_the_app_data_probe_reads_a_missing_path_as_permission() {
+        assert!(Folder::AppData.absent_means_allowed());
+        for folder in [Folder::Documents, Folder::Desktop, Folder::Downloads] {
+            assert!(!folder.absent_means_allowed(), "{folder:?}");
+        }
     }
 
     #[test]
@@ -2627,19 +2774,24 @@ mod tests {
     fn a_plan_is_one_command_per_folder_in_plan_order_from_one_subject() {
         let plan = ResetPlan::new(" a.b.c ", Folder::ALL).expect("plan builds");
         assert_eq!(plan.bundle_id(), "a.b.c", "the subject is trimmed once");
-        assert_eq!(plan.len(), 3);
+        assert_eq!(plan.len(), Folder::ALL.len());
         assert!(!plan.is_empty());
         assert_eq!(plan.folders(), Folder::ALL);
 
         let commands = plan.commands();
-        assert_eq!(commands.len(), 3);
+        assert_eq!(commands.len(), Folder::ALL.len());
         for (folder, argv) in &commands {
             assert_eq!(argv[2], folder.tcc_service());
             assert_eq!(argv[3], "a.b.c", "every invocation names the same subject");
         }
         assert_eq!(
             commands.iter().map(|(f, _)| *f).collect::<Vec<_>>(),
-            vec![Folder::Documents, Folder::Desktop, Folder::Downloads]
+            vec![
+                Folder::Documents,
+                Folder::Desktop,
+                Folder::Downloads,
+                Folder::AppData
+            ]
         );
     }
 
@@ -2753,7 +2905,7 @@ mod tests {
             ),
             Folder::ALL,
         );
-        assert_eq!(offered.map(|p| p.len()), Some(3));
+        assert_eq!(offered.map(|p| p.len()), Some(Folder::ALL.len()));
 
         let (run, notx, gone, unk) = (
             TccutilPresence::Executable,

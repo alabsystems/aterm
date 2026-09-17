@@ -5,9 +5,18 @@
 //! Pending wrap conformance tests.
 //!
 //! Verifies that operations which should clear the `pending_wrap` flag
-//! (xterm's `wrapnext` / `do_wrap`) actually do so. Per xterm behavior,
-//! insert/delete character/line operations and erase-character (ECH) must
-//! cancel deferred wrap state.
+//! (xterm's `do_wrap`) actually do so, and that the ones xterm leaves alone keep
+//! it. Per xterm (`util.c` / `charproc.c`), these cancel the deferred wrap:
+//! insert/delete character/line (ICH/DCH/IL/DL), erase-character (ECH), the
+//! ED 0/1/2 and EL 0/1/2 erases (`ClearRight`, `ClearInLine2` and
+//! `ClearScreen` all call `ResetWrap`), the selective DECSEL/DECSED erases
+//! (DECSEL 0 always; DECSED 0 except at the origin, reachable only on a line one
+//! character wide, where xterm's `do_erase_display` reduces it to DECSED 2;
+//! modes 1/2 and that origin case unless every cell of the span is protected,
+//! because `ClearInLine2` returns before `ResetWrap` when its span holds no
+//! unprotected cell), DECALN, and
+//! entering the alternate screen with CSI ?1049 h (its `ClearScreen` runs
+//! last). Scrolls (SU/SD), TAB, ED 3 and the rectangle ops keep it.
 //!
 //! Part of #5351 (deferred wrapping conformance).
 
@@ -136,77 +145,95 @@ fn screen_alignment_pattern_clears_pending_wrap() {
 }
 
 // ========================================================================
-// Regression: erase operations already clear pending_wrap
+// ED / EL — erases clear pending_wrap (xterm util.c ResetWrap)
 // ========================================================================
+//
+// These six used to assert the xterm.js rule (pending wrap stored as
+// x == cols, so an erase keeps both the wrap and the parked glyph). Real xterm
+// resets the wrap on every one of them.
 
-/// ED mode 2 (Erase in Display) preserves pending_wrap — xterm clears cells but
-/// never resets the deferred wrap; a later glyph still wraps.
+/// ED mode 2 (Erase in Display) clears pending_wrap.
+///
+/// xterm: `do_erase_display` case 2 -> `ClearScreen`, which calls `ResetWrap`.
 #[test]
-fn erase_screen_keeps_pending_wrap() {
+fn erase_screen_clears_pending_wrap() {
     let mut grid = grid_with_pending_wrap(3, 5);
     grid.erase_screen();
-    assert!(grid.pending_wrap(), "ED mode 2 must preserve pending_wrap");
+    assert!(!grid.pending_wrap(), "ED mode 2 must clear pending_wrap");
 }
 
-/// EL mode 2 (Erase in Line) preserves pending_wrap (xterm).
+/// EL mode 2 (Erase in Line) clears pending_wrap.
+///
+/// xterm: `do_erase_line` case 2 -> `ClearLine` -> `ClearInLine2` `ResetWrap`.
 #[test]
-fn erase_line_keeps_pending_wrap() {
+fn erase_line_clears_pending_wrap() {
     let mut grid = grid_with_pending_wrap(3, 5);
     grid.erase_line();
-    assert!(grid.pending_wrap(), "EL mode 2 must preserve pending_wrap");
+    assert!(!grid.pending_wrap(), "EL mode 2 must clear pending_wrap");
 }
 
-/// EL mode 0 (erase to end) PRESERVES pending_wrap and the parked last cell.
+/// EL mode 0 (erase to end) clears pending_wrap AND the parked last cell.
 ///
-/// xterm.js encodes pending-wrap as x==cols, so EL-0 erases the empty range
-/// [cols, cols) — it touches neither the last glyph nor the wrap state. A later
-/// glyph still wraps to the next row (conformance: el-pending-wrap).
+/// xterm: `do_erase_line` case 0 -> `ClearRight(xw, -1)`, which clears from
+/// `cur_col` inclusive — the parked last column while a wrap is pending — and
+/// ends with `ResetWrap`.
 #[test]
-fn erase_to_end_of_line_keeps_pending_wrap_and_last_cell() {
+fn erase_to_end_of_line_clears_pending_wrap_and_last_cell() {
     let mut grid = grid_with_pending_wrap(3, 5);
     grid.erase_to_end_of_line();
-    assert!(grid.pending_wrap(), "EL mode 0 must preserve pending_wrap");
+    assert!(!grid.pending_wrap(), "EL mode 0 must clear pending_wrap");
     assert_eq!(
         grid.cell(0, 4).unwrap().char(),
-        'E',
-        "EL mode 0 must not erase the parked last cell"
+        ' ',
+        "EL mode 0 must erase the parked last cell"
     );
 }
 
-/// EL mode 1 (erase from start) preserves pending_wrap (xterm).
+/// EL mode 1 (erase from start) clears pending_wrap.
+///
+/// xterm: `do_erase_line` case 1 -> `ClearLeft` -> `ClearInLine2` `ResetWrap`.
 #[test]
-fn erase_from_start_of_line_keeps_pending_wrap() {
+fn erase_from_start_of_line_clears_pending_wrap() {
     let mut grid = grid_with_pending_wrap(3, 5);
     grid.erase_from_start_of_line();
-    assert!(grid.pending_wrap(), "EL mode 1 must preserve pending_wrap");
+    assert!(!grid.pending_wrap(), "EL mode 1 must clear pending_wrap");
 }
 
-/// ED mode 0 (erase to end of screen) PRESERVES pending_wrap and the parked cell.
+/// ED mode 0 (erase to end of screen) clears pending_wrap AND the parked cell.
 ///
-/// Like EL-0, the cursor is logically past the last cell, so the current row's
-/// erase-to-end clears nothing and the wrap survives; only rows below the cursor
-/// are cleared (conformance: ed-pending-wrap).
+/// xterm: `do_erase_display` case 0 -> `ClearBelow` -> `ClearRight(xw, -1)`,
+/// the same inclusive clear and `ResetWrap` as EL 0, then the rows below.
 #[test]
-fn erase_to_end_of_screen_keeps_pending_wrap_and_last_cell() {
+fn erase_to_end_of_screen_clears_pending_wrap_and_last_cell() {
     let mut grid = grid_with_pending_wrap(3, 5);
     grid.erase_to_end_of_screen();
-    assert!(grid.pending_wrap(), "ED mode 0 must preserve pending_wrap");
+    assert!(!grid.pending_wrap(), "ED mode 0 must clear pending_wrap");
     assert_eq!(
         grid.cell(0, 4).unwrap().char(),
-        'E',
-        "ED mode 0 must not erase the parked last cell"
+        ' ',
+        "ED mode 0 must erase the parked last cell"
     );
 }
 
-/// ED mode 1 (erase from start of screen) preserves pending_wrap (xterm).
+/// ED mode 1 (erase from start of screen) clears pending_wrap.
+///
+/// xterm: `do_erase_display` case 1 -> `ClearAbove` -> `ClearLeft` ->
+/// `ClearInLine2` `ResetWrap` (or, at bottom-right, `ClearScreen`).
 #[test]
-fn erase_from_start_of_screen_keeps_pending_wrap() {
+fn erase_from_start_of_screen_clears_pending_wrap() {
     let mut grid = grid_with_pending_wrap(3, 5);
     grid.erase_from_start_of_screen();
-    assert!(grid.pending_wrap(), "ED mode 1 must preserve pending_wrap");
+    assert!(!grid.pending_wrap(), "ED mode 1 must clear pending_wrap");
 }
 
-/// DECERA (erase rectangular area) preserves pending_wrap (xterm).
+// ========================================================================
+// Rectangle ops PRESERVE pending_wrap
+// ========================================================================
+
+/// DECERA (erase rectangular area) preserves pending_wrap.
+///
+/// xterm: `CASE_DECERA` -> screen.c `ScrnFillRectangle`; screen.c never calls
+/// `ResetWrap` or writes `do_wrap`.
 #[test]
 fn erase_rect_keeps_pending_wrap() {
     let mut grid = grid_with_pending_wrap(3, 5);

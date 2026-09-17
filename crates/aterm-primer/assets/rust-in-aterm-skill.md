@@ -61,12 +61,14 @@ formatting neither prove nor build. That printout is the answer;
 aterm help rust      # which toolchain this directory gets, and why — measured now
 ```
 
-It prints which toolchain won and which candidates were refused, what `rustc`
-on this PATH answers to `--print sysroot`, whether `rust-toolchain.toml` pins a
-channel, and whether `.cargo/config.toml` switches verification off. It reads
-no instruction file: if a project's `CLAUDE.md` or `AGENTS.md` names a
-different toolchain or lane, that one is yours to open, and the project wins —
-say so when you use it.
+It prints which toolchain aterm's own gates pick and which candidates were
+refused, where a bare `targo` on this PATH really runs (followed through an
+atpkg shim) and whether that is a different directory or build from the gates'
+pick, what `rustc` on this PATH answers to `--print sysroot`, whether
+`rust-toolchain.toml` pins a channel, and whether `.cargo/config.toml` switches
+verification off. It reads no instruction file: if a project's `CLAUDE.md` or
+`AGENTS.md` names a different toolchain or lane, that one is yours to open, and
+the project wins — say so when you use it.
 
 ## Errors that are not what they look like
 

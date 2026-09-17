@@ -42,11 +42,14 @@ pub enum Io {
     /// All three INHERITED — an elevated install: `sudo` asks for its password on the
     /// caller's terminal and the installer's own progress reaches the user.
     Inherit,
-    /// stdin from `/dev/null`, stdout and stderr INHERITED — an UNATTENDED install
-    /// ([`Elevation::Deferred`]: a user-scoped manager run by the six-hourly pass): its
-    /// progress still reaches the pass log, but nothing it spawns can wait on a
-    /// password or a `[y/N]` — a `brew install` of a cask whose installer asks for
-    /// `sudo` fails at once instead of hanging the pass on a prompt nobody can see.
+    /// stdin from `/dev/null`, stdout and stderr RELAYED through atpkg's own (piped to
+    /// atpkg, copied on to wherever atpkg's descriptors point — the window's pipe, or
+    /// the orphan log after a re-point) — an UNATTENDED install ([`Elevation::Deferred`]:
+    /// a user-scoped manager run by the six-hourly pass): its progress still reaches the
+    /// pass log, but nothing it spawns can wait on a password or a `[y/N]` — a `brew
+    /// install` of a cask whose installer asks for `sudo` fails at once instead of
+    /// hanging the pass on a prompt nobody can see — and a window that exits under the
+    /// pass no longer kills the child by SIGPIPE (2026-09-15).
     Unattended,
 }
 
@@ -101,11 +104,54 @@ impl Runner for RealRunner {
                     stderr: String::from_utf8_lossy(&out.stderr).into_owned(),
                 })
             }
-            Io::Inherit | Io::Unattended => {
-                if io == Io::Unattended {
-                    cmd.stdin(std::process::Stdio::null());
-                }
+            Io::Inherit => {
                 let status = cmd.status().map_err(|e| spawn_failed(exe, &e))?;
+                Ok(Ran {
+                    code: status.code(),
+                    stdout: String::new(),
+                    stderr: String::new(),
+                })
+            }
+            // PIPED AND RELAYED, never inherited (2026-09-15): the pass runs with its
+            // stdout piped to the window that spawned it, and a child handed that pipe
+            // died by SIGPIPE at its next print the moment the window went away — the
+            // orphan watch re-points the PARENT's descriptors
+            // ([`crate::progress::watch_for_orphaning`]), which can do nothing for a
+            // pipe a running child already holds. So the child writes to atpkg, and
+            // atpkg's own `stdout()`/`stderr()` handles — which follow the re-pointed
+            // descriptors — carry the bytes on; a write that fails there is ignored, and
+            // costs the child nothing.
+            Io::Unattended => {
+                use std::io::{Read as _, Write as _};
+                cmd.stdin(std::process::Stdio::null())
+                    .stdout(std::process::Stdio::piped())
+                    .stderr(std::process::Stdio::piped());
+                let mut child = cmd.spawn().map_err(|e| spawn_failed(exe, &e))?;
+                let out = child.stdout.take();
+                let err = child.stderr.take();
+                let relay_out = std::thread::spawn(move || {
+                    if let Some(mut pipe) = out {
+                        let mut buf = [0u8; 8192];
+                        while let Ok(n) = pipe.read(&mut buf)
+                            && n > 0
+                        {
+                            let _ = std::io::stdout().write_all(&buf[..n]);
+                        }
+                    }
+                });
+                let relay_err = std::thread::spawn(move || {
+                    if let Some(mut pipe) = err {
+                        let mut buf = [0u8; 8192];
+                        while let Ok(n) = pipe.read(&mut buf)
+                            && n > 0
+                        {
+                            let _ = std::io::stderr().write_all(&buf[..n]);
+                        }
+                    }
+                });
+                let status = child.wait().map_err(|e| spawn_failed(exe, &e))?;
+                let _ = relay_out.join();
+                let _ = relay_err.join();
                 Ok(Ran {
                     code: status.code(),
                     stdout: String::new(),

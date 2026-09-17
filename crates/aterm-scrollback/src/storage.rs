@@ -540,23 +540,6 @@ impl ScrollbackStorage {
             rev_idx: 0,
         }
     }
-
-    /// Corrupt the oldest warm block for cross-crate behavioral tests.
-    #[cfg(feature = "testing")]
-    #[doc(hidden)]
-    pub fn corrupt_oldest_warm_block_for_testing(&mut self) -> bool {
-        match self {
-            ScrollbackStorage::Memory(sb) => {
-                if sb.warm.block_count() == 0 {
-                    return false;
-                }
-                sb.warm.corrupt_oldest_block();
-                true
-            }
-            #[cfg(feature = "disk-tier")]
-            ScrollbackStorage::Disk(_) => false,
-        }
-    }
 }
 
 impl Default for ScrollbackStorage {

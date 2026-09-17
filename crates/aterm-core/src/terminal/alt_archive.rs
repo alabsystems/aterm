@@ -40,6 +40,16 @@
 //! default; [`Terminal::set_alt_archive_enabled`] and
 //! [`Terminal::set_alt_archive_budget`] override per session.
 //!
+//! # The budget is one budget
+//!
+//! The retained-row budget is a PROCESS total, not a per-session allowance:
+//! sessions that joined [`AltArchiveBudget::process`] (the GUI joins every one
+//! it spawns) each retain at most `4 MiB / live sessions`, floored at
+//! [`ALT_ARCHIVE_MIN_SHARE`] so a crowded window still answers. A session
+//! lowers only its OWN retention, on the next frame it commits, so a share
+//! never crosses a terminal lock; a tab that closes gives its share back by
+//! dropping its archive. See [`AltArchiveBudget`].
+//!
 //! One thing outlives the process: a self-update HANDOFF carries it to the
 //! process that adopts the session ([`AltArchiveCarry`]) — its origin and
 //! indices, the differ's state, and the TAIL of its rows the host chose (the
@@ -56,6 +66,7 @@
 
 use std::collections::VecDeque;
 use std::hash::Hasher;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, OnceLock};
 
 use aterm_hash::{FxHashMap, FxHasher};
@@ -63,11 +74,27 @@ use aterm_hash::{FxHashMap, FxHasher};
 use super::Terminal;
 use crate::grid::Grid;
 
-/// Default retained-row accounting budget for one session's archive: 4 MiB.
+/// Default retained-row accounting budget for one archive on its own: 4 MiB.
 /// Each retained row is charged by [`alt_archive_row_charge`]. This excludes
 /// spare deque capacity, frame/differ buffers, gaps and other archive storage;
 /// it is not a bound on the archive's total allocation or process RSS.
+///
+/// An archive that joined a budget pool ([`AltArchive::share_budget`]) is held
+/// to the SMALLER of this and its share of the pool's total, so a window's
+/// eight tabs cost one budget between them, not eight.
 pub const ALT_ARCHIVE_DEFAULT_BUDGET: usize = 4 * 1024 * 1024;
+/// Retained-row budget the live sessions of one process SHARE: 4 MiB in total,
+/// not 4 MiB each ([`AltArchiveBudget::process`]).
+pub const ALT_ARCHIVE_TOTAL_BUDGET: usize = ALT_ARCHIVE_DEFAULT_BUDGET;
+/// Floor under one sharing session's budget: no matter how many sessions are
+/// live, each keeps 1/16th of the total (256 KiB, ~2000 rows of an 80-column
+/// transcript) rather than being starved to nothing.
+///
+/// Past 16 live sessions the process total therefore grows with the session
+/// count again — a deliberate trade: a 17th tab must not silently turn the
+/// archive off for the other sixteen, and 16 tabs of an archive that answers
+/// nothing would be worse than 17 tabs of 256 KiB (4.25 MiB total).
+pub const ALT_ARCHIVE_MIN_SHARE: usize = ALT_ARCHIVE_TOTAL_BUDGET / 16;
 /// Hard cap on archived rows regardless of the byte budget.
 pub const ALT_ARCHIVE_MAX_ROWS: usize = 65_536;
 /// Fixed charge per retained row: one deque element ([`ArchivedRow`]) plus
@@ -438,11 +465,172 @@ struct Scratch {
     picks: Vec<usize>,
 }
 
+/// A retained-row budget that live archives SHARE: one total, divided by the
+/// number of archives currently drawing on it.
+///
+/// # Why
+///
+/// The budget used to be charged per session, so a window with eight tabs of a
+/// fullscreen app cost eight budgets — 32 MiB of retained rows for a 4 MiB
+/// policy (measured; see the commit that added this). A pool makes the number
+/// mean what it says: every archive that joined is held to
+/// `total / live` (never below [`AltArchiveBudget::min_share`]), so opening a
+/// tab lowers every session's share and closing one raises it again.
+///
+/// # The policy
+///
+/// EQUAL shares, not first-come-first-served. A pool that only counted bytes
+/// (the first archive to fill it keeps them) would let one idle tab hold the
+/// whole total while the tab the user is looking at evicts every row, and the
+/// threshold would depend on what other threads did between two commits.
+/// Dividing by the live count instead keeps each session's limit a pure
+/// function of the session count: eviction stays oldest-row-first inside each
+/// archive, and the same frames archived in the same order always retain the
+/// same rows.
+///
+/// # When the share is applied
+///
+/// An archive reads its share on every committed frame and whenever its own
+/// budget is set — it can lower its own retention, never another archive's, so
+/// no lock is ever taken across sessions. A session that is drawing therefore
+/// comes within a smaller share on its next frame; one that is idle keeps the
+/// rows it already holds until it draws again (it is no longer growing, and the
+/// alternative — reaching into seven other terminals' mutexes from whichever
+/// thread opened a tab — is how deadlocks are written).
+///
+/// # The total is a bound that CONVERGES, not one that holds at every instant
+///
+/// That last sentence has a price, and it is written down rather than hidden.
+/// A session that fills up while it is alone keeps those rows after others
+/// start drawing, so the worst case is every session filling in turn and then
+/// going idle forever: session `k` holds `total / k` and the sum is
+/// `total * H_n` — 2.72 × for eight sessions, and one frame per session brings
+/// it back inside `total`. `alt_archive_tests::
+/// a_session_that_fills_up_alone_and_goes_idle_is_the_pool_s_worst_case` pins
+/// that arithmetic exactly, both the overshoot and the convergence.
+///
+/// The alternative — counting every archive that is merely ENABLED — holds the
+/// sum at `total` at every instant and is worse, because recording is on for
+/// every session while the archive only FILLS for a session running a
+/// full-screen app. Eight tabs open with one running `vim` gave that one tab an
+/// eighth of the pool and made it evict rows there was room for: the feature
+/// taken away from its only user by the accounting meant to protect it.
+#[derive(Debug)]
+pub struct AltArchiveBudget {
+    total: usize,
+    min_share: usize,
+    live: AtomicUsize,
+}
+
+impl AltArchiveBudget {
+    /// A pool of `total` bytes, no share smaller than `min_share` (clamped to
+    /// `total`: a floor above the total would hand out more than there is).
+    #[must_use]
+    pub fn new(total: usize, min_share: usize) -> Arc<Self> {
+        Arc::new(Self {
+            total,
+            min_share: min_share.min(total),
+            live: AtomicUsize::new(0),
+        })
+    }
+
+    /// THE pool of this process: [`ALT_ARCHIVE_TOTAL_BUDGET`] shared by every
+    /// live session whose host joined it ([`Terminal::set_alt_archive_shared`],
+    /// which the GUI calls for each session it spawns). Embedders that run one
+    /// session per process need not join anything: on its own an archive keeps
+    /// the whole [`ALT_ARCHIVE_DEFAULT_BUDGET`].
+    #[must_use]
+    pub fn process() -> Arc<Self> {
+        static POOL: OnceLock<Arc<AltArchiveBudget>> = OnceLock::new();
+        Arc::clone(
+            POOL.get_or_init(|| {
+                AltArchiveBudget::new(ALT_ARCHIVE_TOTAL_BUDGET, ALT_ARCHIVE_MIN_SHARE)
+            }),
+        )
+    }
+
+    /// Bytes this pool divides between its archives.
+    #[must_use]
+    pub fn total(&self) -> usize {
+        self.total
+    }
+
+    /// The floor under one archive's share.
+    #[must_use]
+    pub fn min_share(&self) -> usize {
+        self.min_share
+    }
+
+    /// Archives currently drawing on this pool: joined, enabled, AND HOLDING
+    /// ROWS.
+    ///
+    /// The last condition is the one that matters in a real window. Recording
+    /// is on for every session, but the archive only fills for a session that
+    /// runs a full-screen app — `vim`, `less`, `htop`. Counting every ENABLED
+    /// archive would divide the pool by the tab count instead of by the number
+    /// of tabs using it: eight tabs open and one running `vim` would hand that
+    /// one an eighth of the pool and make it evict rows there was room for,
+    /// which is the feature being taken away from the only session that wanted
+    /// it. An archive holding nothing costs nothing and is not counted.
+    #[must_use]
+    pub fn live(&self) -> usize {
+        self.live.load(Ordering::Relaxed)
+    }
+
+    /// What one archive may retain right now: `total / live`, floored at
+    /// [`Self::min_share`]. With nothing live yet (the archive asking is about
+    /// to be the first), the whole total.
+    #[must_use]
+    pub fn share(&self) -> usize {
+        (self.total / self.live().max(1)).max(self.min_share)
+    }
+}
+
+/// One archive's membership of a pool. `counted` tracks whether this
+/// membership is currently part of the pool's live count, so the increment and
+/// the decrement are always paired — including the decrement on drop, which is
+/// what makes a closed tab give its share back without the host telling anyone.
+#[derive(Debug)]
+struct BudgetShare {
+    pool: Arc<AltArchiveBudget>,
+    counted: bool,
+}
+
+impl BudgetShare {
+    fn new(pool: Arc<AltArchiveBudget>) -> Self {
+        Self {
+            pool,
+            counted: false,
+        }
+    }
+
+    fn set_counted(&mut self, counted: bool) {
+        if counted == self.counted {
+            return;
+        }
+        if counted {
+            self.pool.live.fetch_add(1, Ordering::Relaxed);
+        } else {
+            self.pool.live.fetch_sub(1, Ordering::Relaxed);
+        }
+        self.counted = counted;
+    }
+}
+
+impl Drop for BudgetShare {
+    fn drop(&mut self) {
+        self.set_counted(false);
+    }
+}
+
 /// The pure differ + store. See the module docs.
 pub struct AltArchive {
     rows: VecDeque<ArchivedRow>,
     bytes: usize,
     budget: usize,
+    /// The shared budget this archive draws on, if a host joined it to one:
+    /// its retention is then the SMALLER of `budget` and the pool's share.
+    share: Option<BudgetShare>,
     max_rows: usize,
     /// Index of `rows[0]`; indices start at 1.
     first: u64,
@@ -516,6 +704,7 @@ impl AltArchive {
             rows: VecDeque::new(),
             bytes: 0,
             budget: ALT_ARCHIVE_DEFAULT_BUDGET,
+            share: None,
             max_rows: ALT_ARCHIVE_MAX_ROWS,
             first: 1,
             gaps: VecDeque::new(),
@@ -579,10 +768,29 @@ impl AltArchive {
         self.bytes
     }
 
-    /// The byte budget (0 = off).
+    /// This archive's OWN byte budget (0 = off) — what a host set for it,
+    /// before any shared pool. [`Self::effective_budget`] is what it may
+    /// actually retain.
     #[must_use]
     pub fn budget(&self) -> usize {
         self.budget
+    }
+
+    /// What this archive may retain right now: its own budget, and no more
+    /// than its share of the pool it joined ([`Self::share_budget`]). Eviction
+    /// is measured against this, so it moves as sessions open and close.
+    #[must_use]
+    pub fn effective_budget(&self) -> usize {
+        match &self.share {
+            Some(s) => self.budget.min(s.pool.share()),
+            None => self.budget,
+        }
+    }
+
+    /// The shared budget this archive draws on, if any.
+    #[must_use]
+    pub fn shared_budget(&self) -> Option<&Arc<AltArchiveBudget>> {
+        self.share.as_ref().map(|s| &s.pool)
     }
 
     /// Rows ever evicted or wiped.
@@ -693,7 +901,9 @@ impl AltArchive {
     }
 
     /// Set the byte budget. 0 turns the archive off and wipes it (rows count as
-    /// lost); a smaller budget evicts down to it.
+    /// lost); a smaller budget evicts down to it. An archive sharing a pool is
+    /// still held to its share when that is smaller
+    /// ([`Self::effective_budget`]).
     pub fn set_budget(&mut self, budget: usize) {
         self.budget = budget;
         if budget == 0 {
@@ -701,7 +911,51 @@ impl AltArchive {
             self.enabled = false;
         } else {
             self.enabled = true;
+        }
+        self.sync_share();
+        if self.enabled {
             self.evict();
+        }
+    }
+
+    /// Draw on `pool` (or, with `None`, on nothing but this archive's own
+    /// budget), evicting straight away down to the share that leaves.
+    ///
+    /// Joining does NOT itself take a share: an archive counts against the pool
+    /// only once it holds rows ([`AltArchiveBudget::live`]), so a tab that never
+    /// runs a full-screen app costs the sessions that do nothing at all.
+    /// Dropping the archive — the session closing — gives back whatever share it
+    /// had: the host says only who is sharing, never how much each gets.
+    pub fn share_budget(&mut self, pool: Option<Arc<AltArchiveBudget>>) {
+        let same = match (&self.share, &pool) {
+            (Some(s), Some(p)) => Arc::ptr_eq(&s.pool, p),
+            (None, None) => true,
+            _ => false,
+        };
+        if same {
+            return;
+        }
+        // Leave the old pool BEFORE joining the new one, so an archive moving
+        // between pools is never counted twice.
+        self.share = None;
+        self.share = pool.map(BudgetShare::new);
+        self.sync_share();
+        self.evict();
+    }
+
+    /// Count this archive among its pool's live archives exactly while it is
+    /// DRAWING on the pool — enabled AND holding at least one row. An archive
+    /// that is off, or on but empty, retains nothing and must not take a share
+    /// from the sessions that do (see [`AltArchiveBudget::live`]).
+    ///
+    /// Every seam that can move `bytes` across zero calls this: [`Self::evict`]
+    /// at both ends of its trim, which is what every commit ends with, and
+    /// [`Self::wipe`]. So an archive joins the count with its first retained
+    /// row and leaves with its last, without the host being told anything.
+    fn sync_share(&mut self) {
+        let drawing = self.enabled && self.bytes > 0;
+        if let Some(share) = &mut self.share {
+            share.set_counted(drawing);
         }
     }
 
@@ -721,6 +975,7 @@ impl AltArchive {
             self.wipe();
             self.enabled = false;
         }
+        self.sync_share();
     }
 
     // -------------------------------------------------------------- commits
@@ -768,6 +1023,12 @@ impl AltArchive {
 
     /// Commit the frame in `cur` (filled through [`frame_buffers`]).
     fn commit_prepared(&mut self, cols: u16, key: Option<u64>) {
+        // A shared budget's share falls when another session opens a tab, and
+        // nothing reaches into this archive to tell it so. Coming within the
+        // current share here — one relaxed load when there is nothing to evict
+        // — makes every drawing session converge on the next frame it commits,
+        // whether or not this frame archives a row.
+        self.evict();
         let rows = self.cur.rows();
         if rows == 0 {
             return;
@@ -1333,8 +1594,18 @@ impl AltArchive {
         self.gaps.push_back(AltArchiveGap { after, kind });
     }
 
+    /// Evict the oldest rows until this archive is inside what it may retain —
+    /// its own budget, and its share of any pool it joined. The share falls as
+    /// sessions open, so the same archive can be over a budget it never set.
     fn evict(&mut self) {
-        while self.bytes > self.budget || self.rows.len() > self.max_rows {
+        // Count this archive BEFORE reading the share. The rows of the frame
+        // being committed are already in, so it is drawing on the pool now,
+        // and a share computed with itself left out of the divisor is one
+        // share too generous — two archives would each be told they may keep
+        // the whole total.
+        self.sync_share();
+        let budget = self.effective_budget();
+        while self.bytes > budget || self.rows.len() > self.max_rows {
             let Some(row) = self.rows.pop_front() else {
                 break;
             };
@@ -1342,6 +1613,9 @@ impl AltArchive {
             self.first += 1;
             self.lost += 1;
         }
+        // The trim can have emptied it (a share below one row's cost, floored
+        // at `min_share`): give the share back in the same call.
+        self.sync_share();
         // A gap after `g` matters to a reader holding row `g`; once `g + 1` is
         // gone too, `lost` already says everything.
         while self.gaps.front().is_some_and(|g| g.after + 1 < self.first) {
@@ -1425,6 +1699,7 @@ impl AltArchive {
         self.first += n;
         self.rows.clear();
         self.bytes = 0;
+        self.sync_share();
         self.gaps.clear();
         let last = self.last();
         if last > 0 {
@@ -2163,7 +2438,23 @@ impl Terminal {
         self.alt_archive.archive.set_origin(origin);
     }
 
-    /// Set the archive's byte budget; 0 turns it off and wipes it.
+    /// Draw on this PROCESS's shared archive budget
+    /// ([`AltArchiveBudget::process`]) instead of keeping one of this
+    /// session's own: eight tabs then cost [`ALT_ARCHIVE_TOTAL_BUDGET`]
+    /// between them rather than eight times over, each session's share falling
+    /// as the next one opens and rising again when it closes (dropping the
+    /// terminal is what gives the share back).
+    ///
+    /// A host that spawns live sessions calls this on each of them; one
+    /// session per process needs nothing.
+    pub fn set_alt_archive_shared(&mut self, shared: bool) {
+        self.alt_archive
+            .archive
+            .share_budget(shared.then(AltArchiveBudget::process));
+    }
+
+    /// Set the archive's byte budget; 0 turns it off and wipes it. A session
+    /// sharing the process budget retains the smaller of this and its share.
     pub fn set_alt_archive_budget(&mut self, budget: usize) {
         let was = self.alt_archive.archive.enabled;
         self.alt_archive.archive.set_budget(budget);

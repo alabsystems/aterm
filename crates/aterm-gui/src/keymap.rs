@@ -394,6 +394,46 @@ pub fn encode_committed_text(text: &str, mode: KeyboardMode) -> Vec<u8> {
 /// ENCODER decides what they produce — reported only under kitty
 /// `REPORT_ALL_KEYS_AS_ESC`, encoded to nothing otherwise. `None` only for keys
 /// with no engine mapping at all (a dead key / `Key::Unidentified`).
+///
+/// THE KEYPAD IS ASKED FIRST, on every platform. winit has no keypad key: KP_5
+/// is `Character("5")` and KP_Enter is `Named(Enter)`, the same logical keys
+/// the main block produces, with the keypad in `location` alone — which nothing
+/// here read, so the engine's `Numpad*` keys (DECKPAM's SS3 forms, kitty's
+/// `CSI 57399..57427 u`) were unreachable from a keyboard and an application
+/// could not tell KP_1 from 1 or KP_Enter from Return.
+/// [`aterm_winit_keymap::map_numpad_key`] resolves the keypad identity from
+/// `location` and `logical_key` (which carries NumLock). On the Linux backends
+/// that also repairs the digits themselves: `key_without_modifiers()` there is
+/// xkb's level-0 keysym, and the KEYPAD type keeps the NumLock-OFF symbol at
+/// level 0, so a NumLock-on KP_1 built `End` and typed End's bytes.
+///
+/// WHAT CHANGES ON THE WIRE, stated plainly rather than as "legacy bytes are
+/// unchanged": with NO mode set a keypad key still types what it always typed
+/// (`5`, CR, and End's bytes for a NumLock-off KP_1). Under DECKPAM — which
+/// `smkx` sets, so vim, less and tmux all do — the keypad digits now send
+/// xterm's `SS3 p..y` and KP_Enter `SS3 M`, where before the keypad was
+/// indistinguishable from the main row and typed `5` and CR. That is the
+/// point of the fix and it is what xterm sends for the same key; it is also
+/// the one thing a user will notice. vim translates unmapped `<k0>`..`<k9>`
+/// back to digits and is unaffected; `less` does not, so a line number typed
+/// on the keypad no longer reaches it. NumLock does NOT override the mode:
+/// see `encode_numpad_named_legacy`, where the alternative would put DECKPAM's
+/// keypad forms permanently out of a keyboard's reach. Under kitty
+/// disambiguate the keypad reports its own `CSI 57399..57427 u` codes; under a
+/// kitty mode WITHOUT disambiguate the engine folds it to the main-block twin,
+/// unless DECKPAM is also set.
+///
+/// The keybinding lookup, the tab-menu chord and every overlay read the
+/// MAIN-BLOCK key a keypad press stands for, so a binding on Enter still fires
+/// for KP_Enter and one on `1` fires for a NumLock-on KP_1: the lookup through
+/// [`crate::app_input::base_logical_key`] (which takes `logical_key` on the
+/// keypad, not the level-0 keysym), the tab menu through
+/// `tab_menu::nav_for_key`, and the rest through `InputEvent::keypad_folded`.
+/// The two consumers that read the BUILT key for its meaning rather than its
+/// bytes — the native pages (`App::native_input_event`, the other caller of
+/// this function's result) and the seam's press classifier (`classify_press` /
+/// `is_plain_enter`) — fold it the same way, so KP_5 still types `5` into a
+/// Settings field and KP_Enter still submits a turn.
 // `key_without_modifiers()` (the `KeyEventExtModifierSupplement` trait) is
 // available on macOS AND on the Linux X11/Wayland backends, so BOTH map the
 // layout BASE key — Alt+<key>/AltGr/Shifted-compose all encode the unshifted key
@@ -406,12 +446,14 @@ pub fn build_key_input(
     mods: Modifiers,
 ) -> Option<(keyboard::Key, Modifiers, Option<char>)> {
     use winit::platform::modifier_supplement::KeyEventExtModifierSupplement;
+    let base_layout = aterm_winit_keymap::base_layout_key_for(ev.physical_key);
+    if let Some(key) =
+        aterm_winit_keymap::map_numpad_key(ev.physical_key, &ev.logical_key, ev.location)
+    {
+        return Some((key, mods, base_layout));
+    }
     let key = aterm_winit_keymap::map_logical_key(&ev.key_without_modifiers())?;
-    Some((
-        key,
-        mods,
-        aterm_winit_keymap::base_layout_key_for(ev.physical_key),
-    ))
+    Some((key, mods, base_layout))
 }
 
 /// Fallback for [`build_key_input`] on platforms WITHOUT
@@ -423,17 +465,25 @@ pub fn build_key_input(
 /// The binding-LOOKUP path (`app_input::base_logical_key`) does use the
 /// extension on Windows; only PTY encoding keeps the composed `logical_key` —
 /// except as the last-resort rescue for a Ctrl+Alt chord the layout composed
-/// into nothing, which [`windows_key_input`] documents.
+/// into nothing, which [`windows_key_input`] documents. The keypad is asked
+/// first here too, ahead of that rescue: a keypad key is never AltGr-composed,
+/// so the strip and the Ctrl+Alt fallback never see one.
 #[cfg(not(any(target_os = "macos", target_os = "linux")))]
 #[must_use]
 pub fn build_key_input(
     ev: &KeyEvent,
     mods: Modifiers,
 ) -> Option<(keyboard::Key, Modifiers, Option<char>)> {
+    let base_layout = aterm_winit_keymap::base_layout_key_for(ev.physical_key);
+    if let Some(key) =
+        aterm_winit_keymap::map_numpad_key(ev.physical_key, &ev.logical_key, ev.location)
+    {
+        return Some((key, mods, base_layout));
+    }
     windows_key_input(
         &ev.logical_key,
         &key_without_modifiers(ev),
-        aterm_winit_keymap::base_layout_key_for(ev.physical_key),
+        base_layout,
         mods,
         layout_shift_state,
     )
@@ -457,7 +507,11 @@ fn key_without_modifiers(ev: &KeyEvent) -> WinitKey {
 
 /// `VkKeyScanExW`'s shift-state bits for "this character needs Ctrl AND Alt" —
 /// i.e. AltGr. (`winuser.h`: 1 = Shift, 2 = Ctrl, 4 = Alt.)
-#[cfg(not(any(target_os = "macos", target_os = "linux")))]
+///
+/// COMPILED EVERYWHERE, like the two pure functions below it — see
+/// [`windows_key_input`] for why the platform `cfg` came off. It is a number
+/// out of a Windows header, not a Windows API.
+#[cfg_attr(any(target_os = "macos", target_os = "linux"), allow(dead_code))]
 const SHIFT_STATE_CTRL_ALT: u8 = 0b0000_0110;
 
 /// The Windows half of [`build_key_input`], as a PURE decision so the layout
@@ -495,7 +549,19 @@ const SHIFT_STATE_CTRL_ALT: u8 = 0b0000_0110;
 ///    same key macOS/Linux encode from — so the chord keeps its control
 ///    sequence. Nothing else can reach this arm: without ALT, winit already
 ///    drops CONTROL from the lookup and hands back the base key itself.
-#[cfg(not(any(target_os = "macos", target_os = "linux")))]
+///
+/// COMPILED ON EVERY TARGET, and that is deliberate. This function is named for
+/// the platform whose behaviour it encodes, not for a platform API it calls: it
+/// takes `layout_shift_state` as a PARAMETER precisely so the layout cases are
+/// decidable without a window — the only real FFI, [`layout_shift_state`], is
+/// separately `#[cfg(windows)]` and stays that way. While a
+/// `not(any(macos, linux))` gate sat here, the body and its four de-DE/AltGr
+/// regression tests were read by NO compiler in this repository: the host suite
+/// gates them out on both machines this team owns, and `xtask gate cells --cell
+/// win` checks its cell's root package without `--all-targets`, so no compiler
+/// it runs ever reads a test target. The lint attribute below is the whole cost
+/// of the fix on a Unix host, where nothing calls this outside `mod tests`.
+#[cfg_attr(any(target_os = "macos", target_os = "linux"), allow(dead_code))]
 #[must_use]
 fn windows_key_input(
     logical_key: &WinitKey,
@@ -527,7 +593,9 @@ fn windows_key_input(
 /// merely the key's own base identity, and that `VkKeyScanExW` says is reachable
 /// only with Ctrl+Alt held on this layout. A control codepoint is exactly what a
 /// real chord would produce, so it can never launder itself through here.
-#[cfg(not(any(target_os = "macos", target_os = "linux")))]
+///
+/// Pure, and so compiled everywhere — see [`windows_key_input`].
+#[cfg_attr(any(target_os = "macos", target_os = "linux"), allow(dead_code))]
 fn altgr_composed(
     logical_key: &WinitKey,
     base_layout: Option<char>,
@@ -740,7 +808,14 @@ mod tests {
     /// `VkKeyScanExW` actually answers on the shipped layout DLLs (measured
     /// 2026-08-22 against `00000407`/`00000409`; 1 = Shift, 2 = Ctrl, 4 = Alt,
     /// `None` = the layout cannot type this character at all).
-    #[cfg(not(any(target_os = "macos", target_os = "linux")))]
+    ///
+    /// These two tables and the four laws under them carry NO platform `cfg`,
+    /// which is the 2026-09-16 fix: they are the whole reason
+    /// [`windows_key_input`] takes its layout query as a parameter, and under a
+    /// `not(any(macos, linux))` gate they ran on no machine anyone here owns
+    /// and were compiled by nothing in this repository. The law they keep — a
+    /// German user's AltGr brace must be a brace and not a control byte — is
+    /// decided by pure logic, so it is pinned from every host instead.
     fn de_de_shift_state(c: char) -> Option<u8> {
         match c {
             // AltGr characters: 0x0637 '{', 0x0638 '[', 0x0651 '@', 0x0645 '€'.
@@ -751,7 +826,6 @@ mod tests {
         }
     }
 
-    #[cfg(not(any(target_os = "macos", target_os = "linux")))]
     fn us_qwerty_shift_state(c: char) -> Option<u8> {
         match c {
             // 0x01DB '{', 0x00DB '[', 0x0132 '@' — Shift or nothing, never 6.
@@ -767,7 +841,6 @@ mod tests {
     /// control byte. winit only clears Ctrl/Alt for the RIGHT Alt, so before the
     /// strip de-DE AltGr+8 ('[') encoded ESC ESC and AltGr+Q ('@') encoded
     /// ESC NUL: a German user typing a brace got a control code.
-    #[cfg(not(any(target_os = "macos", target_os = "linux")))]
     #[test]
     fn de_de_altgr_as_left_ctrl_alt_types_the_character() {
         for (composed, digit, base, want) in [
@@ -807,7 +880,6 @@ mod tests {
     /// The RIGHT-Alt spelling is winit's own path: it already cleared Ctrl/Alt
     /// from `ModifiersState`, so the strip has nothing to do and must not
     /// disturb the character.
-    #[cfg(not(any(target_os = "macos", target_os = "linux")))]
     #[test]
     fn de_de_right_alt_altgr_is_unchanged() {
         let (key, mods, _) = windows_key_input(
@@ -829,7 +901,6 @@ mod tests {
     /// `Unidentified` and the chord used to encode NO bytes at all on Windows),
     /// and a layout that hands back a plain letter, which `VkKeyScanExW` reports
     /// as needing no modifiers and so can never look like AltGr.
-    #[cfg(not(any(target_os = "macos", target_os = "linux")))]
     #[test]
     fn genuine_ctrl_alt_letter_still_encodes_a_control_sequence() {
         let unidentified = WinitKey::Unidentified(winit::keyboard::NativeKey::Unidentified);
@@ -862,7 +933,6 @@ mod tests {
     /// US-QWERTY is structurally out of reach of the strip: no character on it
     /// needs Ctrl+Alt, so `VkKeyScanExW` never answers 6 and nothing is ever
     /// stripped — including the '{' that US types with plain Shift.
-    #[cfg(not(any(target_os = "macos", target_os = "linux")))]
     #[test]
     fn us_qwerty_is_unaffected() {
         // The same composed '{' a de-DE AltGr press produces, on a layout that
@@ -1028,6 +1098,297 @@ mod tests {
         assert!(
             encode_committed_text("\u{8}\u{1b}", mode).is_empty(),
             "an all-control commit remains silent"
+        );
+    }
+
+    /// A real winit press for the seam. `location` is what says keypad, so
+    /// the event carries it exactly as the desktop backends deliver it; a
+    /// `Character` logical key carries its text, as a press does.
+    fn press_at(
+        code: KeyCode,
+        logical: WinitKey,
+        location: winit::keyboard::KeyLocation,
+    ) -> KeyEvent {
+        let text = match &logical {
+            WinitKey::Character(s) => Some(s.clone()),
+            _ => None,
+        };
+        KeyEvent::synthetic_for_test(
+            PhysicalKey::Code(code),
+            logical,
+            text,
+            location,
+            winit::event::ElementState::Pressed,
+            false,
+        )
+    }
+
+    /// The bytes the seam writes for the triple `build_key_input` builds.
+    fn seam_bytes(ev: &KeyEvent, mode: KeyboardMode) -> Vec<u8> {
+        let (key, mods, base) = build_key_input(ev, Modifiers::empty()).expect("the key maps");
+        keyboard::encode_key_with_layout(&key, mods, mode, KeyEventType::Press, base)
+    }
+
+    /// THE KEYPAD DEFECT: a physical KP_5 built `Character('5')` — the main
+    /// row's key — so DECKPAM's `SS3 u` and kitty's `CSI 57404 u` were
+    /// unreachable from a keyboard. The seam asks the keypad first: the
+    /// legacy byte is the same `5`, and the two modes that exist to tell the
+    /// keypad apart now do.
+    #[test]
+    fn numpad_digit_reaches_the_numpad_encoder() {
+        use aterm_types::keyboard::NamedKey;
+        use winit::keyboard::KeyLocation;
+        let ev = press_at(KeyCode::Numpad5, ch("5"), KeyLocation::Numpad);
+        let (key, _, _) = build_key_input(&ev, Modifiers::empty()).expect("KP_5 maps");
+        assert_eq!(key, keyboard::Key::Named(NamedKey::Numpad5));
+        assert_eq!(seam_bytes(&ev, KeyboardMode::empty()), b"5");
+        assert_eq!(seam_bytes(&ev, KeyboardMode::APP_KEYPAD), b"\x1bOu");
+        assert_eq!(
+            seam_bytes(&ev, KeyboardMode::DISAMBIGUATE_ESC_CODES),
+            b"\x1b[57404u"
+        );
+    }
+
+    /// NUMLOCK OFF AND SHIFT HELD — the press the kitty legacy fold got wrong.
+    /// xkb's KEYPAD type holds the DIGIT at level 2 (`map[Shift] = Level2`), so
+    /// this arrives as `Character("5")` at `KeyLocation::Numpad` with SHIFT in
+    /// the modifier state, and the seam resolves it to `Numpad5`. It must type
+    /// `5`: on the keypad SHIFT picks a level, it never composes, and xterm's
+    /// rule is that SHIFT does nothing to a keypad key but cancel DECKPAM.
+    /// Handing the fold's main-block twin to the legacy encoder ran the main
+    /// row's shift table over it and typed `%` — but only when a kitty
+    /// REPORTING flag happened to be set, which is not the keypad's business.
+    #[test]
+    fn shifted_keypad_digit_types_its_digit_never_the_main_rows_glyph() {
+        use aterm_types::keyboard::NamedKey;
+        use winit::keyboard::KeyLocation;
+        let ev = press_at(KeyCode::Numpad5, ch("5"), KeyLocation::Numpad);
+        let (key, mods, base) = build_key_input(&ev, Modifiers::SHIFT).expect("KP_5 maps");
+        assert_eq!(key, keyboard::Key::Named(NamedKey::Numpad5));
+        assert!(
+            mods.contains(Modifiers::SHIFT),
+            "the seam keeps the SHIFT bit"
+        );
+        let bytes =
+            |mode| keyboard::encode_key_with_layout(&key, mods, mode, KeyEventType::Press, base);
+        assert_eq!(
+            bytes(KeyboardMode::REPORT_EVENT_TYPES),
+            b"5",
+            "a kitty reporting flag must not turn KP_5 into `%`"
+        );
+        assert_eq!(bytes(KeyboardMode::empty()), b"5");
+        assert_eq!(
+            bytes(KeyboardMode::APP_KEYPAD),
+            b"5",
+            "SHIFT cancels application keypad mode, as xterm has it"
+        );
+        assert_eq!(
+            bytes(KeyboardMode::DISAMBIGUATE_ESC_CODES),
+            b"\x1b[57404;2u",
+            "disambiguate still reports the keypad's own key, SHIFT bit included"
+        );
+    }
+
+    /// KP_Enter is NumpadEnter — CR in legacy mode, `SS3 M` under DECKPAM,
+    /// `CSI 57414 u` under kitty disambiguate — so an application can tell it
+    /// from Return.
+    #[test]
+    fn numpad_enter_is_distinguishable_from_enter() {
+        use aterm_types::keyboard::NamedKey;
+        use winit::keyboard::KeyLocation;
+        let ev = press_at(
+            KeyCode::NumpadEnter,
+            WinitKey::Named(WinitNamed::Enter),
+            KeyLocation::Numpad,
+        );
+        let (key, _, _) = build_key_input(&ev, Modifiers::empty()).expect("KP_Enter maps");
+        assert_eq!(key, keyboard::Key::Named(NamedKey::NumpadEnter));
+        assert_eq!(seam_bytes(&ev, KeyboardMode::empty()), b"\r");
+        assert_eq!(seam_bytes(&ev, KeyboardMode::APP_KEYPAD), b"\x1bOM");
+        assert_eq!(
+            seam_bytes(&ev, KeyboardMode::DISAMBIGUATE_ESC_CODES),
+            b"\x1b[57414u"
+        );
+    }
+
+    /// NumLock off, the keypad 1 is KP_End: the main block's End bytes in
+    /// legacy mode (kitty's legacy fold) and its own `CSI 57424 u` under
+    /// disambiguate. On the Linux backends this `Named(End)` is also what a
+    /// NumLock-ON keypad 1 used to build, from `key_without_modifiers()`'
+    /// level-0 keysym; the seam reads `logical_key`, which says `5`.
+    #[test]
+    fn numlock_off_keypad_navigation_keeps_its_keypad_identity() {
+        use aterm_types::keyboard::NamedKey;
+        use winit::keyboard::KeyLocation;
+        let ev = press_at(
+            KeyCode::Numpad1,
+            WinitKey::Named(WinitNamed::End),
+            KeyLocation::Numpad,
+        );
+        let (key, _, _) = build_key_input(&ev, Modifiers::empty()).expect("KP_End maps");
+        assert_eq!(key, keyboard::Key::Named(NamedKey::NumpadEnd));
+        assert_eq!(seam_bytes(&ev, KeyboardMode::empty()), b"\x1b[F");
+        assert_eq!(
+            seam_bytes(&ev, KeyboardMode::DISAMBIGUATE_ESC_CODES),
+            b"\x1b[57424u"
+        );
+    }
+
+    /// The negative control: the main block is untouched. `5` above `R` stays
+    /// `Character('5')` and types `5` under DECKPAM and disambiguate alike; the
+    /// main Return stays `Enter` and CR under DECKPAM.
+    #[test]
+    fn main_row_digit_is_unchanged() {
+        use aterm_types::keyboard::NamedKey;
+        use winit::keyboard::KeyLocation;
+        let five = press_at(KeyCode::Digit5, ch("5"), KeyLocation::Standard);
+        let (key, _, _) = build_key_input(&five, Modifiers::empty()).expect("5 maps");
+        assert_eq!(key, keyboard::Key::Character('5'));
+        assert_eq!(seam_bytes(&five, KeyboardMode::APP_KEYPAD), b"5");
+        assert_eq!(
+            seam_bytes(&five, KeyboardMode::DISAMBIGUATE_ESC_CODES),
+            b"5"
+        );
+        let enter = press_at(
+            KeyCode::Enter,
+            WinitKey::Named(WinitNamed::Enter),
+            KeyLocation::Standard,
+        );
+        let (key, _, _) = build_key_input(&enter, Modifiers::empty()).expect("Enter maps");
+        assert_eq!(key, keyboard::Key::Named(NamedKey::Enter));
+        assert_eq!(seam_bytes(&enter, KeyboardMode::APP_KEYPAD), b"\r");
+    }
+
+    /// A winit press whose modifier-supplement BASE key differs from
+    /// `logical_key` — which is what EVERY X11/Wayland keypad press looks like,
+    /// and what the plain constructor cannot express (it sets the two equal).
+    fn press_at_with_base(
+        code: KeyCode,
+        logical: WinitKey,
+        base: WinitKey,
+        location: winit::keyboard::KeyLocation,
+    ) -> KeyEvent {
+        let text = match &logical {
+            WinitKey::Character(s) => Some(s.clone()),
+            _ => None,
+        };
+        KeyEvent::synthetic_for_test_with_base(
+            PhysicalKey::Code(code),
+            logical,
+            base,
+            text,
+            location,
+            winit::event::ElementState::Pressed,
+            false,
+        )
+    }
+
+    /// THE HEADLINE X11/WAYLAND DEFECT, pinned instead of argued. The builder
+    /// encoded from `key_without_modifiers()`, which those backends compute as
+    /// xkb's LEVEL-0 keysym, and the KEYPAD key type holds the NumLock-OFF
+    /// symbol at level 0 (`types/numpad`: `map[None] = Level1`;
+    /// `symbols/keypad(x11)`: `<KP1> { [ KP_End, KP_1 ] }`). So a NumLock-ON
+    /// keypad 1 arrives with `logical_key = Character("1")` and a level-0
+    /// `Named(End)`, and the old builder read the second one: the key TYPED
+    /// `ESC [ F` into the shell instead of `1`, and `.` typed Delete.
+    ///
+    /// `map_numpad_key` is asked first and reads `logical_key`, which carries
+    /// NumLock — so the digit types its digit, and DECKPAM/disambiguate can
+    /// still tell it from the main row. `base_logical_key` reads the same key,
+    /// so the binding table and the encoder agree on what was pressed.
+    #[test]
+    fn numlock_on_keypad_digit_is_not_the_level_zero_keysym() {
+        use aterm_types::keyboard::NamedKey;
+        use winit::keyboard::KeyLocation;
+        let ev = press_at_with_base(
+            KeyCode::Numpad1,
+            ch("1"),
+            WinitKey::Named(WinitNamed::End),
+            KeyLocation::Numpad,
+        );
+        #[cfg(any(target_os = "macos", target_os = "linux", target_os = "windows"))]
+        {
+            use winit::platform::modifier_supplement::KeyEventExtModifierSupplement;
+            assert_eq!(
+                ev.key_without_modifiers(),
+                WinitKey::Named(WinitNamed::End),
+                "the harness really does hand the builder a divergent base key"
+            );
+        }
+        let (key, _, _) = build_key_input(&ev, Modifiers::empty()).expect("KP_1 maps");
+        assert_eq!(key, keyboard::Key::Named(NamedKey::Numpad1));
+        assert_eq!(
+            seam_bytes(&ev, KeyboardMode::empty()),
+            b"1",
+            "a NumLock-ON keypad 1 types 1, not End's ESC [ F"
+        );
+        assert_eq!(seam_bytes(&ev, KeyboardMode::APP_KEYPAD), b"\x1bOq");
+        // The decimal key is the same bug: level 0 is KP_Delete.
+        let dot = press_at_with_base(
+            KeyCode::NumpadDecimal,
+            ch("."),
+            WinitKey::Named(WinitNamed::Delete),
+            KeyLocation::Numpad,
+        );
+        assert_eq!(seam_bytes(&dot, KeyboardMode::empty()), b".");
+        // The binding lookup reads the SAME key the encoder did — before, a
+        // user's `ctrl+pagedown` claimed Ctrl+keypad-3 with NumLock on.
+        assert_eq!(crate::app_input::base_logical_key(&ev), ch("1"));
+        let kp3 = press_at_with_base(
+            KeyCode::Numpad3,
+            ch("3"),
+            WinitKey::Named(WinitNamed::PageDown),
+            KeyLocation::Numpad,
+        );
+        assert_eq!(crate::app_input::base_logical_key(&kp3), ch("3"));
+        // NumLock OFF, the level-0 symbol IS the key: it stays End, for the
+        // encoder and the binding table alike.
+        let off = press_at_with_base(
+            KeyCode::Numpad1,
+            WinitKey::Named(WinitNamed::End),
+            WinitKey::Named(WinitNamed::End),
+            KeyLocation::Numpad,
+        );
+        assert_eq!(seam_bytes(&off, KeyboardMode::empty()), b"\x1b[F");
+        assert_eq!(
+            crate::app_input::base_logical_key(&off),
+            WinitKey::Named(WinitNamed::End)
+        );
+        // The main block never took this road: its base key is the layout base
+        // and stays so.
+        let shifted = press_at_with_base(KeyCode::Digit1, ch("!"), ch("1"), KeyLocation::Standard);
+        assert_eq!(crate::app_input::base_logical_key(&shifted), ch("1"));
+    }
+
+    /// THE NumLock-OFF CENTRE KEY. It is the one keypad key no platform names —
+    /// xkb reports `KP_Begin` as `Unidentified`, Windows as `Clear` — so it is
+    /// settled by its physical code, and the engine's legacy arm for it is
+    /// xterm's `CSI E` (`SS3 E` under DECKPAM), which the kitty encoder has
+    /// always agreed with. Never a `5`: nothing could reach this arm before the
+    /// seam, and shipping the road together with the digit it used to emit
+    /// would have started typing a stray `5` at a shell prompt where this key
+    /// wrote nothing at all.
+    #[test]
+    fn numlock_off_keypad_centre_is_the_letter_form_never_a_digit() {
+        use aterm_types::keyboard::NamedKey;
+        use winit::keyboard::{KeyLocation, NativeKey};
+        // xkb keysym KP_Begin (0xFF9D), which winit maps to no `Key` variant.
+        let ev = press_at(
+            KeyCode::Numpad5,
+            WinitKey::Unidentified(NativeKey::Xkb(0xff9d)),
+            KeyLocation::Numpad,
+        );
+        let (key, _, _) = build_key_input(&ev, Modifiers::empty()).expect("KP_Begin maps");
+        assert_eq!(key, keyboard::Key::Named(NamedKey::NumpadBegin));
+        assert_eq!(
+            seam_bytes(&ev, KeyboardMode::empty()),
+            b"\x1b[E",
+            "the centre key must never type a digit into the shell"
+        );
+        assert_eq!(seam_bytes(&ev, KeyboardMode::APP_KEYPAD), b"\x1bOE");
+        assert_eq!(
+            seam_bytes(&ev, KeyboardMode::DISAMBIGUATE_ESC_CODES),
+            b"\x1b[E"
         );
     }
 }

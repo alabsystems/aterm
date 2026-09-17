@@ -676,6 +676,42 @@ impl KeyEvent {
         state: ElementState,
         repeat: bool,
     ) -> Self {
+        let key_without_modifiers = logical_key.clone();
+        Self::synthetic_for_test_with_base(
+            physical_key,
+            logical_key,
+            key_without_modifiers,
+            text,
+            location,
+            state,
+            repeat,
+        )
+    }
+
+    /// [`synthetic_for_test`](Self::synthetic_for_test) with the modifier
+    /// supplement's BASE key — what `key_without_modifiers()` answers — passed
+    /// explicitly instead of copied from `logical_key`.
+    ///
+    /// The plain constructor sets the two equal, which no real X11/Wayland
+    /// KEYPAD event does: those backends compute `key_without_modifiers()` from
+    /// xkb's LEVEL-0 keysym, and the KEYPAD key type holds the NumLock-OFF
+    /// symbol at level 0 (`types/numpad`: `map[None] = Level1`;
+    /// `symbols/keypad(x11)`: `<KP1> { [ KP_End, KP_1 ] }`). A NumLock-ON
+    /// keypad 1 therefore arrives with `logical_key = Character("1")` and
+    /// `key_without_modifiers() = Named(End)` — two different keys. A
+    /// downstream test of code that reads the base key cannot see that
+    /// divergence through the plain constructor, so it gets this one.
+    #[doc(hidden)]
+    #[must_use]
+    pub fn synthetic_for_test_with_base(
+        physical_key: keyboard::PhysicalKey,
+        logical_key: keyboard::Key,
+        key_without_modifiers: keyboard::Key,
+        text: Option<SmolStr>,
+        location: keyboard::KeyLocation,
+        state: ElementState,
+        repeat: bool,
+    ) -> Self {
         #[cfg(any(
             windows_platform,
             macos_platform,
@@ -685,12 +721,18 @@ impl KeyEvent {
         ))]
         let platform_specific = platform_impl::KeyEventExtra {
             text_with_all_modifiers: text.clone(),
-            key_without_modifiers: logical_key.clone(),
+            key_without_modifiers,
         };
         #[cfg(any(android_platform, ios_platform))]
-        let platform_specific = platform_impl::KeyEventExtra {};
+        let platform_specific = {
+            let _ = &key_without_modifiers;
+            platform_impl::KeyEventExtra {}
+        };
         #[cfg(web_platform)]
-        let platform_specific = platform_impl::KeyEventExtra;
+        let platform_specific = {
+            let _ = &key_without_modifiers;
+            platform_impl::KeyEventExtra
+        };
 
         Self {
             physical_key,

@@ -2264,11 +2264,19 @@ fn run_discovery(
     // when NOTHING answered the classified misses ARE the report. A miss beside
     // an instance that answered stays silent — the success path gains no noise.
     let mut probes: Vec<(u32, String, Probe)> = Vec::with_capacity(targets.len());
+    // Every answered row, kept for the AMBIGUITY sweep below. The rows still
+    // print as they arrive — a wedged instance must not hold up an answered
+    // one's output — so the sweep is the only thing that waits for them all.
+    let mut answered: Vec<FleetSession> = Vec::new();
     for (pid, sock, probe) in probe_sessions(targets) {
         if let Probe::Answered(sessions) = &probe {
             let is_self_instance = self_sock
                 .as_deref()
                 .is_some_and(|self_s| same_socket_path(self_s, &sock));
+            // The rows an in-process caller gets from `fleet_sessions`: ONE mapping
+            // decides what `ls` shows, what the fleet bridge federates, and what the
+            // sweep reads, so the three can never drift apart.
+            let rows = instance_sessions(pid, sessions, self_sid.as_deref());
             if verb == "instances" {
                 let marker = if is_self_instance { " self" } else { "" };
                 writeln!(out, "{pid} {} {sock}{marker}", sessions.len())?;
@@ -2277,14 +2285,12 @@ fn run_discovery(
                     writeln!(out, "{line}")?;
                 }
             } else {
-                // The rows an in-process caller gets from `fleet_sessions`, printed:
-                // ONE mapping decides both what `ls` shows and what the fleet bridge
-                // federates, so the two can never drift apart.
-                for session in instance_sessions(pid, sessions, self_sid.as_deref()) {
+                for session in &rows {
                     let marker = if session.is_self { " *" } else { "" };
                     writeln!(out, "{} {}{marker}", session.pid, session.row)?;
                 }
             }
+            answered.extend(rows);
         }
         probes.push((pid, sock, probe));
     }
@@ -2292,6 +2298,23 @@ fn run_discovery(
     if code != 0 {
         stderr_line(&report)?;
         return Ok(ExitCode::from(code));
+    }
+    // A LISTING IS WHERE A DRIVER PICKS AN ID, so it is where an unusable one has
+    // to be called out: a sid two live instances both answer to addresses NEITHER
+    // of them unambiguously, and `@<sid> key enter` resolved from such a row is
+    // how a keystroke lands in a stranger's window. Loud, named, and on stderr so
+    // the rows a script parses are untouched.
+    for (sid, pids) in duplicate_sids(&answered) {
+        let list = pids
+            .iter()
+            .map(u32::to_string)
+            .collect::<Vec<_>>()
+            .join(", ");
+        stderr_line(&format!(
+            "WARNING: session id {sid} is served by {} live instances (pids {list}) \
+             — `@{sid}` is AMBIGUOUS and may reach either; address one with --pid",
+            pids.len()
+        ))?;
     }
     // The ` self` / ` *` markers mean "hosts the calling terminal", and inside a
     // multiplexer that terminal is the one RUNNING screen/tmux — an honest note
@@ -2489,6 +2512,40 @@ fn instance_sessions(pid: u32, rows: &[String], self_sid: Option<&str>) -> Vec<F
                 let sid = row.split_whitespace().nth(1);
                 sid.is_some() && sid == self_sid
             },
+        })
+        .collect()
+}
+
+/// PURE: the session ids that MORE THAN ONE live instance claims, each with the
+/// pids claiming it, in listing order. Empty for a healthy fleet.
+///
+/// A session id is supposed to name one session on one instance — it is the whole
+/// of `@<sid>`, and `graph/<sid>` records exactly one host for it. Two instances
+/// answering to one id (a premint adopted twice, by an instance from a build
+/// before `identity_claim` gated it) therefore cannot be told apart by the thing
+/// a driver addresses them with. Duplicate rows from ONE pid are not that: the
+/// same instance listed once is not a second claimant, so pids are deduped before
+/// the count.
+fn duplicate_sids(sessions: &[FleetSession]) -> Vec<(String, Vec<u32>)> {
+    let mut order: Vec<&str> = Vec::new();
+    let mut claims: std::collections::HashMap<&str, Vec<u32>> = std::collections::HashMap::new();
+    for session in sessions {
+        let Some(sid) = session.sid() else {
+            continue; // a row too short to carry one — the listing skips it too
+        };
+        let pids = claims.entry(sid).or_insert_with(|| {
+            order.push(sid);
+            Vec::new()
+        });
+        if !pids.contains(&session.pid) {
+            pids.push(session.pid);
+        }
+    }
+    order
+        .into_iter()
+        .filter_map(|sid| {
+            let pids = claims.remove(sid)?;
+            (pids.len() > 1).then(|| (sid.to_string(), pids))
         })
         .collect()
 }
@@ -7931,6 +7988,59 @@ mod tests {
         let outside = instance_sessions(1, &session_rows(&["0"]), None);
         assert_eq!(outside[0].sid(), None, "a row too short names no session");
         assert!(!outside[0].is_self);
+    }
+
+    /// THE LISTING IS WHERE A DRIVER PICKS AN ID, so a sid two live instances
+    /// both answer to has to be visible AS a duplicate here — that listing, and a
+    /// `@<sid> key enter` resolved out of it, is exactly how a keystroke reaches a
+    /// window the driver never meant. One instance listing a sid once is not a
+    /// claimant twice, and a row too short to carry a sid is skipped, not folded
+    /// into a phantom collision.
+    #[test]
+    fn a_sid_two_instances_both_serve_is_reported_as_ambiguous() {
+        let rows = |pid, sids: &[&str]| {
+            instance_sessions(
+                pid,
+                &session_rows(
+                    &sids
+                        .iter()
+                        .enumerate()
+                        .map(|(i, sid)| format!("{i} {sid} - alive sh meta=0"))
+                        .collect::<Vec<_>>()
+                        .iter()
+                        .map(String::as_str)
+                        .collect::<Vec<_>>(),
+                ),
+                None,
+            )
+        };
+
+        // A healthy fleet: two instances, distinct ids, nothing to report.
+        let mut healthy = rows(10, &["s-a", "s-b"]);
+        healthy.extend(rows(11, &["s-c"]));
+        assert!(duplicate_sids(&healthy).is_empty());
+
+        // THE BUG, as a listing sees it: pid 10 and pid 11 both answer to `s-a`.
+        let mut clash = rows(10, &["s-a", "s-b"]);
+        clash.extend(rows(11, &["s-a"]));
+        assert_eq!(
+            duplicate_sids(&clash),
+            vec![("s-a".to_string(), vec![10, 11])],
+            "the duplicated id and BOTH pids claiming it"
+        );
+
+        // One instance, one id, listed twice (it cannot happen through a store
+        // keyed by sid, but a listing must not invent a collision out of it).
+        let mut repeated = rows(10, &["s-a"]);
+        repeated.extend(rows(10, &["s-a"]));
+        assert!(
+            duplicate_sids(&repeated).is_empty(),
+            "one instance is one claimant, however many rows it sends"
+        );
+
+        // A row with no sid column is skipped, exactly as the printer skips it.
+        let short = instance_sessions(10, &session_rows(&["0"]), None);
+        assert!(duplicate_sids(&short).is_empty());
     }
 
     /// THE DISTINCTION THE BRIDGE RUNS ON: an in-process listing must report an

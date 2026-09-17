@@ -313,8 +313,17 @@ mod tests {
         assert!(pid >= 0, "forkpty: {}", std::io::Error::last_os_error());
         if pid == 0 {
             // The stand-in shell: close the slave so the master sees EOF, and be
-            // still ALIVE when the driver reaps, then exit 3.
+            // still ALIVE when the driver reaps, then exit 3. It ignores SIGHUP
+            // first: the driver closes the master before it waits, and on Linux
+            // that hangs up the slave's session leader — this child — while it
+            // is still alive, so it died by signal and the session reported 1,
+            // which the assertion read as "took another child's status". macOS
+            // sends no such hangup once every slave fd is closed, which is why
+            // the fixture passed there (2026-09-14, m17). A real shell has
+            // exited by the time the master sees EOF; the signal reaches
+            // nothing. `signal` is async-signal-safe.
             unsafe {
+                libc::signal(libc::SIGHUP, libc::SIG_IGN);
                 libc::close(0);
                 libc::close(1);
                 libc::close(2);

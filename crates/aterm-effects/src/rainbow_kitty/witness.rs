@@ -78,18 +78,20 @@
 //!   `hello world` — has no glyph of its own to witness: blank before, blank
 //!   after the row is cleared, it could never be retired by content and
 //!   lingered ALONE on the abandoned row for its whole life, a one-cell
-//!   stray. A typed run is one object, so when a walk retires or releases
-//!   any cell of a cohort, every never-armed cell of that cohort on that
-//!   row goes with it, on the same clock. A redraw of the same text retires
-//!   nothing, so the spaces stay with their words (D2).
+//!   stray. When a run is released or every witnessed glyph in it is
+//!   retired, its never-armed cells go with it on the same clock. If some
+//!   letters survive a partial repaint, unchanged spaces stay between them;
+//!   changing one glyph must not split the ribbon at every word boundary.
+//!   A redraw of the same text retires nothing (D2).
 //!
 //! D2 holds by construction: the host samples AFTER the PTY batch is
 //! applied, so an erase followed by the same text at the same cells inside
 //! one batch (every zsh prompt redraw, every Ctrl-L) is seen as the same
-//! glyph and touches nothing. The witness is a fixed-capacity, sorted,
-//! resident list ([`WITNESS_CAP`]); the walk is `O(cells · log entries)`,
-//! allocates nothing past warm-up, and runs only while rainbow kitty owns
-//! the frame.
+//! glyph and touches nothing. Witness records form a fixed-capacity, sorted,
+//! resident list ([`WITNESS_CAP`]); ordinary record lookups cost
+//! `O(cells · log entries)`. Retirement membership uses sorted scratch, and
+//! moved-text checks have their own bound below. The walk allocates nothing
+//! past warm-up and runs only while rainbow kitty owns the frame.
 //!
 //! **It composes with the echo ledger** (`Engine::echo_bridge`, 2026-09-10)
 //! by never touching it: a retirement is a clock on a cell already laid,
@@ -266,10 +268,30 @@ pub struct Witness {
     /// blanked and never-armed cells take the fast melt. Resident scratch,
     /// cleared per walk.
     retired_runs: Vec<(u16, u32)>,
+    /// Sorted `(row, cohort)` identities of retired runs that still have an
+    /// armed, non-retired cell. Such runs keep their unchanged spaces;
+    /// retired runs absent from this list take their spaces with them.
+    /// Resident scratch, cleared per walk.
+    standing_runs: Vec<(u16, u32)>,
+    /// Sorted copy of this walk's retirement identities. The public verdict
+    /// keeps its original order; this scratch makes membership logarithmic
+    /// while finding surviving runs. Capacity is reused after warm-up.
+    retired_cells: Vec<(u16, u16, Instant)>,
     /// `(row, cohort)` of every run a walk RELEASED — blanked, and its text
     /// nowhere the witness can see — the runs whose never-armed cells go to
     /// the swoosh with them. Resident scratch, cleared per walk.
     released_runs: Vec<(u16, u32)>,
+    /// The runs the shape pass reads this walk: every run something was
+    /// named in, retired or released, each once.
+    shape_runs: Vec<(u16, u32)>,
+    /// The ids of this walk's fresh releases, marked on their records only
+    /// once the shape pass has let them stand.
+    fresh_released: Vec<(u16, u16, Instant)>,
+    /// The ids this walk named whose records were already counted — the
+    /// re-verdicts, tallied against the names that survive the shape pass.
+    counted_names: Vec<(u16, u16, Instant)>,
+    /// One run's named ids, for the shape pass's retains.
+    run_ids: Vec<(u16, u16, Instant)>,
     /// The cells whose glyph went blank this walk, sorted by `(row, cohort,
     /// col)` once the pass is over. Resident scratch, cleared per walk.
     blanked: Vec<Blanked>,
@@ -283,7 +305,13 @@ impl Witness {
         Self {
             seen: Vec::with_capacity(WITNESS_CAP),
             retired_runs: Vec::new(),
+            standing_runs: Vec::new(),
+            retired_cells: Vec::new(),
             released_runs: Vec::new(),
+            shape_runs: Vec::new(),
+            fresh_released: Vec::new(),
+            counted_names: Vec::new(),
+            run_ids: Vec::new(),
             blanked: Vec::new(),
             restore_runs: Vec::new(),
         }
@@ -448,10 +476,10 @@ impl Witness {
     /// their own spacing on any sampled row other than where they were
     /// ([`Witness::moved`] — the text moved, the light did not), the run's
     /// blanked cells go onto `retire` with it; otherwise the run's text is
-    /// gone and they go onto `release`. Then every never-armed cell of a run
-    /// one of whose cells was just named goes with it on the same list (the
-    /// blank in a word), and a released run's never-armed cells get a
-    /// released record of their own. Records whose cells the walk never
+    /// gone and they go onto `release`. Never-armed cells follow their run
+    /// when it is released or has no witnessed glyph left standing; unchanged
+    /// blanks between surviving letters stay lit. A released run's never-armed
+    /// cells get a released record of their own. Records whose cells the walk never
     /// reached — dropped by the ribbon — are forgotten. A cell may be pushed
     /// twice (a wide unit's two halves both resident); `Ribbon::retire_cells`
     /// and `Ribbon::release_cells` act on it once.
@@ -477,12 +505,23 @@ impl Witness {
         self.retired_runs.clear();
         self.released_runs.clear();
         self.blanked.clear();
+        self.fresh_released.clear();
+        self.counted_names.clear();
         for s in &mut self.seen {
             s.live = false;
         }
-        let mut recounted = 0usize;
         for cell in cells {
             if cell.leaving() {
+                // A cell a PARTIAL release stamped onto the retract keeps its
+                // released record while it is resident, so the identical
+                // redraw a frame later can still restore it
+                // ([`Witness::restored_runs`], `Ribbon::restore_releases`).
+                if cell.released_at.is_some()
+                    && let Some(i) = self.find(cell.row, cell.col, cell.born)
+                    && self.seen[i].released
+                {
+                    self.seen[i].live = true;
+                }
                 continue;
             }
             let Some(sample) = rows.iter().find(|s| s.row == cell.row) else {
@@ -516,7 +555,7 @@ impl Witness {
                             self.retired_runs.push(run);
                         }
                         if seen.counted {
-                            recounted += 1;
+                            self.counted_names.push((cell.row, cell.col, cell.born));
                         }
                     }
                 }
@@ -548,7 +587,7 @@ impl Witness {
                 for b in &self.blanked[i..end] {
                     Self::push_unit(retire, b.row, b.col, b.born, b.unit);
                     if b.counted {
-                        recounted += 1;
+                        self.counted_names.push((b.row, b.col, b.born));
                     }
                 }
                 if !self.retired_runs.contains(&run) {
@@ -561,14 +600,13 @@ impl Witness {
                 for b in &self.blanked[i..end] {
                     if !b.held {
                         Self::push_unit(release, b.row, b.col, b.born, b.unit);
+                        self.fresh_released.push((b.row, b.col, b.born));
                         if b.counted {
-                            recounted += 1;
+                            self.counted_names.push((b.row, b.col, b.born));
                         }
                     }
                     if let Some(k) = self.find(b.row, b.col, b.born) {
                         self.seen[k].live = true;
-                        self.seen[k].released = true;
-                        self.seen[k].counted = true;
                     }
                 }
                 if fresh_end > i {
@@ -577,6 +615,23 @@ impl Witness {
             }
             i = end;
         }
+        self.shape_verdicts(cells, rows, retire, release);
+        // The releases that stood: their records are kept, marked — a glyph
+        // landing under one later is REPLACED text, a blank is nothing, the
+        // same glyph back is D2 — and counted once.
+        for k in 0..self.fresh_released.len() {
+            let (row, col, born) = self.fresh_released[k];
+            if let Some(i) = self.find(row, col, born) {
+                self.seen[i].released = true;
+                self.seen[i].counted = true;
+            }
+        }
+        let recounted = self
+            .counted_names
+            .iter()
+            .filter(|id| retire.contains(id) || release.contains(id))
+            .count();
+        self.find_standing_runs(cells, retire);
         // THE BLANKS GO WITH THEIR RUN: a cell of a named run that holds no
         // record at all — never armed, because nothing was ever under it —
         // goes with its run-mates, on the run's own clock, and a released
@@ -590,11 +645,126 @@ impl Witness {
                     continue;
                 }
                 let run = (cell.row, cell.cohort);
-                if self.retired_runs.contains(&run) {
-                    retire.push((cell.row, cell.col, cell.born));
+                if self.retired_runs.binary_search(&run).is_ok() {
+                    // **A BLANK THAT IS STILL BLANK, IN A RUN THAT IS STILL
+                    // STANDING, IS NOT EVIDENCE**
+                    // (2026-09-15, the owner: *"odd logic of drawing a part
+                    // of the trail when moving the cursor and editing
+                    // text"*). A never-armed cell has no record because
+                    // nothing was ever under it — it is the SPACE in
+                    // `hello world`. It goes with a RETIRED run because the
+                    // run is one object and its letters moved; but where
+                    // the space is STILL a space, nothing moved under this
+                    // cell and there is nothing for its light to be wrong
+                    // over. Retiring it anyway is what punched the owner's
+                    // band into word-shaped blocks: one character inserted
+                    // mid-line retired eleven cells, five of them spaces at
+                    // columns 8, 14, 18, 20 and 25 whose glyphs had not
+                    // changed, and the band read
+                    // `..######.#####.###.#.-###.####....` — six blocks
+                    // with one-cell gaps — for the next 640 ms
+                    // (`rbt/c4_edit`, frames 0647 → 0655).
+                    //
+                    // A run with NOTHING LEFT STANDING still takes its
+                    // blanks, and so does a released run: there the run's
+                    // text is gone and a space with nothing around it is
+                    // the one-cell stray the law was written for. What is
+                    // refused is only a hole punched in a run whose letters
+                    // are still lit either side of it.
+                    let still_blank = rows
+                        .iter()
+                        .find(|s| s.row == cell.row)
+                        .is_some_and(|s| unit_at(s.cols, cell.col).is_blank());
+                    if !still_blank || self.standing_runs.binary_search(&run).is_err() {
+                        retire.push((cell.row, cell.col, cell.born));
+                    }
                 } else if self.released_runs.binary_search(&run).is_ok() {
                     release.push((cell.row, cell.col, cell.born));
                     self.hold_released(cell);
+                }
+            }
+        }
+        // **WHAT A RUN LOSES, IT LOSES IN ONE PIECE** (2026-09-16, the
+        // owner: *"I still am sometimes seeing bugs and gaps"*, and *"when
+        // backspacing … the rainbow cursor trail breaks a part"*).
+        //
+        // Every verdict above is taken PER CELL, by comparing one column's
+        // recorded glyph with the one standing there now. A text SHIFT — the
+        // mid-line Backspace that pulls the tail left, the insert that pushes
+        // it right — changes every column from the edit to the end of the
+        // line, so the honest per-cell answer is "replaced" for all of them.
+        // But natural text repeats: wherever `old[i + 1] == old[i]` the
+        // shifted column holds the SAME glyph it recorded, the comparison
+        // answers "unchanged", and that one cell is kept while both its
+        // neighbours are named. Measured at the host seam on the owner's own
+        // gesture (`c8_bs_mid`: the caret walked back three words into a
+        // wrapped composer, then a Backspace run mid-word), the named set
+        // came out a COMB — columns 26, 28, 30, 31, 32, 33 and 35 retired,
+        // 27, 29 and 34 kept, over `…and I alsosee some a` — and 120 ms
+        // later, when the fast melt had taken the named ones, the band on
+        // glass was a solid head at 2..25 plus three DETACHED SPECKS: three
+        // interior dark runs where the row had had none.
+        //
+        // `Ribbon::retract_suffix` states the shape light is allowed to
+        // leave a row in, and states it as a law: *"CONTIGUOUS at every frame
+        // … nothing is ever removed from the MIDDLE"*. The Backspace, the
+        // kill and the insert's rewrite all obey it. The content witness is
+        // the one path that removes light by NAME, and a name is not a shape:
+        // a per-cell verdict can name any subset, and most subsets are holes.
+        //
+        // So the names are read as a SPAN and not as a set: within one run —
+        // one row, one cohort, the object the retirement is already reasoned
+        // about as ("the run is one object and its letters moved") — every
+        // cell BETWEEN the leftmost and the rightmost named column goes with
+        // them. A cell inside that span that compared equal did so by
+        // coincidence: the shift moved text over it too, and what is under it
+        // now is not what its light was laid for.
+        //
+        // The span is the tightest closure that removes holes, and that is
+        // why it is a span and not a suffix. It swallows only columns the
+        // walk has already condemned on BOTH sides, so a change that really
+        // is interior stays interior: a program overwriting a wide glyph's
+        // two cells still takes exactly those two and leaves its narrow
+        // neighbours lit either side
+        // ([`a_wide_glyph_s_two_cells_are_retired_as_one_unit`]), and a
+        // single stale cell named alone is still named alone
+        // ([`a_key_typed_over_an_abandoned_cohorts_cell_keeps_its_own_light`]).
+        // A run nothing was named in is untouched. A cell the walk RELEASED
+        // (its glyph WENT, rather than changed) is left on its own clock:
+        // that verdict has a restore path ([`Witness::restored_runs`]) and
+        // this is not the place to revoke it.
+        if !retire.is_empty() {
+            for i in 0..self.retired_runs.len() {
+                let (row, cohort) = self.retired_runs[i];
+                let mut lo = u16::MAX;
+                let mut hi = 0u16;
+                let mut named = false;
+                for cell in cells {
+                    if cell.row == row
+                        && cell.cohort == cohort
+                        && retire.contains(&(cell.row, cell.col, cell.born))
+                    {
+                        named = true;
+                        lo = lo.min(cell.col);
+                        hi = hi.max(cell.col);
+                    }
+                }
+                if !named || lo >= hi {
+                    continue;
+                }
+                for cell in cells {
+                    if cell.leaving()
+                        || cell.row != row
+                        || cell.cohort != cohort
+                        || cell.col < lo
+                        || cell.col > hi
+                    {
+                        continue;
+                    }
+                    let id = (cell.row, cell.col, cell.born);
+                    if !retire.contains(&id) && !release.contains(&id) {
+                        retire.push(id);
+                    }
                 }
             }
         }
@@ -612,6 +782,187 @@ impl Witness {
         }
         self.seen.retain(|s| s.live);
         recounted
+    }
+
+    /// **A RUN LOSES A PREFIX, A SUFFIX, OR ALL OF ITSELF — NEVER ITS MIDDLE**
+    /// (2026-09-16 — the owner: *"there is still this gapping issue that
+    /// arises in codex, it seems to happen when doing backword and
+    /// editing"*, and, on the fix's first cut: *"I'm not convinced that this
+    /// is a Codex specific issue … you need to be fixing in general"*).
+    ///
+    /// [`Ribbon::retract_suffix`] states how light may leave a row —
+    /// *"CONTIGUOUS at every frame … nothing is ever removed from the
+    /// MIDDLE"* — and every geometric path obeys it. The witness is the one
+    /// path that removes light by NAME, and until this pass a name anywhere
+    /// in a run was honoured: one interior cell whose glyph changed, or
+    /// went, punched a one-cell hole in a band whose letters stood lit either
+    /// side of it. The 2026-09-16 span closure below closed the holes
+    /// BETWEEN names; a lone name stayed a hole "by design".
+    ///
+    /// What names a lone interior cell, measured: an app painting a
+    /// decoration into a blank cell of its composer and moving it on — Codex
+    /// 0.154's ambient particle field, a dot drifting through the space
+    /// between two typed words, the cell under a parked caret cleared and
+    /// painted again (`tests/codex_particle_replay.rs`, its real bytes: a
+    /// one-cell hole exactly on each space a word hop had parked the caret
+    /// on, and — the same dot found nowhere else that frame — the whole run
+    /// RELEASED and the band falling from 33 lit cells to 9 while the hand
+    /// was still typing). A spinner glyph, a spellcheck rewriting one letter,
+    /// a TUI drawing its own cursor glyph, a line-number gutter ticking: the
+    /// same shape, none of them Codex.
+    ///
+    /// The law. For a run that is STANDING — some cell of it holds a record
+    /// that is neither released nor named this walk — the names are read as
+    /// ONE SHAPE against the run's recorded extent (its cells with records;
+    /// never-armed spaces are not ends, they go with their run):
+    ///
+    /// * names that reach the run's first or last recorded cell are a
+    ///   prefix, a suffix or the whole, and stand as named — the shift a
+    ///   mid-line Backspace or insert makes, the tail an app cleared, the
+    ///   line it rewrote;
+    /// * names strictly inside that cover MOST of the run's recorded cells
+    ///   are a rewrite whose end cell happened to compare equal (`ll`, `ee`
+    ///   — natural text repeats) and are EXTENDED to the nearer end, so no
+    ///   speck is left standing past them;
+    /// * names strictly inside that cover less are NOT EVIDENCE: the light
+    ///   stays, and the records take the glyphs standing there now, so the
+    ///   walk does not name them again next frame for the same reason. A
+    ///   cell that went blank records a blank; a glyph landing on it later
+    ///   is another interior change, and stays.
+    ///
+    /// A run with nothing standing — every record released, its text gone,
+    /// its light on the retract — is not shaped: a glyph landing under it
+    /// is replaced text and the run melts as it always did.
+    fn shape_verdicts(
+        &mut self,
+        cells: &[Cell],
+        rows: &[RowSample<'_>],
+        retire: &mut Vec<(u16, u16, Instant)>,
+        release: &mut Vec<(u16, u16, Instant)>,
+    ) {
+        self.shape_runs.clear();
+        self.shape_runs.extend_from_slice(&self.retired_runs);
+        self.shape_runs.extend_from_slice(&self.released_runs);
+        self.shape_runs.sort_unstable();
+        self.shape_runs.dedup();
+        for k in 0..self.shape_runs.len() {
+            let run = self.shape_runs[k];
+            let (row, cohort) = run;
+            let mut lo_r = u16::MAX;
+            let mut hi_r = 0u16;
+            let mut recorded = 0usize;
+            let mut lo_n = u16::MAX;
+            let mut hi_n = 0u16;
+            let mut standing = false;
+            self.run_ids.clear();
+            for cell in cells {
+                if cell.leaving() || cell.row != row || cell.cohort != cohort {
+                    continue;
+                }
+                let id = (cell.row, cell.col, cell.born);
+                let Some(i) = self.find(cell.row, cell.col, cell.born) else {
+                    continue;
+                };
+                recorded += 1;
+                lo_r = lo_r.min(cell.col);
+                hi_r = hi_r.max(cell.col);
+                if retire.contains(&id) || release.contains(&id) {
+                    self.run_ids.push(id);
+                    lo_n = lo_n.min(cell.col);
+                    hi_n = hi_n.max(cell.col);
+                } else if !self.seen[i].released {
+                    standing = true;
+                }
+            }
+            if self.run_ids.is_empty() || !standing || lo_n <= lo_r || hi_n >= hi_r {
+                continue;
+            }
+            let inside = cells
+                .iter()
+                .filter(|c| {
+                    !c.leaving()
+                        && c.row == row
+                        && c.cohort == cohort
+                        && (lo_n..=hi_n).contains(&c.col)
+                        && self.find(c.row, c.col, c.born).is_some()
+                })
+                .count();
+            if inside * 2 > recorded {
+                // A rewrite of most of the run: extend to the nearer end.
+                let (a, b) = if lo_n - lo_r <= hi_r - hi_n {
+                    (lo_r, hi_n)
+                } else {
+                    (lo_n, hi_r)
+                };
+                let releasing = !self.retired_runs.contains(&run);
+                for cell in cells {
+                    if cell.leaving()
+                        || cell.row != row
+                        || cell.cohort != cohort
+                        || !(a..=b).contains(&cell.col)
+                    {
+                        continue;
+                    }
+                    let id = (cell.row, cell.col, cell.born);
+                    if retire.contains(&id) || release.contains(&id) {
+                        continue;
+                    }
+                    if releasing {
+                        release.push(id);
+                        self.fresh_released.push(id);
+                    } else {
+                        retire.push(id);
+                    }
+                }
+                continue;
+            }
+            // Not evidence: the names come off, the records catch up.
+            retire.retain(|id| !self.run_ids.contains(id));
+            release.retain(|id| !self.run_ids.contains(id));
+            self.fresh_released.retain(|id| !self.run_ids.contains(id));
+            self.retired_runs.retain(|r| *r != run);
+            self.released_runs.retain(|r| *r != run);
+            let sample = rows.iter().find(|s| s.row == row);
+            for j in 0..self.run_ids.len() {
+                let (r, c, born) = self.run_ids[j];
+                if let Some(i) = self.find(r, c, born) {
+                    self.seen[i].unit = sample.map_or(Unit::BLANK, |s| unit_at(s.cols, c));
+                    self.seen[i].live = true;
+                }
+            }
+        }
+    }
+
+    /// Find the retired runs with something left standing in one pool walk.
+    /// Only runs with no surviving armed cell take their unchanged spaces.
+    /// Previously each retired run rescanned the pool and each candidate
+    /// linearly searched all retirement identities, multiplying the work on
+    /// a composer's partial repaint. Both membership checks now use sorted
+    /// resident scratch; the verdict's order and cell identities are untouched.
+    fn find_standing_runs(&mut self, cells: &[Cell], retire: &[(u16, u16, Instant)]) {
+        self.standing_runs.clear();
+        self.retired_cells.clear();
+        if self.retired_runs.is_empty() {
+            return;
+        }
+        self.retired_runs.sort_unstable();
+        self.retired_cells.extend_from_slice(retire);
+        self.retired_cells.sort_unstable();
+        for cell in cells {
+            let run = (cell.row, cell.cohort);
+            if !cell.leaving()
+                && self.retired_runs.binary_search(&run).is_ok()
+                && self.find(cell.row, cell.col, cell.born).is_some()
+                && self
+                    .retired_cells
+                    .binary_search(&(cell.row, cell.col, cell.born))
+                    .is_err()
+            {
+                self.standing_runs.push(run);
+            }
+        }
+        self.standing_runs.sort_unstable();
+        self.standing_runs.dedup();
     }
 
     /// Runs whose complete original cell identities and glyphs are back.
@@ -661,12 +1012,32 @@ impl Witness {
             run.cells += 1;
             match (seen, sample) {
                 (Some(seen), Some(sample)) => {
-                    run.exact &= !cell.leaving()
+                    run.exact &= (!cell.leaving() || cell.released_at.is_some())
                         && seen.restorable
                         && run.row == cell.row
                         && seen.unit == unit_at(sample.cols, cell.col);
                     run.returned_ink |= seen.released && !seen.unit.is_blank();
                 }
+                // **A CELL WITH NO RECORD IS NOT EVIDENCE** (2026-09-15) —
+                // the restore path's half of the blank law. A never-armed
+                // cell holds no record because nothing was ever under it:
+                // the SPACE in `hello world`, and the cell a key laid while
+                // the app's repaint still had the column blank. It makes no
+                // claim about the run's text, so it can neither authorize a
+                // restore nor refuse one — only recorded cells decide. Read
+                // as a refusal it made a run with a space in it
+                // UNRESTORABLE for good: a composer that clears to the end
+                // of the screen and rewrites releases the row, the restore
+                // is vetoed by the run's own spaces, and every glyph that
+                // lands back under the released light is then read as
+                // REPLACED text and retired — one cell at a time, for the
+                // rest of the run. Measured 2026-09-15 (`c2_bs`): `witness
+                // REPLACED (13,7) was=' ' now='s'`, a one-cell hole that
+                // stood 1.42 s of a 16 s take.
+                //
+                // A cell whose ROW was not sampled is a different thing and
+                // still refuses: there the witness genuinely does not know.
+                (None, Some(_)) => {}
                 _ => run.exact = false,
             }
         }
@@ -689,8 +1060,20 @@ impl Witness {
             .filter(|c| cohorts.binary_search(&c.cohort).is_ok())
         {
             if let Some(i) = self.find(cell.row, cell.col, cell.born) {
-                self.seen[i].released = false;
-                self.seen[i].restorable = false;
+                // A HELD BLANK GOES BACK TO NEVER-ARMED (2026-09-16). The
+                // release gave the run's spaces a released blank record of
+                // their own (`hold_released`); un-releasing that record
+                // would leave a space with a BLANK record no walk can ever
+                // name — blank over blank is D2 — so a later clear of the
+                // whole line could never name every cell of the run and
+                // `Ribbon::release_cells` would read the text gone whole as
+                // gone in part. A blank arms nothing: the record goes.
+                if self.seen[i].unit.is_blank() {
+                    self.seen.remove(i);
+                } else {
+                    self.seen[i].released = false;
+                    self.seen[i].restorable = false;
+                }
             }
         }
     }
@@ -749,6 +1132,7 @@ mod tests {
             edge_cells: 3.0,
             layer: Layer::Base,
             rearm: None,
+            released_at: None,
         }
     }
 
@@ -1396,6 +1780,77 @@ mod tests {
             );
             assert!(out.is_empty(), "stale first = {stale_first}");
         }
+    }
+
+    #[test]
+    fn standing_run_index_matches_the_retirement_oracle() {
+        let t0 = Instant::now();
+        let t1 = t0 + std::time::Duration::from_millis(1);
+        let mut cells = [
+            cell_of(2, 0, t0, 7),
+            cell_of(2, 1, t0, 7), // never-armed space
+            cell_of(2, 2, t0, 7),
+            cell_of(3, 0, t0, 7),  // same cohort ID, different row
+            cell_of(3, 1, t0, 7),  // wide continuation
+            cell_of(3, 2, t0, 7),  // never-armed space
+            cell_of(5, 0, t0, 9),  // released record
+            cell_of(5, 1, t0, 9),  // leaving cell cannot keep its run standing
+            cell_of(6, 0, t0, 10), // no record
+            cell_of(2, 0, t1, 11), // fresh owner at an old position
+        ];
+        cells[7].retire_at = Some(t0);
+        let mut witness = Witness::new();
+        for i in [0, 2, 3, 4, 7, 9] {
+            witness.arm(
+                &cells[i],
+                Unit {
+                    ch: if i == 3 || i == 4 { '你' } else { 'a' },
+                    wide: i == 3 || i == 4,
+                    cont: i == 4,
+                },
+            );
+        }
+        witness.hold_released(&cells[6]);
+        let runs = [(5, 9), (2, 7), (6, 10), (3, 7), (2, 11)];
+
+        // Every subset of the witnessed identities; order is deliberately
+        // reversed and duplicates emulate both halves naming a wide unit.
+        let armed = [0, 2, 3, 4, 6, 7, 9];
+        for mask in 0..(1usize << armed.len()) {
+            let mut retire = Vec::new();
+            for (bit, &i) in armed.iter().enumerate().rev() {
+                if mask & (1 << bit) != 0 {
+                    let c = cells[i];
+                    retire.push((c.row, c.col, c.born));
+                    retire.push((c.row, c.col, c.born));
+                }
+            }
+            let mut expected: Vec<_> = runs
+                .iter()
+                .copied()
+                .filter(|&run| {
+                    cells.iter().any(|c| {
+                        !c.leaving()
+                            && (c.row, c.cohort) == run
+                            && witness.find(c.row, c.col, c.born).is_some()
+                            && !retire.contains(&(c.row, c.col, c.born))
+                    })
+                })
+                .collect();
+            expected.sort_unstable();
+            let original_order = retire.clone();
+            witness.retired_runs.clear();
+            witness.retired_runs.extend_from_slice(&runs);
+            witness.find_standing_runs(&cells, &retire);
+            assert_eq!(witness.standing_runs, expected, "mask {mask}");
+            assert_eq!(retire, original_order, "verdict order must stay unchanged");
+        }
+        witness.retired_runs.clear();
+        witness.find_standing_runs(&cells, &[]);
+        assert!(
+            witness.standing_runs.is_empty(),
+            "no stale run state on an idle walk"
+        );
     }
 
     #[test]

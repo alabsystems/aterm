@@ -82,17 +82,20 @@ const RETIRED_CONFIG_KEYS: &[RetiredConfigKeyMetadata] = &[
         feature: "Keyword Kitty opacity control",
         effect_label: "No effect",
     },
-    // `cursor_trail_wake_ms` USED TO BE LISTED HERE and it was wrong (found
-    // 2026-08-10 while giving the cursor kitty its own Settings page). The
-    // typing wake came back: `CursorGlow::wake` reads `GlowConfig::wake_persist_s`
-    // on every rainbow frame — its own comment even names the Settings row — the
-    // value is clamped 0..=1500 ms by `Config::cursor_trail_wake_persist_or_default`,
-    // and `cursor_glow::rainbow_wake_persistence_is_a_host_dial_that_fails_off`
-    // proves the plume lengthens monotonically with it and fails OFF at 0/NaN.
-    // Manual was telling anyone who authored the key that it "has no effect",
-    // and Settings projected it as "Compatibility only · No effect". A dial that
-    // works and a UI that says it does not is the same defect as a switch that
-    // does nothing, pointing the other way.
+    // `cursor_trail_wake_ms` WAS TAKEN OFF THIS TABLE on 2026-08-10, on the
+    // grounds that "the typing wake came back: `CursorGlow::wake` reads
+    // `GlowConfig::wake_persist_s` on every rainbow frame", witnessed by
+    // `cursor_glow::rainbow_wake_persistence_is_a_host_dial_that_fails_off`.
+    // Both facts had expired by 2026-09-06: `RAINBOW-KITTY-V2.md` §17.3 phase
+    // 7 deleted the wake walk with the v1 engine, and neither that function
+    // nor that test exists anywhere in the tree today. The row below restores
+    // the key to the table it was taken from — this time with the field
+    // deleted, so nothing can quietly come to depend on it again.
+    RetiredConfigKeyMetadata {
+        key: "cursor_trail_wake_ms",
+        feature: "Rainbow kitty typing wake",
+        effect_label: "No effect",
+    },
 ];
 
 pub(crate) fn retired_config_key(key: &str) -> Option<&'static RetiredConfigKeyMetadata> {
@@ -837,11 +840,24 @@ const MANUAL_SCHEMA: &[ManualSchemaEntry] = &[
     // atpkg reads these from the same aterm.toml even when its package loop is
     // disabled. They are real settings, not GUI Config fields or unknown keys.
     // A false warning here paints an eight-second banner over the terminal.
+    // ONE ROW PER KEY. `config_schema()` drops a second entry for a key it already
+    // holds, so the duplicate `machine` row that upstream's rework left below this one
+    // was dead — and it was the one carrying the words a user searches for ("universal
+    // control", "spotlight", "noindex"). Merged here; the uniqueness test now reads
+    // MANUAL_SCHEMA itself, so a shadowed row fails instead of vanishing.
     manual(
         "machine",
-        "Host maintenance",
+        "Machine settings",
         ConfigSchemaKind::Table,
-        &["atpkg", "host", "maintenance"],
+        &[
+            "atpkg",
+            "host",
+            "maintenance",
+            "universal control",
+            "spotlight",
+            "noindex",
+            "mac",
+        ],
         false,
     ),
     manual(
@@ -859,13 +875,6 @@ const MANUAL_SCHEMA: &[ManualSchemaEntry] = &[
         }),
         &["atpkg", "mouse", "keyboard", "sharing"],
         true,
-    ),
-    manual(
-        "machine",
-        "Machine settings",
-        ConfigSchemaKind::Table,
-        &["universal control", "spotlight", "noindex", "host", "mac"],
-        false,
     ),
     manual(
         "matrix_rain",
@@ -4437,6 +4446,69 @@ mod tests {
     /// construction, and folding them allocated per entry per keystroke). Pin the
     /// invariant so a capitalized key fails the build instead of silently
     /// disappearing from Manual completion and global search.
+    ///
+    /// THIS TEST WAS DELETED AND ITS `#[test]` LEFT BEHIND, which is how it came back:
+    /// the orphaned attribute landed on the next test's doc and `duplicated attribute`
+    /// named it 2026-09-16. The law was never withdrawn — only its body went — so the
+    /// body is restored rather than the claim dropped.
+    #[test]
+    fn the_manual_schema_is_lowercase_by_construction() {
+        assert!(
+            MANUAL_SCHEMA.len() > 20,
+            "the control: an empty or truncated table would pass every assertion below \
+             without reading a single key"
+        );
+        for entry in MANUAL_SCHEMA {
+            assert_eq!(
+                entry.key,
+                entry.key.to_ascii_lowercase(),
+                "schema key `{}` is not lowercase, so the completion and search paths — \
+                 which compare against an already-lowercased prefix WITHOUT folding — \
+                 can never match it",
+                entry.key
+            );
+            for word in entry.keywords {
+                assert_eq!(
+                    *word,
+                    word.to_ascii_lowercase(),
+                    "keyword `{word}` of `{}` is not lowercase, so global search cannot \
+                     reach the row through it",
+                    entry.key
+                );
+            }
+        }
+    }
+
+    /// A SHADOWED ROW IS A LOST ROW. `config_schema()` drops a MANUAL_SCHEMA entry whose
+    /// key it already holds, silently — so upstream's second `machine` row, the one
+    /// carrying the words a user actually searches for, simply never existed at runtime
+    /// and nothing failed. This reads the TABLE, not the resolved schema, so the next
+    /// duplicate fails here instead of disappearing.
+    #[test]
+    fn the_manual_schema_holds_one_row_per_key() {
+        let mut seen: std::collections::BTreeMap<&str, usize> = std::collections::BTreeMap::new();
+        for entry in MANUAL_SCHEMA {
+            *seen.entry(entry.key).or_default() += 1;
+        }
+        let duplicates: Vec<(&&str, &usize)> = seen.iter().filter(|(_, n)| **n > 1).collect();
+        assert!(
+            duplicates.is_empty(),
+            "a key listed twice keeps only its FIRST row: {duplicates:?}"
+        );
+        // And the merged row kept both halves of what the two used to say.
+        let machine = MANUAL_SCHEMA
+            .iter()
+            .find(|entry| entry.key == "machine")
+            .expect("the [machine] table is described");
+        for word in ["atpkg", "universal control", "spotlight", "noindex"] {
+            assert!(
+                machine.keywords.contains(&word),
+                "{word:?} must still find the table: {:?}",
+                machine.keywords
+            );
+        }
+    }
+
     #[test]
     fn config_schema_keys_and_keywords_are_lowercase() {
         for entry in config_schema() {
@@ -4920,6 +4992,87 @@ intensity = 0.25
                 )
             }));
         }
+    }
+
+    /// THE RETIRED TYPING-WAKE KEY LOADS, AND IS TOLD THE TRUTH ABOUT.
+    /// `cursor_trail_wake_ms` shipped in the starter config for a year, so real
+    /// `aterm.toml` files on disk set it. Retiring it must therefore do three
+    /// things at once and not two: the file keeps loading byte-for-byte, the
+    /// key stops being an active control anywhere, and Manual gives it the
+    /// RETIRED story rather than the "unknown to this aterm build" typo story
+    /// a bare field deletion would have produced. The last is the whole reason
+    /// the `RETIRED_CONFIG_KEYS` row exists — a user who deliberately authored
+    /// this key is not a user who misspelled one.
+    #[test]
+    fn the_retired_typing_wake_key_loads_and_is_told_the_truth() {
+        const KEY: &str = "cursor_trail_wake_ms";
+        let source = "cursor_trail_wake_ms = 900\ncursor_trail_ms = 260\n";
+        let document = source.parse::<aterm_toml::edit::DocumentMut>().unwrap();
+        assert_eq!(
+            document.to_string(),
+            source,
+            "Manual must not destructively rewrite a retired dial"
+        );
+        let parsed = aterm_toml::from_str::<crate::app_config::Config>(source)
+            .expect("a config authored against the old dial still loads");
+        assert_eq!(
+            parsed.cursor_trail_ms,
+            Some(260),
+            "the retired key must not swallow the keys around it"
+        );
+
+        let retired = retired_config_key(KEY).expect("typing-wake retirement metadata");
+        assert_eq!(retired.feature, "Rainbow kitty typing wake");
+        assert_eq!(retired.effect_label, "No effect");
+        assert!(is_compatibility_only_key(KEY));
+        assert!(
+            config_schema_entry(KEY).is_none(),
+            "a retired key is not an active Manual schema entry"
+        );
+        assert!(
+            crate::prefs::editable_fields(&crate::app_config::Config::default())
+                .iter()
+                .all(|field| field.key != KEY),
+            "a retired key must stay out of Settings and Advanced"
+        );
+
+        let analysis = analyze(source);
+        assert!(!analysis.has_errors(), "{:?}", analysis.diagnostics);
+        let matching = analysis
+            .diagnostics
+            .iter()
+            .filter(|diagnostic| diagnostic.message.contains(KEY))
+            .collect::<Vec<_>>();
+        assert_eq!(matching.len(), 1, "{:?}", analysis.diagnostics);
+        assert_eq!(matching[0].severity, ConfigDiagnosticSeverity::Warning);
+        assert!(
+            matching[0]
+                .message
+                .contains("Rainbow kitty typing wake was removed")
+        );
+        assert!(matching[0].message.contains("has no effect"));
+        assert!(matching[0].message.contains("will be preserved"));
+        assert!(
+            !matching[0].message.contains("unknown"),
+            "a deliberately authored key must never be answered as a typo: {}",
+            matching[0].message
+        );
+
+        // Never offered back: not as a completion, and not as the answer to a
+        // near-miss typo of its own spelling.
+        let key_source = "cursor_trail_wa";
+        let key_assist = assist(key_source, key_source.len());
+        assert!(
+            key_assist
+                .completions
+                .iter()
+                .all(|completion| !completion.insertion.contains(KEY)),
+            "a retired key is never completed: {key_assist:?}"
+        );
+        assert!(
+            !suggestable_config_paths().contains(&KEY),
+            "\"did you mean cursor_trail_wake_ms?\" would answer a typo with a dead key"
+        );
     }
 
     #[test]

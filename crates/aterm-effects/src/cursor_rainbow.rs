@@ -64,7 +64,6 @@ use crate::cursor_glow::{
     rainbow_phase_from_unit_turn, rainbow_sweep_at, rainbow_sweep_reflect, rainbow_thing_of,
 };
 use crate::rainbow_kitty::timing::spring_snap;
-use crate::spectrum::clear_thing_of_cyan;
 
 /// The block-cursor base the rainbow blooms FROM when the host names none:
 /// white on a dark theme, a soft near-black on a light theme — so the "start
@@ -223,16 +222,19 @@ const RIM_SPIN_TURNS_PER_S: f32 = 0.45;
 ///
 /// With every ring at one light the rim's light is a function of `halo_energy`
 /// — coverage — alone, and `halo_energy` is monotone in the paint: the glow's
-/// decay IS the momentum read and nothing else. `0.42` is the arc's own mean,
+/// decay IS the momentum read and nothing else. `0.462` is the arc's own mean,
 /// so the rim's AVERAGE light over a turn is where it was; only its variance is
-/// gone. Blue and violet arrive as their pastels, yellow as a gold: still a sky
+/// gone. (`0.42 -> 0.462` on 2026-09-15: the green→blue crossing stopped being
+/// drawn through a desaturated, value-sagging roof, so the arc's own mean light
+/// rose with it. The constant is a MEASUREMENT of the arc —
+/// `rim_light_grey_is_the_arcs_mean` re-derives it — and it followed.) Blue and violet arrive as their pastels, yellow as a gold: still a sky
 /// rainbow, and bright rather than dim at every stop — which is also what the
 /// 2026-09-01 ruling asked of the arc.
-const RIM_LIGHT: f32 = 0.42;
-/// The grey of relative luminance [`RIM_LIGHT`] — sRGB byte `173`, the encode
-/// of `0.42`. `rim_light_grey_is_the_arcs_mean` pins both halves: this byte's
+const RIM_LIGHT: f32 = 0.462;
+/// The grey of relative luminance [`RIM_LIGHT`] — sRGB byte `181`, the encode
+/// of `0.462`. `rim_light_grey_is_the_arcs_mean` pins both halves: this byte's
 /// luminance against `RIM_LIGHT`, and `RIM_LIGHT` against the arc's own mean.
-const RIM_LIGHT_GREY: u32 = 0x00AD_ADAD;
+const RIM_LIGHT_GREY: u32 = 0x00B5_B5B5;
 
 /// The energy below which the cursor is considered SETTLED — the animator reports
 /// itself inactive so the host stops arming the 60 fps tick. A settled caret is a
@@ -379,7 +381,7 @@ pub struct RainbowConfig {
     /// The rim's light law ([`RIM_LIGHT`]) solves every ring's premultiplied
     /// bytes for the light they ADD to this page, so that a spinning rainbow rim
     /// adds the same light at indigo as at yellow. (Until 2026-09-08 this was
-    /// also the ground the rim's own cyan law composited against; that law — the
+    /// also the ground the rim's own (now deleted) cyan law composited against; that law — the
     /// caret's private copy of the pile-paling the 2026-09-01 ruling retired
     /// everywhere else — is gone, after it was measured on glass stripping the
     /// spun rim to a grey-white edge every time the spin parked it on the
@@ -809,14 +811,6 @@ impl CursorRainbow {
             };
             fill = mix_rgb(fill, glint, TWINKLE_MIX * pop * cfg.intensity);
         }
-        // **THE THING-LAW, LAST** (§2.3) — after every mix, on the byte that
-        // leaves. It is applied HERE rather than to `rainbow` because the block's
-        // colour is not `rainbow`: two further straight lines run through this
-        // cell (the base tint above, the light theme's saturated glint just now),
-        // and either can put a hue in the window that neither of its endpoints
-        // had. A guarantee taken before the last mix is a guarantee about
-        // something else.
-        let fill = clear_thing_of_cyan(fill);
         // **AND THE CARET IS THE BRIGHTEST THING IN THE EFFECT** (§8 d), which
         // is a statement about LIGHT and not about colour, so it is enforced
         // last and in luminance.
@@ -1238,15 +1232,18 @@ impl CursorRainbow {
     /// # What used to run here, and why it does not any more
     ///
     /// Until 2026-09-08 this pass was `clear_caret_light_of_cyan`: it laid the
-    /// rim out, asked [`crate::spectrum::light_is_over_the_glass_ceiling`] of
-    /// every pixel, and bisected one pile-wide `keep` toward
-    /// [`crate::spectrum::pale_light_at_constant_light`] until no pixel sat in
+    /// rim out, asked a glass-ceiling predicate of every pixel, and bisected
+    /// one pile-wide `keep` toward a constant-light pale until no pixel sat in
     /// the cyan window. It was the caret's private copy of the family's
-    /// light-law — and the family's own copy ([`crate::spectrum::clear_light_of_cyan`])
+    /// light-law — and the family's own copy (`spectrum::clear_light_of_cyan`)
     /// had already been retired by the owner's 2026-09-01 ruling (*"you can have
     /// cyan so long as it's a rainbow"*; *"the anti-cyan laws were what greyed the
     /// arc"*). This one survived the deletion because it did not call the
-    /// retired seam; it re-stated the predicate.
+    /// retired seam; it re-stated the predicate. Every one of those spellings —
+    /// the predicate, the pale, the retired seam itself — was deleted on
+    /// 2026-09-15 (*"this is legacy cruft. delete it"*), so they are named here
+    /// in plain text: this paragraph records a DEFECT and its fix, and the
+    /// machinery it names is gone.
     ///
     /// On glass it did exactly what the ruling said such laws do. With the rim
     /// spinning on the momentum (`RIM_SPIN_TURNS_PER_S`), every pause parked it
@@ -1425,11 +1422,7 @@ fn lerp(a: f32, b: f32, t: f32) -> f32 {
 /// rings walking outward, the glitter dots — folded by the family's own
 /// reflection so an offset can never wrap violet into red.
 ///
-/// The positional colour is the authored family spectrum. The no-solid-cyan
-/// guarantee belongs to the final emitted block fill, after [`mix_rgb`]: a straight
-/// per-channel line between two colours and therefore lands on every hue between
-/// them. [`crate::spectrum::clear_thing_of_cyan`] therefore runs after every base
-/// mix, so its guarantee applies to the byte that leaves.
+/// The positional colour is the authored family spectrum.
 #[inline]
 fn spectrum_at(sweep: f32, off: f32) -> u32 {
     rainbow_thing_of(rainbow_sweep_reflect(sweep + off))
@@ -1682,7 +1675,7 @@ mod tests {
             // …and no host ribbon spine, so the colour envelope IS `energy`
             // and every pin below keeps measuring exactly the law it was
             // written against. The shipped `Some(_)` path is swept separately
-            // (`the_caret_never_wears_cyan`, `the_caret_cools_with_its_trail`).
+            // (`the_caret_cools_with_its_trail`).
             paint: None,
             // …and no host page either, so the light-law solves against the
             // shipped ground for the polarity each fixture names.
@@ -1753,7 +1746,7 @@ mod tests {
     #[test]
     fn the_caret_settles_on_its_own_stop_without_a_pop() {
         use crate::cursor_glow::{CursorGlow, GlowConfig, GlowStyle};
-        use crate::rainbow_kitty::meteor::tri;
+        use crate::rainbow_kitty::ribbon::walk_arc;
         use crate::spectrum::spectrum;
 
         let g = geom();
@@ -1774,7 +1767,6 @@ mod tests {
             beam: false,
             head_dx: 0.5,
             pack: None,
-            wake_persist_s: 2.4,
             ribbon_tall: true,
             ribbon_flat: false,
         };
@@ -1875,7 +1867,7 @@ mod tests {
             field_t > 0.25,
             "non-vacuous: the walk laid several stops before the jump (t = {field_t})"
         );
-        let own_stop = spectrum(tri(field_t));
+        let own_stop = spectrum(walk_arc(field_t));
         assert_eq!(
             glow.rainbow_head_rgb(&glow_cfg),
             Some(own_stop),
@@ -1966,14 +1958,61 @@ mod tests {
         (crate::spectrum::spectrum_max_byte_rate() * dt).ceil() as u32 + 1
     }
 
-    /// The same bound for a walk of the BLOCK'S FILL, which is the thing-arc
-    /// MIXED with a colour the arc did not choose.
+    /// The same bound for a walk of the BLOCK'S FILL, which is the arc MIXED
+    /// with a colour the arc did not choose and then LIFTED to the light floor.
     ///
-    /// The exact bound is scanned from the composed base mix and final
-    /// [`crate::spectrum::clear_thing_of_cyan`] projection, so palette changes do
-    /// not leave a stale hand-written ceiling behind.
+    /// **SCANNED FROM [`caret_law`] ITSELF, OVER THE CALLER'S OWN `dt`**, so a
+    /// palette or pace change cannot leave a stale hand-written ceiling behind
+    /// — and so the bound is about the byte the block emits rather than about
+    /// the arc it started from.
+    ///
+    /// **IT USED TO SCAN THE ARC, AND THAT STOPPED BEING HONEST ON 2026-09-15.**
+    /// The old spelling asked `spectrum::spectrum_caret_max_byte_rate` for the
+    /// arc's steepest chord, walked FOUR TIMES FINER than the table; the reason
+    /// given for the four was a hue-keyed projection (`clear_thing_of_cyan`)
+    /// whose shoulder could be narrower than a table chord. That projection was
+    /// the retired no-cyan ruling's and is deleted, so the four times had
+    /// nothing left to catch and the rate it returned — one level per
+    /// quarter-entry, rounded — was an artefact of the rounding. What it never
+    /// modelled at all is the LIFT: `lift_to_light_floor` is not a mix and can
+    /// be steeper than the colour it lifts. Measured here on the shipped arc at
+    /// this walk's own `dt`: the arc moves at most `2` levels, `caret_law`
+    /// moves `3`, and the tick's emitted fill moves `4` — the one extra level
+    /// is the tick's own glint rounding, which is what the `+ 1` below is.
     fn caret_continuity_ceiling(base: u32, mix: f32, dt: f32) -> u32 {
-        (crate::spectrum::spectrum_caret_max_byte_rate(base, mix) * dt).ceil() as u32 + 1
+        // OVERSAMPLED, AND THAT IS THE WHOLE POINT (2026-09-16). This used to
+        // walk ONE grid of spacing `dt` — `t = i/steps` — and take its worst
+        // adjacent step. But the caller's samples are a DIFFERENT grid of the
+        // same spacing, laid wherever its own clock falls, and the largest step
+        // across a `dt`-wide window is not generally the one an arbitrary
+        // alignment happens to land on. Measured on the capped arc: the aligned
+        // grid saw `3` where windows of the same width reach `4`, so the
+        // ceiling came out one level under the thing it was bounding and failed
+        // a sound caller. That is a bound on OUR SAMPLING reported as a fact
+        // about the arc.
+        //
+        // So the grid is `OVERSAMPLE` times finer and the pairs compared are
+        // still exactly `dt` apart: `at(i)` against `at(i + OVERSAMPLE)`. That
+        // is the supremum over every alignment, to an eighth of a window.
+        // Converged: `4`, `8`, `16` and `64` all measure the same worst step,
+        // where `1` measures one less.
+        const OVERSAMPLE: usize = 8;
+        let steps = (1.0 / dt.max(f32::MIN_POSITIVE)).ceil() as usize * OVERSAMPLE;
+        let at = |i: usize| {
+            caret_law(
+                base,
+                crate::spectrum::spectrum(i as f32 / steps as f32),
+                mix,
+                1.0,
+            )
+        };
+        let mut worst = 0u32;
+        for i in 0..steps.saturating_sub(OVERSAMPLE) {
+            worst = worst.max(rgb_max_delta(at(i), at(i + OVERSAMPLE)));
+        }
+        // …and one level for the gap between this reconstruction and the tick
+        // the caller actually composes.
+        worst + 1
     }
 
     /// **THE CARET'S COLOUR LAW, COMPOSED** — what the block emits for a
@@ -1982,7 +2021,7 @@ mod tests {
     /// cannot drift into agreeing about different things.
     fn caret_law(base: u32, rainbow: u32, mix: f32, e: f32) -> u32 {
         lift_to_light_floor(
-            clear_thing_of_cyan(mix_rgb(base, rainbow, mix)),
+            mix_rgb(base, rainbow, mix),
             RAINBOW_CARET_LIGHT_FLOOR * aterm_render::smoothstep01(e / CARET_LIGHT_KNEE),
         )
     }
@@ -3808,7 +3847,9 @@ mod tests {
         // that wore the raw arc would dim or brighten by that much crossing
         // it, with the paint unchanged.
         let mid = crate::spectrum::spectrum_crossing_position();
-        let half = crate::spectrum::spectrum_crossing_width() * 0.5;
+        // THE FLANKS ARE THE LEG'S OWN TWO ANCHORS — green and blue — since the
+        // exempt crossing span they used to be measured from is deleted.
+        let half = crate::spectrum::spectrum_crossing_span() * 0.5;
         let flank_lo = lum(shade(
             crate::spectrum::spectrum(mid - half),
             SAT_MAX,
@@ -4199,7 +4240,6 @@ mod tests {
             beam: false,
             head_dx: 0.5,
             pack: None,
-            wake_persist_s: 2.4,
             ribbon_tall: true,
             ribbon_flat: false,
         };
@@ -4375,29 +4415,4 @@ mod tests {
             );
         }
     }
-    // RETIRED ON THE MERGE 2026-08-27: `caret_spectrum_cyan_census` resolved the
-    // caret through `rainbow_spectrum_of` and called `spectrum_at(col, phase, off)`.
-    // This branch deleted that door on purpose -- `cursor_rainbow` is the one module
-    // that must NOT resolve the raw gradient -- so the census has no callee. Its bar
-    // was also the weaker one: hue [165, 195] at S >= 0.35 and V >= 110, where the
-    // ruling's window is [165, 200] at S > 0.3. The caret is now held by
-    // `the_caret_never_wears_cyan`, and the band by `the_band_is_never_cyan_on_glass`,
-    // which bounds the COMPOSITED pixel at zero rather than counting a table's share.
-    //
-    // RE-CONFIRMED ON THE ROYGBIV MERGE, mechanically and not by preference. The
-    // upstream census cannot be carried across as written: `spectrum_at` here is
-    // `(sweep: f32, off: f32)`, the census calls it `(col, phase, off)`, and both
-    // `rainbow_spectrum_of` and `cursor_glow::RAINBOW_PHASE_RING` -- its other two
-    // operands -- no longer exist in this tree. There is no version of that test
-    // that compiles against this module.
-    //
-    // WHAT DOES CARRY ACROSS IS ITS LAW, which supersedes the one the successors
-    // were written to: cyan is BOUNDED AS A CROSSING, not forbidden as a colour
-    // (upstream 36cee255, on the owner's ruling that "it's possible to blend
-    // through it a little bit"). Under seven-anchor ROYGBIV a zero bar is
-    // unsatisfiable by construction -- the only way to score zero on the
-    // green->blue interval is to desaturate it, and that grey hole is the defect
-    // the seventh anchor was adopted to remove. The successors named above
-    // therefore inherit the BOUND, not the prohibition; see their own headers for
-    // the share each one now permits.
 }

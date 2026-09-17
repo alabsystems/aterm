@@ -11,6 +11,7 @@ mod operations;
 mod style_id;
 mod unsafe_boundary;
 mod wide_char_fixup;
+mod wide_spacer_rendition;
 
 /// Shared test helper: create a Row with the given column count.
 fn make_row(cols: u16) -> (PageStore, Row) {

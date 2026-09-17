@@ -102,7 +102,8 @@ use crate::effect_util::{
 };
 use crate::rainbow_kitty::meteor::{LandingWalk, tri};
 use crate::rainbow_kitty::ribbon::{
-    BIRTH_EDGE_FLOOR, EXPIRY_MELT_SHARE, Ribbon, SWOOSH_TOTAL_S, expiry_melt, reduced_fade,
+    BIRTH_EDGE_FLOOR, EXPIRY_MELT_SHARE, Ribbon, SWOOSH_TOTAL_S, WALK_FAST_CELLS, expiry_melt,
+    reduced_fade,
 };
 use crate::spectrum::{
     SPECTRUM_ANCHOR_AT, SPECTRUM_LUT, SPECTRUM_LUT_LEN, SPECTRUM_STOPS, spectrum, spectrum_snap,
@@ -975,9 +976,10 @@ pub fn sky_lift_px_per_s(ch: f32) -> f32 {
 /// **THE SLIPSTREAM'S SHARE** — a sky star born under a hand at speed
 /// inherits a BACKWARD drift (toward the pane's first column) of
 /// `STREAM_SHARE_CW · cw / IOI` px/s, where `IOI` is the interval between
-/// the last two Typed keys ([`Stardust::note_cadence`]): 0.35 of a cell per
-/// key interval. 10 cps at `cw` 9 → 31 px/s; at the owner's `cw` 15 → 52;
-/// 12 cps → 63; 8 cps → 42.
+/// the last two Typed keys ([`Stardust::note_cadence`]): 1.05 cells per key
+/// interval. 10 cps at `cw` 9 → 95 px/s; at the owner's `cw` 15 → 158;
+/// 12 cps → 189; 8 cps → 126 — 3.0 and 2.0 cells of whole travel
+/// ([`stream_travel_px`]).
 ///
 /// The owner's criterion, verbatim: *"effects that somehow make typing feel
 /// faster or gain momentum are the best."* At speed the whole sky streams
@@ -987,7 +989,13 @@ pub fn sky_lift_px_per_s(ch: f32) -> f32 {
 /// events, never the spine — and the spine only GATES the birth
 /// ([`STREAM_DISP`]). The field stars take it too; the aurora's veils do
 /// not (they belong to their cells).
-pub const STREAM_SHARE_CW: f32 = 0.35;
+///
+/// The sky is the FAR layer: the exhaust (§33) runs at four times this share
+/// ([`EXHAUST_SHARE_CW`]) through the same law, and the parallax between the
+/// two is what reads as depth rather than one sheet sliding. The travel is
+/// clamped at the band's own row's blank frontier and the pane edge
+/// ([`Stardust::stream_reach`]) whatever the share.
+pub const STREAM_SHARE_CW: f32 = 1.05;
 /// The drift's decay, ms: `v(age) = v₀ · e^(−age/τ)`, so the sky slows
 /// from the instant it is born and a star's travel is bounded whatever the
 /// hand does next.
@@ -1005,8 +1013,8 @@ pub const STREAM_END_MS: f32 = 460.0;
 /// the frame path never evaluates it
 /// (`the_stream_spent_share_is_the_exponential_s`).
 pub const STREAM_SPENT: f32 = 0.784_11;
-/// The IOI clamp's fast end, ms — the fastest priced hand (33 cps: 175
-/// px/s on the owner's cell, 2.6 cells of travel).
+/// The IOI clamp's fast end, ms — the fastest priced hand (33 cps: 525
+/// px/s on the owner's cell, 8.2 cells of travel, frontier-clamped).
 pub const STREAM_IOI_MIN_MS: f32 = 30.0;
 /// The IOI clamp's slow end, ms — and the IOI a session's FIRST key is
 /// priced at, having no interval to read (under the stroll gate: nothing).
@@ -1016,7 +1024,7 @@ pub const STREAM_IOI_MAX_MS: f32 = 600.0;
 pub const STREAM_IOI_RUN_MS: f32 = 150.0;
 /// The stroll gate, CLOSED: an IOI at or over this (≤ 3 cps) streams
 /// nothing; between the two the velocity is smoothstepped in. Without it
-/// a 2 cps peck would drift 3 px on the owner's cell: §23 measured a
+/// a 2 cps peck would drift 7 px on the owner's cell: §23 measured a
 /// sustained 2 cps hand at a `disp` of 0.97, so the birth gate alone
 /// cannot make a stroll stand still — the cadence itself has to.
 pub const STREAM_IOI_STROLL_MS: f32 = 333.0;
@@ -1024,18 +1032,29 @@ pub const STREAM_IOI_STROLL_MS: f32 = 333.0;
 /// drift — the second grain's own threshold.
 pub const STREAM_DISP: f32 = 0.5;
 
+/// **THE EXHAUST'S SHARE**, cells of `cw` per key interval (§33) — the NEAR
+/// layer: four times the sky's, through the same gate, clamp and decay
+/// ([`stream_px_per_s_with_share`]), so the parallax is one ratio and never
+/// a second law. 756 px/s at 12 cps on the owner's cell, where the sky runs
+/// 189.
+pub const EXHAUST_SHARE_CW: f32 = 4.0 * STREAM_SHARE_CW;
+
 /// **THE SLIPSTREAM'S VELOCITY**, px/s backward, for a cell width `cw` and
 /// an observed key interval `ioi_ms`: `STREAM_SHARE_CW · cw / IOI` under
 /// the stroll gate, the IOI clamped to
 /// `[STREAM_IOI_MIN_MS, STREAM_IOI_MAX_MS]`. Zero for a stroll, a
-/// non-finite input, or no cell.
+/// non-finite input, or no cell. [`stream_px_per_s_with_share`] at the
+/// sky's own share.
 #[must_use]
 pub fn stream_px_per_s(cw: f32, ioi_ms: f32) -> f32 {
     stream_px_per_s_with_share(STREAM_SHARE_CW, cw, ioi_ms)
 }
 
-/// Scale the sky's velocity by its cell share, with the same stroll gate
-/// and interval clamp used by the cadence measurement.
+/// **THE STREAM LAW AT ANY SHARE**: `share · cw / IOI` px/s under the stroll
+/// gate ([`STREAM_IOI_STROLL_MS`] → [`STREAM_IOI_RUN_MS`] smoothstepped), the
+/// IOI clamped — the sky's ([`STREAM_SHARE_CW`]) and the exhaust's
+/// ([`EXHAUST_SHARE_CW`]) one velocity formula. Zero for a stroll, a
+/// non-finite input, or no cell.
 #[must_use]
 fn stream_px_per_s_with_share(share: f32, cw: f32, ioi_ms: f32) -> f32 {
     if !(share.is_finite() && cw.is_finite() && ioi_ms.is_finite()) || cw <= 0.0 || share <= 0.0 {
@@ -1048,8 +1067,8 @@ fn stream_px_per_s_with_share(share: f32, cw: f32, ioi_ms: f32) -> f32 {
 }
 
 /// The whole travel, px, of a star born at `px_per_s` — the exponential's
-/// integral over the drift's life, `v₀ · τ · STREAM_SPENT`: 14.8 px at 12
-/// cps on the owner's cell, 9.9 at 8.
+/// integral over the drift's life, `v₀ · τ · STREAM_SPENT`: 44.5 px at 12
+/// cps on the owner's cell (3.0 cells), 29.6 at 8 (2.0 cells).
 #[must_use]
 pub fn stream_travel_px(px_per_s: f32) -> f32 {
     px_per_s / 1000.0 * STREAM_TAU_MS * STREAM_SPENT
@@ -1114,6 +1133,51 @@ pub const DRAG_TAU_MS: f32 = 90.0;
 /// The erase throw's window, ms (§5.6: "radial throw 2-4 px over 80 ms
 /// ease-out, up and away from the caret, then pinned + twinkling").
 pub const ERASE_THROW_MS: f32 = 80.0;
+
+/// **THE EXHAUST THROW'S WINDOW**, ms (§33) — how long a grain thrown out of
+/// the caret's sky is still on the wind.
+///
+/// 160, chosen UNDER the transient lives so the grain dies ON THE WING and
+/// never sits pinned in the middle of a blank row looking like litter: a
+/// transient m3 lives `20 + 2.32·67` = 175.6 ms ([`HOLD_M3_TRANSIENT_MS`],
+/// [`TAU_M3_TRANSIENT_MS`]), so the m3 reaches its reach with 16 ms of life
+/// left; a transient m2 lives `30 + 2.32·93` = 245.9, so the 1-in-4 m2
+/// ([`EXHAUST_M2_IN`]) arrives and then PINS AND TWINKLES for 86 ms — §5.6's
+/// "thrown, then pinned" read as a population split rather than as two laws.
+/// The reach is the exhaust's own front at this instant
+/// ([`stream_travel_px`] at [`EXHAUST_SHARE_CW`] × `stream_unit(160)`), so a
+/// grain stops where a grain thrown on that wind would be — which is why
+/// the window is not a free knob: shorter, and the reach shrinks with it.
+pub const EXHAUST_THROW_MS: f32 = 160.0;
+
+/// **THE EXHAUST'S RISE**, cells of `ch` — how far a grain lifts over its
+/// whole throw, dealt `0.5..1.0` of it by seed so the grains do not fly in a
+/// line. Under `tall` the whole flight stays inside `row − 1`; under
+/// `underline` it can cross from the caret's row into the one above, which
+/// is why the frontier is walked over every row the flight covers
+/// ([`Stardust::blank_frontier_px`], D16's fork). Along a TUI rule row the
+/// rise is clamped to the headroom the birth left under the rule's stroke
+/// ([`Stardust::rule_headroom_px`]) — possibly nothing — so the grain flies
+/// in the sky zone and never through the stroke.
+pub const EXHAUST_RISE_CH: f32 = 0.15;
+
+/// **THE EXHAUST'S m2 DEAL**: one grain in 4 is an m2 rather than an m3, and
+/// only where the BIRTH SPINE is at or over [`FIELD_HOT_DISP`] (0.7) — the
+/// same threshold the field's hot deal reads. Gated on the birth spine and
+/// never on flow's heat, so `flow_draws_nothing_of_its_own` (mod.rs) stands:
+/// an open theme holds the sky's share, it does not mint a population. The
+/// m2 is what makes the exhaust read as a SPARK SHOWER rather than a dust
+/// line — it outlives its throw and twinkles where it lands (§5.6).
+pub const EXHAUST_M2_IN: u32 = 4;
+
+/// **THE EXHAUST'S HEADROOM**: the exhaust throws nothing while the live sky
+/// is within this many stars of [`STAR_CAP`] — room for what a key and a
+/// nav gesture bring themselves (a strike, a field star, a five-star fan and
+/// its shed), so a spark never causes the eviction that retires a hero:
+/// neither by seating itself at the cap, nor by taking the seat the next key
+/// needed. Measured on the 60-key fixture: at 25 and 30 cps the eviction
+/// count is the pre-exhaust figure again.
+pub const EXHAUST_HEADROOM: usize = 8;
 
 /// The landing fan's window, ms.
 ///
@@ -1461,6 +1525,14 @@ pub enum StarLane {
     /// cells. Transient pricing. **Never chimes** — Backspace is unpitched,
     /// ruled twice (§13, §19.2).
     Erase,
+    /// **THE EXHAUST** (§33) — born ONE per typed key in the SKY BAND OF THE
+    /// CARET CELL and THROWN BACK along the band's own row on its own wind
+    /// ([`EXHAUST_SHARE_CW`], [`EXHAUST_THROW_MS`]): the visible spark of
+    /// emission, the thing the cursor throws off as it runs. Transient
+    /// pricing; **never chimes** — one keystroke is one melody step and the
+    /// key already has its tine ([`StarLane::may_chime`]); not meteor-lane;
+    /// never touches the glint bucket.
+    Exhaust,
     /// The meteor's shed fragments (§6.5 layer 5). Transient pricing,
     /// meteor-lane, **silent**.
     Shed,
@@ -1495,7 +1567,9 @@ impl StarLane {
     }
 
     /// True where a star may cue a glint at all (§13): erase-born stardust
-    /// never chimes, and meteor-lane stars ride the rain instead.
+    /// never chimes, the EXHAUST never chimes (§33: one keystroke is one
+    /// melody step and the key it was thrown by already has its tine), and
+    /// meteor-lane stars ride the rain instead.
     #[must_use]
     pub fn may_chime(self) -> bool {
         matches!(self, Self::Strike | Self::Field)
@@ -1514,6 +1588,7 @@ impl StarLane {
     pub fn throw_ms(self) -> Option<f32> {
         match self {
             Self::Erase => Some(ERASE_THROW_MS),
+            Self::Exhaust => Some(EXHAUST_THROW_MS),
             Self::Fan => Some(FAN_THROW_MS),
             Self::MiniFan => Some(MINI_FAN_THROW_MS),
             Self::Strike | Self::Field | Self::Shed => None,
@@ -1534,6 +1609,9 @@ impl StarLane {
             // erase is a THROW on the erase window, not a drag; the fan and
             // the mini-fan throw on their own windows.
             Self::Erase => Motion::Throw(ERASE_THROW_MS),
+            // §33: the exhaust is the erase's throw run BACKWARD along the
+            // row on its own wind — the same integrator, a window of its own.
+            Self::Exhaust => Motion::Throw(EXHAUST_THROW_MS),
             Self::Fan => Motion::Throw(FAN_THROW_MS),
             Self::MiniFan => Motion::Throw(MINI_FAN_THROW_MS),
         }
@@ -2368,14 +2446,17 @@ pub const RULE_INK_TOP_CH: f32 = 0.35;
 /// bottom edge is `(ch + stroke) / 2 ≤ 0.57 · ch` on any cell 8 px or
 /// taller, so the band contains the stroke with a margin and is disjoint
 /// from the sky by construction — the assertion beneath pins both
-/// spellings.
+/// spellings, and [`rule_stroke_px`] is the band's ONE rounding to device
+/// pixels.
 pub const RULE_INK_BOT_CH: f32 = 1.0 - (super::ribbon::TALL_UP_CH - 1.0) - SKY_TOP_CH;
 
 // THE RULE CLAUSE'S WHOLE CLAIM: a sky star born by §5.4's zone never has its
-// core on a rule's stroke, in either spelling. Under `tall` the zone is the
-// lower `[0.60, 0.86]` of row − 1 and the stroke band ends at 0.60; under
-// `underline` the zone is `[0.04, 0.30]` of the typed cell and the stroke
-// band starts at 0.35.
+// core on a rule's stroke, in either spelling — at birth, and over its life:
+// the strike's lift is held under the stroke by the same headroom the
+// exhaust's rise is ([`Stardust::rule_headroom_px`]). Under `tall` the zone
+// is the lower `[0.60, 0.86]` of row − 1 and the stroke band ends at 0.60;
+// under `underline` the zone is `[0.04, 0.30]` of the typed cell and the
+// stroke band starts at 0.35.
 const _: () = assert!(
     RULE_INK_BOT_CH <= 1.0 - (super::ribbon::TALL_UP_CH - 1.0) - SKY_TOP_CH,
     "the rule's stroke band must end at or above the tall sky zone's top edge"
@@ -2388,6 +2469,47 @@ const _: () = assert!(
     RULE_INK_TOP_CH < 0.5 && 0.5 < RULE_INK_BOT_CH,
     "the rule's stroke band must contain the cell's vertical centre"
 );
+// A RISE OUT OF THE `underline` ZONE NEVER REACHES THE ROW ABOVE'S STROKE:
+// the zone's highest pixel is `SKY_BOTTOM_CH` under the row boundary, the
+// exhaust's rise is `EXHAUST_RISE_CH` at most (the strike's lift is shorter —
+// `the_stroke_band_is_one_set_of_pixels_for_the_probe_the_zones_and_the_headroom`
+// measures it), and the row above's band ends `1 − RULE_INK_BOT_CH` above
+// the boundary. So the only stroke a rise can meet is the one in the zone's
+// OWN row, which is the one row [`Stardust::rule_headroom_px`] reads.
+const _: () = assert!(
+    SKY_BOTTOM_CH + EXHAUST_RISE_CH < 1.0 - RULE_INK_BOT_CH,
+    "a rise out of the underline zone must stop short of the row above's stroke band"
+);
+
+/// **THE STROKE BAND IN WHOLE PIXELS** — the device-pixel offsets from a
+/// cell's top edge that a light rule's stroke band
+/// ([`RULE_INK_TOP_CH`]`..`[`RULE_INK_BOT_CH`]) covers at cell height `ch`,
+/// half-open. The band's ONE rounding, read by the pixel probe
+/// ([`GlyphProbe::at_px`]) and by the rise's headroom under a rule
+/// ([`Stardust::rule_headroom_px`]), so "the first pixel under the stroke
+/// the probe calls clear" is one number and not two.
+///
+/// The bottom edge is `round(RULE_INK_BOT_CH · ch)` — THE TALL SKY ZONE'S
+/// OWN TOP PIXEL, the rounding [`Stardust::sky_birth_px`] commits when it
+/// puts `top − SKY_TOP_CH · ch` on a device pixel — so the zone and the band
+/// are disjoint pixel for pixel at every cell height, as they are disjoint
+/// in `ch` by construction. Taken at `ceil`, the band claimed the zone's top
+/// pixel on 17 of the 43 cell heights 6..=48 — the owner's 1× 7×14 cell
+/// among them, where `round(8.4) = 8` is a birth pixel and `ceil(8.4) = 9`
+/// was the band's end — and a star born there stood on ink by the probe's
+/// own answer (measured: 101 of 4 000 seeded births at `ch` 14, 375 at
+/// `ch` 20). The top edge is `ceil(RULE_INK_TOP_CH · ch)`, the first pixel
+/// that starts at or below the fraction: the `underline` zone's lowest
+/// pixel is `round(SKY_TOP_CH · ch)` of the same cell, and the two fractions
+/// are under a pixel apart below `ch` 20, so the tighter edge is the one
+/// that keeps them apart. Both edges, the renderer's own stroke inside them
+/// and both zones outside them are pinned across `ch` 6..=48 by
+/// `the_stroke_band_is_one_set_of_pixels_for_the_probe_the_zones_and_the_headroom`.
+#[must_use]
+pub fn rule_stroke_px(ch: usize) -> std::ops::Range<i32> {
+    let ch = ch as f32;
+    (RULE_INK_TOP_CH * ch).ceil() as i32..(RULE_INK_BOT_CH * ch).round() as i32
+}
 
 /// One probed row of the grid: which columns carry ink.
 #[derive(Clone, Debug, Default)]
@@ -2509,12 +2631,16 @@ impl GlyphProbe {
     /// pixel left or right of the grid is off-grid, hence `Some(false)`.
     ///
     /// Over a [`CellInk::Rule`] cell the answer is the STROKE's, not the
-    /// cell's: `Some(true)` for a pixel inside
-    /// [`RULE_INK_TOP_CH`]`..`[`RULE_INK_BOT_CH`] of the cell height,
-    /// `Some(false)` above or below it. This is the one place the probe
-    /// answers finer than a cell, and it is what lets §5.4's sky zone —
-    /// disjoint from that band by construction — be born over the rule a
-    /// TUI draws above its input line.
+    /// cell's: `Some(true)` for a pixel inside the stroke band
+    /// ([`rule_stroke_px`] — [`RULE_INK_TOP_CH`]`..`[`RULE_INK_BOT_CH`] on
+    /// whole pixels), `Some(false)` above or below it. This is the one place
+    /// the probe answers finer than a cell, and it is what lets §5.4's sky
+    /// zone — disjoint from that band pixel for pixel — be born over the
+    /// rule a TUI draws above its input line. The pixel's offset in its row
+    /// is taken in integers: as an f32 fraction of the window coordinate it
+    /// put the pixel at exactly `0.60 · ch` INSIDE the band on every cell
+    /// height that is a multiple of 5 (`4.6 − 4 < 0.6`), the zone's own top
+    /// pixel called ink.
     #[must_use]
     pub fn at_px(&self, x: i32, y: i32, geom: Geom) -> Option<bool> {
         let col = px_col(x as f32, geom);
@@ -2524,10 +2650,9 @@ impl GlyphProbe {
         let row = px_row(y as f32, geom);
         let inked = self.at(row, col as u16, geom.rows)?;
         if inked && self.rule_at(row, col as u16) {
-            // The fraction of the cell height this pixel sits at, `0` at the
-            // cell's top edge.
-            let fy = (y as f32 - f32::from(geom.origin_y)) / geom.ch.max(1) as f32 - row as f32;
-            return Some((RULE_INK_TOP_CH..RULE_INK_BOT_CH).contains(&fy));
+            // The pixel's offset from its cell's top edge, in whole pixels.
+            let off = y - i32::from(geom.origin_y) - row * geom.ch as i32;
+            return Some(rule_stroke_px(geom.ch).contains(&off));
         }
         Some(inked)
     }
@@ -2779,6 +2904,13 @@ pub struct Stardust {
     /// from ([`stream_px_per_s`]). The slow end until two keys have been
     /// seen: a first key streams nothing.
     ioi_ms: f32,
+    /// **THE FRAME'S OWN LAID LIGHT, INDEXED** ([`SkyIndex`]) — the ground a
+    /// star is priced over, filed by grid cell as it is laid instead of
+    /// re-scanned per watched pixel. Resident and cleared per frame, never
+    /// carried across one: `emit` opens it on this frame's geometry and
+    /// slice offsets before the aurora goes out (§18's zero-allocation
+    /// steady state is why it lives in the pool at all).
+    sky_index: SkyIndex,
 }
 
 impl Default for Stardust {
@@ -2806,6 +2938,7 @@ impl Stardust {
             veil: Vec::with_capacity(AURORA_CAP),
             last_typed: None,
             ioi_ms: STREAM_IOI_MAX_MS,
+            sky_index: SkyIndex::default(),
         }
     }
 
@@ -3199,9 +3332,11 @@ impl Stardust {
         let halo_cap = frame.halos.len() + STARDUST_LIGHT_HALO_BUDGET;
         // The aurora first: it is the sky's ground, and on light the stars'
         // ink lays composite OVER it — and on dark the stars are PRICED over
-        // it ([`sky_ground`]), so the slice the sky lays this frame is kept.
-        let out_from = frame.out.len();
-        let sky_from = frame.halos.len();
+        // it ([`sky_ground`]), so the slice the sky lays this frame is kept —
+        // and INDEXED by cell as it is laid ([`SkyIndex`]), the veil's own
+        // halos included.
+        let mut index = std::mem::take(&mut self.sky_index);
+        index.open(ctx.geom, (frame.out.len(), frame.halos.len()));
         self.draw_veil(ctx, frame.halos, halo_cap);
         let mut haloed = 0usize;
         let n = self.stars.len();
@@ -3217,17 +3352,21 @@ impl Stardust {
                 };
                 let left = quad_cap.saturating_sub(frame.out.len());
                 if left == 0 {
+                    // The index is resident: hand its capacity back before
+                    // the budget ends the frame early.
+                    self.sky_index = index;
                     return;
                 }
                 let share = (left / (n - turn)).max(M3_QUADS).min(left);
                 let star_cap = frame.out.len() + share;
                 if ctx.cfg.dark_theme {
-                    paint.draw_add(ctx, frame, star_cap, &mut haloed, (out_from, sky_from));
+                    paint.draw_add(ctx, frame, star_cap, &mut haloed, &mut index);
                 } else {
                     paint.draw_over(ctx.geom, frame, halo_cap);
                 }
             }
         }
+        self.sky_index = index;
     }
 
     /// Stars on glass — `trail status`'s `v2_stars=` row (seam point 12).
@@ -3704,6 +3843,163 @@ impl Stardust {
                 );
             }
         }
+        // THE EXHAUST (§33): one grain per typed EVENT, not per cell — the
+        // key's own spark, thrown out of the caret's sky on its own wind.
+        // After the per-cell loop so a coalesced echo exhausts once at the
+        // final caret, and after the Space early-return above so a Space
+        // exhausts nothing (it lays bed, it does not strike).
+        self.sow_exhaust(at, ctx, ribbon);
+    }
+
+    /// **THE EXHAUST** (§33) — ONE grain per typed key, born in §5.4's sky
+    /// band of the CARET cell ([`Stardust::sky_birth_px`]) and thrown back
+    /// along the band's own row on the hand's wind
+    /// ([`stream_px_per_s_with_share`] at [`EXHAUST_SHARE_CW`], over
+    /// [`EXHAUST_THROW_MS`]). The bed is the emission's LIGHT; this is its
+    /// DEBRIS — the one mark the eye can follow out of the caret, because it
+    /// keeps its identity where the bed is a field. An m3 tinted the caret
+    /// cell's own stop (C2 at the source), or 1 in [`EXHAUST_M2_IN`] an m2
+    /// at a hot birth spine, which outlives its throw and twinkles where it
+    /// lands. The gates are the body's own comments, in the order they
+    /// refuse. Cost: ≤ 3 live grains at 12 cps against [`STAR_CAP`] (a
+    /// 175.6 ms life at an 83 ms interval); one hash, one band read and one
+    /// frontier walk at the key's edge, nothing per frame.
+    fn sow_exhaust(&mut self, at: Instant, ctx: &Ctx<'_>, ribbon: &Ribbon) {
+        // A throw IS motion (§6.11).
+        if ctx.cfg.reduced_motion {
+            return;
+        }
+        // THE BIRTH SPINE, at or over [`STREAM_DISP`] — the slipstream's own
+        // gate — floored by a [`super::Mend`]'s `disp`: the fix resumes the
+        // momentum the deleting interrupted, so it exhausts like the key it
+        // replaces. The floor is taken from the MARK, whether or not the
+        // strike's own pull was accepted ([`Stardust::pull_origin`] refuses
+        // on placement — the erased cell's sky inked — and a mark is about
+        // momentum). A cold hand throws nothing.
+        let birth_disp = ctx
+            .mend
+            .map_or(ctx.birth_disp, |m| ctx.birth_disp.max(m.disp));
+        if birth_disp < STREAM_DISP {
+            return;
+        }
+        // THE CADENCE (T4): the wind is the observed interval at the
+        // exhaust's own share — ONE law with the sky, at one ratio — so a
+        // stroll (the gate closed at [`STREAM_IOI_STROLL_MS`]) and a session's
+        // first key, which has no interval, exhaust NOTHING rather than
+        // dropping a grain that goes nowhere.
+        let g = ctx.geom;
+        let cw = g.cw as f32;
+        let wind = stream_px_per_s_with_share(EXHAUST_SHARE_CW, cw, self.ioi_ms);
+        if wind <= 0.0 {
+            return;
+        }
+        // A SPARK NEVER COSTS A HERO. At the cap [`Stardust::make_room`]
+        // retires the OLDEST live star to seat a newborn — under a fast hand
+        // the strike m1 the eye is following, for a 176 ms grain. The exhaust
+        // is debris, the one lane that refuses ITSELF rather than retiring
+        // light: it yields within [`EXHAUST_HEADROOM`] of the cap, room for
+        // what the next key and a nav gesture bring themselves.
+        let live = self.stars.iter().filter(|s| s.finish.is_none()).count();
+        if live + EXHAUST_HEADROOM > STAR_CAP {
+            return;
+        }
+        let (row, col) = ctx.caret;
+        // THE SEED DOES NOT MINT (§18): [`Stardust::mint_seed`] bumps the
+        // counter every LATER seed folds in, so minting here would reshuffle
+        // the whole sky's deals behind a population meant as an addition to
+        // it. This key's own deals have already advanced the counter, so two
+        // keys never share a draw; [`SALT_EXHAUST`] keeps the draw
+        // independent of theirs on the same cell.
+        let seed = mix32(cell_hash(row, col, self.minted) ^ SALT_EXHAUST);
+        // The light theme thins the population as it thins every thrown
+        // grain (§5.2).
+        if !light_keeps(seed, ctx.cfg) {
+            return;
+        }
+        let class =
+            if birth_disp >= FIELD_HOT_DISP && deal(seed, SALT_EXHAUST ^ 1, EXHAUST_M2_IN, 1.0) {
+                StarClass::M2
+            } else {
+                StarClass::M3
+            };
+        // §5.4's SKY BAND of the caret cell: `row − 1` proved clear (a blank,
+        // or a TUI rule whose stroke the zone never reaches), the pixel on
+        // the glass and not already taken. The caret's cell carries no laid
+        // run, so the band is the spelling's anchor ([`default_band_top`]).
+        let Some((x, y)) = self.sky_birth_px((row, col), seed, ctx, ribbon) else {
+            return;
+        };
+        // Under `underline` the band is the CARET'S OWN row (D16), so §5.4's
+        // clearance is asked of that cell too: a mid-line insert, an
+        // autosuggest ghost or a TUI overtype puts a glyph under the caret,
+        // and the grain would otherwise be born ON it.
+        if !ctx.cfg.ribbon_tall && self.probe.sky_at(i32::from(row), col, g.rows) != Some(false) {
+            return;
+        }
+        // WHERE A GRAIN ON THIS WIND IS when the throw ends — the priced
+        // travel capped at the band's own fast leg ([`WALK_FAST_CELLS`], the
+        // length the eye already reads as one hand's run), then the share of
+        // it the exponential has spent by [`EXHAUST_THROW_MS`].
+        let want = stream_travel_px(wind).min(WALK_FAST_CELLS * cw) * stream_unit(EXHAUST_THROW_MS);
+        // The rise is priced before the frontier because it decides which
+        // grid rows the flight covers — [`Stardust::blank_frontier_px`] has
+        // D16's fork.
+        let rise = EXHAUST_RISE_CH * g.ch as f32 * (0.5 + 0.5 * hash01(mix32(seed ^ 3)));
+        // A GRAIN NEEDS A CELL TO FLY OVER: the one behind the caret, proved
+        // clear for the sky on every row the flight covers — the birth's own
+        // clearance ([`GlyphProbe::sky_at`]: a blank, or a TUI rule whose
+        // stroke lies above the zone), the walk's below, and this gate's.
+        // Without it the walk stops at the caret's own column and the throw
+        // is the cell's own left margin — 4 to 12 px on the owner's cell, a
+        // sub-cell twitch that holds the frame train for its whole window
+        // and shows nothing. That is every grain under `underline` on a line
+        // being typed, where the just-echoed glyph is the cell behind —
+        // measured 15 grains of 15 keys at 4–12 px and 96 % brisk duty over
+        // 60 keys, now 0 grains at the tree's own duty before §33
+        // (`the_exhaust_needs_a_blank_cell_behind_the_caret`).
+        let rows = px_row(y - rise, g)..=px_row(y, g);
+        if !col.checked_sub(1).is_some_and(|c| {
+            rows.into_iter()
+                .all(|r| self.probe.sky_at(r, c, g.rows) == Some(false))
+        }) {
+            return;
+        }
+        // L4 ON THE X AXIS: the reach is clamped at the blank frontier of
+        // every row the flight covers, the one walk the sky's own travel
+        // takes, so a grain never flies over ink or past the pane's first
+        // column.
+        let reach = self.blank_frontier_px(x, (y - rise, y), want, ctx);
+        if reach < 0.5 {
+            return;
+        }
+        // L4 ON THE Y AXIS, UNDER A RULE (§33): the sky zone of a rule cell
+        // is the band UNDER its stroke, and a rise out of it would carry the
+        // core INTO the stroke — the audit measured 351 of 1 677 flight
+        // samples inside the band and 6 rests on the stroke. So along a rule
+        // row the rise is the headroom the birth left under the band, which
+        // may be nothing — the one clamp the strike's lift takes too
+        // ([`Stardust::deal_star`]); over a blank row it is untouched, to
+        // the bit.
+        let rise = rise.min(self.rule_headroom_px(px_col(x - reach, g)..=i32::from(col), y, g));
+        let v0 = (-reach / EXHAUST_THROW_MS, -rise / EXHAUST_THROW_MS);
+        let (tint, gold) = class_tint(class, seed, self.field_t((row, col), ctx, ribbon));
+        self.throw(
+            Throw {
+                class,
+                lane: StarLane::Exhaust,
+                at_px: (x, y),
+                v0,
+                tint,
+                gold,
+                seed,
+                // L4 ON THE REST: [`Stardust::settle`] nudges a rest off a
+                // probed glyph within 2 px or DROPS the grain — §5.4's last
+                // word on a free grain.
+                fixed: false,
+            },
+            at,
+            ctx,
+        );
     }
 
     /// §5.6's ERASE population for ONE Backspace: 3 m3 + 1 m2 thrown up and
@@ -3856,17 +4152,6 @@ impl Stardust {
         let (tint, gold) = spec
             .tint
             .unwrap_or_else(|| class_tint(class, seed, self.field_t(spec.cell, ctx, ribbon)));
-        let v0 = match (class, spec.lane) {
-            // A mend's star is pinned once home (1e: "then pinned").
-            _ if spec.pull.is_some() => (0.0, 0.0),
-            // §5.6: a strike m1/m2 lifts; a grain and every FIELD star are
-            // pinned. The zero `v0` is what expresses "pinned" — there is no
-            // fourth motion law for it.
-            (StarClass::M1 | StarClass::M2, StarLane::Strike) => {
-                (0.0, sky_lift_px_per_s(ctx.geom.ch as f32) / 1000.0)
-            }
-            _ => (0.0, 0.0),
-        };
         // THE MEND'S PULL (1e): from the grabbed star's own pixel — the
         // light does not jump to be pulled — or one cell left of home.
         let from_x = match grabbed {
@@ -3884,9 +4169,36 @@ impl Stardust {
             .pull
             .map_or(ctx.birth_disp, |p| ctx.birth_disp.max(p.disp));
         let stream = if birth_disp >= STREAM_DISP {
-            self.stream_reach(from_x, spec.cell.0, ctx)
+            self.stream_reach(from_x, y, ctx)
         } else {
             0.0
+        };
+        let v0 = match (class, spec.lane) {
+            // A mend's star is pinned once home (1e: "then pinned").
+            _ if spec.pull.is_some() => (0.0, 0.0),
+            // §5.6: a strike m1/m2 lifts; a grain and every FIELD star are
+            // pinned. The zero `v0` is what expresses "pinned" — there is no
+            // fourth motion law for it.
+            (StarClass::M1 | StarClass::M2, StarLane::Strike) => {
+                // THE LIFT IS HELD UNDER A RULE'S STROKE (§5.4's rule clause,
+                // §33's one clamp): the zone is the band UNDER the stroke,
+                // and the lift — 3 px over a hero's life on the retina cell
+                // — carried a star born in the zone's lowest three pixels
+                // INTO it, its core on the rule's ink for the rest of its
+                // life: measured 384 of 8 791 core samples inside the band
+                // and 4 of 61 rests on the stroke, on the 15×28 fixture.
+                // The lift is bounded by the headroom the birth left under
+                // the band over every cell the slipstream carries the star
+                // across — possibly none, and then the star is pinned.
+                // Over a blank row the headroom is unbounded and the lift is
+                // §5.6's, to the bit.
+                let g = ctx.geom;
+                let lift = sky_lift_px_per_s(g.ch as f32) / 1000.0;
+                let life_ms = class.life_s(spec.lane) * 1000.0;
+                let room = self.rule_headroom_px(px_col(x - stream, g)..=px_col(x, g), y, g);
+                (0.0, lift.max(-room / life_ms))
+            }
+            _ => (0.0, 0.0),
         };
         if class == StarClass::M1 {
             self.last_hero = Some(spec.cell);
@@ -4043,7 +4355,9 @@ impl Stardust {
 
     /// Is a live star's BIRTH pixel exactly here? Asked of the birth pixel
     /// and not the current position, because a lifted neighbour one pixel up
-    /// is a neighbour, not a stack.
+    /// is a neighbour, not a stack. Every lane asks it of every lane: an
+    /// exhaust grain (§33) is nudged off a star's pixel and a star off a
+    /// grain's, so nothing in the band is ever born on another mark.
     fn pixel_taken(&self, x: f32, y: f32) -> bool {
         self.stars.iter().any(|s| s.x == x && s.y == y)
     }
@@ -4077,28 +4391,68 @@ impl Stardust {
     /// **THE SLIPSTREAM'S TRAVEL FOR ONE BIRTH** (px ≥ 0): the priced travel
     /// ([`stream_travel_px`] of [`stream_px_per_s`] at this cell width and
     /// the observed interval), CLAMPED AT THE BLANK FRONTIER — L4 on a
-    /// moving star: the centre may drift left only over cells of `row − 1`
-    /// the probe proved blank, contiguously from the star's own, and never
-    /// past the pane's first column. The frontier is read ONCE, here, at
+    /// moving star: the centre may drift left only over cells of its band's
+    /// row the probe proved clear for the sky (a blank, or a light rule —
+    /// the star was born under one), contiguously from the star's own, and
+    /// never past the pane's first column. The frontier is read ONCE, here, at
     /// the birth edge — the probe forgets rows (an Enter, a scroll) and a
     /// later frame must not re-ask it; a scroll drops the star anyway.
     /// Event-edge work: a walk of at most one row's columns per birth,
     /// nothing per frame.
-    fn stream_reach(&self, x: f32, row: u16, ctx: &Ctx<'_>) -> f32 {
+    fn stream_reach(&self, x: f32, y: f32, ctx: &Ctx<'_>) -> f32 {
         let want = stream_travel_px(stream_px_per_s(ctx.geom.cw as f32, self.ioi_ms));
-        self.blank_frontier_px(x, row, want, ctx)
+        // The frontier is read on the band's own row — the one the stream
+        // runs along. The lift (one pixel over a life at 1×, three on the
+        // retina cell) is the headroom clamp's business, not the walk's
+        // ([`Stardust::rule_headroom_px`]): the span is a point.
+        self.blank_frontier_px(x, (y, y), want, ctx)
     }
 
-    /// **THE BLANK FRONTIER** — how far, px ≥ 0, a thing at `x` on `row`
-    /// may travel LEFT of the `want` it was priced: clamped at the first
-    /// column of `row − 1` the probe has not proved blank (contiguously from
-    /// the thing's own column) and at the pane's first column. The one
-    /// clamp [`Stardust::stream_reach`] (the sky's travel) and the exhaust
-    /// (the ribbon's stream at its own share, §27) share, so L4 is one
-    /// walk with two callers and not two walks. Zero for a non-finite or
-    /// sub-half-pixel `want` and off the grid's left edge. Event-edge work:
-    /// at most one row's columns per birth.
-    fn blank_frontier_px(&self, x: f32, row: u16, want: f32, ctx: &Ctx<'_>) -> f32 {
+    /// **THE BLANK FRONTIER** — how far, px ≥ 0, a thing at `x` whose flight
+    /// covers the window-Y span `band` (`(top, bottom)`, both inclusive) may
+    /// travel LEFT of the `want` it was priced: clamped at the first column
+    /// the probe has not proved CLEAR FOR THE SKY ON EVERY GRID ROW THAT
+    /// SPAN TOUCHES (contiguously from the thing's own column) and at the
+    /// pane's first column. The one clamp [`Stardust::stream_reach`] (the
+    /// sky's travel) and [`Stardust::sow_exhaust`] (the near layer's, at its
+    /// own share, §33) share, so L4 is one walk with two callers and not two
+    /// walks. Zero for a non-finite or sub-half-pixel `want` and off the
+    /// grid's left edge.
+    ///
+    /// **THE WALK READS THE BIRTH'S OWN CLEARANCE** ([`GlyphProbe::sky_at`]):
+    /// a blank, and a light rule whose stroke lies above the sky zone
+    /// (§5.4's rule clause — Claude Code's input box), are clear; a glyph is
+    /// ink; an unprobed row is unknown, and unknown stops the walk. Read
+    /// with the cell-level [`GlyphProbe::at`] the walk called the rule ink
+    /// and stopped every flight born over it at its own cell — measured on
+    /// the 15×28 fixture, sky stars streaming a mean 5 px (at most 12, the
+    /// cell's own left margin) under a rule row against 30 (at most 44) over
+    /// a blank one, and the exhaust throwing nothing at all
+    /// (`the_exhaust_flies_along_a_rule_row_in_the_sky_zone_under_the_stroke`).
+    /// The one thing a rule does forbid is a LIFT into its stroke, and that
+    /// is the headroom clamp on the grain's rise and the strike's lift
+    /// ([`Stardust::rule_headroom_px`]), not the walk's.
+    ///
+    /// **THE ROWS ARE THE FLIGHT'S, NOT `row − 1`** — D16's fork, read once,
+    /// here. The sky band has two anchors ([`default_band_top`],
+    /// [`in_sky_of_row`]): under `tall` it is the lower third of `row − 1`,
+    /// and a flight born there stays there (the exhaust's rise included);
+    /// under `underline` it is the `[0.04, 0.30]·ch` of the caret's OWN row,
+    /// and the rise can carry a grain into the row above. A clamp that
+    /// hard-coded `row − 1` proved the wrong row blank under `underline` and
+    /// let the mark run across the text the hand had just typed; reading the
+    /// rows off the flight's own pixels is what makes "it cannot be drawn on
+    /// your text" a fact under both spellings (the measurement is on
+    /// `no_mark_crosses_ink_or_the_pane_edge_at_any_instant_under_either_band_anchor`).
+    ///
+    /// **THE WALK STOPS WHERE THE ANSWER IS ALREADY FIXED.** The value is
+    /// `want.min(x − floor_x)`, and `x − floor_x` only GROWS as the frontier
+    /// moves left, so the moment it covers `want` no column further left can
+    /// change the answer and the loop breaks. Event-edge work, bounded by
+    /// the priced travel — three cells for the sky at 12 cps, about six for
+    /// the exhaust — rather than by the caret's column
+    /// (`the_blank_frontiers_early_stop_is_the_whole_walks_answer`).
+    fn blank_frontier_px(&self, x: f32, band: (f32, f32), want: f32, ctx: &Ctx<'_>) -> f32 {
         let g = ctx.geom;
         if !want.is_finite() || want < 0.5 {
             return 0.0;
@@ -4107,19 +4461,81 @@ impl Stardust {
         if col < 0 {
             return 0.0;
         }
-        let sky = i32::from(row) - 1;
+        // The rows the flight's own pixels fall in — one under `tall` and for
+        // every sky star, two under `underline` when the rise carries the
+        // grain over the boundary into the row above its band.
+        let (first, last) = (px_row(band.0, g), px_row(band.1, g));
         let mut frontier = col;
+        let floor_of = |frontier: i32| (g.fx_left() + frontier * g.cw as i32) as f32;
         while frontier > 0 {
+            // Already clear of the priced travel: no column further left can
+            // lower `want.min(x − floor_x)`, so the walk is over.
+            if x - floor_of(frontier) >= want {
+                break;
+            }
             let left = frontier - 1;
-            let blank =
-                u16::try_from(left).is_ok_and(|c| self.probe.at(sky, c, g.rows) == Some(false));
-            if !blank {
+            let clear = u16::try_from(left).is_ok_and(|c| {
+                (first..=last).all(|r| self.probe.sky_at(r, c, g.rows) == Some(false))
+            });
+            if !clear {
                 break;
             }
             frontier = left;
         }
-        let floor_x = (g.fx_left() + frontier * g.cw as i32) as f32;
-        want.min(x - floor_x).max(0.0)
+        want.min(x - floor_of(frontier)).max(0.0)
+    }
+
+    /// **THE HEADROOM UNDER A RULE** (§5.4's rule clause, §33), px ≥ 0 — how
+    /// far a flight born at window `y` may LIFT before its core enters the
+    /// stroke band ([`rule_stroke_px`]) of a light rule ([`CellInk::Rule`])
+    /// in any cell of `cols` on the birth's own row; `f32::INFINITY` when no
+    /// rule cell is among them, so a flight over a blank row is not touched.
+    /// The one clamp with two callers: the exhaust's rise
+    /// ([`Stardust::sow_exhaust`]) and the strike's lift
+    /// ([`Stardust::deal_star`]). The walk calls a rule clear
+    /// ([`GlyphProbe::sky_at`]) because the sky zone lies UNDER its stroke —
+    /// which is exactly why a rise out of that zone must stop short of the
+    /// stroke.
+    ///
+    /// **The columns are the flight's, the row is the birth's.** The
+    /// columns because a rule that ends left of the caret (a box-drawing
+    /// title, `── name ──`) is crossed by a grain born under a blank cell
+    /// at its full rise: the band of every rule cell under the flight is
+    /// asked, and the shortest headroom wins. One row because a rise is
+    /// short — the grain's `EXHAUST_RISE_CH`, the strike's lift shorter —
+    /// and the only stroke it can meet is the one in the zone's OWN row:
+    /// under `tall` the zone and the stroke share `row − 1`; under
+    /// `underline` the zone is ABOVE the caret row's stroke, so a flight
+    /// born there lifts away from it (`y < band_top`: no clamp), and the
+    /// row above's stroke ends `1 − RULE_INK_BOT_CH` above the boundary
+    /// where the rise stops `SKY_BOTTOM_CH + EXHAUST_RISE_CH` past it (the
+    /// assertion beside [`RULE_INK_BOT_CH`]).
+    ///
+    /// The band's edges are [`rule_stroke_px`]'s whole pixels — the ones
+    /// [`GlyphProbe::at_px`] answers by — because every position is rounded
+    /// to a pixel ([`Star::at_k`]) and a flight held above a fractional edge
+    /// could round onto the stroke; so the room is EXACTLY the pixels from
+    /// the birth to the first one under the stroke, a birth on the stroke has
+    /// none, and `settle` is the second guard on the band, not the first
+    /// (the pixels, at every cell height:
+    /// `the_stroke_band_is_one_set_of_pixels_for_the_probe_the_zones_and_the_headroom`;
+    /// the columns:
+    /// `the_headroom_under_a_rule_reads_every_column_the_flight_crosses`).
+    /// Event-edge work: a handful of bitset reads, once per birth.
+    fn rule_headroom_px(&self, cols: std::ops::RangeInclusive<i32>, y: f32, g: Geom) -> f32 {
+        let row = px_row(y, g);
+        if !cols
+            .into_iter()
+            .any(|c| u16::try_from(c).is_ok_and(|c| self.probe.rule_at(row, c)))
+        {
+            return f32::INFINITY;
+        }
+        let row_top = f32::from(g.origin_y) + row as f32 * g.ch as f32;
+        let band = rule_stroke_px(g.ch);
+        if y < row_top + band.start as f32 {
+            return f32::INFINITY;
+        }
+        (y - (row_top + band.end as f32)).max(0.0)
     }
 
     /// **WHERE A MEND'S STAR IS PULLED FROM** (1e): the erased cell `from`,
@@ -4179,7 +4595,10 @@ impl Stardust {
     /// lawful whatever the probe says of the glyph the caret is on, and the
     /// walk-back always terminates: at worst a hero rests on the caret. A
     /// shed fragment drifts from a station on the path, which is nobody's
-    /// cell, and takes no exemption.
+    /// cell, and takes no exemption; nor does the exhaust (§33), whose
+    /// origin is the caret cell's SKY — under `tall`, `row − 1`, where no
+    /// caret stands — and whose rest is asked of the probe like any free
+    /// grain's.
     ///
     /// Unknown is not inked: a free transient may land on a row nobody
     /// probed, the asymmetry §5.4 draws between a ribbon cell's sky (where
@@ -4202,10 +4621,7 @@ impl Stardust {
         ];
         let geom = ctx.geom;
         let origin = star.origin();
-        let home = star
-            .lane
-            .throw_ms()
-            .is_some()
+        let home = (star.lane != StarLane::Exhaust && star.lane.throw_ms().is_some())
             .then(|| (px_row(origin.1 as f32, geom), px_col(origin.0 as f32, geom)));
         let clear = |p: (i32, i32)| {
             on_glass(p, geom)
@@ -4728,9 +5144,10 @@ impl Paint {
     /// which is the `2.35·34 = 80` §5.2 publishes.
     ///
     /// `quad_cap` is this star's own share of the frame's quad budget;
-    /// `haloed` counts the STARS given a halo so far this frame; `laid_from`
-    /// is where this frame's sky begins in `frame.out` and `frame.halos` —
-    /// the ground a star is priced over ([`sky_ground`]).
+    /// `haloed` counts the STARS given a halo so far this frame; `index` is
+    /// this frame's laid sky, filed by cell — the ground a star is
+    /// priced over ([`sky_ground`]), caught up here with everything the
+    /// star before it laid.
     ///
     /// **EVERY CLASS IS HELD UNDER THE CARET LAW** ([`STAR_LIGHT_CEIL`]),
     /// in two steps. The haloed classes are PRICED before they are drawn
@@ -4753,10 +5170,13 @@ impl Paint {
         frame: &mut Frame<'_>,
         quad_cap: usize,
         haloed: &mut usize,
-        laid_from: (usize, usize),
+        index: &mut SkyIndex,
     ) {
         let geom = ctx.geom;
-        let (out_from, sky_from) = laid_from;
+        // Everything the stars before this one laid (and the aurora under
+        // them) enters the index here, exactly once each, and is then
+        // queried nine times by cell rather than scanned nine times whole.
+        index.ingest(frame);
         // The pixels this star's recipe stacks on, and the sky under each —
         // read BEFORE its own quads go out, since they would be in the slice.
         let d = if self.class == StarClass::M3 {
@@ -4777,16 +5197,7 @@ impl Paint {
             (0, -1),
         ]) {
             let p = (self.x + dx, self.y + dy);
-            *slot = (
-                p,
-                sky_ground(
-                    ctx.cfg.theme_bg,
-                    &frame.out[out_from..],
-                    &frame.halos[sky_from..],
-                    p.0,
-                    p.1,
-                ),
-            );
+            *slot = (p, index.ground(ctx.cfg.theme_bg, frame, p.0, p.1));
         }
         let ground = watch[0].1;
         let q0 = frame.out.len();
@@ -4952,9 +5363,16 @@ impl Paint {
     /// (`α·env < 0.12`: nothing coloured is drawn below α 0.12) — a peak of
     /// `0` for either, so a halo the frame will not draw is never priced
     /// against the body it belongs to.
+    ///
+    /// **THE EXHAUST NEVER ASKS** (§33): the budget is spent in pool order
+    /// and a grain is born on every key, so left in, the newest debris would
+    /// take the slots the sky's heroes are the reason for.
     fn halo_request(&self, share: f32, haloed: usize) -> (u32, u8) {
         let rgb = halo_rgb(self.tint, self.gold, self.env);
-        if haloed >= STARDUST_HALO_BUDGET || self.alpha * self.env < CHROMA_CULL_ALPHA {
+        if self.lane == StarLane::Exhaust
+            || haloed >= STARDUST_HALO_BUDGET
+            || self.alpha * self.env < CHROMA_CULL_ALPHA
+        {
             return (rgb, 0);
         }
         (rgb, cov_byte(self.c * share * self.env))
@@ -5115,6 +5533,9 @@ const SALT_JITTER: u32 = 0x0000_0909;
 const SALT_ERASE: u32 = 0x0000_0A0A;
 /// Salt for the light-theme thinning of a thrown grain (§5.2).
 const SALT_LIGHT: u32 = 0x0000_0B0B;
+/// Salt for the exhaust's class deal and its rise jitter (§33). Distinct from
+/// every salt above, so a cell's grain and its exhaust are independent draws.
+const SALT_EXHAUST: u32 = 0x0000_0E7A;
 
 /// The family's avalanche mix — the same two rounds `cursor_glow` uses for its
 /// per-cell deals, so a v2 star and a v1 spark hashed from the same cell do
@@ -5631,6 +6052,357 @@ fn halo_rgb(tint: u32, gold: bool, env: f32) -> u32 {
     SPECTRUM_LUT[at as usize]
 }
 
+#[cfg(test)]
+thread_local! {
+    /// **A TEST-ONLY WORK CENSUS** of the ground query — `[scan quad tests,
+    /// scan halo tests, indexed quad candidates, indexed halo candidates]`.
+    /// Under `cfg(test)` [`SkyIndex::ground`] checks itself against
+    /// [`sky_ground`] on every query, so ONE run prices both answers to
+    /// exactly the same question;
+    /// `a_point_query_reads_one_cell_not_the_whole_sky` is the pin that
+    /// reads it. Nothing here exists in a shipped build.
+    static GROUND_WORK: std::cell::Cell<[u64; 4]> = const { std::cell::Cell::new([0; 4]) };
+}
+
+/// Add `n` to census slot `slot` ([`GROUND_WORK`]).
+#[cfg(test)]
+fn note_ground_work(slot: usize, n: u64) {
+    GROUND_WORK.with(|c| {
+        let mut w = c.get();
+        w[slot] += n;
+        c.set(w);
+    });
+}
+
+/// The empty link of a [`SkyIndex`] chain.
+const SKY_INDEX_END: u32 = u32::MAX;
+
+/// [`SkyIndex`]'s chain count — a power of two. Sized well over the lays one
+/// frame can file so the chains stay at a handful of entries; two `u32`
+/// heads per slot is the index's largest allocation (8 KiB, resident).
+const SKY_INDEX_SLOTS: usize = 1024;
+
+/// Room for the quad chains' nodes — one per cell a laid quad touches. A
+/// star's lays are ≤ 2 cells wide and the row split keeps each inside one
+/// row, so twice [`STARDUST_QUAD_BUDGET`] is the frame's own ceiling.
+const SKY_INDEX_QUAD_NODES: usize = STARDUST_QUAD_BUDGET * 2;
+
+/// Room for the halo chains' nodes. The aurora's veils are one column each
+/// ([`STARDUST_LIGHT_HALO_BUDGET`] of them at most), and a star's atmosphere
+/// is ≤ 3 × 3 cells with [`STARDUST_HALO_BUDGET`] stars haloed.
+const SKY_INDEX_HALO_NODES: usize = STARDUST_LIGHT_HALO_BUDGET + 9 * STARDUST_HALO_BUDGET;
+
+/// How many cells one lay may be filed under. Nothing the sky lays comes
+/// close — a hero's atmosphere is the widest at ~3 × 3 — so this is a bound
+/// on the filing cost of a lay this file has not written yet.
+///
+/// **IT IS ALSO LOAD-BEARING FOR CORRECTNESS, NOT ONLY FOR COST** (review,
+/// 2026-09-15). [`SkyIndex::slot`] must be INJECTIVE over the cells of ONE
+/// lay's box (see the index's own doc): a lay that filed twice in one chain
+/// would have its light added twice. Whether that holds depends on this cap.
+/// A self-collision needs the hash's `>> 13` to survive a cell delta, which
+/// takes `(dx·0x9E3779B9 + dy·0x85EBCA6B) >> 13 & 1023` equal for two cells
+/// of the same box; swept exhaustively there is no such pair while a box is
+/// at most 19 cells, and at 20 — where a 1 × 20 box first makes the delta
+/// `(0, ±19)` reachable — it collides, for 6671 of the 8192 base hashes.
+/// The margin above 16 is three cells, so this is NOT a free knob: raising
+/// it without re-sweeping breaks the invariant, and
+/// `the_slot_hash_is_injective_over_every_box_the_cap_allows` is what says so.
+const SKY_INDEX_WIDE_CELLS: i64 = 16;
+
+/// **THE SKY LAID SO FAR, INDEXED BY CELL** — the very slices
+/// [`sky_ground`] reads (`frame.out[out_from..]` and
+/// `frame.halos[sky_from..]`), filed under the grid cells they touch AS
+/// THEY ARE PUSHED, so a point query walks the handful of lays that could
+/// cover it instead of re-scanning the whole frame's laid light once per
+/// watched pixel of every later star.
+///
+/// **The cell is the whole key.** A lay is filed under every cell its
+/// `x..x + w` × `y..y + h` box touches, so a lay that covers `(x, y)` is
+/// always in the chain of the cell `(x, y)` falls in — the query needs no
+/// range walk, only that one chain.
+///
+/// **TWO KINDS OF COLLISION, AND ONLY ONE IS HARMLESS.** Slots are shared by
+/// a hash of the cell. Two cells of DIFFERENT lays landing on one chain is
+/// free: it costs an extra `quad_covers` test and nothing else, because the
+/// covering test is still the one that decides. Two cells of the SAME lay
+/// landing on one chain is NOT: a lay is filed once per cell it touches, so
+/// it would appear twice in that chain and [`sky_ground`] would `add_sat` its
+/// light twice. THE INVARIANT is therefore that no two cells of one lay's box
+/// may share a slot, and it is [`SKY_INDEX_WIDE_CELLS`] that makes it true.
+/// Proved by sweep in `the_slot_hash_is_injective_over_every_box_the_cap_allows`,
+/// and the mechanism is real, not theoretical: collapsing `slot` to a
+/// constant — every cell on one chain — puts the indexed ground off the scan
+/// it must match and turns 17 of this file's laws red.
+///
+/// **It never allocates and it never lies.** The arenas are sized once, at
+/// this frame's own budgets, and a lay that will not fit — more than
+/// [`SKY_INDEX_WIDE_CELLS`] cells, or past the end of an arena — SPILLS the
+/// index instead of growing it: `spilled` sends every query back to the
+/// whole-slice scan, which is slower and exactly as right. §18's steady
+/// frame allocates nothing, and no frame can be wrong.
+///
+/// **Membership is indexed; the bytes are read live.** Entries are read out
+/// of the slices at query time, so [`settle_under_ceiling`] dimming a
+/// star's own quads AFTER they were filed is invisible here, and the answer
+/// is the same word [`sky_ground`] would return over the whole slice —
+/// checked by `debug_assert` on every query of every test in this file.
+/// Within one emit the slices only GROW (nothing truncates or reorders
+/// them), so a filed entry never goes stale.
+#[derive(Clone, Debug, Default)]
+struct SkyIndex {
+    /// Grid-interior top-left in window px — the cell anchor.
+    origin: (i32, i32),
+    /// Cell size in px, or `0` where the geometry has none (then every lay
+    /// shares cell `(0, 0)`: exactly the old full scan, still correct).
+    cell: (i32, i32),
+    /// Where this frame's sky begins in `frame.out` / `frame.halos` — every
+    /// filed entry is an offset from these.
+    from: (usize, usize),
+    /// How much of each slice is filed — [`SkyIndex::ingest`] catches up.
+    filed: (usize, usize),
+    /// A lay did not fit: read the whole slice, as the scan did.
+    spilled: bool,
+    /// Per-slot head of the quad chain ([`SKY_INDEX_END`] when empty).
+    quad_head: Vec<u32>,
+    /// Per-slot head of the `Add` halo chain.
+    halo_head: Vec<u32>,
+    /// `(entry, next)` arena for the quad chains.
+    quad_node: Vec<(u32, u32)>,
+    /// `(entry, next)` arena for the halo chains.
+    halo_node: Vec<(u32, u32)>,
+    /// The slots written this frame — what `open` has to empty again.
+    dirty: Vec<u32>,
+}
+
+impl SkyIndex {
+    /// Open the index on one frame: this geometry's cells, emptied, anchored
+    /// at the slice offsets this frame's sky starts at.
+    fn open(&mut self, geom: Geom, from: (usize, usize)) {
+        if self.quad_head.len() == SKY_INDEX_SLOTS {
+            // Only the slots this index actually wrote need emptying.
+            for &s in &self.dirty {
+                self.quad_head[s as usize] = SKY_INDEX_END;
+                self.halo_head[s as usize] = SKY_INDEX_END;
+            }
+        } else {
+            // The one allocation this index ever makes, on its first frame.
+            self.quad_head = vec![SKY_INDEX_END; SKY_INDEX_SLOTS];
+            self.halo_head = vec![SKY_INDEX_END; SKY_INDEX_SLOTS];
+            self.quad_node.reserve_exact(SKY_INDEX_QUAD_NODES);
+            self.halo_node.reserve_exact(SKY_INDEX_HALO_NODES);
+            self.dirty.reserve_exact(SKY_INDEX_SLOTS);
+        }
+        self.dirty.clear();
+        self.quad_node.clear();
+        self.halo_node.clear();
+        self.spilled = false;
+        self.origin = (i32::from(geom.origin_x), i32::from(geom.origin_y));
+        self.cell = (geom.cw as i32, geom.ch as i32);
+        self.from = from;
+        self.filed = (0, 0);
+    }
+
+    /// The grid cell a window pixel falls in — the same floor division the
+    /// pushers tag their row with, on both axes.
+    #[inline]
+    fn cell_at(&self, x: i32, y: i32) -> (i32, i32) {
+        (
+            if self.cell.0 > 0 {
+                (x - self.origin.0).div_euclid(self.cell.0)
+            } else {
+                0
+            },
+            if self.cell.1 > 0 {
+                (y - self.origin.1).div_euclid(self.cell.1)
+            } else {
+                0
+            },
+        )
+    }
+
+    /// The chain a cell hashes to. A collision BETWEEN LAYS costs one extra
+    /// covering test and never a wrong answer; a collision between two cells
+    /// of ONE lay would double-count its light, which is why
+    /// [`SKY_INDEX_WIDE_CELLS`] caps a box small enough that none exists.
+    #[inline]
+    fn slot((cx, cy): (i32, i32)) -> usize {
+        let k = (cx as u32)
+            .wrapping_mul(0x9E37_79B9)
+            .wrapping_add((cy as u32).wrapping_mul(0x85EB_CA6B));
+        (k >> 13) as usize & (SKY_INDEX_SLOTS - 1)
+    }
+
+    /// File entry `i` of one stream, whose box is `(x, y, w, h)`, into every
+    /// cell it touches — or spill the index when it does not fit.
+    fn file(&mut self, i: usize, (x, y, w, h): (i32, i32, i32, i32), quads: bool) {
+        let (cx0, cy0) = self.cell_at(x, y);
+        let (cx1, cy1) = self.cell_at(x + w - 1, y + h - 1);
+        let cells = i64::from(cx1 - cx0 + 1) * i64::from(cy1 - cy0 + 1);
+        let arena = if quads {
+            &self.quad_node
+        } else {
+            &self.halo_node
+        };
+        if cells > SKY_INDEX_WIDE_CELLS
+            || arena.len() + cells as usize > arena.capacity()
+            || self.dirty.len() + cells as usize > self.dirty.capacity()
+        {
+            self.spilled = true;
+            return;
+        }
+        for cy in cy0..=cy1 {
+            for cx in cx0..=cx1 {
+                let s = Self::slot((cx, cy));
+                if self.quad_head[s] == SKY_INDEX_END && self.halo_head[s] == SKY_INDEX_END {
+                    self.dirty.push(s as u32);
+                }
+                if quads {
+                    let next = self.quad_head[s];
+                    self.quad_node.push((i as u32, next));
+                    self.quad_head[s] = self.quad_node.len() as u32 - 1;
+                } else {
+                    let next = self.halo_head[s];
+                    self.halo_node.push((i as u32, next));
+                    self.halo_head[s] = self.halo_node.len() as u32 - 1;
+                }
+            }
+        }
+    }
+
+    /// File everything pushed since the last call. Called once per star,
+    /// before its ground is read, so each lay is filed EXACTLY ONCE for the
+    /// whole frame — the index is built by the same pushes it indexes.
+    fn ingest(&mut self, frame: &Frame<'_>) {
+        if self.spilled {
+            return;
+        }
+        while self.filed.0 < frame.out.len() - self.from.0 {
+            let i = self.filed.0;
+            self.filed.0 += 1;
+            let q = frame.out[self.from.0 + i];
+            // Only premultiplied ADDITIVE light is ever added ([`quad_covers`]).
+            if q.alpha != 0 || q.w == 0 || q.h == 0 {
+                continue;
+            }
+            self.file(
+                i,
+                (
+                    i32::from(q.x),
+                    i32::from(q.y),
+                    i32::from(q.w),
+                    i32::from(q.h),
+                ),
+                true,
+            );
+        }
+        while self.filed.1 < frame.halos.len() - self.from.1 {
+            let i = self.filed.1;
+            self.filed.1 += 1;
+            let h = frame.halos[self.from.1 + i];
+            // `Over` veils are the light theme's ink and add nothing here.
+            if h.mode != HaloMode::Add || h.w == 0 || h.h == 0 {
+                continue;
+            }
+            self.file(
+                i,
+                (
+                    i32::from(h.x),
+                    i32::from(h.y),
+                    i32::from(h.w),
+                    i32::from(h.h),
+                ),
+                false,
+            );
+        }
+    }
+
+    /// [`sky_ground`] at `(x, y)`, off the index — the theme ground plus
+    /// every laid quad and `Add` halo of THIS frame's sky that covers the
+    /// pixel, summed by the same function the scan uses, over one cell's
+    /// candidates instead of the whole slice.
+    #[must_use]
+    fn ground(&self, bg: u32, frame: &Frame<'_>, x: i32, y: i32) -> u32 {
+        let laid = &frame.out[self.from.0..];
+        let sky = &frame.halos[self.from.1..];
+        let s = Self::slot(self.cell_at(x, y));
+        let ground = if self.spilled {
+            sky_ground(bg, laid, sky, x, y)
+        } else {
+            sky_ground(
+                bg,
+                Chain::new(&self.quad_node, self.quad_head[s], laid),
+                Chain::new(&self.halo_node, self.halo_head[s], sky),
+                x,
+                y,
+            )
+        };
+        #[cfg(test)]
+        {
+            note_ground_work(0, laid.len() as u64);
+            note_ground_work(
+                1,
+                sky.iter().filter(|h| h.mode == HaloMode::Add).count() as u64,
+            );
+            if self.spilled {
+                note_ground_work(2, laid.len() as u64);
+                note_ground_work(3, sky.len() as u64);
+            } else {
+                note_ground_work(
+                    2,
+                    Chain::new(&self.quad_node, self.quad_head[s], laid).count() as u64,
+                );
+                note_ground_work(
+                    3,
+                    Chain::new(&self.halo_node, self.halo_head[s], sky).count() as u64,
+                );
+            }
+            debug_assert_eq!(
+                ground,
+                sky_ground(bg, laid, sky, x, y),
+                "the indexed ground at ({x}, {y}) is not the scan's"
+            );
+        }
+        ground
+    }
+}
+
+/// One cell's chain of a [`SkyIndex`], as an iterator of the entries
+/// themselves — the arena walk, so the entry BYTES are read out of the live
+/// slice at query time and a lay dimmed after it was filed still reads true.
+struct Chain<'a, T> {
+    /// The `(entry, next)` arena the chain runs through.
+    nodes: &'a [(u32, u32)],
+    /// The next node, or [`SKY_INDEX_END`].
+    at: u32,
+    /// The slice the entries are offsets into.
+    items: &'a [T],
+}
+
+impl<'a, T> Chain<'a, T> {
+    /// The chain that starts at `head`.
+    const fn new(nodes: &'a [(u32, u32)], head: u32, items: &'a [T]) -> Self {
+        Self {
+            nodes,
+            at: head,
+            items,
+        }
+    }
+}
+
+impl<'a, T> Iterator for Chain<'a, T> {
+    type Item = &'a T;
+
+    fn next(&mut self) -> Option<&'a T> {
+        if self.at == SKY_INDEX_END {
+            return None;
+        }
+        let (entry, next) = self.nodes[self.at as usize];
+        self.at = next;
+        Some(&self.items[entry as usize])
+    }
+}
+
 /// **THE GROUND UNDER A STAR** — the theme ground plus everything the sky
 /// has already laid on this frame at `(x, y)`: the additive quads of the
 /// stars drawn before this one (`add_sat`, as `draw_flat_add` lays them)
@@ -5639,17 +6411,29 @@ fn halo_rgb(tint: u32, gold: bool, env: f32) -> u32 {
 /// `halo_weight`, the halo-parity contract). It is what [`price_centre`]
 /// prices against, so a hero standing in a full-momentum veil, or dealt
 /// onto the cell another star already holds, is held to the SAME ceiling
-/// as one on bare glass. `laid` and `sky` are the slices from this frame's
-/// first sky quad and halo — bounded by [`STARDUST_QUAD_BUDGET`] and
-/// [`AURORA_HALO_BUDGET`] + [`STARDUST_HALO_BUDGET`].
+/// as one on bare glass.
 ///
 /// What a star drawn LATER lays on this one's pixels is not here — its
 /// arms and its halo's tail land after this star is priced and settled —
 /// so the ceiling is exact on each star's own watched pixels over the sky
 /// under it, and a pair the deal puts within a halo's reach of each other
 /// is bounded by the later star's tail on the earlier one's pixels.
+///
+/// **`laid` and `sky` are CANDIDATES, not the whole sky.** The sum is a
+/// saturating add — `aterm_render::add_sat` is documented order-independent
+/// — and every entry that does not cover `(x, y)` contributes zero through
+/// `quad_covers` / [`halo_add_at`], so the answer depends only on the
+/// covering entries being present. [`SkyIndex::ground`] hands it one row
+/// band's candidates and a test hands it the whole slice; both get the same
+/// word out.
 #[must_use]
-fn sky_ground(bg: u32, laid: &[GlowQuad], sky: &[RainHalo], x: i32, y: i32) -> u32 {
+fn sky_ground<'a>(
+    bg: u32,
+    laid: impl IntoIterator<Item = &'a GlowQuad>,
+    sky: impl IntoIterator<Item = &'a RainHalo>,
+    x: i32,
+    y: i32,
+) -> u32 {
     let mut ground = bg & 0x00FF_FFFF;
     for q in laid {
         if quad_covers(q, x, y) {
@@ -6710,10 +7494,11 @@ mod tests {
                 s.x,
                 s.y
             );
-            let fy = (s.y - f32::from(g.origin_y)) / ch - 4.0;
+            let off = s.y as i32 - i32::from(g.origin_y) - 4 * g.ch as i32;
             assert!(
-                fy >= RULE_INK_BOT_CH,
-                "a star core sits in the rule's stroke band: fy = {fy}"
+                off >= rule_stroke_px(g.ch).end,
+                "a star core sits in the rule's stroke band: pixel {off} of row 4, {:.2} ch",
+                off as f32 / ch
             );
             assert_eq!(
                 sky.probe().at_px(s.x as i32, s.y as i32, g),
@@ -6822,6 +7607,232 @@ mod tests {
         probe.probe_row(4, &occupied);
         assert_eq!(probe.at(4, 10, g.rows), Some(false));
         assert_eq!(probe.at_px(rx as i32, y_at(0.50), g), Some(false));
+    }
+
+    /// **§5.4's RULE CLAUSE ON WHOLE PIXELS — THE STROKE BAND IS ONE SET OF
+    /// PIXELS FOR THE PROBE, THE ZONES AND THE HEADROOM**, at every cell
+    /// height 6..=48 ([`rule_stroke_px`]). The band and the sky zones are
+    /// disjoint in `ch` by construction, but a birth is a device pixel
+    /// (`sky_birth_px` rounds `top − 0.30 ch`) and so is the probe's answer,
+    /// and two roundings of one fraction are two edges: taken at `ceil`
+    /// the band's end claimed the tall zone's top pixel on 17 heights (the
+    /// owner's 1× 7×14 cell among them: 101 of 4 000 seeded births ON ink by
+    /// the probe's own answer, 375 at `ch` 20), and computed from an f32
+    /// fraction of the window coordinate the probe called the pixel at
+    /// exactly `0.60 · ch` ink on every multiple of 5. Now, per height:
+    ///
+    /// 1. the pixel probe answers `Some(true)` exactly on the band's pixels
+    ///    of a rule cell — the band's end is the first clear pixel under
+    ///    the stroke, its start the first inked one;
+    /// 2. the renderer's own stroke (`light = (min(cw, ch) + 4) / 8`,
+    ///    centred with the odd pixel below — `aterm_render::procedural`'s
+    ///    one rounding rule) lies inside the band, on the owner's 1:2 cell
+    ///    and on a square one, from `ch` 7 (the clause promises 8);
+    /// 3. the `tall` zone's top pixel IS the band's end and the `underline`
+    ///    zone's bottom pixel lies above the band's start — the two edges
+    ///    `sky_birth_px` rounds to;
+    /// 4. every seeded birth under a rule row is clear by the probe, in
+    ///    both spellings — `underline` with the caret's own row a rule too;
+    /// 5. the headroom under the rule is EXACTLY the pixels from the birth
+    ///    to the band's end, unbounded above the band's start, and the
+    ///    pixel it holds a flight at is clear;
+    /// 6. the strike's whole-life lift is shorter than the exhaust's rise,
+    ///    so the assertion beside [`RULE_INK_BOT_CH`] covers it: no rise
+    ///    out of the `underline` zone reaches the row above's stroke.
+    ///
+    /// Fails before at `ch` 14 (step 1: the pixel at 8 is called ink; step
+    /// 4: births on it) and at `ch` 10 (step 1: the pixel at 6).
+    #[test]
+    fn the_stroke_band_is_one_set_of_pixels_for_the_probe_the_zones_and_the_headroom() {
+        let t0 = Instant::now();
+        let ribbon = Ribbon::new();
+        let tall = cfg(true);
+        let mut under = cfg(true);
+        under.ribbon_tall = false;
+        let lift_ch =
+            -sky_lift_px_per_s(CELL_1X_CH) * StarClass::M1.life_s(StarLane::Strike) / CELL_1X_CH;
+        assert!(
+            lift_ch <= EXHAUST_RISE_CH,
+            "a hero's whole-life lift is {lift_ch:.3} ch, past the exhaust's rise \
+             {EXHAUST_RISE_CH} the const assertion bounds"
+        );
+        for ch in 6usize..=48 {
+            let cw = (ch / 2).max(3);
+            let g = geom_cell(cw, ch);
+            let chf = ch as f32;
+            let band = rule_stroke_px(ch);
+            let row_top = |r: i32| i32::from(g.origin_y) + r * ch as i32;
+            let mut sky = Stardust::new();
+            sky.probe_mut().probe_row_ink(4, &[CellInk::Rule; 120]);
+            sky.probe_mut().probe_row_ink(5, &[CellInk::Rule; 120]);
+            let (x, _) = g.cell_center(4, 30);
+            let x = x as i32;
+            assert!(
+                band.start < band.end && band.end <= ch as i32,
+                "ch {ch}: the band {band:?} is empty or past the cell"
+            );
+            // 1. The probe, pixel for pixel, on both rows.
+            for r in [4, 5] {
+                for off in 0..ch as i32 {
+                    assert_eq!(
+                        sky.probe().at_px(x, row_top(r) + off, g),
+                        Some(band.contains(&off)),
+                        "ch {ch}: pixel {off} of row {r} against the band {band:?}"
+                    );
+                }
+            }
+            // 2. The renderer's stroke.
+            if ch >= 7 {
+                for w in [cw, ch] {
+                    let light = ((w.min(ch) + 4) / 8).max(1) as i32;
+                    let s = (ch as i32 - light) / 2;
+                    assert!(
+                        band.start <= s && s + light <= band.end,
+                        "ch {ch} cw {w}: the renderer's stroke {s}..{} is not inside the band \
+                         {band:?}",
+                        s + light
+                    );
+                }
+            }
+            // 3. The zones' edges, as `sky_birth_px` rounds them.
+            let zone_top = (default_band_top(g, &tall, 5) - SKY_TOP_CH * chf).round() as i32;
+            assert_eq!(
+                zone_top - row_top(4),
+                band.end,
+                "ch {ch}: the tall zone's top pixel is not the band's end"
+            );
+            let zone_bot = (default_band_top(g, &under, 5) - SKY_BOTTOM_CH * chf).round() as i32;
+            assert!(
+                zone_bot - row_top(5) < band.start,
+                "ch {ch}: the underline zone's bottom pixel {} is not above the band's start {}",
+                zone_bot - row_top(5),
+                band.start
+            );
+            // 4. The births.
+            for (c, row, side) in [(&tall, 4, "tall"), (&under, 5, "underline")] {
+                let cx = ctx_in(g, t0, c, (5, 30));
+                let mut births = 0usize;
+                for seed in 0..256u32 {
+                    let Some((bx, by)) = sky.sky_birth_px((5, 30), mix32(seed), &cx, &ribbon)
+                    else {
+                        continue;
+                    };
+                    births += 1;
+                    let off = by as i32 - row_top(row);
+                    assert!(
+                        (0..ch as i32).contains(&off) && !band.contains(&off),
+                        "ch {ch} {side}: a birth at pixel {off} of row {row}, in the band {band:?}"
+                    );
+                    assert_eq!(
+                        sky.probe().at_px(bx as i32, by as i32, g),
+                        Some(false),
+                        "ch {ch} {side}: a birth at ({bx}, {by}) is on ink by the probe"
+                    );
+                }
+                assert!(births > 0, "ch {ch} {side}: no birth under a rule row");
+            }
+            // 5. The headroom, pixel by pixel down row 4.
+            for off in 0..ch as i32 {
+                let y = (row_top(4) + off) as f32;
+                let room = sky.rule_headroom_px(30..=30, y, g);
+                if off < band.start {
+                    assert_eq!(
+                        room,
+                        f32::INFINITY,
+                        "ch {ch}: a flight born at pixel {off}, above the band, is clamped"
+                    );
+                    continue;
+                }
+                assert_eq!(
+                    room,
+                    (off - band.end).max(0) as f32,
+                    "ch {ch}: the headroom at pixel {off} is not the pixels to the band's end \
+                     {}",
+                    band.end
+                );
+                if band.contains(&off) {
+                    // Born on the stroke: no headroom, and the rest is
+                    // `settle`'s to nudge.
+                    continue;
+                }
+                let held = y as i32 - room as i32;
+                assert_eq!(
+                    sky.probe().at_px(x, held, g),
+                    Some(false),
+                    "ch {ch}: the pixel a flight born at {off} is held at is on ink"
+                );
+                assert_eq!(
+                    sky.probe().at_px(x, held - 1, g),
+                    Some(true),
+                    "ch {ch}: a flight born at {off} is held a pixel short of the stroke"
+                );
+            }
+        }
+    }
+
+    /// **THE HEADROOM UNDER A RULE READS EVERY COLUMN THE FLIGHT CROSSES.**
+    /// A rule that ends left of the caret — a box-drawing title's tail,
+    /// rule cells in the columns before 40 and blanks from 40 on — is
+    /// crossed by a grain born under a blank cell at its full rise, so the
+    /// band of every rule cell under the flight is asked and the shortest
+    /// headroom wins; a box of blank cells, a box of glyphs and the columns
+    /// off the grid's left edge bound nothing. Pinned on the owner's 15×28
+    /// cell at the tall zone's top pixel (the band's end: no headroom under
+    /// a rule cell) and two pixels under it. Fails with the box replaced by
+    /// the birth column alone.
+    #[test]
+    fn the_headroom_under_a_rule_reads_every_column_the_flight_crosses() {
+        let g = geom_cell(15, 28);
+        let band = rule_stroke_px(g.ch);
+        let row_top = i32::from(g.origin_y) + 4 * g.ch as i32;
+        let mut sky = Stardust::new();
+        let mut title = [CellInk::Blank; 120];
+        title[..40].fill(CellInk::Rule);
+        sky.probe_mut().probe_row_ink(4, &title);
+        sky.probe_mut().probe_row(5, &[false; 120]);
+        let y = (row_top + band.end) as f32;
+        assert_eq!(
+            sky.rule_headroom_px(39..=39, y, g),
+            0.0,
+            "under the rule's last cell"
+        );
+        assert_eq!(
+            sky.rule_headroom_px(40..=40, y, g),
+            f32::INFINITY,
+            "under the first blank cell"
+        );
+        assert_eq!(
+            sky.rule_headroom_px(40..=46, y, g),
+            f32::INFINITY,
+            "a flight over blank cells only"
+        );
+        assert_eq!(
+            sky.rule_headroom_px(39..=46, y, g),
+            0.0,
+            "one rule cell at the flight's far end is the flight's headroom"
+        );
+        assert_eq!(
+            sky.rule_headroom_px(30..=46, y + 2.0, g),
+            2.0,
+            "two pixels under the band's end, over a run of rule cells"
+        );
+        assert_eq!(
+            sky.rule_headroom_px(-3..=-1, y, g),
+            f32::INFINITY,
+            "columns off the grid's left edge bound nothing"
+        );
+        assert_eq!(
+            sky.rule_headroom_px(-3..=0, y, g),
+            0.0,
+            "…and the first on-grid rule cell beside them does"
+        );
+        let mut glyphs = Stardust::new();
+        glyphs.probe_mut().probe_row(4, &[true; 120]);
+        assert_eq!(
+            glyphs.rule_headroom_px(0..=46, y, g),
+            f32::INFINITY,
+            "a row of glyphs has no stroke band: the cell-level gate refuses it, not the headroom"
+        );
     }
 
     /// The rule class is exactly the LIGHT horizontal members of the Box
@@ -8042,7 +9053,10 @@ mod tests {
             let mut sc = Scratch::default();
             sky.emit(&cx, &mut sc.frame());
             let (mut live, mut live_chromatic) = (0usize, 0usize);
-            for s in sky.live_iter() {
+            // The SKY's own stars: the exhaust (§33) is transient-priced
+            // (`M3_COV_TRANSIENT`), whose tinted arms stand under this
+            // judge's threshold exactly as an erase-lane grain's do.
+            for s in sky.live_iter().filter(|s| s.lane.is_sky()) {
                 if s.born == at {
                     let full = chroma_of(s, at + Duration::from_millis(20));
                     born += 1;
@@ -10029,7 +11043,9 @@ mod tests {
     /// owner 2026-09-08: "dynamic"). Sixty keys on a probed-blank sky at a
     /// fixed spine: cold (0.4) the births per key are the strike deal plus
     /// half a field star, `1.33`; hot (0.8) the second grain and a field star
-    /// on every cell, `2.83` — measured as stars born on the key's own edge.
+    /// on every cell, `2.83` — measured as SKY stars born on the key's own
+    /// edge (the exhaust's transient grain, §33, is a population of its own
+    /// and no part of this deal).
     #[test]
     fn a_hot_hand_deals_every_cell_a_field_star() {
         let c = cfg(true);
@@ -10048,7 +11064,10 @@ mod tests {
                 cx.birth_disp = disp;
                 sky.budget.refill(at);
                 sky.on_event(&typed(TypedClass::Glyph), at, &cx, &ribbon);
-                born += sky.live_iter().filter(|s| s.born == at).count();
+                born += sky
+                    .live_iter()
+                    .filter(|s| s.born == at && s.lane.is_sky())
+                    .count();
             }
             let field: std::collections::BTreeSet<i32> = sky
                 .live_iter()
@@ -10486,10 +11505,12 @@ mod tests {
     /// cell, the spine hot at every cadence. Every sky star the last key
     /// bore is read at its birth and 200 ms on: at 8 and 12 cps its
     /// backward travel, as px/s over the window, is within 10 % of the
-    /// priced curve's (`0.35·cw/IOI` at birth — 42 and 63 px/s — decaying
-    /// on τ 300); at 2 cps it is exactly zero, by the cadence and not by
-    /// the gate. Fails before: every star measured 0 px/s against 30.7 and
-    /// 46.0.
+    /// priced curve's (`STREAM_SHARE_CW·cw/IOI` at birth — 126 and 189 px/s
+    /// since the share became a quarter of the exhaust's, §33 — decaying on
+    /// τ 300); at 2 cps it is exactly zero, by the cadence and not by the
+    /// gate. Fails before: every star measured 0 px/s against 30.7 and
+    /// 46.0; the 42 and 63 px/s this test pinned until 2026-09-16 are the
+    /// same numbers at a third of the share.
     #[test]
     fn stars_born_at_speed_stream_backwards_at_the_hand_s_own_cadence() {
         let c = cfg(true);
@@ -10497,7 +11518,7 @@ mod tests {
         let g = geom_cell(15, 28);
         let window_ms = 200.0f32;
         let window = Duration::from_secs_f32(window_ms / 1000.0);
-        for (cps, priced_v0) in [(8.0f32, 42.0f32), (12.0, 63.0), (2.0, 0.0)] {
+        for (cps, priced_v0) in [(8.0f32, 126.0f32), (12.0, 189.0), (2.0, 0.0)] {
             let v0 = stream_px_per_s(g.cw as f32, 1000.0 / cps);
             assert!(
                 (v0 - priced_v0).abs() <= 0.01 * priced_v0.max(1.0),
@@ -10537,81 +11558,214 @@ mod tests {
         }
     }
 
-    /// **1d / L4 — A STREAMING STAR NEVER CROSSES INK OR THE PANE EDGE.**
-    /// (a) The sky row inked up to column 18 and a 12 cps hand typing from
-    /// column 18: every star's centre, swept 5 ms at a time through the
-    /// whole drift and beyond, stays over a cell the probe proved blank and
-    /// never left of column 18 — and at least one star DID stream, so the
-    /// clamp was a clamp and not an absence. (b) The hand typing from
-    /// column 0: a star born inside its own travel of the pane's first
-    /// column stops at the effects box's left edge. Fails before: nothing
-    /// streams, so the "streamed at all" clause is what fails.
+    /// **L4 — NO MARK CROSSES INK OR THE PANE EDGE AT ANY INSTANT OF ITS
+    /// FLIGHT, UNDER EITHER BAND ANCHOR** (1d for the sky's drift, §33 for
+    /// the exhaust). Twenty keys at 12 cps on the owner's cell, `tall` and
+    /// `underline` — D16 puts the band in `row − 1` and in the caret's own
+    /// row; the ink goes on [`band_row`], so neither spelling is measured
+    /// against the other one's row — the spine hot, and on every key the
+    /// band's row re-probed with ink up to two columns behind the caret, so
+    /// a grain priced for six cells has one and a half and a sky star born
+    /// over the just-typed cell has its own left margin. EVERY mark the key
+    /// bore — strike, field and exhaust — is swept 2 ms at a time from birth
+    /// to death against the probe AS IT STOOD ON ITS OWN KEY (the probe is
+    /// rewritten every key): not one sample on ink or the unknown, none
+    /// left of the column behind the ink, none off the effects box, and
+    /// every exhaust sample inside the caret row's own sky
+    /// ([`in_sky_of_row`] — geometry under `tall`, the probe through the
+    /// frontier under `underline`, where the flight straddles two rows).
+    /// Then the hand typing from the pane's first column over a blank row:
+    /// every mark stays on the glass.
+    ///
+    /// Non-vacuous on both fixtures: the run carries marks of at least two
+    /// lanes and its widest drift is over a cell (a moving sky is being
+    /// read); every key from the second throws a grain and EVERY grain is
+    /// clamped short of its priced 93.7 px — the clamp KEEPS the grain by
+    /// shortening it where §5.4's clearance would have dropped it; a sky
+    /// star was born within its own travel of the ink, and at the edge a sky
+    /// star and a grain were each born within their travel of the pane's
+    /// first column, so both clamps were clamps and not absences.
+    ///
+    /// Fails before: with the frontier clamp dropped every grain is priced
+    /// past the ink, `settle` finds no clear rest within 2 px and drops it,
+    /// and the grain count reddens; with the clamp reading `row − 1`
+    /// unconditionally the `underline` pass reddens on the `at_px` clause —
+    /// measured before that fix on this fixture, 289 of 637 exhaust samples
+    /// and 3 075 of 5 271 sky samples stood on a probed glyph under
+    /// `underline`, 0 under `tall`.
     #[test]
-    fn a_streaming_star_never_crosses_ink_or_the_pane_edge() {
-        let c = cfg(true);
-        let t0 = Instant::now();
-        let g = geom_cell(15, 28);
-        let sweep = |sky: &Stardust, min_col: i32| -> (usize, usize) {
-            let (mut streamed, mut clamped) = (0usize, 0usize);
-            for s in sky.live_iter().filter(|s| s.lane.is_sky()) {
-                let (x0, _) = s.pos(s.born, false);
-                let travel = stream_travel_px(stream_px_per_s(g.cw as f32, 1000.0 / 12.0));
+    fn no_mark_crosses_ink_or_the_pane_edge_at_any_instant_under_either_band_anchor() {
+        for tall in [true, false] {
+            let mut c = cfg(true);
+            c.ribbon_tall = tall;
+            let t0 = Instant::now();
+            let g = geom_cell(15, 28);
+            let cw = g.cw as f32;
+            let ribbon = Ribbon::new();
+            let priced = stream_travel_px(stream_px_per_s_with_share(
+                EXHAUST_SHARE_CW,
+                cw,
+                1000.0 / 12.0,
+            )) * stream_unit(EXHAUST_THROW_MS);
+            let sky_travel = stream_travel_px(stream_px_per_s(cw, 1000.0 / 12.0));
+            // Sweep one mark born at `at` over its life: every sample on a
+            // proven-blank pixel, at or right of column `min_col`, on the
+            // glass; the exhaust inside the caret row's sky. Returns how far
+            // left of its birth the mark ended.
+            let sweep = |sky: &Stardust, s: &Star, at: Instant, min_col: i32| -> f32 {
+                let (x0, _) = s.pos(at, false);
                 let mut x_end = x0;
-                for ms in (0..=(STREAM_END_MS as u64 + 200)).step_by(5) {
-                    let (x, y) = s.pos(s.born + Duration::from_millis(ms), false);
+                for step in 0..=250u64 {
+                    let now = at + Duration::from_millis(step * 2);
+                    if s.dead(now) {
+                        break;
+                    }
+                    let (x, y) = s.pos(now, false);
+                    x_end = x;
                     assert_eq!(
                         sky.probe().at_px(x, y, g),
                         Some(false),
-                        "a star born at x {x0} is over ink or the unknown at ({x}, {y}) {ms} ms on"
+                        "tall {tall}: a {:?} mark stood on ink or the unknown at ({x}, {y}), \
+                         +{} ms",
+                        s.lane,
+                        step * 2
                     );
                     assert!(
                         px_col(x as f32, g) >= min_col,
-                        "a star born at x {x0} crossed to column {} at {ms} ms",
-                        px_col(x as f32, g)
+                        "tall {tall}: a {:?} mark stood over column {} at +{} ms — the floor \
+                         is column {min_col}",
+                        s.lane,
+                        px_col(x as f32, g),
+                        step * 2
                     );
                     assert!(
                         x >= g.fx_left(),
-                        "a star born at x {x0} left the glass at x {x} ({ms} ms)"
+                        "tall {tall}: a {:?} mark stood at x {x}, left of the effects box's {} \
+                         px edge, +{} ms",
+                        s.lane,
+                        g.fx_left(),
+                        step * 2
                     );
-                    x_end = x;
+                    if s.lane == StarLane::Exhaust {
+                        assert!(
+                            in_sky_of_row(y as f32, 5, g),
+                            "tall {tall}: a grain left the caret row's sky at y {y}, +{} ms",
+                            step * 2
+                        );
+                    }
                 }
-                if x_end < x0 {
-                    streamed += 1;
+                (x0 - x_end) as f32
+            };
+            // (a) THE INK FOLLOWS THE HAND.
+            let mut sky = Stardust::new();
+            let mut occupied = [false; 120];
+            let (mut marks, mut grains, mut clamped, mut sky_clamped) = (0usize, 0, 0, 0);
+            let mut lanes: Vec<StarLane> = Vec::new();
+            let mut widest = 0.0f32;
+            for k in 0..20u16 {
+                let col = 40 + k;
+                for slot in occupied.iter_mut().take(usize::from(col) - 1) {
+                    *slot = true;
                 }
-                // Would the unclamped travel have crossed the floor?
-                let floor = i32::from(g.origin_x) + min_col * g.cw as i32;
-                if (x0 as f32 - travel) < floor as f32 {
-                    clamped += 1;
-                    assert!(
-                        x_end >= floor,
-                        "a star born at x {x0} rests at {x_end}, past the floor {floor}"
-                    );
+                sky.probe_mut().probe_row(4, &[false; 120]);
+                sky.probe_mut().probe_row(band_row(&c), &occupied);
+                let at = t0 + Duration::from_secs_f32(f32::from(k) / 12.0);
+                let mut cx = ctx_in(g, at, &c, (5, col));
+                cx.disp = 0.9;
+                cx.birth_disp = 0.9;
+                sky.budget.refill(at);
+                sky.on_event(&typed(TypedClass::Glyph), at, &cx, &ribbon);
+                let floor = (g.fx_left() + (i32::from(col) - 1) * g.cw as i32) as f32;
+                for s in sky.live_iter().filter(|s| s.born == at) {
+                    marks += 1;
+                    if !lanes.contains(&s.lane) {
+                        lanes.push(s.lane);
+                    }
+                    let drift = sweep(&sky, s, at, i32::from(col) - 1);
+                    widest = widest.max(drift);
+                    let (x0, _) = s.pos(at, false);
+                    if s.lane == StarLane::Exhaust {
+                        grains += 1;
+                        let travel = (x0 - s.rest().0) as f32;
+                        assert!(
+                            travel > 0.0,
+                            "tall {tall}: a grain over an inked row did not move at all"
+                        );
+                        clamped += usize::from(travel < priced - 1.0);
+                    } else if x0 as f32 - sky_travel < floor {
+                        sky_clamped += 1;
+                    }
                 }
             }
-            (streamed, clamped)
-        };
-        let (sky, _) = stream_sky(12.0, 8, 18, 18, &c, t0);
-        let (streamed, clamped) = sweep(&sky, 18);
-        eprintln!("ink at column 18: {streamed} stars streamed, {clamped} met the ink frontier");
-        assert!(
-            streamed > 0,
-            "no star streamed over the blank sky — nothing was clamped"
-        );
-        assert!(
-            clamped > 0,
-            "no star was born within its travel of the ink — the clamp was not exercised"
-        );
-        let (sky, _) = stream_sky(12.0, 8, 0, 0, &c, t0);
-        let (streamed, clamped) = sweep(&sky, 0);
-        eprintln!("the pane's first column: {streamed} stars streamed, {clamped} met the edge");
-        assert!(
-            streamed > 0,
-            "no star streamed from the pane's first columns"
-        );
-        assert!(
-            clamped > 0,
-            "no star was born within its travel of the pane's edge"
-        );
+            eprintln!(
+                "L4 SWEEP tall={tall}: {marks} marks of {} lanes, {grains} grains all clamped \
+                 short of {priced:.1} px, {sky_clamped} sky stars born within their travel of \
+                 the ink, widest drift {widest:.1} px ({:.2} cells)",
+                lanes.len(),
+                widest / cw
+            );
+            assert!(
+                marks >= 20 && lanes.len() >= 2,
+                "tall {tall}: the fixture carried {marks} marks of {} lanes — too thin to be a \
+                 census of the sky",
+                lanes.len()
+            );
+            assert!(
+                widest >= cw,
+                "tall {tall}: the widest drift over the whole run was {widest:.1} px — under a \
+                 cell, so the sweep is not reading a moving sky at all"
+            );
+            assert!(
+                grains >= 15,
+                "tall {tall}: the inked fixture threw {grains} grains over twenty keys — the \
+                 clamp is dropping them, not shortening them"
+            );
+            assert_eq!(
+                clamped, grains,
+                "tall {tall}: only {clamped} of {grains} grains were clamped short of the \
+                 priced {priced:.1} px: the frontier is not what is stopping them"
+            );
+            assert!(
+                sky_clamped > 0,
+                "tall {tall}: no sky star was born within its travel of the ink — the sky's \
+                 clamp was not exercised"
+            );
+            // (b) THE PANE'S OWN EDGE, over a blank row, the hand typing from
+            // column 0.
+            let mut sky = Stardust::new();
+            sky.probe_mut().probe_row(4, &[false; 120]);
+            sky.probe_mut().probe_row(5, &[false; 120]);
+            let (mut edge_grains, mut edge_sky) = (0usize, 0usize);
+            for k in 0..8u16 {
+                let at = t0 + Duration::from_secs_f32(f32::from(k) / 12.0);
+                let mut cx = ctx_in(g, at, &c, (5, k));
+                cx.disp = 0.9;
+                cx.birth_disp = 0.9;
+                sky.budget.refill(at);
+                sky.on_event(&typed(TypedClass::Glyph), at, &cx, &ribbon);
+                for s in sky.live_iter().filter(|s| s.born == at) {
+                    sweep(&sky, s, at, 0);
+                    let (x0, _) = s.pos(at, false);
+                    let travel = if s.lane == StarLane::Exhaust {
+                        priced
+                    } else {
+                        sky_travel
+                    };
+                    if (x0 as f32 - travel) < g.fx_left() as f32 {
+                        if s.lane == StarLane::Exhaust {
+                            edge_grains += 1;
+                        } else {
+                            edge_sky += 1;
+                        }
+                    }
+                }
+            }
+            assert!(
+                edge_grains > 0 && edge_sky > 0,
+                "tall {tall}: {edge_grains} grains and {edge_sky} sky stars were born within \
+                 their travel of the pane's edge — the edge clamp was not exercised"
+            );
+        }
     }
 
     /// **1d — THE SKY IS AT REST ONE STAR-LIFE AFTER THE LAST KEY.** The
@@ -10721,6 +11875,1314 @@ mod tests {
             (STREAM_SPENT - want).abs() < 1e-4,
             "STREAM_SPENT {STREAM_SPENT} is not 1 − e^(−{STREAM_END_MS}/{STREAM_TAU_MS}) = {want:.5}"
         );
+    }
+
+    // -- the exhaust (§33) -------------------------------------------------
+
+    /// Run `keys` at `cps` on a probed sky over the owner's cell, with the
+    /// band's own row ([`band_row`]) inked up to (and including) `ink_to − 1`,
+    /// and hand back the pool, the geometry and every exhaust grain with the
+    /// instant it was born on. The caret starts at column `col0` and walks
+    /// right, so the grains are thrown back over blank columns the run has
+    /// already passed. Row 4 is blank under both spellings: the band's own
+    /// row under `tall` (the ink replaces this read), and the row §5.4's
+    /// birth gate reads and the rise reaches into under `underline`.
+    fn exhaust_run(
+        cps: f32,
+        keys: u16,
+        col0: u16,
+        ink_to: usize,
+        c: &Config,
+        t0: Instant,
+    ) -> (Stardust, Geom, Vec<(Star, Instant)>) {
+        let g = geom_cell(15, 28);
+        let ribbon = Ribbon::new();
+        let mut sky = Stardust::new();
+        let mut occupied = [false; 120];
+        for slot in occupied.iter_mut().take(ink_to) {
+            *slot = true;
+        }
+        sky.probe_mut().probe_row(4, &[false; 120]);
+        sky.probe_mut().probe_row(band_row(c), &occupied);
+        let mut born = Vec::new();
+        for k in 0..keys {
+            let at = t0 + Duration::from_secs_f32(f32::from(k) / cps);
+            let mut cx = ctx_in(g, at, c, (5, col0 + k));
+            cx.disp = 0.9;
+            cx.birth_disp = 0.9;
+            sky.budget.refill(at);
+            sky.on_event(&typed(TypedClass::Glyph), at, &cx, &ribbon);
+            born.extend(
+                sky.live_iter()
+                    .filter(|s| s.born == at && s.lane == StarLane::Exhaust)
+                    .map(|s| (*s, at)),
+            );
+        }
+        (sky, g, born)
+    }
+
+    /// **D16'S TWO BAND ANCHORS, AS A ROW NUMBER** — the grid row the sky
+    /// band of the fixtures' caret row 5 falls in: `row − 1` under `tall`,
+    /// the caret's OWN row under `underline` ([`default_band_top`],
+    /// [`in_sky_of_row`]). Every fixture that lays ink under a flight reads
+    /// it from here, so a spelling is never tested against the other one's
+    /// row.
+    fn band_row(c: &Config) -> i32 {
+        if c.ribbon_tall { 4 } else { 5 }
+    }
+
+    /// The gate census: `keys` keys of `class` at `cps` on a probed-blank sky
+    /// at spine `disp`, dark or light, reduced or not — the exhaust grains
+    /// thrown, how many of them are m2, the bucket the run left and the
+    /// glints it cued.
+    fn exhaust_census(
+        class: TypedClass,
+        cps: f32,
+        disp: f32,
+        dark: bool,
+        reduced: bool,
+        keys: u16,
+        t0: Instant,
+    ) -> (usize, usize, f32, usize) {
+        let g = geom_cell(15, 28);
+        let ribbon = Ribbon::new();
+        let mut c = cfg(dark);
+        c.reduced_motion = reduced;
+        let mut sky = Stardust::new();
+        sky.probe_mut().probe_row(4, &[false; 120]);
+        let (mut n, mut m2) = (0usize, 0usize);
+        for k in 0..keys {
+            let at = t0 + Duration::from_secs_f32(f32::from(k) / cps);
+            let mut cx = ctx_in(g, at, &c, (5, 40 + k));
+            cx.disp = disp;
+            cx.birth_disp = disp;
+            sky.budget.refill(at);
+            sky.on_event(&typed(class), at, &cx, &ribbon);
+            for s in sky
+                .live_iter()
+                .filter(|s| s.born == at && s.lane == StarLane::Exhaust)
+            {
+                n += 1;
+                m2 += usize::from(s.class == StarClass::M2);
+            }
+        }
+        let glints = sky.take_glints().count();
+        (n, m2, sky.budget.tokens(), glints)
+    }
+
+    /// **WHAT A TYPING SESSION COSTS THE FRAME TRAIN** — `keys` keys at
+    /// `cps` under either band anchor, on a probed-blank sky (both rows: the
+    /// frontier treats an unprobed row as unknown, so a fixture that probed
+    /// only `row − 1` would measure `underline` throwing nothing and read it
+    /// as a cheap spelling) at a hot spine, stepped FORWARD one millisecond
+    /// at a time. The forward step is the whole method: [`Stardust::brisk`]
+    /// reads the pool AS IT STANDS, and a census taken against the finished
+    /// pool at past instants reads every star's age as zero and answers
+    /// `true` for almost the whole run whatever the exhaust does.
+    ///
+    /// Returns, as percentages of the run's milliseconds, the share the sky
+    /// was brisk and the share it WOULD have been with no exhaust grain in
+    /// the pool — [`Stardust::brisk`]'s own predicate (stars and veils) with
+    /// the [`StarLane::Exhaust`] stars filtered out — then the greatest live
+    /// count the run held and how many stars [`Stardust::make_room`] put on
+    /// an eviction finish. The filtered figure is a sound counterfactual
+    /// exactly while the run evicts nothing, which is why the caller asserts
+    /// the eviction count beside it.
+    fn exhaust_duty(tall: bool, row_4: CellInk, cps: f32, keys: u16) -> (u32, u32, usize, usize) {
+        let mut c = cfg(true);
+        c.ribbon_tall = tall;
+        let t0 = Instant::now();
+        let g = geom_cell(15, 28);
+        let ribbon = Ribbon::new();
+        let mut sky = Stardust::new();
+        sky.probe_mut().probe_row_ink(4, &[row_4; 120]);
+        sky.probe_mut().probe_row(5, &[false; 120]);
+        let span_ms = (1000.0 * f32::from(keys - 1) / cps) as u64 + 300;
+        let (mut brisk_ms, mut bare_ms) = (0u64, 0u64);
+        let (mut max_live, mut evicted, mut prev_fin) = (0usize, 0usize, 0usize);
+        let mut next_key = 0u16;
+        for ms in 0..span_ms {
+            let now = t0 + Duration::from_millis(ms);
+            while next_key < keys && t0 + Duration::from_secs_f32(f32::from(next_key) / cps) <= now
+            {
+                let mut cx = ctx_in(g, now, &c, (5, 20 + (next_key % 90)));
+                cx.disp = 0.9;
+                cx.birth_disp = 0.9;
+                sky.budget.refill(now);
+                sky.on_event(&typed(TypedClass::Glyph), now, &cx, &ribbon);
+                next_key += 1;
+                let fin = sky.live_iter().filter(|s| s.finish.is_some()).count();
+                evicted += fin.saturating_sub(prev_fin);
+                prev_fin = fin;
+                max_live = max_live.max(sky.live_iter().filter(|s| s.finish.is_none()).count());
+            }
+            brisk_ms += u64::from(sky.brisk(now));
+            bare_ms += u64::from(
+                sky.stars
+                    .iter()
+                    .any(|s| s.lane != StarLane::Exhaust && s.brisk(now))
+                    || sky.veil.iter().any(|v| v.age_s(now) < EDGE_IN_S),
+            );
+        }
+        let pct = |ms: u64| (ms * 100 / span_ms.max(1)) as u32;
+        (pct(brisk_ms), pct(bare_ms), max_live, evicted)
+    }
+
+    /// **§33 — THE EXHAUST IS BORN IN THE CARET'S SKY AND THROWN BACK ON THE
+    /// HAND'S OWN WIND** ([`StarLane::Exhaust`], `Stardust::sow_exhaust`,
+    /// [`EXHAUST_THROW_MS`]). The owner, 2026-09-10: the trail should "feel
+    /// more like it's streaming out of the cursor".
+    ///
+    /// Sixteen keys at 12 cps on the owner's 15×28 cell, the spine hot, the
+    /// sky row proved blank. Every key from the second on (the first has no
+    /// interval to be priced from, so it throws nothing) bears EXACTLY ONE
+    /// grain, born inside the caret cell's own sky band — `x` within
+    /// [`SKY_JITTER_CW`] of the cell's centre and `y` inside §5.4's
+    /// `[top − 0.30 ch, top − 0.04 ch]`, both with one pixel of slack for
+    /// the birth nudge and the round to a device pixel.
+    ///
+    /// Then the wind: at [`EXHAUST_THROW_MS`] the grain has run at least 3
+    /// cells BACK along the band's row (the priced reach at 12 cps on this
+    /// cell is `stream_travel_px(4.2·15·1000/83.3) · stream_unit(160)` =
+    /// 93.7 px = 6.2 cells, and the throw's ease-out is complete at its
+    /// window), and it is no higher than [`EXHAUST_RISE_CH`] of a cell above
+    /// where it started. An m3 is DEAD by 176 ms — its transient life is
+    /// `20 + 2.32·67` = 175.6 ms, so the grain dies on the wing — while the
+    /// 1-in-4 m2 ([`EXHAUST_M2_IN`]) is still alive at 200 ms and has not
+    /// moved a pixel since 160: §5.6's "thrown, then pinned", measured.
+    #[test]
+    fn the_exhaust_is_born_in_the_caret_s_sky_and_thrown_back_on_the_hand_s_wind() {
+        let c = cfg(true);
+        let t0 = Instant::now();
+        let (_, g, born) = exhaust_run(12.0, 16, 40, 0, &c, t0);
+        let (cw, ch) = (g.cw as f32, g.ch as f32);
+        let top = default_band_top(g, &c, 5);
+        assert_eq!(
+            born.len(),
+            15,
+            "sixteen keys at 12 cps threw {} grains, not one each from the second key on",
+            born.len()
+        );
+        let mut m2 = None;
+        for (k, (s, at)) in born.iter().enumerate() {
+            let col = 41 + k as u16;
+            let (cx, _) = g.cell_center(5, col);
+            assert!(
+                (s.x - cx).abs() <= SKY_JITTER_CW * cw + 1.0,
+                "grain {k} was born at x {} — {:.1} px off the caret cell's centre {cx}",
+                s.x,
+                (s.x - cx).abs()
+            );
+            assert!(
+                s.y >= (top - SKY_TOP_CH * ch).round() - 1.0
+                    && s.y <= (top - SKY_BOTTOM_CH * ch).round() + 1.0,
+                "grain {k} was born at y {} — outside the caret cell's sky band [{}, {}]",
+                s.y,
+                (top - SKY_TOP_CH * ch).round(),
+                (top - SKY_BOTTOM_CH * ch).round()
+            );
+            let (x0, y0) = s.pos(*at, false);
+            let thrown = *at + Duration::from_millis(EXHAUST_THROW_MS as u64);
+            let (x1, y1) = s.pos(thrown, false);
+            assert!(
+                (x0 - x1) as f32 >= 3.0 * cw,
+                "grain {k} ran {} px back in {EXHAUST_THROW_MS} ms — under three cells",
+                x0 - x1
+            );
+            assert!(
+                (y0 - y1) as f32 <= EXHAUST_RISE_CH * ch + 1.0 && y1 <= y0,
+                "grain {k} rose {} px, not at most {:.1}",
+                y0 - y1,
+                EXHAUST_RISE_CH * ch
+            );
+            match s.class {
+                StarClass::M3 => assert!(
+                    s.dead(*at + Duration::from_millis(176)),
+                    "an exhaust m3 outlived its 175.6 ms transient life"
+                ),
+                StarClass::M2 => {
+                    assert!(
+                        !s.dead(*at + Duration::from_millis(200)),
+                        "an exhaust m2 died before its 245.9 ms transient life"
+                    );
+                    assert_eq!(
+                        s.pos(thrown, false),
+                        s.pos(*at + Duration::from_millis(200), false),
+                        "an exhaust m2 kept moving after its throw: thrown, then PINNED"
+                    );
+                    m2 = Some(*s);
+                }
+                StarClass::M1 => panic!("the exhaust dealt an m1: it deals grains and m2s only"),
+            }
+        }
+        assert!(
+            m2.is_some(),
+            "fifteen grains at a hot spine dealt no m2 at all (1 in {EXHAUST_M2_IN})"
+        );
+    }
+
+    /// **§33 — THE EXHAUST NEVER CHIMES, SKIPS A SPACE, AND DEALS ITS m2
+    /// ONLY AT A HOT SPINE** (T1, §13, §8.2, §5.2). The gate census, twelve
+    /// or sixty keys at 8 cps on the owner's cell:
+    ///
+    /// * a HOT hand throws one grain per key from the second on, and the
+    ///   bucket it leaves is the bucket of the SAME twelve keys under reduced
+    ///   motion, which sows no grain (§6.11) — the exhaust is a throw and
+    ///   spends no glint token: one keystroke is one melody step and the key
+    ///   that threw the grain already has its tine (§19.2). Two byte-identical
+    ///   census calls compared against each other, until 2026-09-16, could
+    ///   only have reddened on a NaN;
+    /// * the LANE never chimes: [`StarLane::may_chime`] is `false` for it,
+    ///   asserted on the predicate itself. That is a second law, not a
+    ///   restatement of the bucket clause: the bucket pins the THROW path,
+    ///   the predicate pins the lane's declared permission — the one that
+    ///   refuses a chime the day someone gives the exhaust a cell and routes
+    ///   it through the sky deal. No count can stand in for it: `may_chime`
+    ///   has one reader (`deal_star`, for an m1) and the exhaust reaches the
+    ///   pool through [`Stardust::throw`], which has no glint arm;
+    /// * a SPACE throws none — it lays bed, it does not strike (§8.2), which
+    ///   is the placement of the `sow_exhaust` call after `deal_typed`'s
+    ///   `TypedClass::Space` early return;
+    /// * a WARM hand — spine 0.6, over [`STREAM_DISP`] and under
+    ///   [`FIELD_HOT_DISP`] — is fully populated over sixty keys and deals NOT
+    ///   ONE m2, with a hot control on the same sixty that does, so the m2
+    ///   deal's hot-spine gate is a gate and the clause is not an empty
+    ///   population;
+    /// * a LIGHT theme throws [`LIGHT_COUNT_SCALE`] of the dark theme's over
+    ///   sixty keys (eleven draws of a 0.6 coin would be a coin, not a share).
+    ///
+    /// Fails before: sowing on a Space (the call above the early return)
+    /// reddens the Space clause; dropping `birth_disp >= FIELD_HOT_DISP`
+    /// from the m2 deal reddens the warm clause with 16 m2s; `may_chime`
+    /// answering `true` for the exhaust reddens the no-chime clause — and,
+    /// for the hours of 2026-09-16 when that clause was cut as a
+    /// "restatement", reddened nothing in the crate. All three mutations
+    /// left every other stardust test green. The cold, stroll and
+    /// reduced-motion refusals are
+    /// `the_exhaust_costs_the_frame_train_its_own_window_and_no_more`'s,
+    /// which needs those fixtures for its brisk clause.
+    #[test]
+    fn the_exhaust_never_chimes_skips_a_space_and_deals_its_m2_only_at_a_hot_spine() {
+        let t0 = Instant::now();
+        let hot = exhaust_census(TypedClass::Glyph, 8.0, 0.9, true, false, 12, t0);
+        assert_eq!(
+            hot.0, 11,
+            "a hot 8 cps hand threw {} grains over twelve keys, not one each from the second",
+            hot.0
+        );
+        let no_grain = exhaust_census(TypedClass::Glyph, 8.0, 0.9, true, true, 12, t0);
+        assert_eq!(
+            no_grain.0, 0,
+            "the no-grain control (reduced motion) sowed {} grains",
+            no_grain.0
+        );
+        assert!(
+            (hot.2 - no_grain.2).abs() < 1e-6,
+            "eleven grains cost the glint bucket {} tokens: the exhaust is a THROW and spends \
+             none (§13 — one keystroke is one melody step)",
+            no_grain.2 - hot.2
+        );
+        // THE NO-CHIME CLAUSE, stated where it can fail. The bucket above is
+        // the throw path's; this is the lane's own answer, which no count in
+        // this module can observe (see the doc bullet).
+        assert!(
+            !StarLane::Exhaust.may_chime(),
+            "the exhaust lane may chime: ONE KEYSTROKE IS ONE MELODY STEP, and the key that \
+             threw the grain already has its tine (§13, §19.2)"
+        );
+        let space = exhaust_census(TypedClass::Space, 8.0, 0.9, true, false, 12, t0);
+        assert_eq!(
+            space.0, 0,
+            "twelve Spaces at a hot spine threw {} grains: a Space lays bed, it does not strike",
+            space.0
+        );
+        assert!(
+            (STREAM_DISP..FIELD_HOT_DISP).contains(&0.6),
+            "0.6 is no longer between STREAM_DISP {STREAM_DISP} and FIELD_HOT_DISP \
+             {FIELD_HOT_DISP}: the warm-but-not-hot band this clause needs has moved"
+        );
+        let warm = exhaust_census(TypedClass::Glyph, 8.0, 0.6, true, false, 60, t0);
+        assert_eq!(
+            warm.0, 59,
+            "a warm hand (spine 0.6) threw {} grains over sixty keys, not one each from the \
+             second: the exhaust's own gate is STREAM_DISP, not FIELD_HOT_DISP",
+            warm.0
+        );
+        assert_eq!(
+            warm.1, 0,
+            "a warm hand (spine 0.6, under FIELD_HOT_DISP {FIELD_HOT_DISP}) dealt {} m2s: the \
+             m2 is the HOT deal",
+            warm.1
+        );
+        let dark = exhaust_census(TypedClass::Glyph, 8.0, 0.9, true, false, 60, t0);
+        assert_eq!(
+            dark.0, 59,
+            "sixty keys on a dark theme threw {} grains, not one each from the second",
+            dark.0
+        );
+        assert!(
+            dark.1 > 0,
+            "sixty grains at a hot spine dealt no m2 at all (1 in {EXHAUST_M2_IN}): the warm \
+             clause above is vacuous"
+        );
+        let light = exhaust_census(TypedClass::Glyph, 8.0, 0.9, false, false, 60, t0);
+        let share = light.0 as f32 / dark.0 as f32;
+        eprintln!(
+            "the light theme threw {} of the dark theme's {} grains — {share:.2}",
+            light.0, dark.0
+        );
+        assert!(
+            (0.45..=0.80).contains(&share),
+            "the light share is {share:.2}, not about {LIGHT_COUNT_SCALE}"
+        );
+    }
+
+    /// **§33 — THE EXHAUST COSTS THE FRAME TRAIN ITS OWN WINDOW AND NOT ONE
+    /// MILLISECOND MORE** (T6, the owner's standing restraint:
+    /// responsiveness). The grain is the ONLY thing in the sky that is brisk
+    /// while a hand is typing — [`Star::brisk`] answers `false` for a
+    /// [`Motion::Lift`] whatever its `v0`, so the strike and field lanes
+    /// never held the train — and that is a real cost, so it is bounded
+    /// here rather than described:
+    ///
+    /// * from the last key the sky is brisk right up to
+    ///   [`EXHAUST_THROW_MS`] − 1 and NOT at + 1: the window closes on its
+    ///   own arithmetic, with no tail of frame-cadence wakes behind it. The
+    ///   measurement is taken at +20 ms and later, PAST the field star's own
+    ///   18 ms `edge-in` ([`EDGE_IN_S`]), so what is being read is the
+    ///   exhaust's window and not the edge-in the tree already had;
+    /// * the TRAVEL CAP ([`WALK_FAST_CELLS`]) is what bounds a burst's grain:
+    ///   at 30 cps every grain runs the capped 8.4 cells and not the priced
+    ///   15.6, over a blank row whose frontier is 300 px away so nothing but
+    ///   the cap can be stopping it, with the cap asserted REACHED so the
+    ///   clause cannot go vacuous if the cadence is lowered. The cap binds
+    ///   only above ~16.2 cps, which is why every other fixture in this file
+    ///   — 2, 8 and 12 cps — left it unguarded and deleting it kept the whole
+    ///   suite, goldens included, green;
+    /// * **the WHOLE SESSION'S duty is the window arithmetic**, no more and
+    ///   no less: key `k ≥ 1` holds `[t_k, t_k + 160)` and every key's field
+    ///   star its 18 ms edge-in, so above 6.25 cps the windows overlap and
+    ///   the train is held through the typing and 160 ms past it. The §18
+    ///   frame-cost gate cannot see this — it measures µs PER FRAME and is
+    ///   blind to a change in the NUMBER of frames — so the measured duty
+    ///   over 60 keys is held to the arithmetic within two points, at 4 and
+    ///   at the owner's 12 cps, and the no-exhaust baseline to its own (the
+    ///   edge-ins alone). §33's table has the figures;
+    /// * **the HEADROOM**: the exhaust yields within [`EXHAUST_HEADROOM`] of
+    ///   the cap, so past the 20 cps knee the pool peaks and evicts exactly
+    ///   as it did before the spark existed — the body's table is the
+    ///   record;
+    /// * and with the effect OFF the cost is exactly zero: under reduced
+    ///   motion, at a cold spine and at a stroll no grain is ever sown, and
+    ///   at the cold spine and the stroll the sky is quiet at +20 ms — the
+    ///   tree's own answer before §33, the field's edge-in and nothing
+    ///   behind it. (Reduced motion pins every mark, so [`Stardust::brisk`]
+    ///   is `false` there by construction and says nothing about the grain.)
+    #[test]
+    fn the_exhaust_costs_the_frame_train_its_own_window_and_no_more() {
+        let c = cfg(true);
+        let t0 = Instant::now();
+        let (sky, _, born) = exhaust_run(12.0, 16, 40, 0, &c, t0);
+        let last = born.last().expect("the run threw grains").1;
+        let at = |ms: u64| last + Duration::from_millis(ms);
+        // Past the field star's 18 ms edge-in: from here the grain is the
+        // only brisk thing in the sky.
+        let edge_in_ms = (EDGE_IN_S * 1000.0).ceil() as u64 + 2;
+        assert!(
+            sky.brisk(at(edge_in_ms)),
+            "the sky went quiet {edge_in_ms} ms after the key: the grain is not holding the train"
+        );
+        assert!(
+            sky.brisk(at(EXHAUST_THROW_MS as u64 - 1)),
+            "the sky went quiet before the grain's throw was over"
+        );
+        assert!(
+            !sky.brisk(at(EXHAUST_THROW_MS as u64 + 1)),
+            "the sky is still brisk after the last grain's throw: the window does not close"
+        );
+        // THE TRAVEL CAP ([`WALK_FAST_CELLS`]), where it BINDS. The cap only
+        // bites above ~16.2 cps — `stream_travel_px(4.2·cw·1000/ioi)` passes
+        // `16·cw` at `ioi` 61.7 ms — which is bursts, paste echoes and Codex
+        // streams, and it is load-bearing art there: at 30 cps it holds the
+        // priced travel to 8.4 cells instead of 15.6. Read over a blank row
+        // whose frontier is 300 px away, so nothing but the cap can be what
+        // is stopping them — and the cap is asserted REACHED, so it cannot
+        // go vacuous if the cadence is later lowered.
+        let (fast, gf, fast_born) = exhaust_run(30.0, 60, 20, 0, &c, t0);
+        let cw = gf.cw as f32;
+        let capped = WALK_FAST_CELLS * cw * stream_unit(EXHAUST_THROW_MS);
+        let uncapped = stream_travel_px(stream_px_per_s_with_share(
+            EXHAUST_SHARE_CW,
+            cw,
+            1000.0 / 30.0,
+        )) * stream_unit(EXHAUST_THROW_MS);
+        assert!(
+            uncapped > capped + cw,
+            "at 30 cps the priced travel is {uncapped:.1} px and the cap {capped:.1}: the cap \
+             is not binding, so the clause below measures nothing"
+        );
+        assert!(!fast_born.is_empty(), "the 30 cps fixture threw nothing");
+        for (s, at) in &fast_born {
+            let travel = (s.pos(*at, false).0 - s.rest().0) as f32;
+            assert!(
+                (travel - capped).abs() < 1.5,
+                "a 30 cps grain travelled {travel:.1} px where the cap is {capped:.1} \
+                 (the priced, uncapped travel is {uncapped:.1})"
+            );
+        }
+        eprintln!(
+            "60 keys at 30 cps: {} live of {STAR_CAP}, pool {} of {STAR_POOL_MAX}, {} of them exhaust",
+            fast.live_iter().filter(|s| s.finish.is_none()).count(),
+            fast.live(),
+            fast.live_iter()
+                .filter(|s| s.lane == StarLane::Exhaust)
+                .count()
+        );
+        // **WHAT THE WHOLE SESSION COSTS, NOT JUST THE TAIL** — held to the
+        // window arithmetic. Over 60 keys at `cps` the first key throws
+        // nothing (no interval to price) and holds only its field star's
+        // edge-in; every later key holds `[t_k, t_k + THROW)`, which overlap
+        // once the interval is under the window. The baseline is the
+        // edge-ins alone. Percentages of the census's own span (the last key
+        // plus 300 ms), truncated as the census truncates; two points of
+        // slack for the millisecond grid.
+        let expect = |cps: f32| -> (u32, u32) {
+            let ioi = 1000.0 / cps;
+            let edge = EDGE_IN_S * 1000.0;
+            let span = (1000.0 * 59.0 / cps).floor() + 300.0;
+            let held = if ioi < EXHAUST_THROW_MS {
+                58.0 * ioi + EXHAUST_THROW_MS
+            } else {
+                59.0 * EXHAUST_THROW_MS
+            } + edge;
+            let bare = 60.0 * edge.min(ioi);
+            ((held * 100.0 / span) as u32, (bare * 100.0 / span) as u32)
+        };
+        for cps in [4.0f32, 12.0] {
+            let (on, off, live, evicted) = exhaust_duty(true, CellInk::Blank, cps, 60);
+            let (want_on, want_off) = expect(cps);
+            eprintln!(
+                "{cps} cps, 60 keys: brisk {on}% of the session with the exhaust (arithmetic \
+                 {want_on}%), {off}% without it (arithmetic {want_off}%); {live} live of \
+                 {STAR_CAP}, {evicted} evictions"
+            );
+            assert_eq!(
+                evicted, 0,
+                "{cps} cps evicted {evicted} stars, so the no-exhaust baseline is not a \
+                 counterfactual: the exhaust displaced a star the baseline keeps"
+            );
+            assert!(
+                on.abs_diff(want_on) <= 2,
+                "{cps} cps holds the frame train {on}% of the session where its window \
+                 arithmetic says {want_on}%: the exhaust costs more, or less, than its window"
+            );
+            assert!(
+                off.abs_diff(want_off) <= 2,
+                "{cps} cps was brisk {off}% of the session with no grain in the pool, where \
+                 the edge-ins alone say {want_off}%: the BASELINE has moved"
+            );
+        }
+        // **WHAT THE CAP COSTS THE SKY — NOTHING, BY RULE.** Measured on this
+        // fixture, max live of 40 and evictions over 60 keys, before the
+        // exhaust → with it → with [`EXHAUST_HEADROOM`]:
+        //
+        //   cps   max live of 40          evictions
+        //    12     22 → 25                 0 → 0
+        //    15     27 → 30                 0 → 0
+        //    20     35 → 40 → 35            0 → 0
+        //    25     40 → 40                 1 → 10 → 1
+        //    30     40 → 40                 1 → 10 → 1
+        //
+        // 20 cps is the knee: the sky used to arrive AT the cap where it had
+        // stopped five short, and past it `make_room` retired the oldest
+        // live star — the strike m1 the eye follows — for a 176 ms grain.
+        // The exhaust yields within `EXHAUST_HEADROOM` of the cap (yielding
+        // only AT the cap measured 3 evictions at 25 cps: the spark had
+        // taken the seats the next key's own strike needed), so past the
+        // knee the eviction count is the pre-exhaust figure again. Pinned
+        // both ways: the peak at the knee and, past it, the evictions.
+        for cps in [25.0f32, 30.0] {
+            let (_, _, live, evicted) = exhaust_duty(true, CellInk::Blank, cps, 60);
+            eprintln!("{cps} cps, 60 keys: {live} live of {STAR_CAP}, {evicted} evictions");
+            assert!(
+                evicted <= 1,
+                "{cps} cps evicted {evicted} stars: the sky measured 1 eviction before the \
+                 exhaust existed, so the spark is displacing a hero it must yield to"
+            );
+        }
+        let (_, _, live20, evict20) = exhaust_duty(true, CellInk::Blank, 20.0, 60);
+        eprintln!("20 cps, 60 keys: {live20} live of {STAR_CAP}, {evict20} evictions");
+        assert!(
+            live20 <= 36,
+            "20 cps now peaks at {live20} live of {STAR_CAP} where the sky measured 35 with \
+             and without the exhaust: the spark is pushing the population past the knee it \
+             is meant to yield at"
+        );
+        // AND UNDER THE OTHER BAND ANCHOR: the two spellings must cost the
+        // same, because the brisk window is the throw's, not the band's —
+        // before the frontier clamp learned the band's own row, `underline`
+        // dropped 13 grains in 20 and paid this whole train for a mark the
+        // user mostly never saw.
+        let (on_t, off_t, _, _) = exhaust_duty(true, CellInk::Blank, 12.0, 60);
+        let (on_u, off_u, _, _) = exhaust_duty(false, CellInk::Blank, 12.0, 60);
+        eprintln!(
+            "12 cps, 60 keys: tall {on_t}% (bare {off_t}%), underline {on_u}% (bare {off_u}%)"
+        );
+        assert!(
+            on_u.abs_diff(on_t) <= 4,
+            "the underline spelling holds the frame train {on_u}% of the session where tall \
+             holds it {on_t}%: one spelling is paying for a grain the other is not throwing"
+        );
+        // Off is off: no grain, and no brisk frame owed to one.
+        for (label, disp, cps, reduced) in [
+            ("reduced motion", 0.9f32, 12.0f32, true),
+            ("a cold spine", 0.3, 12.0, false),
+            ("a 2 cps stroll", 0.9, 2.0, false),
+        ] {
+            let mut c = cfg(true);
+            c.reduced_motion = reduced;
+            let g = geom_cell(15, 28);
+            let ribbon = Ribbon::new();
+            let mut sky = Stardust::new();
+            sky.probe_mut().probe_row(4, &[false; 120]);
+            let mut last = t0;
+            for k in 0..16u16 {
+                last = t0 + Duration::from_secs_f32(f32::from(k) / cps);
+                let mut cx = ctx_in(g, last, &c, (5, 40 + k));
+                cx.disp = disp;
+                cx.birth_disp = disp;
+                sky.budget.refill(last);
+                sky.on_event(&typed(TypedClass::Glyph), last, &cx, &ribbon);
+            }
+            assert_eq!(
+                sky.live_iter()
+                    .filter(|s| s.lane == StarLane::Exhaust)
+                    .count(),
+                0,
+                "{label} sowed an exhaust grain"
+            );
+            // `Stardust::brisk` is `false` under reduced motion by
+            // construction, so only the other two can be asked.
+            assert!(
+                reduced || !sky.brisk(last + Duration::from_millis(edge_in_ms)),
+                "{label} owed the engine a frame-cadence wake {edge_in_ms} ms after the key, \
+                 past the field's own edge-in"
+            );
+        }
+    }
+
+    /// **§33 — A GRAIN NEEDS A CELL TO FLY OVER.** The cell behind the caret
+    /// must be proved CLEAR FOR THE SKY — "blank" here is the birth's own
+    /// clearance, [`GlyphProbe::sky_at`]: a blank, or a light rule whose
+    /// stroke lies above the zone — on every row the flight covers, or
+    /// nothing is thrown: the frontier walk would otherwise stop at the
+    /// caret's own column and the throw would be the cell's left margin —
+    /// measured on the owner's 15×28 cell before this gate, 15 grains of 15
+    /// keys travelling 4–12 px (under a cell) and holding the frame train
+    /// 96 % of a 60-key session, for a mark nobody could see. Two refusing
+    /// fixtures, each with the control that throws, and the rule row:
+    ///
+    /// * `tall` with `row − 1` inked in every column but the caret's own —
+    ///   the birth gate is open and this gate is the one refusing. No grain,
+    ///   and the sky is quiet past the field star's 18 ms edge-in — the
+    ///   tree's cost before §33. The same run under a blank row throws one
+    ///   per key from the second;
+    /// * `tall` under Claude Code's input box — `row − 1` a light rule in
+    ///   every column. Once the refusing fixture (the walk read the rule as
+    ///   ink, `GlyphProbe::at`); now the walk reads the birth's clearance
+    ///   and the run throws one per key, as the blank row does — the flight
+    ///   itself is `the_exhaust_flies_along_a_rule_row_in_the_sky_zone_under_the_stroke`'s;
+    /// * `underline` on a line being typed — the band is the caret's own row
+    ///   (D16) and the just-echoed glyph at `col − 1` is ink at the deal (the
+    ///   engine holds a Typed key until its echo, `Engine::replay_events`,
+    ///   and the host writes the probe before the tick). No grain, quiet
+    ///   past the edge-in; with one blank cell behind the caret — the key
+    ///   after a Space — one per key.
+    ///
+    /// Fails before: 15 grains and a brisk sky in both refusing fixtures.
+    #[test]
+    fn the_exhaust_needs_a_blank_cell_behind_the_caret() {
+        let t0 = Instant::now();
+        let edge_in_ms = (EDGE_IN_S * 1000.0).ceil() as u64 + 2;
+        // Sixteen keys at 12 cps, `probe` written before every key as the
+        // host writes it: the grains thrown, and whether the sky is still
+        // brisk past the field's edge-in after the last key.
+        let run = |c: &Config, probe: &dyn Fn(&mut Stardust, u16)| {
+            let g = geom_cell(15, 28);
+            let ribbon = Ribbon::new();
+            let mut sky = Stardust::new();
+            let mut grains = 0usize;
+            let mut last = t0;
+            for k in 0..16u16 {
+                let col = 40 + k;
+                probe(&mut sky, col);
+                last = t0 + Duration::from_secs_f32(f32::from(k) / 12.0);
+                let mut cx = ctx_in(g, last, c, (5, col));
+                cx.disp = 0.9;
+                cx.birth_disp = 0.9;
+                sky.budget.refill(last);
+                sky.on_event(&typed(TypedClass::Glyph), last, &cx, &ribbon);
+                grains += sky
+                    .live_iter()
+                    .filter(|s| s.born == last && s.lane == StarLane::Exhaust)
+                    .count();
+            }
+            (grains, sky.brisk(last + Duration::from_millis(edge_in_ms)))
+        };
+        // The line being typed as the host probes it: glyphs up to and
+        // including `col − 1 − gap`.
+        let text_to = |sky: &mut Stardust, col: u16, gap: u16| {
+            let mut cells = [false; 120];
+            for slot in cells.iter_mut().take(usize::from(col.saturating_sub(gap))) {
+                *slot = true;
+            }
+            sky.probe_mut().probe_row(5, &cells);
+        };
+        let tall = cfg(true);
+        let (grains, brisk) = run(&tall, &|sky, col| {
+            let mut above = [true; 120];
+            above[usize::from(col)] = false;
+            sky.probe_mut().probe_row(4, &above);
+            text_to(sky, col, 0);
+        });
+        assert_eq!(
+            grains, 0,
+            "tall with the row above inked but for the caret's own column threw {grains} \
+             grains: every one of them was a sub-cell twitch"
+        );
+        assert!(
+            !brisk,
+            "tall with the row above inked but for the caret's own column owed the engine a \
+             frame-cadence wake {edge_in_ms} ms after the key, with nothing thrown to show for it"
+        );
+        let (grains, _) = run(&tall, &|sky, col| {
+            sky.probe_mut().probe_row(4, &[false; 120]);
+            text_to(sky, col, 0);
+        });
+        assert_eq!(
+            grains, 15,
+            "tall under a blank row threw {grains} grains, not one per key from the second"
+        );
+        let (grains, _) = run(&tall, &|sky, col| {
+            sky.probe_mut().probe_row_ink(4, &[CellInk::Rule; 120]);
+            text_to(sky, col, 0);
+        });
+        assert_eq!(
+            grains, 15,
+            "tall under a rule row threw {grains} grains, not the blank row's one per key from \
+             the second: a rule is clear for the sky, and the walk reads the sky's clearance"
+        );
+        let mut under = cfg(true);
+        under.ribbon_tall = false;
+        let (grains, brisk) = run(&under, &|sky, col| {
+            sky.probe_mut().probe_row(4, &[false; 120]);
+            text_to(sky, col, 0);
+        });
+        assert_eq!(
+            grains, 0,
+            "underline on a line being typed threw {grains} grains over the glyph just echoed"
+        );
+        assert!(
+            !brisk,
+            "underline on a line being typed owed a frame-cadence wake {edge_in_ms} ms after \
+             the key"
+        );
+        let (grains, _) = run(&under, &|sky, col| {
+            sky.probe_mut().probe_row(4, &[false; 120]);
+            text_to(sky, col, 1);
+        });
+        assert_eq!(
+            grains, 15,
+            "underline with one blank cell behind the caret threw {grains} grains, not one per \
+             key from the second"
+        );
+    }
+
+    /// **§33 — THE EXHAUST FLIES ALONG A RULE ROW, IN THE SKY ZONE UNDER THE
+    /// STROKE.** The owner's ruling of 2026-09-08: the sky lives above Claude
+    /// Code's input box, whose row above the line being typed is a light rule
+    /// in every column. §5.4's rule clause bore the sky's stars there
+    /// ([`GlyphProbe::sky_at`]) while the frontier walk called the rule ink
+    /// ([`GlyphProbe::at`]) and stopped every flight at its own cell — the
+    /// sky's drift AND the grain's, one walk — and the audit's cell-behind
+    /// gate then threw no grain there at all. Measured on this fixture
+    /// before the walk read the sky's clearance: 0 grains; 21 strike and
+    /// field stars streaming a mean 5.3 px, at most 12 (their own cell's
+    /// left margin), against a mean 30.1 and at most 44 over a blank row.
+    ///
+    /// Sixty keys at 12 cps on the owner's 15×28 cell, `tall`, `row − 1` a
+    /// rule end to end and the line inked up to the caret as the host probes
+    /// Claude Code's box; the same sixty over a blank row as the control:
+    ///
+    /// * one grain per key from the second, as over a blank row, each
+    ///   running at least three cells (the priced 6.2 at this cadence);
+    /// * the sky's own stars stream as far as they do over a blank row —
+    ///   one walk, two callers, one answer;
+    /// * every flight sample of every grain AND of every sky star, 2 ms
+    ///   apart, has its core UNDER the stroke band ([`rule_stroke_px`] of
+    ///   row 4, and the pixel probe clear) inside the caret row's sky, and
+    ///   every rest is off the stroke: the grain's rise and the strike's
+    ///   lift are held to the headroom the birth left under the band. At
+    ///   least one grain rose less than the smallest UNclamped rise
+    ///   (`0.5 · EXHAUST_RISE_CH · ch`), some strikes lift less than their
+    ///   whole lift and some lift it all, and over the blank row every
+    ///   strike lifts it all — so the clamp is what is being read, per
+    ///   birth. Before the lift was held: 384 of 8 791 sky-star samples
+    ///   inside the band and 4 of 61 rests on the stroke, on this fixture;
+    /// * no chime — the glints the run cued are the blank row's own, and no
+    ///   grain is an m1;
+    /// * the frame train's duty over sixty keys is the blank row's — 96 %
+    ///   at 12 cps either way, the window arithmetic of
+    ///   `the_exhaust_costs_the_frame_train_its_own_window_and_no_more` —
+    ///   with the same evictions. (The no-exhaust baseline reads 0 % under
+    ///   the rule against the blank row's 20 %: that is the veil's edge-in,
+    ///   which the veil does not lay over a rule cell. Reported, not
+    ///   compared.);
+    /// * a rule that ENDS left of the caret (a box-drawing title's tail) is
+    ///   crossed by marks born over blank cells, and none of them enters
+    ///   its stroke: the headroom is read over every cell of the flight.
+    ///
+    /// Fails before: 0 grains, the sky's stars streaming 5 px. Mutations,
+    /// each with every other stardust test green: the walk reading `at`
+    /// reddens the travel (59 grains at 3–12 px, the sky's stars at a mean
+    /// 5.7); the rise left unclamped reddens the COUNT (57 of 59 — `settle`
+    /// drops the two whose rests would sit on the stroke with no clear
+    /// pixel within 2 px, and re-aims four more), because the audit's rest
+    /// clearance is the second guard on the band; unclamped AND the pixel
+    /// probe calling the stroke clear reddens the stroke-band clause itself
+    /// (1 216 of 5 647 samples inside); the lift left unclamped reddens the
+    /// sky's stroke-band clause (384 of 8 791). The headroom read at the
+    /// birth column alone survives the title fixture — nine marks cross, and
+    /// none of them was born low enough to reach the band over the rule —
+    /// and is caught by
+    /// `the_headroom_under_a_rule_reads_every_column_the_flight_crosses`;
+    /// the fixture here pins the scenario, the unit test the law.
+    #[test]
+    fn the_exhaust_flies_along_a_rule_row_in_the_sky_zone_under_the_stroke() {
+        let c = cfg(true);
+        let t0 = Instant::now();
+        let g = geom_cell(15, 28);
+        let (cw, ch) = (g.cw as f32, g.ch as f32);
+        // Sixty keys, the probe written before each as the host writes
+        // Claude Code's box: `row_4` above the line, the line inked up to and
+        // including the cell behind the caret. Hands back the pool, the
+        // grains and the sky stars born in the run, each with its birth
+        // instant.
+        type Born = Vec<(Star, Instant)>;
+        let run = |row_4: &[CellInk; 120]| -> (Stardust, Born, Born) {
+            let ribbon = Ribbon::new();
+            let mut sky = Stardust::new();
+            let (mut grains, mut stars) = (Vec::new(), Vec::new());
+            for k in 0..60u16 {
+                let col = 20 + k;
+                let mut line = [false; 120];
+                for slot in line.iter_mut().take(usize::from(col)) {
+                    *slot = true;
+                }
+                sky.probe_mut().probe_row_ink(4, row_4);
+                sky.probe_mut().probe_row(5, &line);
+                let at = t0 + Duration::from_secs_f32(f32::from(k) / 12.0);
+                let mut cx = ctx_in(g, at, &c, (5, col));
+                cx.disp = 0.9;
+                cx.birth_disp = 0.9;
+                sky.budget.refill(at);
+                sky.on_event(&typed(TypedClass::Glyph), at, &cx, &ribbon);
+                for s in sky.live_iter().filter(|s| s.born == at) {
+                    if s.lane == StarLane::Exhaust {
+                        grains.push((*s, at));
+                    } else if s.lane.is_sky() {
+                        stars.push((*s, at));
+                    }
+                }
+            }
+            (sky, grains, stars)
+        };
+        let mean = |v: &[f32]| v.iter().sum::<f32>() / v.len().max(1) as f32;
+        let max = |v: &[f32]| v.iter().copied().fold(0.0f32, f32::max);
+        let min = |v: &[f32]| v.iter().copied().fold(f32::INFINITY, f32::min);
+        // How far each mark travels LEFT over its life, px.
+        let travel = |v: &[(Star, Instant)]| -> Vec<f32> {
+            v.iter()
+                .map(|(s, at)| (s.pos(*at, false).0 - s.rest().0) as f32)
+                .collect()
+        };
+        // Every position of every mark over its life, 2 ms apart, against
+        // the probe as it stood at the birth (the rule row is rewritten
+        // unchanged before every key): samples, cores inside the stroke band
+        // of a rule cell of row 4 (read off the band and the cell's class,
+        // not the pixel probe), cores on ink or the unknown by the pixel
+        // probe, and rests on ink.
+        let band = rule_stroke_px(g.ch);
+        let row_4_top = i32::from(g.origin_y) + 4 * g.ch as i32;
+        let sample = |pool: &Stardust, marks: &[(Star, Instant)]| -> (usize, usize, usize, usize) {
+            let (mut samples, mut in_band, mut on_ink, mut rests) =
+                (0usize, 0usize, 0usize, 0usize);
+            for (s, at) in marks {
+                for step in 0..=1000u64 {
+                    let now = *at + Duration::from_millis(step * 2);
+                    if s.dead(now) {
+                        break;
+                    }
+                    let (x, y) = s.pos(now, false);
+                    samples += 1;
+                    let ruled = u16::try_from(px_col(x as f32, g))
+                        .is_ok_and(|col| pool.probe().rule_at(4, col));
+                    in_band += usize::from(
+                        ruled && px_row(y as f32, g) == 4 && band.contains(&(y - row_4_top)),
+                    );
+                    on_ink += usize::from(pool.probe().at_px(x, y, g) != Some(false));
+                    assert!(
+                        in_sky_of_row(y as f32, 5, g),
+                        "a {:?} mark left the caret row's sky at y {y}, +{} ms",
+                        s.lane,
+                        step * 2
+                    );
+                }
+                let rest = s.rest();
+                rests += usize::from(pool.probe().at_px(rest.0, rest.1, g) == Some(true));
+            }
+            (samples, in_band, on_ink, rests)
+        };
+        let (mut sky, grains, stars) = run(&[CellInk::Rule; 120]);
+        let (mut blank, blank_grains, blank_stars) = run(&[CellInk::Blank; 120]);
+        let (travels, blank_travels) = (travel(&grains), travel(&blank_grains));
+        let (streams, blank_streams) = (travel(&stars), travel(&blank_stars));
+        eprintln!(
+            "RULE ROW: {} grains, travel min {:.1} / mean {:.1} / max {:.1} px ({:.2} cells \
+             mean); {} sky stars streaming mean {:.1} px, max {:.1}. BLANK ROW: {} grains, \
+             travel mean {:.1} px; {} sky stars streaming mean {:.1} px, max {:.1}",
+            grains.len(),
+            min(&travels),
+            mean(&travels),
+            max(&travels),
+            mean(&travels) / cw,
+            streams.len(),
+            mean(&streams),
+            max(&streams),
+            blank_grains.len(),
+            mean(&blank_travels),
+            blank_streams.len(),
+            mean(&blank_streams),
+            max(&blank_streams)
+        );
+        // 1. THE COUNT AND THE TRAVEL — the blank row's.
+        assert_eq!(
+            grains.len(),
+            59,
+            "sixty keys under a rule row threw {} grains, not one per key from the second",
+            grains.len()
+        );
+        assert_eq!(
+            grains.len(),
+            blank_grains.len(),
+            "the rule row threw {} grains where the blank row threw {}",
+            grains.len(),
+            blank_grains.len()
+        );
+        for (k, t) in travels.iter().enumerate() {
+            assert!(
+                *t >= 3.0 * cw,
+                "grain {k} ran {t:.1} px along the rule row — under three cells"
+            );
+        }
+        // 2. THE SKY'S OWN DRIFT — one walk, two callers, one answer.
+        assert!(
+            streams.len() == blank_streams.len() && !streams.is_empty(),
+            "the rule row bore {} sky stars where the blank row bore {}",
+            streams.len(),
+            blank_streams.len()
+        );
+        assert!(
+            (mean(&streams) - mean(&blank_streams)).abs() <= 1.0
+                && (max(&streams) - max(&blank_streams)).abs() <= 1.0,
+            "the sky streams a mean {:.1} px (max {:.1}) along a rule row against {:.1} (max \
+             {:.1}) over a blank row: the walk still calls a rule ink",
+            mean(&streams),
+            max(&streams),
+            mean(&blank_streams),
+            max(&blank_streams)
+        );
+        // 3. THE FLIGHT UNDER THE STROKE, sampled every 2 ms of every grain
+        // and of every sky star.
+        let (samples, in_band, on_ink, rests) = sample(&sky, &grains);
+        let (star_samples, star_in_band, star_on_ink, star_rests) = sample(&sky, &stars);
+        let min_rise = (0.5 * EXHAUST_RISE_CH * ch).round() as i32;
+        let clamped = grains
+            .iter()
+            .filter(|(s, at)| s.pos(*at, false).1 - s.rest().1 < min_rise)
+            .count();
+        // A strike's UNclamped lift over its life, px — 3 for a hero and 2
+        // for an m2 on this cell — against the lift each star actually
+        // takes; an m3 and a field star are pinned and are neither.
+        let full_lift = |s: &Star| {
+            (-sky_lift_px_per_s(ch) / 1000.0 * s.class.life_s(s.lane) * 1000.0).round() as i32
+        };
+        let lifts = |want: &dyn Fn(i32, i32) -> bool| {
+            stars
+                .iter()
+                .filter(|(s, at)| {
+                    s.lane == StarLane::Strike
+                        && s.class != StarClass::M3
+                        && want(s.pos(*at, false).1 - s.rest().1, full_lift(s))
+                })
+                .count()
+        };
+        let (held, whole) = (
+            lifts(&|lift, full| lift < full),
+            lifts(&|lift, full| lift == full),
+        );
+        eprintln!(
+            "GRAINS: {samples} flight samples, {in_band} in the stroke band, {on_ink} on ink, \
+             {rests} rests on ink; {clamped} of {} grains rose under the smallest unclamped \
+             rise ({min_rise} px). STARS: {star_samples} samples, {star_in_band} in the band, \
+             {star_on_ink} on ink, {star_rests} rests on ink; of the lifting strikes {held} \
+             lift less than their whole lift and {whole} lift it all",
+            grains.len()
+        );
+        assert!(samples > 100, "only {samples} flight samples: nothing flew");
+        assert_eq!(
+            in_band, 0,
+            "{in_band} of {samples} flight samples had the core inside the rule's stroke band \
+             {band:?} of row 4"
+        );
+        assert_eq!(
+            on_ink, 0,
+            "{on_ink} of {samples} flight samples stood on ink or the unknown"
+        );
+        assert_eq!(rests, 0, "{rests} grains came to rest on the rule's stroke");
+        assert!(
+            clamped > 0,
+            "no grain rose under the smallest unclamped rise ({min_rise} px): the headroom \
+             clamp was not exercised"
+        );
+        // …and the sky's own stars: a strike born in the zone's lowest
+        // pixels lifted its core INTO the stroke before the lift was held —
+        // 384 of 8 791 samples and 4 of 61 rests on this fixture.
+        assert!(
+            star_samples > 100,
+            "only {star_samples} sky samples: no star lived"
+        );
+        assert_eq!(
+            star_in_band, 0,
+            "{star_in_band} of {star_samples} sky-star samples had the core inside the rule's \
+             stroke band {band:?} of row 4: the strike's lift is not held under the stroke"
+        );
+        assert_eq!(
+            star_on_ink, 0,
+            "{star_on_ink} of {star_samples} sky-star samples stood on ink or the unknown"
+        );
+        assert_eq!(
+            star_rests, 0,
+            "{star_rests} sky stars came to rest on the rule's stroke"
+        );
+        assert!(
+            held > 0 && whole > 0,
+            "of the lifting strikes {held} lift less than their whole lift and {whole} lift it \
+             all: the headroom is not being read per birth"
+        );
+        // The blank row's stars keep §5.6's whole lift, every one.
+        assert!(
+            blank_stars
+                .iter()
+                .filter(|(s, _)| s.lane == StarLane::Strike && s.class != StarClass::M3)
+                .all(|(s, at)| s.pos(*at, false).1 - s.rest().1 == full_lift(s)),
+            "a strike over a blank row lifted less than its whole lift"
+        );
+        // 4. NO CHIME — the glints are the blank row's own.
+        assert_eq!(
+            sky.take_glints().count(),
+            blank.take_glints().count(),
+            "the rule row cued a different number of glints from the blank row"
+        );
+        assert!(
+            grains.iter().all(|(s, _)| s.class != StarClass::M1),
+            "the exhaust dealt an m1 along the rule row"
+        );
+        // 5. THE DUTY — what a blank row costs, no more. The bare figure is
+        // reported and not compared: it is the veil's 18 ms edge-in, and the
+        // veil is refused over a rule cell (`deal_veil` reads the cell-level
+        // `GlyphProbe::at`) — the tree's own answer, not this test's subject.
+        let (on, off, _, evicted) = exhaust_duty(true, CellInk::Rule, 12.0, 60);
+        let (on_b, off_b, _, evicted_b) = exhaust_duty(true, CellInk::Blank, 12.0, 60);
+        eprintln!(
+            "12 cps, 60 keys under a rule row: brisk {on}% of the session ({off}% without the \
+             exhaust), {evicted} evictions; over a blank row {on_b}% ({off_b}%), {evicted_b}"
+        );
+        assert!(
+            on.abs_diff(on_b) <= 1 && evicted == evicted_b,
+            "the rule row holds the frame train {on}% of the session ({evicted} evictions) \
+             where the blank row holds it {on_b}% ({evicted_b}): the spark costs more, or \
+             less, along a rule than over a blank row"
+        );
+        // 6. A RULE THAT ENDS LEFT OF THE CARET — a box-drawing title's
+        // tail: rule cells in the columns before 40, blanks from 40 on. A
+        // grain born under a blank cell rises its full rise unless the
+        // flight crosses onto the rule, where the headroom is read over
+        // every cell of the flight; with the birth column alone asked the
+        // grain would fly through the stroke of the cells it crosses.
+        let mut title = [CellInk::Blank; 120];
+        title[..40].fill(CellInk::Rule);
+        let (pool, grains, stars) = run(&title);
+        let crossed = grains
+            .iter()
+            .chain(&stars)
+            .filter(|(s, at)| {
+                px_col(s.pos(*at, false).0 as f32, g) >= 40 && px_col(s.rest().0 as f32, g) < 40
+            })
+            .count();
+        let (samples, in_band, on_ink, rests) = sample(&pool, &grains);
+        let (star_samples, star_in_band, star_on_ink, star_rests) = sample(&pool, &stars);
+        eprintln!(
+            "TITLE RULE: {} grains and {} stars, {crossed} born over a blank cell and resting \
+             over the rule; grains {samples} samples / {in_band} in band / {on_ink} on ink / \
+             {rests} rests on ink; stars {star_samples} / {star_in_band} / {star_on_ink} / \
+             {star_rests}",
+            grains.len(),
+            stars.len()
+        );
+        assert!(
+            crossed > 0,
+            "no mark born over a blank cell crossed onto the rule"
+        );
+        assert_eq!(
+            (
+                in_band,
+                on_ink,
+                rests,
+                star_in_band,
+                star_on_ink,
+                star_rests
+            ),
+            (0, 0, 0, 0, 0, 0),
+            "a mark crossing onto a rule that ends left of the caret entered its stroke: \
+             grains {in_band} in band / {on_ink} on ink / {rests} rests, stars {star_in_band} / \
+             {star_on_ink} / {star_rests}"
+        );
+    }
+
+    /// **§33 — A GRAIN IS NOT BORN ON THE CARET CELL'S OWN GLYPH.** Under
+    /// `underline` the band is the caret's own row (D16), so §5.4's clearance
+    /// is asked of that cell as well as of `row − 1`: a mid-line insert, an
+    /// autosuggest ghost or a TUI overtype puts a glyph under the caret, and
+    /// the grain would be born on it and fly within its cell. The caret row
+    /// inked everywhere but the one cell behind the caret (so the blank-cell
+    /// gate is open and this gate is the one refusing): `underline` throws
+    /// nothing; `tall`, whose band is the blank row above, throws one per key
+    /// from the second — the control. Fails before: 15 grains under
+    /// `underline`, every one born on a probed glyph.
+    #[test]
+    fn the_exhaust_is_not_born_on_the_caret_cell_s_own_glyph() {
+        let t0 = Instant::now();
+        for (tall, want) in [(false, 0usize), (true, 15)] {
+            let mut c = cfg(true);
+            c.ribbon_tall = tall;
+            let g = geom_cell(15, 28);
+            let ribbon = Ribbon::new();
+            let mut sky = Stardust::new();
+            let (mut grains, mut on_glyph) = (0usize, 0usize);
+            for k in 0..16u16 {
+                let col = 40 + k;
+                let mut cells = [true; 120];
+                cells[usize::from(col) - 1] = false;
+                sky.probe_mut().probe_row(4, &[false; 120]);
+                sky.probe_mut().probe_row(5, &cells);
+                let at = t0 + Duration::from_secs_f32(f32::from(k) / 12.0);
+                let mut cx = ctx_in(g, at, &c, (5, col));
+                cx.disp = 0.9;
+                cx.birth_disp = 0.9;
+                sky.budget.refill(at);
+                sky.on_event(&typed(TypedClass::Glyph), at, &cx, &ribbon);
+                for s in sky
+                    .live_iter()
+                    .filter(|s| s.born == at && s.lane == StarLane::Exhaust)
+                {
+                    grains += 1;
+                    on_glyph +=
+                        usize::from(sky.probe().at_px(s.x as i32, s.y as i32, g) == Some(true));
+                }
+            }
+            assert_eq!(
+                grains, want,
+                "tall {tall}: a caret over a glyph threw {grains} grains, not {want}"
+            );
+            assert_eq!(
+                on_glyph, 0,
+                "tall {tall}: {on_glyph} grains were born with their core on a probed glyph"
+            );
+        }
+    }
+
+    /// **§33 — AN EXHAUST GRAIN'S REST TAKES NO HOME-CELL EXEMPTION.**
+    /// [`Stardust::settle`] calls a radial throw's origin cell clear whatever
+    /// the probe says, because the landing, a hop's landing and the cell an
+    /// erase emptied are cells the caret owns. The exhaust's origin is the
+    /// caret cell's SKY — under `tall`, `row − 1`, where no caret stands — so
+    /// its rest is asked of the probe like any free grain's: a grain born in
+    /// the sky zone of a light-rule cell (0.62 ch, below the stroke) and
+    /// thrown 4 px up into the stroke band is DROPPED — no clear pixel within
+    /// 2 px, and a free grain is never walked back. The same star on the
+    /// erase lane, whose origin cell IS exempt, is sown with its rest
+    /// untouched: the control that says the exemption still stands for the
+    /// lanes it was written for. Fails before: the exhaust grain is sown on
+    /// the stroke.
+    #[test]
+    fn an_exhaust_grain_rests_by_the_probe_and_not_by_its_home_cell() {
+        let c = cfg(true);
+        let t0 = Instant::now();
+        let g = geom_cell(15, 28);
+        let mut sky = Stardust::new();
+        sky.probe_mut().probe_row_ink(4, &[CellInk::Rule; 120]);
+        let cx = ctx_in(g, t0, &c, (5, 40));
+        let (x, _) = g.cell_center(4, 40);
+        let row_top = f32::from(g.origin_y) + 4.0 * g.ch as f32;
+        let y = row_top + (0.62 * g.ch as f32).round();
+        for (lane, sown) in [(StarLane::Exhaust, false), (StarLane::Erase, true)] {
+            let mut s = star(StarClass::M3, lane, t0, TINT_WHITE_RGB);
+            s.x = x.round();
+            s.y = y;
+            let window = lane.throw_ms().expect("a throw lane");
+            s.v0 = (-3.0 / window, -4.0 / window);
+            let rest = s.rest();
+            assert_eq!(
+                sky.probe().at_px(rest.0, rest.1, g),
+                Some(true),
+                "{lane:?}: the fixture's rest {rest:?} is not on the rule's stroke"
+            );
+            assert_eq!(
+                sky.settle(&mut s, false, &cx),
+                sown,
+                "{lane:?}: a rest on the stroke was {}",
+                if sown { "dropped" } else { "sown" }
+            );
+            if sown {
+                assert_eq!(s.rest(), rest, "{lane:?}: the exempt rest was re-aimed");
+            }
+        }
+    }
+
+    /// **§33 — THE EXHAUST FLOORS ITS SPINE ON THE MEND'S** ([`Mend::disp`]).
+    /// A fix key resumes the momentum the deleting interrupted, so it
+    /// exhausts like the key it replaces: a COLD hand (`birth_disp` 0.3,
+    /// under [`STREAM_DISP`]) at 8 cps throws nothing over twelve keys, and
+    /// the same twelve each carrying a mend mark at 0.9 throw one from the
+    /// second. The floor is the MARK's, whether or not the strike's own pull
+    /// was accepted — [`Stardust::pull_origin`] refuses on placement, not
+    /// momentum — which is the law stated at the gate. Fails before
+    /// (`ctx.birth_disp` unfloored): the mended run throws nothing either.
+    #[test]
+    fn the_exhaust_floors_its_spine_on_the_mend_s() {
+        let c = cfg(true);
+        let t0 = Instant::now();
+        let g = geom_cell(15, 28);
+        let ribbon = Ribbon::new();
+        let run = |mended: bool| {
+            let mut sky = Stardust::new();
+            sky.probe_mut().probe_row(4, &[false; 120]);
+            let mut n = 0usize;
+            for k in 0..12u16 {
+                let col = 40 + k;
+                let at = t0 + Duration::from_secs_f32(f32::from(k) / 8.0);
+                let mut cx = ctx_in(g, at, &c, (5, col));
+                cx.disp = 0.3;
+                cx.birth_disp = 0.3;
+                cx.mend = mended.then_some(Mend {
+                    at,
+                    disp: 0.9,
+                    row: 5,
+                    col: col - 1,
+                    deletes: 1,
+                });
+                sky.budget.refill(at);
+                sky.on_event(&typed(TypedClass::Glyph), at, &cx, &ribbon);
+                n += sky
+                    .live_iter()
+                    .filter(|s| s.born == at && s.lane == StarLane::Exhaust)
+                    .count();
+            }
+            n
+        };
+        let cold = run(false);
+        assert_eq!(
+            cold, 0,
+            "a cold hand (spine 0.3) threw {cold} grains with no mend to floor it"
+        );
+        let mended = run(true);
+        assert_eq!(
+            mended, 11,
+            "a cold hand mending at 0.9 threw {mended} grains, not one per key from the second: \
+             the exhaust does not floor its spine on the mend's"
+        );
+    }
+
+    /// **THE BLANK FRONTIER'S EARLY STOP IS THE SAME ANSWER** — the walk
+    /// breaks as soon as `x − floor_x` covers the `want` it was priced,
+    /// because that quantity only grows as the frontier moves left and the
+    /// value is `want.min(x − floor_x)`. Read against a REFERENCE that
+    /// always walks the whole contiguous blank run, over a 190-column row in
+    /// twelve ink patterns × nine caret columns × six `want`s (a
+    /// sub-half-pixel one, a fraction of a cell, and up to 40 cells — past
+    /// anything the sky or the exhaust can price): 5 832 answers, every one
+    /// equal to the bit.
+    ///
+    /// Fails before/after: stopping at `want / 2` instead of `want` (a break
+    /// that is not the fixed point) reports a short reach on every pattern
+    /// whose ink is inside the priced travel.
+    #[test]
+    fn the_blank_frontiers_early_stop_is_the_whole_walks_answer() {
+        let c = cfg(true);
+        let t0 = Instant::now();
+        let g = geom_cell(15, 28);
+        let cw = g.cw as f32;
+        let cx = ctx_in(g, t0, &c, (5, 60));
+        let mut checked = 0usize;
+        for pattern in 0..12u32 {
+            let mut occupied = [false; 120];
+            for (col, slot) in occupied.iter_mut().enumerate() {
+                // Twelve shapes: an all-blank row, an all-ink row, and ten
+                // seeded mixes, so the frontier lands at every distance from
+                // the caret the walk can reach.
+                *slot = match pattern {
+                    0 => false,
+                    1 => true,
+                    p => hash01(mix32(col as u32 ^ (p << 16))) < 0.08 * p as f32,
+                };
+            }
+            let mut sky = Stardust::new();
+            sky.probe_mut().probe_row(4, &occupied);
+            for caret in [0u16, 1, 2, 7, 30, 59, 60, 61, 119] {
+                let (x, _) = g.cell_center(5, caret);
+                // The reference: the whole contiguous blank run left of the
+                // caret's own column, with no early stop at all.
+                let mut frontier = i32::from(caret);
+                while frontier > 0 {
+                    let left = frontier - 1;
+                    if !occupied[left as usize] {
+                        frontier = left;
+                    } else {
+                        break;
+                    }
+                }
+                let floor_x = (g.fx_left() + frontier * g.cw as i32) as f32;
+                for want in [0.4f32, 0.5, 3.0, 7.0 * cw, 16.0 * cw, 40.0 * cw] {
+                    let reference = if want.is_finite() && want >= 0.5 {
+                        want.min(x - floor_x).max(0.0)
+                    } else {
+                        0.0
+                    };
+                    // The band's own row, as every caller now passes it: a
+                    // point span inside row 4 under this fixture's `tall`.
+                    let by = default_band_top(g, &c, 5) - 0.2 * g.ch as f32;
+                    let got = sky.blank_frontier_px(x, (by, by), want, &cx);
+                    assert!(
+                        (got - reference).abs() < 1e-4,
+                        "pattern {pattern}, caret {caret}, want {want}: the early stop \
+                         answered {got} where the whole walk answers {reference}"
+                    );
+                    checked += 1;
+                }
+            }
+        }
+        assert_eq!(checked, 12 * 9 * 6, "the census did not run in full");
     }
 
     // -- the mend's star (1e) ----------------------------------------------
@@ -11004,11 +13466,30 @@ mod tests {
                 "{label}: the caret's cell holds {at_home:?} at +{window_ms} ms — one star per cell"
             );
 
-            // The cadence: one brisk window, then tails.
+            // The cadence: one brisk window, then tails. The POOL's window
+            // is the longest thing the fix key set moving — the pull
+            // ([`MEND_PULL_MS`] 110) until §33, the exhaust's throw
+            // ([`EXHAUST_THROW_MS`] 160) since, on the fixtures whose fix
+            // lands inside the stroll gate: a fix is a typed key, so it
+            // throws a grain out of the caret's sky like any other, and that
+            // grain is still on the wind 51 ms after the pull is home. The
+            // PULL's own window is read off the mend's star itself, because
+            // the pool's answer cannot see it end under the grain's throw —
+            // and it must, on every fixture, including the 500 ms fix that
+            // throws no grain.
+            let moving_ms = window_ms.max(EXHAUST_THROW_MS as u64);
             assert!(sky.brisk(at(55)), "{label}: not brisk mid-pull");
             assert!(
-                !sky.brisk(at(window_ms + 1)),
-                "{label}: still brisk one millisecond after the pull"
+                star.brisk(at(window_ms - 1)),
+                "{label}: the mend's star is not brisk one millisecond before its pull ends"
+            );
+            assert!(
+                !star.brisk(at(window_ms + 1)),
+                "{label}: the mend's star is still brisk one millisecond after its pull"
+            );
+            assert!(
+                !sky.brisk(at(moving_ms + 1)),
+                "{label}: still brisk one millisecond after the last thing the fix set moving"
             );
 
             // The caret stays brightest: the centre under the caret law.
@@ -11898,6 +14379,335 @@ mod tests {
                 seen.len() <= 3,
                 "t {t_land}: a 12 px fan wore {} names",
                 seen.len()
+            );
+        }
+    }
+
+    /// A sky driven to a steady state by `keys` keystrokes at `cps` over
+    /// `gm`, and the last frame it drew — the fixture both index pins read.
+    /// The same shape `a_twelve_cps_sky_holds_about_twenty_stars` uses: row
+    /// 4 probed blank under a caret on row 5, the spine where the engine's
+    /// own integrator would have it.
+    fn steady_sky(gm: Geom, cps: f32, keys: u16) -> (Stardust, Scratch) {
+        let c = cfg(true);
+        let t0 = Instant::now();
+        let ribbon = Ribbon::new();
+        let mut sky = Stardust::new();
+        sky.probe_mut().probe_row(4, &[false; 120]);
+        let mut sc = Scratch::default();
+        for k in 0..keys {
+            let at = t0 + Duration::from_micros((f32::from(k) * 1e6 / cps) as u64);
+            let mut cx = ctx_in(gm, at, &c, (5, 10 + k));
+            cx.disp = disp_at_12cps(k).max(0.9);
+            cx.birth_disp = cx.disp;
+            sky.budget.refill(at);
+            sky.on_event(&typed(TypedClass::Glyph), at, &cx, &ribbon);
+            sc = Scratch::default();
+            sky.emit(&cx, &mut sc.frame());
+        }
+        (sky, sc)
+    }
+
+    /// **THE GROUND IS READ BY CELL, NOT BY SCAN** — the defect this index
+    /// was built for, priced in the only currency that does not swing with
+    /// the build lane: the number of point-in-rect and falloff tests one
+    /// frame of stars costs.
+    ///
+    /// `sky_ground` answers a POINT query, and every star asks it
+    /// [`SETTLE_PIXELS`] times before it is drawn. Scanned, each of those
+    /// answers walked the whole of this frame's laid sky — a slice that
+    /// grows to [`STARDUST_QUAD_BUDGET`] — so the 125 cps retina fixture
+    /// below spent 35 800 covering tests per frame on 329 point queries
+    /// whose true supports are a handful of lays each. Indexed by CELL it is
+    /// the same answer (checked on every query by the `debug_assert` in
+    /// [`SkyIndex::ground`]) off 543 tests a frame — a sixty-sixth.
+    ///
+    /// The bound asserted is deliberately loose — a tenth of the scan, where
+    /// the measurement says a fiftieth — so that art changes to the sky's
+    /// population move it without breaking it. What it does catch is the
+    /// regression: any return to scanning the laid slice per query lands the
+    /// ratio back at 1.0.
+    #[test]
+    fn a_point_query_reads_one_cell_not_the_whole_sky() {
+        for (label, gm, cps) in [
+            ("12 cps 1x", geom(), 12.0f32),
+            ("125 cps retina", geom_cell(15, 28), 125.0),
+        ] {
+            GROUND_WORK.with(|w| w.set([0; 4]));
+            let (_, sc) = steady_sky(gm, cps, 48);
+            let w = GROUND_WORK.with(std::cell::Cell::get);
+            let (scan, cell) = (w[0] + w[1], w[2] + w[3]);
+            eprintln!(
+                "{label:<16} last frame {} quads / {} halos | ground tests: scan {scan} \
+                 (quads {} halos {}) -> cell {cell} (quads {} halos {})",
+                sc.out.len(),
+                sc.halos.len(),
+                w[0],
+                w[1],
+                w[2],
+                w[3],
+            );
+            assert!(scan > 0, "{label}: the sky never priced a star");
+            assert!(
+                cell * 10 <= scan,
+                "{label}: the indexed ground still reads {cell} entries against the scan's \
+                 {scan} — the cell index is not narrowing the query"
+            );
+        }
+    }
+
+    /// **THE INDEXED GROUND IS THE SCAN'S, PIXEL FOR PIXEL.** The emitted
+    /// quad volume may not move by a byte, and it cannot: the ceiling every
+    /// star is priced and settled under is read from this query, so one
+    /// wrong word here is a differently-dimmed star.
+    ///
+    /// Swept over a REAL frame's laid sky (the 125 cps retina fixture, ~200
+    /// quads and ~80 halos across the grid): every corner of every entry,
+    /// the pixel just outside each of its four edges — a cell boundary is
+    /// exactly where a wrong slot shows — and a deterministic scatter over
+    /// the whole effects box, above the grid and below it included.
+    #[test]
+    fn the_indexed_ground_is_the_scan_s_on_every_pixel_of_a_real_frame() {
+        let gm = geom_cell(15, 28);
+        let (_, mut sc) = steady_sky(gm, 125.0, 48);
+        assert!(
+            sc.out.len() > 60 && sc.halos.len() > 8,
+            "the fixture laid only {} quads / {} halos",
+            sc.out.len(),
+            sc.halos.len()
+        );
+        let mut probes: Vec<(i32, i32)> = Vec::new();
+        for q in &sc.out {
+            let (x, y, w, h) = (
+                i32::from(q.x),
+                i32::from(q.y),
+                i32::from(q.w),
+                i32::from(q.h),
+            );
+            for p in [
+                (x, y),
+                (x + w - 1, y),
+                (x, y + h - 1),
+                (x + w - 1, y + h - 1),
+                (x - 1, y),
+                (x + w, y),
+                (x, y - 1),
+                (x, y + h),
+            ] {
+                probes.push(p);
+            }
+        }
+        for h in &sc.halos {
+            let (x, y, w, ht) = (
+                i32::from(h.x),
+                i32::from(h.y),
+                i32::from(h.w),
+                i32::from(h.h),
+            );
+            for p in [
+                (i32::from(h.cx), i32::from(h.cy)),
+                (x, y),
+                (x + w - 1, y + ht - 1),
+                (x, y - 1),
+                (x, y + ht),
+            ] {
+                probes.push(p);
+            }
+        }
+        // A deterministic scatter over the whole box — the head band above
+        // the grid and the rows no star reached included.
+        for k in 0..4_000u32 {
+            let hx = mix32(k ^ 0x5F35_6495);
+            let hy = mix32(k ^ 0x27D4_EB2D);
+            probes.push((
+                gm.fx_left() + (hx % (gm.fx_right() - gm.fx_left()).max(1) as u32) as i32,
+                gm.fx_top() - 4 + (hy % (gm.fx_bot() + 8 - gm.fx_top()).max(1) as u32) as i32,
+            ));
+        }
+        let mut index = SkyIndex::default();
+        index.open(gm, (0, 0));
+        {
+            let frame = sc.frame();
+            index.ingest(&frame);
+        }
+        let frame = sc.frame();
+        let bg = cfg(true).theme_bg;
+        let mut lit = 0usize;
+        for (x, y) in probes {
+            let want = sky_ground(bg, &*frame.out, &*frame.halos, x, y);
+            let got = index.ground(bg, &frame, x, y);
+            assert_eq!(
+                got, want,
+                "the indexed ground at ({x}, {y}) is not the scan's"
+            );
+            lit += usize::from(want != bg & 0x00FF_FFFF);
+        }
+        assert!(
+            lit > 100,
+            "only {lit} of the swept pixels had any sky on them — the sweep proves nothing"
+        );
+    }
+
+    /// **THE SLOT HASH IS INJECTIVE OVER EVERY BOX THE CAP ALLOWS — WHICH
+    /// IS WHY THE INDEX MAY *ADD* LIGHT AT ALL.** A lay is filed once per
+    /// cell of its box. Two cells of the SAME box on one chain would put
+    /// that lay in the chain twice and [`sky_ground`] would `add_sat` its
+    /// light twice: a ground brighter under a hero than the scan reads, with
+    /// nothing wrong to see in the shape of the code. Across DIFFERENT lays
+    /// a shared chain is free — one more `quad_covers`, and the covering
+    /// test still decides — so this is the one collision that must not
+    /// exist, and [`SKY_INDEX_WIDE_CELLS`] is what rules it out.
+    ///
+    /// **The sweep is the WHOLE PLANE, not a sample.** Write `k` for the
+    /// pre-shift hash of a cell; the other cell of the box hashes to
+    /// `k + t`, `t = dx·A + dy·B`. Binary addition gives
+    /// `slot(k + t) = (slot(k) + mid(t) + c) mod 1024`, and the carry `c`
+    /// out of the low 13 bits is decided by `k & 0x1FFF` alone — so whether
+    /// two cells of one box agree depends on the base ONLY through those 13
+    /// bits. `A` is odd, so 8192 consecutive `cx` at `cy = 0` realise all
+    /// 8192 of those residues, once each. Every cell in the plane is in
+    /// here, and `deltas` is closed under negation, so every ORDERED pair of
+    /// cells of every box the cap allows is checked.
+    #[test]
+    fn the_slot_hash_is_injective_over_every_box_the_cap_allows() {
+        /// Every offset two cells of one box can be apart, for a box of at
+        /// most `cap` cells — deduplicated, and closed under negation.
+        fn deltas(cap: i32) -> Vec<(i32, i32)> {
+            let mut v: Vec<(i32, i32)> = Vec::new();
+            for w in 1..=cap {
+                for h in 1..=cap {
+                    if w * h > cap {
+                        continue;
+                    }
+                    for dx in -(w - 1)..w {
+                        for dy in -(h - 1)..h {
+                            if (dx, dy) != (0, 0) && !v.contains(&(dx, dy)) {
+                                v.push((dx, dy));
+                            }
+                        }
+                    }
+                }
+            }
+            v
+        }
+
+        let cap = i32::try_from(SKY_INDEX_WIDE_CELLS).expect("the cap is small");
+        let offsets = deltas(cap);
+        assert_eq!(
+            offsets.len(),
+            136,
+            "a 16-cell box reaches 136 offsets; if this moved, the cap moved \
+             and the sweep below is no longer the sweep this law needs"
+        );
+        for cx in 0..1_i32 << 13 {
+            let base = SkyIndex::slot((cx, 0));
+            for &(dx, dy) in &offsets {
+                assert_ne!(
+                    base,
+                    SkyIndex::slot((cx + dx, dy)),
+                    "cells (0, 0) and ({dx}, {dy}) of ONE box share a chain at \
+                     base cell ({cx}, 0) — a lay filed under both would have \
+                     its light added twice by `sky_ground`"
+                );
+            }
+        }
+
+        // And the cap is load-bearing, not lucky. One box wider than 16 cells
+        // can reach — the `(0, 19)` a 1 × 20 box first allows — and the very
+        // same sweep finds base cells where the two chains DO agree. Raising
+        // `SKY_INDEX_WIDE_CELLS` past 19 without re-sweeping buys the
+        // double-count this law exists to forbid.
+        let doubled = (0..1_i32 << 13)
+            .filter(|&cx| SkyIndex::slot((cx, 0)) == SkyIndex::slot((cx, 19)))
+            .count();
+        assert!(
+            doubled > 0,
+            "the `(0, 19)` offset collided at none of 8192 base cells, so \
+             this arm no longer shows the cap is what makes the law true"
+        );
+    }
+
+    /// **A LAY THE INDEX CANNOT FILE SPILLS IT, AND THE ANSWER SURVIVES.**
+    /// Nothing the sky lays today spans more than ~3 × 3 cells, so this is
+    /// the guard on the lay this file has not written yet: past
+    /// [`SKY_INDEX_WIDE_CELLS`] the index stops being used and every query
+    /// reads the whole slice, exactly as the scan did. The wrong answer to
+    /// this is silence — a lay quietly left out of the ground a star is
+    /// priced over — so the pin is that the two paths still agree.
+    #[test]
+    fn a_lay_too_wide_to_file_spills_the_index_and_still_answers() {
+        let gm = geom();
+        let mut sc = Scratch::default();
+        // 40 cells wide at `cw` 9: past the filing bound by a factor of 22.
+        sc.out.push(GlowQuad {
+            row: 5,
+            x: 90,
+            y: 130,
+            w: 360,
+            h: 4,
+            color: 0x0010_2030,
+            alpha: 0,
+        });
+        let mut index = SkyIndex::default();
+        index.open(gm, (0, 0));
+        {
+            let frame = sc.frame();
+            index.ingest(&frame);
+        }
+        assert!(index.spilled, "a 40-cell lay was filed as if it were one");
+        let frame = sc.frame();
+        for (x, y) in [(90, 130), (300, 131), (449, 133), (89, 130), (450, 130)] {
+            assert_eq!(
+                index.ground(0, &frame, x, y),
+                sky_ground(0, &*frame.out, &*frame.halos, x, y),
+                "({x}, {y}) under a spilled index"
+            );
+        }
+        // And the next frame is indexed again: a spill lasts one frame.
+        index.open(gm, (0, 0));
+        assert!(!index.spilled, "the spill outlived its frame");
+    }
+
+    /// **A DEGENERATE GEOMETRY STILL ANSWERS.** A zero cell has no grid to
+    /// divide by (the pushers would divide by it too), so the index
+    /// collapses to ONE cell — the old full scan, still the right answer —
+    /// rather than panicking or dropping the light.
+    #[test]
+    fn a_cell_less_geometry_falls_back_to_one_chain() {
+        let gm = Geom {
+            cw: 0,
+            ch: 0,
+            ..geom()
+        };
+        let mut sc = Scratch::default();
+        sc.out.push(GlowQuad {
+            row: 0,
+            x: 90,
+            y: 100,
+            w: 4,
+            h: 2,
+            color: 0x0020_3040,
+            alpha: 0,
+        });
+        let mut index = SkyIndex::default();
+        index.open(gm, (0, 0));
+        {
+            let frame = sc.frame();
+            index.ingest(&frame);
+        }
+        let frame = sc.frame();
+        for (x, y) in [
+            (90, 100),
+            (93, 101),
+            (89, 100),
+            (94, 100),
+            (90, 99),
+            (90, 102),
+        ] {
+            assert_eq!(
+                index.ground(0, &frame, x, y),
+                sky_ground(0, &*frame.out, &*frame.halos, x, y),
+                "({x}, {y}) under a cell-less geometry"
             );
         }
     }

@@ -59,7 +59,7 @@ There is no hosted CI: nothing runs automatically on a pull request, so paste
 the output of the tests you ran into the description.
 
 **Which gate is the contract, and which one is yours.** The gate that decides
-whether a change lands is `tools/verify.sh --fast` — a twenty-nine-stage local
+whether a change lands is `tools/verify.sh --fast` — a thirty-stage local
 ladder (`crates/aterm-verify`) that a maintainer runs on the rebased branch, on
 the development line, at land time. You are not expected to run it, and this
 file does not ask you to: that ladder drives the development line's own

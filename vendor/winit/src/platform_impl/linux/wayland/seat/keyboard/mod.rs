@@ -1,3 +1,5 @@
+//! Modified by the aterm project in 2026; see the repository NOTICE.
+//!
 //! The keyboard input handling.
 
 use std::sync::Mutex;
@@ -37,6 +39,26 @@ impl Dispatch<WlKeyboard, KeyboardData, WinitState> for WinitState {
                 return;
             },
         };
+        // The seat's newest keyboard serial: what a clipboard copy hands to
+        // `set_selection` (see `clipboard.rs`) — the compositor validates it
+        // against this client's recent input.
+        if let WlKeyboardEvent::Enter { serial, .. }
+        | WlKeyboardEvent::Key { serial, .. }
+        | WlKeyboardEvent::Modifiers { serial, .. } = &event
+        {
+            seat_state.latest_keyboard_serial = *serial;
+        }
+        // Where that keyboard IS, beside the serial it last gave us: a clipboard
+        // copy needs both, because a compositor hands the selection only to the
+        // client its keyboard is on (see `clipboard.rs`). Recorded before the
+        // per-window bookkeeping below, which returns early on a surface we do
+        // not know — mutter sends `leave` with a nil surface, and the keyboard
+        // has left us just the same.
+        match &event {
+            WlKeyboardEvent::Enter { .. } => seat_state.set_keyboard_entered(true),
+            WlKeyboardEvent::Leave { .. } => seat_state.set_keyboard_entered(false),
+            _ => {},
+        }
         let keyboard_state = match seat_state.keyboard_state.as_mut() {
             Some(keyboard_state) => keyboard_state,
             None => {

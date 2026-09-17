@@ -64,9 +64,11 @@ const CANDIDATES: usize = 4;
 /// Assets downloaded per candidate: `index.toml`, `index.toml.sig`, the roster, its sig.
 const ASSETS_PER_CANDIDATE: usize = 4;
 /// The real channel's size, from `aterm-update-core`'s own measurement of
-/// `alabsystems/aterm` (2026-08-20): 42 releases / 200 assets on page 1. It fits in ONE
-/// `per_page=100` page, which is why the listing here is one request and why this bench
-/// does not pretend release count is the scaling variable — the candidate cap is.
+/// `alabsystems/aterm` (2026-08-20): 42 releases / 200 assets on page 1. The channel has
+/// since outgrown a single `per_page=100` page (117 releases on 2026-09-16), so the
+/// listing is one request because `net::GithubFetcher::index_releases` stops at the page
+/// that completes the candidate cap — not because the catalog happens to fit — and this
+/// bench still does not pretend release count is the scaling variable: the cap is.
 const REAL_CHANNEL_RELEASES: usize = 42;
 
 /// A fetcher with `net::GithubFetcher`'s cost shape: one memoized release listing, then

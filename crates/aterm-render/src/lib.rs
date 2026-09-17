@@ -1033,6 +1033,24 @@ impl GlyphImage {
         }
     }
 
+    /// The glyph's INK box as `(ymin, height)` — the rasterized box with its
+    /// fully transparent TOP and BOTTOM rows trimmed off, in the same
+    /// baseline-relative units as [`Self::ymin`] / [`Self::height`].
+    ///
+    /// The rasterized box is an over-approximation of the ink: fontdue sizes it
+    /// from the scaled outline bbox, so a glyph routinely carries a row or two
+    /// of zero coverage at each edge. That surplus is harmless for the blit
+    /// (it stamps zeros) but NOT for any decision about which side of the
+    /// baseline a glyph lies on: DejaVu Sans Mono 18px rasterizes U+0323
+    /// COMBINING DOT BELOW as a 6-row box at `ymin == -5`, whose top edge
+    /// (`ymin + height == 1`) sits one empty row ABOVE the baseline, while its
+    /// ink is the 3 rows `[-4, -2]`, wholly below. [`MarkStack`] classifies a
+    /// mark by exactly that test, so it must be fed this box, not the raster
+    /// one (see that type's docs).
+    ///
+    /// `height == 0` — an empty raster, or one with no covered texel anywhere —
+    /// means the glyph paints nothing; `ymin` is then the raster's own.
+    #[must_use]
     /// The raw bitmap bytes (1 byte/texel for `Mono`, 4 for `Rgba`).
     pub fn bytes(&self) -> &[u8] {
         match self {
@@ -1102,10 +1120,10 @@ enum ShapedHit<'a> {
 /// cache; adapted to aterm's nested `(style -> run)` map).
 ///
 /// Instead this keeps two generations. Lookups probe `cur` then `prev`; a `prev`
-/// hit is served without re-shaping and PROMOTED back into `cur` (folded in by
-/// the caller after planning, exactly like a miss). At the cap `cur` ROTATES
-/// into `prev` — the old `prev` is dropped and its allocation recycled as the
-/// empty new `cur` — so anything touched within the last generation survives.
+/// hit is served without re-shaping and PROMOTED back into `cur`, exactly like
+/// a miss. At the cap `cur` ROTATES into `prev` — the old `prev` is dropped and
+/// its allocation recycled as the empty new `cur` — so anything touched within
+/// the last generation survives.
 /// Hot runs are therefore never evicted and no frame ever pays a mass re-shape.
 ///
 /// Output is byte-identical to the single-map cache: each generation is still a
@@ -1443,14 +1461,11 @@ pub struct Renderer {
     /// run shaping (ligatures). `None` when no bytes were available (e.g. a font
     /// loaded only by path that failed to re-read) — ligatures then cleanly
     /// decline and the per-cell path is used. A `rustybuzz::Face` borrows these,
-    /// so a fresh face is parsed per shaping miss (rare; shaped runs are cached).
+    /// so the row planner lazily parses one face on its first cache miss and
+    /// reuses it for the rest of the row. Cached rows need no parse.
     ///
-    /// `Arc<[u8]>` (not `Vec<u8>`): `row_glyph_plan` clones this handle once per
-    /// shaped row so the shaping closure can borrow the bytes without borrowing
-    /// `self`; with a `Vec` that was a whole-font (100KB–1MB) memcpy PER ROW PER
-    /// FRAME on the features/ligatures path. The `Arc` makes it an atomic refcount
-    /// bump. `Arc` (not `Rc`) because the GPU builds its CPU face on a background
-    /// font-load thread.
+    /// `Arc<[u8]>` shares font storage across renderer forks and background
+    /// font-load threads; the row planner borrows it without cloning a handle.
     rb_primary_bytes: Option<std::sync::Arc<[u8]>>,
     /// W9 (variable-font instantiation): the PRIMARY face's resolved
     /// variation coords, one `(tag, design-space value)` pair per `fvar`
@@ -1504,8 +1519,8 @@ pub struct Renderer {
     /// through the Unicode cmap with ttf-parser (the same Mac-Roman-avoiding routing
     /// the primary uses — see [`Self::primary_unicode_gid`]), and so styled ligature
     /// RUNS can shape against the real bold face (W6). Paired with `bold_font`; both
-    /// are set together by [`Self::set_bold_font`]. `Arc<[u8]>` so `row_glyph_plan`
-    /// clones a handle per shaped row, not the whole font.
+    /// are set together by [`Self::set_bold_font`]. Shared across renderer
+    /// forks; `row_glyph_plan` borrows the bytes for its lazy per-row face.
     bold_font_bytes: Option<std::sync::Arc<[u8]>>,
     /// Per-char injected-BOLD-face glyph-id cache (Unicode cmap), the bold analog of
     /// [`Self::primary_gid_cache`]. `None` = the injected bold face has no glyph for
@@ -1964,8 +1979,10 @@ pub struct Renderer {
     /// cell (glyph shows through, so the block cut-out is skipped). The GPU
     /// face reads this off its wrapped CPU renderer (parity).
     cursor_opacity: f32,
-    /// The glyph cache, keyed by full rasterization identity.
-    glyphs: FxHashMap<GlyphKey, GlyphImage>,
+    /// The glyph cache, keyed by full rasterization identity. Each entry carries
+    /// the raster AND the scan-derived facts about it ([`CachedGlyph`]), so a
+    /// reader that needs both pays one probe.
+    glyphs: FxHashMap<GlyphKey, CachedGlyph>,
     /// The bitmap payload bytes `glyphs` holds, maintained at its ONE insert site
     /// ([`Renderer::glyph_image`]) and reset by [`Renderer::clear_glyph_images`].
     /// The entry count alone cannot bound these bytes: image size scales with
@@ -2167,6 +2184,13 @@ pub struct WindowCpu {
     /// frame allocates no per-call dirty Vec. The flags it holds — and thus the
     /// damage decision — are byte-identical to the old per-call `vec![false; rows]`.
     pub(crate) dirty_scratch: Vec<bool>,
+    /// Persistent SHIFT-PLAN scratch: the second `&mut Vec<bool>` the E7 planner
+    /// ([`scroll_shift_plan`]) writes its candidate dirty set into while
+    /// [`dirty_scratch`](Self::dirty_scratch) still holds the ordinary row diff's,
+    /// so `render_core` can COUNT both and keep the smaller. Resident for the same
+    /// reason as its sibling (no per-frame allocation); the two are swapped, never
+    /// copied, when the shift plan wins.
+    pub(crate) shift_scratch: Vec<bool>,
     /// Decoded inline-image cache (iTerm2 OSC 1337 `File=`), keyed by the image
     /// payload's `Arc` pointer identity + the footprint pixel size it was scaled
     /// for. Each entry is the RGBA8 image already resampled to exactly
@@ -2263,9 +2287,12 @@ impl WindowCpu {
     }
 
     /// The per-row repaint flags of the most recent frame (`dirty[r]` ⇔ row `r`
-    /// was repainted). AUTHORITATIVE only when [`Self::last_damage`] is
-    /// [`DamageOutcome::Rows`]; on `Full`/`GateHit` the scratch holds stale
-    /// flags from an earlier frame and must not drive a partial copy.
+    /// was repainted). AUTHORITATIVE when [`Self::last_damage`] is
+    /// [`DamageOutcome::Rows`] or [`DamageOutcome::Scroll`] — on a `Scroll` the
+    /// flags name the rows repainted ON TOP of the shifted pixels, so a presenter
+    /// must apply the shift FIRST and then these bands (which is what the wasm
+    /// dirty-band present does). On `Full`/`GateHit` the scratch holds stale flags
+    /// from an earlier frame and must not drive a partial copy.
     pub fn dirty_rows(&self) -> &[bool] {
         &self.dirty_scratch
     }
@@ -2638,15 +2665,28 @@ pub const DISPLAY_FACE_LEGACY_IDS: &[(&str, Option<&str>)] = &[
 /// to its successor, and everything else — including `mariokart`, whose face was
 /// deleted with no replacement — to `None`, so the caller falls back to ordinary
 /// family resolution instead of failing.
+///
+/// THE COMPARISON FOLDS ASCII CASE, because this judges a value a human typed
+/// into `aterm.toml` and every other such value in the config already folds
+/// (`cursor_trail_style`, the rain hue, the sparkle styles — `app_config.rs` is
+/// full of `eq_ignore_ascii_case`). `display_font` was the exception, and the
+/// failure was SILENT in the worst way: an unrecognised id is not an error here,
+/// it falls through to ordinary `font_family` resolution, so `display_font =
+/// "Pixel"` did not warn, did not fail, and did not apply — the setting simply
+/// had no effect. Every registry id is lowercase ASCII and they are distinct as
+/// such, so folding can introduce no collision.
 #[must_use]
 pub fn display_face_canonical_id(id: &str) -> Option<&'static str> {
     let id = id.trim();
-    if let Some(face) = DISPLAY_FACES.iter().find(|face| face.id == id) {
+    if let Some(face) = DISPLAY_FACES
+        .iter()
+        .find(|face| face.id.eq_ignore_ascii_case(id))
+    {
         return Some(face.id);
     }
     DISPLAY_FACE_LEGACY_IDS
         .iter()
-        .find(|(legacy, _)| *legacy == id)
+        .find(|(legacy, _)| legacy.eq_ignore_ascii_case(id))
         .and_then(|(_, current)| *current)
 }
 
@@ -2799,10 +2839,36 @@ const DISPLAY_FACE_PROBE_PX: f32 = 128.0;
 /// proportional font is never silently re-fitted behind their back (that would
 /// change cell metrics for existing configs). The registry entry supplies
 /// `embolden`; the measurement supplies the rest.
+///
+/// IDENTITY IS THE CONTENT, NOT THE ALLOCATION. This used to match with
+/// `std::ptr::eq` against the `DISPLAY_FACES` statics, which made the fit a
+/// property of WHICH COPY of the bytes you happened to hold. Every rebuild path
+/// rebuilds from a copy — `rebuild_from_admitted` goes through
+/// `shared_parsed_face`'s `Arc::from(bytes)` (and `fork_semantic_surface` calls
+/// it), and the config worker copies twice more before
+/// `Renderer::from_resolved_font_file` — so each of them silently returned
+/// `None` here and threw away the WHOLE fit policy: px_scale, widest-advance
+/// cell, ink centring and embolden headroom, not merely the cell width.
+///
+/// Measured 2026-09-15 for `display:engraved` at 16 px: a `rebuild_from_admitted`
+/// took the cell from (21, 19) to (15, 22), and the widest printable-ASCII raster
+/// in that 15 px cell is 24 px — 9 px of ink over the cell edge, per cell. In the
+/// shipped GUI that is reached by `rebuild_backend_with_prepared`, so a user with
+/// `display_font` set got the right grid at launch and permanently lost it the
+/// first time the config file was saved or the theme flipped. It also broke
+/// `rebuild_from_admitted`'s own documented contract to preserve "font appearance
+/// knobs".
+///
+/// The length test still runs first, so the added comparison is reached only by
+/// a byte string that is already exactly as long as a bundled face, and the
+/// pointer test still short-circuits the common case. This has one caller, the
+/// constructor, which goes on to rasterize 94 glyphs at 128 px — the compare is
+/// not measurable beside it.
 #[must_use]
 pub fn display_face_fit(bytes: &[u8]) -> Option<DisplayFaceFit> {
     let entry = DISPLAY_FACES.iter().find(|font| {
-        std::ptr::eq(font.bytes.as_ptr(), bytes.as_ptr()) && font.bytes.len() == bytes.len()
+        font.bytes.len() == bytes.len()
+            && (std::ptr::eq(font.bytes.as_ptr(), bytes.as_ptr()) || font.bytes == bytes)
     })?;
     let identity = DisplayFaceFit {
         embolden: entry.embolden,
@@ -3647,6 +3713,16 @@ impl LazyFontdue {
     /// parses — a pure read of the cached verdict, safe on the render thread.
     fn known_bad(&self) -> bool {
         matches!(self.0.get(), Some(None))
+    }
+
+    /// The parsed face if materialisation has ALREADY happened, else `None` —
+    /// a pure read of the cell, never a parse, so it is safe on any thread at
+    /// any time. [`Self::get`]/[`Self::get_at`] pay the parse; this is the read
+    /// for a caller that must never pay it ([`Renderer::ready_fallback_faces`],
+    /// the GUI chrome's coverage rung). A cell latched to "the parse refused
+    /// these bytes" reads as `None` too.
+    fn parsed(&self) -> Option<&std::sync::Arc<crate::font::Font>> {
+        self.0.get().and_then(Option::as_ref)
     }
 
     /// TEST ONLY: whether the deferred parse has happened yet. This is the
@@ -5143,9 +5219,11 @@ pub fn clamp_to_col_band(left: i32, width: usize, band_w: usize) -> (usize, usiz
 ///
 /// THE INK IS NOT THE BOX. Two of this crate's three raster paths return a
 /// bitmap deliberately LARGER than the glyph: macOS CoreText pads the ink box
-/// by 1px per side (2 when `font_thicken` is on) plus a phase row
-/// ([`ct_padded_extent`]), and [`crate::subpixel`] widens by 1px per side for
-/// the FIR5 filter spread — while [`crate::variation`] crops its own
+/// by 1px per side (2 when `font_thicken` is on) plus a phase row/column, on
+/// BOTH axes ([`ct_padded_extent`] is one axis, applied to each), and
+/// [`crate::subpixel`] widens by 1px per side for the FIR5 filter spread — but
+/// HORIZONTALLY ONLY, its row extent being the outline's own `min_y.floor()`
+/// / `max_y.ceil()` — while [`crate::variation`] crops its own
 /// [`crate::variation::RASTER_PAD`] back off before it reports. So the
 /// reported `(height, ymin)` box overhangs the real ink by a pixel or three on
 /// the padded paths and not at all on the cropped one. Any rule that reads
@@ -5238,9 +5316,12 @@ fn seated_ymin(
         .then_some(ymin + (ink_bottom - floor))
 }
 
-fn seat_ink_on_the_cell_floor(img: &mut GlyphImage, baseline: i32, cell_h: usize) {
+/// The `(first, last + 1)` INK row extent of a rasterized glyph, for either
+/// bitmap kind — the one place that knows how to ask a `Mono` and an `Rgba`
+/// raster the same question. `None` for a blank raster.
+fn glyph_ink_rows(img: &GlyphImage) -> Option<(usize, usize)> {
     let (w, h) = (img.width(), img.height());
-    let Some(ink) = (match img {
+    match img {
         GlyphImage::Mono { bytes, .. } => ink_row_extent(h, |y| {
             bytes
                 .get(y * w..(y + 1) * w)
@@ -5251,7 +5332,94 @@ fn seat_ink_on_the_cell_floor(img: &mut GlyphImage, baseline: i32, cell_h: usize
                 .get(y * w * 4..(y + 1) * w * 4)
                 .is_some_and(|r| r.as_chunks::<4>().0.iter().any(|px| px[3] > 0))
         }),
-    }) else {
+    }
+}
+
+/// A glyph's INK box in the same frame as its reported `(height, ymin)`:
+/// `(ink_height, ink_ymin)`, where `ink_ymin` is the bottom edge of the ink in
+/// rows above the baseline and `ink_ymin + ink_height` its top edge. `None` for
+/// a blank raster.
+///
+/// THE INK IS NOT THE BOX ([`ink_row_extent`]): the shipping macOS CoreText
+/// path pads the reported box by a pixel per side plus a phase row
+/// ([`ct_padded_extent`], applied on BOTH axes), so the box overhangs the ink
+/// and can even report a mark on the WRONG SIDE of the baseline. Any rule that
+/// decides where a glyph's ink lies VERTICALLY — which side of the baseline it
+/// is on, how far the cell lets it move — must ask this, not
+/// `(height(), ymin())`. Placement arithmetic derived from the answer still
+/// applies to the whole raster: the pad rows are blank, so shifting the box by
+/// an ink-derived offset moves exactly the ink.
+///
+/// # Which paths pad, and on which axis
+///
+/// Only CoreText pads the rows. [`crate::subpixel`]'s FIR5 widening is
+/// HORIZONTAL only — `subpixel_glyph_raster` takes `x_min = min_x.floor() - 1`
+/// and `x_max = max_x.ceil() + 1` but plain `y_min = min_y.floor()` /
+/// `y_max = max_y.ceil()` (subpixel.rs:175-178) — and [`crate::variation`]
+/// crops its own [`crate::variation::RASTER_PAD`] back off before reporting. So
+/// the wrong-side-of-the-baseline reading this exists to prevent is a CoreText
+/// reading; the other paths report a vertical box that is the ink's own rows
+/// rounded out to the pixel grid, and this function is a no-op trim there. That
+/// is why the end-to-end witness
+/// (`tests/combining_stack.rs::the_stack_is_placed_by_ink_not_by_the_reported_raster_box`)
+/// LOGS the reported box instead of asserting a trim happened.
+///
+/// # The horizontal twin, not converted here
+///
+/// [`mark_cell_x_at`] is the one remaining placement rule that reads the
+/// reported box: it centres a mark by `gw`/`xmin` though its own doc says it
+/// centres the INK. CoreText's horizontal pad is very nearly symmetric, so the
+/// two answers usually coincide — measured on SF Mono 18px in an 11px cell,
+/// U+0301 centres at the same `+4` either way, while U+0323 (box `gw 6,
+/// xmin 3`, ink `gw 3, xmin 4`) centres one pixel left of its ink at `-1`
+/// instead of `0`. Converting it is a change of a different SHAPE from this
+/// one: it moves marks HORIZONTALLY in single-mark cells too, which this fix
+/// leaves byte-identical, so it needs its own pixel evidence and is not folded
+/// in here.
+#[must_use]
+pub fn glyph_ink_box(img: &GlyphImage) -> Option<(usize, i32)> {
+    let (first, last) = glyph_ink_rows(img)?;
+    let top = img.ymin() + i32::try_from(img.height()).ok()?;
+    Some((last - first, top - i32::try_from(last).ok()?))
+}
+
+/// One entry of [`Renderer::glyphs`]: a rasterized glyph and the facts about it
+/// that are a PURE FUNCTION OF ITS BYTES but cost a raster scan to recompute.
+///
+/// [`glyph_ink_box`] is O(pixels) and both painters' mark loops want it once per
+/// mark per FRAME, while the raster it reads never changes for the life of the
+/// entry — so it is computed at the one insert site and carried here.
+///
+/// Measured, release, on a 40x120 grid with four combining marks in every cell
+/// (19 200 marks/frame) at SF Mono 18px, four builds of this loop run
+/// interleaved, medians of nine rounds: reading the reported box (the pre-fix
+/// operand) 3.72 ms/frame, SCANNING the raster per mark per frame 4.02, this
+/// memo 3.74. The scan costs ~14.5 ns per mark and the memo gives all of it
+/// back; a side map keyed by `GlyphKey` measured the same 3.72 within the
+/// round-to-round spread, so the choice between them is structural, not speed:
+/// here the answer lives with the bytes it describes and is dropped with them,
+/// there is no second map to keep in lockstep with this one, and the mark loops
+/// — which already look the raster up for `(width, height, xmin)` — pay one
+/// hash probe for all four facts instead of two.
+///
+/// [`Self::new`] is the ONLY constructor, so `ink` can never describe bytes
+/// other than `img`'s.
+struct CachedGlyph {
+    img: GlyphImage,
+    /// [`glyph_ink_box`] of `img`, computed once when the entry is built.
+    ink: Option<(usize, i32)>,
+}
+
+impl CachedGlyph {
+    /// Memoize `img`'s ink box and take ownership of the raster.
+    fn new(img: GlyphImage) -> Self {
+        let ink = glyph_ink_box(&img);
+        Self { img, ink }
+    }
+}
+
+fn seat_ink_on_the_cell_floor(img: &mut GlyphImage, baseline: i32, cell_h: usize) {
+    let Some(ink) = glyph_ink_rows(img) else {
         return;
     };
     let (GlyphImage::Mono { height, ymin, .. } | GlyphImage::Rgba { height, ymin, .. }) = img;
@@ -7083,8 +7251,8 @@ impl Renderer {
         let (cell_h, baseline) = cell_h_baseline(asc, desc, gap, 1.0);
         let mut r = Renderer {
             font,
-            // Retain the primary bytes (as a shared Arc) so run shaping can build a
-            // rustybuzz::Face — and so `row_glyph_plan` clones a handle, not the font.
+            // Retain the primary bytes (as a shared Arc) so run shaping can
+            // borrow them while building its lazy per-row rustybuzz::Face.
             // The handle comes from the face cache, so N renderers over one face
             // share ONE byte copy as well as one parse.
             rb_primary_bytes: Some(primary_bytes),
@@ -7674,9 +7842,28 @@ impl Renderer {
         // Shared parse (see `shared_parsed_face`): swapping BACK to a face another
         // pane still holds costs a lookup, not a whole-face re-materialisation.
         let (primary_bytes, font) = shared_parsed_face(bytes, 0)?;
-        font.horizontal_line_metrics(self.px)
+        // FONT-DISPLAY-FIT BELONGS TO THE FACE, so re-probe it for the NEW bytes
+        // — alongside `typo_lm` / `deco_tables` below — BEFORE anything derives a
+        // px or a metric from it. Leaving the OLD face's fit in place meant a swap
+        // carried the previous face's px_scale, widest-advance cell, ink centring
+        // and embolden headroom onto bytes they were never measured from. That is
+        // also why this cannot stay unfixed now that `refresh_variations` (called
+        // at the end of this function) derives through the fit: a stale `Some`
+        // would be applied to the new face rather than merely ignored.
+        //
+        // `px_request` is the UNSCALED size the host asked for; `self.px` is the
+        // old face's EFFECTIVE size. Re-derive from the request so a fitted ->
+        // unfitted swap returns to full size instead of staying shrunk (and the
+        // reverse shrinks), and drop `fit_cell_pad`, which is a calibration of the
+        // face that just left.
+        let display_fit = display_face_fit(bytes);
+        let px_eff = self.px_request * display_fit.map_or(1.0, |fit| fit.px_scale);
+        font.horizontal_line_metrics(px_eff)
             .ok_or("font has no horizontal line metrics at the current px")?;
-        let adv = font.metrics('M', self.px).advance_width;
+        self.display_fit = display_fit;
+        self.fit_cell_pad = 0;
+        self.px = px_eff;
+        self.px_q = GlyphKey::quantize_px(px_eff);
         self.font = font;
         self.rb_primary_bytes = Some(primary_bytes);
         // W9: the old face's variation coords are meaningless on the new
@@ -7700,7 +7887,9 @@ impl Renderer {
         // decoration bands belong to the face, like its line metrics.
         self.deco_tables = deco_tables(bytes);
         self.undercurl_masks.borrow_mut().clear();
-        self.cell_w = cell_w_from_advance(adv);
+        // Through the FIT, like every other site that re-derives the cell.
+        let adv = self.primary_m_advance_px(px_eff);
+        self.cell_w = self.fitted_cell_w(px_eff, adv);
         let (cell_h, baseline) = self
             .derive_cell_geometry(self.px)
             .ok_or("font has no usable cell geometry at the current px")?;
@@ -7733,6 +7922,11 @@ impl Renderer {
         // The old primary's CoreText fonts and hinting instances are keyed by its
         // (now dropped) bytes ptr; drop them so the new face's build fresh.
         self.clear_face_address_caches();
+        // FONT-DISPLAY-FIT: measure the NEW face's widest ink, as `set_px` does
+        // for a new size. After the clears above, so the calibration rasterizes
+        // the new face rather than measuring a survivor of the old one. No-op on
+        // any face without a fitted cell — which is every ordinary user font.
+        self.calibrate_fitted_cell();
         // W9: instantiate the NEW face (config requests + nudge carry over);
         // re-derives the geometry again only when it is actually variable.
         self.refresh_variations();
@@ -7980,7 +8174,12 @@ impl Renderer {
     /// FONT-DISCOVERY). Default on. Hosts without a filesystem (web/wasm) turn
     /// it off: discovery can never succeed there, and a real miss should reach
     /// [`Self::take_missing_font_classes`] without per-char fs attempts.
-    pub fn set_runtime_font_discovery(&mut self, enabled: bool) {
+    ///
+    /// Returns whether the chain actually WIDENED — the only case that drops the
+    /// rasterized glyphs below. A wrapper holding its own copy of those pixels
+    /// (the GPU atlas) must follow on `true`; it has no other way to see it,
+    /// because the widening predicate reads two private fields.
+    pub fn set_runtime_font_discovery(&mut self, enabled: bool) -> bool {
         let widened = enabled && (!self.runtime_discovery || self.admitted_sources_sealed);
         self.runtime_discovery = enabled;
         if enabled {
@@ -8002,6 +8201,7 @@ impl Renderer {
             self.clear_glyph_images();
             self.font_epoch += 1;
         }
+        widened
     }
 
     fn block_on_lazy_fallbacks(&mut self) {
@@ -8658,6 +8858,34 @@ impl Renderer {
         self.styled_faces[0]
             .as_ref()
             .map(|sf| (sf.bytes.clone(), sf.index))
+    }
+
+    /// Every broad-chain face, then the symbol-slot face, that a renderer of
+    /// this generation has ALREADY parsed — in the chain's own precedence
+    /// order, so a caller probing them first-hit-wins agrees with
+    /// [`FaceId::Fallback`]'s pick. NEVER parses and never reads a file: a
+    /// deferred cell is simply absent until its parse lands (the live terminal
+    /// drawing the char, or a semantic warm-up), and the read is a handful of
+    /// atomic loads.
+    ///
+    /// This is the GUI chrome's fourth coverage rung. Its own stack (the
+    /// user's primary, its bold sibling, the embedded DejaVu) carries no CJK,
+    /// so a tab title with an ideograph fell out of the pixel band onto the
+    /// cell lane — drawn on the CELL baseline, a half-lip below every Latin
+    /// label, and cut by the seam rule. The chain faces are [`LazyFontdue`]
+    /// cells SHARED between the live renderer and its semantic fork
+    /// ([`Self::fork_semantic_surface`] / [`Self::rebuild_from_admitted`]
+    /// clone the `Vec`), so the moment the terminal has paid for a face the
+    /// chrome may draw with it — and it must not pay itself:
+    /// `NotoSansCJK-Regular.ttc` is ~20 MB, and a parse on the UI thread is a
+    /// visible stall.
+    pub fn ready_fallback_faces(
+        &self,
+    ) -> impl Iterator<Item = &std::sync::Arc<crate::font::Font>> + '_ {
+        self.fallback_chain
+            .iter()
+            .chain(self.symbol_fallback.iter())
+            .filter_map(|face| face.font.parsed())
     }
 
     /// Fork the live terminal's FONT engine for a renderer-native semantic
@@ -9966,8 +10194,34 @@ impl Renderer {
         // the drop-to-`None` in `set_primary_font` clears it in parallel.
         self.rb_variations_cache = self.compute_rb_variations();
         // Cell geometry tracks the instance (advance via HVAR, vertical via
-        // MVAR/typo): re-derive exactly like `set_primary_font`.
-        self.cell_w = cell_w_from_advance(self.primary_m_advance_px(self.px));
+        // MVAR/typo): re-derive exactly like `set_px` — THROUGH THE FIT.
+        //
+        // This used to call the bare `cell_w_from_advance`, the one derivation
+        // that ignores FONT-DISPLAY-FIT, while every sibling site (the
+        // constructor, `set_px`, `activate_px`, both `cell_geometry` arms) goes
+        // through `fitted_cell_w`. On a fitted face it therefore discarded the
+        // widest-advance cell the fit exists to compute. Measured 2026-09-15 for
+        // `display:engraved` at 16 px: cell 21 -> 13 while the widest printable
+        // ASCII raster is 22 px, i.e. ~9 px of ink over the cell edge per cell.
+        //
+        // It is reachable on the generation that actually carries a live fit —
+        // STARTUP: `apply_font_config_to_backend` calls `set_font_variations`
+        // immediately after construction, so any non-empty `font_variation` /
+        // `font_weight` or a non-zero `font_weight_dark_nudge` makes the coords
+        // differ from the constructor's resolution and runs this past its
+        // early-out. The dark-nudge safety gate in `compute_variations` does NOT
+        // protect it: that gate compares `cell_w_from_advance`, which is the very
+        // measure that is wrong here, so it admits the nudge and the collapse
+        // follows. It also desynchronised the PURE read from paint —
+        // `cell_geometry` still reported the fitted 21 — putting grid sizing,
+        // hit-testing and IME positioning 8 px per column out of step with the
+        // glyphs, against `cell_geometry`'s documented promise to "equal exactly
+        // what the renderer produces once activated to `px`".
+        //
+        // `self.px` is ALREADY the effective (fitted) px — `set_px` stores
+        // `px_eff` there — so it is the right argument for both derivations.
+        let adv = self.primary_m_advance_px(self.px);
+        self.cell_w = self.fitted_cell_w(self.px, adv);
         if let Some((cell_h, baseline)) = self.derive_cell_geometry(self.px) {
             self.cell_h = cell_h;
             self.baseline = baseline;
@@ -9991,6 +10245,13 @@ impl Renderer {
         // exact hazard the CT clear one line up exists for.
         #[cfg(any(all(unix, not(target_os = "macos")), windows))]
         self.hint_bank.clear();
+        // FONT-DISPLAY-FIT: the new INSTANCE needs its own measurement, exactly
+        // as a new px does in `set_px` — a heavier weight dilates the ink. This
+        // runs AFTER the clears above, not before them as in `set_px`: the
+        // calibration rasterizes `'!'..='~'` to measure them, and here it is the
+        // instance that changed, so a surviving raster would measure the OLD
+        // coords. No-op on any face without a fitted cell.
+        self.calibrate_fitted_cell();
         true
     }
 
@@ -11625,27 +11886,24 @@ impl Renderer {
                     && !self.break_mask_scratch[c]
                     && !is_procedural;
         }
-        // `plan_row_runs` borrows `cells` and shapes via a closure; the shape
-        // closure needs `&mut self`, so collect runs first, shape them, then plan.
-        // Two-phase to satisfy the borrow checker without cloning the grid: pass a
-        // closure that captures a shaping buffer keyed off a RefCell-free plan by
-        // shaping inline using a raw-bytes copy is avoided — instead we resolve
-        // each run through the cache via an owned bytes handle.
+        // The planner and its shape closure borrow disjoint renderer fields:
+        // row scratch belongs to the planner, and the run cache to the closure.
+        // Publish a miss immediately so a repeated run later in this same row
+        // hits the cache instead of shaping and allocating its key again.
         let style_of = |c: usize| cell_style(&cells[c]);
-        // Shape via the cache: clone the rb bytes handle out so the closure does
-        // not borrow `self` while `plan_row_runs` borrows `cells`.
-        let rb = self.rb_primary_bytes.clone();
-        // W6: the per-style run faces — cheap `Arc` handles cloned out so the
-        // closure can pick a face per run without borrowing `self`. A styled run
+        // Borrow only the font fields, independently of the mutable run cache
+        // and scratch below; even a fully cached row needs no Arc refcount bumps.
+        let rb = self.rb_primary_bytes.as_deref();
+        // W6: the per-style run faces, borrowed for this row. A styled run
         // shapes against the REAL styled face (`resolve_styled_face` on presence),
         // so a bold `=>` ligates with the genuine Bold face's gids instead of the
         // regular face + dilation; `rasterize`'s MonoGid arm re-derives the same
         // pick to draw them.
-        let injected_bold = self.bold_font_bytes.clone();
-        let styled_bytes: [Option<(std::sync::Arc<[u8]>, u32)>; 3] = std::array::from_fn(|i| {
+        let injected_bold = self.bold_font_bytes.as_deref();
+        let styled_bytes: [Option<(&[u8], u32)>; 3] = std::array::from_fn(|i| {
             self.styled_faces[i]
                 .as_ref()
-                .map(|sf| (sf.bytes.clone(), sf.index))
+                .map(|sf| (sf.bytes.as_ref(), sf.index))
         });
         // W9: the primary's resolved variation coords, in rustybuzz form —
         // applied to PRIMARY-face runs only (styled/injected faces are
@@ -11659,17 +11917,17 @@ impl Renderer {
         // per missed run, and ZERO on a fully-cached row (an unconditional per-row
         // parse would regress the steady state). W9: the primary variation coords are
         // applied to it once at build, so this memoized face shapes at the SAME coords
-        // the byte-slice path would. `Some(None)` memoizes a parse FAILURE. STYLED/
-        // INJECTED runs shape from their OWN face (different bytes) and never touch
-        // this. The `Face` borrows `rb_slice`/`rb`, locals that outlive the
-        // `plan_row_runs` call.
-        let rb_slice: Option<&[u8]> = rb.as_deref();
+        // the byte-slice path would. `Some(None)` memoizes a parse FAILURE.
+        // Styled siblings and injected bold each get their own lazy slot too:
+        // styled output can have many distinct runs in one row, but the same
+        // font tables only need parsing once. Empty slots parse nothing.
         let mut row_face: Option<Option<rustybuzz::Face<'_>>> = None;
-        // On a cache MISS we record (style, owned run, result) to fold into the
-        // nested cache after planning; the `Box<str>` key is allocated ONLY here,
-        // never on the steady-state hit path inside the closure.
-        let mut newly_shaped: Vec<(StyleBits, Box<str>, ShapedRunGlyphs)> = Vec::new();
-        let cache = &self.shaped_runs;
+        let mut styled_row_faces: [Option<Option<rustybuzz::Face<'_>>>; 4] =
+            std::array::from_fn(|_| None);
+        // Inserting does not rotate the cache: generations still rotate only
+        // at the frame boundary. This produces the same final memo as batching
+        // inserts after the row, without the batch allocation or duplicate work.
+        let cache = &mut self.shaped_runs;
         // Borrow the feature array resolved once at config time — no per-run alloc
         // or scan of `font_features`. Empty user features => the base [liga, calt].
         let features = &self.resolved_features;
@@ -11689,8 +11947,7 @@ impl Renderer {
                 // allocation on the hot (`cur`) path, and the returned `Arc<ShapedRun>`
                 // clone is a refcount BUMP, not a deep copy of the boxed gid slice. A
                 // `prev`-generation hit is served WITHOUT re-shaping and PROMOTED back
-                // into `cur` (folded in after planning, exactly like a miss) so a hot
-                // run survives the next rotation and never re-shapes.
+                // into `cur` immediately so later runs in this row hit it too.
                 match cache.get(style, run) {
                     Some(ShapedHit::Cur(c)) => return c.clone(),
                     Some(ShapedHit::Prev(c)) => {
@@ -11698,7 +11955,7 @@ impl Renderer {
                         // value is refcounted), so a run oscillating at the cap every
                         // frame no longer re-clones the boxed per-column gid slice.
                         let promoted = c.clone();
-                        newly_shaped.push((style, Box::<str>::from(run), promoted.clone()));
+                        cache.insert(style, Box::<str>::from(run), promoted.clone());
                         return promoted;
                     }
                     None => {}
@@ -11716,7 +11973,7 @@ impl Renderer {
                     // (built once, with the W9 coords applied) so a scroll of unique
                     // runs no longer re-walks the font's table directory per miss.
                     let face = row_face.get_or_insert_with(|| {
-                        rb_slice.and_then(|b| {
+                        rb.and_then(|b| {
                             let mut f = rustybuzz::Face::from_slice(b, 0)?;
                             // W9: instantiate at the resolved coords once, so shaper
                             // and rasterizer agree (byte-identical to the byte-slice
@@ -11743,49 +12000,40 @@ impl Renderer {
                         )
                     })
                 } else {
-                    // W6: a STYLED/INJECTED-bold run shapes against its OWN real face
-                    // (`resolve_styled_face` on presence), so a bold `=>` ligates with
-                    // the genuine Bold face's gids instead of the regular face +
-                    // dilation. These faces are separate, non-instantiated files (no
-                    // variation coords). Each builds its face inside `shape_ligature_run`
-                    // — the styled set is small, so no per-row memo is warranted.
-                    let face: Option<(&std::sync::Arc<[u8]>, u32)> = match pick {
-                        FacePick::Styled { slot, .. } => {
-                            styled_bytes[slot].as_ref().map(|(b, i)| (b, *i))
-                        }
-                        FacePick::InjectedBold { .. } => injected_bold.as_ref().map(|b| (b, 0)),
-                        FacePick::Primary => None,
+                    // Preserve each sibling's collection index. These are
+                    // separate, non-instantiated files, so no primary variation
+                    // coordinates apply to them.
+                    let (slot, source) = match pick {
+                        FacePick::Styled { slot, .. } => (slot, styled_bytes[slot]),
+                        FacePick::InjectedBold { .. } => (3, injected_bold.map(|b| (b, 0))),
+                        FacePick::Primary => (3, None), // handled above
                     };
-                    face.and_then(|(b, idx)| {
-                        ligature_shaping::shape_ligature_run(
-                            b,
-                            idx,
+                    let face = styled_row_faces[slot].get_or_insert_with(|| {
+                        source.and_then(|(b, idx)| rustybuzz::Face::from_slice(b, idx))
+                    });
+                    face.as_ref().and_then(|f| {
+                        ligature_shaping::shape_ligature_run_with_face(
+                            f,
                             run,
                             run_chars,
                             true,
                             admit_collapsed,
                             features,
-                            &[],
                         )
                     })
                 };
                 // Wrap the freshly-shaped run in an `Arc` ONCE, so both the
-                // promote-into-`cur` copy below and the returned handle are refcount
+                // insert-into-`cur` copy below and the returned handle are refcount
                 // bumps — never a second deep copy of the boxed per-column gid slice.
                 let res = res.map(std::sync::Arc::new);
                 // Allocate the owned key ONLY on a miss/insert.
-                newly_shaped.push((style, Box::<str>::from(run), res.clone()));
+                cache.insert(style, Box::<str>::from(run), res.clone());
                 res
             },
             &mut self.shape_run_scratch,
             &mut self.shape_chars_scratch,
             out,
         );
-        // Persist freshly shaped runs (and promoted `prev` hits) into the current
-        // generation for later frames.
-        for (style, run, v) in newly_shaped {
-            self.shaped_runs.insert(style, run, v);
-        }
     }
 
     /// The glyph key for a ligated column: a `mono_gid` coverage glyph at the
@@ -11826,6 +12074,9 @@ impl Renderer {
     /// seal and capacity invalidations all use this; their other cache families
     /// retain each caller's existing invalidation policy.
     fn clear_glyph_images(&mut self) {
+        // The memoized ink boxes live in the entries, so they go with them: a
+        // re-rasterization under the same key (a font swap, a geometry change)
+        // can never be described by the old raster's ink.
         self.glyphs.clear();
         self.glyph_bytes = 0;
     }
@@ -11834,15 +12085,40 @@ impl Renderer {
     /// atlas) consume the exact bytes the CPU blit path uses, so their output
     /// can match pixel-for-pixel without duplicating the font logic/fallback.
     pub fn glyph_image(&mut self, key: GlyphKey) -> &GlyphImage {
+        &self.cached_glyph(key).img
+    }
+
+    /// `key`'s cache entry — the raster together with the facts memoized off it
+    /// ([`CachedGlyph`]), for a reader that wants more than one of them and
+    /// should pay only one hash probe for the set.
+    fn cached_glyph(&mut self, key: GlyphKey) -> &CachedGlyph {
         if !self.glyphs.contains_key(&key) {
             let mut img = self.rasterize(key);
             seat_ink_on_the_cell_floor(&mut img, self.baseline, self.cell_h);
             // The one insert site, so the byte total is maintained here and
-            // nowhere else. The key was absent, so nothing is displaced.
+            // nowhere else. The key was absent, so nothing is displaced. The
+            // ink box is memoized HERE, off the seated raster the entry keeps —
+            // the one place it is ever computed for a cached glyph.
             self.glyph_bytes = self.glyph_bytes.saturating_add(img.byte_len());
-            self.glyphs.insert(key, img);
+            self.glyphs.insert(key, CachedGlyph::new(img));
         }
         &self.glyphs[&key]
+    }
+
+    /// [`glyph_ink_box`] for `key`'s raster, read from the MEMO the cache entry
+    /// carries — the one answer both painters' mark loops place a stack by.
+    ///
+    /// The scan behind [`glyph_ink_box`] walks the whole raster, and the mark
+    /// loops ask it once per mark per FRAME while the raster it reads is
+    /// immutable for the life of the entry. So it is computed once, when the
+    /// entry is built, and dropped with the raster it describes
+    /// ([`Self::clear_glyph_images`]) — never recomputed per frame.
+    ///
+    /// ONE memo, read by the CPU blit and by the GPU quad loop under the key
+    /// each derives from the same `glyph_key(mark)`: CPU/GPU parity here is not
+    /// an argument that two computations agree, it is the same stored answer.
+    pub fn glyph_ink_box_cached(&mut self, key: GlyphKey) -> Option<(usize, i32)> {
+        self.cached_glyph(key).ink
     }
 
     /// Pre-rasterize printable ASCII (U+0020..=U+007E), REGULAR and BOLD, into
@@ -12946,10 +13222,33 @@ impl Renderer {
         // below can borrow `self` mutably for rasterization. It is restored into
         // `wc.dirty_scratch` before every return (capacity retained for reuse).
         let mut dirty = std::mem::take(&mut wc.dirty_scratch);
-        // E7: a rigid whole-row history scroll that `compute_dirty_rows` rejects
-        // (offset AND anchor both shifted → FullRepaint) is rescued into a BLIT —
-        // shift the retained rows, re-rasterize only the exposed strip. `Some`
-        // delta ⇒ `dirty` holds exactly the exposed/cursor rows to repaint.
+        // E7: a whole-row scroll is rescued into a BLIT — shift the retained rows,
+        // re-rasterize only what the shift could not carry. `Some` delta ⇒ `dirty`
+        // holds exactly those rows.
+        //
+        // Consulted on EVERY reusable frame, not just the `FullRepaint` verdict,
+        // because the verdict is not what says whether the frame slid. The two
+        // shapes it rescues:
+        //
+        //   * HISTORY SCROLL (offset AND anchor shift) — `compute_dirty_rows`
+        //     returns `FullRepaint` and the planner turns it into the exposed
+        //     strip. Unchanged from before.
+        //   * OUTPUT FLOOD (bottom-pinned: `display_offset` stays 0 while `base_y`
+        //     advances) — `compute_dirty_rows` ADMITS the frame on its equal-offset
+        //     arm and then diffs destination row `r` against SOURCE row `r`, which
+        //     for a screen that just slid up means every row differs: 49 of 50 by
+        //     content, all 50 once the cursor row is unioned in, at EVERY output
+        //     rate from 1 line a frame to 16. The planner
+        //     diffs against row `r + da` instead and reports the exposed strip, the
+        //     row the writer was filling, and the two-row overshoot apron —
+        //     measured 4.95 rows/frame at 1 line a frame, 19.77 at 16.
+        //
+        // The plan is taken only when it is STRICTLY FEWER rows than the ordinary
+        // diff found (`shift` is a second scratch precisely so both counts exist at
+        // once): the blit is not free, and a frame that really did change
+        // everywhere must not pay for a memmove it then overpaints. A gate-hit
+        // frame is never offered to it at all — zero rows already wins.
+        let mut shift = std::mem::take(&mut wc.shift_scratch);
         let mut scroll_delta: Option<i32> = None;
         let decision = match &wc.cache {
             // The cached pixel dims must also match `(w, h)`. `compute_dirty_rows`
@@ -12974,8 +13273,15 @@ impl Renderer {
                     self.cell_h,
                     &mut dirty,
                 );
-                if matches!(d, DirtyDecision::FullRepaint) {
-                    scroll_delta = scroll_blit_plan(
+                // What the ordinary diff would cost, in rows: every row on a
+                // `FullRepaint`, the marked ones otherwise.
+                let baseline = match &d {
+                    DirtyDecision::FullRepaint => rows,
+                    DirtyDecision::Rows(_) => dirty.iter().filter(|&&b| b).count(),
+                };
+                let gate_hit = matches!(&d, DirtyDecision::Rows(r) if r.is_gate_hit());
+                if !gate_hit
+                    && let Some(delta) = scroll_shift_plan(
                         &c.input,
                         input,
                         c.cursor_blink_phase,
@@ -12983,13 +13289,33 @@ impl Renderer {
                         self.cursor_blink_phase,
                         self.cursor_style_override,
                         self.cell_h,
-                        &mut dirty,
-                    );
+                        // The CPU pixel move is a `memmove` of the cached grid
+                        // band; a retained row that changed is re-rasterized over
+                        // it rather than refusing the whole plan.
+                        RetainedRows::Diff,
+                        &mut shift,
+                    )
+                {
+                    // WORTH IT? On a `FullRepaint` verdict, yes by contract:
+                    // that is the E7 arm as it has always been, where the
+                    // alternative is re-establishing the entire frame and the
+                    // band memmove is bounded by the bg fill that path runs
+                    // anyway. Displacing a `Rows` verdict is the new arm, and
+                    // there the ordinary diff already has a row set — so the
+                    // plan must be STRICTLY smaller to justify its memmove,
+                    // or a frame that genuinely changed everywhere would pay
+                    // for pixels it immediately overpaints.
+                    let n = shift.iter().filter(|&&b| b).count();
+                    if n < baseline || matches!(&d, DirtyDecision::FullRepaint) {
+                        scroll_delta = Some(delta);
+                        std::mem::swap(&mut dirty, &mut shift);
+                    }
                 }
                 d
             }
             _ => DirtyDecision::FullRepaint,
         };
+        wc.shift_scratch = shift;
         let dirty_rows = match decision {
             // A true full repaint (no scroll-blit rescue): rebuild every row.
             DirtyDecision::FullRepaint if scroll_delta.is_none() => {
@@ -12998,9 +13324,15 @@ impl Renderer {
                 self.full_render(wc, input, w, h);
                 return (w, h);
             }
-            // Rescued scroll blit: the exposed/cursor rows in `dirty` drive the
-            // SAME damaged tail as ordinary row damage (pixels pre-shifted below).
+            // Rescued scroll blit: the flagged rows in `dirty` drive the SAME
+            // damaged tail as ordinary row damage (pixels pre-shifted below).
+            // `rows_only` on BOTH scroll arms, including the one that displaced a
+            // `Rows` verdict: the planner's own gate proved there is no overlay
+            // stream, no selection and no cursor change in either frame, so every
+            // flag the displaced verdict carried is false by construction — and
+            // `any_dirty` is true, so the frame cannot be mistaken for a gate hit.
             DirtyDecision::FullRepaint => DirtyRows::rows_only(),
+            DirtyDecision::Rows(_) if scroll_delta.is_some() => DirtyRows::rows_only(),
             DirtyDecision::Rows(d) => d,
         };
 
@@ -14749,11 +15081,38 @@ impl Renderer {
                 if cluster.is_none()
                     && let Some(marks) = combining_for(row_combining, c)
                 {
+                    // A second mark on the same side of the base is STACKED on
+                    // the first, as far as the cell has room (`MarkStack`,
+                    // shared with the GPU combining loop: the same integer
+                    // arithmetic on both paths, so a second acute lifts by the
+                    // identical pixels). Its operand is the mark's INK box, not
+                    // the raster box CoreText reports — CoreText pads the rows,
+                    // so a box rule reads a dot below as straddling the baseline
+                    // and never stacks it (see `MarkStack`).
+                    let mut stack = MarkStack::default();
                     for &m in marks {
                         let mk = self.glyph_key(m);
-                        let (gw, xmin) = {
-                            let mi = self.glyph_image(mk);
-                            (mi.width(), mi.xmin())
+                        // ONE cache probe for all four facts: the ink box is
+                        // MEMOIZED in the entry (`CachedGlyph`), never scanned
+                        // per mark per frame — it is a pure function of a raster
+                        // that cannot change while the entry lives. The GPU loop
+                        // reads the SAME memo entry.
+                        let (gw, gh, xmin, ink) = {
+                            let cg = self.cached_glyph(mk);
+                            (cg.img.width(), cg.img.height(), cg.img.xmin(), cg.ink)
+                        };
+                        // An inkless mark paints nothing (the blit returns
+                        // early) and must not lift the marks after it — the GPU
+                        // loop skips its empty slot the same way. A raster whose
+                        // BOX is non-empty but carries no coverage is inkless
+                        // too, and the ink box is the one thing that can tell
+                        // (the GPU loop asks the same question of the same
+                        // raster).
+                        if gw == 0 || gh == 0 {
+                            continue;
+                        }
+                        let Some((ink_h, ink_ymin)) = ink else {
+                            continue;
                         };
                         // `mark_cell_x_at` takes the cell's LEFT PIXEL rather
                         // than re-deriving it from `c * rcw`, because on a
@@ -14762,12 +15121,13 @@ impl Renderer {
                         // so this is the old `mark_cell_x(c, cw, ..) + pad_x`
                         // term for term (same centring, same integer division).
                         let cx = mark_cell_x_at(x as i32, cw, gw, xmin, scale);
+                        let dy = stack.dy(ink_h, ink_ymin, self.baseline, self.cell_h, scale.ys);
                         // Combining marks paint in the SAME effective fg as their
                         // base glyph — W5b floors (selection / min-contrast) applied
                         // to the INK-substituted `base_fg`, so accented forms both
                         // FOLLOW ink and stay floored with their base. The GPU
                         // combining loop applies the identical policy (parity).
-                        self.blit(pixels, w, cx, anchor_y, mk, fg, bg_under, scale);
+                        self.blit(pixels, w, cx, anchor_y + dy, mk, fg, bg_under, scale);
                     }
                 }
             }
@@ -16965,18 +17325,20 @@ fn blit_mono_1x(
         let (i_lo, i_hi) = ((vx0 - gx) as usize, (vx1 - gx) as usize);
         let row_off = j * width;
         let srow = &bytes[row_off + i_lo..row_off + i_hi];
-        let base = yrow + gx; // dest index for src column 0
-        for (k, &cov) in srow.iter().enumerate() {
+        // The clipped source and destination windows have the same length.
+        // Slice the destination once so each texel needs no index arithmetic
+        // or independent framebuffer bounds check.
+        let drow = &mut px[(yrow + vx0) as usize..(yrow + vx1) as usize];
+        for (dst, &cov) in drow.iter_mut().zip(srow) {
             if cov == 0 {
                 continue;
             }
-            let idx = (base + (i_lo + k) as i64) as usize;
-            px[idx] = if cov == 255 {
+            *dst = if cov == 255 {
                 cmasked
             } else if let Some(memo) = memo.as_deref_mut() {
-                blend_text_pre(px[idx], color, cov, memo)
+                blend_text_pre(*dst, color, cov, memo)
             } else {
-                blend(px[idx], color, cov)
+                blend(*dst, color, cov)
             };
         }
     }
@@ -17328,19 +17690,14 @@ fn blit_rgba_1x(
         };
         let (i_lo, i_hi) = ((vx0 - gx) as usize, (vx1 - gx) as usize);
         let srow = &bytes[(j * width + i_lo) * 4..(j * width + i_hi) * 4];
-        let base = yrow + gx;
-        for (k, texel) in srow.as_chunks::<4>().0.iter().enumerate() {
+        let drow = &mut px[(yrow + vx0) as usize..(yrow + vx1) as usize];
+        for (dst, texel) in drow.iter_mut().zip(srow.as_chunks::<4>().0) {
             let a = texel[3];
             if a == 0 {
                 continue;
             }
             let rgb = ((texel[0] as u32) << 16) | ((texel[1] as u32) << 8) | (texel[2] as u32);
-            let idx = (base + (i_lo + k) as i64) as usize;
-            px[idx] = if a == 255 {
-                rgb
-            } else {
-                blend(px[idx], rgb, a)
-            };
+            *dst = if a == 255 { rgb } else { blend(*dst, rgb, a) };
         }
     }
 }
@@ -18055,17 +18412,39 @@ fn mark(dirty: &mut [bool], r: usize) {
 }
 
 /// The producer-built revision is authoritative only when BOTH snapshots carry
-/// it.  Hand-built inputs intentionally retain the old exact-vector fallback.
+/// it.  Hand-built inputs intentionally retain the old exact-vector fallback —
+/// **BUT ONLY WHEN THE PREV PAYLOAD IS STILL THERE TO COMPARE.**
+///
+/// [`RenderInput::clone_damage_cache_from`] empties a stream's payload exactly
+/// when that stream's metadata is VALID, so whether `prev` still holds anything
+/// is decided by `prev_damage` ALONE. Requiring both sides valid before
+/// trusting the metadata meant a producer-stamped CACHED frame followed by a
+/// hand-built successor (metadata left at `Default`, the documented public
+/// fallback) fell through to `prev != current` — comparing the live payload
+/// against a `Vec` the cache deliberately emptied. A glow that VANISHED read as
+/// `[] != []`, i.e. unchanged: gate hit, zero dirty rows, and the previous
+/// frame's glow re-presented forever.
+///
+/// So the prev side is judged on its own validity. With `prev` emptied and no
+/// trustworthy `current` metadata to compare against, the honest answer is
+/// CHANGED — we cannot prove it unchanged, and a false "unchanged" strands
+/// light on the glass while a false "changed" costs one row's raster.
 fn effect_stream_changed<T: PartialEq>(
     prev: &[T],
     current: &[T],
     prev_damage: &EffectStreamDamage,
     current_damage: &EffectStreamDamage,
 ) -> bool {
-    prev_damage
-        .same_content(current_damage)
-        .map(|same| !same)
-        .unwrap_or_else(|| prev != current)
+    if let Some(same) = prev_damage.same_content(current_damage) {
+        return !same;
+    }
+    if prev_damage.is_valid() {
+        // `prev` was emptied by the cache; it is not evidence of anything.
+        // Fall back to the one comparison that survives: what the metadata
+        // says prev held, against what current actually holds.
+        return !(prev_damage.was_empty() == Some(true) && current.is_empty());
+    }
+    prev != current
 }
 
 /// Mark prev∪current rows from compact metadata when possible; otherwise walk
@@ -18077,8 +18456,18 @@ fn mark_effect_stream_rows(
     current_damage: &EffectStreamDamage,
     fallback_rows: impl Iterator<Item = usize>,
 ) {
-    if prev_damage.is_valid() && current_damage.is_valid() {
+    // THE PREV SIDE IS JUDGED ON ITS OWN VALIDITY, for the same reason
+    // `effect_stream_changed` does: the cache empties a payload exactly when
+    // its metadata is valid, and `EffectStreamDamage::rows` exists precisely to
+    // "retain vacated rows after the render cache drops the expensive payload".
+    // Gating that on BOTH sides meant a hand-built successor walked a prev
+    // payload that was empty, so the row a glow VACATED was never marked and
+    // last frame's additive light was never rastered away — a glow that moved
+    // from row 1 to row 3 lit both.
+    if prev_damage.is_valid() {
         prev_damage.mark_rows(dirty);
+    }
+    if current_damage.is_valid() && prev_damage.is_valid() {
         current_damage.mark_rows(dirty);
     } else {
         for row in fallback_rows {
@@ -18356,11 +18745,27 @@ fn cursor_shown_in(
 /// handled separately (it is a single relocatable overlay). Every stream is
 /// empty in the common history-scroll case, so this is a cheap `is_empty` fan.
 fn scroll_blittable_content(input: &RenderInput) -> bool {
+    /// Was this stream absent from the frame `input` describes?
+    ///
+    /// **NOT `payload.is_empty()`.** One of the two frames this predicate is
+    /// asked about is the CACHED previous frame, and
+    /// [`RenderInput::clone_damage_cache_from`] drops the payload of these four
+    /// streams and keeps only their metadata. Asking the `Vec` would answer
+    /// "empty" for a previous frame that was covered in glow, and the blit
+    /// would rigidly shift pixels carrying an overlay it cannot relocate.
+    /// [`EffectStreamDamage::was_empty`] is what survives the cache; the
+    /// payload is the answer only for a hand-built input, whose metadata is
+    /// invalid and whose payload was therefore cloned intact.
+    fn absent<T>(payload: &[T], damage: &aterm_core::render::EffectStreamDamage) -> bool {
+        // `unwrap_or`, not `unwrap_or_else`: the fallback is one length check.
+        damage.was_empty().unwrap_or(payload.is_empty())
+    }
+
     input.cursor_trail.is_empty()
-        && input.cursor_glow_add.is_empty()
-        && input.glow_halo.is_empty()
-        && input.glow_under.is_empty()
-        && input.fire_patch.is_empty()
+        && absent(&input.cursor_glow_add, &input.cursor_glow_add_damage)
+        && absent(&input.glow_halo, &input.glow_halo_damage)
+        && absent(&input.glow_under, &input.glow_under_damage)
+        && absent(&input.fire_patch, &input.fire_patch_damage)
         && input.word_decorations.is_empty()
         && input.ink.is_empty()
         && input.char_fg.is_empty()
@@ -18417,6 +18822,10 @@ const OVERSHOOT_APRON_ROWS: usize = 2;
 /// above is backend-independent — it is a statement about row rasterization being
 /// a pure Y-translation, which is equally true of the GPU's glyph placement — so
 /// the rescue belongs to both or to neither.
+///
+/// This is [`RetainedRows::Rigid`] — see [`scroll_shift_plan`] for the policy the
+/// CPU backend takes on a STREAMING flood, where one retained row changes every
+/// frame and the rigid contract refuses.
 #[allow(clippy::too_many_arguments)]
 pub fn scroll_blit_plan(
     prev: &RenderInput,
@@ -18426,6 +18835,82 @@ pub fn scroll_blit_plan(
     cur_blink_phase: bool,
     cur_cursor_style_override: Option<CursorStyle>,
     cell_h: usize,
+    dirty: &mut Vec<bool>,
+) -> Option<i32> {
+    scroll_shift_plan(
+        prev,
+        input,
+        prev_blink_phase,
+        prev_cursor_style_override,
+        cur_blink_phase,
+        cur_cursor_style_override,
+        cell_h,
+        RetainedRows::Rigid,
+        dirty,
+    )
+}
+
+/// What [`scroll_shift_plan`] does with a RETAINED row whose content did not
+/// survive the shift — the one axis on which the two backends' scroll rescues
+/// legitimately differ, because they pay for the pixel move in different coin.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum RetainedRows {
+    /// REFUSE the whole plan: the frame is not a pure slide.
+    ///
+    /// The GPU present path asks for this, and the reason is MEASURED, not
+    /// assumed. Its pixel move is a staged texture-to-texture band copy
+    /// (`shift_offscreen_rows` → two full-width copies through a scratch texture
+    /// plus a submit), so it costs O(framebuffer) of copy traffic no matter how
+    /// few rows it saves re-encoding. On the first-party Metal arm (M4 Pro,
+    /// 50x200) that trade is worth it against a FULL repaint — the existing rigid
+    /// rescue reads 693 us/frame against 1330 us for the Clear-and-redraw it
+    /// replaces (`gpu_present_scrollback_50x200`, -40%) — and NOT worth it against
+    /// a scissored encode: `gpu_present_flood_50x200` reads 343 us/frame for the
+    /// 49-row Load+scissor and 690 us with the shift plan, a 47% regression even
+    /// though the encode collapses from 5341 instances to 328. So the GPU takes
+    /// the rescue only where `compute_dirty_rows` gives up entirely, and a flood
+    /// stays on the scissor.
+    Rigid,
+    /// KEEP the plan and mark that row dirty, so the damaged tail re-rasterizes
+    /// it over the shifted pixels.
+    ///
+    /// The CPU path asks for this. Its pixel move is a `memmove` of the cached
+    /// framebuffer's grid band — the same O(framebuffer) the full repaint pays
+    /// on its bg fill alone, and an order of magnitude under the cost of
+    /// rasterizing the rows it saves. A bottom-pinned OUTPUT FLOOD is the shape
+    /// that needs it: `display_offset` stays 0 while `base_y` advances, so
+    /// `compute_dirty_rows`' equal-offset arm admits the frame and then compares
+    /// destination row `r` against SOURCE row `r` — every row differs (49 of 50 by
+    /// content, all 50 with the cursor row), and the rigid planner refuses (the
+    /// row the writer touched changed) so nothing rescues it. Diffing
+    /// against row `r + da` instead
+    /// reports the exposed strip, its overshoot apron, and whatever else really
+    /// changed.
+    Diff,
+}
+
+/// The E7 scroll planner proper: [`scroll_blit_plan`] with an explicit
+/// [`RetainedRows`] policy.
+///
+/// SOUNDNESS of the `Diff` arm, on top of `scroll_blit_plan`'s: a retained row
+/// that CHANGED is marked dirty, so it is re-rasterized from scratch by the same
+/// per-row passes the full path runs — it is never reused, and the blit that
+/// moved its stale pixels underneath is simply overpainted. The only thing that
+/// makes it different from an EXPOSED row is that its neighbours were blitted, and
+/// the upward-overshoot apron below treats it exactly like one for that reason.
+/// Every other clause (no overlay, no selection, a static identically-drawn
+/// cursor, whole-cell shift) is unchanged, so the rest of the frame is the same
+/// rigid slide it always was.
+#[allow(clippy::too_many_arguments)]
+pub fn scroll_shift_plan(
+    prev: &RenderInput,
+    input: &RenderInput,
+    prev_blink_phase: bool,
+    prev_cursor_style_override: Option<CursorStyle>,
+    cur_blink_phase: bool,
+    cur_cursor_style_override: Option<CursorStyle>,
+    cell_h: usize,
+    retained: RetainedRows,
     dirty: &mut Vec<bool>,
 ) -> Option<i32> {
     let rows = input.rows;
@@ -18459,21 +18944,12 @@ pub fn scroll_blit_plan(
         return None;
     }
     let da = da as i32; // |da| < rows, and rows is small
-    // Every RETAINED row must survive the shift byte-identically: new row r maps
-    // to prev row r + da when in range. The image memo is call-scoped (see
-    // `ImageEqMemo`), so a scrolled re-transmitted image deep-compares once,
-    // not once per surviving covered cell.
-    let mut image_memo = ImageEqMemo::default();
-    for r in 0..rows {
-        let src = r as i64 + i64::from(da);
-        if (0..rows as i64).contains(&src)
-            && row_differs_shifted(input, r, prev, src as usize, &mut image_memo)
-        {
-            return None;
-        }
-    }
     // Cursor: the blit relocates the OLD cursor's pixels, so only a static,
-    // identically-drawn cursor (or none) is handled here.
+    // identically-drawn cursor (or none) is handled here. Checked BEFORE the
+    // O(rows·cols) content scan below — every refusal is now decided before a
+    // single byte of `dirty` is written, which is what lets a caller hand this
+    // function the SAME scratch its ordinary row diff already filled and still
+    // rely on "`None` leaves `dirty` untouched".
     let prev_shown = cursor_shown_in(prev, prev_blink_phase, prev_cursor_style_override);
     let cur_shown = cursor_shown_in(input, cur_blink_phase, cur_cursor_style_override);
     if prev_shown != cur_shown {
@@ -18491,39 +18967,49 @@ pub fn scroll_blit_plan(
     {
         return None;
     }
-    // Eligible. Flag the exposed strip (rows with no in-range source) + the
-    // cursor's re-stamp row and its blitted-ghost row (so the damaged tail erases
-    // the moved cursor pixels and re-stamps the crisp cursor).
-    dirty.clear();
-    dirty.resize(rows, false);
-    for (r, slot) in dirty.iter_mut().enumerate() {
-        let src = r as i64 + i64::from(da);
-        if !(0..rows as i64).contains(&src) {
-            *slot = true; // no in-range source ⇒ newly exposed
-        }
-    }
-    if cur_shown {
-        mark(dirty, input.cursor_row);
-        let ghost = i64::from(input.cursor_row as i32 - da);
-        if (0..rows as i64).contains(&ghost) {
-            dirty[ghost as usize] = true;
-        }
-    }
-    // SHADE-PHASE PARITY (BUG 1). The blit memmoves each retained row's already-
-    // rasterized pixels by `da·cell_h` device px. A procedural shade dither
-    // (U+2591–2593) is a function of ABSOLUTE framebuffer Y-parity ([`shade`] via
-    // [`shade_phase_key`]), so when that shift is ODD it lands at the OPPOSITE
-    // phase — a stale-phase seam that doubles the dither line. Re-raster (rather
-    // than blit) exactly the retained rows that carry a phase-sensitive cell; when
-    // the shift is EVEN the phase is preserved and every retained row still blits,
-    // so the common-case win is untouched. Most scroll frames carry no such cell,
-    // so this marks nothing.
-    if (i64::from(da) * cell_h as i64) & 1 != 0 {
+    // Every RETAINED row maps to prev row `r + da` when in range. The image memo
+    // is call-scoped (see `ImageEqMemo`), so a scrolled re-transmitted image
+    // deep-compares once, not once per surviving covered cell.
+    //
+    // Under [`RetainedRows::Rigid`] a single changed retained row refuses the
+    // whole plan (the pure-slide contract the GPU present path asks for), so the
+    // scan runs as a PURE CHECK before anything is written.
+    let mut image_memo = ImageEqMemo::default();
+    if retained == RetainedRows::Rigid {
         for r in 0..rows {
             let src = r as i64 + i64::from(da);
-            if (0..rows as i64).contains(&src) && row_has_y_phase_cell(input, r) {
-                mark(dirty, r);
+            if (0..rows as i64).contains(&src)
+                && row_differs_shifted(input, r, prev, src as usize, &mut image_memo)
+            {
+                return None;
             }
+        }
+    }
+    // Eligible. Flag the exposed strip (rows with no in-range source), the
+    // retained rows whose content did NOT survive the shift (Diff only), the
+    // overshoot apron above each of those, and the cursor's re-stamp row and its
+    // blitted-ghost row (so the damaged tail erases the moved cursor pixels and
+    // re-stamps the crisp cursor).
+    dirty.clear();
+    dirty.resize(rows, false);
+    // Step 1 — REBUILT rows: exposed, plus (Diff) the retained rows that changed.
+    // Nothing else may be marked until the apron loop below has read this set:
+    // the apron is the reconciliation depth for a row REBUILT WITH DIFFERENT
+    // CONTENT, and a re-rastered row whose content is UNCHANGED (a shade-parity
+    // or cursor row) deliberately gets the snapshot/restore treatment instead.
+    for (r, row_dirty) in dirty.iter_mut().enumerate() {
+        let src = r as i64 + i64::from(da);
+        if !(0..rows as i64).contains(&src) {
+            *row_dirty = true; // no in-range source ⇒ newly exposed
+        } else if retained == RetainedRows::Diff
+            && row_differs_shifted(input, r, prev, src as usize, &mut image_memo)
+        {
+            // A STREAMING flood is exactly this shape: the anchor advances, every
+            // retained row slides up byte-identically, and the one row the writer
+            // touched (the old bottom line, now one row higher) differs. Marking
+            // it — instead of refusing the whole plan — is what turns a flood from
+            // "every row dirty" into "the exposed strip plus its apron".
+            *row_dirty = true;
         }
     }
     // UPWARD-OVERSHOOT INVARIANT (the general rule; subsumes the ad-hoc bug-2
@@ -18550,17 +19036,28 @@ pub fn scroll_blit_plan(
     // bottom retained row is therefore re-rastered separately below.
     // composite_free draws each exposed / apron row's fresh overshoot into the
     // re-rastered band above it; the UPPER apron protects the topmost still-blitted
-    // neighbour from the double-composite. Keyed off the EXPOSED set (source out of
-    // range), never `dirty`, so a shade/cursor re-raster is never taken for exposed
-    // content.
-    for r in 0..rows {
-        let below_exposed = !(0..rows as i64).contains(&((r + 1) as i64 + i64::from(da)));
-        if below_exposed {
-            for k in 0..OVERSHOOT_APRON_ROWS as i64 {
-                let rr = r as i64 - k;
-                if rr >= 0 && (0..rows as i64).contains(&(rr + i64::from(da))) {
-                    mark(dirty, rr as usize);
-                }
+    // neighbour from the double-composite.
+    //
+    // Keyed off the REBUILT set — a row with no in-range source (exposed) or, under
+    // [`RetainedRows::Diff`], a retained row whose content changed. Both are rebuilt
+    // from scratch with ink the blit could not have carried, so both make the
+    // blitted copy above them stale in exactly the same way; the two-row depth is
+    // the same argument either way. It is deliberately NOT keyed off a re-rastered
+    // row whose content is UNCHANGED (a shade-parity or cursor row): that row's
+    // overshoot is already correct in the blitted band above, so it gets the
+    // snapshot/restore treatment (`scroll_snapshot_upper_aprons`) instead — which
+    // is why the shade and cursor marks below run AFTER this loop, and why this
+    // loop reads `dirty` ASCENDING (every mark it makes lands at a STRICTLY LOWER
+    // index than the row being read, so a freshly marked apron row can never
+    // cascade into another apron and drag the whole screen up with it).
+    for q in 0..rows {
+        if !dirty[q] {
+            continue;
+        }
+        for k in 1..=OVERSHOOT_APRON_ROWS as i64 {
+            let rr = q as i64 - k;
+            if rr >= 0 && (0..rows as i64).contains(&(rr + i64::from(da))) {
+                mark(dirty, rr as usize);
             }
         }
     }
@@ -18568,6 +19065,33 @@ pub fn scroll_blit_plan(
         let bottom = rows - 1;
         if (0..rows as i64).contains(&(bottom as i64 + i64::from(da))) {
             mark(dirty, bottom);
+        }
+    }
+    // SHADE-PHASE PARITY (BUG 1). The blit memmoves each retained row's already-
+    // rasterized pixels by `da·cell_h` device px. A procedural shade dither
+    // (U+2591–2593) is a function of ABSOLUTE framebuffer Y-parity ([`shade`] via
+    // [`shade_phase_key`]), so when that shift is ODD it lands at the OPPOSITE
+    // phase — a stale-phase seam that doubles the dither line. Re-raster (rather
+    // than blit) exactly the retained rows that carry a phase-sensitive cell; when
+    // the shift is EVEN the phase is preserved and every retained row still blits,
+    // so the common-case win is untouched. Most scroll frames carry no such cell,
+    // so this marks nothing.
+    if (i64::from(da) * cell_h as i64) & 1 != 0 {
+        for r in 0..rows {
+            let src = r as i64 + i64::from(da);
+            if (0..rows as i64).contains(&src) && row_has_y_phase_cell(input, r) {
+                mark(dirty, r);
+            }
+        }
+    }
+    // The cursor's re-stamp row and its blitted-ghost row. Content-identical by
+    // the clause above (the cursor neither moved nor changed shape), so these are
+    // exactly the unchanged-content re-rasters the upper-apron snapshot protects.
+    if cur_shown {
+        mark(dirty, input.cursor_row);
+        let ghost = i64::from(input.cursor_row as i32 - da);
+        if (0..rows as i64).contains(&ghost) {
+            dirty[ghost as usize] = true;
         }
     }
     Some(da)
@@ -19552,10 +20076,296 @@ pub fn mark_cell_x(c: usize, rcw: usize, gw: usize, xmin: i32, scale: Scale) -> 
 /// (pad included) and get an absolute one. `mark_cell_x(c, rcw, ..)` is exactly
 /// `mark_cell_x_at((c * rcw) as i32, rcw, ..)`, which is why the uniform CPU path
 /// and the GPU's column-indexed call site stay byte-identical through the change.
+///
+/// # `gw`/`xmin` here are the REPORTED box, not the ink
+///
+/// Both callers pass the raster's own `(width, xmin)`, so on a padded path this
+/// centres the BOX — unlike the vertical rule ([`MarkStack`]), which was moved
+/// onto [`glyph_ink_box`] because CoreText's row pad crosses the baseline and
+/// changes a mark's SIDE. The column pad does not change anything categorical
+/// and is nearly symmetric, so the two centrings usually agree: measured on
+/// SF Mono 18px in an 11px cell, U+0301 centres at `+4` from either operand,
+/// while U+0323 (box `gw 6, xmin 3`, ink `gw 3, xmin 4`) centres at `-1` by its
+/// box against `0` by its ink — one pixel left. Converting this one moves marks
+/// horizontally in SINGLE-mark cells too, which the stacking change left
+/// byte-identical, so it is a separate change with its own pixel evidence.
 #[must_use]
 pub fn mark_cell_x_at(cell_left: i32, rcw: usize, gw: usize, xmin: i32, scale: Scale) -> i32 {
     let xs = scale.xs.max(1) as i32;
     cell_left + (rcw as i32 - gw as i32 * xs) / 2 - xmin * xs
+}
+
+/// Running vertical placement of ONE cell's combining marks, so a second mark on
+/// the same side of the base STACKS on the first instead of overprinting it.
+///
+/// The painters place a mark by its own outline alone (`baseline - gh - ymin`),
+/// and a font's combining glyphs all sit at the same height over the x-height,
+/// so `e` + U+0301 + U+0301 used to be pixel-equal to `e` + U+0301 up to
+/// double-coverage darkening: every mark past the first was invisible. The
+/// cell is never shaped as a cluster, so no GPOS `mkmk` anchor can lift the
+/// second mark; this synthesises the lift from the INK boxes both painters
+/// already hold ([`GlyphImage::ink_box`] — the rasterized box trimmed of its
+/// zero-coverage edge rows, never the raster box itself: fontdue sizes that
+/// one from the scaled outline bbox, and a surplus row there moves a mark to
+/// the wrong side of every test below).
+///
+/// Each mark is classified by where its ink lies relative to the baseline —
+/// `ink_ymin >= 0` is an above-mark, `ink_ymin + ink_h <= 0` a below-mark,
+/// anything that straddles the baseline (a nukta-like or enclosing mark) keeps
+/// its designed place and joins no stack. An above-mark is lifted so its bottom
+/// sits one glyph row clear of the highest ink so far; a below-mark is dropped
+/// so its top sits one row clear of the lowest. The first mark on each side
+/// needs no lift (`dy == 0`), so every single-mark cell is byte-identical to
+/// what it was, and a mark whose designed place already clears the stack is not
+/// moved.
+///
+/// # The operand is the INK, never the reported raster box
+///
+/// Both callers hand this the entry's memoized [`glyph_ink_box`], not
+/// `(height(), ymin())`. The box a raster path reports is not the glyph
+/// ([`ink_row_extent`]): macOS CoreText — the SHIPPING macOS raster — pads it
+/// by a pixel per side plus a phase row, on the ROWS as well as the columns
+/// ([`ct_padded_extent`] is one axis, used for both). A box-fed classifier
+/// therefore answers differently about one character on two raster paths, and
+/// on CoreText it answers WRONG: measured on macOS CoreText at 18px with the
+/// face [`Renderer::from_system`] resolves here (SF Mono,
+/// `/System/Library/Fonts/SFNSMono.ttf`), U+0323 COMBINING DOT BELOW rasterizes
+/// to a `gh 6, ymin -5` box whose TOP EDGE is `+1` — a row ABOVE the baseline
+/// the glyph has no ink on — so the box rule called a dot below a
+/// baseline-straddling overlay and no dot-below stack ever moved. Its ink is
+/// `gh 3, ymin -4` (top edge `-1`), which is a below-mark on any path. The pad
+/// rows are blank, so a lift derived from the ink still moves the whole raster
+/// by exactly the right amount.
+///
+/// The other raster paths do not pad the rows — [`crate::subpixel`]'s FIR5
+/// widening is horizontal only and [`crate::variation`] crops its pad off
+/// before reporting (see [`glyph_ink_box`]) — so there the ink box IS the
+/// reported box rounded to the pixel grid and this operand changes nothing.
+///
+/// # Bounds
+///
+/// The lift is BOUNDED by the cell: a mark's ink moves only as far as its band
+/// has room, never past the cell's top or bottom edge, so the stack stays
+/// inside the row by construction. The room a mark gets is the FACE's cell box
+/// and baseline, not the raster path's, so both are named with every number
+/// here: measured at 18px on SF Mono (what [`Renderer::from_system`] resolves
+/// on this machine — `/System/Library/Fonts/SFNSMono.ttf`), whose cell is 11x21
+/// with baseline 17, rasterized by CoreText. A second acute has two rows of
+/// room over the first and moves two, overlapping it by two rows rather than
+/// vanishing off the top; a second dot below has no room (its ink already
+/// reaches the cell floor) and overprints as before. At a doubled line height (11x42, baseline 28) both
+/// pairs get their whole lift with a clear row between: acutes ink rows 50-53
+/// and 55-58, dots 71-73 and 75-77. Cutting the surplus at the band would drop
+/// such a mark entirely, and letting it climb would paint into the row above —
+/// which the damage-scoped repaint and the scroll blit's overshoot aprons
+/// assume no row does by more than one cell. The room is measured in unscaled
+/// glyph rows from the cell's `baseline` and `cell_h`, so the two halves of a
+/// DECDHL row agree on it; the offset comes back in device pixels (`ys` doubles
+/// it there), to be added to the row's `anchor_y`. Pure integer arithmetic, one
+/// instance per cell, shared by the CPU and GPU loops so both lift the mark by
+/// the identical amount (CPU/GPU parity by construction).
+#[derive(Clone, Copy, Debug, Default)]
+pub struct MarkStack {
+    /// Highest ink row so far above the baseline (exclusive top edge), or
+    /// `None` before the first above-mark.
+    above_top: Option<i32>,
+    /// Lowest ink row so far below the baseline (inclusive bottom edge, a
+    /// non-positive `ymin`), or `None` before the first below-mark.
+    below_bottom: Option<i32>,
+}
+
+impl MarkStack {
+    /// Device-pixel y offset for the cell's next mark, whose INK box
+    /// ([`glyph_ink_box`] — NOT the padded raster box, see the type's docs) is
+    /// `ink_h` rows tall with its bottom edge `ink_ymin` rows above the
+    /// baseline, in a cell `cell_h` rows tall with its baseline `baseline` rows
+    /// down, painted under vertical scale `ys`.
+    #[must_use]
+    pub fn dy(
+        &mut self,
+        ink_h: usize,
+        ink_ymin: i32,
+        baseline: i32,
+        cell_h: usize,
+        ys: usize,
+    ) -> i32 {
+        let (ink_h, cell_h, ys) = (ink_h as i32, cell_h as i32, ys.max(1) as i32);
+        if ink_ymin >= 0 {
+            // Above the baseline: lift clear of the stack's ceiling, but no
+            // further than the rows between the mark's designed ink top and the
+            // cell's top edge.
+            let want = self.above_top.map_or(0, |top| (top + 1 - ink_ymin).max(0));
+            let room = (baseline - ink_h - ink_ymin).max(0);
+            let lift = want.min(room);
+            let top = ink_ymin + lift + ink_h;
+            self.above_top = Some(self.above_top.map_or(top, |t| t.max(top)));
+            -lift * ys
+        } else if ink_ymin + ink_h <= 0 {
+            // Below the baseline: drop clear of the stack's floor, but no
+            // further than the rows between the mark's designed ink bottom and
+            // the cell's bottom edge.
+            let want = self
+                .below_bottom
+                .map_or(0, |bottom| (ink_ymin + ink_h + 1 - bottom).max(0));
+            let room = (cell_h - (baseline - ink_ymin)).max(0);
+            let drop = want.min(room);
+            let bottom = ink_ymin - drop;
+            self.below_bottom = Some(self.below_bottom.map_or(bottom, |b| b.min(bottom)));
+            drop * ys
+        } else {
+            0
+        }
+    }
+}
+
+#[cfg(test)]
+mod mark_stack_tests {
+    use super::*;
+
+    /// The placement law, mark by mark, in a cell with room to spare: the first
+    /// mark on each side stays put (single-mark cells are byte-identical), a
+    /// repeat on the same side is lifted / dropped one row clear of the stack,
+    /// a straddling mark is left alone and joins no stack, and a mark whose
+    /// designed place already clears the stack is not moved.
+    #[test]
+    fn mark_stack_dy_stacks_above_up_below_down_and_leaves_overlays_alone() {
+        let (baseline, cell_h) = (100, 200);
+        let mut s = MarkStack::default();
+        // (ink_ymin, ink_h): acute-like above-marks, dot-below-like below-marks,
+        // a baseline-straddling overlay, and a mark designed high.
+        let marks = [
+            (10, 3),
+            (10, 3),
+            (-4, 2),
+            (-3, 8),
+            (-4, 2),
+            (20, 2),
+            (10, 3),
+        ];
+        let got: Vec<i32> = marks
+            .iter()
+            .map(|&(ink_ymin, ink_h)| s.dy(ink_h, ink_ymin, baseline, cell_h, 1))
+            .collect();
+        assert_eq!(
+            got,
+            [0, -4, 0, 0, 3, 0, -13],
+            "first on each side 0; second acute lifted gh+1; overlay untouched; \
+             second dot dropped gh+1; a mark already above the ceiling unmoved; \
+             then the next acute clears that one"
+        );
+        // Every first mark is 0 whatever its side, size or scale.
+        for &(ink_ymin, ink_h) in &[(0, 1), (7, 12), (-1, 1), (-9, 9), (-2, 5)] {
+            assert_eq!(
+                MarkStack::default().dy(ink_h, ink_ymin, baseline, cell_h, 1),
+                0,
+                "({ink_ymin},{ink_h})"
+            );
+            assert_eq!(
+                MarkStack::default().dy(ink_h, ink_ymin, baseline, cell_h, 2),
+                0,
+                "({ink_ymin},{ink_h}) 2x"
+            );
+        }
+        // The lift is measured in glyph rows and scaled to device pixels: a
+        // DECDHL row doubles both the gap and the height contribution.
+        let mut s2 = MarkStack::default();
+        assert_eq!(s2.dy(3, 10, baseline, cell_h, 2), 0);
+        assert_eq!(s2.dy(3, 10, baseline, cell_h, 2), -8);
+        assert_eq!(s2.dy(2, -4, baseline, cell_h, 2), 0);
+        assert_eq!(s2.dy(2, -4, baseline, cell_h, 2), 6);
+    }
+
+    /// The lift is bounded by the cell: SF Mono at 18px as measured — the FACE
+    /// gives the 11x21 cell and baseline 17, CoreText the rasters — with the
+    /// acute an (`ink_ymin` 11, `ink_h` 4) INK box and the dot below
+    /// (`ink_ymin` -4, `ink_h` 3). A second acute wants five rows and gets the
+    /// two the cell has; a third gets the same two (it overprints the second,
+    /// not the first); a second dot below has no room and stays put. Nothing is
+    /// ever placed past the cell's edge.
+    ///
+    /// These are INK boxes: the same rasters REPORT `(ymin 10, gh 6)` and
+    /// `(ymin -5, gh 6)`, a pad-fattened box that would make this test's
+    /// numbers unreachable (see `mark_stack_dy_reads_the_ink_not_the_padded_box`).
+    #[test]
+    fn mark_stack_dy_never_lifts_past_the_cell_edge() {
+        let (baseline, cell_h) = (17, 21);
+        let mut s = MarkStack::default();
+        assert_eq!(s.dy(4, 11, baseline, cell_h, 1), 0);
+        assert_eq!(
+            s.dy(4, 11, baseline, cell_h, 1),
+            -2,
+            "two rows of room, not five"
+        );
+        assert_eq!(
+            s.dy(4, 11, baseline, cell_h, 1),
+            -2,
+            "the third gets the same two"
+        );
+        assert_eq!(s.dy(3, -4, baseline, cell_h, 1), 0);
+        assert_eq!(
+            s.dy(3, -4, baseline, cell_h, 1),
+            0,
+            "no room under the descent"
+        );
+        // A mark whose designed box already overshoots the cell is not moved.
+        let mut o = MarkStack::default();
+        assert_eq!(o.dy(6, 13, baseline, cell_h, 1), 0);
+        assert_eq!(o.dy(6, 13, baseline, cell_h, 1), 0);
+        // With the room doubled by a taller line the same pair gets its full lift.
+        let mut r = MarkStack::default();
+        assert_eq!(r.dy(4, 11, 27, 42, 1), 0);
+        assert_eq!(r.dy(4, 11, 27, 42, 1), -5);
+        assert_eq!(r.dy(3, -4, 27, 42, 1), 0);
+        assert_eq!(r.dy(3, -4, 27, 42, 1), 4);
+    }
+
+    /// REGRESSION (the defect the ink operand exists to close): fed the raster
+    /// box the shipping macOS CoreText path REPORTS, a dot below never stacks —
+    /// the box is padded a row past the baseline, so the classifier reads a
+    /// below-mark as a baseline-straddling overlay and leaves every mark of the
+    /// stack at the one anchor. Fed the same raster's INK box it drops as
+    /// designed.
+    ///
+    /// Measured on the CoreText raster of SF Mono at 18px (the face
+    /// `Renderer::from_system` resolves here, which also gives the cell and
+    /// baseline these numbers are in): U+0323 rasterizes to `gh 6, ymin -5`
+    /// (ink `gh 3, ymin -4`) and U+0301 to `gh 6, ymin 10` (ink `gh 4,
+    /// ymin 11`). The above side is not immune either — the pad inflates the
+    /// room it reads, so the box lifts the second acute seven rows where the
+    /// ink has five. The numbers here are the operand's whole effect, which is
+    /// why they are pinned rather than merely the classification.
+    #[test]
+    fn mark_stack_dy_reads_the_ink_not_the_padded_box() {
+        // A doubled line height: the cell has room, so nothing here is a bound.
+        let (baseline, cell_h) = (28, 42);
+        // Dot below, BY THE REPORTED BOX: `ymin + gh == 1 > 0` — straddling.
+        let mut box_below = MarkStack::default();
+        assert_eq!(box_below.dy(6, -5, baseline, cell_h, 1), 0);
+        assert_eq!(
+            box_below.dy(6, -5, baseline, cell_h, 1),
+            0,
+            "the padded box reads a dot below as a straddling overlay — the defect"
+        );
+        // The same raster BY ITS INK: a below-mark, dropped clear.
+        let mut ink_below = MarkStack::default();
+        assert_eq!(ink_below.dy(3, -4, baseline, cell_h, 1), 0);
+        assert_eq!(
+            ink_below.dy(3, -4, baseline, cell_h, 1),
+            4,
+            "the ink box drops the second dot one row clear of the first"
+        );
+        // Above the baseline both classify alike, but the pad inflates the room.
+        let mut box_above = MarkStack::default();
+        assert_eq!(box_above.dy(6, 10, baseline, cell_h, 1), 0);
+        assert_eq!(box_above.dy(6, 10, baseline, cell_h, 1), -7);
+        let mut ink_above = MarkStack::default();
+        assert_eq!(ink_above.dy(4, 11, baseline, cell_h, 1), 0);
+        assert_eq!(
+            ink_above.dy(4, 11, baseline, cell_h, 1),
+            -5,
+            "the ink lifts the second acute by what its own rows need"
+        );
+    }
 }
 
 /// Columns of row `r` that must stay PER-CELL this frame for ligature purposes:
@@ -21812,16 +22622,6 @@ pub const BAYER4: [[f32; 4]; 4] = [
     [3.5 / 16.0, 11.5 / 16.0, 1.5 / 16.0, 9.5 / 16.0],
     [15.5 / 16.0, 7.5 / 16.0, 13.5 / 16.0, 5.5 / 16.0],
 ];
-
-/// The dither offset for a device pixel — [`BAYER4`] indexed by its own
-/// coordinates, so the pattern is fixed to the SCREEN rather than to the mark.
-/// A pattern that moved with the mark would crawl as the mark moved, which is
-/// the artifact ordered dithering exists to avoid.
-#[inline]
-#[must_use]
-pub fn bayer4_at(x: i32, y: i32) -> f32 {
-    BAYER4[(y.rem_euclid(4)) as usize][(x.rem_euclid(4)) as usize]
-}
 
 /// One vertex of the RIBBON polyline, in WINDOW-ABSOLUTE pixels (the
 /// window-space effects layer: the producer folds in the grid origin, the
@@ -24953,6 +25753,75 @@ mod tests {
         );
     }
 
+    /// **A CACHED FRAME HAS NO PAYLOAD, SO THE PAYLOAD IS NOT WHAT DECIDES.**
+    ///
+    /// `scroll_blit_plan` asks BOTH frames whether they are pure grid, and one
+    /// of the two is always the CACHED previous frame.
+    /// [`RenderInput::clone_damage_cache_from`] drops the payload of the four
+    /// cursor-effect streams and keeps only their compact metadata — that is
+    /// the whole point of the cache. So a predicate spelled
+    /// `prev.cursor_glow_add.is_empty()` answers "pure grid" for a previous
+    /// frame that was covered in glow, and the blit rigidly shifts a band of
+    /// pixels carrying an overlay it does not relocate: the glow rides the
+    /// scroll instead of staying with the cursor, and nothing re-rasters it
+    /// because those rows were declared retained.
+    ///
+    /// The fix is to ask [`EffectStreamDamage::was_empty`], which is what
+    /// survives the cache. This pins both arms so the cheap spelling cannot
+    /// come back.
+    #[test]
+    fn a_cached_frame_that_carried_a_glow_is_not_scroll_blittable() {
+        let mut term = Terminal::new(6, 12);
+        for i in 0..40 {
+            term.process(format!("line {i}\r\n").as_bytes());
+        }
+        let mut prev = term.cell_frame(6, 12);
+        term.scroll_display(3);
+        let cur = term.cell_frame(6, 12);
+
+        // THE CONTROL: two pure-grid frames, a rigid history scroll — the case
+        // the blit exists for. Without it the negative arm below proves nothing,
+        // since `None` is also what a frame that is not a scroll at all returns.
+        let mut cached = RenderInput::empty();
+        cached.clone_damage_cache_from(&prev);
+        let mut dirty = Vec::new();
+        let rescued = scroll_blit_plan(&cached, &cur, false, None, false, None, 16, &mut dirty);
+        assert!(
+            rescued.is_some(),
+            "a rigid scroll of two pure-grid frames must be rescued, or this \
+             test is measuring something else"
+        );
+
+        // Now the previous frame carried a cursor glow.
+        prev.cursor_glow_add.push(GlowQuad {
+            row: 2,
+            x: 0,
+            y: 32,
+            w: 8,
+            h: 16,
+            color: 0x0020_4060,
+            alpha: 0,
+        });
+        prev.refresh_cursor_effect_damage();
+        let mut cached = RenderInput::empty();
+        cached.clone_damage_cache_from(&prev);
+        assert!(
+            cached.cursor_glow_add.is_empty(),
+            "the cache drops the payload — this emptiness IS the trap, and a \
+             cache that stopped dropping it would make this test vacuous"
+        );
+        assert_eq!(
+            cached.cursor_glow_add_damage.was_empty(),
+            Some(false),
+            "the metadata is what remembers"
+        );
+        assert_eq!(
+            scroll_blit_plan(&cached, &cur, false, None, false, None, 16, &mut dirty),
+            None,
+            "a previous frame with a glow must not be blitted rigidly"
+        );
+    }
+
     /// A host/effect shape transition on a stationary cursor is global snapshot
     /// content, not a row-cell diff. It must dirty the cursor row and un-gate the
     /// shared CPU/GPU caches; otherwise a composed Bolt can be stranded as the
@@ -25891,14 +26760,14 @@ mod tests {
             let key = GlyphKey::mono_char(source, ch, StyleBits::REGULAR, r.px_q);
             r.glyphs.insert(
                 key,
-                GlyphImage::Mono {
+                CachedGlyph::new(GlyphImage::Mono {
                     width: 1,
                     height: 1,
                     xmin: 0,
                     ymin: 0,
                     advance: 0.0,
                     bytes: vec![0xFF],
-                },
+                }),
             );
         }
 
@@ -27866,6 +28735,46 @@ mod tests {
         );
     }
 
+    /// THE CHROME'S READ OF THE CHAIN NEVER PAYS FOR IT. `ready_fallback_faces`
+    /// admits exactly the faces a parse has already landed in: a deferred
+    /// discovery face is absent, and asking leaves it unparsed, while an
+    /// eagerly injected face is present — by identity, at its chain position.
+    #[cfg(feature = "embedded-font")]
+    #[test]
+    fn ready_fallback_faces_admits_only_parsed_faces_and_never_parses() {
+        let mut r = Renderer::from_bytes(embedded_font(), 16.0, Theme::default())
+            .expect("embedded font builds a renderer");
+        r.fallback_paths = present_fallback_paths();
+        r.debug_block_on_lazy_fallbacks();
+        let deferred = r.fallback_chain.len();
+        assert_eq!(
+            r.ready_fallback_faces().count(),
+            0,
+            "a deferred chain face is not ready"
+        );
+        assert!(
+            r.fallback_chain
+                .iter()
+                .all(|face| !face.font.is_materialised()),
+            "reading readiness parsed a deferred face"
+        );
+        r.add_fallback_bytes(embedded_font())
+            .expect("the embedded face injects");
+        let ready: Vec<_> = r.ready_fallback_faces().cloned().collect();
+        assert_eq!(ready.len(), 1, "the eager injection is ready at once");
+        let injected = &r.fallback_chain[deferred];
+        assert!(
+            std::sync::Arc::ptr_eq(&ready[0], injected.font.parsed().expect("eager cell")),
+            "the ready face is the chain's own parse, by identity"
+        );
+        assert!(
+            r.fallback_chain[..deferred]
+                .iter()
+                .all(|face| !face.font.is_materialised()),
+            "the deferred faces stayed deferred"
+        );
+    }
+
     /// LAZINESS MUST END WHERE THE FACE IS ACTUALLY USED. Under the portable
     /// fontdue backend a fallback glyph really does need the parse, and it must
     /// happen then — deferring it forever would be tofu, not a speed-up.
@@ -28264,14 +29173,14 @@ mod tests {
         for gid in 0..=16_384u16 {
             r.glyphs.insert(
                 GlyphKey::mono_gid(gid, StyleBits::REGULAR, r.px_q),
-                GlyphImage::Mono {
+                CachedGlyph::new(GlyphImage::Mono {
                     width: 0,
                     height: 0,
                     xmin: 0,
                     ymin: 0,
                     advance: 0.0,
                     bytes: Vec::new(),
-                },
+                }),
             );
         }
         r.evict_caches_if_large();
@@ -29843,6 +30752,142 @@ mod tests {
         }
     }
 
+    /// [`glyph_ink_box`] reports the INK, not the reported raster box, in the
+    /// box's own frame: `(ink_height, ink_ymin)` with `ink_ymin` the bottom edge
+    /// in rows above the baseline.
+    ///
+    /// The fixture is the shape the padded raster paths actually produce — the
+    /// macOS CoreText numbers for U+0323 COMBINING DOT BELOW at 18px, a
+    /// `gh 6, ymin -5` box (top edge `+1`, a row ABOVE the baseline) whose three
+    /// inked rows are `gh 3, ymin -4` (top edge `-1`). A rule reading the box
+    /// calls that mark a baseline-straddling overlay; reading the ink calls it
+    /// what it is. A blank raster has no ink box at all.
+    #[test]
+    fn glyph_ink_box_trims_the_raster_pad_off_the_reported_box() {
+        let padded = |rows: &[u8]| GlyphImage::Mono {
+            width: 1,
+            height: rows.len(),
+            xmin: 3,
+            ymin: -5,
+            advance: 0.0,
+            bytes: rows.to_vec(),
+        };
+        // Bitmap rows 0,1 and 5 are pad; the dot inks rows 2..5.
+        let dot = padded(&[0, 0, 200, 255, 200, 0]);
+        assert_eq!(dot.height(), 6, "the reported box is six rows");
+        assert_eq!(
+            dot.ymin() + i32::try_from(dot.height()).unwrap(),
+            1,
+            "the reported box's top edge is a row ABOVE the baseline"
+        );
+        let (ink_h, ink_ymin) = glyph_ink_box(&dot).expect("the dot inks three rows");
+        assert_eq!(
+            (ink_h, ink_ymin),
+            (3, -4),
+            "the ink is three rows ending one row below the baseline"
+        );
+        assert!(
+            ink_ymin + i32::try_from(ink_h).unwrap() <= 0,
+            "and that ink box is a below-mark, which the reported box is not"
+        );
+        // Ink touching both bitmap edges is reported whole.
+        assert_eq!(glyph_ink_box(&padded(&[7, 0, 0, 0, 0, 9])), Some((6, -5)));
+        // A raster with a non-empty box but no coverage has no ink box.
+        assert_eq!(glyph_ink_box(&padded(&[0, 0, 0, 0, 0, 0])), None);
+        // Rgba rasters answer the same question off the alpha channel.
+        let rgba = GlyphImage::Rgba {
+            width: 1,
+            height: 3,
+            xmin: 0,
+            ymin: 4,
+            advance: 0.0,
+            bytes: vec![9, 9, 9, 0, 9, 9, 9, 255, 9, 9, 9, 0],
+        };
+        assert_eq!(glyph_ink_box(&rgba), Some((1, 5)));
+    }
+
+    /// An INKLESS mark — a raster with a non-empty BOX and no coverage anywhere
+    /// in it — paints nothing and does not advance the stack: the next mark on
+    /// its side lands exactly where it would have with the inkless one absent.
+    ///
+    /// This is a BEHAVIOUR CHANGE, deliberately pinned. The old box-fed loops
+    /// skipped only a `0x0` raster, so such a mark counted as a real above-mark
+    /// and pushed every later mark of the cell one glyph row further out — a
+    /// blank pushing visible marks around. `MarkStack` is never told about it
+    /// now; both painters `continue` on the same `None` from the same memo
+    /// ([`Renderer::glyph_ink_box_cached`]), so the CPU blit and the GPU quad
+    /// loop drop it identically.
+    ///
+    /// The fixture has to be seeded: on this face every combining mark that
+    /// rasterizes at all has ink, so U+0302's entry is replaced by a raster
+    /// shaped exactly like U+0301's with its coverage zeroed. The rig runs at
+    /// `line_height = 2.0`, where the cell has room for the whole lift, so a
+    /// stack that DID advance moves the later mark visibly: measured on SF Mono
+    /// 18px, the two acutes ink rows 44-47 and 49-52, and counting the blank as
+    /// an above-mark drives the second one up to rows 38-41.
+    #[test]
+    fn an_inkless_mark_between_two_acutes_leaves_the_second_acute_where_it_was() {
+        let Some(mut r) = renderer() else {
+            eprintln!("SKIP: no system mono font found");
+            return;
+        };
+        r.set_line_height(2.0);
+        let (acute, inkless) = ('\u{0301}', '\u{0302}');
+        let acute_key = r.glyph_key(acute);
+        let inkless_key = r.glyph_key(inkless);
+        let (w, h, xmin, ymin) = {
+            let a = r.glyph_image(acute_key);
+            (a.width(), a.height(), a.xmin(), a.ymin())
+        };
+        assert!(w > 0 && h > 0, "the acute rasterizes to a non-empty box");
+        r.glyphs.insert(
+            inkless_key,
+            CachedGlyph::new(GlyphImage::Mono {
+                width: w,
+                height: h,
+                xmin,
+                ymin,
+                advance: 0.0,
+                bytes: vec![0; w * h],
+            }),
+        );
+        assert_eq!(
+            r.glyph_ink_box_cached(inkless_key),
+            None,
+            "the fixture's box is non-empty but it has no ink — the case at issue"
+        );
+
+        // The rows each variant's marks ink, as rows that differ from the bare
+        // base — the same "rows of ink, not darkness" measure the
+        // `combining_stack` suite uses, and compact enough to read on a failure.
+        let mut mark_rows = |text: &str| {
+            let mut render = |text: &str| {
+                let mut term = Terminal::new(2, 4);
+                term.process(format!("\x1b[?25l\x1b[2;1H{text}").as_bytes());
+                r.render_input(&term.cell_frame(2, 4))
+            };
+            let bare = render("e");
+            let f = render(text);
+            let w = f.width;
+            (0..f.height)
+                .filter(|&y| f.pixels[y * w..(y + 1) * w] != bare.pixels[y * w..(y + 1) * w])
+                .collect::<Vec<_>>()
+        };
+        let one = mark_rows("e\u{0301}");
+        let two = mark_rows("e\u{0301}\u{0301}");
+        let two_around_blank = mark_rows("e\u{0301}\u{0302}\u{0301}");
+
+        assert_ne!(
+            one, two,
+            "non-vacuity: at this line height the second acute really is lifted \
+             clear of the first, so a stack that moved would be visible here"
+        );
+        assert_eq!(
+            two_around_blank, two,
+            "an inkless mark must neither paint nor push the acute after it"
+        );
+    }
+
     /// Primary font swap (P4): `set_primary_font(bytes)` replaces the primary face,
     /// re-derives cell metrics, and re-rasterizes from the new face. Swapping
     /// between two genuinely-different committed faces changes the glyph bytes and
@@ -30825,6 +31870,113 @@ mod tests {
         assert!(!cjk.cells[0][0].text_presentation);
         assert!(!cjk.cells[0][0].emoji_presentation);
         assert_eq!(materialized_cell_span(&cjk.cells[0], 0), 2);
+    }
+
+    /// A default-ignorable mark — a tag character after a letter, an
+    /// ideographic variation selector after its ideograph — leaves the frame
+    /// byte-identical to the base alone: the mark attaches to the base cell
+    /// (so the following X is truly adjacent) and reaches neither renderer's
+    /// mark loop. NON-VACUOUS on two counts: the tag used to take a cell of
+    /// its own (X landed one column late), and a mark that DID reach the
+    /// overlay loop would change these very pixels — proved below with a mark
+    /// every text font carries, not with a bet on what this host maps.
+    #[test]
+    fn tag_character_draws_nothing_over_its_base() {
+        let Some(mut r) = renderer() else {
+            eprintln!("SKIP: no system mono font found");
+            return;
+        };
+        r.debug_block_on_lazy_fallbacks();
+        let frame_for = |r: &mut Renderer, text: &str| {
+            let mut term = Terminal::new(1, 4);
+            term.process(format!("\x1b[?25l{text}").as_bytes());
+            let input = term.cell_frame(1, 4);
+            let attached = term
+                .grid()
+                .cell_extra(0, 0)
+                .map_or(0, |e| e.combining().len());
+            let frame = r.render_input(&input);
+            (input, frame, attached)
+        };
+        for (marked, plain) in [("A\u{E0001}X", "AX"), ("e\u{E0100}X", "eX")] {
+            let (input, marked_frame, attached) = frame_for(&mut r, marked);
+            let (_, plain_frame, _) = frame_for(&mut r, plain);
+            assert_eq!(
+                attached, 1,
+                "{marked:?}: the mark attached to the base cell"
+            );
+            assert_eq!(input.cells[0][1].ch, 'X', "{marked:?}: X is adjacent");
+            assert!(
+                input.combining_at(0, 0).is_none() && input.cluster_at(0, 0).is_none(),
+                "{marked:?}: the mark is neither an overlay nor a cluster"
+            );
+            assert_eq!(
+                marked_frame.pixels, plain_frame.pixels,
+                "{marked:?} must render byte-identically to {plain:?}"
+            );
+        }
+
+        // NON-VACUITY, AND NOT A BET ON THE FONT. The guard here used to be
+        // that the tag character ITSELF resolves to a glyph with ink, so an
+        // overlay would have shown. No font is required to carry a glyph for a
+        // deprecated format character: on a host whose fallback chain resolves
+        // U+E0001 to a blank — this one does, and so does every CI runner
+        // without a plane-14 face — that guard fails while the behaviour under
+        // test is exactly right. What the test actually needs is that the
+        // comparison above CAN SEE an overlay, so prove that with a mark every
+        // text font carries and let the plane-14 claim mean something on every
+        // host instead of one.
+        let (_, acute, acute_attached) = frame_for(&mut r, "e\u{0301}X");
+        let (_, bare, _) = frame_for(&mut r, "eX");
+        assert_eq!(acute_attached, 1, "the acute attached to its base cell");
+        assert_ne!(
+            acute.pixels, bare.pixels,
+            "non-vacuity: a harness that cannot see a combining acute cannot \
+             see a tag character either, and every assertion above would pass \
+             for the wrong reason"
+        );
+    }
+
+    /// 🏴 + tag letters is a CLUSTER for the colour face. A face that carries
+    /// the subdivision ligature shapes it to one colour glyph; one that does
+    /// not declines, and the cell resolves exactly as the bare 🏴 would — on
+    /// neither branch a `.notdef` box.
+    #[test]
+    fn subdivision_flag_resolves_to_a_colour_glyph_or_the_bare_flag() {
+        const ENGLAND: &str = "\u{1F3F4}\u{E0067}\u{E0062}\u{E0065}\u{E006E}\u{E0067}\u{E007F}";
+        let Some(mut r) = renderer() else {
+            eprintln!("SKIP: no system mono font found");
+            return;
+        };
+        r.debug_block_on_lazy_fallbacks();
+        let mut term = Terminal::new(1, 4);
+        term.process(format!("\x1b[?25l{ENGLAND}X").as_bytes());
+        let input = term.cell_frame(1, 4);
+        assert_eq!(input.cluster_at(0, 0), Some(ENGLAND));
+        assert!(input.combining_at(0, 0).is_none());
+        assert_eq!(materialized_cell_span(&input.cells[0], 0), 2);
+        assert_eq!(input.cells[0][2].ch, 'X');
+        let cell = input.cells[0][0];
+        let key = r.resolve_cell_key(Some(ENGLAND), &cell);
+        if r.shape_cluster(ENGLAND).is_some() {
+            assert_eq!(
+                key.source,
+                FaceId::ColorEmoji,
+                "the colour face ligated gbeng"
+            );
+            assert_eq!(
+                key.glyph_class,
+                GlyphClass::RgbaGid,
+                "a shaped cluster is keyed by its glyph id on the colour face"
+            );
+        } else {
+            eprintln!("colour face has no subdivision ligature: bare-flag branch");
+            assert_eq!(
+                key,
+                r.resolve_cell_key(None, &cell),
+                "a colour face without the ligature falls back to the bare flag"
+            );
+        }
     }
 
     /// A configured PRIMARY can itself own an `Emoji_Presentation=Yes` scalar;
@@ -33598,7 +34750,7 @@ mod glyph_cache_accounting_tests {
     fn assert_accounted(r: &Renderer) {
         assert_eq!(
             r.glyph_bytes,
-            r.glyphs.values().map(GlyphImage::byte_len).sum::<usize>(),
+            r.glyphs.values().map(|g| g.img.byte_len()).sum::<usize>(),
             "only currently resident bitmap bytes may be charged"
         );
     }
@@ -33664,14 +34816,14 @@ mod glyph_cache_accounting_tests {
         // must distinguish the byte boundary from the independent entry cap.
         r.glyphs.insert(
             key,
-            GlyphImage::Mono {
+            CachedGlyph::new(GlyphImage::Mono {
                 width: BYTE_CAP,
                 height: 1,
                 xmin: 0,
                 ymin: 0,
                 advance: 1.0,
                 bytes: vec![0xFF; BYTE_CAP],
-            },
+            }),
         );
         r.glyph_bytes = BYTE_CAP;
         assert_accounted(&r);
@@ -33683,7 +34835,10 @@ mod glyph_cache_accounting_tests {
         assert_eq!(r.glyph_bytes, BYTE_CAP);
         assert!(!r.deco_masks.borrow().is_empty());
 
-        let GlyphImage::Mono { width, bytes, .. } = r.glyphs.get_mut(&key).unwrap() else {
+        // Only the payload is under test here (the byte charge), so this pokes
+        // the entry's raster in place; the entry's memoized ink box describes
+        // the glyph before the poke and nothing in this test reads it.
+        let GlyphImage::Mono { width, bytes, .. } = &mut r.glyphs.get_mut(&key).unwrap().img else {
             unreachable!();
         };
         *width += 1;
@@ -33744,7 +34899,7 @@ mod glyph_cache_accounting_tests {
             let _ = r.glyph_image(key);
         }
         assert!(!r.glyphs.is_empty(), "the cache took the glyphs");
-        let walked: usize = r.glyphs.values().map(GlyphImage::byte_len).sum();
+        let walked: usize = r.glyphs.values().map(|g| g.img.byte_len()).sum();
         assert_eq!(
             r.glyph_bytes, walked,
             "the running total is the sum of what the cache holds"

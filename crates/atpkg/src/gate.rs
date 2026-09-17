@@ -6,7 +6,11 @@
 //!
 //! Enforced **at apply** (not just at stage), because a build can be revoked *after* it
 //! was staged: `min_build` is a force-upgrade floor and `yanked` is per-program
-//! revocation (`"trust@4790"`). The gate is fail-closed — if even the channel's *pinned*
+//! revocation (`"trust@4790"`). Every floor comparison reads
+//! [`Channel::min_build_for`] — the program's OWN floor — never the channel-wide number
+//! directly: build counters are per program (`nn = 108` and `trust-mc = 20065` are both
+//! current), so a floor meant for one program must not tombstone another whose numbering
+//! is simply smaller. The gate is fail-closed — if even the channel's *pinned*
 //! build is below the floor or on the yank-list, there is no safe build to run, so the
 //! program is **tombstoned** (marked unrunnable) rather than silently left on a revoked
 //! build. The transactional stage→verify→flip that consumes these decisions is the rest
@@ -22,8 +26,9 @@ pub enum ApplyDecision {
     Install,
     /// The installed build already equals the (valid) pinned build — no-op.
     UpToDate,
-    /// Even the channel's pinned build is below `min_build` or on the yank-list: there is
-    /// no safe build, so the program is marked unrunnable. Never run a revoked build.
+    /// Even the channel's pinned build is below the program's floor or on the yank-list:
+    /// there is no safe build, so the program is marked unrunnable. Never run a revoked
+    /// build.
     Tombstone,
     /// The channel does not pin this program — it is not part of this channel's set.
     NotPinned,
@@ -41,15 +46,16 @@ pub fn is_yanked(channel: &Channel, program: &str, build: u64) -> bool {
 }
 
 /// Whether the currently-installed `build` of `program` is itself still acceptable to keep
-/// running: at/above the channel floor AND not yanked. This is the guard a LOCAL PIN must
-/// pass before it may suppress an upgrade — a pin can freeze a program on its current build
-/// only while that build is still gate-valid, never keep a revoked/below-floor build alive
-/// (that is exactly what `decide` force-upgrades OFF of, returning `Install` not `Tombstone`).
-/// `None` (not installed) is trivially valid — there is no live build to hold.
+/// running: at/above THAT PROGRAM's floor ([`Channel::min_build_for`]) AND not yanked. This
+/// is the guard a LOCAL PIN must pass before it may suppress an upgrade — a pin can freeze a
+/// program on its current build only while that build is still gate-valid, never keep a
+/// revoked/below-floor build alive (that is exactly what `decide` force-upgrades OFF of,
+/// returning `Install` not `Tombstone`). `None` (not installed) is trivially valid — there is
+/// no live build to hold.
 #[must_use]
 pub fn current_build_ok(channel: &Channel, program: &str, installed: Option<u64>) -> bool {
     match installed {
-        Some(cur) => cur >= channel.min_build && !is_yanked(channel, program, cur),
+        Some(cur) => cur >= channel.min_build_for(program) && !is_yanked(channel, program, cur),
         None => true,
     }
 }
@@ -62,7 +68,7 @@ pub fn decide(channel: &Channel, program: &str, installed: Option<u64>) -> Apply
         return ApplyDecision::NotPinned;
     };
     // Fail-closed: if even the PIN is below the floor or yanked, nothing is safe to run.
-    if pinned < channel.min_build || is_yanked(channel, program, pinned) {
+    if pinned < channel.min_build_for(program) || is_yanked(channel, program, pinned) {
         return ApplyDecision::Tombstone;
     }
     match installed {
@@ -83,10 +89,27 @@ mod tests {
             name: "stable".into(),
             channel_build: 1,
             min_build,
+            min_build_by_program: Default::default(),
             yanked: yanked.iter().map(|s| (*s).to_string()).collect(),
             pin: pin.iter().map(|(k, v)| ((*k).to_string(), *v)).collect(),
             pin_by_target: Default::default(),
             meta: BTreeMap::new(),
+        }
+    }
+
+    /// [`channel`] plus PER-PROGRAM floors (`min_build_by_program`).
+    fn channel_floors(
+        min_build: u64,
+        per_program: &[(&str, u64)],
+        pin: &[(&str, u64)],
+        yanked: &[&str],
+    ) -> Channel {
+        Channel {
+            min_build_by_program: per_program
+                .iter()
+                .map(|(k, v)| ((*k).to_string(), *v))
+                .collect(),
+            ..channel(min_build, pin, yanked)
         }
     }
 
@@ -156,6 +179,60 @@ mod tests {
         // Installed the now-yanked 4790 → force-upgrade to the valid pin 4800.
         assert_eq!(decide(&ch, "trust", Some(4790)), ApplyDecision::Install);
         assert_eq!(decide(&ch, "trust", Some(4800)), ApplyDecision::UpToDate);
+    }
+
+    // REGRESSION (audit 2026-09-15): a floor is per PROGRAM, because a build number is only
+    // comparable to another build number of the same program. Comparing every program's pin
+    // against ONE channel-wide number made the documented yank floor unusable: the only value
+    // that did not tombstone unrelated programs was 0.
+    #[test]
+    fn a_program_floor_never_tombstones_a_program_it_does_not_name() {
+        // The live toolchain channel's shape: independent counters per member (measured
+        // 2026-09-15 — nn = 108, ty = 3007, trust = 6808). The owner floors `trust` below
+        // 7000 to revoke a bad toolchain build and re-pins it above the floor.
+        let ch = channel_floors(
+            0,
+            &[("trust", 7000)],
+            &[("trust", 7100), ("nn", 108), ("ty", 3007)],
+            &[],
+        );
+        // trust: the floor bites exactly as a floor should — the revoked installed build is
+        // force-upgraded to the valid pin, and a local pin may not hold it.
+        assert_eq!(decide(&ch, "trust", Some(6808)), ApplyDecision::Install);
+        assert!(!current_build_ok(&ch, "trust", Some(6808)));
+        assert_eq!(decide(&ch, "trust", Some(7100)), ApplyDecision::UpToDate);
+        // Every other member is untouched. A counter three orders of magnitude smaller is
+        // NOT "below the floor": that floor was never theirs.
+        assert_eq!(decide(&ch, "nn", Some(108)), ApplyDecision::UpToDate);
+        assert_eq!(decide(&ch, "ty", Some(3007)), ApplyDecision::UpToDate);
+        assert_eq!(decide(&ch, "nn", None), ApplyDecision::Install);
+        assert!(current_build_ok(&ch, "nn", Some(108)));
+        assert!(current_build_ok(&ch, "ty", Some(3007)));
+    }
+
+    #[test]
+    fn a_program_below_its_own_floor_tombstones_alone() {
+        // `trust`'s own pin is below `trust`'s floor → no safe build for trust …
+        let ch = channel_floors(0, &[("trust", 7000)], &[("trust", 6808), ("nn", 108)], &[]);
+        assert_eq!(decide(&ch, "trust", Some(6808)), ApplyDecision::Tombstone);
+        assert_eq!(decide(&ch, "trust", None), ApplyDecision::Tombstone);
+        // … and `nn` still installs in the same pass, shims intact.
+        assert_eq!(decide(&ch, "nn", None), ApplyDecision::Install);
+        assert_eq!(decide(&ch, "nn", Some(108)), ApplyDecision::UpToDate);
+    }
+
+    #[test]
+    fn a_program_entry_can_only_raise_the_channel_wide_floor() {
+        // MAX, never override: an entry BELOW the channel-wide floor leaves the channel
+        // floor in force, so a client that knows the key is never LOOSER than one that does
+        // not (the single-counter app channel keeps behaving exactly as before).
+        let ch = channel_floors(120, &[("ay", 50)], &[("ay", 130), ("ny", 130)], &[]);
+        assert_eq!(ch.min_build_for("ay"), 120);
+        assert!(!current_build_ok(&ch, "ay", Some(100)));
+        assert_eq!(decide(&ch, "ay", Some(100)), ApplyDecision::Install);
+        // A program with no entry keeps the channel-wide floor too.
+        assert_eq!(ch.min_build_for("ny"), 120);
+        assert!(!current_build_ok(&ch, "ny", Some(119)));
     }
 
     #[test]

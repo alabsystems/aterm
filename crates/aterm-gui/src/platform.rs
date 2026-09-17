@@ -2687,3 +2687,770 @@ pub(crate) fn disable_press_and_hold() {
         appkit::send_v_id(std_defaults, sel!(registerDefaults:), defaults);
     });
 }
+
+/// **PLATFORM `cfg` HYGIENE OVER THIS CRATE'S TEST CODE**, checked from here
+/// because the only other witness is a compiler nobody on this team runs. Two
+/// laws, one on each side of the same coin:
+///
+/// 1. UNIX-ONLY TEST CODE IS PLATFORM-GATED — a test that names an API Windows
+///    has not got must say so, or the crate's whole test target stops compiling
+///    for Windows (`no_ungated_unix_only_name_in_this_crate_s_test_code`).
+/// 2. A TEST NO MACHINE HERE RUNS SAYS SO OUT LOUD — a `#[test]` gated off BOTH
+///    macOS and Linux is kept by nobody, and must be on a hand-edited roster
+///    (`every_test_no_machine_here_runs_is_on_the_roster`, at the bottom of this
+///    module, which carries its own history).
+///
+/// THE SHAPE THE FIRST EXISTS FOR, measured 2026-09-16. `control.rs`'s
+/// `rainbow_kitty_window` fixture opened a pipe and wrapped its read end with an
+/// ungated `use std::os::unix::io::FromRawFd`, inside the `#[cfg(test)]` module.
+/// On a Mac or a Linux box nothing showed — `cargo test -p aterm-gui` was green.
+/// For `x86_64-pc-windows-msvc` the crate's whole TEST TARGET stopped compiling
+/// (`E0433` for the missing `unix` module, `E0425` for the `#[cfg(unix)]` pipe
+/// helper, `E0599` for the raw-fd constructor), so NONE of this crate's laws
+/// were pinned on Windows — not just the fixture's own. `xtask gate cells
+/// --cell win` cannot see it either: that gate checks the cell's ROOT package
+/// without `--all-targets`, so it never asks a compiler to read a test target.
+///
+/// THE LAW. Inside a `#[cfg(test)]` region of this crate, a line naming an API
+/// Windows has not got must sit under a platform `cfg` — its own, or one it
+/// inherits from an enclosing item, block, or module declaration. The names are
+/// the unix descriptor surface plus this crate's own two unix-only pipe
+/// fixtures, which are `#[cfg(unix)]` by construction and so resolve nowhere
+/// else. All of them are spelled at RUNTIME below, so this module's own source
+/// never carries a contiguous copy of a name it refuses.
+///
+/// WHAT IT DOES NOT CLAIM. This is a source law over one crate, not a Windows
+/// build: it cannot see a platform assumption that carries no unix-only NAME,
+/// and it reads nothing outside `aterm-gui/src`. The compiler-backed answer is
+/// `--all-targets` coverage in the cross-cell gate; this is the half that runs
+/// on the machine the code is actually written on.
+#[cfg(test)]
+mod platform_cfg_hygiene_tests {
+    use std::collections::BTreeSet;
+    use std::path::{Path, PathBuf};
+
+    fn is_ident_byte(b: u8) -> bool {
+        b.is_ascii_alphanumeric() || b == b'_'
+    }
+
+    /// `word` occurs in `text` as a whole identifier — so `cfg(unix)` matches
+    /// and `feature = "unixish"` does not, and `cfg(test)` matches while
+    /// `feature = "latest"` does not.
+    fn has_word(text: &str, word: &str) -> bool {
+        let bytes = text.as_bytes();
+        let mut from = 0;
+        while let Some(rel) = text[from..].find(word) {
+            let at = from + rel;
+            let end = at + word.len();
+            let before_ok = at == 0 || !is_ident_byte(bytes[at - 1]);
+            let after_ok = end == bytes.len() || !is_ident_byte(bytes[end]);
+            if before_ok && after_ok {
+                return true;
+            }
+            from = at + 1;
+        }
+        false
+    }
+
+    fn indent_of(line: &str) -> usize {
+        line.len() - line.trim_start_matches(' ').len()
+    }
+
+    /// The lines one kind of `#[cfg(…)]` attribute REACHES.
+    ///
+    /// An attribute at indent `I` is followed by its item head — further
+    /// attributes and comments skipped — and the head is read to its first
+    /// terminator at paren/bracket depth zero. A head ending in `{` (an `fn`, a
+    /// `mod`, a bare block) reaches to the first later line at indent `<= I`
+    /// that starts with `}`; a head ending in `;` or `,` (a `use`, a `mod foo;`,
+    /// a struct field) reaches only itself. That second rule is the load-bearing
+    /// one: it keeps ONE gated `use` at the top of a test module from vouching
+    /// for everything under it.
+    fn cfg_reach(lines: &[&str], want: &dyn Fn(&str) -> bool) -> Vec<bool> {
+        let n = lines.len();
+        let mut reach = vec![false; n];
+        for (i, line) in lines.iter().enumerate() {
+            let attr = line.trim();
+            if !(attr.starts_with("#[cfg(") && want(attr)) {
+                continue;
+            }
+            let own_indent = indent_of(line);
+            let Some(head) = (i + 1..n).find(|&j| {
+                let t = lines[j].trim();
+                !(t.is_empty() || t.starts_with('#') || t.starts_with("//"))
+            }) else {
+                continue;
+            };
+            let mut depth: i32 = 0;
+            let mut last = head;
+            let mut is_block = false;
+            for (j, item_line) in lines.iter().enumerate().skip(head) {
+                let t = item_line.trim();
+                for b in t.bytes() {
+                    match b {
+                        b'(' | b'[' => depth += 1,
+                        b')' | b']' => depth -= 1,
+                        _ => {}
+                    }
+                }
+                last = j;
+                if depth <= 0 {
+                    if t.ends_with('{') {
+                        is_block = true;
+                        break;
+                    }
+                    if t.ends_with(';') || t.ends_with(',') {
+                        break;
+                    }
+                }
+            }
+            let end = if is_block {
+                (last + 1..n)
+                    .find(|&m| {
+                        let t = lines[m].trim();
+                        !t.is_empty() && indent_of(lines[m]) <= own_indent && t.starts_with('}')
+                    })
+                    .unwrap_or(n - 1)
+            } else {
+                last
+            };
+            for slot in reach.iter_mut().take(end + 1).skip(i) {
+                *slot = true;
+            }
+        }
+        reach
+    }
+
+    fn platform_cfg(attr: &str) -> bool {
+        [
+            "unix",
+            "windows",
+            "target_os",
+            "target_family",
+            "target_arch",
+            "target_vendor",
+            "target_env",
+        ]
+        .iter()
+        .any(|word| has_word(attr, word))
+    }
+
+    fn test_cfg(attr: &str) -> bool {
+        has_word(attr, "test")
+    }
+
+    /// Every `mod foo;` in the crate whose declaration is platform-gated. A file
+    /// reached only through such a declaration is exempt wholesale: no compiler
+    /// off that platform ever reads it, so nothing inside it can break one.
+    fn platform_gated_modules(sources: &[(PathBuf, String)]) -> BTreeSet<String> {
+        let mut gated = BTreeSet::new();
+        for (_, text) in sources {
+            let lines: Vec<&str> = text.lines().collect();
+            let reach = cfg_reach(&lines, &platform_cfg);
+            for (i, line) in lines.iter().enumerate() {
+                if !reach[i] {
+                    continue;
+                }
+                let Some(decl) = line.trim().strip_suffix(';') else {
+                    continue;
+                };
+                let mut rest = decl.trim();
+                if let Some(after_pub) = rest.strip_prefix("pub") {
+                    rest = after_pub.trim_start();
+                    if rest.starts_with('(') {
+                        let Some(close) = rest.find(')') else {
+                            continue;
+                        };
+                        rest = rest[close + 1..].trim_start();
+                    }
+                }
+                let Some(name) = rest.strip_prefix("mod ") else {
+                    continue;
+                };
+                let name = name.trim();
+                if !name.is_empty() && name.bytes().all(is_ident_byte) {
+                    gated.insert(name.to_string());
+                }
+            }
+        }
+        gated
+    }
+
+    /// The offending `(line number, line)` pairs in one file's test regions.
+    fn ungated_unix_lines(
+        text: &str,
+        needles: &(Vec<String>, Vec<String>),
+    ) -> Vec<(usize, String)> {
+        let lines: Vec<&str> = text.lines().collect();
+        let platform = cfg_reach(&lines, &platform_cfg);
+        let tested = cfg_reach(&lines, &test_cfg);
+        let mut found = Vec::new();
+        for (i, line) in lines.iter().enumerate() {
+            if !tested[i] || platform[i] {
+                continue;
+            }
+            let trimmed = line.trim();
+            if trimmed.starts_with("//") {
+                continue;
+            }
+            let named = needles.0.iter().any(|path| line.contains(path.as_str()))
+                || needles.1.iter().any(|ident| has_word(line, ident));
+            if named {
+                found.push((i + 1, trimmed.to_string()));
+            }
+        }
+        found
+    }
+
+    /// The names Windows cannot resolve, spelled at RUNTIME so this module's own
+    /// source never carries a contiguous copy of one it refuses — the same trick
+    /// `app_render`'s font-warm scan uses on itself.
+    ///
+    /// `.0` are module paths, matched as substrings; `.1` are identifiers,
+    /// matched whole, so a `FromRawFd` import is not counted twice as a bare
+    /// `RawFd`.
+    fn needles() -> (Vec<String>, Vec<String>) {
+        let paths = [("std::os::", "unix"), ("std::os::", "fd"), ("libc", "::")]
+            .iter()
+            .map(|(head, tail)| format!("{head}{tail}"))
+            .collect();
+        let idents = [
+            ("from_raw", "_fd"),
+            ("as_raw", "_fd"),
+            ("into_raw", "_fd"),
+            ("Owned", "Fd"),
+            ("Borrowed", "Fd"),
+            ("Raw", "Fd"),
+            // This crate's own unix-only pipe fixtures (`control.rs`), both
+            // `#[cfg(unix)]` by construction: a call to one from ungated test
+            // code is the same defect, one step further in.
+            ("cloexec", "_pipe"),
+            ("pipe", "_session"),
+        ]
+        .iter()
+        .map(|(head, tail)| format!("{head}{tail}"))
+        .collect();
+        (paths, idents)
+    }
+
+    fn rs_sources(dir: &Path, out: &mut Vec<(PathBuf, String)>) {
+        for entry in std::fs::read_dir(dir).expect("read a directory under aterm-gui/src") {
+            let path = entry.expect("a directory entry").path();
+            if path.is_dir() {
+                rs_sources(&path, out);
+            } else if path.extension().and_then(|e| e.to_str()) == Some("rs") {
+                let text = std::fs::read_to_string(&path).expect("read a source file");
+                out.push((path, text));
+            }
+        }
+    }
+
+    #[test]
+    fn no_ungated_unix_only_name_in_this_crate_s_test_code() {
+        let src = Path::new(env!("CARGO_MANIFEST_DIR")).join("src");
+        let mut sources = Vec::new();
+        rs_sources(&src, &mut sources);
+        assert!(
+            sources.len() > 50,
+            "the walk found only {} source file(s) under {} — a scan that reads nothing \
+             passes everything",
+            sources.len(),
+            src.display()
+        );
+        let gated = platform_gated_modules(&sources);
+        let needles = needles();
+        let mut offences: Vec<String> = Vec::new();
+        for (path, text) in &sources {
+            let rel = path.strip_prefix(&src).unwrap_or(path);
+            let exempt = rel.components().any(|part| {
+                let name = part.as_os_str().to_string_lossy();
+                gated.contains(name.trim_end_matches(".rs"))
+            });
+            if exempt {
+                continue;
+            }
+            for (line_no, line) in ungated_unix_lines(text, &needles) {
+                offences.push(format!("{}:{line_no}: {line}", rel.display()));
+            }
+        }
+        assert!(
+            offences.is_empty(),
+            "test code names an API Windows has not got, under no platform `cfg`, so \
+             `cargo test -p aterm-gui` cannot BUILD for a Windows target and NONE of this \
+             crate's laws are pinned there:\n  {}\n\
+             Put `#[cfg(unix)]` on the fixture and on every `#[test]` that drives it — saying \
+             in a comment why the law is unix-pinned — or move it to a portable API.",
+            offences.join("\n  ")
+        );
+    }
+
+    /// The detector is proved on the shape it was written for, both directions:
+    /// a law whose scanner is never exercised is a law nobody is keeping.
+    #[test]
+    fn the_scanner_catches_the_fixture_it_was_written_for_and_clears_its_gated_twin() {
+        let needles = needles();
+        let import = format!("        use std::os::{}::io::FromRawFd;", "unix");
+        let open = format!("        let (rd, wr) = cloexec{}();", "_pipe");
+        let wrap = format!(
+            "        let rx = unsafe {{ std::fs::File::from_raw{}(rd) }};",
+            "_fd"
+        );
+        let body = format!("{import}\n{open}\n{wrap}");
+
+        let ungated =
+            format!("#[cfg(test)]\nmod tests {{\n    fn fixture() {{\n{body}\n    }}\n}}\n");
+        assert_eq!(
+            ungated_unix_lines(&ungated, &needles)
+                .iter()
+                .map(|(at, _)| *at)
+                .collect::<Vec<_>>(),
+            vec![4, 5, 6],
+            "the three lines the Windows compiler refused are the three the scanner names"
+        );
+
+        let gated = format!(
+            "#[cfg(test)]\nmod tests {{\n    #[cfg(unix)]\n    fn fixture() {{\n{body}\n    }}\n}}\n"
+        );
+        assert!(
+            ungated_unix_lines(&gated, &needles).is_empty(),
+            "a gated fixture is not an offence"
+        );
+
+        // A gated `use` at the top of a module covers ITSELF, never the module.
+        let leaky = format!(
+            "#[cfg(test)]\nmod tests {{\n    #[cfg(unix)]\n{import}\n\n    fn fixture() {{\n{wrap}\n    }}\n}}\n"
+        );
+        assert_eq!(
+            ungated_unix_lines(&leaky, &needles)
+                .iter()
+                .map(|(at, _)| *at)
+                .collect::<Vec<_>>(),
+            vec![7],
+            "one gated statement must not vouch for the rest of the module"
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // THE SECOND LAW: A TEST NO MACHINE HERE RUNS MUST SAY SO OUT LOUD
+    // -----------------------------------------------------------------------
+
+    /// One `cfg` predicate, decided for a host — `None` when this scanner
+    /// cannot decide it (`feature = …`, `a11y_tree`, `target_arch`, `test`).
+    ///
+    /// `None` is the SAFE answer: an expression this cannot fold is never
+    /// called an offence, so the law under-reports rather than inventing one.
+    fn cfg_atom(expr: &str, host_os: &str) -> Option<bool> {
+        let expr = expr.trim();
+        if expr == "unix" {
+            return Some(true);
+        }
+        if expr == "windows" {
+            return Some(false);
+        }
+        let (key, value) = expr.split_once('=')?;
+        let value = value.trim().trim_matches('"');
+        match key.trim() {
+            "target_os" => Some(value == host_os),
+            "target_family" => Some(value == "unix"),
+            _ => None,
+        }
+    }
+
+    /// Split `any(a, b)`'s inner text on TOP-LEVEL commas, so a nested
+    /// `all(x, y)` stays one argument.
+    fn split_top_level(inner: &str) -> Vec<&str> {
+        let mut parts = Vec::new();
+        let mut depth = 0i32;
+        let mut start = 0usize;
+        for (at, b) in inner.bytes().enumerate() {
+            match b {
+                b'(' => depth += 1,
+                b')' => depth -= 1,
+                b',' if depth == 0 => {
+                    parts.push(inner[start..at].trim());
+                    start = at + 1;
+                }
+                _ => {}
+            }
+        }
+        let tail = inner[start..].trim();
+        if !tail.is_empty() {
+            parts.push(tail);
+        }
+        parts
+    }
+
+    /// A whole `cfg` expression, folded for one host. `not`/`any`/`all`
+    /// short-circuit the way rustc's own evaluation does, so one decidable
+    /// `windows` inside an `all(…)` is enough to fold the expression to false
+    /// even when its siblings are opaque.
+    fn cfg_eval(expr: &str, host_os: &str) -> Option<bool> {
+        let expr = expr.trim();
+        for head in ["not", "any", "all"] {
+            let Some(rest) = expr.strip_prefix(head) else {
+                continue;
+            };
+            let rest = rest.trim_start();
+            let Some(inner) = rest.strip_prefix('(').and_then(|r| r.strip_suffix(')')) else {
+                continue;
+            };
+            let args: Vec<Option<bool>> = split_top_level(inner)
+                .iter()
+                .map(|a| cfg_eval(a, host_os))
+                .collect();
+            return match head {
+                "not" => args.first().copied().flatten().map(|v| !v),
+                "any" if args.contains(&Some(true)) => Some(true),
+                "any" if args.iter().all(|a| *a == Some(false)) => Some(false),
+                "all" if args.contains(&Some(false)) => Some(false),
+                "all" if args.iter().all(|a| *a == Some(true)) => Some(true),
+                _ => None,
+            };
+        }
+        cfg_atom(expr, host_os)
+    }
+
+    /// A `#[cfg(…)]` attribute that is FALSE on macOS AND false on Linux — the
+    /// two operating systems every machine this repository is developed and
+    /// tested on runs. Whatever it gates is compiled by no host suite here.
+    fn cfg_off_every_host(attr: &str) -> bool {
+        let Some(inner) = attr
+            .strip_prefix("#[cfg(")
+            .and_then(|a| a.strip_suffix(")]"))
+        else {
+            return false;
+        };
+        cfg_eval(inner, "macos") == Some(false) && cfg_eval(inner, "linux") == Some(false)
+    }
+
+    /// Every `#[test]` in one file that such a `cfg` reaches, as
+    /// `(line number of the `#[test]`, function name)`.
+    ///
+    /// The `#[test]` LINE is not what is tested for reach — `control.rs` writes
+    /// the gate BELOW it — so the item HEAD is found first (attributes and
+    /// comments skipped) and the head is what must be reached.
+    fn tests_no_host_runs(text: &str) -> Vec<(usize, String)> {
+        let lines: Vec<&str> = text.lines().collect();
+        let reach = cfg_reach(&lines, &cfg_off_every_host);
+        let mut found = Vec::new();
+        for (i, line) in lines.iter().enumerate() {
+            if line.trim() != "#[test]" {
+                continue;
+            }
+            let Some(head) = (i + 1..lines.len()).find(|&j| {
+                let t = lines[j].trim();
+                !(t.is_empty() || t.starts_with('#') || t.starts_with("//"))
+            }) else {
+                continue;
+            };
+            if !reach[head] {
+                continue;
+            }
+            let after_fn = lines[head]
+                .split_once("fn ")
+                .map_or("", |(_, rest)| rest)
+                .trim_start();
+            let name: String = after_fn
+                .chars()
+                .take_while(|c| c.is_ascii_alphanumeric() || *c == '_')
+                .collect();
+            found.push((i + 1, name));
+        }
+        found
+    }
+
+    /// THE ROSTER: every `#[test]` in a SHARED file of this crate that runs on
+    /// no machine anyone here owns, as `(file, function)`.
+    ///
+    /// HAND-EDITED, BOTH WAYS, and with no writer flag — the same posture as
+    /// the coverage floors in `tools/cross-cell-gate.tsv`, and for the same
+    /// reason: a list a failing run can rewrite is not a list. A new entry
+    /// means somebody decided a law would be kept by nobody; a stale entry
+    /// means a law came back to life and the roster should shrink. Both fail
+    /// the test below.
+    ///
+    /// The `*_win.rs` modules are NOT here and must never be: `lib.rs` declares
+    /// them `#[cfg(windows)]`, so no compiler off Windows reads a line of them
+    /// and their tests are Windows-only by construction, visibly, from the file
+    /// name down. What this roster catches is the other shape — a Windows-only
+    /// `#[test]` living in a SHARED file beside portable logic, where being
+    /// compiled by nothing looks exactly like being green.
+    const UNRUN_TEST_ROSTER: &[(&str, &str)] = &[
+        // Windows UI furniture and shell integration, all reached through real
+        // Win32 calls or Windows-only state.
+        (
+            "app_config.rs",
+            "the_shipped_windows_face_reaches_the_standard_band",
+        ),
+        (
+            "app_introspect.rs",
+            "video_publication_bundle_drops_guards_before_unpublished_directory_on_panic",
+        ),
+        (
+            "app_mouse.rs",
+            "the_bare_band_system_menu_arms_on_press_and_fires_on_release",
+        ),
+        (
+            "tab_bar.rs",
+            "the_windows_band_resolves_its_labels_together_not_one_at_a_time",
+        ),
+        (
+            "tray_raster.rs",
+            "windows_ui_face_candidates_lead_with_segoe_ui_variable_over_a_static_semibold",
+        ),
+        ("lib.rs", "task_dialog_config_layout_matches_the_sdk"),
+        (
+            "input.rs",
+            "wheel_scale_is_the_platform_distance_not_one_line",
+        ),
+        ("keymap.rs", "lock_modifiers_reports_only_lock_bits"),
+        (
+            "native_editor.rs",
+            "ctrl_s_saves_on_windows_and_isearch_keeps_a_chord",
+        ),
+        // The `aterm windows …` verb family, which exists only on Windows.
+        ("cli.rs", "default_terminal_pair_dispatches"),
+        ("cli.rs", "windows_help_advertises_every_windows_verb"),
+        (
+            "cli.rs",
+            "unset_default_terminal_is_never_gated_while_set_refuses",
+        ),
+        (
+            "diagnostics.rs",
+            "validate_accepts_the_windows_shell_spellings_a_user_would_write",
+        ),
+        // The structured-exception crash handler: its formatters and banner are
+        // pure, but they exist only in a `#[cfg(windows)]` region of the file.
+        (
+            "crash_signal.rs",
+            "hex_formatter_matches_std_for_many_values",
+        ),
+        ("crash_signal.rs", "hex64_formatter_matches_std"),
+        (
+            "crash_signal.rs",
+            "banner_bytes_are_the_expected_marker_text",
+        ),
+        (
+            "crash_signal.rs",
+            "exception_record_layout_matches_native_offsets",
+        ),
+        ("crash_signal.rs", "install_is_idempotent"),
+        // Windows path shapes: drive letters, UNC, and the file-URI rules.
+        (
+            "cwd_native.rs",
+            "drive_letter_uri_path_becomes_a_native_windows_path",
+        ),
+        (
+            "cwd_native.rs",
+            "an_already_native_windows_path_passes_through_unchanged",
+        ),
+        (
+            "cwd_native.rs",
+            "a_unc_payload_keeps_its_leading_double_slash",
+        ),
+        (
+            "cwd_native.rs",
+            "non_drive_shaped_paths_are_left_alone_on_windows_too",
+        ),
+        (
+            "native_document_host.rs",
+            "windows_drive_path_and_file_uri_round_trip_through_real_path_rules",
+        ),
+        ("snapshot_path.rs", "write_private_refuses_symlinked_target"),
+        // Quit safety over the Windows process tree (toolhelp snapshots), and
+        // the job-object probe whose cost these two bound.
+        (
+            "quit_safety.rs",
+            "windows_single_idle_tab_closes_without_a_prompt",
+        ),
+        ("quit_safety.rs", "windows_busy_prompts_with_the_real_verbs"),
+        (
+            "quit_safety.rs",
+            "windows_multi_tab_close_prompts_when_idle",
+        ),
+        ("quit_safety.rs", "windows_invalid_shell_pid_is_idle"),
+        ("quit_safety.rs", "windows_child_walk_detects_a_live_child"),
+        ("quit_safety.rs", "the_two_child_walks_share_one_predicate"),
+        (
+            "session_status.rs",
+            "an_idle_windows_job_probe_cost_does_not_scale_with_tab_count",
+        ),
+        (
+            "session_status.rs",
+            "a_session_whose_grid_moves_buys_a_fresh_capture",
+        ),
+        // The confined-directory publication path: `NtSetInformationFile`
+        // rename payloads, reparse points, and handle-scoped delete guards.
+        (
+            "pinned_dir.rs",
+            "rename_payload_nul_terminates_its_destination_at_every_length",
+        ),
+        (
+            "pinned_dir.rs",
+            "retained_windows_handles_validate_publish_and_delete_exact_children",
+        ),
+        (
+            "pinned_dir.rs",
+            "windows_device_stream_and_normalization_aliases_are_rejected",
+        ),
+        (
+            "pinned_dir.rs",
+            "windows_hardlink_target_is_rejected_without_mutating_victim",
+        ),
+        (
+            "pinned_dir.rs",
+            "windows_guards_deny_delete_until_exact_handles_drop",
+        ),
+        (
+            "pinned_dir.rs",
+            "windows_reparse_directory_is_never_followed_during_cleanup",
+        ),
+        // Control-socket auth: Windows has no peer-cred primitive, and the
+        // token file is created with CREATE_NEW rather than O_EXCL|O_NOFOLLOW.
+        (
+            "control_auth.rs",
+            "provision_token_roundtrips_and_create_new_refuses_preexisting",
+        ),
+        ("control_auth.rs", "peer_check_passes_on_windows"),
+        (
+            "net_connections.rs",
+            "windows_token_file_roundtrips_and_rejects_non_regular",
+        ),
+    ];
+
+    #[test]
+    fn every_test_no_machine_here_runs_is_on_the_roster() {
+        let src = Path::new(env!("CARGO_MANIFEST_DIR")).join("src");
+        let mut sources = Vec::new();
+        rs_sources(&src, &mut sources);
+        assert!(
+            sources.len() > 50,
+            "the walk found only {} source file(s) under {} — a scan that reads nothing \
+             passes everything",
+            sources.len(),
+            src.display()
+        );
+        let gated = platform_gated_modules(&sources);
+        let mut seen: BTreeSet<(String, String)> = BTreeSet::new();
+        let mut unrostered: Vec<String> = Vec::new();
+        let roster: BTreeSet<(String, String)> = UNRUN_TEST_ROSTER
+            .iter()
+            .map(|(f, t)| ((*f).to_string(), (*t).to_string()))
+            .collect();
+        for (path, text) in &sources {
+            let rel = path.strip_prefix(&src).unwrap_or(path);
+            let exempt = rel.components().any(|part| {
+                let name = part.as_os_str().to_string_lossy();
+                gated.contains(name.trim_end_matches(".rs"))
+            });
+            if exempt {
+                continue;
+            }
+            let file = rel.display().to_string();
+            for (line_no, name) in tests_no_host_runs(text) {
+                let key = (file.clone(), name.clone());
+                if !roster.contains(&key) {
+                    unrostered.push(format!(
+                        "        (\"{file}\", \"{name}\"),   // {file}:{line_no}"
+                    ));
+                }
+                seen.insert(key);
+            }
+        }
+        assert!(
+            unrostered.is_empty(),
+            "these `#[test]`s are gated off BOTH macOS and Linux, so they run on no machine \
+             anyone here owns and — `xtask gate cells --cell win` checking its cell's root \
+             package without `--all-targets` — are read by no compiler in this repository \
+             either:\n{}\n\
+             FIRST ASK WHETHER THE GATE IS NEEDED. `keymap.rs`'s `windows_key_input` carried \
+             one for a month over logic with no platform API in it at all, and its four \
+             de-DE/AltGr laws — a German user's brace must not encode as a control byte — \
+             were kept by nothing. If the law really does need Windows, paste the line(s) \
+             above into `UNRUN_TEST_ROSTER`.",
+            unrostered.join("\n")
+        );
+        let stale: Vec<String> = roster
+            .difference(&seen)
+            .map(|(f, t)| format!("        (\"{f}\", \"{t}\"),"))
+            .collect();
+        assert!(
+            stale.is_empty(),
+            "`UNRUN_TEST_ROSTER` names {} test(s) this crate no longer gates off every host:\n{}\n\
+             Delete the line(s) — the roster ratchets DOWN by hand, and an entry nobody can \
+             see expire is an excuse that outlives its reason.",
+            stale.len(),
+            stale.join("\n")
+        );
+    }
+
+    /// The `cfg` folder and the `#[test]` detector, proved on the exact shapes
+    /// this crate writes — in both directions, because a scanner that answers
+    /// "no offence" to everything passes every tree.
+    #[test]
+    fn the_cfg_folder_agrees_with_the_compiler_on_the_shapes_this_crate_writes() {
+        // Off every host: the shape `keymap.rs` carried, and the plain one.
+        assert!(cfg_off_every_host(
+            "#[cfg(not(any(target_os = \"macos\", target_os = \"linux\")))]"
+        ));
+        assert!(cfg_off_every_host("#[cfg(windows)]"));
+        assert!(cfg_off_every_host("#[cfg(target_os = \"windows\")]"));
+        // One decidable `windows` folds an `all(…)` whose sibling is opaque.
+        assert!(cfg_off_every_host("#[cfg(all(test, windows))]"));
+        // Reachable on at least one host — none of these may be flagged.
+        for ok in [
+            "#[cfg(unix)]",
+            "#[cfg(target_os = \"macos\")]",
+            "#[cfg(target_os = \"linux\")]",
+            "#[cfg(not(target_os = \"macos\"))]",
+            "#[cfg(any(windows, target_os = \"linux\"))]",
+            "#[cfg(any(target_os = \"macos\", windows))]",
+            "#[cfg(target_family = \"unix\")]",
+            // Undecidable predicates are never an offence, on purpose.
+            "#[cfg(a11y_tree)]",
+            "#[cfg(feature = \"bench-support\")]",
+            "#[cfg(target_pointer_width = \"64\")]",
+            "#[cfg(test)]",
+        ] {
+            assert!(!cfg_off_every_host(ok), "{ok} reaches a host suite here");
+        }
+
+        // The detector, on the two attribute ORDERS this crate writes: the gate
+        // above `#[test]` (keymap.rs) and the gate below it (control_auth.rs,
+        // net_connections.rs), the second past a doc comment.
+        let a = "    fn a() {\n        assert!(true);\n    }\n";
+        let b = "    fn b() {\n        assert!(true);\n    }\n";
+        let above = format!(
+            "#[cfg(test)]\nmod tests {{\n    #[cfg(windows)]\n    #[test]\n{a}\n    #[test]\n{b}}}\n"
+        );
+        assert_eq!(
+            tests_no_host_runs(&above),
+            vec![(4, "a".to_string())],
+            "a gate ABOVE `#[test]` reaches the test it is written on, and only that one"
+        );
+        let below = format!(
+            "#[cfg(test)]\nmod tests {{\n    #[test]\n    /// why\n    #[cfg(windows)]\n{a}\n    #[test]\n{b}}}\n"
+        );
+        assert_eq!(
+            tests_no_host_runs(&below),
+            vec![(3, "a".to_string())],
+            "a gate BELOW `#[test]`, past a doc comment, gates the same test"
+        );
+        // `all(test, windows)` on the whole module carries every test inside
+        // it — the shape `session_status.rs` writes.
+        let whole = format!(
+            "#[cfg(all(test, windows))]\nmod tests {{\n    #[test]\n{a}\n    #[test]\n{b}}}\n"
+        );
+        assert_eq!(
+            tests_no_host_runs(&whole)
+                .iter()
+                .map(|(_, n)| n.as_str())
+                .collect::<Vec<_>>(),
+            vec!["a", "b"],
+            "a gated module gates all of its tests"
+        );
+        // And a module every host compiles has no offence in it at all.
+        let clean = format!("#[cfg(test)]\nmod tests {{\n    #[test]\n{a}}}\n");
+        assert!(tests_no_host_runs(&clean).is_empty());
+    }
+}

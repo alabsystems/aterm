@@ -232,6 +232,43 @@ impl CellFlags {
     pub const fn has_extended_flags(&self) -> bool {
         (self.0 & Self::EXTENDED_FLAGS_MASK) != 0
     }
+
+    /// Mask of the rendition a wide character's continuation spacer inherits
+    /// from its lead: bits 0-8 and 11-13, every visual attribute and nothing else.
+    ///
+    /// Deliberately excluded, each for its own reason:
+    /// - `WIDE` (bit 9) — the spacer is the tail of the pair, never a lead;
+    /// - `WIDE_CONTINUATION`/`PROTECTED` (bit 10) — the spacer's own role bit, and
+    ///   it aliases PROTECTED, so a blind union of the lead's flags would smuggle
+    ///   DECSCA protection into a cell that cannot carry it independently;
+    /// - `USES_STYLE_ID` (bit 14) and `COMPLEX` (bit 15) — storage discriminants of
+    ///   the spacer's OWN colors/char fields, which its constructor owns.
+    pub const SPACER_RENDITION_MASK: u16 =
+        Self::VISUAL_FLAGS_MASK & !(Self::WIDE.0 | Self::WIDE_CONTINUATION.0);
+
+    /// The flags for the continuation spacer of a wide character written with `self`.
+    ///
+    /// **The law: a rendition belongs to the CHARACTER, not to the column.** ECMA-48
+    /// SGR sets an attribute on a character, and a double-width character is one
+    /// character occupying two columns — there is no such thing as half a character
+    /// carrying half a rendition. The spacer therefore inherits the lead's visual
+    /// attributes and keeps only its own role bit.
+    ///
+    /// Measured reason (2026-09-16): a spacer built with `WIDE_CONTINUATION` alone
+    /// discarded every rendition bit, and under SGR 7 that erased the right half of
+    /// every double-width glyph. `resolve_both` swaps fg/bg for the lead only, so
+    /// `lead.resolved_fg == spacer.resolved_bg` for EVERY colour pair — an identity,
+    /// not a coincidence — and the glyph's spilled right half was composited
+    /// invisibly. `\033[7m[漢字]` on a 9x17 cell measured 153 of 153 pixels of flat
+    /// `#111318` in each spacer, distinct=1, zero glyph ink; the same line under
+    /// `\033[31;44;7m` measured 153/153 of the un-swapped blue `#3b8eea`. A CJK user
+    /// could not read a `less` search match. Underline, strikethrough and overline
+    /// rules gapped under every right half for the same reason.
+    #[must_use]
+    #[inline]
+    pub const fn wide_continuation_of(self) -> Self {
+        Self((self.0 & Self::SPACER_RENDITION_MASK) | Self::WIDE_CONTINUATION.0)
+    }
 }
 
 // Standard library bitwise operator implementations for Alacritty compatibility.

@@ -472,6 +472,65 @@ pub fn presence_from_config() -> crate::presence::Mode {
     }
 }
 
+/// `[fabric] receipts` out of an aterm.toml's TEXT: `Ok(None)` when the table
+/// or the key is absent.
+///
+/// # Errors
+///
+/// A file that is not TOML, a `fabric` that is not a table, or a `receipts`
+/// that is not a boolean.
+pub fn receipts_in_toml(text: &str) -> Result<Option<bool>, String> {
+    let table: aterm_toml::Table =
+        aterm_toml::from_str(text).map_err(|e| format!("not valid TOML: {e}"))?;
+    let Some(fabric) = table.get("fabric") else {
+        return Ok(None);
+    };
+    let Some(fabric) = fabric.as_table() else {
+        return Err("`fabric` is not a table".to_string());
+    };
+    match fabric.get("receipts") {
+        None => Ok(None),
+        Some(v) => v
+            .as_bool()
+            .map(Some)
+            .ok_or_else(|| "`[fabric] receipts` is not a boolean".to_string()),
+    }
+}
+
+/// `[fabric] receipts` from the aterm.toml [`config_path`] resolves, for a
+/// `serve` whose command line said neither `--receipts` nor `--no-receipts`.
+/// OFF when the file has no such key, or no file exists; ALSO off — said on
+/// stderr, not fatal — when the file cannot be read or the value is wrong, for
+/// the reason [`presence_from_config`] gives: a bridge that refused to start
+/// over a config typo would hold every session of its instance.
+#[must_use]
+pub fn receipts_from_config() -> bool {
+    let Some(path) = config_path() else {
+        return false;
+    };
+    let text = match std::fs::read_to_string(&path) {
+        Ok(t) => t,
+        Err(e) if e.kind() == io::ErrorKind::NotFound => return false,
+        Err(e) => {
+            eprintln!(
+                "aterm-link: {} could not be read ({e}); receipts default to off",
+                path.display()
+            );
+            return false;
+        }
+    };
+    match receipts_in_toml(&text) {
+        Ok(on) => on.unwrap_or(false),
+        Err(e) => {
+            eprintln!(
+                "aterm-link: {}: {e}; receipts default to off",
+                path.display()
+            );
+            false
+        }
+    }
+}
+
 /// The configured command, env first — the app's own precedence.
 ///
 /// # Errors
@@ -953,6 +1012,134 @@ fn record_t(conn: &mut Conn, filter: &str, off: u64) -> Option<u64> {
     (*at == off).then(|| Body::decode(raw).0.t)
 }
 
+/// An `ask` or `task` whose `dl=` has passed with no `answer`, `report` or
+/// `ack` carrying its offset as `re=` anywhere on the fleet's `in` lanes (R8).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Overdue {
+    /// The ask's offset — what a reply would carry as `re=`.
+    pub off: u64,
+    /// Who asked, as TRAFFIC renders it.
+    pub from: String,
+    /// Who was asked: `<sid>@<node>`.
+    pub to: String,
+    /// `ask` or `task`.
+    pub kind: String,
+    /// The advisory deadline it carried, ms.
+    pub dl: u64,
+    /// How long past the deadline it is, ms.
+    pub late_ms: u64,
+    /// Whether the asker's own bridge has already put `expired re=<off>` on
+    /// the asker's lane — the verdict R8 makes that bridge responsible for.
+    pub expired: bool,
+}
+
+/// How many offsets below the head the deadline scan reads. Every `in` record
+/// in that window is decoded once; a fleet busier than this over one report is
+/// a fleet whose oldest asks are past any deadline worth listing.
+const OVERDUE_SCAN_SPAN: u64 = 1 << 16;
+
+/// Every overdue ask on the bus, oldest first, over the last
+/// [`OVERDUE_SCAN_SPAN`] offsets.
+///
+/// FOLDED PAGE BY PAGE. The scan used to collect every raw record in the window
+/// — up to 65,536 of them, BODIES included — before reading any; a report is a
+/// one-shot command, but a window of large bodies made it a memory spike of
+/// the whole window's text. Each page is reduced to the few fields the rule
+/// needs ([`OverdueScan`]) and dropped, so the scan holds one page of bodies at
+/// a time and the rest as offsets and addresses.
+fn overdue_work(conn: &mut Conn, fleet: &str, head: u64, now_ms: u64) -> io::Result<Vec<Overdue>> {
+    let filter = format!("/f/{fleet}/in/>");
+    let mut scan = OverdueScan::default();
+    let mut next = head.saturating_sub(OVERDUE_SCAN_SPAN);
+    loop {
+        let (page, (after, now_head)) = conn.fetch(next, &filter, 256)?;
+        for (off, subject, raw) in &page {
+            scan.feed(fleet, *off, subject, raw);
+        }
+        if after <= next || after >= now_head {
+            break;
+        }
+        next = after;
+    }
+    Ok(scan.finish(now_ms))
+}
+
+/// The overdue asks among `records` (each `(off, subject, raw)`), as of
+/// `now_ms`. PURE, so the rule is pinned by a test that needs no broker: a
+/// `WORK_KINDS` record with `dl=` whose `t + dl` is past, and no
+/// `answer|report|ack` record with `re=` naming it.
+#[must_use]
+pub fn overdue_of(fleet: &str, records: &[(u64, String, Vec<u8>)], now_ms: u64) -> Vec<Overdue> {
+    let mut scan = OverdueScan::default();
+    for (off, subject, raw) in records {
+        scan.feed(fleet, *off, subject, raw);
+    }
+    scan.finish(now_ms)
+}
+
+/// [`overdue_of`]'s rule as a fold: what one record contributes is decided
+/// when it is read, and nothing of its body is kept.
+#[derive(Default)]
+struct OverdueScan {
+    settled: BTreeSet<u64>,
+    expired: BTreeSet<u64>,
+    asks: Vec<(Traffic, u64, u64)>,
+}
+
+impl OverdueScan {
+    fn feed(&mut self, fleet: &str, off: u64, subject: &str, raw: &[u8]) {
+        let t = traffic_of(fleet, off, subject, raw);
+        let (body, _) = Body::decode(raw);
+        match t.kind.as_str() {
+            k if WORK_KINDS.contains(&k) => {
+                if let Some(dl) = body.dl {
+                    // The addresses, never the text: an overdue row names who
+                    // asked whom, and only `tail --bodies` prints a body.
+                    let t = Traffic {
+                        text: String::new(),
+                        ..t
+                    };
+                    self.asks.push((t, body.t, dl));
+                }
+            }
+            "answer" | "report" | "ack" => {
+                if let Some(re) = body.re {
+                    self.settled.insert(re);
+                }
+            }
+            "expired" => {
+                if let Some(re) = body.re {
+                    self.expired.insert(re);
+                }
+            }
+            _ => {}
+        }
+    }
+
+    fn finish(self, now_ms: u64) -> Vec<Overdue> {
+        let Self {
+            settled,
+            expired,
+            asks,
+        } = self;
+        asks.into_iter()
+            .filter(|(t, _, _)| !settled.contains(&t.off))
+            .filter_map(|(t, at, dl)| {
+                let due = at.saturating_add(dl);
+                (at > 0 && now_ms > due).then(|| Overdue {
+                    off: t.off,
+                    expired: expired.contains(&t.off),
+                    from: t.from,
+                    to: t.to,
+                    kind: t.kind,
+                    dl,
+                    late_ms: now_ms - due,
+                })
+            })
+            .collect()
+    }
+}
+
 // ---------------------------------------------------------------------------
 // BRIDGES and local SESSIONS, over the control socket
 // ---------------------------------------------------------------------------
@@ -1298,6 +1485,9 @@ pub struct Report {
     /// What the bridge's presence rows carry: `--presence` on the command, else
     /// `[fabric] presence` in the config file, else `meta`.
     pub presence: crate::presence::Mode,
+    /// Whether the bridge publishes receipts (R8): `--receipts`/`--no-receipts`
+    /// on the command, else `[fabric] receipts` in the config file, else off.
+    pub receipts: bool,
     /// The node id in the command's state dir.
     pub node: Option<String>,
     /// `(path, grant count or error)` per cap file.
@@ -1316,6 +1506,9 @@ pub struct Report {
     pub exited: usize,
     /// TRAFFIC, oldest first.
     pub traffic: Vec<Traffic>,
+    /// Every `ask`/`task` on the bus past its `dl=` with no reply (R8). Each
+    /// is a WARNING; kept as data for `--json`.
+    pub overdue: Vec<Overdue>,
     /// WARNINGS.
     pub warnings: Vec<String>,
     /// When the report was taken, ms since the epoch.
@@ -1397,6 +1590,13 @@ pub fn gather() -> Result<Report, Off> {
     } else {
         presence_from_config()
     };
+    let receipts = if serve_flags(&command)
+        .is_some_and(|f| f.iter().any(|a| a == "--receipts" || a == "--no-receipts"))
+    {
+        cfg.receipts
+    } else {
+        receipts_from_config()
+    };
     let node = read_node(&cfg.state_dir);
     let caps = cfg
         .cap_files
@@ -1416,6 +1616,7 @@ pub fn gather() -> Result<Report, Off> {
         config_path,
         cfg,
         presence,
+        receipts,
         node,
         caps,
         broker,
@@ -1425,6 +1626,7 @@ pub fn gather() -> Result<Report, Off> {
         nodes: Vec::new(),
         exited: 0,
         traffic: Vec::new(),
+        overdue: Vec::new(),
         warnings: Vec::new(),
         now_ms,
     };
@@ -1443,6 +1645,10 @@ pub fn gather() -> Result<Report, Off> {
             Err(e) => bus_errors.push(format!("the traffic could not be read: {e}")),
         }
         halts = fleet_halts(&mut conn, &report.cfg.fleet);
+        match overdue_work(&mut conn, &report.cfg.fleet, head, now_ms) {
+            Ok(o) => report.overdue = o,
+            Err(e) => bus_errors.push(format!("the deadlines could not be read: {e}")),
+        }
         let in_filter = format!("/f/{}/in/>", report.cfg.fleet);
         for inst in &report.instances {
             for s in &inst.sessions {
@@ -1823,6 +2029,28 @@ fn warnings(
             }
         }
     }
+    // AN ASK PAST ITS DEADLINE WITH NO REPLY (R8). The bus is the authority:
+    // a reply the asker's endpoint dropped is still a reply, and an ask whose
+    // asker's bridge has already recorded `expired` is still unanswered — the
+    // line says which of the two states it is in.
+    for o in &r.overdue {
+        w.push(format!(
+            "{} off={} from {} to @{} passed its deadline {} ago (dl={} ms) with no answer, \
+             report or ack — {}",
+            safe(&o.kind, 16),
+            o.off,
+            safe(&o.from, 128),
+            safe(&o.to, 128),
+            age(o.late_ms),
+            o.dl,
+            if o.expired {
+                "the asker's bridge recorded it expired"
+            } else {
+                "not yet recorded expired by the asker's bridge (its tick does that; a bridge \
+                 older than round 15 never will)"
+            }
+        ));
+    }
     // A LIVE presence row for this machine's node that no instance here hosts
     // routes mail to nowhere: every post to it comes back undeliverable.
     let answered = r.discovery_error.is_none() && r.instances.iter().all(|i| i.error.is_none());
@@ -2050,6 +2278,16 @@ pub fn render_text(r: &Report) -> String {
             crate::presence::Mode::Minimal => {
                 "minimal (state, hold and attention only; no screen is read)".to_string()
             }
+        },
+    ));
+    kvs.push((
+        "receipts",
+        if r.receipts {
+            "on (inbox seen handled|refused|deferred on an ask/task acks the sender)".to_string()
+        } else {
+            "off (no ack reaches a sender; `[fabric] receipts = true` or `--receipts` turns \
+             it on)"
+                .to_string()
         },
     ));
     push_kvs(&mut out, &kvs);
@@ -2527,6 +2765,7 @@ pub fn render_json(r: &Report) -> String {
                 ("fleet", J::s(&r.cfg.fleet)),
                 ("node", J::opt_s(r.node.as_deref())),
                 ("presence", J::s(r.presence.name())),
+                ("receipts", J::Bool(r.receipts)),
                 ("cap_files", J::Arr(caps)),
                 ("state_dir", J::s(&r.cfg.state_dir)),
                 (
@@ -2555,6 +2794,25 @@ pub fn render_json(r: &Report) -> String {
         ("sessions", J::Arr(sessions)),
         ("exited_sessions", J::Num(r.exited as u64)),
         ("traffic", J::Arr(traffic)),
+        (
+            "overdue",
+            J::Arr(
+                r.overdue
+                    .iter()
+                    .map(|o| {
+                        J::Obj(vec![
+                            ("off", J::Num(o.off)),
+                            ("from", J::s(&o.from)),
+                            ("to", J::s(&o.to)),
+                            ("kind", J::s(&o.kind)),
+                            ("dl_ms", J::Num(o.dl)),
+                            ("late_ms", J::Num(o.late_ms)),
+                            ("expired", J::Bool(o.expired)),
+                        ])
+                    })
+                    .collect(),
+            ),
+        ),
         (
             "warnings",
             J::Arr(r.warnings.iter().map(|w| J::s(w)).collect()),
@@ -3258,6 +3516,7 @@ mod tests {
             config_path: Some(PathBuf::from("/c/aterm.toml")),
             cfg: bridge_config(CMD).expect("a bridge command"),
             presence: crate::presence::Mode::Meta,
+            receipts: false,
             node: Some("n-a".to_string()),
             caps: vec![("/c/node.cap".to_string(), Ok(8))],
             broker: BrokerView {
@@ -3287,6 +3546,7 @@ mod tests {
             nodes: Vec::new(),
             exited: 0,
             traffic: Vec::new(),
+            overdue: Vec::new(),
             warnings: Vec::new(),
             now_ms: 100 * 60 * 1000,
         }
@@ -3477,6 +3737,112 @@ mod tests {
         );
         ages.insert(("s-one".to_string(), 40), r.now_ms - 9 * 60 * 1000);
         assert!(warnings(&r, &ages, &[]).is_empty(), "a note is not work");
+    }
+
+    /// **AN ASK PAST ITS DEADLINE WITH NO REPLY IS A WARNING (R8), AND THE RULE
+    /// IS READ OFF THE BUS.** An `answer|report|ack` carrying `re=` settles it;
+    /// an `expired` verdict does not settle it but is reported; a `note` with a
+    /// `dl=` is not work; a deadline not yet passed is not overdue.
+    #[test]
+    fn an_ask_past_its_deadline_with_no_reply_is_a_warning() {
+        let now = 100 * 60 * 1000u64;
+        let lane = |src: &str, kind: &str| format!("/f/lab/in/n-a/s-one/{src}/{kind}");
+        let rec = |off: u64, subject: String, body: &str| (off, subject, body.as_bytes().to_vec());
+        let records = vec![
+            // Twenty minutes old, a ten-minute deadline, nothing names it.
+            rec(
+                40,
+                lane("h-andrew", "ask"),
+                &format!("v=1 t={} dl=600000 text=which", now - 20 * 60 * 1000),
+            ),
+            // The same, answered.
+            rec(
+                41,
+                lane("h-andrew", "task"),
+                &format!("v=1 t={} dl=600000 text=do", now - 20 * 60 * 1000),
+            ),
+            rec(
+                45,
+                lane("n-b", "answer"),
+                &format!("v=1 t={} from=s-two re=41 text=done", now - 5 * 60 * 1000),
+            ),
+            // The same, with the asker's bridge's verdict already on the lane.
+            rec(
+                42,
+                lane("n-b", "ask"),
+                &format!(
+                    "v=1 t={} from=s-two dl=600000 text=why",
+                    now - 20 * 60 * 1000
+                ),
+            ),
+            rec(
+                46,
+                lane("n-a", "expired"),
+                &format!("v=1 t={} re=42 dl=600000 text=expired", now - 9 * 60 * 1000),
+            ),
+            // Not yet due.
+            rec(
+                43,
+                lane("h-andrew", "ask"),
+                &format!("v=1 t={} dl=600000 text=soon", now - 5 * 60 * 1000),
+            ),
+            // A note is not work, and a record with no dl= has no deadline.
+            rec(
+                44,
+                lane("h-andrew", "note"),
+                &format!("v=1 t={} dl=1 text=fyi", now - 20 * 60 * 1000),
+            ),
+            rec(
+                47,
+                lane("h-andrew", "ask"),
+                &format!("v=1 t={} text=nodl", now - 20 * 60 * 1000),
+            ),
+            // An ask settled by an ack, and one settled by a report.
+            rec(
+                48,
+                lane("h-andrew", "ask"),
+                &format!("v=1 t={} dl=1 text=a", now - 20 * 60 * 1000),
+            ),
+            rec(
+                49,
+                lane("n-b", "ack"),
+                "v=1 t=1 re=48 text=verdict%3Dhandled",
+            ),
+            rec(
+                50,
+                lane("h-andrew", "task"),
+                &format!("v=1 t={} dl=1 text=b", now - 20 * 60 * 1000),
+            ),
+            rec(51, lane("n-b", "report"), "v=1 t=1 re=50 text=done"),
+        ];
+        let overdue = overdue_of("lab", &records, now);
+        let offs: Vec<(u64, bool)> = overdue.iter().map(|o| (o.off, o.expired)).collect();
+        assert_eq!(offs, vec![(40, false), (42, true)], "{overdue:#?}");
+        assert_eq!(overdue[0].late_ms, 10 * 60 * 1000);
+        assert_eq!(overdue[0].from, "h-andrew");
+        assert_eq!(overdue[0].to, "s-one@n-a");
+        assert_eq!(overdue[1].from, "s-two@n-b");
+
+        let mut r = healthy();
+        r.overdue = overdue;
+        let w = warned(&r);
+        assert_eq!(w.len(), 2, "{w:#?}");
+        assert!(
+            w[0].contains("ask off=40 from h-andrew to @s-one@n-a passed its deadline 10m ago (dl=600000 ms) with no answer, report or ack — not yet recorded expired"),
+            "{}",
+            w[0]
+        );
+        assert!(
+            w[1].contains("ask off=42 from s-two@n-b to @s-one@n-a")
+                && w[1].ends_with("the asker's bridge recorded it expired"),
+            "{}",
+            w[1]
+        );
+        r.warnings = w;
+        assert_eq!(exit_of(&r), 1);
+        let json = render_json(&r);
+        assert!(json.contains("\"overdue\":[{\"off\":40,"), "{json}");
+        assert!(json.contains("\"expired\":true"), "{json}");
 
         // A bridge that is not supervised; one that is down.
         let mut r = healthy();

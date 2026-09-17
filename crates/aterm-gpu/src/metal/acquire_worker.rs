@@ -36,11 +36,32 @@ pub(crate) enum AcquireOutcome<O> {
 #[derive(Debug)]
 pub(crate) struct Completed<O> {
     pub(crate) generation: u64,
+    /// Wall time this request spent QUEUED — `try_request` publishing the
+    /// command until this worker was scheduled to dequeue it — which is a
+    /// different leg from the acquisition the outcome carries.
+    ///
+    /// It is a latency the CALLER pays: a frame that finds no prefetched
+    /// drawable returns `AcquireRefusal::Pending` and cannot present until
+    /// this worker runs, so on a saturated machine a descheduled worker
+    /// defers a key echo by whole panel periods. The acquisition's own clock
+    /// (`LayerAcquire::run`) starts INSIDE the worker, after this leg is
+    /// already over, so it reports the ~0.02 ms `nextDrawable` cost and
+    /// nothing of the wait — which is how the stall came to be
+    /// unattributable. Stamped at admission, measured at dequeue, published
+    /// beside the acquire wait as `acquire_queue_*`.
+    pub(crate) queue_ns: u64,
     pub(crate) outcome: AcquireOutcome<O>,
 }
 
 enum Command<I, R> {
-    Request { generation: u64, input: I },
+    Request {
+        generation: u64,
+        /// Admission time, for [`Completed::queue_ns`]. Stamped by
+        /// `try_request` rather than by the worker, because the whole point
+        /// is to measure the span the worker is NOT running.
+        queued: aterm_time::Instant,
+        input: I,
+    },
     Retire(R),
 }
 
@@ -109,7 +130,11 @@ impl<I: Send + 'static, O: Send + 'static, R: Send + 'static> AcquireWorker<I, O
         let Some(commands) = &self.commands else {
             return Err(input);
         };
-        match commands.try_send(Command::Request { generation, input }) {
+        match commands.try_send(Command::Request {
+            generation,
+            queued: aterm_time::Instant::now(),
+            input,
+        }) {
             Ok(()) => {
                 self.pending_generation = Some(generation);
                 Ok(())
@@ -133,6 +158,10 @@ impl<I: Send + 'static, O: Send + 'static, R: Send + 'static> AcquireWorker<I, O
             Err(mpsc::TryRecvError::Empty) => return None,
             Err(mpsc::TryRecvError::Disconnected) => Completed {
                 generation,
+                // A synthesized terminal result: no worker ever dequeued the
+                // request, so there is no queue span to report. Zero here is
+                // "not measured", and the caller books no sample for it.
+                queue_ns: 0,
                 outcome: AcquireOutcome::Disconnected,
             },
         };
@@ -164,16 +193,58 @@ impl<I: Send + 'static, O: Send + 'static, R: Send + 'static> AcquireWorker<I, O
     }
 }
 
+// SAFETY: `pthread_set_qos_class_self_np` is libpthread's, part of `libSystem`,
+// which is linked into every process on this platform (the same reason
+// `aterm-objc`'s libdispatch block needs no link attribute). `qos_class_t` is
+// `unsigned int` in `<sys/qos.h>`.
+unsafe extern "C" {
+    fn pthread_set_qos_class_self_np(qos_class: u32, relative_priority: i32) -> i32;
+}
+
+/// `QOS_CLASS_USER_INTERACTIVE` (`<sys/qos.h>`), the class `aterm-gui`'s
+/// `qos::Role::Interactive` maps to.
+const QOS_CLASS_USER_INTERACTIVE: u32 = 0x21;
+
+/// Rank the acquisition thread with the keystroke→glass path it serves.
+///
+/// A new pthread does NOT inherit its creator's class, so spawning from the
+/// main thread (pri 47) left this one at `QOS_CLASS_DEFAULT` (pri 31), level
+/// with every compiler on a saturated machine. The main thread never waits on
+/// it synchronously, but a frame (a key echo included) cannot present until
+/// this thread is scheduled to hand the drawable back, so a descheduled worker
+/// defers the present by whole panel periods. Measured on the live window:
+/// `acquire_p99_ms=5.24 max_acquire_wait_ms=15.32 present_p99_ms=75.50` for
+/// 0.6 ms of frame CPU. It holds no lock the UI thread contends (both channels
+/// are `sync_channel`s used with `try_*` on the caller side), so raising it
+/// cannot invert anything. Declared for the whole thread, so the blocking
+/// `nextDrawable` wait and the retirement drop both run at this class.
+fn declare_interactive_thread() {
+    // SAFETY: sets this thread's own QoS class; takes no pointers and mutates
+    // no shared state. Failure leaves the default class and is not actionable.
+    unsafe {
+        pthread_set_qos_class_self_np(QOS_CLASS_USER_INTERACTIVE, 0);
+    }
+}
+
 fn run_worker<I, O, R>(
     mut acquire: impl FnMut(I) -> O,
     notify: Arc<dyn Fn() + Send + Sync>,
     requests: mpsc::Receiver<Command<I, R>>,
     completed: mpsc::SyncSender<Completed<O>>,
 ) {
+    declare_interactive_thread();
     let mut poisoned = false;
     while let Ok(command) = requests.recv() {
         match command {
-            Command::Request { generation, input } => {
+            Command::Request {
+                generation,
+                queued,
+                input,
+            } => {
+                // FIRST, before any acquisition work: this stamp closes the
+                // span that began at `try_request`, so it measures exactly
+                // how long this thread was not scheduled to serve the frame.
+                let queue_ns = u64::try_from(queued.elapsed().as_nanos()).unwrap_or(u64::MAX);
                 let outcome = if poisoned {
                     // Normal admission closes when the panic result
                     // is taken. Do not reuse an unwound callback if
@@ -197,6 +268,7 @@ fn run_worker<I, O, R>(
                 if completed
                     .try_send(Completed {
                         generation,
+                        queue_ns,
                         outcome,
                     })
                     .is_ok()
@@ -512,5 +584,99 @@ mod tests {
         assert!(!worker.is_pending());
         assert_eq!(worker.try_request(10, ()), Err(()));
         assert!(worker.try_take().is_none());
+    }
+
+    // SAFETY: `qos_class_self` is libpthread's, part of `libSystem`, linked into
+    // every process on this platform. It reads only the calling thread's own
+    // requested class.
+    unsafe extern "C" {
+        fn qos_class_self() -> u32;
+    }
+
+    /// `QOS_CLASS_USER_INTERACTIVE` as the SDK spells it (`<sys/qos.h>`).
+    const USER_INTERACTIVE_RAW: u32 = 0x21;
+
+    #[test]
+    fn acquisition_runs_at_user_interactive_so_the_waiting_ui_thread_is_not_outranked() {
+        let (wake, woken) = mpsc::channel();
+        let mut worker = AcquireWorker::<(), u32, ()>::spawn(
+            // SAFETY: see the extern block above; no arguments, no shared state.
+            |()| unsafe { qos_class_self() },
+            Arc::new(move || wake.send(()).unwrap()),
+        )
+        .unwrap();
+        worker.try_request(1, ()).unwrap();
+        woken.recv_timeout(LIMIT).unwrap();
+        let result = worker.try_take().unwrap();
+        let AcquireOutcome::Ready(class) = result.outcome else {
+            panic!("acquisition did not complete: {:?}", result.outcome);
+        };
+        // A new pthread does NOT inherit its creator's class: spawned bare from
+        // any parent class it reads QOS_CLASS_DEFAULT (0x15, sched pri 31), the
+        // compilers' band, below the main thread it hands drawables to.
+        assert_eq!(QOS_CLASS_USER_INTERACTIVE, USER_INTERACTIVE_RAW);
+        assert_eq!(
+            class, USER_INTERACTIVE_RAW,
+            "aterm-drawable-acquire ran at QoS class {class:#x}, not USER_INTERACTIVE"
+        );
+        assert!(worker.close(()).is_ok());
+    }
+
+    /// THE QUEUE LEG IS MEASURED, not inferred.
+    ///
+    /// `LayerAcquire::run` starts its clock INSIDE the worker, so the figure
+    /// it publishes (`acquire_wait`) can only ever be what `nextDrawable`
+    /// itself cost — ~0.02 ms in the steady state. The leg that actually
+    /// stalls a key echo is the one BEFORE it: admission until this thread is
+    /// scheduled to dequeue. During that span the frame has already returned
+    /// `AcquireRefusal::Pending` and the main thread is parked waiting for
+    /// `Wake::GpuSurfaceReady`, so it is pure keystroke→glass latency — and
+    /// before `queue_ns` it was stamped nowhere and reached no metric, which
+    /// is what made a real stall unattributable.
+    ///
+    /// Deterministic, and it generates NO load: the request is admitted while
+    /// the worker loop is still held shut behind a gate, so the measured span
+    /// is the test's own gate rather than a scheduling race it had to lose.
+    #[test]
+    fn a_request_waiting_for_a_descheduled_worker_books_its_queue_time() {
+        const GATE: Duration = Duration::from_millis(50);
+        let (commands, requests) = mpsc::sync_channel(2);
+        let (completed, results) = mpsc::sync_channel(1);
+        let (start, started) = mpsc::channel();
+        let (wake, woken) = mpsc::channel();
+        let mut worker = AcquireWorker {
+            commands: Some(commands),
+            results: Some(results),
+            pending_generation: None,
+            closed: false,
+        };
+        let thread = std::thread::spawn(move || {
+            // The shipping loop, held shut until the request has been waiting
+            // for GATE. This is the descheduled worker, made reproducible.
+            started.recv_timeout(LIMIT).unwrap();
+            run_worker(
+                |()| (),
+                Arc::new(move || wake.send(()).unwrap()),
+                requests,
+                completed,
+            );
+        });
+        worker.try_request(1, ()).unwrap();
+        std::thread::sleep(GATE);
+        start.send(()).unwrap();
+        woken.recv_timeout(LIMIT).unwrap();
+        let result = worker.try_take().unwrap();
+        assert!(matches!(result.outcome, AcquireOutcome::Ready(())));
+        // The acquisition itself was a no-op closure, so every nanosecond
+        // here is queue. `>=` and not a window: the worker CANNOT have
+        // dequeued before `start`, so this bound holds by construction on any
+        // machine, at any load, without generating any.
+        assert!(
+            result.queue_ns >= u64::try_from(GATE.as_nanos()).unwrap(),
+            "a request that waited {GATE:?} for the worker booked {} ns of queue time",
+            result.queue_ns
+        );
+        assert!(worker.close(()).is_ok());
+        thread.join().unwrap();
     }
 }

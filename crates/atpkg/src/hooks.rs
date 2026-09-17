@@ -31,8 +31,21 @@
 //! REACH: `~/.aterm/shell.d` is sourced from two places. aterm's own shell integration
 //! (`aterm-shell-integration`'s zsh/bash/fish/ps1 scripts) sources it for shells running
 //! INSIDE an aterm session; and [`ensure_rc_sources_hooks`] adds a marker-bounded block
-//! to the user's `~/.zshrc` / `~/.bashrc` / fish config so an ORDINARY interactive shell
-//! — Terminal.app, iTerm, VS Code, ssh, an agent's shell — gets the managed tools too.
+//! to the user's `~/.zshrc` / `~/.bashrc` / `~/.bash_profile` / fish config so an
+//! ORDINARY interactive shell — Terminal.app, iTerm, VS Code, ssh, an agent's shell —
+//! gets the managed tools too. WHICH SHELLS THAT REACHES (measured 2026-09-15, macOS
+//! `/bin/bash` 3.2.57, throwaway HOME): zsh reads `~/.zshrc` for every interactive
+//! shell, login or not; bash reads `~/.bashrc` ONLY for an interactive NON-login shell,
+//! and a LOGIN shell — what Terminal.app, iTerm and an ssh session open, what `bash -l`
+//! is — reads `~/.bash_profile` instead (falling through to `~/.bash_login`, then
+//! `~/.profile`, when it is absent) and never `~/.bashrc` on its own. Until 2026-09-15
+//! the table held `.bashrc` alone, so a user whose login shell is bash got the block
+//! written and no toolchain on PATH in any terminal they opened (audit finding);
+//! `.bash_profile` is now a second bash target sourcing the same `00-atpkg.bash`.
+//! `~/.profile` is deliberately NOT one — this module has never reasoned about it, and
+//! it is read by `sh`/dash logins the bash/zsh hook body (`${x//p/r}`) is not written
+//! for. Nothing is invented: a home with a `.bashrc` and no `.bash_profile` keeps
+//! exactly that, and `aterm pkg doctor` prints the PATH line for the rest.
 //! It edits only rc files that already exist and never creates one, and it never OPENS
 //! one that resolves under a macOS-protected folder ([`crate::protected`]): the wiring
 //! runs unattended (the six-hourly pass, the first-launch seed), and a dotfiles repo
@@ -60,6 +73,80 @@ use crate::store::Layout;
 
 /// The hook file base name (`00-` sorts first; distinct from any `aterm-pkg`-era name).
 pub const HOOK_BASENAME: &str = "00-atpkg";
+
+/// The hook file `shell` — the basename of `$SHELL` — sources: `00-atpkg.zsh`,
+/// `00-atpkg.bash`, `00-atpkg.fish`, `00-atpkg.ps1` (`pwsh`/`powershell`); NOT `sh` — the
+/// bash hook's body uses `${var//pat/rep}`, which a POSIX `sh` (dash) rejects, so a
+/// `$SHELL=/bin/sh` user gets the `PATH` line instead (review finding, 2026-09-16);
+/// `None` for a shell atpkg writes no hook for (nushell, xonsh, cmd). One table for
+/// [`rc_hook_wired`], [`hook_file`] and the remedy `doctor`/`which` print
+/// ([`crate::cli::shell_remedy_command`]) — the same four files [`write_hooks`] lays.
+#[must_use]
+pub fn hook_for_shell(shell: &str) -> Option<&'static str> {
+    match shell {
+        "zsh" => Some("00-atpkg.zsh"),
+        "bash" => Some("00-atpkg.bash"),
+        "fish" => Some("00-atpkg.fish"),
+        "pwsh" | "powershell" => Some("00-atpkg.ps1"),
+        _ => None,
+    }
+}
+
+/// `<home>/.aterm/shell.d/<hook>` when the hook for `shell` EXISTS there as a regular
+/// file (a symlink is not ours — the writer refuses one, [`crate::platform::ensure_private_dir`]),
+/// paired with the hook's file name; `None` for a shell without a hook or a hook never
+/// written (an install whose hook write failed, a `HOME` atpkg has not seen). The
+/// predicate behind the one remedy `doctor`/`which` name: the hook is sourced in place
+/// where it stands, and only where it does not stand is a `PATH` line printed instead.
+#[must_use]
+pub fn hook_file(home: &Path, shell: &str) -> Option<(std::path::PathBuf, &'static str)> {
+    let hook = hook_for_shell(shell)?;
+    let path = home.join(".aterm").join("shell.d").join(hook);
+    fs::symlink_metadata(&path)
+        .ok()
+        .filter(|m| m.file_type().is_file())
+        .map(|_| (path, hook))
+}
+
+/// Whether `shell` — the basename of `$SHELL`: `zsh`, `bash`, `fish` — has an rc under
+/// `home` that SOURCES the atpkg hook, paired with that hook's file name; `None` for a
+/// shell the table does not know. "Sources" is read off the rc itself: the marker block
+/// [`ensure_rc_sources_hooks`] writes, or a hand-written line naming the hook file (a
+/// `.zprofile` wired by the owner counts). Read-only, and an rc under a protected root is
+/// NOT opened — the consent fence the writer keeps (TCC audit, 2026-09-12) — so it answers
+/// "not wired" there, which names the remedy that works either way.
+///
+/// A FACT, NOT A REMEDY (2026-09-16). The first cut of the agent programs' shadow row
+/// keyed its remedy on this: `exec $SHELL` where an rc sources the hook, the source line
+/// where none does. Measured the same day on the owner's machine, `exec $SHELL` inside an
+/// aterm tab LOSES the tab's shell integration (`aterm-shell-integration`'s zsh wrapper
+/// restores `ZDOTDIR` and consumes `ATERM_ORIGINAL_ZDOTDIR` before sourcing, so the
+/// re-exec'd zsh never loads it; bash rides `--rcfile`, same loss), so
+/// [`crate::cli::shell_remedy_command`] now names the hook source everywhere and keys
+/// only on whether the hook FILE exists ([`hook_for_shell`], [`hook_file`]). This stays
+/// the reader for "is the rc wired" — `doctor`'s shell-integration facts, a test's
+/// witness — and answers no remedy.
+#[must_use]
+pub fn rc_hook_wired(home: &Path, shell: &str) -> Option<(bool, &'static str)> {
+    let rcs: &[&str] = match shell {
+        "zsh" => &[".zshrc", ".zprofile"],
+        "bash" | "sh" => &[".bashrc", ".bash_profile", ".profile"],
+        "fish" => &[".config/fish/config.fish"],
+        _ => return None,
+    };
+    let hook = hook_for_shell(shell)?;
+    let canonical_home = fs::canonicalize(home).unwrap_or_else(|_| home.to_path_buf());
+    let wired = rcs.iter().any(|rc| {
+        let Ok(real) = fs::canonicalize(home.join(rc)) else {
+            return false;
+        };
+        if crate::protected::under_protected_root(&canonical_home, &real) {
+            return false;
+        }
+        fs::read_to_string(&real).is_ok_and(|body| body.contains(RC_BEGIN) || body.contains(hook))
+    });
+    Some((wired, hook))
+}
 
 /// The `(filename, content)` for each shell dialect, parametrized on `bin_dir` (APPENDED)
 /// and `agents_dir` (MOVED TO THE FRONT — the agent programs' shims, module doc).
@@ -157,7 +244,34 @@ pub fn write_hooks(shell_d: &Path, bin_dir: &Path, agents_dir: &Path) -> io::Res
 /// Best-effort choke point called after activation ([`crate::flow`]). Hardens `~/.aterm` +
 /// `~/.aterm/shell.d` (0700, symlink-refusing) then writes the hooks. NEVER propagates an
 /// error — hooks are ergonomics, not trust; a failed write must not fail an install.
+///
+/// This is the UNATTENDED pass (install, seed, the six-hourly `update`), so its rc wiring
+/// HONOURS THE OPT-OUT the block itself documents: an rc that was wired once and no longer
+/// carries the block is left exactly as the user left it ([`RC_LEDGER`]).
+/// [`refresh_rewiring_rc`] is the deliberate pass that writes it back.
 pub fn refresh(layout: &Layout) {
+    refresh_with(layout, RcWiring::HonorOptOut);
+}
+
+/// [`refresh`], but the rc block is written back even where the user removed it — the
+/// ASKED-FOR pass, and only that: `atpkg repair`, whose own output promises it rewrote the
+/// shell integration. It is the way back in after an opt-out, so opting out costs nobody a
+/// hand-edited dotfile to undo.
+pub fn refresh_rewiring_rc(layout: &Layout) {
+    refresh_with(layout, RcWiring::Rewire);
+}
+
+/// What a pass does with an rc whose block the user DELETED (the opt-out the block's own
+/// text documents): an unattended pass leaves it deleted; `repair` writes it back.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum RcWiring {
+    /// An rc recorded in [`RC_LEDGER`] that no longer carries the block is skipped.
+    HonorOptOut,
+    /// Every eligible rc is wired, ledger or not.
+    Rewire,
+}
+
+fn refresh_with(layout: &Layout, wiring: RcWiring) {
     let Some(home) = aterm_types::dirs::home_dir() else {
         return;
     };
@@ -168,7 +282,9 @@ pub fn refresh(layout: &Layout) {
     }
     let _ = write_hooks(&shell_d, &layout.bin_dir(), &layout.agents_dir());
     #[cfg(unix)]
-    ensure_rc_sources_hooks(&home);
+    ensure_rc_sources_hooks(&home, wiring);
+    #[cfg(not(unix))]
+    let _ = wiring;
     #[cfg(unix)]
     ensure_command_links(&home);
 }
@@ -177,6 +293,74 @@ pub fn refresh(layout: &Layout) {
 /// found, refreshed and removed exactly — never matched by content, which drifts.
 const RC_BEGIN: &str = "# >>> atpkg shell integration >>>";
 const RC_END: &str = "# <<< atpkg shell integration <<<";
+
+/// `~/.aterm/rc-wired` — the rc files this machine has wired, one canonical path per
+/// line. It is what makes the block's OWN SENTENCE true.
+///
+/// The block says "delete this block to opt out", and until 2026-09-16 the only
+/// idempotency check was the marker itself: a pass that read an rc with no [`RC_BEGIN`]
+/// in it appended the block again. [`refresh`] runs unconditionally from install, seed,
+/// `repair` and the six-hourly background `update`, so the documented opt-out lasted only
+/// until the next pass — hours — and a dotfiles repo showed the same diff coming back
+/// forever, the user's own edit to their own file silently reverted (audit finding,
+/// 2026-09-16). Nothing else recorded the opt-out: no config key, no tombstone.
+///
+/// So a wired rc is RECORDED here, and a recorded rc that no longer carries the block is
+/// read as the user's opt-out and skipped. A pass also records an rc it finds ALREADY
+/// wired, so a machine wired by an older build gets its entry on the first pass after the
+/// upgrade and the FIRST deletion there is honoured too.
+///
+/// State, not trust, and cheap to lose: a wiped `~/.aterm` costs one re-add, and two
+/// passes racing cost at most one lost entry (each writes the union of what it read and
+/// what it wired). [`refresh_rewiring_rc`] ignores it on purpose — that is the way back.
+#[cfg(unix)]
+const RC_LEDGER: &str = "rc-wired";
+
+#[cfg(unix)]
+fn rc_ledger_path(home: &Path) -> std::path::PathBuf {
+    home.join(".aterm").join(RC_LEDGER)
+}
+
+/// The recorded rc paths, or an empty set when the ledger is absent or unreadable — a
+/// missing ledger means "nothing has been wired yet", which is what a fresh home is.
+#[cfg(unix)]
+fn read_rc_ledger(home: &Path) -> std::collections::BTreeSet<String> {
+    fs::read_to_string(rc_ledger_path(home))
+        .map(|body| {
+            body.lines()
+                .map(str::trim)
+                .filter(|line| !line.is_empty())
+                .map(str::to_owned)
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+/// Record `real` as wired, best-effort (0600, temp + rename, the discipline every other
+/// file here is written with). Already recorded ⇒ no write at all, so the ordinary pass —
+/// every rc already in the ledger — touches nothing.
+///
+/// A path containing a NEWLINE cannot be one line of a line-per-path file, so it is left
+/// out rather than written as two entries that would each mean something else: such an rc
+/// keeps the old behaviour (wired again by the next pass) and the rest of the ledger stays
+/// exactly what it says it is.
+#[cfg(unix)]
+fn record_rc_wired(home: &Path, real: &Path, ledger: &mut std::collections::BTreeSet<String>) {
+    let entry = real.to_string_lossy().into_owned();
+    if entry.contains('\n') {
+        return;
+    }
+    if !ledger.insert(entry) {
+        return; // already on disk
+    }
+    // `~/.aterm` is ours, and [`refresh`] has already hardened it; this covers a caller
+    // that reaches the wiring directly.
+    if ensure_private_dir(&home.join(".aterm")).is_err() {
+        return;
+    }
+    let body: String = ledger.iter().map(|path| format!("{path}\n")).collect();
+    let _ = atomic_write(&rc_ledger_path(home), &body);
+}
 
 /// Source the `shell.d` hooks from the user's own rc, so the managed toolchain is on
 /// PATH in EVERY shell — Terminal.app, iTerm, VS Code, ssh, an agent's shell — not only
@@ -191,21 +375,50 @@ const RC_END: &str = "# <<< atpkg shell integration <<<";
 /// Deliberately conservative about touching a file it does not own:
 /// * only rc files that ALREADY EXIST are edited — atpkg never creates a shell's rc;
 /// * the block is bounded by [`RC_BEGIN`]/[`RC_END`] so it is idempotent (present ⇒
-///   nothing happens) and a user can delete it in one motion;
+///   nothing happens) and a user can delete it in one motion — and a deletion STAYS
+///   deleted, because a wired rc is recorded in [`RC_LEDGER`] and a recorded rc that no
+///   longer carries the block is this pass's evidence that the user opted out;
 /// * it SOURCES `shell.d` rather than inlining a PATH, so the path stays correct after
 ///   the prefix moves and there is exactly one generator;
+/// * the hook path is written DOUBLE-QUOTED, so a home with a space (`/Users//Jane Doe`)
+///   sources the hook instead of erroring at every shell start;
 /// * the sourced hook appends the managed `bin/`, never prepends it, so a managed tool
 ///   cannot shadow system `sudo`/`ssh`/`git` (the agents dir it prepends can only ever
 ///   carry `claude`/`codex` — module doc);
 /// * every step is best-effort — wiring PATH must never fail an install.
+///
+/// bash gets TWO targets, `~/.bashrc` and `~/.bash_profile`, because bash reads them for
+/// DIFFERENT shells (measured 2026-09-15, macOS `/bin/bash` 3.2.57, a throwaway HOME
+/// holding all three of `.bash_profile`/`.bashrc`/`.profile`, each echoing its name):
+/// `bash -l -i` — a Terminal.app or iTerm tab, an ssh login, `bash -l` — printed
+/// `.bash_profile` alone; `bash -i` printed `.bashrc` alone; with `.bash_profile`
+/// removed the login shell fell through to `.profile`; with only `.bashrc` left it
+/// printed nothing. Until then the table held `.bashrc` alone, so a bash-login user got
+/// the block AND no toolchain on PATH in any terminal they opened (audit finding,
+/// 2026-09-15). Both rows source the same `00-atpkg.bash`; a `.bash_profile` that itself
+/// sources `.bashrc` runs it twice, which the hook is built for (bin/ presence-guarded,
+/// agents/ move-to-front — the real-shell test pins a second source as a no-op). The
+/// never-create rule stands: a home with a `.bashrc` and no `.bash_profile` gets nothing
+/// invented (many users source `.bashrc` from a `.bash_profile` of their own, and a
+/// file we invent is ours forever). `~/.bash_login` and `~/.profile` are NOT rows — this
+/// module has never reasoned about `.profile`, and it is read by `sh`/dash logins the
+/// bash/zsh hook body (`${x//p/r}`) is not written for; `aterm pkg doctor`'s PATH line
+/// is the way in for those.
 #[cfg(unix)]
-fn ensure_rc_sources_hooks(home: &Path) {
+fn ensure_rc_sources_hooks(home: &Path, wiring: RcWiring) {
     // Both sides of the protected-root comparison canonical: `$TMPDIR` and a home
     // reached through a link both spell `/private/…` once resolved.
     let canonical_home = fs::canonicalize(home).unwrap_or_else(|_| home.to_path_buf());
+    // Read once for the whole pass: the four rows share it, and each write folds its own
+    // entry back in ([`record_rc_wired`]).
+    let mut ledger = read_rc_ledger(home);
     for (rc, hook) in [
         (".zshrc", "00-atpkg.zsh"),
         (".bashrc", "00-atpkg.bash"),
+        // The LOGIN bash rc (doc above): the same hook, reached by the shell
+        // Terminal.app actually opens. Each row is independent — an absent one is
+        // skipped below, never created.
+        (".bash_profile", "00-atpkg.bash"),
         (".config/fish/config.fish", "00-atpkg.fish"),
     ] {
         let rc_path = home.join(rc);
@@ -246,13 +459,36 @@ fn ensure_rc_sources_hooks(home: &Path) {
             continue;
         };
         if existing.contains(RC_BEGIN) {
-            continue; // already wired; the hook body itself is what gets refreshed
+            // Already wired; the hook body itself is what gets refreshed. Record it —
+            // including an rc wired by a build that predates the ledger — so that the
+            // NEXT deletion is read as the opt-out the block promises.
+            record_rc_wired(home, &real, &mut ledger);
+            continue;
+        }
+        // THE OPT-OUT, HONOURED. This rc carried the block once and does not now, so the
+        // user deleted it exactly as the block told them to. An unattended pass — an
+        // install, a seed, the six-hourly `update` — must not undo a user's edit to their
+        // own dotfile; `atpkg repair` ([`refresh_rewiring_rc`]) is the pass that asks for
+        // it back.
+        if wiring == RcWiring::HonorOptOut && ledger.contains(real.to_string_lossy().as_ref()) {
+            continue;
         }
         let hook_path = home.join(".aterm").join("shell.d").join(hook);
+        // DOUBLE-QUOTED, both interpolations. `sh_quote`'s contract is a double-quoted
+        // context (its doc), and this line was the one place that interpolated it bare:
+        // a HOME with a space — `/Users//Jane Doe`, ordinary on Linux and in custom
+        // setups — word-split the path, so `[` got too many arguments, the hook was
+        // NEVER sourced (the entire purpose of the block), and zsh/bash printed that
+        // error at EVERY interactive shell start. The block is marker-bounded, so a bad
+        // line is never rewritten by a later pass — it has to be born right (2026-09-16
+        // audit; the real-shell test below replays it in bash and zsh).
         let line = if hook.ends_with(".fish") {
-            format!("test -f {p}; and source {p}", p = sh_quote(&hook_path))
+            format!(
+                "test -f \"{p}\"; and source \"{p}\"",
+                p = sh_quote(&hook_path)
+            )
         } else {
-            format!("[ -f {p} ] && . {p}", p = sh_quote(&hook_path))
+            format!("[ -f \"{p}\" ] && . \"{p}\"", p = sh_quote(&hook_path))
         };
         let mut next = existing;
         if !next.is_empty() && !next.ends_with('\n') {
@@ -260,7 +496,8 @@ fn ensure_rc_sources_hooks(home: &Path) {
         }
         next.push_str(&format!(
             "\n{RC_BEGIN}\n\
-             # Puts the ALab toolchain on PATH. Managed by atpkg; delete this block to opt out.\n\
+             # Puts the ALab toolchain on PATH. Managed by atpkg; delete this block to opt\n\
+             # out -- it stays deleted; `aterm pkg repair` puts it back.\n\
              {line}\n\
              {RC_END}\n"
         ));
@@ -284,6 +521,8 @@ fn ensure_rc_sources_hooks(home: &Path) {
             .and_then(|()| fs::rename(&tmp, &real));
         if written.is_err() {
             let _ = fs::remove_file(&tmp);
+        } else {
+            record_rc_wired(home, &real, &mut ledger);
         }
     }
 }
@@ -305,16 +544,17 @@ fn create_rc_temp(tmp: &Path) -> io::Result<fs::File> {
 /// Put `aterm` and `atpkg` in `~/.local/bin` when we are running from an app bundle.
 ///
 /// The rc wiring is [`ensure_rc_sources_hooks`]'s (the marker-bounded block in an
-/// EXISTING `~/.zshrc` / `~/.bashrc` / fish config that sources `shell.d`); this is the
-/// OTHER half of reaching the toolchain from outside aterm: the `aterm <tool>` /
-/// `atpkg run` route. On the DMG install route those two commands did not exist on any
-/// PATH — the binaries live only inside `/Applications/aterm.app/Contents/MacOS`, and
-/// only `tools/install.sh` ever linked them out. So the fallback the docs named was
-/// itself unreachable for anyone who dragged the app to Applications, which README
-/// offers as a first-class option: the ten programs installed, and nothing could reach
-/// them from outside aterm (2026-08-20 round-8 audit). (Until 2026-09-10 this comment
-/// claimed the module "deliberately does NOT write into `~/.zshrc`" — untrue since
-/// the rc wiring landed; `aterm help pkg` said the same and was corrected with it.)
+/// EXISTING `~/.zshrc` / `~/.bashrc` / `~/.bash_profile` / fish config that sources
+/// `shell.d`); this is the OTHER half of reaching the toolchain from outside aterm: the
+/// `aterm <tool>` / `atpkg run` route. On the DMG install route those two commands did
+/// not exist on any PATH — the binaries live only inside
+/// `/Applications/aterm.app/Contents/MacOS`, and only `tools/install.sh` ever linked
+/// them out. So the fallback the docs named was itself unreachable for anyone who
+/// dragged the app to Applications, which README offers as a first-class option: the
+/// ten programs installed, and nothing could reach them from outside aterm (2026-08-20
+/// round-8 audit). (Until 2026-09-10 this comment claimed the module "deliberately does
+/// NOT write into `~/.zshrc`" — untrue since the rc wiring landed; `aterm help pkg`
+/// said the same and was corrected with it.)
 ///
 /// Deliberately narrow: symlinks only, into the same `~/.local/bin` that
 /// `tools/install.sh` uses, and NEVER over anything that is not already ours — a
@@ -459,6 +699,83 @@ mod tests {
     use std::os::unix::fs::PermissionsExt;
     use std::path::PathBuf;
 
+    /// THE CHECKED REMEDY (review, 2026-09-16): `rc_hook_wired` reads the rc itself —
+    /// the marker block, or a hand-written line naming the hook — never a ledger, and
+    /// knows the three shell families and nothing else.
+    #[test]
+    fn rc_hook_wired_reads_the_rc_for_the_shell_family() {
+        let home = std::env::temp_dir().join(format!("atpkg-rcwired-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&home);
+        fs::create_dir_all(home.join(".config/fish")).unwrap();
+        // Nothing wired anywhere: every known shell says so, an unknown one says nothing.
+        assert_eq!(rc_hook_wired(&home, "zsh"), Some((false, "00-atpkg.zsh")));
+        assert_eq!(rc_hook_wired(&home, "bash"), Some((false, "00-atpkg.bash")));
+        assert_eq!(rc_hook_wired(&home, "fish"), Some((false, "00-atpkg.fish")));
+        assert_eq!(rc_hook_wired(&home, "nu"), None);
+        assert_eq!(rc_hook_wired(&home, ""), None);
+        // The marker block in .zshrc: zsh wired, bash still not.
+        fs::write(
+            home.join(".zshrc"),
+            format!("x=1\n{RC_BEGIN}\n. hook\n{RC_END}\n"),
+        )
+        .unwrap();
+        assert_eq!(rc_hook_wired(&home, "zsh"), Some((true, "00-atpkg.zsh")));
+        assert_eq!(rc_hook_wired(&home, "bash"), Some((false, "00-atpkg.bash")));
+        // A hand-written source line (no markers) in the LOGIN rc counts for bash…
+        fs::write(
+            home.join(".bash_profile"),
+            "[ -f ~/.aterm/shell.d/00-atpkg.bash ] && . ~/.aterm/shell.d/00-atpkg.bash\n",
+        )
+        .unwrap();
+        assert_eq!(rc_hook_wired(&home, "bash"), Some((true, "00-atpkg.bash")));
+        // …and an rc that exists but names no hook does not.
+        fs::write(home.join(".config/fish/config.fish"), "set -x FOO 1\n").unwrap();
+        assert_eq!(rc_hook_wired(&home, "fish"), Some((false, "00-atpkg.fish")));
+        let _ = fs::remove_dir_all(&home);
+    }
+
+    /// ONE TABLE FOR THE HOOK NAME (2026-09-16): the four files `write_hooks` lays are
+    /// exactly what `hook_for_shell` names per shell family, and `hook_file` answers only
+    /// for a hook that EXISTS as a regular file — a symlink under `shell.d` is not ours.
+    #[cfg(unix)]
+    #[test]
+    fn hook_for_shell_and_hook_file_read_the_files_write_hooks_lays() {
+        let home = tmp("hookfile");
+        assert_eq!(hook_for_shell("zsh"), Some("00-atpkg.zsh"));
+        assert_eq!(hook_for_shell("bash"), Some("00-atpkg.bash"));
+        // `sh` gets no hook: the bash hook is not POSIX sh (`${var//pat/rep}`), so the
+        // remedy for a `/bin/sh` user is the `PATH` line, never a file sh cannot source.
+        assert_eq!(hook_for_shell("sh"), None);
+        assert_eq!(hook_for_shell("fish"), Some("00-atpkg.fish"));
+        assert_eq!(hook_for_shell("pwsh"), Some("00-atpkg.ps1"));
+        assert_eq!(hook_for_shell("powershell"), Some("00-atpkg.ps1"));
+        assert_eq!(hook_for_shell("nu"), None);
+        // Nothing written: no hook file for any shell.
+        for sh in ["zsh", "bash", "fish", "pwsh", "nu"] {
+            assert_eq!(hook_file(&home, sh), None, "{sh}");
+        }
+        let shell_d = home.join(".aterm/shell.d");
+        fs::create_dir_all(&shell_d).unwrap();
+        let written = write_hooks(&shell_d, Path::new("/p/bin"), Path::new("/p/agents")).unwrap();
+        for sh in ["zsh", "bash", "fish", "pwsh"] {
+            let (path, hook) = hook_file(&home, sh).unwrap_or_else(|| panic!("{sh}"));
+            assert_eq!(path, shell_d.join(hook));
+            assert!(
+                written.contains(&hook.to_string()),
+                "{hook} is a file write_hooks lays"
+            );
+        }
+        assert_eq!(hook_file(&home, "nu"), None);
+        // `sh` never gets the bash hook: its body is not POSIX sh.
+        assert_eq!(hook_file(&home, "sh"), None);
+        // A symlink in the hook's place is not the hook.
+        fs::remove_file(shell_d.join("00-atpkg.zsh")).unwrap();
+        std::os::unix::fs::symlink(shell_d.join("00-atpkg.bash"), shell_d.join("00-atpkg.zsh"))
+            .unwrap();
+        assert_eq!(hook_file(&home, "zsh"), None);
+        let _ = fs::remove_dir_all(&home);
+    }
+
     fn tmp(label: &str) -> PathBuf {
         let d = std::env::temp_dir().join(format!("atpkg-hooks-{label}-{}", std::process::id()));
         let _ = fs::remove_dir_all(&d);
@@ -481,7 +798,7 @@ mod tests {
         // .bashrc deliberately absent: atpkg must not CREATE an rc for a shell the
         // user does not use — a file we invent is a file we own forever.
 
-        ensure_rc_sources_hooks(&home);
+        ensure_rc_sources_hooks(&home, RcWiring::HonorOptOut);
         let once = std::fs::read_to_string(&zshrc).unwrap();
         assert!(
             once.contains(RC_BEGIN) && once.contains(RC_END),
@@ -498,12 +815,223 @@ mod tests {
         assert!(!home.join(".bashrc").exists(), "no rc was invented");
 
         // Idempotent: a second refresh must not stack a second block.
-        ensure_rc_sources_hooks(&home);
+        ensure_rc_sources_hooks(&home, RcWiring::HonorOptOut);
         let twice = std::fs::read_to_string(&zshrc).unwrap();
         assert_eq!(twice, once, "a second pass must be a no-op");
         assert_eq!(twice.matches(RC_BEGIN).count(), 1, "exactly one block");
 
         let _ = std::fs::remove_dir_all(&home);
+    }
+
+    /// THE OPT-OUT THE BLOCK DOCUMENTS ACTUALLY LASTS — and `repair` is the way back.
+    ///
+    /// The block carries the sentence "delete this block to opt out", and until
+    /// 2026-09-16 the only idempotency check was [`RC_BEGIN`] itself: a user who
+    /// deleted the block as instructed got it back on the next pass — an install, a
+    /// seed, `repair`, or the six-hourly background `update`, so within hours — with
+    /// their own edit to their own dotfile silently reverted and a dotfiles repo
+    /// showing the same diff forever (audit finding). [`RC_LEDGER`] records the wiring,
+    /// so a recorded rc that no longer carries the block is read as the opt-out it is.
+    /// The other half is that opting out must not be a trap: the deliberate pass
+    /// ([`refresh_rewiring_rc`], which `atpkg repair` runs) writes it back, and after
+    /// that the block is deletable-for-good again.
+    #[cfg(unix)]
+    #[test]
+    fn a_deleted_rc_block_stays_deleted_and_repair_is_the_way_back() {
+        let home = tmp("rcoptout");
+        let zshrc = home.join(".zshrc");
+        let user = "# pre-existing user content\nexport FOO=1\n";
+        fs::write(&zshrc, user).unwrap();
+
+        ensure_rc_sources_hooks(&home, RcWiring::HonorOptOut);
+        assert!(
+            fs::read_to_string(&zshrc).unwrap().contains(RC_BEGIN),
+            "wired on the first pass, as before"
+        );
+        let real = fs::canonicalize(&zshrc).unwrap();
+        assert!(
+            read_rc_ledger(&home).contains(real.to_string_lossy().as_ref()),
+            "the wiring is recorded: {:?}",
+            read_rc_ledger(&home)
+        );
+        assert_eq!(
+            fs::metadata(rc_ledger_path(&home))
+                .unwrap()
+                .permissions()
+                .mode()
+                & 0o777,
+            0o600,
+            "the ledger is private, like every other file this module writes"
+        );
+
+        // The user does exactly what the block tells them to.
+        fs::write(&zshrc, user).unwrap();
+        for pass in 0..3 {
+            ensure_rc_sources_hooks(&home, RcWiring::HonorOptOut);
+            assert_eq!(
+                fs::read_to_string(&zshrc).unwrap(),
+                user,
+                "pass {pass}: an unattended pass must not undo the user's own edit"
+            );
+        }
+
+        // `atpkg repair` is the pass the user asks for, so it wires the rc again.
+        ensure_rc_sources_hooks(&home, RcWiring::Rewire);
+        assert!(
+            fs::read_to_string(&zshrc).unwrap().contains(RC_BEGIN),
+            "repair puts the block back"
+        );
+
+        // …and the opt-out is still available afterwards.
+        fs::write(&zshrc, user).unwrap();
+        ensure_rc_sources_hooks(&home, RcWiring::HonorOptOut);
+        assert_eq!(
+            fs::read_to_string(&zshrc).unwrap(),
+            user,
+            "a second opt-out is honoured just like the first"
+        );
+
+        let _ = fs::remove_dir_all(&home);
+    }
+
+    /// A machine wired by a build from BEFORE the ledger opts out on its first deletion.
+    ///
+    /// Recording only at the moment of writing would have made every existing install
+    /// spend its first deletion re-learning what it already knew: the block would come
+    /// back once, and only the second deletion would stick. So a pass records an rc it
+    /// finds already wired — it rewrites nothing, it only remembers.
+    #[cfg(unix)]
+    #[test]
+    fn an_rc_wired_before_the_ledger_existed_is_recorded_by_the_next_pass() {
+        let home = tmp("rcpreledger");
+        let bashrc = home.join(".bashrc");
+        let user = "export FOO=1\n";
+        let hook = home.join(".aterm").join("shell.d").join("00-atpkg.bash");
+        let pre = format!(
+            "{user}\n{RC_BEGIN}\n[ -f \"{p}\" ] && . \"{p}\"\n{RC_END}\n",
+            p = hook.display()
+        );
+        fs::write(&bashrc, &pre).unwrap();
+        assert!(
+            !rc_ledger_path(&home).exists(),
+            "the pre-2026-09-16 shape: wired, with nothing recorded"
+        );
+
+        ensure_rc_sources_hooks(&home, RcWiring::HonorOptOut);
+        assert_eq!(
+            fs::read_to_string(&bashrc).unwrap(),
+            pre,
+            "an already-wired rc is still never rewritten"
+        );
+        assert!(
+            rc_ledger_path(&home).is_file(),
+            "the pass records what it found wired"
+        );
+
+        // The FIRST deletion on such a machine is honoured.
+        fs::write(&bashrc, user).unwrap();
+        ensure_rc_sources_hooks(&home, RcWiring::HonorOptOut);
+        assert_eq!(
+            fs::read_to_string(&bashrc).unwrap(),
+            user,
+            "the first deletion sticks on a machine wired by an older build"
+        );
+
+        let _ = fs::remove_dir_all(&home);
+    }
+
+    /// A HOME with a SPACE still gets the toolchain, and no shell prints an error.
+    ///
+    /// The rc line interpolates the hook path through [`sh_quote`], whose contract is a
+    /// DOUBLE-QUOTED context — so the interpolation has to carry the quotes, and until
+    /// 2026-09-16 it did not. With `HOME=/Users//Jane Doe` the line word-split:
+    /// `zsh:[:1: too many arguments`, bash's `[: binary operator expected`, at EVERY
+    /// interactive shell start, and the hook never sourced — which is the whole point of
+    /// the block. Marker-bounded, so no later pass would have repaired it. Replayed in
+    /// the real shells, running the generated line exactly as the user's rc runs it.
+    #[cfg(unix)]
+    #[test]
+    fn rc_wiring_quotes_the_hook_path_so_a_home_with_a_space_still_sources_it() {
+        let root = tmp("rcspace");
+        let home = root.join("Jane Doe");
+        let shell_d = home.join(".aterm").join("shell.d");
+        fs::create_dir_all(&shell_d).unwrap();
+        for (rc, hook) in [
+            (".zshrc", "00-atpkg.zsh"),
+            (".bashrc", "00-atpkg.bash"),
+            (".config/fish/config.fish", "00-atpkg.fish"),
+        ] {
+            let rc_path = home.join(rc);
+            fs::create_dir_all(rc_path.parent().unwrap()).unwrap();
+            fs::write(&rc_path, "# pre-existing user content\n").unwrap();
+            fs::write(shell_d.join(hook), "ATPKG_RC_TEST=sourced\n").unwrap();
+        }
+
+        ensure_rc_sources_hooks(&home, RcWiring::HonorOptOut);
+
+        // The generated source line for one dialect, read from inside the markers.
+        let line_of = |rc: &str| -> String {
+            let body = fs::read_to_string(home.join(rc)).unwrap();
+            let (_, after) = body.split_once(RC_BEGIN).expect("block written");
+            let (block, _) = after.split_once(RC_END).expect("block closed");
+            block
+                .lines()
+                .find(|l| l.contains("00-atpkg."))
+                .unwrap_or_else(|| panic!("{rc}: no source line in the block"))
+                .to_owned()
+        };
+
+        // Presence is decided by the spawn alone (the idiom of the other real-shell
+        // test): only a shell that cannot be started is skipped.
+        for (shell, args, rc) in [
+            ("bash", &["--noprofile", "--norc", "-c"][..], ".bashrc"),
+            ("zsh", &["-f", "-c"][..], ".zshrc"),
+        ] {
+            match std::process::Command::new(shell)
+                .args(args)
+                .arg("true")
+                .output()
+            {
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                    assert_ne!(shell, "bash", "bash must be runnable on a unix host");
+                    continue; // zsh not installed here
+                }
+                Err(error) => panic!("{shell}: cannot start: {error}"),
+                Ok(_) => {}
+            }
+            let line = line_of(rc);
+            let out = std::process::Command::new(shell)
+                .args(args)
+                .arg(format!("{line}\nprintf 'X=%s\\n' \"$ATPKG_RC_TEST\""))
+                // Non-interactive bash sources $BASH_ENV even under --noprofile --norc.
+                .env_remove("BASH_ENV")
+                .output()
+                .unwrap_or_else(|error| panic!("{shell}: spawn: {error}"));
+            let stdout = String::from_utf8_lossy(&out.stdout);
+            let stderr = String::from_utf8_lossy(&out.stderr);
+            assert!(
+                out.status.success() && stderr.is_empty(),
+                "{shell}: a home with a space must not error at shell start: exit {:?}, stderr={stderr:?}, line={line:?}",
+                out.status.code()
+            );
+            assert_eq!(
+                stdout.trim_end(),
+                "X=sourced",
+                "{shell}: the hook must actually be sourced; line={line:?}"
+            );
+        }
+
+        // fish is not installed on every host, so its line is checked as text: BOTH
+        // interpolations quoted (`test -f "..."; and source "..."`).
+        let fish = line_of(".config/fish/config.fish");
+        let fish_quoted = format!("\"{}\"", shell_d.join("00-atpkg.fish").display());
+        assert_eq!(
+            fish.matches(fish_quoted.as_str()).count(),
+            2,
+            "fish: both interpolations must be double-quoted, got {fish:?}"
+        );
+
+        let _ = fs::remove_dir_all(&root);
     }
 
     /// A symlinked rc (GNU stow, yadm/chezmoi symlink mode, home-manager, any dotfiles
@@ -531,7 +1059,7 @@ mod tests {
         fs::write(&fish, "set -x FOO 1\n").unwrap();
         fs::set_permissions(&fish, fs::Permissions::from_mode(0o600)).unwrap();
 
-        ensure_rc_sources_hooks(&home);
+        ensure_rc_sources_hooks(&home, RcWiring::HonorOptOut);
         assert!(
             fs::symlink_metadata(&link)
                 .unwrap()
@@ -566,7 +1094,7 @@ mod tests {
             "a regular 0600 rc must not widen either"
         );
 
-        ensure_rc_sources_hooks(&home);
+        ensure_rc_sources_hooks(&home, RcWiring::HonorOptOut);
         assert_eq!(
             fs::read_to_string(&target)
                 .unwrap()
@@ -576,6 +1104,196 @@ mod tests {
             "exactly one block through the link"
         );
         for dir in [&home, &dot, &fish.parent().unwrap().to_path_buf()] {
+            let strays: Vec<_> = fs::read_dir(dir)
+                .unwrap()
+                .filter_map(Result::ok)
+                .map(|e| e.file_name().to_string_lossy().into_owned())
+                .filter(|n| n.contains("atpkg-") && n.ends_with(".tmp"))
+                .collect();
+            assert!(
+                strays.is_empty(),
+                "temp files left in {}: {strays:?}",
+                dir.display()
+            );
+        }
+        let _ = fs::remove_dir_all(&home);
+    }
+
+    /// THE BASH LOGIN SHELL. Measured 2026-09-15 (macOS `/bin/bash` 3.2.57): a login
+    /// shell — what Terminal.app, iTerm and ssh open — reads `~/.bash_profile` and NOT
+    /// `~/.bashrc`, which only an interactive non-login shell reads. Until this row
+    /// existed a bash-login user had the block in `.bashrc` and no toolchain on PATH in
+    /// any terminal they opened (audit finding). A home with `.bash_profile` gets the
+    /// block, sourcing the SAME `00-atpkg.bash` as `.bashrc`; a home with both gets it
+    /// in both; and `.bashrc` is never invented beside a lone `.bash_profile`.
+    #[cfg(unix)]
+    #[test]
+    fn rc_wiring_reaches_a_bash_login_shell_through_an_existing_bash_profile() {
+        let home = tmp("bashprofile");
+        let profile = home.join(".bash_profile");
+        fs::write(&profile, "# login-only content\nexport FOO=1").unwrap(); // no final newline
+
+        ensure_rc_sources_hooks(&home, RcWiring::HonorOptOut);
+        let wired = fs::read_to_string(&profile).unwrap();
+        assert!(
+            wired.contains(RC_BEGIN) && wired.contains(RC_END),
+            "block written into .bash_profile: {wired}"
+        );
+        assert!(
+            wired.contains(".aterm/shell.d/00-atpkg.bash"),
+            "it sources the bash hook, the same one .bashrc sources: {wired}"
+        );
+        assert!(
+            wired.starts_with("# login-only content\nexport FOO=1\n\n"),
+            "the user's content stays first and gains the newline it lacked: {wired}"
+        );
+        assert!(
+            !home.join(".bashrc").exists(),
+            ".bashrc must not be invented beside a lone .bash_profile"
+        );
+
+        // Both present: both wired, each with exactly one block and the same hook.
+        let bashrc = home.join(".bashrc");
+        fs::write(&bashrc, "export BAR=1\n").unwrap();
+        ensure_rc_sources_hooks(&home, RcWiring::HonorOptOut);
+        for rc in [&profile, &bashrc] {
+            let body = fs::read_to_string(rc).unwrap();
+            assert_eq!(
+                body.matches(RC_BEGIN).count(),
+                1,
+                "exactly one block in {}",
+                rc.display()
+            );
+            assert!(body.contains("00-atpkg.bash"), "{}", rc.display());
+        }
+        let _ = fs::remove_dir_all(&home);
+    }
+
+    /// The never-create rule, for the login rc in particular. A home with only a
+    /// `.bashrc` is the common Linux shape and a legitimate macOS one (a hand-written
+    /// `.bash_profile` that sources `.bashrc` is the usual fix, but its absence is the
+    /// user's to fill): `.bashrc` is wired as before and NO `.bash_profile` appears. A
+    /// home with neither gains no file at all — not an rc, not a temp.
+    #[cfg(unix)]
+    #[test]
+    fn rc_wiring_never_invents_a_bash_profile_or_a_bashrc() {
+        let home = tmp("noinvent");
+        // Neither: the pass must leave an empty home empty.
+        ensure_rc_sources_hooks(&home, RcWiring::HonorOptOut);
+        let after: Vec<_> = fs::read_dir(&home)
+            .unwrap()
+            .filter_map(Result::ok)
+            .map(|e| e.file_name().to_string_lossy().into_owned())
+            .collect();
+        assert!(after.is_empty(), "invented in an empty home: {after:?}");
+
+        // Only `.bashrc`: wired exactly as before this row existed, nothing beside it.
+        let bashrc = home.join(".bashrc");
+        fs::write(&bashrc, "export FOO=1\n").unwrap();
+        ensure_rc_sources_hooks(&home, RcWiring::HonorOptOut);
+        assert!(fs::read_to_string(&bashrc).unwrap().contains(RC_BEGIN));
+        assert!(
+            fs::symlink_metadata(home.join(".bash_profile")).is_err(),
+            "a .bash_profile must never be invented beside a lone .bashrc"
+        );
+        assert!(
+            fs::symlink_metadata(home.join(".profile")).is_err()
+                && fs::symlink_metadata(home.join(".bash_login")).is_err(),
+            "nor any other login rc"
+        );
+        let _ = fs::remove_dir_all(&home);
+    }
+
+    /// A second pass over a wired `.bash_profile` REWRITES NOTHING — not "writes the same
+    /// bytes again": the file keeps its inode (a temp+rename would give it a new one), its
+    /// content and its mode, and leaves no temp behind. The block is found by its
+    /// markers, never by content, so this holds after the hook line itself changes.
+    #[cfg(unix)]
+    #[test]
+    fn rc_wiring_of_bash_profile_is_idempotent_and_a_second_pass_rewrites_nothing() {
+        use std::os::unix::fs::MetadataExt as _;
+        let home = tmp("bashprofile-idem");
+        let profile = home.join(".bash_profile");
+        fs::write(&profile, "export FOO=1\n").unwrap();
+        fs::set_permissions(&profile, fs::Permissions::from_mode(0o600)).unwrap();
+
+        ensure_rc_sources_hooks(&home, RcWiring::HonorOptOut);
+        let once = fs::read_to_string(&profile).unwrap();
+        let meta_once = fs::metadata(&profile).unwrap();
+        assert_eq!(once.matches(RC_BEGIN).count(), 1);
+        assert_eq!(meta_once.permissions().mode() & 0o777, 0o600, "mode kept");
+
+        ensure_rc_sources_hooks(&home, RcWiring::HonorOptOut);
+        let twice = fs::read_to_string(&profile).unwrap();
+        let meta_twice = fs::metadata(&profile).unwrap();
+        assert_eq!(twice, once, "a second pass changes no byte");
+        assert_eq!(twice.matches(RC_BEGIN).count(), 1, "exactly one block");
+        assert_eq!(
+            meta_twice.ino(),
+            meta_once.ino(),
+            "the file was not rewritten: same inode, no temp+rename"
+        );
+        assert_eq!(meta_twice.permissions().mode() & 0o777, 0o600);
+        let strays: Vec<_> = fs::read_dir(&home)
+            .unwrap()
+            .filter_map(Result::ok)
+            .map(|e| e.file_name().to_string_lossy().into_owned())
+            .filter(|n| n.contains("atpkg-") && n.ends_with(".tmp"))
+            .collect();
+        assert!(strays.is_empty(), "temp files left: {strays:?}");
+        let _ = fs::remove_dir_all(&home);
+    }
+
+    /// A symlinked `.bash_profile` (stow, yadm/chezmoi, home-manager) is edited IN PLACE:
+    /// the block lands in the dotfile the link names, the link stays a link, and the
+    /// dotfile keeps its mode — the same guarantee audit K12 (2026-09-12) won for
+    /// `.zshrc`, pinned here for the row added 2026-09-15 so it cannot regress alone.
+    #[cfg(unix)]
+    #[test]
+    fn rc_wiring_writes_through_a_symlinked_bash_profile_and_keeps_it_a_link() {
+        let home = tmp("bashprofile-symlink");
+        let dot = home.join("dotfiles");
+        fs::create_dir_all(&dot).unwrap();
+        let target = dot.join("bash_profile");
+        fs::write(&target, "export FOO=1\n").unwrap();
+        fs::set_permissions(&target, fs::Permissions::from_mode(0o600)).unwrap();
+        let link = home.join(".bash_profile");
+        std::os::unix::fs::symlink(&target, &link).unwrap();
+
+        ensure_rc_sources_hooks(&home, RcWiring::HonorOptOut);
+        assert!(
+            fs::symlink_metadata(&link)
+                .unwrap()
+                .file_type()
+                .is_symlink(),
+            ".bash_profile must stay a symlink"
+        );
+        assert_eq!(
+            fs::read_link(&link).unwrap(),
+            target,
+            "and point where it did"
+        );
+        let through = fs::read_to_string(&target).unwrap();
+        assert!(
+            through.contains(RC_BEGIN) && through.contains("00-atpkg.bash"),
+            "the block lands in the dotfile: {through}"
+        );
+        assert!(through.starts_with("export FOO=1\n"), "{through}");
+        assert_eq!(
+            fs::metadata(&target).unwrap().permissions().mode() & 0o777,
+            0o600,
+            "a 0600 dotfile must not widen"
+        );
+        ensure_rc_sources_hooks(&home, RcWiring::HonorOptOut);
+        assert_eq!(
+            fs::read_to_string(&target)
+                .unwrap()
+                .matches(RC_BEGIN)
+                .count(),
+            1,
+            "exactly one block through the link"
+        );
+        for dir in [&home, &dot] {
             let strays: Vec<_> = fs::read_dir(dir)
                 .unwrap()
                 .filter_map(Result::ok)
@@ -621,7 +1339,7 @@ mod tests {
         fs::write(&bashrc, "export BAR=1\n").unwrap();
         std::os::unix::fs::symlink(&bashrc, home.join(".bashrc")).unwrap();
 
-        ensure_rc_sources_hooks(&home);
+        ensure_rc_sources_hooks(&home, RcWiring::HonorOptOut);
 
         assert_eq!(
             fs::read_to_string(&zshrc).unwrap(),

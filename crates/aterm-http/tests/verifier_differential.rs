@@ -169,6 +169,17 @@
 //!   the `apple` detail column is not, because it was measured on macOS and
 //!   predicting the other platforms' error vocabulary would be inventing
 //!   evidence. See [`the_shipped_verifier_matches_its_recorded_expectations`].
+//! * The `accept` column presumes the RECORDING machine's anchors (m21, Darwin
+//!   25.5, 2026-08-29). One row — `github.com`'s leaf with only the intermediate
+//!   it truly needs — is anchored by Sectigo Public Server Authentication Root
+//!   E46, which macOS 13.7.8's store does not carry (it anchors the USERTrust
+//!   ECC root the withheld cross-sign leads to); measured 2026-09-15 on an
+//!   Intel Mac: ours `UnknownIssuer`, the oracle `-67843` naming E46. Such a
+//!   row is not asserted for equality or for its accept: it is held to what the
+//!   store can decide (both reject, twice the same, and the chain WITH its
+//!   cross-sign accepts on both) and printed as a `SKIP`, the way the anchor
+//!   probe below already skips a chain this machine cannot validate. Whether
+//!   the recording machine's engine fetched E46 over AIA is not measured.
 
 use std::sync::Arc;
 use std::time::Duration;
@@ -762,6 +773,37 @@ fn pair() -> Option<(PlatformVerifier, rustls_platform_verifier::Verifier)> {
 // THE DIFFERENTIAL
 // ---------------------------------------------------------------------------
 
+/// `errSecNotTrusted`: the platform's own word for "the chain ends at a root
+/// this store does not anchor".
+const ERR_SEC_NOT_TRUSTED: i64 = -67843;
+
+/// The recorded-ACCEPT case whose chain is `case`'s plus the intermediates a
+/// server withholds — the same leaf, the same name and instant, a longer chain
+/// that starts with `case`'s. `None` when `case` has no such twin (every
+/// rejection row, and the full chains themselves).
+fn superset_twin(case: &Case) -> Option<&'static Case> {
+    REAL.iter().find(|twin| {
+        twin.accept
+            && twin.server == case.server
+            && twin.now == case.now
+            && twin.chain.len() > case.chain.len()
+            && twin.chain.starts_with(case.chain)
+    })
+}
+
+/// Whether `want` — the ORACLE's verdict on a recorded-ACCEPT `case` — says the
+/// platform cannot anchor its root here (see the header's last bullet). Only
+/// the oracle's own `errSecNotTrusted` counts, never a guess about the store;
+/// and only when the chain with its cross-sign exists in the corpus to be
+/// asserted instead, which is returned. Nothing about the tree, our verifier
+/// or the case changes the answer: a verifier of ours that started rejecting
+/// this chain on its own leaves the oracle accepting and the row red.
+fn root_absent_from_this_store(case: &Case, want: &Outcome) -> Option<&'static Case> {
+    (case.accept && want.status() == Some(ERR_SEC_NOT_TRUSTED))
+        .then(|| superset_twin(case))
+        .flatten()
+}
+
 #[test]
 fn the_shipped_verifier_and_the_incumbent_reach_the_same_verdict_on_every_case() {
     // Not "both are Err". The SAME verdict: the same accept/reject, the same
@@ -776,6 +818,35 @@ fn the_shipped_verifier_and_the_incumbent_reach_the_same_verdict_on_every_case()
     for case in corpus() {
         let got = case.run(&mine);
         let want = case.run(&oracle);
+        if let Some(twin) = root_absent_from_this_store(case, &want) {
+            // The same SKIP the anchor probe below takes: equality is demanded
+            // on every other row, and this row is held to what this store CAN
+            // decide — both reject, deterministically, and the same bytes with
+            // the cross-sign present accept on both.
+            eprintln!(
+                "SKIP (equality only): {}: this trust store does not anchor the root the \
+                 oracle named; mine={got:?} oracle={want:?}",
+                case.what
+            );
+            assert!(
+                !got.accepted() && !want.accepted(),
+                "{}: with the root absent both sides must reject: mine={got:?} oracle={want:?}",
+                case.what
+            );
+            assert_eq!(
+                case.run(&mine),
+                got,
+                "{}: our verdict must not change between two runs",
+                case.what
+            );
+            assert!(
+                twin.run(&mine).accepted() && twin.run(&oracle).accepted(),
+                "{}: the same chain with its cross-sign ({}) must accept on both sides",
+                case.what,
+                twin.what
+            );
+            continue;
+        }
         if got != want {
             disagreements.push(format!(
                 "{}\n      mine={got:?}\n    oracle={want:?}",
@@ -817,6 +888,24 @@ fn the_shipped_verifier_matches_its_recorded_expectations() {
     for case in corpus() {
         let got = case.run(&mine);
         if got.accepted() != case.accept {
+            // A recorded ACCEPT that this machine's store cannot anchor: our
+            // verifier said exactly `UnknownIssuer`, and the same leaf with its
+            // cross-sign present DOES accept here. No oracle is consulted — this
+            // test is independent of it on purpose — the twin is what says the
+            // store, not the verifier, is what differs. A reject-everything
+            // verifier still dies on the twin.
+            if case.accept
+                && got == Outcome::UnknownIssuer
+                && let Some(twin) = superset_twin(case)
+                && twin.run(&mine).accepted()
+            {
+                eprintln!(
+                    "SKIP (accept column): {}: this trust store does not anchor the root the \
+                     recording machine's did; the chain with its cross-sign ({}) accepts",
+                    case.what, twin.what
+                );
+                continue;
+            }
             wrong.push(format!(
                 "{}: accept={} but expected accept={}  ({got:?})",
                 case.what,

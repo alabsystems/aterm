@@ -8308,9 +8308,13 @@ mod tests {
         // The cat's own category (2026-08-10): the companion picker, the rainbow
         // wake dial, and the sprite art moved off "Trail effect"/"Trail color"
         // into three boxes that belong to the KITTY rather than the trail engine.
+        // "Rainbow wake" went with its dial (retired 2026-09-16); of the two
+        // left, "Companion" is the showcase card and "Kitty art" is Manual-only,
+        // so this page paints no ordinary group box
+        // (`native_settings::the_cursor_kitty_page_is_its_showcase_card`).
         assert_eq!(
             caps(prefs::Section::CursorKitty),
-            ["Companion", "Rainbow wake", "Kitty art"]
+            ["Companion", "Kitty art"]
         );
         assert_eq!(
             caps(prefs::Section::Typography),

@@ -98,8 +98,9 @@ fn foundation_invokes_an_arity_two_block() {
     // materialising it as a Rust `bool` is undefined behaviour rather than a
     // wrong answer. The `Encode` bound this pass put on `RcBlock::newN` is what
     // refuses `*mut bool`; `*mut Bool` is the only spelling that compiles, and
-    // its encoding is `^B` on arm64 and `*` on x86_64 (measured; `BOOL *` IS
-    // `char *` there).
+    // its encoding is `^B` on arm64 and `^c` on x86_64 (measured against
+    // Foundation's own compiled signatures: clang encodes the `BOOL` typedef,
+    // never the `char *` it aliases — see `BOOL_PTR_ENCODING`).
     // SAFETY: the prototype below is exactly what AppKit documents for
     // `enumerateLinesUsingBlock:`.
     let block = unsafe {

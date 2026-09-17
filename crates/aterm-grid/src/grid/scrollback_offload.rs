@@ -49,7 +49,11 @@
 //! kept via `scrollback_detached_for_reflow` (staged to the lazy buffer, flushed on
 //! re-attach); a scrollback erase during the window is honored via
 //! `scrollback_clear_gen` (the stale store is dropped, not resurrected); and the
-//! reader's scroll position is carried through `prev_offset`. One ACCEPTED
+//! reader's scroll position is carried through `prev_offset`, restored unless the
+//! `detach_live_bottom_gen` baseline shows the READER themselves brought the viewport
+//! down to the live bottom during the window (without that baseline the detach's own
+//! clamp reads as the reader's choice, and every width change threw a scrolled-back
+//! reader at the prompt). One ACCEPTED
 //! TRANSIENT remains: a concurrent control-socket reader (`search`/`text`/`lines`)
 //! during the window sees only the ring, not the detached tiered history, so it can
 //! momentarily report not-found for text that is in off-screen scrollback. It
@@ -108,6 +112,14 @@ pub struct PendingScrollbackReflow {
     new_cols: u16,
     /// The reader's scroll position at detach, restored on re-attach (audit bug D).
     prev_offset: usize,
+    /// `GridStorage::reader_live_bottom_gen` sampled at detach — the baseline that
+    /// lets the re-attach ask "did the READER bring the viewport down to live while
+    /// this job was out?" and get an answer no reading of `display_offset` can give
+    /// (audit #7): the detach's own clamp, a retention clamp, a rows-only resize's
+    /// re-anchor, an output batch's pin dance and the reader's End all write the same
+    /// 0 to the same field. A generation separates them by provenance — only
+    /// reader-facing primitives advance it, and only on a real descent.
+    detach_live_bottom_gen: u64,
     /// The scrollback-erase generation at detach; if it advanced by re-attach an
     /// erase happened during the window and the reflowed store is dropped (bug C).
     /// Captured once PER JOB at detach — stepping never re-samples it, so a
@@ -242,6 +254,10 @@ pub struct ReflowedScrollback {
     ring_out: Vec<Line>,
     new_cols: u16,
     prev_offset: usize,
+    /// See [`PendingScrollbackReflow::detach_live_bottom_gen`] — carried through the
+    /// rewrap unchanged, so every chunked schedule re-attaches on the same
+    /// baseline the one-shot does.
+    detach_live_bottom_gen: u64,
     clear_gen: u64,
 }
 
@@ -505,6 +521,7 @@ impl PendingScrollbackReflow {
                         ring_out,
                         new_cols: self.new_cols,
                         prev_offset: self.prev_offset,
+                        detach_live_bottom_gen: self.detach_live_bottom_gen,
                         clear_gen: self.clear_gen,
                     })
                 } else {
@@ -658,6 +675,17 @@ impl Grid {
         // NOTHING — the synchronous cost is the visible-grid reflow,
         // O(viewport), the budget the bounded-cost obligation checks.
         self.resize(new_rows, new_cols);
+        // This window's reader-descent baseline. The resize above just clamped
+        // `display_offset` to `prev_offset.min(scrollback_lines())` with all three
+        // history layers already in this job, so the VALUE it left is worthless as a
+        // baseline — measured, 0 on every widen and on short-line content in either
+        // direction, whatever the reader had been doing. The generation is not:
+        // machine motion (that clamp included) leaves it alone, so any advance seen
+        // at re-attach is the reader's own hand on the viewport. Sampled AFTER the
+        // resize so the resize's own clamp sits inside the baseline rather than being
+        // counted against it. Read the guard in `reattach_reflowed_scrollback` for
+        // what it buys.
+        let detach_live_bottom_gen = self.storage.reader_live_bottom_gen;
 
         // Enter the reflow window AFTER resize (so the resize itself runs exactly as
         // the plain path): from here until re-attach, scroll-off keeps being staged
@@ -672,6 +700,7 @@ impl Grid {
             ring_lines,
             new_cols,
             prev_offset,
+            detach_live_bottom_gen,
             clear_gen,
             phase,
             lifted_limits: None,
@@ -761,10 +790,57 @@ impl Grid {
         // Audit bug D: restore the reader's pre-detach scroll position clamped to the
         // regrown full history (the synchronous resize had clamped it to the ring-only
         // count while the store was detached). EXCEPT when the reader followed output
-        // to the live bottom during the window (display_offset collapsed to 0, e.g.
+        // to the live bottom during the window (display_offset DESCENDED to 0, e.g.
         // pressed End to watch streaming output) — honor that instead of yanking the
         // viewport back up to the stale deep position (audit #7).
-        if !(self.storage.display_offset == 0 && reflowed.prev_offset > 0) {
+        //
+        // "The READER did it" is the whole law, and no reading of `display_offset`
+        // can establish it. This guard used to take a bare `display_offset == 0` as
+        // the reader's choice, but the detach lifts ALL THREE history layers into the
+        // job before the synchronous resize runs, so that resize clamps the reader
+        // against an EMPTY history: measured, a reader 150 rows up in a 300-line log
+        // went to 0 on an 80->100 widen (pixels: ROW0128 on the top row before, the
+        // live `$` prompt after), and with ordinary short lines — which rewrap into
+        // nothing at either width — every width change did it, in both directions.
+        // The guard read that self-inflicted 0 as "the reader pressed End" and
+        // skipped the restore, so the commonest gesture on this surface (scroll back,
+        // widen to see the long lines) silently lost the reader's place with no undo.
+        //
+        // No VALUE can fix that, because the 0 the detach writes and the 0 the reader
+        // chooses are the same 0. Measured on all four axes, `display_offset` sampled
+        // at the detach is 0 on every widen and on short-line content in either
+        // direction, which would leave the exception unable to fire AT ALL for most
+        // real sessions. And a high-water of the offset taken DURING the window fails
+        // the other way: it counts the machine's own raises — SCR-1's per-batch repin,
+        // a rows-only resize re-anchoring the viewport — as "somewhere to descend
+        // from", so the machine could manufacture the reader's consent.
+        //
+        // The window has to be OBSERVED, and observed by PROVENANCE.
+        // `reader_live_bottom_gen` advances on exactly one event: a reader-facing
+        // scroll primitive taking `display_offset` from non-zero to zero. Nothing the
+        // machine does advances it — each machine path has its own non-bumping entry
+        // (see the field's doc). So a generation that moved while this job was out is
+        // the reader's hand on the wheel and nothing else's, and it sees the case a
+        // detach-time baseline is blind to: a reader who scrolls up over the output
+        // that STREAMED IN during the window and then presses End, descending from a
+        // position that did not exist at the detach (measured against a detach-time
+        // baseline: that reader was yanked 150 rows back up into history).
+        //
+        // Accepted residual, now for the stated reason rather than by coincidence:
+        // where the detach had already pinned the viewport to the live bottom, an End
+        // press moves nothing, so it records nothing and the restore wins. That is the
+        // right default — the 0 such a reader would be "confirming" is one the resize
+        // inflicted on them, not one they chose.
+        //
+        // Still offset-identity, not line-identity: `prev_offset` is a distance from
+        // the live bottom, so when output arrived during the window the restored
+        // viewport lands that many rows above the NEW bottom, not on the line the
+        // reader left. Unchanged by this fix and strictly better than the snap it
+        // replaces; a width reflow has no pre→post absolute-row map to do better with
+        // (see `reflow.rs`'s note on the missing anchor).
+        let reader_descended_to_live =
+            self.storage.reader_live_bottom_gen != reflowed.detach_live_bottom_gen;
+        if !(reader_descended_to_live && self.storage.display_offset == 0) {
             self.storage.display_offset = reflowed.prev_offset.min(sb);
         }
         self.storage.damage = Damage::Full;
@@ -833,6 +909,21 @@ impl Grid {
             .scrollback
             .take()
             .expect("scrollback.is_none() early-returned above");
+        // The first detach gets this for free from the synchronous resize's own
+        // clamp; this one has no resize behind it, so it must clamp for itself.
+        // Draining the lazy buffer and taking the store above removed history from
+        // UNDER `display_offset` — and the re-attach that just ran restored the
+        // reader to their full-history depth, which the ring alone cannot honor. Left
+        // unclamped the viewport spends the whole converging window addressing
+        // history that is out with the worker (blank rows, and a broken
+        // `display_offset <= scrollback_lines()`). `prev_offset` above was captured
+        // BEFORE the clamp, so the reader's real depth still rides the job home.
+        self.clamp_display_offset();
+        // This window's own gesture baseline, sampled exactly as the first detach
+        // samples its own. The clamp above is machine motion and does not advance
+        // the generation, so either side of it would read the same; it is taken here
+        // to keep the two detach sites the same shape.
+        let detach_live_bottom_gen = self.storage.reader_live_bottom_gen;
         self.storage.scrollback_detached_for_reflow = true;
         self.storage.pending_scrollback_settings = Some(pending_settings);
         let phase = ReflowPhase::start(&store);
@@ -842,6 +933,7 @@ impl Grid {
             ring_lines: Vec::new(),
             new_cols: self.storage.cols,
             prev_offset,
+            detach_live_bottom_gen,
             clear_gen,
             phase,
             lifted_limits: None,
@@ -1001,6 +1093,12 @@ impl Grid {
             // the lazy buffer's window output can no longer be tiered — discard
             // it (bounded) rather than leave it un-drainable.
             self.storage.lazy_buffer.clear();
+            // Third site of the one law the re-attach guard states: history just
+            // went away under `display_offset`, so re-clamp. A reader who scrolled
+            // up during the window was clamped against a total that COUNTED those
+            // staged lines (`scrollback_lines()` sums ring + lazy + tiered); the
+            // clear leaves them addressing rows no layer holds any more.
+            self.clamp_display_offset();
 
             // A LOWER requested total still tightens the surviving ring. Never
             // expand this emergency fallback for a higher/unlimited request:

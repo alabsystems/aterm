@@ -92,11 +92,12 @@ pub(crate) fn headless_arming(flag: bool, env: Option<&str>) -> HeadlessArming {
 /// The `--help` text. A clean OPTIONS section where every user-facing flag shows
 /// its argument, a one-line description, AND its `[env: ATERM_*]` equivalent, plus
 /// an ENVIRONMENT section — the discoverable surface an AI (or human) reads to
-/// drive aterm without source-diving. Kept as a single `concat!` so a no-arg /
-/// Finder launch never touches it. Each ATERM_* knob enumerated below also has a
-/// first-class flag (precedence: flag > env > config > default).
+/// drive aterm without source-diving. Kept in constants printed only by the
+/// `--help` arm, so a no-arg / Finder launch never touches them. Each ATERM_* knob
+/// enumerated below also has a first-class flag (precedence: flag > env > config > default).
+const HELP_TITLE: &str = "aterm-gui — a fast, hardened terminal\n";
 const HELP_HEAD: &str = concat!(
-    "aterm-gui — a fast, hardened terminal\n\n",
+    "\n",
     "USAGE:\n",
     "    aterm-gui [OPTIONS]\n",
     "    aterm-gui [-d <dir>] -e <command> [args...]\n\n",
@@ -444,8 +445,6 @@ const STARTER_CONFIG: &str = "\
 # cursor_trail_length = 24             # max comet length in cells (1..=512)
 # cursor_trail_intensity = 1.0         # aurora brightness 0.0..=1.0
 # cursor_trail_radius = 0.6            # bloom-crown radius in cells (0.0..=2.0)
-# cursor_trail_wake_ms = 300           # PARSED BUT INERT since 2026-09-06 (the retired v1
-#                                      # rainbow-kitty wake dial; kept loading, 0..=1500)
 # cursor_trail_ring = true             # expanding landing \"ping\" ring on a jump (default ON)
 # --- sound (Settings > Cursor & Motion > Sound) -------------------------------
 # trail_sounds = true              # macOS-only trail-style audio (parsed but inert elsewhere); silent whenever the trail is (default ON)
@@ -705,7 +704,13 @@ pub(crate) fn parse_cli(argv: Vec<std::ffi::OsString>) -> Cli {
     while let Some(arg) = args.next() {
         match arg.as_str() {
             "-h" | "--help" => {
-                print!("{HELP_HEAD}{}{HELP_TAIL}", keys_help());
+                // Title, then the origin line (`by Andrew Yates · ALab ·
+                // alab.systems`), then the body.
+                print!(
+                    "{HELP_TITLE}{}\n{HELP_HEAD}{}{HELP_TAIL}",
+                    aterm_types::identity::ORIGIN_LINE,
+                    keys_help()
+                );
                 // Windows-only verbs, printed here rather than folded into the
                 // cross-platform HELP_TAIL so no Unix build advertises a flag it
                 // does not have. `--unset-default-terminal` in particular is the
@@ -1623,8 +1628,8 @@ mod tests {
         keys.dedup();
         assert_eq!(
             keys.len(),
-            161,
-            "the starter config's key count moved — update the `161 keys` line in \
+            160,
+            "the starter config's key count moved — update the `160 keys` line in \
              `aterm help config` (crates/aterm-cli/src/manual.rs, CONFIG_PAGE) and \
              this number together"
         );

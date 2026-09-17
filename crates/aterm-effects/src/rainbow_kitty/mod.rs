@@ -5056,9 +5056,12 @@ mod tests {
             eng.field_at(3, 1).is_none(),
             "no neighbour cell before the run"
         );
-        // The witness sees `abc`, then sees the `b` overwritten.
+        // The witness sees `abc`, then sees the `c` overwritten — the run's
+        // last recorded cell, a suffix of one: a change strictly INSIDE a
+        // standing run is not evidence (`Witness::shape_verdicts`, 2026-09-16)
+        // and the accounting this test pins needs a verdict that stands.
         let abc: Vec<char> = "  abc".chars().collect();
-        let axc: Vec<char> = "  aXc".chars().collect();
+        let axc: Vec<char> = "  abX".chars().collect();
         let seen_abc = [RowSample { row: 3, cols: &abc }];
         let seen_axc = [RowSample { row: 3, cols: &axc }];
         assert_eq!(
@@ -5075,7 +5078,7 @@ mod tests {
         assert_eq!(
             eng.witness_rows(&seen_axc, fired),
             1,
-            "b -> X retires the `b` cell"
+            "c -> X retires the `c` cell"
         );
         assert_eq!(eng.status().retired, 1);
         let leaving = |eng: &Engine| -> Vec<u16> {
@@ -5091,8 +5094,8 @@ mod tests {
         };
         assert_eq!(
             leaving(&eng),
-            vec![3],
-            "`b` is on the melt; `a` and `c` stand"
+            vec![4],
+            "`c` is on the melt; `a` and `b` stand"
         );
         // A press whose echo the seam refused, then the licensed echo of
         // the next key: the ledger pays the hole at (3, 5) — a FRESH cell
@@ -5118,7 +5121,7 @@ mod tests {
         assert!(eng.field_at(3, 5).is_some() && eng.field_at(3, 6).is_some());
         assert_eq!(
             leaving(&eng),
-            vec![3],
+            vec![4],
             "the payout did not revive the retired cell"
         );
         // Past the melt the retired cells are gone; the rest stand.
@@ -5128,12 +5131,14 @@ mod tests {
             "the melt ended: nothing is leaving"
         );
         assert!(
-            eng.field_at(3, 3).is_none(),
+            eng.field_at(3, 4).is_none(),
             "…and the retired cell is out of the pool"
         );
         assert!(
-            eng.field_at(3, 2).is_some() && eng.field_at(3, 5).is_some(),
-            "…while `a` and the paid cell stand"
+            eng.field_at(3, 2).is_some()
+                && eng.field_at(3, 3).is_some()
+                && eng.field_at(3, 5).is_some(),
+            "…while `a`, `b` and the paid cell stand"
         );
         // The tally survives a reset; the records do not.
         eng.reset();
@@ -7244,7 +7249,6 @@ mod tests {
             beam: false,
             head_dx: 0.5,
             pack: None,
-            wake_persist_s: 0.0,
             ribbon_tall: false,
             ribbon_flat: false,
         };

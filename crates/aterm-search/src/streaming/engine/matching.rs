@@ -6,8 +6,38 @@ use super::super::types::{FilterMode, StreamingMatch};
 use super::StreamingSearch;
 #[cfg(kani)]
 use crate::grapheme::map_lower_byte_to_original;
-use crate::grapheme::{ColumnMap, LowerByteMap};
+use crate::grapheme::{ColumnMap, LowerByteMap, LowerNeed, lower_fold, lower_need};
 use std::borrow::Cow;
+
+/// Per-row coordinate scratch, populated only after the first substring hit.
+/// Most rows in a history search miss; they need neither grapheme traversal
+/// nor an allocated offset map. ASCII lowercasing preserves every byte offset,
+/// including control characters (whose display width still uses `ColumnMap`).
+struct MatchColumns<'a> {
+    text: &'a str,
+    lowered: bool,
+    maps: Option<(ColumnMap, Option<LowerByteMap>)>,
+}
+
+impl<'a> MatchColumns<'a> {
+    fn new(text: &'a str, lowered: bool) -> Self {
+        Self {
+            text,
+            lowered,
+            maps: None,
+        }
+    }
+
+    fn resolve(&mut self, abs_pos: usize, match_len: usize) -> (usize, usize) {
+        let (col_map, lower_map) = self.maps.get_or_insert_with(|| {
+            (
+                ColumnMap::new(self.text),
+                (self.lowered && !self.text.is_ascii()).then(|| LowerByteMap::new(self.text)),
+            )
+        });
+        resolve_columns(col_map, lower_map.as_ref(), abs_pos, match_len)
+    }
+}
 
 /// Resolve column positions for a match using precomputed maps.
 /// O(log G) + O(log C) per call instead of O(G) + O(C) (#5672).
@@ -37,8 +67,7 @@ fn literal_find_matches(
     search_text: &str,
     search_pattern: &str,
     row: usize,
-    col_map: &ColumnMap,
-    lower_map: Option<&LowerByteMap>,
+    columns: &mut MatchColumns<'_>,
 ) -> Vec<StreamingMatch> {
     let mut matches = Vec::new();
     let match_len = search_pattern.len();
@@ -54,7 +83,7 @@ fn literal_find_matches(
         let Some(abs_pos) = start.checked_add(pos) else {
             break;
         };
-        let (start_col, end_col) = resolve_columns(col_map, lower_map, abs_pos, match_len);
+        let (start_col, end_col) = columns.resolve(abs_pos, match_len);
         let m = StreamingMatch::new(row, start_col, end_col);
         // Filter zero-display-width matches (combining marks that are
         // non-empty in bytes but map to the same column). See INV-SEARCH-2c.
@@ -79,10 +108,7 @@ impl StreamingSearch {
         if self.config.case_sensitive {
             (Cow::Borrowed(text), Cow::Borrowed(&self.pattern))
         } else {
-            (
-                Cow::Owned(text.to_lowercase()),
-                Cow::Owned(self.pattern.to_lowercase()),
-            )
+            (case_fold(text), case_fold(&self.pattern))
         }
     }
 
@@ -92,16 +118,14 @@ impl StreamingSearch {
         text: &str,
         search_text: &str,
         search_pattern: &str,
-        col_map: &ColumnMap,
     ) -> Vec<StreamingMatch> {
-        let lower_map = (!self.config.case_sensitive).then(|| LowerByteMap::new(text));
+        let mut columns = MatchColumns::new(text, !self.config.case_sensitive);
 
         #[cfg(kani)]
         {
             let mut matches = Vec::new();
             for abs_pos in find_overlapping_substring_positions(search_text, search_pattern) {
-                let (start_col, end_col) =
-                    resolve_columns(col_map, lower_map.as_ref(), abs_pos, search_pattern.len());
+                let (start_col, end_col) = columns.resolve(abs_pos, search_pattern.len());
                 let m = StreamingMatch::new(row, start_col, end_col);
                 // Filter zero-display-width matches (INV-SEARCH-2c).
                 if m.match_len > 0 {
@@ -112,13 +136,7 @@ impl StreamingSearch {
         }
 
         #[cfg(not(kani))]
-        literal_find_matches(
-            search_text,
-            search_pattern,
-            row,
-            col_map,
-            lower_map.as_ref(),
-        )
+        literal_find_matches(search_text, search_pattern, row, &mut columns)
     }
 
     fn fuzzy_matches_in_row(
@@ -126,7 +144,6 @@ impl StreamingSearch {
         text: &str,
         search_text: &str,
         search_pattern: &str,
-        col_map: &ColumnMap,
     ) -> Vec<StreamingMatch> {
         // push instead of `vec![..]`: the macro's boxed-slice expansion
         // (Box::new_uninit) trips the L0 gate's hardened-unsafe boundary
@@ -134,6 +151,7 @@ impl StreamingSearch {
         // Identical single-element (or empty) result.
         let mut matches = Vec::new();
         if Self::fuzzy_match(search_text, search_pattern) {
+            let col_map = ColumnMap::new(text);
             let end_col = col_map.byte_to_column(text.len());
             matches.push(StreamingMatch::new(row, 0, end_col));
         }
@@ -150,10 +168,6 @@ impl StreamingSearch {
             return Vec::new();
         }
 
-        // Build the grapheme→column map once per line so every match resolves
-        // columns in O(log G) instead of rescanning graphemes (#5672).
-        let col_map = ColumnMap::new(text);
-
         match self.filter_mode {
             FilterMode::Literal => {
                 let (search_text, search_pattern) = self.prepare_case_folded_inputs(text);
@@ -162,17 +176,17 @@ impl StreamingSearch {
                     text,
                     search_text.as_ref(),
                     search_pattern.as_ref(),
-                    &col_map,
                 )
             }
             FilterMode::Regex => {
                 #[cfg(feature = "regex")]
                 if let Some(ref re) = self.compiled_regex {
+                    let mut columns = MatchColumns::new(text, false);
                     re.find_iter(text)
                         .filter(|cap| cap.start() != cap.end())
                         .map(|cap| {
-                            let start_col = col_map.byte_to_column(cap.start());
-                            let end_col = col_map.byte_to_column(cap.end());
+                            let (start_col, end_col) =
+                                columns.resolve(cap.start(), cap.end() - cap.start());
                             StreamingMatch::new(row, start_col, end_col)
                         })
                         // Filter zero-display-width matches (e.g., combining marks
@@ -191,13 +205,12 @@ impl StreamingSearch {
                         text,
                         search_text.as_ref(),
                         search_pattern.as_ref(),
-                        &col_map,
                     )
                 }
             }
             FilterMode::Fuzzy => {
                 let (search_text, search_pattern) = self.prepare_case_folded_inputs(text);
-                Self::fuzzy_matches_in_row(row, text, &search_text, &search_pattern, &col_map)
+                Self::fuzzy_matches_in_row(row, text, &search_text, &search_pattern)
             }
         }
     }
@@ -215,6 +228,17 @@ impl StreamingSearch {
             }
         }
         true
+    }
+}
+
+/// Keep identity ASCII folds borrowed and use the index's canonical Unicode
+/// fold. Contextual `str::to_lowercase` turns word-final Σ into ς, which made
+/// the streaming UI disagree with indexed searches for σ.
+fn case_fold(text: &str) -> Cow<'_, str> {
+    match lower_need(text) {
+        LowerNeed::None => Cow::Borrowed(text),
+        LowerNeed::Ascii => Cow::Owned(text.to_ascii_lowercase()),
+        LowerNeed::Unicode => Cow::Owned(lower_fold(text)),
     }
 }
 
@@ -418,6 +442,7 @@ mod kani_proofs {
 mod tests {
     use super::super::super::types::{FilterMode, SearchState, StreamingSearchConfig};
     use super::super::StreamingSearch;
+    use super::{MatchColumns, literal_find_matches};
 
     /// Helper: create engine with literal mode and given case sensitivity.
     fn engine_literal(case_sensitive: bool) -> StreamingSearch {
@@ -438,6 +463,103 @@ mod tests {
             .iter()
             .map(|m| (m.start_col, m.end_col))
             .collect()
+    }
+
+    #[test]
+    fn unmatched_rows_do_not_build_coordinate_maps() {
+        let text = "日本語 Kelvin e\u{0301} 😀";
+        let mut columns = MatchColumns::new(text, true);
+        assert!(literal_find_matches(&text.to_lowercase(), "absent", 0, &mut columns).is_empty());
+        assert!(columns.maps.is_none());
+
+        assert_eq!(
+            literal_find_matches(&text.to_lowercase(), "kelvin", 0, &mut columns).len(),
+            1
+        );
+        assert!(columns.maps.is_some());
+    }
+
+    #[test]
+    fn ascii_lowercase_offsets_need_no_map_but_controls_keep_display_columns() {
+        let text = "\tHeLLo\r hello";
+        let mut columns = MatchColumns::new(text, true);
+        let matches = literal_find_matches(&text.to_lowercase(), "hello", 0, &mut columns);
+        assert_eq!(matches.len(), 2);
+        let (_, lower_map) = columns.maps.as_ref().expect("matching row has columns");
+        assert!(lower_map.is_none());
+        for (m, offset) in matches.iter().zip([1, 8]) {
+            assert_eq!(m.start_col, crate::grapheme::byte_to_column(text, offset));
+            assert_eq!(m.end_col, crate::grapheme::byte_to_column(text, offset + 5));
+        }
+    }
+
+    #[test]
+    fn lazy_coordinate_maps_match_reference_for_overlaps_and_unicode() {
+        use crate::grapheme::{byte_to_column, lower_fold, map_lower_byte_to_original};
+
+        for text in [
+            "aAaAa\tAA",
+            "日本語 Kelvin İSTANBUL e\u{0301} 😀😀",
+            "ΟΣ Σσς éÉ",
+            "",
+        ] {
+            for pattern in ["aa", "AA", "日", "k", "i", "\u{0301}", "😀", "σ", "absent"] {
+                for case_sensitive in [true, false] {
+                    let mut engine = engine_literal(case_sensitive);
+                    engine.start_search(pattern, FilterMode::Literal).unwrap();
+                    let haystack = if case_sensitive {
+                        text.to_owned()
+                    } else {
+                        lower_fold(text)
+                    };
+                    let needle = if case_sensitive {
+                        pattern.to_owned()
+                    } else {
+                        lower_fold(pattern)
+                    };
+                    let mut expected = Vec::new();
+                    for (offset, _) in haystack.char_indices() {
+                        if !haystack[offset..].starts_with(&needle) {
+                            continue;
+                        }
+                        let original = |offset| {
+                            if case_sensitive {
+                                offset
+                            } else {
+                                map_lower_byte_to_original(text, offset)
+                            }
+                        };
+                        let start = byte_to_column(text, original(offset));
+                        let end = byte_to_column(text, original(offset + needle.len()));
+                        if end > start {
+                            expected.push((start, end));
+                        }
+                    }
+                    let actual: Vec<_> = engine
+                        .find_matches_in_row(0, text)
+                        .iter()
+                        .map(|m| (m.start_col, m.end_col))
+                        .collect();
+                    assert_eq!(
+                        actual, expected,
+                        "text={text:?}, pattern={pattern:?}, sensitive={case_sensitive}"
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn streaming_sigma_matches_all_forms_at_original_display_columns() {
+        // The CJK prefix makes byte offsets different from display columns.
+        for pattern in ["Σ", "σ", "ς"] {
+            assert_eq!(
+                find_in_row(pattern, "日ΟΣ Σσς", false),
+                vec![(3, 4), (5, 6), (6, 7), (7, 8)],
+                "pattern={pattern}"
+            );
+        }
+        assert_eq!(find_in_row("σ", "日ΟΣ Σσς", true), vec![(6, 7)]);
     }
 
     // ====================================================================

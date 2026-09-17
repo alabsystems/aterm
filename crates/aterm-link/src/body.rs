@@ -5,8 +5,8 @@
 //! followed by `len=<n>` raw bytes.
 //!
 //! ```text
-//! v=1 t=<ms> [from=<sid>] [re=<offset>] [dl=<ms>] [epoch=<hex32>] [gen=<seq>:<fp16>]
-//!            [via=<p>[,<p>…]] [text=<pct>] [len=<n>]
+//! v=1 t=<ms> [from=<sid>] [re=<offset>] [dl=<ms>] [verdict=<handled|refused|deferred>]
+//!            [epoch=<hex32>] [gen=<seq>:<fp16>] [via=<p>[,<p>…]] [text=<pct>] [len=<n>]
 //! ["\n" ‖ <n> raw bytes]
 //! ```
 //!
@@ -41,6 +41,15 @@ pub const KINDS: [&str; 9] = [
 #[must_use]
 pub fn is_kind(k: &str) -> bool {
     KINDS.contains(&k)
+}
+
+/// The verdicts a receipt may carry (R8) — the three words `inbox seen` accepts.
+pub const VERDICTS: [&str; 3] = ["handled", "refused", "deferred"];
+
+/// Whether `v` is one of [`VERDICTS`].
+#[must_use]
+pub fn is_verdict(v: &str) -> bool {
+    VERDICTS.contains(&v)
 }
 
 /// The most relay hops a `via=` chain may name, and the most bytes it may spend
@@ -125,6 +134,11 @@ pub struct Body {
     pub re: Option<u64>,
     /// An advisory deadline in ms.
     pub dl: Option<u64>,
+    /// The receipt's verdict (R8): on a `kind=ack` record the RECIPIENT's bridge
+    /// publishes when its session ran `inbox seen <id> handled|refused|deferred`
+    /// on the `ask`/`task` at `re=`. One of [`VERDICTS`]; anything else is left
+    /// in `unknown` by the decoder and never reaches a `deliver` line.
+    pub verdict: Option<String>,
     /// The target session's public launch nonce — MANDATORY on `term/in` and
     /// `control` (§7). A freshness fence, not a secret.
     pub epoch: Option<String>,
@@ -176,6 +190,9 @@ impl Body {
         if let Some(dl) = self.dl {
             line.push_str(&format!(" dl={dl}"));
         }
+        if let Some(v) = &self.verdict {
+            line.push_str(&format!(" verdict={v}"));
+        }
         for (k, v) in &self.unknown {
             line.push_str(&format!(" {k}={v}"));
         }
@@ -218,6 +235,9 @@ impl Body {
                 "from" => body.from = Some(val.to_string()),
                 "re" => body.re = val.parse().ok(),
                 "dl" => body.dl = val.parse().ok(),
+                // CLOSED at the decoder: a token outside the set is an unknown
+                // field, not a verdict, so nothing downstream has to re-check.
+                "verdict" if is_verdict(val) => body.verdict = Some(val.to_string()),
                 "epoch" => body.epoch = Some(val.to_string()),
                 "gen" => body.gen = Some(val.to_string()),
                 "via" => body.via = Some(val.to_string()),
@@ -262,6 +282,33 @@ mod tests {
         let (got, raw) = Body::decode(&wire);
         assert_eq!(raw, None);
         assert_eq!(got, b);
+    }
+
+    /// A RECEIPT'S VERDICT IS A CLOSED WORD (R8). `verdict=` round-trips for the
+    /// three words `inbox seen` accepts, and anything else decodes as an unknown
+    /// token — so no `deliver` line downstream can carry a stranger's spelling.
+    #[test]
+    fn a_verdict_round_trips_and_an_unknown_one_is_not_a_verdict() {
+        let mut b = Body::new(9);
+        b.re = Some(41);
+        b.verdict = Some("refused".into());
+        b.text = "ack re=41 verdict=refused".into();
+        let wire = b.encode(None);
+        let line = String::from_utf8(wire.clone()).expect("ascii line");
+        assert!(line.contains(" re=41 verdict=refused text="), "{line}");
+        let (got, _) = Body::decode(&wire);
+        assert_eq!(got.verdict.as_deref(), Some("refused"));
+        assert_eq!(got, b);
+        for word in ["handled", "deferred"] {
+            assert!(is_verdict(word));
+        }
+        let (hostile, _) = Body::decode(b"v=1 t=1 re=41 verdict=handled%20now text=x");
+        assert_eq!(hostile.verdict, None, "not one of the three words");
+        assert_eq!(
+            hostile.unknown.get("verdict").map(String::as_str),
+            Some("handled%20now"),
+            "kept as an unknown token, never as a verdict"
+        );
     }
 
     /// The `len=` form carries arbitrary bytes — newlines, NULs, invalid UTF-8 —

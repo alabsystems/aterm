@@ -132,6 +132,51 @@ fn gpu_matches_cpu() {
     );
 }
 
+/// `backends` hands back a FONT-SETTLED pair: neither renderer is still holding
+/// an unstarted lazy fallback chain when a test begins to render.
+///
+/// This is the pin for the order- and contention-dependence that made
+/// `linear_mode_matches_cpu_and_keeps_procedural_exact` fail 2 runs in 6 at clean
+/// main — max per-channel delta 229 against a tolerance of 8, and the divergence
+/// localised (2026-09-15) to cells (2,0)…(2,3): the 日本 row, where the CPU frame
+/// held 0x000000 and the GPU frame held the e5e5e5 ink. One backend's chain had
+/// landed and the other's had not.
+///
+/// Stated on the CONSTRUCTOR, and stated WHITE-BOX. Not on the pixels: "did the
+/// CJK row get drawn" is the very race in question, so a pixel assertion passes
+/// whenever the parse happens to win — which is exactly what it does when the
+/// test is run alone. `Renderer::ensure_fallback` TAKES its candidate-path list
+/// when it starts the parse, so an empty list is the renderer's own word for "the
+/// lazy chain is no longer pending", `&self` cannot settle it by asking, and the
+/// assertion is the same on an idle machine and a loaded one.
+#[test]
+fn backends_hand_back_a_font_settled_pair() {
+    // Non-vacuity: a raw renderer on THIS host really does start with candidates
+    // to take, so the emptiness asserted below has teeth here.
+    let Some(raw) = Renderer::from_system(18.0, Theme::default()) else {
+        eprintln!("SKIP: no system monospace font");
+        return;
+    };
+    if raw.debug_fallback_candidate_paths().is_empty() {
+        eprintln!("SKIP: no lazy fallback candidates on this host");
+        return;
+    }
+    let Some((cpu, gpu)) = backends(18.0, Theme::default()) else {
+        return;
+    };
+    assert!(
+        cpu.debug_fallback_candidate_paths().is_empty(),
+        "the CPU renderer still holds an unstarted fallback chain: its first \
+         renders will draw `.notdef` where the chain would draw a glyph, and a \
+         parity comparison that straddles the arrival reads it as a divergence"
+    );
+    assert!(
+        gpu.debug_fallback_candidate_paths().is_empty(),
+        "the GPU renderer still holds an unstarted fallback chain (the pair has \
+         two chains, and each races its own parse)"
+    );
+}
+
 /// Interior padding holds GPU/CPU parity: with the SAME `pad` set on both
 /// renderers, the GPU and CPU frames have the same (grown) dimensions and the
 /// grid lands on the same pixels within the antialiasing tolerance, and the
@@ -2030,6 +2075,197 @@ fn combining_mark_on_space_base_gpu_matches_cpu() {
         delta <= 8,
         "GPU drew a combining mark the CPU dropped: max per-channel delta {delta} > 8"
     );
+}
+
+/// STACKED marks: a cell's second mark on the same side of the base is lifted
+/// (above) or dropped (below) clear of the first by `aterm_render::MarkStack`,
+/// as far as the cell has room — shared with the CPU combining blit, so the
+/// GPU quad must land on the identical rows. Before the stack every mark
+/// painted at the row's one anchor: `e` + U+0301 + U+0301 was pixel-equal to
+/// `e` + U+0301 up to double-coverage darkening, so the assertions here are
+/// about ROWS of ink, never darkness. Two rigs: the default line height (a
+/// 21px cell at 18px, where the stack has two rows of room and must stay in
+/// the band) and a doubled one (where every lift is whole and the marks form
+/// separate bands). Text sits on row 1 of a two-row grid so row 0 is the band
+/// an unbounded stack would climb into.
+///
+/// Both painters place the stack by the mark's INK box, not by the box its
+/// raster reports — and by the SAME one: it is memoized in the CPU glyph-cache
+/// entry when the raster is cached (`Renderer::glyph_ink_box_cached`), which is
+/// the raster the atlas was packed from, and the quad loop reads that memo
+/// rather than scanning per frame. So the operand is one stored value on both
+/// sides and the quads land on the same rows. Reading the reported box instead
+/// drops the below-stack entirely on the CoreText raster (`aterm_render`'s
+/// `combining_stack` suite is the unit witness).
+#[test]
+fn stacked_combining_marks_gpu_matches_cpu() {
+    let theme = Theme::default();
+    let px = 18.0;
+
+    let Some((mut cpu, mut gpu)) = backends(px, theme) else {
+        return;
+    };
+    cpu.debug_block_on_lazy_fallbacks();
+    gpu.debug_block_on_lazy_fallbacks();
+
+    let (rows, cols) = (2usize, 4usize);
+    let mut win = aterm_gpu::WindowGpu::new();
+    // Frame rows on which two frames differ anywhere: against the bare base,
+    // the rows a cell's marks ink.
+    let differing_rows = |a: &Frame, b: &Frame| -> Vec<usize> {
+        (0..a.height)
+            .filter(|&y| {
+                a.pixels[y * a.width..(y + 1) * a.width] != b.pixels[y * b.width..(y + 1) * b.width]
+            })
+            .collect()
+    };
+
+    for (rig, line_height) in [("tight", 1.0f32), ("roomy", 2.0f32)] {
+        cpu.set_line_height(line_height);
+        gpu.set_line_height(line_height);
+        let mut frame_for = |cpu: &mut Renderer, gpu: &mut aterm_gpu::GpuRenderer, text: &str| {
+            let mut term = Terminal::new(rows as u16, cols as u16);
+            term.process(format!("\x1b[?25l\x1b[2;1H{text}").as_bytes());
+            let input = term.cell_frame(rows, cols);
+            let cpu_frame = cpu.render_input(&input);
+            let gpu_frame = gpu.render_input(&mut win, &input, None);
+            (input, cpu_frame, gpu_frame)
+        };
+        let (_, cpu_bare, gpu_bare) = frame_for(&mut cpu, &mut gpu, "e");
+        let (_, cpu_one, gpu_one) = frame_for(&mut cpu, &mut gpu, "e\u{0301}");
+        let (two, cpu_two, gpu_two) = frame_for(&mut cpu, &mut gpu, "e\u{0301}\u{0301}");
+        let (_, cpu_pair, gpu_pair) = frame_for(&mut cpu, &mut gpu, "e\u{0302}\u{0301}");
+        let (_, cpu_dot1, gpu_dot1) = frame_for(&mut cpu, &mut gpu, "e\u{0323}");
+        let (_, cpu_dot2, gpu_dot2) = frame_for(&mut cpu, &mut gpu, "e\u{0323}\u{0323}");
+
+        // NON-VACUITY: the frame lane hands both marks to the renderers.
+        assert_eq!(
+            two.combining_at(1, 0).map(<[char]>::len),
+            Some(2),
+            "{rig}: fixture drifted, the two-acute cell does not carry two marks"
+        );
+
+        // Parity on every fixture: the lift is one helper on both paths, so
+        // the stack lands on the same pixels within the AA tolerance every
+        // combining test uses.
+        for (name, c, g) in [
+            ("bare", &cpu_bare, &gpu_bare),
+            ("one acute", &cpu_one, &gpu_one),
+            ("two acutes", &cpu_two, &gpu_two),
+            ("circumflex + acute", &cpu_pair, &gpu_pair),
+            ("one dot below", &cpu_dot1, &gpu_dot1),
+            ("two dots below", &cpu_dot2, &gpu_dot2),
+        ] {
+            assert_eq!(
+                (g.width, g.height),
+                (c.width, c.height),
+                "{rig} {name}: dims"
+            );
+            let delta = max_channel_delta(c, g);
+            eprintln!("stacked marks [{rig} {name}] GPU vs CPU max per-channel delta = {delta}");
+            assert!(
+                delta <= 8,
+                "{rig} {name}: GPU/CPU stacked-mark pixels diverge: max per-channel delta {delta} > 8"
+            );
+        }
+
+        let (_, ch) = cpu.cell_size();
+        let band_top = cpu.grid_top() + ch;
+        let band_bottom = band_top + ch;
+        // (a) The pair of acutes grew UPWARD on both painters: ink starts on a
+        // higher row and covers more rows than the single acute — and stays in
+        // the band, so row 0 is byte-identical to the bare frame.
+        for (name, one, two, bare) in [
+            ("CPU", &cpu_one, &cpu_two, &cpu_bare),
+            ("GPU", &gpu_one, &gpu_two, &gpu_bare),
+        ] {
+            let r1 = differing_rows(one, bare);
+            let r2 = differing_rows(two, bare);
+            eprintln!("{rig} {name}: one acute rows {r1:?}, two acutes rows {r2:?}");
+            assert!(
+                !r1.is_empty(),
+                "{rig} {name}: non-vacuity, a single acute draws ink"
+            );
+            assert!(
+                r2[0] < r1[0],
+                "{rig} {name}: two acutes must start above one: {r2:?} vs {r1:?}"
+            );
+            assert!(
+                r2.len() > r1.len(),
+                "{rig} {name}: two acutes must occupy more rows than one: {r2:?} vs {r1:?}"
+            );
+            assert!(
+                r2.iter().all(|&y| y >= band_top),
+                "{rig} {name}: the stack climbed above the cell band (top {band_top}): {r2:?}"
+            );
+            if rig == "roomy" {
+                // A whole lift: one ink-free row between the two acutes, and the
+                // first acute's own rows untouched by the second.
+                assert!(
+                    r2.windows(2).any(|w| w[1] > w[0] + 1),
+                    "{rig} {name}: the acutes must be separated by an ink-free row: {r2:?}"
+                );
+                for &y in &r1 {
+                    assert_eq!(
+                        one.pixels[y * one.width..(y + 1) * one.width],
+                        two.pixels[y * two.width..(y + 1) * two.width],
+                        "{rig} {name}: row {y}: the first acute moved when a second was added"
+                    );
+                }
+            }
+        }
+        // (b) Circumflex + acute: the acute is lifted off the circumflex (more
+        // rows than the single acute's band) — two separate bands when the cell
+        // has the room.
+        for (name, pair, one, bare) in [
+            ("CPU", &cpu_pair, &cpu_one, &cpu_bare),
+            ("GPU", &gpu_pair, &gpu_one, &gpu_bare),
+        ] {
+            let r = differing_rows(pair, bare);
+            let r1 = differing_rows(one, bare);
+            eprintln!("{rig} {name}: circumflex + acute rows {r:?}");
+            assert!(
+                r.len() > r1.len() && r[0] < r1[0],
+                "{rig} {name}: circumflex + acute must rise above one acute: {r:?} vs {r1:?}"
+            );
+            if rig == "roomy" {
+                assert!(
+                    r.windows(2).any(|w| w[1] > w[0] + 1),
+                    "{rig} {name}: acute and circumflex must be separated by an ink-free row: {r:?}"
+                );
+            }
+        }
+        // (c) Two dots below: a second row of ink under the first where the
+        // descent has room (the tight rig has none — the pair equals one dot,
+        // bounded, never cut); in every rig the ink stays inside the band.
+        for (name, one, two, bare) in [
+            ("CPU", &cpu_dot1, &cpu_dot2, &cpu_bare),
+            ("GPU", &gpu_dot1, &gpu_dot2, &gpu_bare),
+        ] {
+            let r1 = differing_rows(one, bare);
+            let r2 = differing_rows(two, bare);
+            eprintln!("{rig} {name}: one dot below rows {r1:?}, two dots below rows {r2:?}");
+            assert!(
+                !r1.is_empty(),
+                "{rig} {name}: non-vacuity, a single dot below draws ink"
+            );
+            assert!(
+                r2.iter().all(|&y| y < band_bottom),
+                "{rig} {name}: the stack dropped below the cell band (bottom {band_bottom}): {r2:?}"
+            );
+            // A below stack never moves its first mark and never loses ink.
+            assert!(
+                r2[0] == r1[0] && r2.last() >= r1.last(),
+                "{rig} {name}: the first dot moved or the pair lost rows: {r2:?} vs {r1:?}"
+            );
+            if rig == "roomy" {
+                assert!(
+                    r2.last() > r1.last() && r2.len() > r1.len(),
+                    "{rig} {name}: two dots below must end below one: {r2:?} vs {r1:?}"
+                );
+            }
+        }
+    }
 }
 
 /// OFFSCREEN-PERSISTENCE GATE: a renderer REUSED across CHANGING dimensions must

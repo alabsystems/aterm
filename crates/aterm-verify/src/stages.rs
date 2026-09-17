@@ -156,31 +156,13 @@ pub fn doctest_args(scope: &Scope) -> Vec<String> {
     a
 }
 
-/// Build the GUI that the sealed bridge harness drives, in that harness's own
-/// target directory. The GUI has no `sealed` feature: encryption belongs to
-/// the separate bridge process built by [`sealed_lane_args`].
-#[must_use]
-pub fn sealed_gui_build_args() -> Vec<String> {
-    [
-        "--unverified",
-        "build",
-        "-p",
-        "aterm-gui",
-        "--bin",
-        "aterm-gui",
-    ]
-    .into_iter()
-    .map(String::from)
-    .collect()
-}
-
 /// `targo --unverified test -p aterm-link --features sealed --test two_nodes_sealed --no-fail-fast`
 ///
 /// The sealed cross-host rung. `tests/two_nodes_sealed.rs` is `#![cfg(feature =
 /// "sealed")]`, so the workspace test stage compiles it to NOTHING, and the one
 /// test covering the vendored astream-aead ran only when somebody typed this by
-/// hand (audit 2026-09-12). Its own lane and target dir, for the regex lane's
-/// reason: a feature set the workspace never builds.
+/// hand (audit 2026-09-12). The rung's second child, in the driver lane behind
+/// the `aterm-gui` build it drives: see [`sealed_lane_cmds`].
 #[must_use]
 pub fn sealed_lane_args() -> Vec<String> {
     [
@@ -197,6 +179,19 @@ pub fn sealed_lane_args() -> Vec<String> {
     .into_iter()
     .map(String::from)
     .collect()
+}
+
+/// `targo --unverified build -q -p atpkg` — the binary the publish tooling's
+/// end-to-end pack suite drives, built in the driver lane as that stage's first
+/// child. The suite's own resolution order is `$ATPKG`, else
+/// `<root>/target/debug/atpkg`, else the release one, and both fallbacks are a
+/// PREVIOUS run's artifact: see [`atpkg_suite_cmd`].
+#[must_use]
+pub fn atpkg_build_args() -> Vec<String> {
+    ["--unverified", "build", "-q", "-p", "atpkg"]
+        .into_iter()
+        .map(String::from)
+        .collect()
 }
 
 /// `targo --unverified test -p aterm-search --features regex --no-fail-fast`
@@ -1007,10 +1002,30 @@ fn targo(ctx: &Ctx, args: Vec<String>) -> Cmd {
 #[must_use]
 pub const fn lane_build_jobs(lane: Lane) -> Option<u32> {
     match lane {
-        Lane::RegexTarget | Lane::SealedTarget | Lane::XtaskTarget => Some(4),
+        Lane::RegexTarget | Lane::XtaskTarget => Some(4),
         Lane::DriverTarget => Some(8),
         _ => None,
     }
+}
+
+/// The job cap a side lane's child gets: [`lane_build_jobs`], and never more
+/// than the caller's own `CARGO_BUILD_JOBS` when that parses as a positive
+/// integer. The constants were sized on a many-core builder; on a 4-core,
+/// 8-thread Intel MacBook Pro the overlapping lanes (main and lint at cargo's
+/// default 8, drivers 8, three side lanes 4 each) were measured at a load
+/// average of 17–20 for the whole first run (2026-09-15), and a caller who
+/// exported `CARGO_BUILD_JOBS=4` saw only the main and lint lanes obey it —
+/// the side lanes overrode it back UP. A caller's value that does not parse is
+/// left alone: it still reaches cargo by inheritance on the main lane and
+/// fails there with cargo's own message, exactly as before.
+#[must_use]
+pub fn lane_jobs(lane: Lane, caller: Option<&std::ffi::OsStr>) -> Option<u32> {
+    let cap = lane_build_jobs(lane)?;
+    let ceiling = caller
+        .and_then(|v| v.to_str())
+        .and_then(|s| s.trim().parse::<u32>().ok())
+        .filter(|&n| n > 0);
+    Some(ceiling.map_or(cap, |c| cap.min(c)))
 }
 
 /// Put a cargo child in its lane: that lane's own `CARGO_TARGET_DIR` and job
@@ -1026,16 +1041,18 @@ pub fn in_lane(ctx: &Ctx, lane: Lane, cmd: Cmd) -> Cmd {
         return cmd;
     };
     let cmd = cmd.env("CARGO_TARGET_DIR", dir);
-    match lane_build_jobs(lane) {
+    match lane_jobs(lane, ctx.env.cargo_build_jobs.as_deref()) {
         Some(jobs) => cmd.env("CARGO_BUILD_JOBS", jobs.to_string()),
         None => cmd,
     }
 }
 
-/// A build of a binary the gate DRIVES, in the driver lane.
+/// A build of a binary the gate DRIVES, in the driver lane. Only the build is
+/// [`Cmd::demoted`]; the driven binary runs as its own child at the inherited
+/// tier.
 #[must_use]
 pub fn driver_build_cmd(ctx: &Ctx, args: Vec<String>) -> Cmd {
-    in_lane(ctx, Lane::DriverTarget, targo(ctx, args))
+    in_lane(ctx, Lane::DriverTarget, targo(ctx, args)).demoted()
 }
 
 /// The driver lane's target dir: every driven binary is resolved under it,
@@ -1137,13 +1154,18 @@ fn script_cmd(path: &std::path::Path, root: &std::path::Path) -> Cmd {
 // ---------------------------------------------------------------------------
 // 1) BUILD
 // ---------------------------------------------------------------------------
+/// The build stage's child. It only compiles, so it is [`Cmd::demoted`].
+fn build_cmd(ctx: &Ctx) -> Cmd {
+    targo(ctx, build_args(&ctx.scope)).demoted()
+}
+
 fn build(ctx: &Ctx, r: &mut Report) {
     if ctx.tools.have_targo() {
         run_scoped(
             ctx,
             r,
             &format!("targo build {}", ctx.scope.label()),
-            &targo(ctx, build_args(&ctx.scope)),
+            &build_cmd(ctx),
         );
     } else {
         // Fail-closed, and COULD-NOT-RUN rather than FAILED: nothing about the
@@ -1161,6 +1183,21 @@ fn build(ctx: &Ctx, r: &mut Report) {
 //    still binds trustdoc when the stage2 has one, so both children keep the
 //    environment the single child had.
 // ---------------------------------------------------------------------------
+
+/// The test stage's two children, compile then run, with trustdoc bound when
+/// `bind`. Only the COMPILE is [`Cmd::demoted`]. The run executes the paint and
+/// spin guards, and a QoS clamp would reach the aterm they launch.
+fn test_cmds(ctx: &Ctx, bind: bool) -> [Cmd; 2] {
+    let cmd = |args: Vec<String>| {
+        let c = targo(ctx, args);
+        if bind { with_trustdoc(ctx, c) } else { c }
+    };
+    [
+        cmd(test_compile_args(&ctx.scope)).demoted(),
+        cmd(test_run_args(&ctx.scope)),
+    ]
+}
+
 fn test(ctx: &Ctx, r: &mut Report) {
     if !ctx.tools.have_targo() {
         r.skip("targo test (no targo)");
@@ -1181,19 +1218,11 @@ fn test(ctx: &Ctx, r: &mut Report) {
         // problem: the doctests stage names it.
         DocDriver::BarePath | DocDriver::Absent => ("", false),
     };
-    let cmd = |args: Vec<String>| {
-        let c = targo(ctx, args);
-        if bind { with_trustdoc(ctx, c) } else { c }
-    };
+    let [compile, run] = test_cmds(ctx, bind);
     let run_label = format!("{label} --tests{suffix}");
-    let compiled = run_labeled(
-        ctx,
-        r,
-        &format!("{label} --no-run{suffix}"),
-        &cmd(test_compile_args(&ctx.scope)),
-    );
+    let compiled = run_labeled(ctx, r, &format!("{label} --no-run{suffix}"), &compile);
     if compiled || ctx.selftest {
-        run_labeled(ctx, r, &run_label, &cmd(test_run_args(&ctx.scope)));
+        run_labeled(ctx, r, &run_label, &run);
     } else {
         // Not a skip: nothing was absent. The FAIL above is the decision, and
         // the single child it replaced ran no test after a compile error either.
@@ -1288,14 +1317,37 @@ fn regex_lane_cmd(ctx: &Ctx) -> Cmd {
     )
 }
 
-/// The exact command the sealed lane spawns — extracted so a test asserts on it
-/// rather than on a replica.
-fn sealed_lane_cmd(ctx: &Ctx) -> Cmd {
-    in_lane(ctx, Lane::SealedTarget, targo(ctx, sealed_lane_args()))
-}
-
-fn sealed_gui_build_cmd(ctx: &Ctx) -> Cmd {
-    in_lane(ctx, Lane::SealedTarget, targo(ctx, sealed_gui_build_args()))
+/// The sealed rung's two children, labelled, in the order they run — the
+/// exact commands, so a test asserts on them rather than on a replica. Both are
+/// in the DRIVER lane, and they name ONE target dir.
+///
+/// `two_nodes_sealed` boots real `aterm-gui`s that aterm-link cannot declare, so
+/// its harness (`crates/aterm-link/tests/harness/mod.rs`, `built_binary`) FINDS
+/// one: first in the target dir the test binary was built into, then
+/// `$CARGO_TARGET_DIR`, then `<root>/target` — and refuses one older than any
+/// input its cargo depfile names. The first child is what makes that first
+/// search answer with a binary built from the sources under test: the smokes'
+/// own build argv, so it is a fingerprint no-op after the driver builds row and
+/// a real build when anything moved since. A suite compiled into any other dir
+/// would search a directory this build never wrote.
+///
+/// Until 2026-09-14 the rung was the second child alone, at t0, in a
+/// `target-sealed/` that never held an `aterm-gui`: the harness fell through to
+/// `target/`'s, which the build stage was still relinking on a warm gate (5 of
+/// 9 tests refused STALE) and which a cold gate had not built at all.
+#[must_use]
+pub fn sealed_lane_cmds(ctx: &Ctx) -> [(String, Cmd); 2] {
+    [
+        (
+            "targo build -p aterm-gui -p aterm-ctl (the aterm-gui the sealed rung drives)"
+                .to_string(),
+            driver_build_cmd(ctx, smoke_stages::smoke_build_args()),
+        ),
+        (
+            "targo test -p aterm-link --features sealed --test two_nodes_sealed".to_string(),
+            in_lane(ctx, Lane::DriverTarget, targo(ctx, sealed_lane_args())),
+        ),
+    ]
 }
 
 fn sealed_lane(ctx: &Ctx, r: &mut Report) {
@@ -1303,26 +1355,20 @@ fn sealed_lane(ctx: &Ctx, r: &mut Report) {
         r.skip("sealed fabric lane (no targo)");
         return;
     }
-    // The harness searches its own target directory first, with the normal
-    // depfile freshness check. Prepare it here before the test can fall back
-    // to MainTarget's GUI, which may still be rebuilding concurrently. Shared
-    // libraries rebuilt by the sealed test live under this same target root;
-    // the guard correctly excludes generated artifacts, not source inputs.
-    let prepared = run_labeled(
-        ctx,
-        r,
-        "targo build -p aterm-gui --bin aterm-gui (sealed harness)",
-        &sealed_gui_build_cmd(ctx),
-    );
-    if !prepared && !ctx.selftest {
-        r.skip("sealed fabric tests (GUI preparation failed; not executed)");
-        return;
-    }
-    let label = "targo test -p aterm-link --features sealed --test two_nodes_sealed";
-    let cmd = sealed_lane_cmd(ctx);
+    let [(build_label, build), (run_label, run)] = sealed_lane_cmds(ctx);
     // An integration-test-only run compiles no doctests, so unlike the regex
-    // lane it has no doc-driver rule to take: it runs as written.
-    run_labeled(ctx, r, label, &cmd);
+    // lane it has no doc-driver rule to take: both children run as written.
+    let built = run_labeled(ctx, r, &build_label, &build);
+    if built || ctx.selftest {
+        run_labeled(ctx, r, &run_label, &run);
+    } else {
+        // Not a skip: nothing was absent, and the build's FAIL above is the
+        // decision. Running the suite anyway would drive a missing or STALE
+        // `aterm-gui` — nine red rows about a build, not about the fabric.
+        r.raw(format!(
+            "  not run: {run_label} — the aterm-gui build above failed, so the rung has no fresh binary to drive"
+        ));
+    }
 }
 
 fn regex_lane(ctx: &Ctx, r: &mut Report) {
@@ -1386,6 +1432,8 @@ fn tippy_cmd(ctx: &Ctx, bin: &std::path::Path, args: Vec<String>) -> Cmd {
         .env("PATH", path)
         .env("CARGO_TARGET_DIR", ctx.root.join("target-tippy"))
         .env("TRUST_NO_MIGRATE_WARN", "1")
+        // A lint only compiles.
+        .demoted()
 }
 
 fn tippy(ctx: &Ctx, r: &mut Report) {
@@ -1499,24 +1547,137 @@ fn install_channel(ctx: &Ctx, r: &mut Report) {
 //    (their headers say so): no network, no token, no repo mutation. Until
 //    2026-09-08 neither suite ran under any gate, so a change to the scripts
 //    that sign the toolchain index could land unmeasured (the audit finding).
-//    The third suite pins the sysroot-bundle pack's one-compiler contract
-//    (atpkg-pack-bundle.sh): keyless and offline, everything under one mktemp
-//    dir. Same posture as install_channel: a missing suite is a cannot-run,
-//    never a skip.
+//    test-atpkg-pack-one-compiler.sh pins the sysroot-bundle pack's one-compiler
+//    contract (atpkg-pack-bundle.sh): keyless and offline, everything under one
+//    mktemp dir. Same posture as install_channel: a missing suite is a
+//    cannot-run, never a skip.
+//
+//    test-atpkg-mirror-extras.sh runs atpkg-mirror-public.sh itself (DRY_RUN, a
+//    gh stub serving a fixture tree): the no-extras gate, the download retry,
+//    and — since 2026-09-16 — that the mirror's work list is the UNION of the
+//    index's `pin` and every per-target `pin_by_target` overlay. That suite
+//    existed and was wired into NOTHING, which is how the overlay gap survived:
+//    the mirror is the only writer of public atpkg releases, it walked `pin`
+//    alone, and every build a non-darwin seal published rode an overlay row it
+//    never read — verified into staging, pinned by a public index, never
+//    mirrored, 404 on every client of that triple. No host can observe that for
+//    itself; an operator on the `pin` triple resolves the mirrored builds and
+//    sees nothing wrong.
+//
+//    A DRIVER-LANE STAGE SINCE 2026-09-16 (it prints after the sealed rung; the
+//    ladder order is `plan.rs`, which carries the measurement). The third suite
+//    PACKS with a real atpkg, and where that pack can run at all a missing
+//    binary is a gap in the run rather than a platform limit — so it fails.
+//    Its first child builds that binary in this lane, the pack runs only if
+//    that build succeeded, and $ATPKG points at what was built.
 // ---------------------------------------------------------------------------
+
+/// The publish-tooling suites, in the order the stage runs them.
+///
+/// `test-atpkg-target-pins.sh` joined them on 2026-09-16: the channel's pins are
+/// PER-TARGET (`pin_by_target`, applied by the client's `Channel::for_target`) and
+/// every producer read the platform-agnostic `pin` instead, so the Linux stager
+/// reported `OK: x86_64-unknown-linux-gnu row published` for a build no Linux
+/// client resolves. It is the one suite here that runs a shipping lane end to end
+/// for a target that is NOT this host's — the arch nobody develops on is exactly
+/// the one that shipped broken.
+///
+/// `test-linux-auto-atpkg.sh` joined them on 2026-09-17 for the neighbouring
+/// class: the Linux stager served ONE Linux triple per run, and the fleet has
+/// one Linux builder, so `aarch64-unknown-linux-gnu` — in `atpkg::TARGETS` from
+/// the start — could not be published at all. That failure has NO error in it:
+/// a missing row is the client's silent `unavailable on <target>` skip, and the
+/// builder's own decision table never printed the word. The suite runs the lane
+/// against a stubbed channel on an x86 host, an aarch64 host and a host missing
+/// each cross toolchain (uname/rustup/linker are stubs), so one box measures
+/// both architectures. Its static twin is
+/// `crates/atpkg/tests/publish_lane_targets.rs`.
+pub const ATPKG_SUITES: [&str; 6] = [
+    "test-atpkg-vendor-tooling.sh",
+    "test-atpkg-mirror-extras.sh",
+    "test-atpkg-auto-vendor.sh",
+    "test-atpkg-target-pins.sh",
+    "test-linux-auto-atpkg.sh",
+    "test-atpkg-pack-one-compiler.sh",
+];
+
+/// The one suite that drives a real `atpkg` rather than stubs of its own
+/// making: section D of the pack contract, the end-to-end pack.
+pub const ATPKG_DRIVEN_SUITE: &str = "test-atpkg-pack-one-compiler.sh";
+
+/// The label of this stage's first child — the build the suite below depends on.
+pub const ATPKG_BUILD_LABEL: &str = "targo build -p atpkg (the atpkg the pack suite drives)";
+
+/// The binary [`ATPKG_DRIVEN_SUITE`] is pointed at: this lane's own
+/// `debug/atpkg`, which this stage's first child writes. Never
+/// `<root>/target/debug/atpkg` — that one belongs to the workspace build, which
+/// runs in another lane, may still be linking it, and under a `--scope`
+/// narrowing never builds it at all.
+#[must_use]
+pub fn atpkg_driven_binary(ctx: &Ctx) -> std::path::PathBuf {
+    debug_bin(&ctx.root, Some(drivers_dir(ctx).as_os_str()), "atpkg")
+}
+
+/// The build of that binary, in the driver lane. Compile-only, so demoted.
+#[must_use]
+pub fn atpkg_build_cmd(ctx: &Ctx) -> Cmd {
+    driver_build_cmd(ctx, atpkg_build_args())
+}
+
+/// One suite's command.
+///
+/// [`ATPKG_DRIVEN_SUITE`] is handed `$ATPKG` = the binary this stage just
+/// built, and that binding is the half of the fix that ordering cannot do: the
+/// script's own resolution order ends in `<root>/target/{debug,release}/atpkg`,
+/// so an ordered stage whose lane dir is empty would still silently drive a
+/// previous run's binary rather than saying it had none.
+///
+/// Every OTHER suite is handed NOTHING. They are self-contained — each builds
+/// stub `atpkg`/`atpkg-keys`/`gh` shims under its own mktemp dir — and
+/// several of their cases deliberately invoke a producer script with `$ATPKG`
+/// unset, to measure what it does without one. Exporting a real binary into
+/// those cases would change what they measure.
+#[must_use]
+pub fn atpkg_suite_cmd(ctx: &Ctx, name: &str) -> Cmd {
+    let cmd = Cmd::new(ctx.tools_dir().join(name));
+    if name == ATPKG_DRIVEN_SUITE {
+        cmd.env("ATPKG", atpkg_driven_binary(ctx))
+    } else {
+        cmd
+    }
+}
+
 fn atpkg_tooling(ctx: &Ctx, r: &mut Report) {
-    for name in [
-        "test-atpkg-vendor-tooling.sh",
-        "test-atpkg-auto-vendor.sh",
-        "test-atpkg-pack-one-compiler.sh",
-    ] {
+    let built = if ctx.tools.have_targo() {
+        run_labeled(ctx, r, ATPKG_BUILD_LABEL, &atpkg_build_cmd(ctx))
+    } else {
+        r.skip(format!("{ATPKG_BUILD_LABEL} (no targo)"));
+        false
+    };
+    for name in ATPKG_SUITES {
         let t = ctx.tools_dir().join(name);
-        if is_executable_file(&t) {
-            run_labeled(ctx, r, name, &Cmd::new(&t));
-        } else {
+        if !is_executable_file(&t) {
             r.cannot_run(format!(
                 "{name} missing or not executable ({})",
                 t.display()
+            ));
+        } else if name != ATPKG_DRIVEN_SUITE || built || ctx.selftest {
+            run_labeled(ctx, r, name, &atpkg_suite_cmd(ctx, name));
+        } else if ctx.tools.have_targo() {
+            // Not a skip: nothing was absent, and the build's FAIL above is the
+            // decision. Running the pack anyway would drive whatever
+            // `<root>/target` happened to hold — a pack report about some older
+            // binary, or a section-D gap reported as a finding about scripts
+            // that never changed.
+            r.raw(format!(
+                "  not run: {name} — the atpkg build above failed, so the end-to-end pack has no fresh binary to drive"
+            ));
+        } else {
+            // A counted, named skip rather than a raw line: with no toolchain
+            // nothing can build the binary, and section D's coverage is then
+            // genuinely absent from the run. The verdict must say so.
+            r.skip(format!(
+                "{name} (no targo — nothing built the atpkg its end-to-end pack drives)"
             ));
         }
     }
@@ -2467,8 +2628,9 @@ mod tests {
             test_run_args(&s),
             doctest_args(&s),
             regex_lane_args(),
-            sealed_gui_build_args(),
+            smoke_stages::smoke_build_args(),
             sealed_lane_args(),
+            atpkg_build_args(),
             xtask_gate_args("drift"),
             freeze_gate_args(),
             differential_args(),
@@ -2483,21 +2645,25 @@ mod tests {
         }
     }
 
+    /// The sealed rung's GUI build and its suite share ONE owned target dir and
+    /// job cap, and set nothing else — above all no `ATERM_GUI_BIN`, which would
+    /// exempt the harness's stale-binary guard instead of satisfying it. The dir
+    /// is the driver lane's, whatever the caller exported.
     #[test]
     fn sealed_gui_and_tests_share_the_owned_target_without_a_freshness_override() {
         let mut c = ctx(Scope::workspace());
         c.env.cargo_target_dir = Some("/caller/target".into());
-        let build = sealed_gui_build_cmd(&c);
-        let test = sealed_lane_cmd(&c);
+        let [(_, build), (_, test)] = sealed_lane_cmds(&c);
         assert_eq!(
             build.args,
             [
                 "--unverified",
                 "build",
+                "-q",
                 "-p",
                 "aterm-gui",
-                "--bin",
-                "aterm-gui"
+                "-p",
+                "aterm-ctl"
             ]
             .map(std::ffi::OsString::from)
         );
@@ -2505,8 +2671,8 @@ mod tests {
         assert_eq!(
             build.envs,
             [
-                ("CARGO_TARGET_DIR".into(), "/repo/target-sealed".into()),
-                ("CARGO_BUILD_JOBS".into(), "4".into()),
+                ("CARGO_TARGET_DIR".into(), "/repo/target-drivers".into()),
+                ("CARGO_BUILD_JOBS".into(), "8".into()),
             ],
             "the harness discovers the fresh local artifact; no ATERM_GUI_BIN bypass"
         );
@@ -3038,6 +3204,51 @@ mod tests {
         );
     }
 
+    /// Pins which children yield the CPU (see [`Cmd::demoted`]). Every child
+    /// that only COMPILES is demoted. Every child that RUNS code keeps the
+    /// inherited tier, because a clamp reaches everything it launches, and the
+    /// test run and the sealed rung launch aterms.
+    #[test]
+    fn compile_only_children_yield_and_children_that_run_code_do_not() {
+        let mut c = ctx(Scope::workspace());
+        c.tools.tippy = Some(PathBuf::from("/s2/targo-tippy"));
+
+        assert!(build_cmd(&c).demoted, "targo build");
+        for bind in [false, true] {
+            let [compile, run] = test_cmds(&c, bind);
+            assert!(compile.demoted, "targo test --no-run");
+            assert!(
+                !run.demoted,
+                "targo test --tests runs the paint and spin guards"
+            );
+            assert_eq!(compile.argv()[1..], test_compile_args(&c.scope)[..]);
+            assert_eq!(run.argv()[1..], test_run_args(&c.scope)[..]);
+        }
+        assert!(
+            tippy_cmd(
+                &c,
+                std::path::Path::new("/s2/targo-tippy"),
+                tippy_args(&c.scope)
+            )
+            .demoted,
+            "tippy"
+        );
+        for (label, cmd) in driver_build_cmds(&c) {
+            assert!(cmd.demoted, "{label}");
+        }
+        let [(build_label, build), (suite_label, suite)] = sealed_lane_cmds(&c);
+        assert!(build.demoted, "{build_label}");
+        assert!(
+            !suite.demoted,
+            "{suite_label} boots real aterm-gui --headless processes"
+        );
+        assert!(
+            atpkg_build_cmd(&c).demoted,
+            "the atpkg the pack suite drives is only compiled here"
+        );
+        assert!(!regex_lane_cmd(&c).demoted, "the regex lane runs its suite");
+    }
+
     #[test]
     fn the_gated_pass_names_every_required_features_target_and_only_those() {
         let argv = tippy_gated_args(&Scope::workspace()).expect("the workspace selects both");
@@ -3205,6 +3416,11 @@ mod tests {
         let mc = prefix.join("store/trust-mc/current/bin");
         std::fs::create_dir_all(&mc).expect("mkdir");
         std::fs::write(mc.join("trust-mc-driver"), b"#!/bin/sh\nexit 0\n").expect("write");
+        // The chmod is the only unix-shaped line, so it is the only one gated:
+        // where there is no execute bit `is_executable_file` is existence, so
+        // the file above already satisfies the same premise and the ORDER law
+        // this test is about stays pinned on every target.
+        #[cfg(unix)]
         {
             use std::os::unix::fs::PermissionsExt;
             std::fs::set_permissions(
@@ -3216,6 +3432,7 @@ mod tests {
         let shims = prefix.join("bin");
         std::fs::create_dir_all(&shims).expect("mkdir");
         std::fs::write(shims.join("ay"), b"#!/bin/sh\nexit 0\n").expect("write");
+        #[cfg(unix)]
         {
             use std::os::unix::fs::PermissionsExt;
             std::fs::set_permissions(shims.join("ay"), std::fs::Permissions::from_mode(0o755))
@@ -3374,6 +3591,73 @@ mod tests {
         }
     }
 
+    /// A caller's `CARGO_BUILD_JOBS` is a CEILING for the side lanes' constants —
+    /// never a floor, never a parse error. Measured 2026-09-15 on a 4-core Intel
+    /// MacBook Pro: `CARGO_BUILD_JOBS=4 tools/verify.sh --fast` capped the main
+    /// and lint lanes (they inherit) while the driver lane went to 8 and the
+    /// three side lanes to 4 regardless, so the export changed nothing about
+    /// the overlap that ran the box at a load of 17–20.
+    #[test]
+    fn a_callers_cargo_build_jobs_is_a_ceiling_for_the_side_lanes() {
+        use std::ffi::OsStr;
+        for lane in [Lane::RegexTarget, Lane::XtaskTarget] {
+            assert_eq!(lane_jobs(lane, None), Some(4));
+            assert_eq!(lane_jobs(lane, Some(OsStr::new("2"))), Some(2), "{lane:?}");
+            assert_eq!(
+                lane_jobs(lane, Some(OsStr::new(" 3 "))),
+                Some(3),
+                "{lane:?}"
+            );
+            assert_eq!(lane_jobs(lane, Some(OsStr::new("16"))), Some(4), "{lane:?}");
+        }
+        assert_eq!(lane_jobs(Lane::DriverTarget, None), Some(8));
+        assert_eq!(
+            lane_jobs(Lane::DriverTarget, Some(OsStr::new("4"))),
+            Some(4)
+        );
+        assert_eq!(
+            lane_jobs(Lane::DriverTarget, Some(OsStr::new("8"))),
+            Some(8)
+        );
+        // Not a positive integer: the constant stands, and the raw value still
+        // reaches the main lane by inheritance to fail with cargo's own message.
+        for junk in ["", "0", "-1", "four", "4.5"] {
+            assert_eq!(
+                lane_jobs(Lane::DriverTarget, Some(OsStr::new(junk))),
+                Some(8),
+                "{junk:?}"
+            );
+        }
+        // Lanes with no cap of their own stay uncapped here — they inherit.
+        for lane in [Lane::MainTarget, Lane::Pure, Lane::TippyTarget] {
+            assert_eq!(lane_jobs(lane, Some(OsStr::new("2"))), None, "{lane:?}");
+        }
+        // Through `in_lane`: the ceiling reaches the child's environment.
+        let mut c = ctx(Scope::workspace());
+        c.env.cargo_build_jobs = Some("3".into());
+        let envs = |cmd: &Cmd| -> Vec<(String, String)> {
+            cmd.envs
+                .iter()
+                .map(|(k, v)| {
+                    (
+                        k.to_string_lossy().into_owned(),
+                        v.to_string_lossy().into_owned(),
+                    )
+                })
+                .collect()
+        };
+        for (label, cmd) in driver_build_cmds(&c) {
+            assert!(
+                envs(&cmd).contains(&("CARGO_BUILD_JOBS".to_string(), "3".to_string())),
+                "{label}: {:?}",
+                envs(&cmd)
+            );
+        }
+        assert!(
+            envs(&regex_lane_cmd(&c)).contains(&("CARGO_BUILD_JOBS".to_string(), "3".to_string()))
+        );
+    }
+
     #[test]
     fn side_lane_cmds_name_their_own_target_dir() {
         let env = |cmd: &Cmd| -> Vec<(String, String)> {
@@ -3409,7 +3693,11 @@ mod tests {
             ] {
                 assert_eq!(env(&cmd), lane("/repo/target-xtask", Some("4")));
             }
-            for (label, cmd) in driver_build_cmds(&c) {
+            for (label, cmd) in driver_build_cmds(&c)
+                .into_iter()
+                .chain(sealed_lane_cmds(&c))
+                .chain([(ATPKG_BUILD_LABEL.to_string(), atpkg_build_cmd(&c))])
+            {
                 assert_eq!(
                     env(&cmd),
                     lane("/repo/target-drivers", Some("8")),
@@ -3442,6 +3730,106 @@ mod tests {
                 ))
                 .is_empty()
             );
+        }
+    }
+
+    /// THE SEALED RUNG BUILDS THE aterm-gui IT DRIVES WHERE ITS HARNESS LOOKS
+    /// FIRST (2026-09-14). The suite searches the target dir it was compiled
+    /// into before any other, and refuses a stale binary; 28508563a's command
+    /// was the suite alone, in a dir no stage built `aterm-gui` into, so it
+    /// drove the build stage's binary mid-link. Whatever the caller exported:
+    /// the first child builds `aterm-gui` (the smokes' argv, so a no-op after
+    /// the driver builds), the second is the suite, both name ONE dir, and that
+    /// dir is the lane the plan schedules the rung in — the lane whose order
+    /// puts it behind the driver builds (`plan.rs`, `sched.rs`).
+    #[test]
+    fn the_sealed_rung_builds_the_aterm_gui_it_drives_where_its_harness_looks_first() {
+        let dir = |cmd: &Cmd| {
+            cmd.envs
+                .iter()
+                .find(|(k, _)| k.to_str() == Some("CARGO_TARGET_DIR"))
+                .map(|(_, v)| PathBuf::from(v))
+        };
+        for caller in [None, Some("/elsewhere"), Some("relative")] {
+            let mut c = ctx(Scope::workspace());
+            c.env.cargo_target_dir = caller.map(Into::into);
+            let [(_, build), (_, run)] = sealed_lane_cmds(&c);
+            assert_eq!(build.argv()[1..], smoke_stages::smoke_build_args()[..]);
+            assert!(
+                build
+                    .argv()
+                    .windows(2)
+                    .any(|w| w[0] == "-p" && w[1] == "aterm-gui"),
+                "the first child must build aterm-gui"
+            );
+            assert_eq!(run.argv()[1..], sealed_lane_args()[..]);
+            assert_eq!(dir(&build), dir(&run), "caller {caller:?}");
+            let spec = crate::plan::plan(&c)
+                .into_iter()
+                .find(|s| s.id == StageId::SealedLane)
+                .expect("the sealed rung is planned whole-tree");
+            assert_eq!(dir(&run), lane_dir(&c, spec.lane), "caller {caller:?}");
+            assert_eq!(dir(&run), Some(drivers_dir(&c)), "caller {caller:?}");
+        }
+    }
+
+    /// THE PACK SUITE DRIVES THE atpkg THIS STAGE BUILT (2026-09-16).
+    ///
+    /// The script resolves its binary as `$ATPKG`, else
+    /// `<root>/target/debug/atpkg`, else the release one — the first is what
+    /// this stage sets, and the others are whatever a PREVIOUS run left. So,
+    /// whatever the caller exported: the build child is `-p atpkg` in the
+    /// driver lane, the binary named is that lane's own `debug/atpkg` and never
+    /// the workspace build's, the pack suite carries exactly that path as
+    /// `$ATPKG`, and the self-contained suites carry no `ATPKG` at all —
+    /// several of their cases measure a producer script that has none, and an
+    /// exported one would change what they measure.
+    #[test]
+    fn the_atpkg_pack_suite_drives_the_binary_this_stage_built_not_a_stale_one() {
+        let env_of = |cmd: &Cmd, key: &str| {
+            cmd.envs
+                .iter()
+                .find(|(k, _)| k.to_str() == Some(key))
+                .map(|(_, v)| PathBuf::from(v))
+        };
+        for caller in [None, Some("/elsewhere"), Some("relative")] {
+            let mut c = ctx(Scope::workspace());
+            c.env.cargo_target_dir = caller.map(Into::into);
+
+            let build = atpkg_build_cmd(&c);
+            assert_eq!(
+                build.argv()[1..],
+                atpkg_build_args()[..],
+                "caller {caller:?}"
+            );
+            let dir = env_of(&build, "CARGO_TARGET_DIR");
+            assert_eq!(dir, Some(drivers_dir(&c)), "caller {caller:?}");
+
+            let bin = atpkg_driven_binary(&c);
+            assert_eq!(bin, drivers_dir(&c).join("debug").join("atpkg"));
+            assert!(
+                !bin.starts_with(c.root.join("target")),
+                "the workspace build's own dir is exactly the stale path: {}",
+                bin.display()
+            );
+
+            for name in ATPKG_SUITES {
+                let cmd = atpkg_suite_cmd(&c, name);
+                assert_eq!(cmd.program, c.tools_dir().join(name));
+                assert_eq!(
+                    env_of(&cmd, "ATPKG"),
+                    (name == ATPKG_DRIVEN_SUITE).then(|| bin.clone()),
+                    "{name}, caller {caller:?}"
+                );
+            }
+
+            // …and the dir that build writes is the dir this stage's LANE
+            // names, which is what orders it behind the driver builds.
+            let spec = crate::plan::plan(&c)
+                .into_iter()
+                .find(|s| s.id == StageId::AtpkgTooling)
+                .expect("the atpkg publish tooling is planned whole-tree");
+            assert_eq!(dir, lane_dir(&c, spec.lane), "caller {caller:?}");
         }
     }
 

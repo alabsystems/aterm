@@ -7,22 +7,27 @@
 //! bin shims, per-user `%LOCALAPPDATA%`-ACL privacy (no POSIX mode/owner bits),
 //! `GetDiskFreeSpaceExW` for free space, and `spawn().wait()` + `exit` for exec.
 //!
-//! **This backend has NOT been exercised on a real Windows host, and NOTHING IN THIS
-//! WORKSPACE COMPILES IT.** It is written to be correct-by-construction; the pure `.cmd`
-//! formatting/parsing is unit-tested (on Unix) in [`crate::platform`], and that is the
-//! whole of the evidence for it.
+//! **This backend has NOT been exercised on a real Windows host.** It is written to be
+//! correct-by-construction; the pure `.cmd` formatting/parsing is unit-tested (on Unix) in
+//! [`crate::platform`], and running it is still nobody's evidence.
 //!
-//! This file used to claim it "cross-compiles clean for `x86_64-pc-windows-gnu`". It does
-//! not, and cannot: `atpkg` depends on `libc` unconditionally, `[patch.crates-io]` resolves
-//! `libc` to `crates/aterm-libc`, and that crate's target whitelist admits Windows only as
-//! `all(target_os = "windows", target_env = "msvc", target_arch = "x86_64")` — every other
-//! Windows target hits its `compile_error!("aterm-libc has no generated ABI cell for this
-//! target")`. `x86_64-pc-windows-gnu` is `target_env = "gnu"`, so the documented lane
-//! (`cargo +stable build --target x86_64-pc-windows-gnu`, `.cargo/config.toml`) stops in
-//! `aterm-libc` before this file is parsed. Verified 2026-09-02 by the analogous failure on
-//! `i686-unknown-linux-gnu`, which is refused by the same whitelist. Generating a
-//! `windows-gnu` ABI cell (or gating `atpkg`'s `libc` dependency per-target) is what would
-//! make the old claim true; until then, treat every line below as UNCOMPILED source.
+//! IT IS TYPE-CHECKED, ON EVERY WINDOWS LANE THIS REPOSITORY HAS, and this header has twice
+//! said otherwise. `mod windows` is `#[cfg(windows)]`, so a compiler reads every line below
+//! on all three Windows cells `crates/aterm-libc` now admits — `x86_64-pc-windows-msvc`,
+//! `aarch64-pc-windows-msvc` and `x86_64-pc-windows-gnu`. Type-checked is not run: no `.cmd`
+//! shim, no junction and no `GetDiskFreeSpaceExW` call below has ever executed on a real
+//! Windows host, and that remains the honest limit of the evidence for this file.
+//!
+//! WHICH WINDOWS TRIPLES REACH THIS FILE AT ALL is decided two crates down: `atpkg` depends
+//! on `libc` unconditionally, `[patch.crates-io]` resolves it to `crates/aterm-libc`, and a
+//! triple absent from that crate's cell list does not fall back to an empty cell — it stops
+//! the build at `compile_error!("aterm-libc has no generated ABI cell for this target")`.
+//! Both gaps that cost this repo a lane are closed: `aarch64-pc-windows-msvc`, a triple
+//! `atpkg::TARGETS` publishes rows for, and `x86_64-pc-windows-gnu`, the cfg-validation lane
+//! `.cargo/config.toml` and `rust-toolchain.toml` both configure. Two standing guards keep
+//! the claim true rather than restating it: `crates/atpkg/tests/shipped_triples_have_an_abi_cell.rs`
+//! fails when a SHIPPED triple is one `aterm-libc` refuses, and
+//! `crates/aterm-libc/tests/target_gate.rs` fails when a CONFIGURED build lane is.
 
 use std::ffi::OsStr;
 use std::fs::{self, File, Metadata, OpenOptions};
@@ -104,14 +109,17 @@ pub fn spotlight_query(_scope: &Path, _filename: &str) -> Option<bool> {
 /// `None`: there is no per-volume indexing switch this layer can read (`mdutil` has no
 /// Windows analogue). Refines a message only; no verdict depends on it.
 #[must_use]
-pub fn spotlight_indexing_enabled(_path: &Path) -> Option<bool> {
+pub fn spotlight_index_state(_path: &Path) -> Option<super::IndexState> {
     None
 }
 
 /// Universal Control is a macOS feature; there is nothing to read here.
 #[must_use]
-pub fn universal_control_state() -> [Option<bool>; 2] {
-    [None, None]
+pub fn universal_control_state() -> [crate::machine::KeyRead; 2] {
+    [
+        crate::machine::KeyRead::Absent,
+        crate::machine::KeyRead::Absent,
+    ]
 }
 
 /// Universal Control is a macOS feature; nothing is written and nothing changed.
@@ -161,6 +169,11 @@ pub fn set_mode(_path: &Path, _mode: u32) -> io::Result<()> {
     Ok(())
 }
 
+/// No-op: the handle-based twin of [`set_mode`], for the same reason.
+pub fn set_mode_on(_f: &File, _mode: u32) -> io::Result<()> {
+    Ok(())
+}
+
 /// Open `path` for a fresh (create+truncate) write. `mode` is ignored (no POSIX bits).
 pub fn open_create_write(path: &Path, _mode: u32) -> io::Result<File> {
     OpenOptions::new()
@@ -168,6 +181,14 @@ pub fn open_create_write(path: &Path, _mode: u32) -> io::Result<File> {
         .create(true)
         .truncate(true)
         .open(path)
+}
+
+/// Push ONE open file's contents to the filesystem — the Windows analogue of the Unix
+/// `fsync(2)`: `FlushFileBuffers`, which is what std's `sync_data` calls here. Used by
+/// [`crate::store::sync_tree`] to make a staged tree durable before the renames that
+/// publish it, and by the readiness marker's write.
+pub fn sync_file_contents(f: &File) -> io::Result<()> {
+    f.sync_data()
 }
 
 /// No permission bits on Windows — reports `0` (callers mask/treat it as not-applicable;
@@ -445,6 +466,30 @@ pub fn shim_executable_to_env(
         shim,
         super::cmd_shim_content_env(target, env),
     ))
+}
+
+/// The `agents/` twin on Windows is the plain `.cmd` shim: no `sh` prelude exists for
+/// `cmd.exe`, so `prelude` is accepted for the one call site's sake and ignored — the
+/// landing wait ([`crate::landing`]) is a Unix twin's behaviour.
+pub fn twin_executable_to_env(
+    shim: &Path,
+    target: &Path,
+    env: &crate::shim_env::ShimEnv,
+    prelude: &str,
+) -> io::Result<crate::lay::Executable> {
+    let _ = prelude;
+    shim_executable_to_env(shim, target, env)
+}
+
+/// Lay the `.cmd` twin ([`twin_executable_to_env`]).
+pub fn install_twin_to_env(
+    shim: &Path,
+    target: &Path,
+    env: &crate::shim_env::ShimEnv,
+    prelude: &str,
+) -> io::Result<()> {
+    let _ = prelude;
+    install_shim_to_env(shim, target, env)
 }
 
 /// Install a **failing tombstone shim** at `shim` (a `.cmd`) that prints `message` to

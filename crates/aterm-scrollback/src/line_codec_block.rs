@@ -20,23 +20,18 @@ use super::Line;
 pub fn serialize_lines(lines: &[Line]) -> Vec<u8> {
     // Format: [count:4][line0][line1]...
     //
-    // Pre-allocate from content sizes to avoid repeated Vec doublings
-    // on the warm-tier compaction hot path (#5860).
-    // Per v3 line: 9 bytes fixed overhead (version + flags + content_len
-    // + has_attrs + hyperlink_count) plus content bytes.
+    // Reserve the full wire size, including styles, hyperlinks and underline
+    // colors. Content-only sizing forced colored/link-heavy terminal output
+    // to repeatedly grow and copy the block during warm-tier compression.
     //
     // The estimate is only a capacity hint (never affects the serialized
     // bytes): saturating arithmetic and the pre-allocation bound keep the
     // strict L0 gate's overflow / allocation-budget obligations provable,
-    // while every real block (bounded by warm-tier limits, far below the
-    // 64 MiB page cap) reserves exactly what it did before.
-    let content_bytes = lines
+    // while every real block remains far below the 64 MiB page cap.
+    let estimate = lines
         .iter()
-        .map(Line::len)
-        .fold(0usize, usize::saturating_add);
-    let estimate = 4usize
-        .saturating_add(content_bytes)
-        .saturating_add(lines.len().saturating_mul(9));
+        .map(Line::serialized_size_estimate)
+        .fold(4usize, usize::saturating_add);
     let mut result = if estimate < crate::codec::MAX_DECOMPRESSED_SCROLLBACK_PAGE_BYTES {
         // Inline `.min(MAX - 1)` clamp: in this branch `estimate < MAX`
         // already holds, so `estimate.min(MAX - 1) == estimate` and the
@@ -54,7 +49,7 @@ pub fn serialize_lines(lines: &[Line]) -> Vec<u8> {
     let count = u32::try_from(lines.len()).unwrap_or(u32::MAX);
     result.extend_from_slice(&count.to_le_bytes());
     for line in lines {
-        line.serialize_into(&mut result);
+        line.append_serialized(&mut result);
     }
     result
 }

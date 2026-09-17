@@ -4,9 +4,12 @@
 
 //! Integration test: verify mode recovery pattern used by hotswap (#5520).
 //!
-//! `restore_containment_mode()` in aterm-daemon parses a manifest mode string
-//! and calls `init_mode()`. This test exercises the same contract: parse the
-//! mode string from JSON, initialize it, and verify the global state.
+//! The recovery contract is: parse the mode string a hotswap manifest carries,
+//! call `init_mode()` with it, and have every gate honour the restored mode.
+//! This test exercises that contract end to end against the crate's own API.
+//! It was written against `restore_containment_mode()` in `aterm-daemon`, which
+//! owned the call site; that crate no longer exists (see `src/lib.rs`), so the
+//! contract is stated here directly rather than by pointing at a ghost.
 //!
 //! Regression guard: before #5520 fix, hotswap would silently reset to Master.
 

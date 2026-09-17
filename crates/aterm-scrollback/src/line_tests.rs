@@ -1019,6 +1019,39 @@ fn serialize_lines_capacity_covers_plain_text() {
     }
 }
 
+/// Colored output, OSC 8 links and SGR 58 all contribute to the block's
+/// reservation; a content-only estimate grows and retains excess capacity.
+#[test]
+fn serialize_lines_capacity_covers_styled_hyperlinked_rows() {
+    let mut lines = Vec::new();
+    for _ in 0..64 {
+        let mut attrs = Rle::new();
+        for col in 0..48 {
+            attrs.push(CellAttrs::new(0x01_000000 + col, DEFAULT_BG, 0));
+        }
+        let mut line = Line::with_hyperlinks_owned(
+            "x".repeat(48),
+            attrs,
+            vec![HyperlinkSpan::with_id(
+                0,
+                48,
+                Arc::from("https://example.test/build/output"),
+                Some(Arc::from("build-result")),
+            )],
+        );
+        line.set_underline_colors(vec![UnderlineColorSpan::new(0, 48, 0x01_AA_BB_CC)]);
+        lines.push(line);
+    }
+
+    let serialized = serialize_lines(&lines);
+    assert_eq!(serialized.capacity(), serialized.len());
+    let roundtrip = deserialize_lines(&serialized);
+    assert_eq!(roundtrip.len(), lines.len());
+    for (actual, expected) in roundtrip.iter().zip(&lines) {
+        assert_eq!(actual.serialize(), expected.serialize());
+    }
+}
+
 /// #5860: serialize_lines handles empty and single-line blocks correctly.
 #[test]
 fn serialize_lines_empty_and_single() {

@@ -181,12 +181,12 @@ impl Line {
         } else {
             Vec::new()
         };
-        self.serialize_into(&mut v);
+        self.append_serialized(&mut v);
         v
     }
 
-    /// Exact per-line serialized-size estimate shared by [`Line::serialize`]
-    /// and [`Line::serialize_into`] (capacity hint only).
+    /// Exact per-line serialized-size estimate shared by line and block
+    /// serialization (capacity hint only).
     ///
     /// Saturating arithmetic and an explicit slice loop replace the previous
     /// `1 + 4 + run_count * 14` / `.iter().map(..).sum()` spellings: identical
@@ -199,7 +199,7 @@ impl Line {
     // modeled (toolchain). A size ESTIMATE for tier promotion; every use is
     // advisory.
     #[cfg_attr(trust_verify, trust::skip)]
-    fn serialized_size_estimate(&self) -> usize {
+    pub(super) fn serialized_size_estimate(&self) -> usize {
         let content_len = self.content.as_bytes().len();
         // Closure-free shapes + fn-item accessors (`attr_runs`,
         // `Line::hyperlinks`): identical values, but direct calls to the tiny
@@ -243,17 +243,14 @@ impl Line {
     ///
     /// Identical wire format to [`Line::serialize`], but writes into the
     /// caller's buffer so block-level serialization avoids a per-line
-    /// allocation and redundant copy (#5860). Reserves the exact per-line
-    /// size up front so styled blocks never reallocate `result`.
+    /// allocation and redundant copy (#5860). Reserves this line's size before
+    /// writing; block serialization reserves all lines together instead.
     // Skip: the residual rows are `Rvalue::UnaryOp(PtrMetadata)` (fat-pointer
     // metadata — diagnostic-only until the metadata lane is modeled) and the
     // `Vec::extend_from_slice` alloc class. Round-trip tested against
     // deserialize; every write is length-prefixed.
     #[cfg_attr(trust_verify, trust::skip)]
     pub(crate) fn serialize_into(&self, result: &mut Vec<u8>) {
-        let content = self.content.as_bytes();
-        let content_len = content.len();
-
         // Reserve the exact per-line size (mirrors serialize()'s estimate)
         // so attr/hyperlink-heavy lines don't trigger a realloc. The estimate
         // is a capacity hint only; the bound check keeps the strict gate's
@@ -263,6 +260,18 @@ impl Line {
         if estimate < crate::codec::MAX_DECOMPRESSED_SCROLLBACK_PAGE_BYTES {
             result.reserve(estimate);
         }
+        self.append_serialized(result);
+    }
+
+    /// Shared byte writer. Callers reserve at the line or block boundary, so
+    /// writing an already-sized block does not remeasure every hyperlink or
+    /// repeat a capacity check for every line. `Vec` still grows normally when
+    /// the bounded reservation hint was skipped.
+    // Skip: same PtrMetadata/extend allocation class as `serialize_into`.
+    #[cfg_attr(trust_verify, trust::skip)]
+    pub(super) fn append_serialized(&self, result: &mut Vec<u8>) {
+        let content = self.content.as_bytes();
+        let content_len = content.len();
 
         // Version byte. Emit v4 ONLY when the line carries SGR 58 underline
         // colours, so plain/styled lines stay byte-identical to v3 (a v3 reader

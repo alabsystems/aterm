@@ -39,15 +39,6 @@ pub enum Lane {
     /// the workspace test never builds, so in `target/` it compiled its own
     /// variants serially, after the doctests. Same argv, own lock, t0.
     RegexTarget,
-    /// `target-sealed/` — build the harness's GUI, then run
-    /// `-p aterm-link --features sealed --test two_nodes_sealed`. Preparing the
-    /// GUI here keeps the test off MainTarget's concurrently rebuilt artifact.
-    /// The ONE test covering the vendored astream-aead is `#![cfg(feature =
-    /// "sealed")]`, so the workspace test run compiles it to nothing; until this
-    /// lane it ran on nobody's cadence but a hand's (audit 2026-09-12). Its own
-    /// dir for the regex lane's reason: a feature set the workspace never builds
-    /// would otherwise recompile its variants serially in `target/`.
-    SealedTarget,
     /// `target-xtask/` — the xtask-verb stages (formatting, feature gates, the
     /// proof inventory). The verbs they run spawn no cargo (grep of
     /// `crates/xtask/src/gate.rs`, 2026-09-13), so the only lock they take is
@@ -55,10 +46,13 @@ pub enum Lane {
     XtaskTarget,
     /// `target-drivers/` — every binary the gate DRIVES rather than tests: the
     /// smokes' `aterm-gui`/`aterm-ctl`, the redraw harness, the eight objc
-    /// drivers, and the `driver builds` stage that pre-compiles all of them.
-    /// Only stages in this lane write its uplifted binaries, so no other stage
-    /// can relink one under a smoke (in `target/` the test stage relinked
-    /// `aterm-gui` with dev features).
+    /// drivers, the `driver builds` stage that pre-compiles all of them,
+    /// (since 2026-09-14) the sealed fabric rung, whose suite boots real
+    /// `aterm-gui`s, and (since 2026-09-16) the atpkg publish tooling, whose
+    /// end-to-end pack suite drives a real `atpkg`. Only stages in this lane
+    /// write its uplifted binaries, so no other stage can relink one under a
+    /// smoke, under the rung or under the pack (in `target/` the test stage
+    /// relinked `aterm-gui` with dev features).
     DriverTarget,
 }
 
@@ -69,7 +63,8 @@ pub enum StageId {
     Test,
     Doctests,
     RegexLane,
-    /// The sealed cross-host rung of the fabric bridge, `--features sealed`.
+    /// The sealed cross-host rung of the fabric bridge, `--features sealed`. A
+    /// DRIVER-lane stage: its suite boots real `aterm-gui`s (see `plan`).
     SealedLane,
     Tippy,
     Formatting,
@@ -153,7 +148,6 @@ pub fn lane_dir(ctx: &Ctx, lane: Lane) -> Option<PathBuf> {
         Lane::FreezeGateTarget => under_root("tools/freeze-safety-gate/target"),
         Lane::LibcOracleTarget => under_root("libc-oracle/target"),
         Lane::RegexTarget => under_root("target-regex"),
-        Lane::SealedTarget => under_root("target-sealed"),
         Lane::XtaskTarget => under_root("target-xtask"),
         Lane::DriverTarget => under_root("target-drivers"),
     }
@@ -162,8 +156,9 @@ pub fn lane_dir(ctx: &Ctx, lane: Lane) -> Option<PathBuf> {
 /// Build the run's stage list.
 ///
 /// Two things can remove a stage entirely (as opposed to skipping it):
-///  * `--scope` narrowing away from `aterm-search` drops the regex lane, because
-///    there is nothing for it to run — the script never printed its header either;
+///  * `--scope` narrowing away from `aterm-search` drops the regex lane, and away
+///    from `aterm-link` the sealed fabric lane, because there is nothing for either
+///    to run — the script never printed the regex lane's header either;
 ///  * `--fast` drops the two `--full`-only stages.
 ///
 /// Nothing else is conditional here. Absent TOOLS produce skips inside a stage,
@@ -176,14 +171,11 @@ pub fn plan(ctx: &Ctx) -> Vec<StageSpec> {
         spec(StageId::Build, format!("build ({label})"), Lane::MainTarget),
         // THE TEST RUN WAITS FOR THE SIDE LANES (2026-09-13). They start at t0
         // beside the build; the test run still owns the machine's cargo work
-        // the way it did when they queued behind it in `target/`.
+        // the way it did when they queued behind it in `target/`. The sealed
+        // fabric rung is one of the driver lane's stages, so it is waited for
+        // through `DriverTarget`.
         StageSpec {
-            after_lanes: vec![
-                Lane::RegexTarget,
-                Lane::SealedTarget,
-                Lane::XtaskTarget,
-                Lane::DriverTarget,
-            ],
+            after_lanes: vec![Lane::RegexTarget, Lane::XtaskTarget, Lane::DriverTarget],
             ..spec(StageId::Test, format!("test ({label})"), Lane::MainTarget)
         },
         spec(
@@ -197,13 +189,6 @@ pub fn plan(ctx: &Ctx) -> Vec<StageSpec> {
             StageId::RegexLane,
             "regex search lane (aterm-search --features regex)",
             Lane::RegexTarget,
-        ));
-    }
-    if ctx.scope.includes_sealed_lane() {
-        v.push(spec(
-            StageId::SealedLane,
-            "sealed fabric lane (aterm-link --features sealed)",
-            Lane::SealedTarget,
         ));
     }
     v.push(spec(
@@ -234,11 +219,6 @@ pub fn plan(ctx: &Ctx) -> Vec<StageSpec> {
     v.push(spec(
         StageId::InstallChannel,
         "bootstrap update-channel arbitration/identity",
-        Lane::Pure,
-    ));
-    v.push(spec(
-        StageId::AtpkgTooling,
-        "atpkg publish tooling (author-vendor/index/publish rows + the vendor lane; stubbed)",
         Lane::Pure,
     ));
     v.push(spec(
@@ -287,6 +267,78 @@ pub fn plan(ctx: &Ctx) -> Vec<StageSpec> {
     v.push(spec(
         StageId::DriverBuilds,
         "driver builds (smoke, redraw and objc binaries)",
+        Lane::DriverTarget,
+    ));
+    // THE SEALED FABRIC RUNG (2026-09-14), a DRIVER-lane stage declared behind
+    // the driver builds. `tests/two_nodes_sealed.rs` is `#![cfg(feature =
+    // "sealed")]`, so the workspace test run compiles the one test covering the
+    // vendored astream-aead to nothing and this row is its only cadence. Its
+    // suite boots real `aterm-gui --headless` processes, which aterm-link cannot
+    // declare (`CARGO_BIN_EXE_` names its own package's binaries only), so the
+    // harness FINDS one — first in the target dir the test binary was built
+    // into — and refuses one older than any source cargo's depfile names.
+    //
+    // It first ran at t0 in a `target-sealed/` of its own, which never builds
+    // `aterm-gui`, so the harness fell through to `target/`'s: still being
+    // relinked by the build stage on a warm gate, absent on a cold one.
+    // MEASURED on a warm gate after a commit that touched an aterm-gui
+    // dependency: the rung ran 2.0–71.4 s, the build 2.0–116.9 s, and 5 of its
+    // 9 tests were refused with "aterm-gui is STALE". The guard was right; the
+    // order was wrong.
+    //
+    // So it runs where the gate's driven `aterm-gui` is built: the suite is
+    // compiled into `target-drivers/`, which makes that binary the harness's
+    // first search; the stage's first child is the smokes' own build argv (a
+    // fingerprint no-op after the row above, a real build if anything moved)
+    // and the suite starts only if it succeeded; and this lane's order keeps
+    // the whole row behind the driver builds, with nothing else writing the
+    // lane's binaries while it runs. Declared BEFORE the smokes' barrier, so
+    // the test run still waits for it and never overlaps it; it waits on no
+    // lanes itself, so `sched::check_after_lanes` still holds.
+    if ctx.scope.includes_sealed_lane() {
+        v.push(spec(
+            StageId::SealedLane,
+            "sealed fabric lane (aterm-link --features sealed)",
+            Lane::DriverTarget,
+        ));
+    }
+    // THE ATPKG PUBLISH TOOLING (2026-09-16) — the driver lane's other row, and
+    // it moved here for the reason the rung above did. Its third suite
+    // (`tools/test-atpkg-pack-one-compiler.sh`, section D) PACKS a sysroot
+    // bundle with a real `atpkg`, and on a host that can run that pack (macOS
+    // with cc, codesign and zstd) it treats a missing binary as a GAP in the
+    // run and FAILS, rather than printing PASS over half its checks. It
+    // resolved that binary as `$ATPKG`, else `<root>/target/debug/atpkg`, else
+    // the release one — and a `Lane::Pure` stage starting at t0 can only read
+    // those from a PREVIOUS run.
+    //
+    // MEASURED on 86381efbf (`ATERM_VERIFY_TIMINGS`): the row ran 2.685 s ->
+    // 112.393 s and FAILED with "section D (the real pack end to end) cannot
+    // run: no atpkg binary", while the workspace build that writes
+    // `target/debug/atpkg` ran 2.685 s -> 805.370 s. Three earlier gates passed
+    // the row only because a STALE `atpkg` from an earlier run sat in the warm
+    // snapshot; on a cold one it could never pass.
+    //
+    // So it is a driver-lane stage: its first child is `targo build -q -p
+    // atpkg` in `target-drivers/`, the pack suite runs only if that built and
+    // is handed `$ATPKG` = the binary it just built (which puts the stale
+    // `<root>/target` fallback out of reach), and this lane's order keeps the
+    // whole row behind the driver builds, with nothing else writing the lane's
+    // binaries while it runs. Declared BEFORE the smokes' barrier, so the test
+    // run still waits for it and never overlaps it; it waits on no lanes
+    // itself, so `sched::check_after_lanes` still holds.
+    //
+    // THE DRIVER LANE rather than one of its own, measured: of the 49 units
+    // `-p atpkg` needs, 48 are units this lane already holds (unit graphs,
+    // 2026-09-16) — 44 of them at an identical feature set, and 4 (`ring`'s
+    // three units and `aterm-types`) at a different one, which cargo keys and
+    // caches separately and therefore never relinks out from under the
+    // `aterm-gui` the smokes drive. A lane of its own would compile all 49
+    // from cold on every gate, which is the second `aterm-gui` mistake
+    // `target-sealed/` made.
+    v.push(spec(
+        StageId::AtpkgTooling,
+        "atpkg publish tooling (author-vendor/index/publish rows + the vendor lane; stubbed)",
         Lane::DriverTarget,
     ));
     v.push(exclusive(
@@ -542,12 +594,10 @@ mod tests {
                 StageId::Test,
                 StageId::Doctests,
                 StageId::RegexLane,
-                StageId::SealedLane,
                 StageId::Tippy,
                 StageId::Formatting,
                 StageId::GrepGuards,
                 StageId::InstallChannel,
-                StageId::AtpkgTooling,
                 StageId::TrustGateVerdict,
                 StageId::TrustContractProbe,
                 StageId::StartCompare,
@@ -557,6 +607,8 @@ mod tests {
                 StageId::FreezeGate,
                 StageId::ProofInventory,
                 StageId::DriverBuilds,
+                StageId::SealedLane,
+                StageId::AtpkgTooling,
                 StageId::ControlSocketSmoke,
                 StageId::GuiSmoke,
                 StageId::RedrawConformance,
@@ -577,6 +629,14 @@ mod tests {
     /// allowed to lose one. This is the 18f19eea6 ladder as a literal — its 28
     /// `--fast` stages and the 3 `--full` tiers — and every one must still be
     /// planned, in that order, in every mode and scope that planned it then.
+    /// The literal also carries the sealed fabric lane, which joined on
+    /// 2026-09-14 and moved behind the driver builds the same day (its row is
+    /// filtered by its crate, like the regex lane's). The atpkg publish tooling
+    /// moved on 2026-09-16, for the same reason and to the same place: it
+    /// drives an `atpkg` binary, and at t0 in `Lane::Pure` the only one it
+    /// could find was a previous run's. Its row is still here, still before the
+    /// smokes — what moved is where in this order it sits, and that is exactly
+    /// what a stage-set proof must let through and an order proof must not.
     #[test]
     fn every_stage_of_the_18f19eea6_ladder_is_still_planned_in_order() {
         const FAST_18F19EEA6: [StageId; 29] = [
@@ -584,12 +644,10 @@ mod tests {
             StageId::Test,
             StageId::Doctests,
             StageId::RegexLane,
-            StageId::SealedLane,
             StageId::Tippy,
             StageId::Formatting,
             StageId::GrepGuards,
             StageId::InstallChannel,
-            StageId::AtpkgTooling,
             StageId::TrustGateVerdict,
             StageId::TrustContractProbe,
             StageId::StartCompare,
@@ -598,6 +656,8 @@ mod tests {
             StageId::LibcOracle,
             StageId::FreezeGate,
             StageId::ProofInventory,
+            StageId::SealedLane,
+            StageId::AtpkgTooling,
             StageId::ControlSocketSmoke,
             StageId::GuiSmoke,
             StageId::RedrawConformance,
@@ -667,23 +727,19 @@ mod tests {
             let test = p.iter().position(|s| s.id == StageId::Test).expect("test");
             assert_eq!(
                 p[test].after_lanes,
-                [
-                    Lane::RegexTarget,
-                    Lane::SealedTarget,
-                    Lane::XtaskTarget,
-                    Lane::DriverTarget
-                ]
+                [Lane::RegexTarget, Lane::XtaskTarget, Lane::DriverTarget]
             );
             let awaited: Vec<StageId> = crate::sched::awaited(&p, test).map(|j| p[j].id).collect();
             assert_eq!(
                 awaited,
                 [
                     StageId::RegexLane,
-                    StageId::SealedLane,
                     StageId::Formatting,
                     StageId::FeatureGates,
                     StageId::ProofInventory,
                     StageId::DriverBuilds,
+                    StageId::SealedLane,
+                    StageId::AtpkgTooling,
                 ],
                 "{mode:?}"
             );
@@ -708,6 +764,104 @@ mod tests {
                     .all(|s| s.after_lanes.is_empty())
             );
             crate::sched::check_after_lanes(&p).expect("the plan cannot deadlock");
+        }
+    }
+
+    /// THE SEALED RUNG IS ORDERED BEHIND THE aterm-gui IT DRIVES (2026-09-14).
+    ///
+    /// Its suite finds `aterm-gui` in the target dir it was built into and
+    /// refuses a stale one. When it ran at t0 in a lane of its own, nothing
+    /// ordered it behind any build of that binary, and a warm gate measured 5 of
+    /// its 9 tests refused "aterm-gui is STALE" while the build stage was still
+    /// linking. It must sit in the lane whose driver builds produce the binary,
+    /// declared after them and before the smokes' barrier (so the test run
+    /// still awaits it), and wait on no lanes itself. `stages.rs` pins that its
+    /// commands build into that same lane's dir, and `sched.rs` model-checks
+    /// that it never starts before the driver builds finish.
+    #[test]
+    fn the_sealed_rung_is_ordered_behind_the_driver_builds_of_the_aterm_gui_it_drives() {
+        for mode in [Mode::Fast, Mode::Full] {
+            for scope in [
+                Scope::workspace(),
+                Scope::crate_only("aterm-link"),
+                Scope::changed("main", vec!["aterm-link".into()], true),
+            ] {
+                let p = plan(&ctx(mode, scope.clone()));
+                let at = |id| p.iter().position(|s| s.id == id);
+                let sealed = at(StageId::SealedLane).expect("the sealed rung is planned");
+                let builds = at(StageId::DriverBuilds).expect("driver builds are planned");
+                let test = at(StageId::Test).expect("test");
+                let barrier = p
+                    .iter()
+                    .position(|s| s.exclusive)
+                    .expect("an exclusive stage");
+                let what = format!("{mode:?} / {}", scope.label());
+                assert_eq!(p[sealed].lane, Lane::DriverTarget, "{what}");
+                assert_eq!(p[builds].lane, p[sealed].lane, "{what}");
+                assert!(
+                    builds < sealed && sealed < barrier,
+                    "{what}: the rung must follow the driver builds and precede the smokes"
+                );
+                assert!(p[sealed].after_lanes.is_empty(), "{what}");
+                assert!(
+                    crate::sched::awaited(&p, test).any(|j| j == sealed),
+                    "{what}: the test run must still wait for the rung"
+                );
+            }
+        }
+    }
+
+    /// THE ATPKG PUBLISH TOOLING IS ORDERED BEHIND THE atpkg IT DRIVES
+    /// (2026-09-16).
+    ///
+    /// Its third suite packs a real sysroot bundle with a real `atpkg`, which
+    /// it resolves as `$ATPKG`, else `<root>/target/debug/atpkg`, else the
+    /// release one — and on a host that can run that pack it FAILS rather than
+    /// skipping when there is none. At t0 in `Lane::Pure` it could only ever
+    /// find a PREVIOUS run's binary: measured on 86381efbf, FAIL at 2.685 s ->
+    /// 112.393 s while the build that writes that path ran to 805.370 s. So it
+    /// must sit in the lane whose dir its own build child writes, declared
+    /// after the driver builds and before the smokes' barrier (so the test run
+    /// still awaits it), waiting on no lanes itself — and it must never again
+    /// be `Lane::Pure`, which is what a t0 start means here. `stages.rs` pins
+    /// the build child and the `$ATPKG` binding; `sched.rs` model-checks that
+    /// it never starts before the driver builds finish.
+    #[test]
+    fn the_atpkg_tooling_is_ordered_behind_the_build_of_the_atpkg_it_drives() {
+        for mode in [Mode::Fast, Mode::Full] {
+            for scope in [
+                Scope::workspace(),
+                Scope::crate_only("atpkg"),
+                Scope::crate_only("aterm-grid"),
+                Scope::changed("main", vec!["aterm-gui".into()], true),
+                Scope::changed("main", vec![], true),
+            ] {
+                let p = plan(&ctx(mode, scope.clone()));
+                let at = |id| p.iter().position(|s| s.id == id);
+                let what = format!("{mode:?} / {}", scope.label());
+                // A narrowing may not remove it: the suites are whole-tree.
+                let atpkg = at(StageId::AtpkgTooling)
+                    .unwrap_or_else(|| panic!("{what}: the atpkg publish tooling is planned"));
+                let builds = at(StageId::DriverBuilds).expect("driver builds are planned");
+                let test = at(StageId::Test).expect("test");
+                let barrier = p
+                    .iter()
+                    .position(|s| s.exclusive)
+                    .expect("an exclusive stage");
+                assert_eq!(p[atpkg].lane, Lane::DriverTarget, "{what}");
+                assert_eq!(p[builds].lane, p[atpkg].lane, "{what}");
+                assert!(
+                    builds < atpkg && atpkg < barrier,
+                    "{what}: the row must follow the driver builds and precede the smokes"
+                );
+                assert!(p[atpkg].after_lanes.is_empty(), "{what}");
+                assert!(
+                    crate::sched::awaited(&p, test).any(|j| j == atpkg),
+                    "{what}: the test run must wait for it, as it does for every \
+                     non-barrier row of that lane"
+                );
+                crate::sched::check_after_lanes(&p).expect("the plan cannot deadlock");
+            }
         }
     }
 
@@ -873,11 +1027,12 @@ mod tests {
                 StageId::FreezeGate => Lane::FreezeGateTarget,
                 StageId::LibcOracle => Lane::LibcOracleTarget,
                 StageId::RegexLane => Lane::RegexTarget,
-                StageId::SealedLane => Lane::SealedTarget,
                 StageId::Formatting | StageId::FeatureGates | StageId::ProofInventory => {
                     Lane::XtaskTarget
                 }
                 StageId::DriverBuilds
+                | StageId::SealedLane
+                | StageId::AtpkgTooling
                 | StageId::ControlSocketSmoke
                 | StageId::GuiSmoke
                 | StageId::RedrawConformance
@@ -891,7 +1046,6 @@ mod tests {
                 | StageId::ObjcBoundDrive => Lane::DriverTarget,
                 StageId::GrepGuards
                 | StageId::InstallChannel
-                | StageId::AtpkgTooling
                 | StageId::TrustGateVerdict
                 | StageId::TrustContractProbe
                 | StageId::StartCompare

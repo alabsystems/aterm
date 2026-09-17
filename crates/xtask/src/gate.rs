@@ -2745,8 +2745,8 @@ impl CellPolicy {
     }
 }
 
-/// WHERE A BUILD-SCRIPT OVERRIDE IS NOT ALLOWED TO BE USED, named rather than
-/// assumed.
+/// WHERE A BUILD-SCRIPT OVERRIDE IS NOT ALLOWED TO BE USED ANYWHERE, named
+/// rather than assumed.
 ///
 /// An override is faithful exactly when the build script it replaces emits
 /// nothing that changes how the compiler reads the crate — no `rustc-cfg`, no
@@ -2757,27 +2757,17 @@ impl CellPolicy {
 /// it there would type-check a DIFFERENT crate and call the result coverage.
 ///
 /// So the two triples where the one shipped shim is known to be unfaithful are
-/// refused by the gate itself, and a policy row that names one is a hard error
+/// refused by the parser itself, and a policy row that names one is a hard error
 /// rather than a silently-wrong green.
+///
+/// EVERYTHING REFUSED HERE IS REFUSED ON EVERY BOX, and that is the rule for
+/// what may live in this function. The policy file is committed and read on
+/// macOS, Linux and Windows alike, so a refusal that depends on which machine
+/// is reading cannot be a parse error about the FILE — it would make a portable
+/// row unwritable and take the whole verb down with it. The host's own triple
+/// is exactly such a refusal, and it lives in `host_shim_refusal`, applied to
+/// the one cell it is about.
 fn shim_refusal(triple: &str) -> Option<String> {
-    // The HOST triple is refused too, and for a different reason than the two
-    // below. A judge proved this one: triple-scoping does NOT exclude the host,
-    // the mac-arm cell runs with no `--target`, and cargo applies a
-    // `[target.<host-triple>.<links>]` override there — so a committed row
-    // naming `aarch64-apple-darwin` made `gate cells --cell mac-arm` print
-    // `SHIMMED … 114/114 … 69/69` and exit 0 while zstd-sys's build script
-    // never ran. The comment two lines from here claimed that could not happen.
-    //
-    // The principle that makes this a refusal rather than a caveat: a cell that
-    // can RUN a build script has no need of an override. The shim exists only
-    // because no cross C toolchain is installed; on the host, one is.
-    if rustc_host_triple().is_some_and(|h| h == triple) {
-        return Some(format!(
-            "`{triple}` is this machine's own triple, where the build script RUNS — a cell that \
-             can run a build script needs no override, and applying one there would suppress the \
-             real script and call the result coverage"
-        ));
-    }
     if triple.starts_with("wasm32") || triple.contains("hermit") {
         return Some(format!(
             "`{triple}` is a target where a bundled-C build script is known to emit `rustc-cfg` \
@@ -2786,6 +2776,41 @@ fn shim_refusal(triple: &str) -> Option<String> {
         ));
     }
     None
+}
+
+/// WHERE A BUILD-SCRIPT OVERRIDE IS NOT ALLOWED TO BE APPLIED ON *THIS* BOX.
+///
+/// A judge proved this one: triple-scoping does NOT exclude the host. The
+/// native cell runs with no `--target`, and cargo applies a
+/// `[target.<host-triple>.<links>]` override there too — so a committed row
+/// naming `aarch64-apple-darwin` made `gate cells --cell mac-arm` print
+/// `SHIMMED … 114/114 … 69/69` and exit 0 on an Apple box while zstd-sys's
+/// build script never ran.
+///
+/// The principle: a cell that can RUN a build script has no need of an
+/// override. The shim exists only because no cross C toolchain is installed;
+/// on the host, one is.
+///
+/// WHICH TRIPLE IS THE HOST IS A FACT ABOUT THE MACHINE, NOT ABOUT THE FILE,
+/// and reading it as a fact about the file is what this function exists to
+/// stop. The refusal used to fire inside `parse_cell_policy`, before a single
+/// cell had been selected, so the two committed `x86_64-unknown-linux-gnu`
+/// rows — correct rows, measured on m21 where Linux is a CROSS cell — made
+/// `gate cells --cell win` print `COULD NOT RUN` on every Linux box and never
+/// reach the `win` cell at all: the only gate that compiles aterm for Windows,
+/// unstartable on a Linux box, so no Windows break authored on one could turn
+/// it red. So the answer is per-cell. The row is CARRIED, the cell whose triple
+/// is the host declines to apply it and says so, and every other cell gets its
+/// overrides. Such a row is not a dead row either — the box that needs it is
+/// some other box.
+fn host_shim_refusal(triple: &str, host: &str) -> Option<String> {
+    (triple == host).then(|| {
+        format!(
+            "`{triple}` is this machine's own triple, where the build script RUNS — a cell that \
+             can run a build script needs no override, and applying one there would suppress the \
+             real script and call the result coverage"
+        )
+    })
 }
 
 /// Parse [`CELL_GATE_POLICY`]. Strict on purpose: an unreadable row is a
@@ -3034,6 +3059,13 @@ struct CellReport {
     /// In-repo packages that CANNOT produce an artifact for a cross triple
     /// because they are proc macros, and so are not owed one.
     own_proc_macros: usize,
+    /// Workspace members in this cell's graph whose TEST targets a compiler read
+    /// for the cell's triple, over the number owed. `0/0` where the cell is
+    /// exempt (`tests_note`) — the host cell, and the two wasm32 cells.
+    tests_checked: usize,
+    tests_owed: usize,
+    /// Why the test-target pass did not run here, when it did not.
+    tests_note: Option<String>,
     secs: u64,
     status: String,
     ok: bool,
@@ -3092,6 +3124,277 @@ fn manifest_is_proc_macro(dir: &Path) -> bool {
         }
     }
     false
+}
+
+// ---------------------------------------------------------------------------
+// G-CELLS, SECOND PASS: THE TEST TARGETS
+// ---------------------------------------------------------------------------
+
+/// The names of every workspace member, from `cargo metadata --no-deps`.
+///
+/// Parsed rather than globbed out of the root manifest because `[workspace]
+/// members` carries globs and four packages in this workspace are named
+/// something other than their directory (`crates/aterm-libc` is `libc`,
+/// `crates/aterm-arrayvec` is `arrayvec`, and so on) — and the NAME is what
+/// `--exclude` takes.
+fn parse_member_names(json: &str) -> Result<std::collections::BTreeSet<String>, String> {
+    let value = aterm_json::from_str::<aterm_json::Value>(json)
+        .map_err(|e| format!("`cargo metadata` did not print JSON: {e}"))?;
+    let packages = value
+        .get("packages")
+        .and_then(aterm_json::Value::as_array)
+        .ok_or_else(|| "`cargo metadata` printed no `packages` array".to_string())?;
+    let names: std::collections::BTreeSet<String> = packages
+        .iter()
+        .filter_map(|p| p.get("name"))
+        .filter_map(aterm_json::Value::as_str)
+        .map(str::to_string)
+        .collect();
+    if names.is_empty() {
+        return Err("`cargo metadata --no-deps` listed no workspace members".to_string());
+    }
+    Ok(names)
+}
+
+/// Split the workspace's members into the ones this cell's graph carries and the
+/// ones it does not.
+///
+/// `--workspace --exclude …`, NOT a list of `-p` flags, and that is not a
+/// stylistic choice. Cargo re-resolves for a partial `-p` selection, and this
+/// workspace cannot be resolved for one that holds both `aterm-alloc` and
+/// `aterm-gpu`: the differential oracle pins `arrayvec = "=0.7.7"` as a dev-dep
+/// while `[patch.crates-io]` points every other consumer at the first-party
+/// 0.7.8, and the two cannot coexist in one partial resolve — measured, `error:
+/// failed to select a version for arrayvec … all possible versions conflict
+/// with previously selected packages`. `--workspace` resolves the whole graph
+/// once, the way an ordinary build does, and `--exclude` then narrows what is
+/// COMPILED without touching what was RESOLVED.
+fn cell_test_selection(
+    members: &std::collections::BTreeSet<String>,
+    graph: &std::collections::BTreeSet<String>,
+) -> (Vec<String>, Vec<String>) {
+    let selected: Vec<String> = members.intersection(graph).cloned().collect();
+    let excluded: Vec<String> = members.difference(graph).cloned().collect();
+    (selected, excluded)
+}
+
+/// Why this cell is NOT owed a test-target pass — `None` when it is.
+///
+/// TWO EXEMPTIONS, BOTH NARROW, BOTH SAID OUT LOUD IN THE RUN rather than left
+/// as a silent `if`.
+///
+///   * THE HOST CELL. `cargo test` on this box already compiles every test
+///     target for this triple, and `tools/verify.sh` runs it on every change.
+///     The hole this pass exists for is a triple that is NOT the box's own,
+///     where nothing anywhere compiles a `#[cfg(test)]` line.
+///   * THE wasm32 CELLS. `cargo test --target wasm32-unknown-unknown` is not an
+///     operation this repo performs — the web renderers run inside Electron —
+///     and pulling the test targets in drags every member's DEV-dependencies
+///     with them: `criterion` (Rayon: "cannot be used when targeting wasi32"),
+///     `getrandom` ("the wasm32-unknown-unknown targets are not supported by
+///     default"), `wait-timeout` and `zstd-sys` all fail to build for wasm32 in
+///     their own code. Measured 2026-09-16. Owing a pass that upstream crates
+///     make impossible would teach the next reader to delete the pass.
+fn test_pass_exemption(triple: &str, is_host: bool) -> Option<String> {
+    if is_host {
+        return Some(format!(
+            "it is this box's own triple, so `cargo test` already compiles every test target for \
+             {triple}"
+        ));
+    }
+    if triple.starts_with("wasm32") {
+        return Some(format!(
+            "`cargo test --target {triple}` is not an operation this repo performs, and the test \
+             targets drag in dev-dependencies (criterion/Rayon, getrandom, wait-timeout, zstd-sys) \
+             that do not build for wasm32 in their own code"
+        ));
+    }
+    None
+}
+
+/// What one cell's TEST-TARGET pass produced.
+struct TestPass {
+    /// Workspace members in this cell's graph that produced a test artifact for
+    /// the cell's triple.
+    checked: std::collections::BTreeSet<String>,
+    /// Workspace members in this cell's graph, minus proc macros: the members
+    /// this pass OWES a test artifact for.
+    owed: Vec<String>,
+    /// Rendered `error` diagnostics, by package.
+    errors: Vec<(String, String)>,
+    /// Cargo-level errors (a rejected flag, a dead build script, a missing std).
+    cargo_errors: Vec<String>,
+    secs: u64,
+}
+
+/// What [`run_cell_test_pass`] needs: everything the library pass already
+/// resolved for this cell, so the two passes cannot disagree about the
+/// toolchain, the target dir or the build-script overrides in force.
+#[derive(Clone, Copy)]
+struct TestPassJob<'a> {
+    root: &'a Path,
+    cell: &'a aterm_forge::model::Cell,
+    /// The toolchain the library pass selected — a cross cell only, so never
+    /// the repo pin.
+    toolchain: &'a str,
+    target_dir: &'a Path,
+    /// The `--config` build-script overrides this cell's `cshim` rows put in
+    /// force, verbatim: a second pass compiling the same graph without them
+    /// would die on the same C build scripts the first pass was excused from.
+    shim_args: &'a [String],
+    members: &'a std::collections::BTreeSet<String>,
+    graph_names: &'a std::collections::BTreeSet<String>,
+    proc_macros: &'a std::collections::BTreeSet<String>,
+}
+
+/// Type-check EVERY TARGET — lib, bins, tests, benches, examples — of every
+/// workspace member in this cell's graph, for the cell's own triple.
+///
+/// THE HOLE THIS CLOSES, measured rather than argued. The pass above checks
+/// `-p <cell root package>` without `--all-targets`, so no compiler any cell
+/// ran had ever read a `#[cfg(test)]` line for a triple that is not the box's
+/// own. Three defects landed in that gap in four days, each found by hand and
+/// each invisible to every gate in the tree: `atpkg`'s unit-test binary did not
+/// BUILD off macOS (commit 693f1c331), `aterm-gui`'s did not build for Windows
+/// (b2c2bb53d), and `aterm-verify`'s — the merge gate's own crate, which ships
+/// inside `aterm-cli` — did not either. A `#[cfg(test)]` module is one
+/// compilation unit with the crate, so ONE unix-only name in a fixture costs
+/// the whole crate's test binary on every other target, not one test.
+fn run_cell_test_pass(job: &TestPassJob<'_>) -> Result<TestPass, String> {
+    let TestPassJob {
+        root,
+        cell,
+        toolchain,
+        target_dir,
+        shim_args,
+        members,
+        graph_names,
+        proc_macros,
+    } = *job;
+    let (selected, excluded) = cell_test_selection(members, graph_names);
+    // A SELECTION THAT CAME OUT EMPTY IS A FAILURE, NOT A GREEN PASS. If the
+    // member list or the graph ever stopped lining up — a rename, a resolver
+    // change — `--workspace` minus every member is a cargo run that compiles
+    // nothing and exits 0, which is precisely the shape of vacuity this whole
+    // verb exists to refuse.
+    if selected.is_empty() {
+        return Err(format!(
+            "no workspace member is in cell `{}`'s graph, so the test-target pass would compile \
+             nothing and pass. The member list ({} names) and the graph ({} packages) do not \
+             overlap at all.",
+            cell.name,
+            members.len(),
+            graph_names.len()
+        ));
+    }
+    let started = std::time::Instant::now();
+    let cwd = neutral_build_cwd("cells-tests")
+        .ok_or_else(|| "could not create the neutral build cwd".to_string())?;
+    let mut cmd = Command::new("cargo");
+    cmd.current_dir(&cwd)
+        .env("CARGO_TARGET_DIR", target_dir)
+        .env("RUSTUP_TOOLCHAIN", toolchain)
+        .arg("check")
+        .arg("--locked")
+        .arg("--keep-going")
+        .arg("--message-format=json")
+        .arg("--all-targets")
+        .arg("--workspace")
+        .arg("--manifest-path")
+        .arg(root.join("Cargo.toml"))
+        .arg("--target")
+        .arg(&cell.triple);
+    for name in &excluded {
+        cmd.arg("--exclude").arg(name);
+    }
+    for arg in shim_args {
+        cmd.arg("--config").arg(arg);
+    }
+    let out = cmd.output();
+    let _ = std::fs::remove_dir_all(&cwd);
+    let out = out.map_err(|e| format!("could not run cargo ({e})"))?;
+    let secs = started.elapsed().as_secs();
+
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    let filter = Some(cell.triple.as_str());
+    let mut checked: std::collections::BTreeSet<String> = std::collections::BTreeSet::new();
+    let mut errors: Vec<(String, String)> = Vec::new();
+    for line in stdout.lines() {
+        let Ok(value) = aterm_json::from_str::<aterm_json::Value>(line) else {
+            continue;
+        };
+        let reason = value.get("reason").and_then(aterm_json::Value::as_str);
+        let pkg = value
+            .get("package_id")
+            .and_then(aterm_json::Value::as_str)
+            .map(package_id_name)
+            .unwrap_or("<unknown>")
+            .to_string();
+        match reason {
+            Some("compiler-artifact") => {
+                // `profile.test` is what separates a TEST target's unit from
+                // the lib unit the first pass already counted. Without it a
+                // crate whose tests failed to compile would still be "checked"
+                // here on the strength of its library, and this pass would
+                // measure exactly what the pass above it measures.
+                let is_test = value
+                    .get("profile")
+                    .and_then(|p| p.get("test"))
+                    .and_then(aterm_json::Value::as_bool)
+                    .unwrap_or(false);
+                let files: Vec<String> = value
+                    .get("filenames")
+                    .and_then(aterm_json::Value::as_array)
+                    .map(|a| {
+                        a.iter()
+                            .filter_map(aterm_json::Value::as_str)
+                            .map(str::to_string)
+                            .collect()
+                    })
+                    .unwrap_or_default();
+                if is_test && artifact_is_for(filter, &files) && graph_names.contains(&pkg) {
+                    checked.insert(pkg);
+                }
+            }
+            Some("compiler-message") => {
+                let msg = value.get("message");
+                let level = msg
+                    .and_then(|m| m.get("level"))
+                    .and_then(aterm_json::Value::as_str);
+                if level == Some("error") {
+                    let rendered = msg
+                        .and_then(|m| m.get("rendered"))
+                        .and_then(aterm_json::Value::as_str)
+                        .unwrap_or("")
+                        .to_string();
+                    errors.push((pkg, rendered));
+                }
+            }
+            _ => {}
+        }
+    }
+    // Same column-zero rule as the pass above, and for the same reason: an
+    // excused build script re-emits its own output INDENTED under `Caused by:`,
+    // and `error: could not compile` is cargo's summary of diagnostics already
+    // counted through the JSON stream.
+    let cargo_errors: Vec<String> = stderr
+        .lines()
+        .filter(|l| l.starts_with("error") && !l.starts_with("error: could not compile"))
+        .map(str::to_string)
+        .collect();
+
+    let owed: Vec<String> = selected
+        .into_iter()
+        .filter(|n| !proc_macros.contains(n))
+        .collect();
+    Ok(TestPass {
+        checked,
+        owed,
+        errors,
+        cargo_errors,
+        secs,
+    })
 }
 
 /// `xtask gate cells` — every forge cell, type-checked BY A COMPILER for its own
@@ -3166,6 +3469,25 @@ fn manifest_is_proc_macro(dir: &Path) -> bool {
 /// 123 -> 147, with every remaining unreached package on both a host-only proc
 /// macro or a build dep of one.
 ///
+/// A row naming THE READER'S OWN TRIPLE is a third case, and it is answered per
+/// cell rather than per file (`host_shim_refusal`): that cell declines the
+/// override and compiles with the real build script, every other cell keeps
+/// its overrides, and the row is live rather than dead. Refusing it at parse
+/// time instead — which this verb did until the rows for a cross Linux cell
+/// met a Linux host — took down `--cell win` along with it.
+///
+/// TWO PASSES PER CELL SINCE 2026-09-16, and the second is the one this gate
+/// had been missing. Pass one checks `-p <cell package>` — libraries, the cell's
+/// root binary, and everything beneath them. Pass two checks `--workspace
+/// --all-targets` minus the members this cell's graph does not carry, so every
+/// workspace member's TESTS, benches and examples are read by a compiler for the
+/// cell's triple too. Until it existed, no compiler anywhere read a
+/// `#[cfg(test)]` line for a triple that was not the box's own, and three crates
+/// shipped test binaries that did not BUILD off the author's machine — `atpkg`
+/// off macOS, `aterm-gui` and `aterm-verify` for Windows — each found by hand,
+/// none by a gate. `test_pass_exemption` names the two cells that are not owed
+/// the pass and why, in the run's own output.
+///
 /// WHAT IT STILL DOES NOT COVER, said out loud in the verdict rather than left
 /// to a reader. A shimmed cell TYPE-CHECKS; it never links the bundled C — nor
 /// does any other cell, because `cargo check` does not link — and no cell runs a
@@ -3216,6 +3538,37 @@ fn gate_cells(rest: &[String]) -> bool {
                 "gate cells: COULD NOT RUN — cannot read {}: {e}",
                 policy_path.display()
             );
+            return false;
+        }
+    };
+
+    // THE WORKSPACE MEMBER LIST, read once and shared by every cell: the
+    // test-target pass selects `--workspace` minus the members a cell's graph
+    // does not carry, and `--exclude` takes package NAMES, not directories.
+    let members = match Command::new("cargo")
+        .current_dir(&root)
+        .args(["metadata", "--no-deps", "--locked", "--offline"])
+        .args(["--format-version", "1"])
+        .output()
+    {
+        Ok(out) if out.status.success() => {
+            match parse_member_names(&String::from_utf8_lossy(&out.stdout)) {
+                Ok(m) => m,
+                Err(e) => {
+                    eprintln!("gate cells: COULD NOT RUN — {e}");
+                    return false;
+                }
+            }
+        }
+        Ok(out) => {
+            eprintln!(
+                "gate cells: COULD NOT RUN — `cargo metadata --no-deps` failed:\n{}",
+                String::from_utf8_lossy(&out.stderr)
+            );
+            return false;
+        }
+        Err(e) => {
+            eprintln!("gate cells: COULD NOT RUN — could not run `cargo metadata` ({e}).");
             return false;
         }
     };
@@ -3351,7 +3704,29 @@ fn gate_cells(rest: &[String]) -> bool {
                 );
                 continue;
             }
+            // LIVE, therefore not a dead row — and that verdict is taken
+            // BEFORE the host question below, on purpose. A row naming this
+            // box's own triple is a row some OTHER box needs; marking it unused
+            // here would make the end-of-run liveness audit say "delete the
+            // row", and deleting it would put the cross cell that depends on it
+            // back behind an uninstallable C toolchain. Satisfied-by-host, not
+            // dead.
             cshim_row_used[i] = true;
+            // AND NOW THE HOST QUESTION, asked of this cell rather than of the
+            // file. Applying an override on the native cell is the failure a
+            // judge caught (`SHIMMED … GREEN` with the real build script never
+            // run), so the row is declined here — loudly, in the same place the
+            // applied ones are announced — and the cell compiles with the real
+            // script, which on this box is a script that RUNS.
+            if let Some(why) = host_shim_refusal(&cell.triple, &host) {
+                shim_notes.push(format!(
+                    "gate cells: cell `{}` — `{}@{}`'s `cshim` row NOT APPLIED: {why}. The row \
+                     stays in {CELL_GATE_POLICY} for the boxes where this triple is a CROSS cell; \
+                     here the build script runs for real.",
+                    cell.name, shim.package, shim.version
+                ));
+                continue;
+            }
             // `[target.<triple>.<links>]` with only a link directive. `cargo
             // check` never links, so nothing here is load-bearing for the
             // type-check — which is the entire reason this is honest.
@@ -3402,6 +3777,9 @@ fn gate_cells(rest: &[String]) -> bool {
                         own_checked: 0,
                         own_total: own.difference(&own_proc_macros).count(),
                         own_proc_macros: own_proc_macros.len(),
+                        tests_checked: 0,
+                        tests_owed: 0,
+                        tests_note: Some("nothing was compiled for this cell at all".to_string()),
                         secs: 0,
                         status: "SKIPPED(no-std)".to_string(),
                         ok: true,
@@ -3702,6 +4080,146 @@ fn gate_cells(rest: &[String]) -> bool {
             );
         }
 
+        // 6d. THE TEST TARGETS. Everything above this line reads LIBRARIES: the
+        //     first pass checks `-p <cell package>` with no `--all-targets`, so
+        //     for four days running, three separate crates shipped a test
+        //     binary that did not COMPILE for a triple nobody here can see, and
+        //     every gate in the tree was green through all of it. A
+        //     `#[cfg(test)]` module is part of its crate's compilation unit, so
+        //     the unit of loss is the crate's whole test binary.
+        let test_note = test_pass_exemption(&cell.triple, is_host);
+        let (tests_checked, tests_owed) = match &test_note {
+            Some(why) => {
+                eprintln!(
+                    "gate cells: cell `{}` — test targets NOT owed here: {why}.",
+                    cell.name
+                );
+                (0, 0)
+            }
+            // Only when the library pass is clean: a crate whose lib did not
+            // type-check cannot have its tests type-check either, and piling a
+            // second copy of the same diagnostics on the reader hides the one
+            // that matters.
+            None if !cell_ok => {
+                eprintln!(
+                    "gate cells: cell `{}` — test targets NOT reached: the library pass above \
+                     failed, and a test target cannot compile past its own crate.",
+                    cell.name
+                );
+                (0, 0)
+            }
+            None => match run_cell_test_pass(&TestPassJob {
+                root: &root,
+                cell,
+                toolchain: &toolchain,
+                target_dir: &target_dir,
+                shim_args: &shim_args,
+                members: &members,
+                graph_names: &graph_names,
+                proc_macros: &own_proc_macros,
+            }) {
+                Err(e) => {
+                    cell_ok = false;
+                    if status == "GREEN" {
+                        status = "TESTS-COULD-NOT-RUN".to_string();
+                    }
+                    eprintln!("gate cells: cell `{}` FAILED — {e}", cell.name);
+                    (0, 0)
+                }
+                Ok(pass) => {
+                    if !pass.errors.is_empty() {
+                        cell_ok = false;
+                        if status == "GREEN" {
+                            status = format!("TEST-TARGET-ERROR({})", pass.errors.len());
+                        }
+                        eprintln!(
+                            "\ngate cells: cell `{}` ({}) FAILED — {} type error(s) in TEST \
+                             TARGETS, which no host build and no other gate compiles for this \
+                             triple:",
+                            cell.name,
+                            cell.triple,
+                            pass.errors.len()
+                        );
+                        for (pkg, rendered) in pass.errors.iter().take(20) {
+                            eprintln!("gate cells:   in `{pkg}`:");
+                            eprint!("{rendered}");
+                        }
+                    }
+                    for line in &pass.cargo_errors {
+                        cell_ok = false;
+                        if status == "GREEN" {
+                            status = "TESTS-CARGO-ERROR".to_string();
+                        }
+                        eprintln!(
+                            "gate cells: cell `{}` FAILED — test-target pass: {line}",
+                            cell.name
+                        );
+                    }
+                    // OWED, exactly like 6c and for the same reason: a pass that
+                    // quietly stopped selecting a member would otherwise report
+                    // a smaller number and stay green.
+                    let missing: Vec<&String> = pass
+                        .owed
+                        .iter()
+                        .filter(|n| !pass.checked.contains(*n))
+                        .collect();
+                    if !missing.is_empty() {
+                        cell_ok = false;
+                        if status == "GREEN" {
+                            status = format!("TESTS-UNREAD({})", missing.len());
+                        }
+                        eprintln!(
+                            "gate cells: cell `{}` FAILED — {} of the {} workspace members in \
+                             this cell's graph produced NO test-target artifact for {}: {}. \
+                             Either the target was skipped or it did not build; both leave that \
+                             crate's `#[cfg(test)]` code unread for this triple.",
+                            cell.name,
+                            missing.len(),
+                            pass.owed.len(),
+                            cell.triple,
+                            missing
+                                .iter()
+                                .map(|n| n.as_str())
+                                .collect::<Vec<_>>()
+                                .join(", ")
+                        );
+                    }
+                    // THE COVERAGE LINE IS ONLY SAID WHEN IT IS TRUE. A member
+                    // counts as reached the moment ONE of its test targets
+                    // produced an artifact, which is the right question for
+                    // vacuity (did the selection shrink?) and the WRONG one for
+                    // health: `aterm-verify` reached it on `profile_pin` and
+                    // `process_doc` while `environment_contract` and the lib
+                    // test were failing to compile beside them. So a run with
+                    // errors above says what it found, never a fraction that
+                    // reads as clean.
+                    if pass.errors.is_empty() && pass.cargo_errors.is_empty() {
+                        eprintln!(
+                            "gate cells: cell `{}` — test targets: every target (lib, bins, tests, \
+                             benches, examples) of all {} workspace members in its graph \
+                             type-checked for {} in {}s.",
+                            cell.name,
+                            pass.owed.len(),
+                            cell.triple,
+                            pass.secs
+                        );
+                    } else {
+                        eprintln!(
+                            "gate cells: cell `{}` — test targets: {} of {} workspace members \
+                             produced an artifact for {} in {}s, but the pass is NOT clean — see \
+                             the errors above.",
+                            cell.name,
+                            pass.owed.len() - missing.len(),
+                            pass.owed.len(),
+                            cell.triple,
+                            pass.secs
+                        );
+                    }
+                    (pass.owed.len() - missing.len(), pass.owed.len())
+                }
+            },
+        };
+
         // 7. THE FLOOR.
         match policy.floor(&cell.name) {
             None => {
@@ -3793,6 +4311,9 @@ fn gate_cells(rest: &[String]) -> bool {
             own_checked,
             own_total: own_owed.len(),
             own_proc_macros: own_proc_macros.len(),
+            tests_checked,
+            tests_owed,
+            tests_note: test_note,
             secs,
             status,
             ok: cell_ok,
@@ -3892,9 +4413,13 @@ fn gate_cells(rest: &[String]) -> bool {
     // read for the cell's triple, over the number it owed. PM is the in-repo
     // proc macros, which compile for the HOST on every cell and are therefore
     // outside that obligation rather than silently inside it.
+    // TESTS is the second column this gate is now about: workspace members whose
+    // TEST targets a compiler read for the cell's triple. `-` means the cell is
+    // exempt (the host cell, whose `cargo test` already does it; the wasm32
+    // cells, which nothing tests) — never "0 of 0 and green".
     eprintln!(
-        "{:<10} {:<26} {:<34} {:>8} {:>6} {:>9} {:>4} {:>5}  STATUS",
-        "CELL", "TRIPLE", "TOOLCHAIN", "CHECKED", "GRAPH", "OWN-CODE", "PM", "SECS"
+        "{:<10} {:<26} {:<34} {:>8} {:>6} {:>9} {:>4} {:>7} {:>5}  STATUS",
+        "CELL", "TRIPLE", "TOOLCHAIN", "CHECKED", "GRAPH", "OWN-CODE", "PM", "TESTS", "SECS"
     );
     for r in &reports {
         let mut tail = String::new();
@@ -3905,7 +4430,7 @@ fn gate_cells(rest: &[String]) -> bool {
             tail.push_str(&format!(" (shimmed: {})", r.shimmed.join(", ")));
         }
         eprintln!(
-            "{:<10} {:<26} {:<34} {:>8} {:>6} {:>9} {:>4} {:>5}  {}{}",
+            "{:<10} {:<26} {:<34} {:>8} {:>6} {:>9} {:>4} {:>7} {:>5}  {}{}",
             r.cell,
             r.triple,
             r.toolchain,
@@ -3913,6 +4438,11 @@ fn gate_cells(rest: &[String]) -> bool {
             r.graph,
             format!("{}/{}", r.own_checked, r.own_total),
             r.own_proc_macros,
+            if r.tests_note.is_some() {
+                "-".to_string()
+            } else {
+                format!("{}/{}", r.tests_checked, r.tests_owed)
+            },
             r.secs,
             r.status,
             tail
@@ -3939,6 +4469,28 @@ fn gate_cells(rest: &[String]) -> bool {
     } else {
         format!("{own_checked} of {own_total} in-repo crate-instances read; {unread} NOT")
     };
+    // AND SAY WHAT THE TEST-TARGET PASS REACHED, in the same sentence, because
+    // "the cells type-check" was quotable and true while not one `#[cfg(test)]`
+    // line had been compiled for a triple that is not this box's.
+    let tests_checked: usize = reports.iter().map(|r| r.tests_checked).sum();
+    let tests_owed: usize = reports.iter().map(|r| r.tests_owed).sum();
+    let exempt: Vec<&str> = reports
+        .iter()
+        .filter(|r| r.tests_note.is_some())
+        .map(|r| r.cell.as_str())
+        .collect();
+    let coverage = format!(
+        "{coverage}; test targets compiled for {tests_checked} of {tests_owed} member-instances{}",
+        if exempt.is_empty() {
+            String::new()
+        } else {
+            format!(
+                " ({} not owed a test pass: {})",
+                exempt.len(),
+                exempt.join(", ")
+            )
+        }
+    );
     if narrowed {
         eprintln!(
             "gate cells: GREEN OF WHAT RAN — {} of forge's {} cells, {coverage}. NOT the matrix \
@@ -4149,7 +4701,29 @@ fn run_repo_guards(root: &Path) -> LaneVerdict {
             // code. The repo ROOT is the no-op PATH prefix this helper requires
             // — it holds no executables, so prepending it cannot change what a
             // guard resolves — and both streams are still teed verbatim.
-            let (ok, stdout, stderr) = run_capturing_both(label, &script, &args, root, root);
+            //
+            // THROUGH THE INTERPRETER, never by exec'ing the script file. Every
+            // guard is `#!/usr/bin/env bash`, and `env bash <script>` is what
+            // the kernel would run for it — but on macOS a process is
+            // provenance-TRACKED when the executable it was exec'd from carries
+            // `com.apple.provenance`, and a SCRIPT exec'd by path counts as that
+            // executable (docs/RELEASING.md, the shim rule). A checkout written
+            // from a tracked shell — every shell inside aterm.app, every agent
+            // under a tagged `claude` — has every tracked file tagged (1,801 of
+            // them on the owner's machine, 2026-09-16), so exec'ing
+            // `tools/spin_guard.sh` tracked the guard, the guard tracked the
+            // snapshot, and `proof_snapshot.py` refused its own take with
+            // "published proof snapshot has extended metadata" even from a
+            // launchd job, the one untracked lane there is. Measured the same
+            // day: exec of the tagged script → tracked; `bash <script>` and
+            // `python3 <file>` → untracked. The interpreter is the system
+            // `env`'s `bash` (clean), `$0` is still the script's path, so the
+            // guards' `HERE="$(dirname "$0")"` resolves as before.
+            let script_arg = script.to_string_lossy().into_owned();
+            let mut via_bash: Vec<&str> = vec!["bash", script_arg.as_str()];
+            via_bash.extend(args.iter().copied());
+            let (ok, stdout, stderr) =
+                run_capturing_both(label, Path::new("/usr/bin/env"), &via_bash, root, root);
             if guard_announced_skip(&stdout) || guard_announced_skip(&stderr) {
                 not_vouched.push(label);
             }
@@ -7965,33 +8539,116 @@ note: Trust verification: 1 proved, 0 failed, 0 unknown, 0 timed out, 0 runtime-
         );
         assert!(super::shim_refusal("wasm32-unknown-unknown").is_some());
         assert!(super::shim_refusal("x86_64-unknown-hermit").is_some());
-        // The host triple, which a judge got a `SHIMMED … GREEN` out of: the
-        // mac-arm cell passes no `--target`, so cargo applies a
-        // `[target.<host>.<links>]` override there and the real build script
-        // never runs. A cell that CAN run a build script needs no override.
-        if let Some(host) = super::rustc_host_triple() {
-            let why = super::shim_refusal(&host)
-                .expect("a `cshim` row naming this machine's own triple must be refused");
-            assert!(
-                why.contains("own triple"),
-                "the refusal must say WHY the host is different from wasm32/hermit: {why}"
+        // AND THE PARSER REFUSES NOTHING ELSE, on any box. What it rejects is a
+        // claim about what a build script EMITS, which no machine gets a vote
+        // on; `aarch64-apple-darwin`, `x86_64-unknown-linux-gnu` and
+        // `x86_64-pc-windows-msvc` are all writable rows wherever this test
+        // runs. The host's own triple is a different question with a different
+        // answer — not "unwritable", but "not applied to that one cell" — and
+        // it is asked of `host_shim_refusal` in the test below. Asking it here
+        // is what shut the Windows lane on every Linux box.
+        for cell in aterm_forge::resolve::default_cells() {
+            let intrinsic = cell.triple.starts_with("wasm32") || cell.triple.contains("hermit");
+            assert_eq!(
+                super::shim_refusal(&cell.triple).is_some(),
+                intrinsic,
+                "the parser's verdict on `{}` must depend on its build scripts and on nothing \
+                 else — least of all on which box is reading the file",
+                cell.triple
             );
         }
-        assert!(super::shim_refusal("x86_64-unknown-linux-gnu").is_none());
-        assert!(super::shim_refusal("x86_64-pc-windows-msvc").is_none());
-        // `aarch64-apple-darwin` was asserted `is_none()` here, which is the
-        // assertion that held the hole OPEN: it encoded the belief the judge
-        // disproved, that triple-scoping excludes the host. On this machine the
-        // host IS that triple, so it must now be refused — and the two rows
-        // above are the control, since a shim for a triple this box cannot run
-        // is exactly what the mechanism is for. Written host-relative rather
-        // than hardcoded so the meaning survives a move to another box.
-        let cross = ["x86_64-unknown-linux-gnu", "x86_64-pc-windows-msvc"];
-        if let Some(host) = super::rustc_host_triple() {
+    }
+
+    /// THE HOST'S OWN TRIPLE IS A FACT ABOUT THE BOX, AND IT IS ASKED OF ONE
+    /// CELL. A judge got `SHIMMED … 114/114 … GREEN` out of a row naming the
+    /// host: the native cell passes no `--target`, so cargo applies a
+    /// `[target.<host>.<links>]` override there too and the real build script
+    /// never ran. That refusal is intact — as a per-cell decline, taken with
+    /// the host triple in hand — and it reaches exactly one cell.
+    #[test]
+    fn a_shim_for_the_hosts_own_triple_is_declined_by_that_cell_and_by_no_other() {
+        let host = super::rustc_host_triple().expect("`rustc -vV` reports a host triple");
+        let why = super::host_shim_refusal(&host, &host)
+            .expect("a `cshim` row naming this machine's own triple must not be APPLIED");
+        assert!(
+            why.contains("own triple"),
+            "the decline must say WHY the host is different from wasm32/hermit: {why}"
+        );
+        // And every other cell keeps its overrides. This is the clause the old
+        // code did not have: the refusal was global, so one row about the host
+        // spoke for cells the host has nothing to do with.
+        for cell in aterm_forge::resolve::default_cells() {
+            if cell.triple == host {
+                continue;
+            }
             assert!(
-                !cross.contains(&host.as_str()),
-                "this test reads those two as CROSS triples; on {host} they are not"
+                super::host_shim_refusal(&cell.triple, &host).is_none(),
+                "cell `{}` ({}) lost its shim to a fact about the host `{host}`",
+                cell.name,
+                cell.triple
             );
+        }
+    }
+
+    /// THE SHIPPED POLICY MUST BE READABLE FROM WHICHEVER MACHINE IS READING
+    /// IT, and from 2026-09-01 until this test it was not.
+    ///
+    /// `tools/cross-cell-gate.tsv` carries two `cshim` rows for
+    /// `x86_64-unknown-linux-gnu` — correct rows, measured on m21, where Linux
+    /// is a CROSS cell. `parse_cell_policy` refused any row naming the reader's
+    /// own triple, and refused it BEFORE `gate cells` had selected a single
+    /// cell, so on m17-tower — where Linux is the NATIVE cell —
+    /// `cargo run -p xtask -- gate cells --cell win` printed (measured on an
+    /// unmodified 2ad5de183, where those rows are lines 89 and 90)
+    /// `COULD NOT RUN — tools/cross-cell-gate.tsv:89: refusing the `cshim` row
+    /// for `ring`` and never reached the `win` cell at all. The only gate that
+    /// compiles aterm for Windows could not be STARTED on a Linux box, so no
+    /// Windows break authored on one could ever turn it red — and the first
+    /// run after this fix found one: `crate::seam::is_real_dir` is
+    /// `#[cfg(unix)]` and `crates/atpkg/src/compat.rs:611` calls it on every
+    /// target.
+    ///
+    /// So this walks the verb's own first two steps, in the verb's own order,
+    /// once for every cell's triple pretended to be the host: the file parses,
+    /// the narrowed cell is selectable, and it still has its overrides. A
+    /// policy row about one machine can never again speak for another.
+    #[test]
+    fn the_shipped_policy_reads_and_narrows_from_every_cells_own_machine() {
+        let root = crate::workspace_root();
+        let text = std::fs::read_to_string(root.join(super::CELL_GATE_POLICY))
+            .expect("tools/cross-cell-gate.tsv is shipped");
+        // Step one of `gate_cells`, and its answer must not depend on who asks.
+        let policy = super::parse_cell_policy(&text)
+            .expect("the shipped policy parses on THIS machine, whichever machine it is");
+        let cells = aterm_forge::resolve::default_cells();
+        assert!(
+            policy.cshims.iter().any(|c| {
+                cells.iter().any(|cell| cell.triple == c.triple)
+                    && super::rustc_host_triple().is_some_and(|h| h != c.triple)
+            }),
+            "this test needs at least one `cshim` row to audit"
+        );
+        for pretend_host in cells.iter().map(|c| c.triple.as_str()) {
+            for cell in &cells {
+                if cell.triple == pretend_host {
+                    continue;
+                }
+                // Step two: the narrowing the Windows lane is run with.
+                let selected =
+                    aterm_forge::resolve::select(&cells, std::slice::from_ref(&cell.name))
+                        .unwrap_or_else(|e| panic!("cell `{}` is selectable: {e}", cell.name));
+                assert_eq!(selected.len(), 1, "`--cell {}` selects one cell", cell.name);
+                // Step 1c: and it is handed every override the file gives it,
+                // whichever of its neighbours happens to be native today.
+                for (_, shim) in policy.shims_for(&cell.triple) {
+                    assert!(
+                        super::host_shim_refusal(&cell.triple, pretend_host).is_none(),
+                        "`{}` loses `{}`'s override when `{pretend_host}` is the host",
+                        cell.name,
+                        shim.package
+                    );
+                }
+            }
         }
     }
 
@@ -8109,5 +8766,85 @@ note: Trust verification: 1 proved, 0 failed, 0 unknown, 0 timed out, 0 runtime-
                 floor.cell
             );
         }
+    }
+
+    // -----------------------------------------------------------------------
+    // G-CELLS, THE TEST-TARGET PASS
+    // -----------------------------------------------------------------------
+
+    /// `--exclude` takes NAMES, and four packages in this workspace are named
+    /// something other than their directory, so the list has to come from
+    /// `cargo metadata` rather than from a glob over `crates/`.
+    #[test]
+    fn member_names_come_out_of_cargo_metadata() {
+        let json = r#"{"packages":[
+            {"name":"aterm","id":"path+file:///w/crates/aterm#0.87.0"},
+            {"name":"libc","id":"path+file:///w/crates/aterm-libc#libc@0.2.186"},
+            {"name":"xtask","id":"path+file:///w/crates/xtask#0.87.0"}
+        ],"workspace_root":"/w"}"#;
+        let names = super::parse_member_names(json).expect("parses");
+        assert!(names.contains("libc"), "the NAME, not the directory");
+        assert_eq!(names.len(), 3);
+        // A run that produced no members at all must be an error, never an
+        // empty selection: `--workspace` minus nothing would then compile the
+        // whole tree for a cross triple, and minus everything would compile
+        // nothing and exit 0.
+        assert!(super::parse_member_names(r#"{"packages":[]}"#).is_err());
+        assert!(super::parse_member_names(r#"{"nope":1}"#).is_err());
+        assert!(super::parse_member_names("not json at all").is_err());
+    }
+
+    /// The selection is the INTERSECTION with the cell's graph, and the excludes
+    /// are its complement — so a member the cell does not carry is never
+    /// compiled for that cell's triple (`aterm-objc` for Windows), and a graph
+    /// package that is not a member (a `vendor/` path dependency) is never
+    /// handed to `--exclude`, which would be a hard cargo error.
+    #[test]
+    fn the_test_pass_selects_the_members_this_cell_carries_and_excludes_the_rest() {
+        let members: std::collections::BTreeSet<String> =
+            ["aterm", "aterm-gui", "aterm-objc", "xtask"]
+                .iter()
+                .map(|s| (*s).to_string())
+                .collect();
+        let graph: std::collections::BTreeSet<String> = ["aterm", "aterm-gui", "winit"]
+            .iter()
+            .map(|s| (*s).to_string())
+            .collect();
+        let (selected, excluded) = super::cell_test_selection(&members, &graph);
+        assert_eq!(selected, vec!["aterm".to_string(), "aterm-gui".to_string()]);
+        assert_eq!(
+            excluded,
+            vec!["aterm-objc".to_string(), "xtask".to_string()]
+        );
+        assert!(
+            !excluded.contains(&"winit".to_string()),
+            "`winit` is in the graph but is not a workspace member: `--exclude winit` is an error"
+        );
+    }
+
+    /// The two exemptions are NARROW and they are SAID. A cell that is exempt
+    /// prints why; every other cell owes the pass, and nothing may quietly
+    /// become exempt by being slow or inconvenient.
+    #[test]
+    fn only_the_host_cell_and_the_wasm_cells_are_exempt_from_the_test_pass() {
+        assert!(super::test_pass_exemption("x86_64-pc-windows-msvc", false).is_none());
+        assert!(super::test_pass_exemption("aarch64-apple-darwin", false).is_none());
+        assert!(super::test_pass_exemption("x86_64-unknown-linux-gnu", false).is_none());
+        let host = super::test_pass_exemption("x86_64-unknown-linux-gnu", true)
+            .expect("the host cell is exempt");
+        assert!(host.contains("cargo test"), "{host}");
+        let wasm = super::test_pass_exemption("wasm32-unknown-unknown", false)
+            .expect("the wasm cells are exempt");
+        assert!(wasm.contains("dev-dependencies"), "{wasm}");
+        // THE LIVE CELL LIST: at most two of forge's five cells may be exempt on
+        // any box, and the three shipping triples are never among them unless
+        // one of them IS the box. A third exemption appearing here means someone
+        // widened the escape hatch.
+        let exempt: Vec<String> = aterm_forge::resolve::default_cells()
+            .into_iter()
+            .filter(|c| super::test_pass_exemption(&c.triple, false).is_some())
+            .map(|c| c.name)
+            .collect();
+        assert_eq!(exempt, vec!["wasm-cpu".to_string(), "wasm-gpu".to_string()]);
     }
 }

@@ -6,12 +6,14 @@
 //! Version row, a press on the staged status-bar row ([`App::press_update_bar`]), the
 //! off-macOS tab-strip ↻), the live Version-menu
 //! re-sync ([`App::refresh_version_menu`]), and the process updater state projected into
-//! the native Settings `/updates` route. The retired modal remains test scaffolding only
-//! until its low-level painter/input regression tests are migrated.
+//! the native Settings `/updates` route. (The retired own-rendered modal's glue —
+//! `update_screen_exit`/`_refresh`/`_check`, `update_hit_at`, `update_screen_click`,
+//! `on_key_update_mode`, `update_input_event` — was DELETED on 2026-09-15 with the card
+//! itself; see `update_screen.rs`.)
 
 use crate::App;
 use crate::native_app::UpdateOutcome;
-use crate::update_screen::{UpdateHit, UpdateState};
+use crate::update_screen::UpdateState;
 
 /// Serializes tests that record failures or read standing failure facts in the
 /// process-wide scratch update ledger.
@@ -406,75 +408,6 @@ impl App {
             return Err("could not open the native Software Update route".to_string());
         }
         Ok(self.start_native_update_check())
-    }
-
-    /// Close the Software Update overlay on window `wid` (no-op if not open there).
-    pub(crate) fn update_screen_exit(&mut self, wid: crate::WindowId) {
-        if let Some(ws) = self.windows.get_mut(&wid)
-            && ws.update_screen().is_some()
-        {
-            ws.overlay = None;
-            if let Some(w) = &ws.os_window {
-                w.request_redraw();
-            }
-        }
-        // Publish the now-empty tree (the overlay closed).
-        self.overlay_a11y_update();
-    }
-
-    /// Refresh an OPEN Software Update overlay from the current on-disk status (reached from
-    /// the native updater completion reducer after a manual check finishes) — clears the
-    /// "Checking…" state and shows any freshly-staged build + notes. No-op if the overlay
-    /// closed meanwhile. Refreshes EVERY window that has it open (front can lag).
-    #[cfg(test)]
-    pub(crate) fn update_screen_refresh(&mut self) {
-        let snap_open: Vec<crate::WindowId> = self
-            .windows
-            .iter()
-            .filter(|(_, ws)| ws.update_screen().is_some())
-            .map(|(id, _)| *id)
-            .collect();
-        for wid in snap_open {
-            let snap = self.update_snapshot(false);
-            if let Some(ws) = self.windows.get_mut(&wid) {
-                ws.overlay = Some(crate::overlay::Overlay::Update(snap));
-                if let Some(w) = &ws.os_window {
-                    w.request_redraw();
-                }
-            }
-        }
-        // A fresh check may have staged a new build: refresh the accessibility tree.
-        self.overlay_a11y_update();
-    }
-
-    /// Run ONE update check off the event loop, marking the open overlay "Checking…" first,
-    /// then joining the process-global native updater service. Repeated requests
-    /// subscribe to its revision and never spawn a second physical worker.
-    pub(crate) fn update_screen_check(&mut self) {
-        #[cfg(not(test))]
-        {
-            let _ = self.start_native_update_check();
-        }
-        #[cfg(test)]
-        {
-            let Some(wid) = self.frontmost_window else {
-                return;
-            };
-            // Reflect "Checking…" immediately.
-            let checking = self.update_snapshot(true);
-            if let Some(ws) = self.windows.get_mut(&wid) {
-                if ws.update_screen().is_none() {
-                    return;
-                }
-                ws.overlay = Some(crate::overlay::Overlay::Update(checking));
-                if let Some(w) = &ws.os_window {
-                    w.request_redraw();
-                }
-            }
-            // Reflect the "Checking…" state to a screen reader too.
-            self.overlay_a11y_update();
-            let _ = self.start_native_update_check();
-        }
     }
 
     /// TRUE iff the process reducer owns a verified, STRICTLY-newer staged build.
@@ -1119,7 +1052,6 @@ impl App {
         if n.alpha(now) < crate::notice::CLICK_MIN_ALPHA {
             return false;
         }
-        let actionable = n.is_update_ready();
         let access = n.is_macos_access();
         let admin_names = n.admin_step_names().map(<[String]>::to_vec);
         let (cw, ch) = self.win_cell_size(wid);
@@ -1144,7 +1076,7 @@ impl App {
         else {
             return false;
         };
-        self.notice_hit_dispatch(admin_names, access, actionable, hit, now);
+        self.notice_hit_dispatch(admin_names, access, hit, now);
         true
     }
 
@@ -1156,7 +1088,6 @@ impl App {
         &mut self,
         admin_names: Option<Vec<String>>,
         access: bool,
-        actionable: bool,
         hit: crate::notice::NoticeHit,
         now: std::time::Instant,
     ) {
@@ -1230,13 +1161,10 @@ impl App {
             (None, crate::notice::NoticeHit::Body) if access => {
                 self.consent_card.on_owner_acted();
             }
-            (None, _) => {
-                if actionable {
-                    // UPGRADE (one click; details-overlay fallback when nothing is actually
-                    // staged) — see `apply_update_or_details`.
-                    self.apply_update_or_details();
-                }
-            }
+            // Every other card is dismissed by the press and does nothing else: no
+            // notice kind carries a one-press action since the update lane moved onto
+            // the status bar (2026-09-07).
+            (None, _) => {}
         }
         self.request_redraw_all_windows();
     }
@@ -1247,105 +1175,6 @@ impl App {
     /// accessor so the painter and the hit test cannot disagree about where the card is.
     pub(crate) fn notice_clear_rows(&self) -> f32 {
         f32::from(self.chrome_rows())
-    }
-
-    /// Map a window-px point to what the Update overlay under it hits (close dot / Close /
-    /// Check / Install). `None` when the overlay is closed on `wid` or the point misses.
-    pub(crate) fn update_hit_at(&self, wid: crate::WindowId, x: f64, y: f64) -> Option<UpdateHit> {
-        let ws = self.windows.get(&wid)?;
-        let u = ws.update_screen()?;
-        let panel_rows = ws.overlay_rows();
-        if panel_rows == 0 {
-            return None;
-        }
-        let (cw, ch) = self.win_cell_size(wid);
-        let pad = self.win_pad(wid) as f32;
-        let top = (self.win_pad_top(wid) + self.win_head(wid)) as f32;
-        let geom = crate::settings::SettingsGeom {
-            cw: cw as f32,
-            ch: ch as f32,
-            font_px: self.win_font_px(wid),
-            cols: ws.cols as usize,
-            panel_rows,
-        };
-        let (x, y) = self.window_to_frame(wid, x, y);
-        crate::update_screen::update_hit(u, &geom, x as f32 - pad, y as f32 - top)
-    }
-
-    /// Resolve a click on the Update overlay to its action. Close dot / Close → close;
-    /// Check → a fresh check; Install → apply the staged build (re-exec).
-    pub(crate) fn update_screen_click(&mut self, wid: crate::WindowId, hit: UpdateHit) {
-        match hit {
-            UpdateHit::Close => self.update_screen_exit(wid),
-            UpdateHit::Check => self.update_screen_check(),
-            UpdateHit::Install => {
-                if let Some(proxy) = &self.proxy {
-                    let _ = proxy.send_event(crate::Wake::ApplyStagedUpdate);
-                }
-            }
-        }
-    }
-
-    /// While the Update overlay is open on `wid`, SWALLOW every key (return `true`): `Esc`
-    /// closes; `Enter` triggers the button painted as the highlighted DEFAULT in each
-    /// state — Install when a build is staged, else Check for Updates while checks are
-    /// enabled, else Close. (The button row highlights Install when staged, Check when
-    /// up-to-date + enabled, and only Close when checks are disabled, so Return always
-    /// fires the option the user sees as the default.) Closed ⇒ `false` (keys flow
-    /// normally). Mirrors `on_key_about_mode`.
-    #[cfg(test)]
-    pub(crate) fn on_key_update_mode(
-        &mut self,
-        wid: crate::WindowId,
-        ev: &winit::event::KeyEvent,
-    ) -> bool {
-        use winit::keyboard::{Key, NamedKey};
-        let Some(default) = self
-            .windows
-            .get(&wid)
-            .and_then(|ws| ws.update_screen())
-            .map(|u| u.default_action())
-        else {
-            return false;
-        };
-        match &ev.logical_key {
-            Key::Named(NamedKey::Escape) => self.update_screen_exit(wid),
-            // Return fires the button painted as the highlighted default in this state.
-            Key::Named(NamedKey::Enter) => self.update_screen_click(wid, default),
-            _ => {}
-        }
-        true
-    }
-
-    /// The ENGINE-NEUTRAL twin of [`Self::on_key_update_mode`] — reached by controller
-    /// `key`/`text` verbs. The caller still swallows the event from the PTY.
-    #[cfg(test)]
-    pub(crate) fn update_input_event(
-        &mut self,
-        wid: crate::WindowId,
-        ev: &crate::input::InputEvent,
-    ) {
-        use crate::input::InputEvent;
-        use aterm_types::keyboard::{Key as TKey, KeyEventType, NamedKey as TNamed};
-        let Some(default) = self
-            .windows
-            .get(&wid)
-            .and_then(|ws| ws.update_screen())
-            .map(|u| u.default_action())
-        else {
-            return;
-        };
-        if let InputEvent::Key {
-            key, event_type, ..
-        } = ev
-            && !matches!(event_type, KeyEventType::Release)
-        {
-            match key {
-                TKey::Named(TNamed::Escape) => self.update_screen_exit(wid),
-                TKey::Named(TNamed::Enter) => self.update_screen_click(wid, default),
-                _ => {}
-            }
-        }
     }
 }
 
@@ -1620,7 +1449,6 @@ mod tests {
         let tabs = app.windows.get(&wid).unwrap().tab_set.len();
         app.apply_update_or_details();
         assert_eq!(app.windows.get(&wid).unwrap().tab_set.len(), tabs);
-        assert!(app.windows.get(&wid).unwrap().update_screen().is_none());
     }
 
     #[test]

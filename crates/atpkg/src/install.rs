@@ -27,8 +27,13 @@
 //!    ([`crate::extract::extract_tar_zst_rooted`]) instead of by re-reading the whole
 //!    payload back off disk — see [`verify_and_stage`] step 3 for exactly which bytes
 //!    that still proves and which window it gives up.
-//! 4. **Atomic swap, with rollback** — only a tree that passed every check above is renamed
-//!    into `build_dir`, and only then is the build marked complete.
+//! 4. **Durability, then an atomic swap with rollback** — the staged tree's file contents
+//!    and directory entries are flushed FIRST ([`crate::store::sync_tree`]): a rename is
+//!    metadata, so without that flush a power loss can leave the swap and the completeness
+//!    marker durable over file data that was never written back. Only then is a tree that
+//!    passed every check above renamed into `build_dir`, and only then is the build marked
+//!    complete — durably too, so a marker whose NAME survives a crash can never vouch for
+//!    contents that did not.
 //!
 //! Any failure removes the scratch tree and returns fail-closed — a half- or wrongly-staged
 //! build never reaches activation, and **a stage that cannot install the new build must not
@@ -279,6 +284,21 @@ pub fn verify_and_stage_with(
         }
     }
 
+    // 3b. DURABILITY, before anything publishes this tree. Every check above is about the
+    //     bytes this process WROTE; none of them is about bytes the filesystem has
+    //     COMMITTED. The swap below is renames, and a rename is metadata: on a
+    //     delayed-allocation filesystem (ext4's default) the directory entries for
+    //     `<build>/` and the `<build>.ready` marker beside it can reach the journal while
+    //     the gigabytes behind them are still page cache. A power loss in that window left
+    //     the store saying "build N is complete" over zero-length or truncated files — a
+    //     state nothing repairs, because `decide` then answers `UpToDate` and the swap has
+    //     already reclaimed the tree it superseded. So the CONTENTS go down first, and the
+    //     names that vouch for them only afterwards.
+    if let Err(e) = crate::store::sync_tree(&incoming) {
+        let _ = std::fs::remove_dir_all(&incoming);
+        return Err(StageError::Io(e));
+    }
+
     // 4. SWAP. Marker down first (mid-swap, the build is honestly not complete), then the
     //    old tree aside, then the verified tree into place, then the old tree reclaimed.
     if let Err(e) = swap_into_place(build_dir, &incoming) {
@@ -294,10 +314,28 @@ pub fn verify_and_stage_with(
     //     bundle nothing on disk explains. A clean stage clears any record a previous
     //     stage of this build number left, so `doctor` never names a cause that is gone.
     crate::store::clear_tracked_install(build_dir);
-    if let Some(why) = &tracked_record
-        && let Err(e) = crate::store::record_tracked_install(build_dir, why)
-    {
-        return Err(StageError::Io(e));
+    if let Some(why) = &tracked_record {
+        if let Err(e) = crate::store::record_tracked_install(build_dir, why) {
+            return Err(StageError::Io(e));
+        }
+        // THE MARKER (2026-09-15): the record beside the build is for `doctor` and
+        // `repair`; this line is for the window, which turns it into a Warn row on the
+        // toolchain lane — a tagged toolchain installed by the default policy must never
+        // be a silent one (audit 2026-09-14).
+        let build = build_dir
+            .file_name()
+            .map(|n| n.to_string_lossy().into_owned())
+            .unwrap_or_default();
+        let program = build_dir
+            .parent()
+            .and_then(|p| p.file_name())
+            .map(|n| n.to_string_lossy().into_owned())
+            .unwrap_or_default();
+        println!(
+            "atpkg: {}{program} build {build} — {}",
+            crate::cli::TRACKED_INSTALL_MARKER,
+            crate::cli::clip_cause(why)
+        );
     }
 
     // 5. Mark the build COMPLETE — the last step, written atomically AFTER the tree_root
@@ -315,9 +353,11 @@ pub fn verify_and_stage_with(
         //
         // The tree on disk passed every check above, so keeping it is not keeping a
         // partial: it is the verified toolchain, honestly UNMARKED. `list_installed` skips
-        // marker-less dirs, so it reads as not-installed and the next run re-stages it; a
-        // `current` link that named this build still resolves to correct bytes instead of
-        // dangling. The old "take the tree with it so the next run stages cleanly rather
+        // marker-less dirs and `flow::installed_for_decide` drops one from the apply
+        // decision (the shim view alone would call it up to date forever, even here where
+        // its shims still resolve), so it reads as not-installed to the readers AND to
+        // `decide`, and the next run re-stages it; a `current` link that named this build
+        // still resolves to correct bytes instead of dangling. The old "take the tree with it so the next run stages cleanly rather
         // than extracting over a stranger" reasoning belonged to the delete-then-extract
         // flow — nothing extracts into `build_dir` any more, it is swapped onto, so an
         // unmarked leftover is never extracted over. It is also fully reclaimable: the next
@@ -776,67 +816,209 @@ fn run_tool(tool: &str, args: &[&std::ffi::OsStr]) -> Result<(), StageError> {
     if out.status.success() {
         return Ok(());
     }
+    Err(tool_failed(tool, out.status.code(), &out.stderr))
+}
+
+/// `<tool> failed (exit N): <reason>` — the LAST stderr line is where hdiutil and ditto
+/// put the reason (`hdiutil: attach failed - Resource temporarily unavailable`), which
+/// is why neither is run under `-quiet`'s suppression of it.
+#[cfg(target_os = "macos")]
+fn tool_failed(tool: &str, code: Option<i32>, stderr: &[u8]) -> StageError {
     let mut m = String::from(tool);
     m.push_str(" failed");
-    if let Some(code) = out.status.code() {
+    if let Some(code) = code {
         m.push_str(" (exit ");
         m.push_str(&crate::dec_u64(u64::from(code.unsigned_abs())));
         m.push(')');
     }
-    let stderr = String::from_utf8_lossy(&out.stderr);
+    let stderr = String::from_utf8_lossy(stderr);
     let tail = stderr.trim();
     if !tail.is_empty() {
         m.push_str(": ");
-        // The LAST line is where hdiutil/ditto put the reason.
         m.push_str(tail.lines().last().unwrap_or(tail));
     }
-    Err(StageError::Payload(m))
+    StageError::Payload(m)
+}
+
+/// Run `/usr/bin/<tool>` to completion with no stdin and return its stdout; a
+/// non-zero exit is the same [`StageError::Payload`] [`run_tool`] reports.
+#[cfg(target_os = "macos")]
+fn capture_tool(tool: &str, args: &[&std::ffi::OsStr]) -> Result<String, StageError> {
+    let mut path = String::from("/usr/bin/");
+    path.push_str(tool);
+    let out = std::process::Command::new(&path)
+        .args(args)
+        .stdin(std::process::Stdio::null())
+        .output()
+        .map_err(StageError::Io)?;
+    if !out.status.success() {
+        return Err(tool_failed(tool, out.status.code(), &out.stderr));
+    }
+    Ok(String::from_utf8_lossy(&out.stdout).into_owned())
+}
+
+/// One image as `hdiutil info` reports it: the device node to eject it by (the FIRST
+/// `/dev/` entity of the block, which is the image's own node — ejecting it tears the
+/// synthesised APFS container down with it) and where each of its entities is mounted.
+#[cfg(target_os = "macos")]
+struct AttachedImage {
+    image: PathBuf,
+    node: PathBuf,
+    mounted_at: Vec<PathBuf>,
+}
+
+/// Parse `hdiutil info`'s plain-text report into one [`AttachedImage`] per attached
+/// image. The format is stable and simple: a `====…` rule separates the blocks, `key :
+/// value` lines carry `image-path`, and every entity is a TAB-separated
+/// `<dev-entry>\t<content-hint>[\t<mount-point>]` line whose third field is present only
+/// while that entity is mounted. A block with no `/dev/` entity (an image being attached
+/// at this instant) is skipped: there is nothing to eject.
+///
+/// Kept a PURE function over the text so the carcass shape that motivated it is
+/// pinned on any machine, hdiutil or no hdiutil
+/// (`a_failed_attach_leaves_a_carcass_the_hdiutil_report_names`).
+#[cfg(target_os = "macos")]
+fn parse_hdiutil_info(report: &str) -> Vec<AttachedImage> {
+    let mut out: Vec<AttachedImage> = Vec::new();
+    let mut block: Vec<&str> = Vec::new();
+    for line in report.lines() {
+        if line.starts_with("====") {
+            out.extend(parse_hdiutil_block(&block));
+            block.clear();
+        } else {
+            block.push(line);
+        }
+    }
+    out.extend(parse_hdiutil_block(&block));
+    out
+}
+
+/// One `hdiutil info` block; `None` unless it names an image AND lists a device.
+#[cfg(target_os = "macos")]
+fn parse_hdiutil_block(lines: &[&str]) -> Option<AttachedImage> {
+    let mut image: Option<PathBuf> = None;
+    let mut node: Option<PathBuf> = None;
+    let mut mounted_at: Vec<PathBuf> = Vec::new();
+    for line in lines {
+        if let Some(rest) = line.strip_prefix("/dev/") {
+            let mut fields = rest.split('\t');
+            let dev = fields.next().unwrap_or("").trim();
+            if node.is_none() && !dev.is_empty() {
+                let mut n = String::from("/dev/");
+                n.push_str(dev);
+                node = Some(PathBuf::from(n));
+            }
+            // Field 3 is the mount point while the entity is mounted; absent or empty
+            // otherwise. It may contain spaces (`/Volumes/aterm 0.81.0`), never a tab.
+            if let Some(point) = fields.nth(1).map(str::trim).filter(|p| !p.is_empty()) {
+                mounted_at.push(PathBuf::from(point));
+            }
+        } else if let Some((key, value)) = line.split_once(':')
+            && key.trim() == "image-path"
+        {
+            image = Some(PathBuf::from(value.trim()));
+        }
+    }
+    Some(AttachedImage {
+        image: image?,
+        node: node?,
+        mounted_at,
+    })
+}
+
+/// Whether two paths name the same file. `hdiutil info` echoes the path the attaching
+/// process passed, so the literal comparison is the one that usually fires; the
+/// canonical one covers a symlinked temp dir (`/var/folders` vs `/private/var/folders`)
+/// or a relative path on either side.
+#[cfg(target_os = "macos")]
+fn same_file(a: &Path, b: &Path) -> bool {
+    a == b
+        || match (a.canonicalize(), b.canonicalize()) {
+            (Ok(x), Ok(y)) => x == y,
+            _ => false,
+        }
 }
 
 /// An attached disk image, detached on EVERY path (`Drop` for the error paths, an
 /// explicit [`Mount::detach`] on the happy path so a detach failure is reported
 /// rather than swallowed). The mount point directory is removed with it.
+///
+/// The guard is armed BEFORE `hdiutil attach` runs, not after it succeeds, because a
+/// non-zero `attach` does not mean nothing was attached. On this machine `attach` fails
+/// with `Resource temporarily unavailable` in roughly one attempt in five under
+/// back-to-back attach/detach traffic, and each of those failures leaves the image's
+/// `/dev/disk*` entities behind with nothing mounted on them — devices that survive for
+/// the life of the boot and make the NEXT attach of the same image fail `Resource busy`.
 #[cfg(target_os = "macos")]
 struct Mount {
+    image: PathBuf,
     point: PathBuf,
+    /// `hdiutil attach` has been SPAWNED for this image: the guard owes a detach
+    /// whatever the exit status claimed.
     attached: bool,
 }
 
+/// How many times `hdiutil attach` is attempted before the stage gives up. The failure
+/// it exists for is a transient `Resource temporarily unavailable` — measured at 5
+/// failures in 20 attaches on an idle Mac, every one of which succeeded on the next
+/// attempt once the failed attempt's devices had been reclaimed. A genuinely bad image
+/// costs this many attach attempts and no more.
+#[cfg(target_os = "macos")]
+const ATTACH_ATTEMPTS: u32 = 4;
+
 #[cfg(target_os = "macos")]
 impl Mount {
-    /// `hdiutil attach -nobrowse -readonly -noverify -noautoopen -quiet -mountpoint
-    /// <point> <image>`: not in Finder, never written, no second checksum pass (the
-    /// download's sha256 gate already ran over these bytes), nothing auto-opened. With
-    /// stdin closed an image that demands a license click fails instead of hanging.
+    /// `hdiutil attach -nobrowse -readonly -noverify -noautoopen -mountpoint <point>
+    /// <image>`: not in Finder, never written, no second checksum pass (the download's
+    /// sha256 gate already ran over these bytes), nothing auto-opened. With stdin closed
+    /// an image that demands a license click fails instead of hanging.
+    ///
+    /// NOT `-quiet`: that flag suppresses the failure line too, which turns every
+    /// diagnosable refusal into a bare `hdiutil failed (exit 1)`. Its stdout (the device
+    /// table) is captured and dropped by [`run_tool`] either way.
+    ///
+    /// A failed attempt is reclaimed ([`Mount::detach_now`]) and retried, up to
+    /// [`ATTACH_ATTEMPTS`].
     fn attach(image: &Path, dest: &Path) -> Result<Self, StageError> {
         let point = dmg_mount_point(dest)?;
         // An EMPTY leftover from a crashed run is ours; a live mount there refuses the
         // `remove_dir` and then refuses the attach below, which is the right outcome.
         let _ = std::fs::remove_dir(&point);
         std::fs::create_dir_all(&point).map_err(StageError::Io)?;
-        let mut m = Mount {
-            point,
-            attached: false,
-        };
-        if let Err(e) = run_tool(
-            "hdiutil",
-            &[
-                "attach".as_ref(),
-                "-nobrowse".as_ref(),
-                "-readonly".as_ref(),
-                "-noverify".as_ref(),
-                "-noautoopen".as_ref(),
-                "-quiet".as_ref(),
-                "-mountpoint".as_ref(),
-                m.point.as_os_str(),
-                image.as_os_str(),
-            ],
-        ) {
-            let _ = std::fs::remove_dir(&m.point);
-            return Err(e);
+        let mut last: Option<StageError> = None;
+        for _ in 0..ATTACH_ATTEMPTS {
+            let mut m = Mount {
+                image: image.to_path_buf(),
+                point: point.clone(),
+                attached: true,
+            };
+            match run_tool(
+                "hdiutil",
+                &[
+                    "attach".as_ref(),
+                    "-nobrowse".as_ref(),
+                    "-readonly".as_ref(),
+                    "-noverify".as_ref(),
+                    "-noautoopen".as_ref(),
+                    "-mountpoint".as_ref(),
+                    m.point.as_os_str(),
+                    image.as_os_str(),
+                ],
+            ) {
+                Ok(()) => return Ok(m),
+                Err(e) => {
+                    // Reclaim whatever the failed attempt left attached before trying
+                    // again: otherwise the retry meets our own carcass as `Resource
+                    // busy` and the devices leak for the life of the boot.
+                    let _ = m.detach_now();
+                    last = Some(e);
+                }
+            }
         }
-        m.attached = true;
-        Ok(m)
+        let _ = std::fs::remove_dir(&point);
+        Err(last.unwrap_or_else(|| {
+            StageError::Payload(String::from("hdiutil attach was never attempted"))
+        }))
     }
 
     /// The ONE `.app` directory at the image root. Anything else there (`Applications`
@@ -872,26 +1054,87 @@ impl Mount {
             return Ok(());
         }
         self.attached = false;
-        let quiet = run_tool(
+        let by_point = run_tool(
             "hdiutil",
             &["detach".as_ref(), "-quiet".as_ref(), self.point.as_os_str()],
         );
-        let r = match quiet {
+        let r = match by_point {
             Ok(()) => Ok(()),
-            // Something still has a file open on the image (Spotlight is the usual
-            // culprit): force it, once.
-            Err(_) => run_tool(
+            // Either nothing is mounted at our point (an `attach` that exited non-zero
+            // after attaching the devices) or something still holds a file open on the
+            // image (Spotlight is the usual culprit). Ask the system which devices this
+            // image actually has, and eject those.
+            Err(_) => self.eject_own_devices(),
+        };
+        let _ = std::fs::remove_dir(&self.point);
+        r
+    }
+
+    /// Eject every device `hdiutil info` still lists for THIS image, and PROVE it worked
+    /// by re-reading the report.
+    ///
+    /// Only an attachment that is wholly unmounted, or mounted nowhere but our own mount
+    /// point, is ejected. `-mountpoint` puts OUR mount at our point and nowhere else, so
+    /// an attachment mounted elsewhere cannot be ours — it is the user's own copy, not
+    /// ours to yank, and reporting nothing left behind is the true answer rather than a
+    /// silent miss. That is also the right reading of a `Resource busy` attach failure
+    /// against a copy the user already has open: a refusal worth reporting, not papering
+    /// over.
+    fn eject_own_devices(&self) -> Result<(), StageError> {
+        let nodes = self.own_devices()?;
+        if nodes.is_empty() {
+            return Ok(());
+        }
+        let mut last: Option<StageError> = None;
+        for node in &nodes {
+            if run_tool(
+                "hdiutil",
+                &["detach".as_ref(), "-quiet".as_ref(), node.as_os_str()],
+            )
+            .is_ok()
+            {
+                continue;
+            }
+            if let Err(e) = run_tool(
                 "hdiutil",
                 &[
                     "detach".as_ref(),
                     "-force".as_ref(),
                     "-quiet".as_ref(),
-                    self.point.as_os_str(),
+                    node.as_os_str(),
                 ],
-            ),
-        };
-        let _ = std::fs::remove_dir(&self.point);
-        r
+            ) {
+                last = Some(e);
+            }
+        }
+        if self.own_devices()?.is_empty() {
+            return Ok(());
+        }
+        Err(last.unwrap_or_else(|| {
+            payload2(
+                "hdiutil could not detach the image: ",
+                &crate::call1(std::path::Path::to_string_lossy, &self.image),
+            )
+        }))
+    }
+
+    /// The device nodes `hdiutil info` lists for this image that are ours to eject
+    /// (see [`Mount::eject_own_devices`]).
+    fn own_devices(&self) -> Result<Vec<PathBuf>, StageError> {
+        let report = capture_tool("hdiutil", &["info".as_ref()])?;
+        Ok(self.reclaimable(&report))
+    }
+
+    /// The device nodes an `hdiutil info` report holds for this image that are ours to
+    /// eject. Split out from [`Mount::own_devices`] so the rule is a pure function of
+    /// the report text and a test can state it without a disk image.
+    fn reclaimable(&self, report: &str) -> Vec<PathBuf> {
+        parse_hdiutil_info(report)
+            .into_iter()
+            .filter(|a| same_file(&a.image, &self.image))
+            .filter(|a| a.mounted_at.iter().all(|p| same_file(p, &self.point)))
+            .map(|a| a.node)
+            .collect()
     }
 
     /// Detach and report. Consumes the guard so `Drop` has nothing left to do.
@@ -1270,7 +1513,10 @@ mod tests {
         );
 
         // The default: installed, complete, RECORDED.
-        assert_eq!(crate::lay::tracked_policy_of(None), TrackedPolicy::Allow);
+        assert_eq!(
+            crate::lay::tracked_policy_of(None, None),
+            TrackedPolicy::Allow
+        );
         verify_and_stage_with(&a, &archive, &build, true, &broken, TrackedPolicy::Allow)
             .expect("the default stages in-process");
         assert!(build.join("bin/ay").is_file());
@@ -2558,6 +2804,157 @@ mod tests {
         let _ = std::fs::remove_dir_all(&b.dir);
     }
 
+    /// Detaches every disk image attached from under `dir` when it goes out of scope —
+    /// on EVERY path out of a test: an early `return`, an assertion panic, or success.
+    ///
+    /// It exists because the leak it cleans up OUTLIVES the process. A failed
+    /// `hdiutil attach` leaves the image's devices attached with nothing mounted on
+    /// them; until [`Mount`] learned to reclaim those, they survived until the machine
+    /// was rebooted or a human ran `hdiutil detach` by hand, and each one made the next
+    /// attach of the same image fail `Resource busy`.
+    #[cfg(target_os = "macos")]
+    struct DetachAll {
+        prefixes: Vec<PathBuf>,
+    }
+
+    #[cfg(target_os = "macos")]
+    impl DetachAll {
+        /// Guard everything attached from under `dir` — by the path as spelled and as
+        /// resolved, since `/var/folders/…` and `/private/var/folders/…` are the same
+        /// directory and `hdiutil` echoes whichever spelling it was handed.
+        fn over(dir: &Path) -> Self {
+            let mut prefixes = vec![dir.to_path_buf()];
+            match dir.canonicalize() {
+                Ok(c) if c != *dir => prefixes.push(c),
+                _ => {}
+            }
+            Self { prefixes }
+        }
+
+        /// The device nodes of every image `hdiutil info` still lists from under the
+        /// guarded directory. Never panics: it runs from `Drop`, which may itself be
+        /// running because an assertion already failed.
+        fn leaked(&self) -> Vec<PathBuf> {
+            let Ok(out) = std::process::Command::new("/usr/bin/hdiutil")
+                .arg("info")
+                .output()
+            else {
+                return Vec::new();
+            };
+            parse_hdiutil_info(&String::from_utf8_lossy(&out.stdout))
+                .into_iter()
+                .filter(|a| self.prefixes.iter().any(|p| a.image.starts_with(p)))
+                .map(|a| a.node)
+                .collect()
+        }
+
+        fn assert_clean(&self, what: &str) {
+            let leaked = self.leaked();
+            assert!(leaked.is_empty(), "{what}: still attached: {leaked:?}");
+        }
+    }
+
+    #[cfg(target_os = "macos")]
+    impl Drop for DetachAll {
+        fn drop(&mut self) {
+            for node in self.leaked() {
+                let _ = std::process::Command::new("/usr/bin/hdiutil")
+                    .args(["detach", "-force", "-quiet"])
+                    .arg(&node)
+                    .status();
+            }
+        }
+    }
+
+    /// `hdiutil info`'s report, parsed: the block a FAILED attach leaves behind — the
+    /// image attached, every entity mounted NOWHERE — is recognised as a carcass with a
+    /// device node to eject, while an image mounted somewhere that is not our mount
+    /// point is left alone.
+    ///
+    /// This is the defect the `dmg` lane leaked on. `hdiutil attach` can exit non-zero
+    /// having ALREADY attached the image (`Resource temporarily unavailable`, measured
+    /// at 5 attempts in 20 on an idle Mac); the guard read that non-zero exit as
+    /// "nothing attached" and the devices outlived the process. The report is the only
+    /// place the carcass is visible, so the rule that reads it is pinned here rather
+    /// than left to a test that has to lose a race to exercise it.
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn a_failed_attach_leaves_a_carcass_the_hdiutil_report_names() {
+        const REPORT: &str = "framework       : 683.160.3
+driver          : 683.160.3
+images          : 3
+================================================
+image-path      : /Users//someone/Downloads/aterm-0.81.0.dmg
+image-alias     : /Users//someone/Downloads/aterm-0.81.0.dmg
+image-type      : read-only disk image
+/dev/disk4\tGUID_partition_scheme\t
+/dev/disk4s1\t48465300-0000-11AA-AA11-00306543ECAC\t/Volumes/aterm 0.81.0
+================================================
+image-path      : /tmp/stage/foo.dmg
+image-alias     : /tmp/stage/foo.dmg
+image-type      : UDIF read-only [write once]
+/dev/disk5\tGUID_partition_scheme\t
+/dev/disk5s1\t7C3457EF-0000-11AA-AA11-00306543ECAC\t
+/dev/disk6\tEF57347C-0000-11AA-AA11-00306543ECAC\t
+/dev/disk6s1\t41504653-0000-11AA-AA11-00306543ECAC\t
+================================================
+image-path      : /tmp/stage/bar.dmg
+image-alias     : /tmp/stage/bar.dmg
+/dev/disk7\tGUID_partition_scheme\t
+/dev/disk7s1\t41504653-0000-11AA-AA11-00306543ECAC\t/tmp/stage/bar.mnt
+";
+        let all = parse_hdiutil_info(REPORT);
+        assert_eq!(all.len(), 3, "one entry per attached image");
+        assert_eq!(all[0].node, Path::new("/dev/disk4"));
+        assert_eq!(
+            all[0].mounted_at,
+            vec![PathBuf::from("/Volumes/aterm 0.81.0")],
+            "a mount point may hold spaces; the fields are tab-separated"
+        );
+        assert_eq!(
+            all[1].node,
+            Path::new("/dev/disk5"),
+            "the image's OWN node, not the synthesised APFS container's"
+        );
+        assert!(
+            all[1].mounted_at.is_empty(),
+            "the carcass is attached and mounted nowhere: {:?}",
+            all[1].mounted_at
+        );
+
+        let mine = |image: &str, point: &str| Mount {
+            image: PathBuf::from(image),
+            point: PathBuf::from(point),
+            // Never armed: these guards must not shell out when they drop.
+            attached: false,
+        };
+        assert_eq!(
+            mine("/tmp/stage/foo.dmg", "/tmp/stage/foo.mnt").reclaimable(REPORT),
+            vec![PathBuf::from("/dev/disk5")],
+            "the carcass of OUR image is ours to eject"
+        );
+        assert_eq!(
+            mine("/tmp/stage/bar.dmg", "/tmp/stage/bar.mnt").reclaimable(REPORT),
+            vec![PathBuf::from("/dev/disk7")],
+            "so is an image mounted at our own mount point"
+        );
+        assert!(
+            mine(
+                "/Users//someone/Downloads/aterm-0.81.0.dmg",
+                "/tmp/stage/x.mnt"
+            )
+            .reclaimable(REPORT)
+            .is_empty(),
+            "an image the user has mounted elsewhere is NOT ours to yank"
+        );
+        assert!(
+            mine("/tmp/stage/other.dmg", "/tmp/stage/other.mnt")
+                .reclaimable(REPORT)
+                .is_empty(),
+            "an image we never attached is never touched"
+        );
+    }
+
     /// The `dmg` lane, for real: a tiny image is built with `hdiutil create` around
     /// a `Foo.app` (an executable, a `0600` file, an internal symlink) beside the usual
     /// `Applications` link and a README; the stage copies ONLY the bundle, preserves its
@@ -2573,6 +2970,9 @@ mod tests {
             return;
         }
         let d = tmp("vendor-dmg");
+        // Armed BEFORE the first image exists, dropped after the last assertion: an
+        // assertion that fires half way through must not leave an image attached.
+        let leaks = DetachAll::over(&d);
         let src = d.join("src");
         lay(
             &src,
@@ -2645,14 +3045,7 @@ mod tests {
             .filter(|e| e.file_name().to_string_lossy().ends_with(".mnt"))
             .collect();
         assert!(mounts.is_empty(), "no mount point left behind: {mounts:?}");
-        let info = std::process::Command::new("/usr/bin/hdiutil")
-            .arg("info")
-            .output()
-            .unwrap();
-        assert!(
-            !String::from_utf8_lossy(&info.stdout).contains(&d.display().to_string()),
-            "the image must be detached"
-        );
+        leaks.assert_clean("the image must be detached");
 
         // Two apps at the root, and none: refused, detached, nothing staged.
         for (label, apps) in [("two", &["A.app", "B.app"][..]), ("none", &[][..])] {
@@ -2676,14 +3069,7 @@ mod tests {
             assert!(matches!(err, StageError::Payload(_)), "{label}: {err:?}");
             assert!(!build2.exists(), "{label}");
             assert!(scratch_beside(&build2).is_empty(), "{label}");
-            let info = std::process::Command::new("/usr/bin/hdiutil")
-                .arg("info")
-                .output()
-                .unwrap();
-            assert!(
-                !String::from_utf8_lossy(&info.stdout).contains(&d.display().to_string()),
-                "{label}: detached on the error path"
-            );
+            leaks.assert_clean(&format!("{label}: detached on the error path"));
         }
 
         // A link INSIDE the bundle that leaves the stage root — absolute, or `..` above
@@ -2744,14 +3130,7 @@ mod tests {
                 assert!(!build3.exists(), "{label}: nothing staged");
                 assert!(scratch_beside(&build3).is_empty(), "{label}");
             }
-            let info = std::process::Command::new("/usr/bin/hdiutil")
-                .arg("info")
-                .output()
-                .unwrap();
-            assert!(
-                !String::from_utf8_lossy(&info.stdout).contains(&d.display().to_string()),
-                "{label}: detached"
-            );
+            leaks.assert_clean(&format!("{label}: detached"));
         }
         let _ = std::fs::remove_dir_all(&d);
     }

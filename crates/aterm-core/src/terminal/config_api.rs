@@ -330,6 +330,16 @@ impl Terminal {
             changes.push(ConfigChange::SyncTimeout);
         }
 
+        // THE HOST IS A MUTATION SITE TOO. The three app-negotiated modes applied
+        // above include DEC 1004, which the tab/pane focus-report gate now reads
+        // from the lock-free `ModeMirror` rather than from `modes`. Applying a
+        // config that arms focus reporting therefore moves an input of that word
+        // outside `process()`, and without this the mirror stays stale until the
+        // next byte of output — at which point the mirror's own debug obligation
+        // fires. Republished once at the end: cheaper to keep correct than a call
+        // inside the `FocusReporting` branch.
+        self.refresh_mode_mirror();
+
         if visual_repaint {
             // A config-driven recolor/policy change repaints already-drawn cells
             // without changing their content. Advance full-grid damage so a

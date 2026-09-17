@@ -13,12 +13,25 @@ use aterm_core::selection::{SelectionSide, SelectionType};
 use aterm_core::terminal::Terminal;
 use aterm_render::{LigatureMode, Renderer, TextShapingConfig, Theme};
 
-// Layout-independent ligature font discovery. Order: (a) $ATERM_FONT if set and
-// readable; (b) the committed repo fixture (sibling of this test, present in both
-// canonical and vendored layouts). Returns None -> the test SKIPs cleanly rather
-// than panicking, so a host without the fixture never breaks the suite.
+// Layout-independent ligature font discovery. Order: (a) $ATERM_LIGATURE_TEST_FONT
+// if set and readable; (b) the committed repo fixture (sibling of this test,
+// present in both canonical and vendored layouts). Returns None -> the test SKIPs
+// cleanly rather than panicking, so a host without the fixture never breaks the
+// suite.
+//
+// THE OVERRIDE IS A DEDICATED VAR, NOT $ATERM_FONT. This helper used to read
+// $ATERM_FONT, which is not a test knob at all: it is a PRODUCTION setting that
+// outranks `font_family` in config (see `effective_font_family`). So a developer
+// who simply names their preferred terminal font in their shell profile silently
+// displaced the committed fixture, and six tests in this file — which hard-assert
+// that `=>` ligates, that `zero` is present, that a fixture-specific shape
+// appears — went RED on correct code. Measured 2026-09-15 with
+// `ATERM_FONT=/System/Library/Fonts/Monaco.ttf`: 13 passed, 6 failed, among them
+// `fixture_font_has_ligature_features_and_still_ligates`, whose whole subject is
+// the fixture the env had just replaced. A test must not bet on the developer's
+// environment; the committed fixture is the point of committing it.
 fn ligature_test_font() -> Option<Vec<u8>> {
-    if let Ok(path) = std::env::var("ATERM_FONT")
+    if let Ok(path) = std::env::var("ATERM_LIGATURE_TEST_FONT")
         && let Ok(bytes) = std::fs::read(&path)
     {
         return Some(bytes);

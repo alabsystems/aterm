@@ -38,15 +38,20 @@ pub(crate) const SHELL_INTEGRATION_LOADED_GUARD: &str = "ATERM_SHELL_INTEGRATION
 /// what actually happened, as opposed to the advertised capability constant.
 ///
 /// This is load-bearing honesty, not telemetry: the toolchain seed pill
-/// promises "open a new tab to use them", and new tabs get `<prefix>/bin` on
-/// PATH only because the integration loader sources `~/.aterm/shell.d`. When
-/// preparation fails — an unknown shell, an unwritable loader cache — that
-/// promise is a "command not found" in waiting, so the pill composer and
-/// `--diagnose` both read this record instead of assuming success.
+/// promises "ready in every aterm tab, this one too" (until 2026-09-16 it said
+/// "open a new tab to use them"; owner, that day: "NO! all the latest and best
+/// MUST WORK IN THE SAME TAB with live update!"), and a tab gets `<prefix>/bin`
+/// on PATH — and keeps `agents/` and `reroute/` in front after its rc ran —
+/// only because the integration script's live path (`__aterm_managed_path_live`,
+/// every precmd and preexec) sources `~/.aterm/shell.d` and re-asserts the
+/// order. When preparation fails — an unknown shell, an unwritable loader cache
+/// — that promise is a "command not found" in waiting for THIS tab and every
+/// other, so the pill composer and `--diagnose` both read this record instead
+/// of assuming success.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) enum ShellIntegrationOutcome {
-    /// The loader was written and injected: new tabs source `shell.d`, so the
-    /// ALab tools' PATH hook reaches them.
+    /// The loader was written and injected: every tab of this window sources
+    /// `shell.d` at its next prompt, so the ALab tools' PATH hook reaches them.
     Prepared,
     /// No integration script exists for this shell (named as selected/`$SHELL`)
     /// — nothing will ever source `shell.d` in it.
@@ -233,7 +238,9 @@ type ShellIntegrationSetup = (
 /// non-default shell gets its OWN integration script (bash → the bash hooks),
 /// not PowerShell's. `detect_current()` only sees `ATERM_SHELL`, so a shell
 /// chosen via the CONFIG key would otherwise be misdetected as PowerShell.
-fn detect_spawn_shell(shell_hint: Option<&str>) -> aterm_core::shell_integration::ShellType {
+pub(crate) fn detect_spawn_shell(
+    shell_hint: Option<&str>,
+) -> aterm_core::shell_integration::ShellType {
     use aterm_core::shell_integration as si;
     match shell_hint.filter(|s| !s.is_empty()) {
         Some(h) => si::ShellType::detect(h),
@@ -424,14 +431,108 @@ pub(crate) fn parse_injected_identity(
 }
 
 /// Read this aterm's injected root identity from the process environment — set by
-/// an OUTER aterm when it spawned us. `None` (→ fresh identity) when unset or
-/// malformed. Only the ROOT session (`id == 0`) adopts it, so the outer's
-/// preminted edges (which name this id as `dst`) authorize against our table.
+/// an OUTER aterm when it spawned us — AND CLAIM IT. `None` (→ fresh identity)
+/// when unset, malformed, or already held by a live instance. Only the ROOT
+/// session (`id == 0`) adopts it, so the outer's preminted edges (which name this
+/// id as `dst`) authorize against our table.
 fn adopt_injected_identity() -> Option<(SessionId, LaunchNonce)> {
     use aterm_types::domain::{ENV_LAUNCH_NONCE, ENV_SESSION_ID};
     let sid = std::env::var(ENV_SESSION_ID).ok();
     let nonce = std::env::var(ENV_LAUNCH_NONCE).ok();
-    parse_injected_identity(sid.as_deref(), nonce.as_deref())
+    adopt_injected_identity_in(
+        control_auth::socket_dir().as_deref(),
+        sid.as_deref(),
+        nonce.as_deref(),
+    )
+}
+
+/// The adoption decision, against a caller-named control directory so it is
+/// testable without the process environment or the user's real control dir.
+///
+/// The premint in `$ATERM_SESSION_ID` is re-readable ON PURPOSE: a child aterm
+/// that exits and is relaunched in the same shell must come back under its
+/// original identity, or every edge the outer minted for it dies with the first
+/// launch. What that spelling could not tell apart is a relaunch (the previous
+/// holder is GONE — a transfer) from a second simultaneous launch (the previous
+/// holder is LIVE — a duplicate), and it adopted in both cases. Two live
+/// instances then answered to one `s-…` id, published one `graph/<sid>` discovery
+/// entry between them, and a driver resolving that id from a fleet listing could
+/// land `key`/`send` in the wrong instance's window. Observed on a real machine,
+/// twice.
+///
+/// So adoption now requires the identity to be provably unheld
+/// ([`crate::identity_claim::claim_for_adoption`]); a launch that cannot prove it
+/// mints a fresh id instead, losing the outer's preminted edges (it says so on
+/// stderr) rather than borrowing another instance's address. `None` with no
+/// control directory at all, for the same reason: nowhere to contend is nowhere
+/// to prove.
+fn adopt_injected_identity_in(
+    dir: Option<&std::path::Path>,
+    sid: Option<&str>,
+    nonce_hex: Option<&str>,
+) -> Option<(SessionId, LaunchNonce)> {
+    let (sid, nonce) = parse_injected_identity(sid, nonce_hex)?;
+    let dir = dir?;
+    crate::identity_claim::claim_for_adoption(dir, &sid).then_some((sid, nonce))
+}
+
+#[cfg(test)]
+mod injected_identity_adoption_tests {
+    use super::adopt_injected_identity_in;
+    use aterm_session::{LaunchNonce, SessionId};
+
+    /// THE BUG, at the seam that had it. One pane's shell exports ONE
+    /// `$ATERM_SESSION_ID`, and every aterm launched from it reads that same
+    /// value — so this is literally the same two arguments, twice. The first
+    /// launch adopts; the second is refused and its caller mints a fresh id
+    /// (`spawn_session`'s `unwrap_or_else`). Two live instances, two addresses.
+    ///
+    /// Before the claim both calls returned the premint, which is how a fresh
+    /// instance and a long-running one came to report `s-65c4be9f5a0c67d85148`
+    /// together, and how `@<sid> key enter` could land in the wrong window.
+    #[test]
+    fn two_launches_from_one_shell_do_not_share_an_identity() {
+        let dir = aterm_tempfile::tempdir().expect("scratch control dir");
+        let premint = SessionId::generate();
+        let nonce = LaunchNonce::generate();
+        let (sid, hex) = (premint.as_str().to_string(), nonce.to_hex());
+        let start = std::time::Instant::now();
+
+        let first = adopt_injected_identity_in(Some(dir.path()), Some(&sid), Some(&hex))
+            .expect("the first launch adopts the premint");
+        assert_eq!(first.0, premint);
+        assert!(first.1.ct_eq(&nonce), "the nonce rides with the id");
+
+        assert!(
+            adopt_injected_identity_in(Some(dir.path()), Some(&sid), Some(&hex)).is_none(),
+            "a second launch from the same shell must NOT answer to a live id"
+        );
+        assert!(
+            start.elapsed() < std::time::Duration::from_secs(1),
+            "both launches must land in one process-second for this to be the \
+             same-second case; took {:?}",
+            start.elapsed()
+        );
+    }
+
+    /// Fail-closed in both of the other directions: a half-injected identity is
+    /// still refused BEFORE any claim (the pre-existing contract), and so is a
+    /// well-formed one with nowhere to contend — no control directory means no
+    /// proof of sole ownership, and an unprovable id is exactly the one that
+    /// must not be adopted.
+    #[test]
+    fn adoption_is_refused_without_a_whole_identity_or_a_place_to_claim_it() {
+        let dir = aterm_tempfile::tempdir().expect("scratch control dir");
+        let sid = SessionId::generate().as_str().to_string();
+        let hex = LaunchNonce::generate().to_hex();
+        assert!(adopt_injected_identity_in(Some(dir.path()), Some(&sid), None).is_none());
+        assert!(adopt_injected_identity_in(Some(dir.path()), None, Some(&hex)).is_none());
+        assert!(adopt_injected_identity_in(Some(dir.path()), Some("bad"), Some(&hex)).is_none());
+        assert!(
+            adopt_injected_identity_in(None, Some(&sid), Some(&hex)).is_none(),
+            "no control directory, no claim, no adoption"
+        );
+    }
 }
 
 /// The capability tokens a parent minted for ONE child, kept so the parent can
@@ -698,6 +799,15 @@ pub(crate) struct Adopted {
     /// and the tail of its alt-screen archive, when the handoff carried them and
     /// they checked out. Best-effort: `None` adopts exactly as before.
     pub control: Option<crate::handoff_carry::ControlCarry>,
+    /// FROZEN PATH (2026-09-16): this shell was spawned by a build before the
+    /// self-healing sessions (`session_store::predates_path_self_heal`) — its PATH
+    /// has no `<prefix>/agents/` in front and nothing running in it will learn of
+    /// the directory — the owner's tab of that day. Decided by
+    /// `seamless::take_incoming` from the manifest's `outgoing_build` (absent ⇒
+    /// predates; presence, never the number) or the record's own
+    /// `frozen_path`; marked on the registry at `App::register_session`, counted for
+    /// the managed-current row, carried on by the next handoff.
+    pub frozen_path: bool,
 }
 
 #[allow(
@@ -741,6 +851,7 @@ pub(crate) fn spawn_session(
         prime_agents_if_due();
     }
     let handoff_local_id = adopt.as_ref().map(|adopted| adopted.local_id);
+    let frozen_path = adopt.as_ref().is_some_and(|adopted| adopted.frozen_path);
     // Per-tab shell integration: a FRESH nonce per session. Reusing a nonce
     // across tabs would let tab A's (untrusted) output emit tab B's authorized
     // OSC 133/633 marks; a distinct nonce per engine prevents that cross-tab
@@ -785,7 +896,13 @@ pub(crate) fn spawn_session(
     let (self_id, self_nonce) = match &adopt {
         // ADOPTED: RESTORE the exact fabric identity from the handoff manifest so the
         // session keeps its sid/nonce across the update (edges + discovery stay valid).
-        Some(a) => (a.sid.clone(), a.nonce),
+        // A TRANSFER, never a second holder: the id is kept unconditionally, and the
+        // claim is taken only if the predecessor has already let go of it (during an
+        // overlap handoff it has not — see `identity_claim::hold_transferred`).
+        Some(a) => {
+            crate::identity_claim::hold_transferred(&a.sid);
+            (a.sid.clone(), a.nonce)
+        }
         None if id == 0 => adopt_injected_identity()
             .unwrap_or_else(|| (SessionId::generate(), LaunchNonce::generate())),
         None => (SessionId::generate(), LaunchNonce::generate()),
@@ -1097,6 +1214,7 @@ pub(crate) fn spawn_session(
         master,
         pid,
         handoff_local_id,
+        frozen_path,
         ctx,
         child_proxy_sid,
         output_wake_pending,
@@ -1286,12 +1404,15 @@ mod shell_integration_guard_tests {
     /// overrides the inherited [`SHELL_INTEGRATION_LOADED_GUARD`] with an
     /// EMPTY value, which only defuses the loader guard if the shipped
     /// scripts (a) use exactly this variable name and (b) test it with a
-    /// non-empty check (`[[ -n … ]]`). Pin both so the script and the spawn
-    /// scrub can never drift apart silently.
+    /// non-empty check — `[[ -n "${…:-}" ]]`, the nounset-safe spelling the
+    /// shell lane gave the loader guard on 2026-09-16 (a user's `set -u` used
+    /// to abort the load; an empty override still fails `-n` with or without
+    /// the `:-`). Pin both so the script and the spawn scrub can never drift
+    /// apart silently.
     #[test]
     fn nested_launch_guard_name_matches_the_shipped_scripts() {
         use aterm_core::shell_integration::scripts;
-        let guard_test = format!("[[ -n \"${SHELL_INTEGRATION_LOADED_GUARD}\" ]]");
+        let guard_test = format!("[[ -n \"${{{SHELL_INTEGRATION_LOADED_GUARD}:-}}\" ]]");
         for (shell, script) in [("zsh", scripts::ZSH), ("bash", scripts::BASH)] {
             assert!(
                 script.contains(SHELL_INTEGRATION_LOADED_GUARD),
@@ -1821,6 +1942,14 @@ pub(crate) fn new_live_terminal(
     // session whose handoff carried its archive takes the carried origin back
     // (`AltArchive::import`), and its marks go on meaning what they meant.
     t.set_alt_archive_origin(alt_archive_origin());
+    // The archive's 4 MiB budget is ONE budget for the whole app, not one per
+    // tab: a window with eight sessions used to retain 8 x 4 MiB (measured).
+    // Joining the process pool makes each live session's share `4 MiB / live`
+    // (floored at 256 KiB so a crowded window still answers `offscreen`), and
+    // dropping this terminal — the tab closing — gives the share back with no
+    // bookkeeping on this side. Each session still evicts only its own oldest
+    // rows, so no lock is ever taken across sessions.
+    t.set_alt_archive_shared(true);
     t
 }
 
@@ -2468,6 +2597,15 @@ fn spawn_cast_writer(
     std::thread::Builder::new()
         .name("aterm-cast-writer".into())
         .spawn(move || {
+            // Holds the `cast` recorder mutex for every burst it appends — the
+            // same mutex the MAIN thread takes on every resize pass, to stamp a
+            // pane's new geometry into its asciicast (`app_render`'s per-pane
+            // `record_resize`, "main thread, lock uncontended here"). qos.rs's
+            // port-time floor rule therefore forbids leaving this worker below
+            // `Responsive`, and undeclared it ran at the inherited DEFAULT band:
+            // a descheduled holder there puts its whole wait in front of a UI
+            // thread that is about to take the same lock.
+            crate::qos::set_self(crate::qos::Role::Responsive);
             while let Ok(bytes) = cast_rx.recv() {
                 let mut rec = cast.lock().unwrap_or_else(|p| p.into_inner());
                 let t = rec.now();
@@ -2505,6 +2643,14 @@ fn spawn_temporal_writer(
         .name("aterm-temporal-writer".into())
         .spawn(move || {
             use crate::temporal::TemporalMsg;
+            // The MAIN thread WAITS on this worker: `park_reader` spins on its
+            // `is_finished()` under the update-handoff deadline before a
+            // re-attach may spawn a second writer into the same recorder, and a
+            // missed deadline is a failed park. The `temporal` mutex it holds
+            // per burst is taken by the control lanes as well. Undeclared it ran
+            // at the inherited DEFAULT band — below the floor qos.rs sets for a
+            // worker something above it is queued behind.
+            crate::qos::set_self(crate::qos::Role::Responsive);
             while let Ok(msg) = temporal_rx.recv() {
                 let mut rec = temporal.lock().unwrap_or_else(|p| p.into_inner());
                 // Hand the reader's SHARED allocation straight through (refcount
@@ -2697,6 +2843,43 @@ mod reply_writer_lifetime_tests {
             assert!(t0.elapsed() < Duration::from_secs(5), "{what} never exited");
             std::thread::sleep(Duration::from_millis(1));
         }
+    }
+
+    /// THE CLASS THE WRITER ACTUALLY RUNS AT, asked of the kernel rather than of
+    /// the source. `Role::Interactive` reaches this thread through ONE line at
+    /// the top of the closure [`spawn_reply_writer`] hands the seam, and the
+    /// tests around this one cover lifetime and spawn failure — so deleting that
+    /// line, or moving the body to a bare `std::thread::spawn`, compiles and
+    /// stays green while the thread that holds `Shared.lock` (the mutex the
+    /// keystroke write spins on) drops into the band the compilers run in. That
+    /// regression is invisible on an idle machine and is felt as typing lag on a
+    /// saturated one, which is why the assertion is the class itself.
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn the_reply_writer_runs_at_the_class_the_keystroke_path_needs() {
+        use std::os::unix::thread::JoinHandleExt as _;
+        let (sink, _peer) = sink_and_peer();
+        let (reply_tx, join) = spawn_reply_writer(sink.clone()).expect("spawn");
+        let thread = join.as_pthread_t() as libc::pthread_t;
+        // The class is the inherited default until the closure's first statement
+        // runs, so observe it rather than racing it.
+        let deadline = Instant::now() + Duration::from_secs(2);
+        let observed = loop {
+            let now = crate::qos::class_of(thread).expect("the writer's QoS class");
+            if now != crate::qos::UNDECLARED_CLASS || Instant::now() >= deadline {
+                break now;
+            }
+            std::thread::sleep(Duration::from_millis(1));
+        };
+        assert_eq!(
+            observed,
+            crate::qos::class_for(crate::qos::Role::Interactive),
+            "the reply writer runs at 0x{observed:x}, not the class the keystroke \
+             path needs: it holds the sink lock the UI thread's own write spins on"
+        );
+        drop(reply_tx);
+        drop(sink);
+        wait_finished(&join, "the reply writer");
     }
 
     #[test]
@@ -3771,10 +3954,14 @@ impl crate::App {
             master: session.master,
             ctx: session.ctx.clone(),
         };
-        store
-            .write()
-            .unwrap_or_else(|p| p.into_inner())
-            .register(handle);
+        let mut registry = store.write().unwrap_or_else(|p| p.into_inner());
+        registry.register(handle);
+        // An adopted shell with a frozen PATH (2026-09-16) is recorded where the
+        // managed-current row counts it and the next handoff carries it.
+        if session.frozen_path {
+            registry.mark_frozen_path(session.id);
+        }
+        drop(registry);
         // Sibling discovery: publish this session's graph entry (sid → our
         // instance socket) so an `@<sid>` arriving at ANOTHER same-uid instance
         // can be forwarded here. No-op until/unless the control socket is bound.
@@ -3862,6 +4049,34 @@ pub(crate) fn reroute_path_env(
     injected.then(|| ("PATH".to_string(), entries.join(&sep.to_string())))
 }
 
+/// THE MANAGED `agents/` DIRECTORY EVERY SESSION GETS IN FRONT OF ITS PATH — ENSURED
+/// TO EXIST AT LAUNCH (2026-09-16). Until this, the spawn seam front-inserted
+/// `<prefix>/agents/` only when the directory already existed (`dir.is_dir()`), and it
+/// is atpkg that creates it, on the first activation of a managed `claude`/`codex` —
+/// so on EVERY fresh machine the first tab opened before the seed pass laid the twins
+/// and never ran the managed programs, and the tab the owner was looking at on
+/// 2026-09-16 ("aterm atpkg DID install the latest but it didn't make them available
+/// for me") had no `agents/` on its PATH at all. What a launch needs synchronously is
+/// only that the directory EXIST, so the sessions it spawns get it in front of the
+/// PATH they are spawned with and the twins atpkg lays into it later are found on
+/// the next invocation; that is one `mkdir -p`, exactly the reroute dir's discipline
+/// just above it in the seam (a launch path never waits on a launchd job; nothing
+/// here blocks the first frame). The spawn PATH is the seam's whole reach: an rc
+/// that prepends `~/.local/bin` puts a foreign `claude` in front again, and the
+/// shell integration's per-prompt re-assert — sourcing `~/.aterm/shell.d/00-atpkg.*`
+/// once the pass writes it — is what finishes the job in that tab.
+/// `None` when the directory could not be created — the spawn then omits it, as it
+/// always did for an absent one — and the reason is said on stderr, never silently.
+pub(crate) fn managed_agents_dir(layout: &atpkg::store::Layout) -> Option<String> {
+    let dir = layout.agents_dir();
+    if let Err(error) = layout.ensure_dir(&dir) {
+        eprintln!(
+            "aterm: managed agents dir not created ({error}); the managed `claude`/`codex` are NOT in front of PATH in this window's sessions — `aterm pkg repair` re-lays it (a system prefix needs root)"
+        );
+    }
+    dir.to_str().filter(|_| dir.is_dir()).map(str::to_owned)
+}
+
 /// THE PATH THE CO-LOCATED atpkg CHILDREN RUN WITH (2026-09-10, R1). A Finder-launched
 /// app inherits launchd's `PATH=/usr/bin:/bin:/usr/sbin:/sbin` (measured on m21:
 /// `ps -E` on the running window), so the `atpkg seed`/`atpkg update` children it
@@ -3927,7 +4142,9 @@ fn login_shell_path_with(
     args: &[&str],
     budget: std::time::Duration,
 ) -> Option<String> {
-    let mut command = std::process::Command::new(program);
+    // Below the typing band: this runs the user's whole rc chain for an atpkg
+    // pass, and a thread's QoS does not cross the spawn (`qos::command`).
+    let mut command = crate::qos::command(crate::qos::Role::Background, program);
     command
         .args(args)
         .stdin(std::process::Stdio::null())
@@ -4131,6 +4348,38 @@ mod reroute_path_env_tests {
         assert_eq!(reroute_path_env(None, None, None, Some("/usr/bin")), None);
     }
 
+    /// THE FIRST TAB IS COVERED (2026-09-16): the agents dir is CREATED by the
+    /// spawn seam, not waited for. A fresh prefix has no `agents/`; after this
+    /// call it exists (private, like every `$HOME` layout dir) and is the string
+    /// the seam front-inserts — so the very first tab on a fresh machine has it
+    /// on PATH before atpkg lays a single twin, and the next `claude` there runs
+    /// the managed build the moment the twin lands. A second call is a no-op.
+    #[test]
+    fn the_agents_dir_is_ensured_at_launch_so_the_first_tab_is_covered() {
+        use super::managed_agents_dir;
+        let prefix = aterm_tempfile::tempdir().expect("scratch prefix");
+        let layout = atpkg::store::Layout {
+            prefix: prefix.path().join("pkg"),
+        };
+        assert!(
+            !layout.agents_dir().is_dir(),
+            "a fresh prefix has no agents/"
+        );
+        let dir = managed_agents_dir(&layout).expect("created, hence on PATH");
+        assert_eq!(dir, layout.agents_dir().to_str().unwrap());
+        assert!(layout.agents_dir().is_dir());
+        assert_eq!(managed_agents_dir(&layout).as_deref(), Some(dir.as_str()));
+        // And it is what the seam front-inserts, ahead of the foreign homes.
+        let (_, value) = reroute_path_env(
+            None,
+            Some(&dir),
+            None,
+            Some("/Users//u/.local/bin:/opt/homebrew/bin"),
+        )
+        .expect("injects");
+        assert!(value.starts_with(&format!("{dir}:")), "{value}");
+    }
+
     /// The atpkg children's PATH: the login shell's answer is the last `/…:…` line
     /// (banners before it, spaces inside it); the fallback appends the two foreign
     /// homes and `/usr/local/bin` to whatever the process had, once each.
@@ -4188,6 +4437,31 @@ mod reroute_path_env_tests {
                 bin
             ]),
             "agents/ moved to the front, bin/ appended"
+        );
+    }
+
+    /// THE RC FILES RUN BELOW THE TYPING BAND (2026-09-15). The lookup runs a
+    /// login shell's whole rc chain for an `atpkg` pass, on a `Background` worker —
+    /// and started it at pri 31, the band of the program being typed into, because
+    /// a thread's QoS does not cross the spawn. The probe shell now reports its own
+    /// priority as its "PATH".
+    #[test]
+    #[cfg(target_os = "macos")]
+    fn login_path_shell_runs_below_the_inherited_band() {
+        let path = super::login_shell_path_with(
+            "/bin/sh",
+            &["-c", "printf '/pri:%s\\n' \"$(/bin/ps -o pri= -p $$)\""],
+            std::time::Duration::from_secs(5),
+        )
+        .expect("the probe shell answered");
+        let pri: i32 = path
+            .trim_start_matches("/pri:")
+            .trim()
+            .parse()
+            .unwrap_or_else(|_| panic!("no priority in {path:?}"));
+        assert!(
+            pri <= 20,
+            "the login-shell probe ran at pri {pri}, not utility (20)"
         );
     }
 

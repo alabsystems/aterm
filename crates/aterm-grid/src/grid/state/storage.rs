@@ -118,24 +118,35 @@ pub struct GridStorage {
     /// re-checked on re-attach: if it advanced, the reflowed (pre-erase) store is
     /// dropped rather than resurrecting history the user explicitly cleared.
     pub(crate) scrollback_clear_gen: u64,
-    /// Monotonic generation bumped whenever retained HISTORY rows are
-    /// RENUMBERED in the absolute-row space with no
-    /// [`AbsoluteRowUpdate`](crate::AbsoluteRowUpdate) emitted. Three paths
-    /// raise it, all with the same shape — the retained-line total moves while
-    /// `absolute_row_counter` does not, so `oldest_absolute_row()` (`counter −
-    /// visible − scrollback`) slides and carries every retained row's
-    /// `oldest + i` key with it, while `base_y()` arithmetic and the
-    /// protected-footer revision stay put:
+    /// Monotonic generation bumped whenever rows are RENUMBERED in the
+    /// absolute-row space with no
+    /// [`AbsoluteRowUpdate`](crate::AbsoluteRowUpdate) emitted — i.e. whenever
+    /// an absolute row number starts naming DIFFERENT text without `base_y()`
+    /// arithmetic or the protected-footer revision moving. Four paths raise it:
     ///
+    /// * ANY width reflow (`Grid::resize_with_reflow_mode`). A rewrap re-splits
+    ///   the same logical lines across a different number of rows, so the text
+    ///   a given absolute key names slides — on the LIVE screen as much as in
+    ///   history, which is why this bump is unconditional on the width change
+    ///   rather than gated on a splice having happened;
     /// * the Kitty CSI +T unscroll (`unscroll_from_scrollback`), which removes
     ///   the NEWEST scrollback lines;
-    /// * the width rewrap's scrollback restore (`scrollback_reflow.rs`), which
-    ///   re-splits history into a different number of rows;
+    /// * the width rewrap's scrollback restore (`scrollback_reflow.rs`) and the
+    ///   deficit pullback (`reflow_pullback.rs`), which move the retained-line
+    ///   total under a still-standing `absolute_row_counter`. Subsumed by the
+    ///   width bump above during a resize, and kept because the OFFLOADED
+    ///   re-attach reaches both outside one;
     /// * a ROWS-ONLY resize that adds or removes rows at the BOTTOM — the
     ///   grow's blank append and the shrink's trailing-blank trim
     ///   (`Grid::note_bottom_end_renumbered`). Rows moved ACROSS the
     ///   live/history boundary (reveal, top-demote) leave the total unchanged
     ///   and are pure relabels that do NOT bump this.
+    ///
+    /// The last three share one shape: the retained-line total moves while
+    /// `absolute_row_counter` does not, so `oldest_absolute_row()` (`counter −
+    /// visible − scrollback`) slides and carries every retained row's
+    /// `oldest + i` key with it, while `base_y()` and the footer revision stay
+    /// put. The width reflow is the one that also moves LIVE rows.
     ///
     /// Ordinary retention eviction
     /// drops the OLDEST lines and preserves every survivor's absolute key, so
@@ -177,6 +188,42 @@ pub struct GridStorage {
     /// sentinel. WRITE-ONLY except for [`Grid::content_gen`]: no render or parse
     /// path reads it, so it cannot alter any rendered output.
     pub content_gen: u64,
+    /// Monotonic generation bumped exactly once each time the READER DESCENDS the
+    /// viewport to the live bottom — `display_offset` going from non-zero to zero
+    /// through a reader-facing scroll primitive, and through nothing else.
+    ///
+    /// It exists because [`crate::grid::scrollback_offload`]'s audit-#7 exception
+    /// asks a question `display_offset` cannot answer. That exception honors a reader
+    /// who followed streaming output down to the live bottom during a reflow window,
+    /// instead of restoring their pre-resize depth — so it must tell that End apart
+    /// from the detach's own clamp, from a retention clamp, from a rows-only resize
+    /// re-anchoring the viewport and from SCR-1's per-batch pin dance. Every one of
+    /// those writes the same `0` to the same field, so no reading of the VALUE — at
+    /// the detach, at the re-attach, or as a high-water mark in between — can
+    /// separate them. A generation can, because it records PROVENANCE: sampled at
+    /// detach and compared at re-attach, an advance means the reader's own hand.
+    ///
+    /// The bump condition is the audit's own sentence made literal — "the reader
+    /// DESCENDED to 0" — so it is `before != 0 && after == 0` inside the four
+    /// reader-facing primitives in [`crate::grid::scroll`] (`scroll_display`,
+    /// `scroll_to_top`, `scroll_to_bottom`, `scroll_to_absolute_row`). Two readings
+    /// follow from that and both are deliberate: an End at a viewport already pinned
+    /// to the live bottom moves nothing and records nothing (a gesture that moved
+    /// nothing is not evidence of a choice), and a reader who scrolls UP and stops
+    /// records nothing either (they did not choose the bottom; the machine did if
+    /// anything later puts them there).
+    ///
+    /// Deliberately NOT bumped by machine motion, each of which has its own
+    /// non-bumping entry point: `reset_display_offset_with_damage` (the row-arithmetic
+    /// precondition IL/DL/ED/unscroll/`scroll_up` force),
+    /// `pin_viewport_to_live_for_output_batch` + `repin_display_offset` (SCR-1's
+    /// force-to-live-then-repin around a batch of output),
+    /// `scroll_to_absolute_row_internal` (a rows-only resize re-anchoring the
+    /// viewport), `clamp_display_offset`, the reflow clamp and the erase resets.
+    ///
+    /// Like `content_gen`, WRITE-ONLY outside its one consumer: no render or parse
+    /// path reads it, so it can never alter rendered output.
+    pub(crate) reader_live_bottom_gen: u64,
     /// Monotonic AUTOWRAP serial — the emulator wrap fact (kitty-motion §4.1).
     ///
     /// Bumped exactly once each time `advance_autowrap_line` runs, which is
@@ -264,6 +311,7 @@ impl GridStorage {
             absolute_row_counter: u64::from(visible_rows),
             // Init NONZERO so `0` is a usable "never observed" sentinel (P1.0).
             content_gen: 1,
+            reader_live_bottom_gen: 0,
             wrap_serial: 0,
             any_double_width: false,
             has_horizontal_margins: false,

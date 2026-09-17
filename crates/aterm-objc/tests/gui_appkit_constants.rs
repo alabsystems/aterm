@@ -270,6 +270,11 @@ fn as_c_literal(rust: &str) -> String {
 
 /// Compile `body` as Objective-C for `arch`, syntax only. `Ok(())` if clang
 /// accepted it, `Err(stderr)` if it did not.
+///
+/// A `cc` that cannot even be started panics: a missing compiler is a broken
+/// box, and an oracle that cannot run on a broken box is not a pass. A `cc`
+/// that runs but cannot fold a `static const` is a narrower case with its own
+/// rule, on one measured host only: [`green_verdict`] and [`inverted_verdict`].
 fn compile(arch: &str, body: &str, tag: &str) -> Result<(), String> {
     let dir = std::env::temp_dir().join(format!("aterm-gui-consts-{tag}-{arch}"));
     std::fs::create_dir_all(&dir).expect("a scratch directory");
@@ -289,13 +294,173 @@ fn compile(arch: &str, body: &str, tag: &str) -> Result<(), String> {
         .output()
         .expect(
             "`cc` must be runnable: this test IS the oracle that replaced the \
-             objc2 diff, and an oracle that cannot run is not a pass",
+             objc2 diff, and a compiler that cannot even start is a broken box, \
+             not a pass",
         );
     if out.status.success() {
         Ok(())
     } else {
         Err(String::from_utf8_lossy(&out.stderr).into_owned())
     }
+}
+
+/// The diagnostic Apple clang 14.0.3 gives for every `static const` row —
+/// `NSNotFound`, `NSModalResponseOK`, `NSAppKitVersionNumber10_12`,
+/// `NSVariableStatusItemLength`, `NSAlertFirstButtonReturn`,
+/// `NSWindowFullScreenButton` — when asked to fold it into `_Static_assert`.
+/// It is the HOST compiler's limit, not the target's: the fold fails for both
+/// `-arch` arms on that clang (measured 2026-09-06 and again 2026-09-16 on an
+/// Intel MacBook Pro running macOS 13.7.8 with the Command Line Tools' clang
+/// 14.0.3; the enum rows fold fine). A newer clang folds them all.
+#[cfg(all(target_arch = "x86_64", target_os = "macos"))]
+const FOLD_DIAGNOSTIC: &str = "static_assert expression is not an integral constant expression";
+
+/// The rows clang could not fold, in the order it named them — `Some` only
+/// when EVERY `error:` line in `stderr` is [`FOLD_DIAGNOSTIC`]. Any other
+/// error (a value disagreement reads `static assertion failed due to
+/// requirement`), or no `error:` line at all, is `None`: not classified, so
+/// the caller keeps its verdict. The row is the quoted name on the source line
+/// clang prints under the diagnostic.
+#[cfg(all(target_arch = "x86_64", target_os = "macos"))]
+fn unfolded_rows(stderr: &str) -> Option<Vec<String>> {
+    let lines: Vec<&str> = stderr.lines().collect();
+    let mut rows = Vec::new();
+    let mut saw_error = false;
+    for (i, line) in lines.iter().enumerate() {
+        if !line.contains("error:") {
+            continue;
+        }
+        saw_error = true;
+        if !line.contains(FOLD_DIAGNOSTIC) {
+            return None;
+        }
+        let row = lines
+            .iter()
+            .skip(i + 1)
+            .take(3)
+            .find_map(|l| {
+                let (_, rest) = l.split_once('"')?;
+                let (name, _) = rest.split_once('"')?;
+                Some(name.to_owned())
+            })
+            .unwrap_or_else(|| "<a row clang did not print>".to_owned());
+        rows.push(row);
+    }
+    saw_error.then_some(rows)
+}
+
+/// The green arm's verdict on `compile`'s answer — `assert!`-shaped: a clean
+/// compile is the pass, anything else is `what` on `arch` with clang's text.
+/// On every target but x86_64 macOS that is the whole function.
+#[cfg(not(all(target_arch = "x86_64", target_os = "macos")))]
+#[track_caller]
+fn green_verdict(arch: &str, what: &str, result: Result<(), String>) {
+    if let Err(stderr) = result {
+        panic!("{what} on {arch}:\n{stderr}");
+    }
+}
+
+/// x86_64 macOS — the one host measured with a clang that cannot fold a
+/// `static const` (see [`FOLD_DIAGNOSTIC`]): a compile whose every error is that
+/// diagnostic is REPORTED, one stderr line naming the rows, and is not a
+/// failure; every other row in the same probe was asserted by the same
+/// compile. An error that is not the fold diagnostic, or an unclassifiable
+/// failure, panics exactly as on every other target. The waiver keys on clang's
+/// text, never on the cfg: an Intel Mac with a folding clang asserts every
+/// row, and an Apple silicon Mac with clang 14.0.3 stays red by design — only
+/// this host was measured.
+#[cfg(all(target_arch = "x86_64", target_os = "macos"))]
+#[track_caller]
+fn green_verdict(arch: &str, what: &str, result: Result<(), String>) {
+    let Err(stderr) = result else {
+        return;
+    };
+    match unfolded_rows(&stderr) {
+        Some(rows) => report_unfolded(arch, &rows),
+        None => panic!("{what} on {arch}:\n{stderr}"),
+    }
+}
+
+/// The inverted arm's verdict: the probe with one row flipped must FAIL for
+/// that row's VALUE on `arch`. On every target but x86_64 macOS any failure is
+/// the pass, as it always was.
+#[cfg(not(all(target_arch = "x86_64", target_os = "macos")))]
+#[track_caller]
+fn inverted_verdict(arch: &str, row: &str, result: Result<(), String>, vacuous: &str) {
+    let _ = (arch, row);
+    assert!(result.is_err(), "{vacuous}");
+}
+
+/// x86_64 macOS: a clang that cannot fold makes the inverted probe fail
+/// whatever the values are, so "it failed" proves nothing here. The pass is
+/// clang's value diagnostic — `static_assert failed due to requirement …` (`static assertion` on a newer clang) —
+/// on the inverted `row` itself; the fold errors on the other rows are reported
+/// and never counted.
+#[cfg(all(target_arch = "x86_64", target_os = "macos"))]
+#[track_caller]
+fn inverted_verdict(arch: &str, row: &str, result: Result<(), String>, vacuous: &str) {
+    let Err(stderr) = result else {
+        panic!("{vacuous}");
+    };
+    let lines: Vec<&str> = stderr.lines().collect();
+    let failed_for_its_value = lines.iter().enumerate().any(|(i, l)| {
+        l.contains("failed due to requirement")
+            && lines
+                .iter()
+                .skip(i)
+                .take(4)
+                .any(|s| s.contains(&format!("\"{row}\"")))
+    });
+    assert!(
+        failed_for_its_value,
+        "the INVERTED row {row} did not fail for its value on {arch} — this clang's fold \
+         errors alone would make any inverted probe fail, which proves nothing:\n{stderr}"
+    );
+    let fold_only: Vec<String> = lines
+        .iter()
+        .enumerate()
+        .filter(|(_, l)| l.contains(FOLD_DIAGNOSTIC))
+        .filter_map(|(i, _)| {
+            lines.iter().skip(i + 1).take(3).find_map(|l| {
+                let (_, rest) = l.split_once('"')?;
+                let (name, _) = rest.split_once('"')?;
+                Some(name.to_owned())
+            })
+        })
+        .collect();
+    if !fold_only.is_empty() {
+        report_unfolded(arch, &fold_only);
+    }
+}
+
+/// The one line an x86_64 macOS run prints per probe with unfolded rows: which
+/// rows, which clang, and why they are not asserted here. Written to the
+/// stderr handle rather than through `eprintln!`, which libtest captures and
+/// drops for a passing test: a waived row must show in every run.
+#[cfg(all(target_arch = "x86_64", target_os = "macos"))]
+fn report_unfolded(arch: &str, rows: &[String]) {
+    use std::io::Write as _;
+    let version = Command::new("cc")
+        .arg("--version")
+        .output()
+        .ok()
+        .and_then(|o| {
+            String::from_utf8_lossy(&o.stdout)
+                .lines()
+                .next()
+                .map(str::to_owned)
+        })
+        .unwrap_or_else(|| "unknown".to_owned());
+    let line = format!(
+        "{}: {arch}: {} row(s) not asserted on x86_64 macOS — this host's `cc` ({version}) \
+         cannot fold their `static const` into `_Static_assert` (the fold fails for both \
+         -arch arms on Apple clang 14.0.3, measured 2026-09-16); every other row was \
+         asserted by the same compile: {}\n",
+        file!(),
+        rows.len(),
+        rows.join(", ")
+    );
+    let _ = std::io::stderr().write_all(line.as_bytes());
 }
 
 /// The probe source: one `_Static_assert` per constant, using `appkit.rs`'s own
@@ -471,9 +636,11 @@ fn only_an_arch_gate_is_read_as_one() {
 fn every_gui_constant_equals_the_sdk_on_both_arches() {
     let body = probe(None);
     for arch in ["arm64", "x86_64"] {
-        if let Err(stderr) = compile(arch, &body, "green") {
-            panic!("an appkit.rs constant disagrees with the SDK on {arch}:\n{stderr}");
-        }
+        green_verdict(
+            arch,
+            "an appkit.rs constant disagrees with the SDK",
+            compile(arch, &body, "green"),
+        );
     }
 }
 
@@ -487,10 +654,14 @@ fn every_gui_constant_equals_the_sdk_on_both_arches() {
 fn the_assertion_is_load_bearing_on_both_arches() {
     let body = probe(Some("NS_COLOR_RENDERING_INTENT_PERCEPTUAL"));
     for arch in ["arm64", "x86_64"] {
-        assert!(
-            compile(arch, &body, "inverted").is_err(),
-            "an INVERTED constant compiled cleanly on {arch}: this test is \
-             passing for the wrong reason and proves nothing about the other one"
+        inverted_verdict(
+            arch,
+            "NS_COLOR_RENDERING_INTENT_PERCEPTUAL",
+            compile(arch, &body, "inverted"),
+            &format!(
+                "an INVERTED constant compiled cleanly on {arch}: this test is passing for \
+                 the wrong reason and proves nothing about the other one"
+            ),
         );
     }
 }
@@ -507,16 +678,20 @@ fn the_assertion_is_load_bearing_on_both_arches() {
 fn the_arch_split_row_is_checked_on_the_arch_it_belongs_to() {
     // Green first: both arms as written must compile on both arches.
     for arch in ["arm64", "x86_64"] {
-        if let Err(stderr) = compile(arch, &probe(None), "split-green") {
-            panic!("the arch-split arms disagree with the SDK on {arch}:\n{stderr}");
-        }
+        green_verdict(
+            arch,
+            "the arch-split arms disagree with the SDK",
+            compile(arch, &probe(None), "split-green"),
+        );
     }
     // …and inverted, both arms fail — each on its own arch.
     let body = probe(Some("NS_TEXT_ALIGNMENT_CENTER"));
     for arch in ["arm64", "x86_64"] {
-        assert!(
-            compile(arch, &body, "split-inverted").is_err(),
-            "the arch-split constant's {arch} arm is not really checked on {arch}"
+        inverted_verdict(
+            arch,
+            "NS_TEXT_ALIGNMENT_CENTER",
+            compile(arch, &body, "split-inverted"),
+            &format!("the arch-split constant's {arch} arm is not really checked on {arch}"),
         );
     }
 }

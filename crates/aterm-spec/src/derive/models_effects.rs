@@ -1700,6 +1700,13 @@ pub fn cursor_hint_license_model() -> Model {
                 swallowed = 0;
                 just_forgot = 0;
             }
+            // Pointer hover that writes no terminal bytes and owns no local
+            // gesture cannot dispose of an in-flight key. It is a stutter of
+            // the licence state, like an inert modifier. The mutant loses the
+            // stamp without any of the four legitimate arm dispositions.
+            action ByteSilentPointerPreservesLicense when (hint == 1) {
+                hint = if Buggy == 1 { 0 } else { hint };
+            }
             // THE PASTE IS QUEUED: enqueue is not delivery, so the completed
             // arm is nothing yet (the host's arrival-time gesture stamp is
             // revoked in the same turn — `SwallowedKeyClearsLicense`'s shape).
@@ -3198,4 +3205,89 @@ pub fn reply_fidelity_model() -> Model {
             eq(var("reported_err"), int(0)),
         ),
     })
+}
+
+/// **A FLICKERING PROGRAM NEVER TAKES THE CURSOR** — the anti-flap law of the
+/// cursor companion's tenure gate, which is what stands between the user and a
+/// cat that changes identity every time a command block opens and closes.
+///
+/// `KittyTenure::observe` is a DWELL gate: a claim that differs from the one on
+/// glass becomes a CANDIDATE, and it lands only once it has held for
+/// `dwell_for` (TENURE to arrive, RELEASE to fall back). The load-bearing arm
+/// is the `_` one — any observation that does not match the standing candidate
+/// RESTARTS it at `now`. So a pane whose claim alternates never accumulates
+/// dwell, and the cat does not move.
+///
+/// This model is the flicker SCENARIO and nothing else: `last` forces the two
+/// observations to alternate, so every trace in the state space is a flicker,
+/// and the invariant is simply that the worn identity never changes. `Buggy = 1`
+/// is the pre-tenure behaviour — land the raw claim at once — and it breaks the
+/// law on the very first observation.
+///
+/// What it does NOT model, deliberately: the steady case, where a program that
+/// really does hold the pane lands after `Tenure` and the identity SHOULD
+/// change once. Mixing the two would need the invariant to be about a rate
+/// rather than a count, and a rate invariant that has to be true of both
+/// scenarios ends up asserting less than either. The steady arm is covered by
+/// `app_kitty`'s own tests, which drive the real gate across `TENURE`.
+#[must_use]
+// Skip (T2 vcgen-budget lane): a spec-model DATA constructor — the MODEL it
+// returns is what `ty` machine-checks.
+#[cfg_attr(trust_verify, trust::skip)]
+pub fn companion_tenure_flicker_model() -> Model {
+    crate::ty_model! {
+        CompanionTenureFlicker {
+            const Buggy = 0;    // 1 = land the raw claim at once, no dwell
+            const Tenure = 2;   // observations a candidate must hold to land
+            var worn = 0;       // 0 = the base cat, 1 = the program cat
+            var cand = 2;       // 2 = no candidate, 0 = base pending, 1 = program pending
+            var dwell = 0;      // observations the standing candidate has held
+            var changes = 0;    // times the identity on glass moved
+            var last = 0;       // 0 = the last observation was `none`, 1 = a program
+            var steps = 0;      // run bound
+
+            // The pane reports a program executing. Alternation is forced by
+            // `last`, so this is the flicker a command block opening puts on
+            // the gate, never a steady claim.
+            action SeeProgram when (steps <= 7 && last == 0) {
+                steps = steps + 1;
+                last = 1;
+                worn = if Buggy == 1 { 1 }
+                       else { if worn == 1 { 1 }
+                              else { if cand == 1 && Tenure <= dwell { 1 } else { worn } } };
+                changes = if Buggy == 1 { if worn == 1 { changes } else { changes + 1 } }
+                          else { if worn == 1 { changes }
+                                 else { if cand == 1 && Tenure <= dwell
+                                        { changes + 1 } else { changes } } };
+                cand = if worn == 1 { 2 }
+                       else { if cand == 1 { (if Tenure <= dwell { 2 } else { 1 }) }
+                              else { 1 } };
+                dwell = if worn == 1 { 0 }
+                        else { if cand == 1 { (if Tenure <= dwell { 0 } else { dwell + 1 }) }
+                               else { 0 } };
+            }
+
+            // And the block closes again. Same gate, the other claim.
+            action SeeNone when (steps <= 7 && last == 1) {
+                steps = steps + 1;
+                last = 0;
+                worn = if Buggy == 1 { 0 }
+                       else { if worn == 0 { 0 }
+                              else { if cand == 0 && Tenure <= dwell { 0 } else { worn } } };
+                changes = if Buggy == 1 { if worn == 0 { changes } else { changes + 1 } }
+                          else { if worn == 0 { changes }
+                                 else { if cand == 0 && Tenure <= dwell
+                                        { changes + 1 } else { changes } } };
+                cand = if worn == 0 { 2 }
+                       else { if cand == 0 { (if Tenure <= dwell { 2 } else { 0 }) }
+                              else { 0 } };
+                dwell = if worn == 0 { 0 }
+                        else { if cand == 0 { (if Tenure <= dwell { 0 } else { dwell + 1 }) }
+                               else { 0 } };
+            }
+
+            // THE LAW: across a whole flicker storm, the cat does not move.
+            invariant FlickerNeverLands: changes == 0;
+        }
+    }
 }

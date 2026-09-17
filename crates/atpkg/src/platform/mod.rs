@@ -28,7 +28,7 @@
 //! * **Disk** — [`volume_free_bytes`] calls `GetDiskFreeSpaceExW` (dependency-free
 //!   manual FFI) instead of `statvfs`; both fail **OPEN** (`None` on any error).
 //! * **Spotlight** — the index query ([`spotlight_query`],
-//!   [`spotlight_indexing_enabled`]) is macOS only and `None` everywhere else, Windows
+//!   [`spotlight_index_state`]) is macOS only and `None` everywhere else, Windows
 //!   Search having no per-directory opt-out for [`crate::noindex`] to honour or to
 //!   measure. `None` means the question could not be ASKED, never "not indexed".
 //! * **Exec** — [`exec_or_run`] `spawn().wait()` + `process::exit` (Windows has no
@@ -105,6 +105,19 @@ pub fn install_shim_env(
     env: &crate::shim_env::ShimEnv,
 ) -> io::Result<()> {
     install_shim_to_env(shim, &build_bin_dir.join(tool.exe_file()), env)
+}
+
+/// What a volume's Spotlight index does with new files ([`spotlight_index_state`]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum IndexState {
+    /// Indexing on: a planted file shows up.
+    Enabled,
+    /// Switched off (`mdutil -i off`, or "Indexing and searching disabled"): a setting.
+    Disabled,
+    /// "Index is read-only." — mds holds the index while the volume is low on space
+    /// (measured 2026-09-16): it answers searches and takes no new entries until the
+    /// hold lifts. Not a setting, and not a reason to leave build output unmigrated.
+    ReadOnly,
 }
 
 /// [`install_shim_to`] with the exported `env` — the `(shim path, target)` form of
@@ -309,11 +322,156 @@ const SH_SHIM_ENV_NOTE: &str =
 /// real path; argv[0] is the target) — the exports are inherited by the exec'd image,
 /// which is the whole mechanism. `parse_sh_shim_target` reads the target off the exec
 /// line as before, so every sweep keyed on where a shim resolves is unchanged.
-#[cfg(any(unix, test))]
+///
+/// The unrouted form of [`sh_shim_content_routed`], which the backend writes through;
+/// kept for the tests that pin the shape every shim not routed through an exec root has.
+#[cfg(test)]
 pub(crate) fn sh_shim_content_env(target: &Path, env: &crate::shim_env::ShimEnv) -> String {
+    sh_shim_content_routed(target, env, None)
+}
+
+/// The note ahead of the guard line of a shim routed through a [`crate::compat`] exec
+/// root — what a human reading `bin/tippy` learns about the extra line, and where to ask.
+#[cfg(any(unix, test))]
+const SH_SHIM_ROUTE_NOTE: &str = "# atpkg exec root: this build ships bin/rustc as a separate copy of trustc, which its \
+     tippy refuses; the same tools run from a clone of the build where rustc holds trustc's bytes (aterm pkg doctor).\n";
+
+/// [`sh_shim_content_env`] with an optional ROUTE: with `route = None` it is that shim,
+/// byte for byte — every shim of every build that does not need an exec root, which is
+/// every build Trust publishes from 2026-09-14 on. With `route = Some(R)`, the target
+/// `S`'s `exec` line is preceded by the note and one guard line:
+///
+/// ```text
+/// [ ! -h 'R' ] && [ -f 'R' ] && [ -x 'R' ] && [ -f 'S' ] && [ ! -h 'M' ] && [ -f 'M' ] && exec 'R' "$@"
+/// exec 'S' "$@"
+/// ```
+///
+/// where `M` is the root's [`crate::compat::ROOT_MARKER`] (`R` is `<root>/bin/<file>`, so
+/// `M` is `<root>/.atpkg-root`).
+///
+/// WHY. Trust bundles 8571, 8589, 8590 and 8595 ship `bin/rustc` as a separately signed
+/// copy of `bin/trustc` (2,428 bytes differ on 8595, every one inside the ad-hoc code
+/// signature), and their tippy refuses to run unless the sibling `rustc` is the same file
+/// as, or byte-identical to, the selected `trustc` — "rustc-compatible sibling … is not
+/// the selected Trust compiler". The store is content-addressed and never modified, so
+/// [`crate::compat`] lays a copy-on-write CLONE of the build ([`crate::clone`]) where
+/// `rustc` holds `trustc`'s bytes, and the shim runs the tool from there. Run from that
+/// tree, `tippy` and `targo tippy` lint (measured 2026-09-16 on bundle 8595).
+///
+/// THE GUARD checks, at every exec, that the root stands and is whole: `R` is a regular
+/// executable file and not a symlink (every Trust frontend refuses a symlinked sibling
+/// anyway), the store file `S` it stands for still exists (a build reclaimed from the
+/// store never runs from a leftover root), and the root's marker `M` — written last,
+/// before the root was committed by `rename(2)` — is a regular file and not a symlink (a
+/// root half-way through a lay or a rebuild, or one laid as hard links before clones, has
+/// none). Any false falls through to the unchanged store `exec` — today's behaviour
+/// exactly. Every test is a `test`/`[` builtin: a handful of `stat`s, no fork. It does NOT
+/// prove bytes (no builtin can): [`crate::compat::ensure_root`] proves them when it lays
+/// the root, and `repair` and doctor re-read them at `Depth::Deep`. The guard used to be
+/// `[ 'R' -ef 'S' ]`, same device and inode, which only a hard link satisfies. A failed
+/// `exec R` after a true guard exits the shell (126) rather than falling through — the
+/// same race today's store `exec` has with `gc`.
+///
+/// NOTHING THAT READS A SHIM SEES A DIFFERENCE. The env note and `export` lines stay
+/// ahead of the guard, so both `exec`s inherit them. The guard line starts with `[`, so
+/// `parse_sh_shim_target` — the first trimmed line that starts with `exec '` — still
+/// answers `S`, `parse_sh_shim_env` still reads the same exports, and
+/// `tools/bootstrap-publisher.sh`'s `sed '^exec …'` still prints `S`: `which`, gc's
+/// witnesses, `prune_stale_shims`, the alias reconcile and doctor's broken-shim scan all
+/// answer as they did for the plain shim.
+#[cfg(any(unix, test))]
+pub(crate) fn sh_shim_content_routed(
+    target: &Path,
+    env: &crate::shim_env::ShimEnv,
+    route: Option<&Path>,
+) -> String {
+    sh_shim_body(target, env, route, "")
+}
+
+/// The note ahead of the landing prelude of an `agents/` twin — what a human reading
+/// `agents/claude` learns about the lines before the exports, and where to ask.
+const SH_LANDING_NOTE: &str = "# atpkg agents twin: while a newer build of this program is landing, `atpkg __landing` \
+     waits for it and then runs the new one (aterm help pkg).\n";
+
+/// THE LANDING PRELUDE of an `agents/` twin ([`crate::landing`], 2026-09-16): one `[ -f
+/// <marker> ]` — a single `stat` — and, only while the marker stands, a hand-over to
+/// `atpkg __landing <program> '<prefix>' -- "$@"` through a VARIABLE naming the embedded
+/// co-located `atpkg` (the one this process runs as); when that binary is not executable
+/// the prelude falls through to the twin's own exports and store `exec`. The PREFIX
+/// rides along as an operand so the verb finds the store with no `HOME` (an `env -i`
+/// wrapper, a launchd job) and never exits without running the tool — the twin's own
+/// `exec` line would have run it, so the hand-over must too (review, 2026-09-16). Pure
+/// string building, so it is rendered on every platform and unit-tested everywhere; only
+/// the Unix twin carries it (a `.cmd` twin is the plain shim).
+///
+/// NO `command -v atpkg` FALLBACK (review, 2026-09-16). The pending stub's chain tries
+/// whatever `atpkg` PATH finds when the embedded one is gone, and for `__pending` that
+/// is right: with no tool installed there is nothing else to run. Here there is — the
+/// store build the twin's own `exec` line runs — and an OLDER `atpkg` on PATH (a
+/// `~/.local/bin` alias from before this verb, a stale bundle) answers `__landing` with
+/// exit 2 `unknown verb`, so the user's `claude` would never run. The wait is a courtesy;
+/// the `exec` is the guarantee. A twin whose embedded path dangles (the app relocated)
+/// runs the old build silently until the next pass re-lays it with the live path
+/// ([`crate::activate::reconcile_agents`] compares the rendered bytes) — the pre-prelude
+/// behaviour, never a stranded tool.
+///
+/// NO LINE HERE IS A LITERAL `exec '`. `parse_sh_shim_target` takes the first trimmed
+/// line that starts with `exec '` as the target; both `exec`s below are `exec "$…"` on a
+/// line that starts with `if`, so every reader keyed on the target — `resolve_shim`,
+/// `sweep_agents_dir`'s keep-predicate, `active_builds`, gc's witnesses — still answers
+/// the store target off the twin's real `exec` line. `parse_sh_shim_env` reads only
+/// `export ` lines, of which the prelude has none. `is_pending_stub` reads line 2, which
+/// stays the shim comment.
+#[must_use]
+pub(crate) fn sh_landing_prelude(
+    program: &str,
+    prefix: &Path,
+    marker: &Path,
+    atpkg: &Path,
+) -> String {
+    let mut operands = sh_quote_str(program);
+    operands.push(' ');
+    operands.push_str(&sh_quote_str(&prefix.to_string_lossy()));
+    let mut s = String::from(SH_LANDING_NOTE);
+    s.push_str("if [ -f ");
+    s.push_str(&sh_quote_str(&marker.to_string_lossy()));
+    s.push_str(" ]; then\n  __atpkg=");
+    s.push_str(&sh_quote_str(&atpkg.to_string_lossy()));
+    s.push_str("\n  if [ -x \"$__atpkg\" ]; then exec \"$__atpkg\" ");
+    s.push_str(crate::landing::HIDDEN_VERB);
+    s.push(' ');
+    s.push_str(&operands);
+    s.push_str(" -- \"$@\"; fi\nfi\n");
+    s
+}
+
+/// [`sh_shim_content_routed`] with `prelude` (empty for every `bin/` shim; an `agents/`
+/// twin's [`sh_landing_prelude`]) inserted right after the header comment — ahead of the
+/// exports, so a hand-over to `atpkg __landing` inherits nothing the store `exec` would
+/// have set (the verb execs `bin/<program>`, which exports them itself).
+#[cfg(any(unix, test))]
+pub(crate) fn sh_shim_content_twin(
+    target: &Path,
+    env: &crate::shim_env::ShimEnv,
+    route: Option<&Path>,
+    prelude: &str,
+) -> String {
+    sh_shim_body(target, env, route, prelude)
+}
+
+/// The one body every Unix shim renders through — see [`sh_shim_content_routed`] for
+/// the shape and [`sh_shim_content_twin`] for the prelude.
+#[cfg(any(unix, test))]
+fn sh_shim_body(
+    target: &Path,
+    env: &crate::shim_env::ShimEnv,
+    route: Option<&Path>,
+    prelude: &str,
+) -> String {
     let mut s = String::from(
         "#!/bin/sh\n# atpkg shim — exec so the tool authenticates at its real path.\n",
     );
+    s.push_str(prelude);
     if !env.is_empty() {
         s.push_str(SH_SHIM_ENV_NOTE);
     }
@@ -324,8 +482,33 @@ pub(crate) fn sh_shim_content_env(target: &Path, env: &crate::shim_env::ShimEnv)
         s.push_str(&sh_quote_str(value));
         s.push('\n');
     }
+    let target_q = sh_shim_quote(target);
+    if let Some(route) = route {
+        let marker = route
+            .parent()
+            .and_then(Path::parent)
+            .map_or_else(|| route.to_path_buf(), crate::compat::root_marker);
+        let (r, m) = (sh_shim_quote(route), sh_shim_quote(&marker));
+        s.push_str(SH_SHIM_ROUTE_NOTE);
+        for (test, path) in [
+            ("[ ! -h ", &r),
+            ("[ -f ", &r),
+            ("[ -x ", &r),
+            ("[ -f ", &target_q),
+            ("[ ! -h ", &m),
+            ("[ -f ", &m),
+        ] {
+            s.push_str(test);
+            s.push_str(path);
+            s.push_str(" ] && ");
+        }
+        s.push_str("exec ");
+        s.push_str(&r);
+        s.push_str(" \"$@\"\n");
+    }
+    let target = target_q;
     s.push_str("exec ");
-    s.push_str(&sh_shim_quote(target));
+    s.push_str(&target);
     s.push_str(" \"$@\"\n");
     s
 }
@@ -365,8 +548,7 @@ pub(crate) fn sh_shim_quote(target: &Path) -> String {
 }
 
 /// [`sh_shim_quote`] over a string: the one quoting rule the shim body uses for its
-/// target AND its exported values.
-#[cfg(any(unix, test))]
+/// target AND its exported values (and, on every platform, the landing prelude's).
 fn sh_quote_str(s: &str) -> String {
     let mut out = String::from("'");
     for c in s.chars() {
@@ -734,5 +916,203 @@ mod sh_shim_tests {
         let body = sh_shim_content(nasty);
         assert!(body.contains(r"'\''"), "quote is POSIX-escaped: {body}");
         assert_eq!(parse_sh_shim_target(&body).as_deref(), Some(nasty));
+    }
+
+    /// THE ROUTED SHIM, exact: the header, the env note and exports (so both execs inherit
+    /// them), the exec-root note, the guard, and the unchanged store `exec` line. `None` is
+    /// the plain shim byte for byte; the target and the env parse back off the routed form
+    /// exactly as off the plain one, because the guard line starts with `[`.
+    #[test]
+    fn the_routed_shim_is_exact_and_parses_as_the_plain_one() {
+        let target = Path::new("/p/store/trust/8595/bin/tippy");
+        let route = Path::new("/p/compat/trust/8595/bin/tippy");
+        let none = crate::shim_env::ShimEnv::NONE;
+        let body = sh_shim_content_routed(target, &none, Some(route));
+        assert_eq!(
+            body,
+            "#!/bin/sh\n\
+             # atpkg shim — exec so the tool authenticates at its real path.\n\
+             # atpkg exec root: this build ships bin/rustc as a separate copy of trustc, which \
+             its tippy refuses; the same tools run from a clone of the build where rustc holds \
+             trustc's bytes (aterm pkg doctor).\n\
+             [ ! -h '/p/compat/trust/8595/bin/tippy' ] && [ -f '/p/compat/trust/8595/bin/tippy' \
+             ] && [ -x '/p/compat/trust/8595/bin/tippy' ] && [ -f '/p/store/trust/8595/bin/tippy' \
+             ] && [ ! -h '/p/compat/trust/8595/.atpkg-root' ] && [ -f \
+             '/p/compat/trust/8595/.atpkg-root' ] && exec '/p/compat/trust/8595/bin/tippy' \
+             \"$@\"\n\
+             exec '/p/store/trust/8595/bin/tippy' \"$@\"\n"
+        );
+        assert_eq!(parse_sh_shim_target(&body).as_deref(), Some(target));
+        assert_eq!(parse_sh_shim_env(&body), none);
+        assert_eq!(
+            sh_shim_content_routed(target, &none, None),
+            sh_shim_content(target),
+            "no route: today's shim, byte for byte"
+        );
+
+        let env = crate::shim_env::ShimEnv::admit(&["DISABLE_AUTOUPDATER=1".to_string()]).unwrap();
+        let body = sh_shim_content_routed(target, &env, Some(route));
+        assert_eq!(
+            body,
+            "#!/bin/sh\n\
+             # atpkg shim — exec so the tool authenticates at its real path.\n\
+             # shim_env from the signed manifest: only this managed copy runs with it.\n\
+             export DISABLE_AUTOUPDATER='1'\n\
+             # atpkg exec root: this build ships bin/rustc as a separate copy of trustc, which \
+             its tippy refuses; the same tools run from a clone of the build where rustc holds \
+             trustc's bytes (aterm pkg doctor).\n\
+             [ ! -h '/p/compat/trust/8595/bin/tippy' ] && [ -f '/p/compat/trust/8595/bin/tippy' \
+             ] && [ -x '/p/compat/trust/8595/bin/tippy' ] && [ -f '/p/store/trust/8595/bin/tippy' \
+             ] && [ ! -h '/p/compat/trust/8595/.atpkg-root' ] && [ -f \
+             '/p/compat/trust/8595/.atpkg-root' ] && exec '/p/compat/trust/8595/bin/tippy' \
+             \"$@\"\n\
+             exec '/p/store/trust/8595/bin/tippy' \"$@\"\n"
+        );
+        assert_eq!(parse_sh_shim_target(&body).as_deref(), Some(target));
+        assert_eq!(parse_sh_shim_env(&body), env);
+        assert_eq!(
+            sh_shim_content_routed(target, &env, None),
+            sh_shim_content_env(target, &env)
+        );
+        // A tombstone-shaped or stub-shaped reader keyed on the FIRST `exec '` line is the
+        // contract; the guard's own `exec 'R'` sits mid-line and is never that line.
+        assert_eq!(
+            body.lines()
+                .filter(|l| l.trim_start().starts_with("exec '"))
+                .count(),
+            1
+        );
+    }
+
+    /// A quote in the prefix is POSIX-escaped in every quoted slot — the route three times
+    /// in the tests and once in the exec, the target once in its `-f` test and once in its
+    /// own `exec`, the marker twice — and the target still parses back whole.
+    #[test]
+    fn a_quote_in_the_prefix_is_escaped_in_every_slot_of_the_guard() {
+        let target = Path::new("/it's/store/trust/1/bin/targo");
+        let route = Path::new("/it's/compat/trust/1/bin/targo");
+        let body = sh_shim_content_routed(target, &crate::shim_env::ShimEnv::NONE, Some(route));
+        assert_eq!(
+            body.matches(r"'/it'\''s/compat/trust/1/bin/targo'").count(),
+            4
+        );
+        assert_eq!(
+            body.matches(r"'/it'\''s/store/trust/1/bin/targo'").count(),
+            2
+        );
+        assert_eq!(
+            body.matches(r"'/it'\''s/compat/trust/1/.atpkg-root'")
+                .count(),
+            2
+        );
+        assert!(!body.contains("/it's/"), "no raw quote survives: {body}");
+        assert_eq!(parse_sh_shim_target(&body).as_deref(), Some(target));
+    }
+
+    /// THE GUARD UNDER A REAL SHELL. The rendered shim is run by `/bin/sh` (bash 3.2 in
+    /// POSIX mode on macOS) and by `/bin/dash` where present, with an empty environment and
+    /// arguments carrying a space and both quote kinds, under a prefix whose path holds a
+    /// space and a quote. Store and route are the same script, which prints the path it
+    /// was exec'd as (`$0`), so the output says which one ran: a CLONE or a byte COPY at the
+    /// route runs the route when the root's marker stands; with no marker, a marker that is
+    /// a symlink, a route that is a SYMLINK, one that is not executable, or a MISSING route,
+    /// the store path runs — today's shim. A HARD LINK is a regular file too, and the shell
+    /// cannot tell it from a clone: that is `route_for_shim`'s job, and repair's, which
+    /// rebuild such a root before a shim is ever rendered through it. The export reaches
+    /// whichever ran.
+    #[cfg(unix)]
+    #[test]
+    fn the_guard_runs_the_root_only_when_the_marked_root_stands() {
+        use std::os::unix::fs::PermissionsExt as _;
+        let base = std::env::temp_dir()
+            .join(format!("atpkg-sh-route-{}", std::process::id()))
+            .join("pre fix's");
+        let _ = std::fs::remove_dir_all(base.parent().unwrap());
+        let store_bin = base.join("store").join("trust").join("8595").join("bin");
+        let root_bin = base.join("compat").join("trust").join("8595").join("bin");
+        std::fs::create_dir_all(&store_bin).unwrap();
+        std::fs::create_dir_all(&root_bin).unwrap();
+        std::fs::create_dir_all(base.join("bin")).unwrap();
+        let store = store_bin.join("tippy");
+        let route = root_bin.join("tippy");
+        std::fs::write(
+            &store,
+            b"#!/bin/sh\nprintf '%s|%s|%s|%s|%s\\n' \"$0\" \"$#\" \"$1\" \"$2\" \
+              \"${DISABLE_AUTOUPDATER:-unset}\"\n",
+        )
+        .unwrap();
+        std::fs::set_permissions(&store, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let env = crate::shim_env::ShimEnv::admit(&["DISABLE_AUTOUPDATER=1".to_string()]).unwrap();
+        let shim = base.join("bin").join("tippy");
+        std::fs::write(&shim, sh_shim_content_routed(&store, &env, Some(&route))).unwrap();
+        std::fs::set_permissions(&shim, std::fs::Permissions::from_mode(0o755)).unwrap();
+
+        let shells: Vec<&str> = ["/bin/sh", "/bin/dash"]
+            .into_iter()
+            .filter(|s| Path::new(s).is_file())
+            .collect();
+        assert!(shells.contains(&"/bin/sh"), "every Unix has /bin/sh");
+        let run = |shell: &str| -> String {
+            let out = std::process::Command::new(shell)
+                .arg(&shim)
+                .arg("a b")
+                .arg("it's \"q\"")
+                .env_clear()
+                .output()
+                .unwrap();
+            assert!(
+                out.status.success(),
+                "{shell}: {}",
+                String::from_utf8_lossy(&out.stderr)
+            );
+            String::from_utf8(out.stdout).unwrap()
+        };
+        let ran = |path: &Path| format!("{}|2|a b|it's \"q\"|1\n", path.display());
+
+        let marker = crate::compat::root_marker(&base.join("compat").join("trust").join("8595"));
+        for (what, marked, runs_route) in [
+            ("clone", true, true),
+            ("byte copy", true, true),
+            ("clone", false, false),
+            ("clone behind a symlinked marker", false, false),
+            ("symlink", true, false),
+            ("not executable", true, false),
+            ("missing", true, false),
+        ] {
+            let _ = std::fs::remove_file(&route);
+            let _ = std::fs::remove_file(&marker);
+            match what {
+                "clone" | "clone behind a symlinked marker" => {
+                    crate::clone::clone_file(&store, &route).unwrap();
+                }
+                "byte copy" => std::fs::copy(&store, &route).map(|_| ()).unwrap(),
+                "symlink" => std::os::unix::fs::symlink(&store, &route).unwrap(),
+                "not executable" => {
+                    std::fs::copy(&store, &route).unwrap();
+                    std::fs::set_permissions(&route, std::fs::Permissions::from_mode(0o644))
+                        .unwrap();
+                }
+                _ => {}
+            }
+            if marked {
+                std::fs::write(&marker, b"atpkg exec root v1\n").unwrap();
+            } else if what == "clone behind a symlinked marker" {
+                std::os::unix::fs::symlink(&store, &marker).unwrap();
+            }
+            let expected = if runs_route { &route } else { &store };
+            for shell in &shells {
+                assert_eq!(
+                    run(shell),
+                    ran(expected),
+                    "{shell}, route is a {what}, marker {marked}"
+                );
+            }
+        }
+        // A missing ROOT (not only a missing file in it) falls back the same way.
+        std::fs::remove_dir_all(base.join("compat")).unwrap();
+        for shell in &shells {
+            assert_eq!(run(shell), ran(&store), "{shell}, no root");
+        }
+        std::fs::remove_dir_all(base.parent().unwrap()).unwrap();
     }
 }

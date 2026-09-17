@@ -1991,3 +1991,99 @@ pub fn no_transitive_authority_model() -> Model {
         inv: "ForwardImpliesOwner",
     })
 }
+
+/// **ONE LIVE HOLDER PER SESSION ID** — the safety property behind a real
+/// incident, where the wrong answer is a keystroke delivered into a human's
+/// window.
+///
+/// A pane's shell exports `ATERM_SESSION_ID`: the identity the OUTER aterm
+/// PREMINTED for the inner aterm that pane may launch. That export outlives the
+/// launch it was minted for, deliberately — a child aterm that exits must be
+/// able to relaunch in the same shell under its original identity, or every
+/// edge the outer minted for it dies with the first launch. What the old
+/// spelling could not tell apart is a RELAUNCH (the previous holder is gone, a
+/// transfer) from a SECOND SIMULTANEOUS LAUNCH (the previous holder is live, a
+/// duplicate). Two instances then answered to one id, `@<sid>` resolved through
+/// ONE discovery entry, and a driver reading a sid out of a listing could land
+/// a keystroke in the other instance's window.
+///
+/// Three dials, and the two defects they name fail differently on purpose:
+///
+/// * `Instances` — launches from ONE shell, which is what the surviving export
+///   hands out. `Launch` is admitted only below it, so `Instances = 1`
+///   collapses this onto the single-launch theorem where nothing can go wrong.
+/// * `Local` — WHAT a launch consults. `Local = 0` (committed) is the shipping
+///   rule: the kernel arbitrates, via a `flock` held for the process's life and
+///   a live foreign `graph/<sid>` entry. `Local = 1` is the pre-fix read: each
+///   launch decides from ITS OWN premint alone, blind to every other holder.
+///   Each launch is individually "correct" — it really did read a valid
+///   premint — and the id is held N times. Multiplication alone is the defect,
+///   so this breaks the invariant at EVERY corner.
+/// * `Buggy` — the NARROWER defect: consult the claim lock but not the live
+///   entry. That is invisible until a seamless update, whose successor keeps
+///   its ids by design and CANNOT inherit the predecessor's lock, so the lock
+///   goes free while the successor's own entry is the thing saying the id is
+///   held. It therefore needs `Handoff = 1` to bite, which is exactly why the
+///   entry gate exists beside the lock rather than instead of it.
+///
+/// The lock dying with its holder is load-bearing in the other direction: it is
+/// what lets a RELAUNCH adopt, and it is why the claim file is never unlinked
+/// (unlinking a claim a peer holds open is how two processes could both come to
+/// hold one). `Exit` models that release, so a model that "fixed" duplication
+/// by never adopting would not reproduce the relaunch trace this one does.
+///
+/// Tier-1 binding: aterm-gui's
+/// `identity_claim::a_second_claim_on_one_id_is_refused_while_the_first_lives`
+/// and `spawn::two_launches_from_one_shell_do_not_share_an_identity` drive the
+/// real `claim_for_adoption` through the same two arms.
+#[must_use]
+// Skip (T2 vcgen-budget lane): a spec-model DATA constructor — the MODEL it
+// returns is what `ty` machine-checks.
+#[cfg_attr(trust_verify, trust::skip)]
+pub fn session_id_claim_model() -> Model {
+    crate::ty_model! {
+        SessionIdClaim {
+            const Buggy = 0;      // 1 = consult the claim lock but NOT the live entry
+            const Local = 0;      // 1 = each launch adopts on its own premint read alone
+            const Instances = 2;  // launches from one shell (the export outlives the launch)
+            const Handoff = 0;    // scenario: a seamless-update successor took the id over
+            var holders = 0;      // LIVE instances answering to THE id
+            var lock = 0;         // the claim flock is held by a live process
+            var entry = 0;        // a live process has published graph/<sid>
+            var steps = 0;        // run bound
+
+            // A launch reads the surviving premint and tries to adopt it.
+            action Launch when (steps <= 5 && Instances > holders) {
+                steps = steps + 1;
+                holders = if Local == 1 { holders + 1 }
+                          else { if lock == 0 && (Buggy == 1 || entry == 0)
+                                 { holders + 1 } else { holders } };
+                lock = if Local == 1 { 1 }
+                       else { if lock == 0 && (Buggy == 1 || entry == 0)
+                              { 1 } else { lock } };
+            }
+
+            // The holder exits. The lock dies WITH it — that is what makes a
+            // relaunch able to adopt at all, and why nothing is ever unlinked.
+            action Exit when (steps <= 5 && holders > 0) {
+                steps = steps + 1;
+                holders = holders - 1;
+                lock = if holders > 1 { 1 } else { 0 };
+                entry = if holders > 1 { entry } else { 0 };
+            }
+
+            // A seamless-update successor takes the id over: a TRANSFER, not a
+            // second holder. It cannot inherit the predecessor's flock, so the
+            // lock goes free while its own graph entry is what holds the id.
+            action Handover when (steps <= 5 && Handoff == 1 && holders == 1 && entry == 0) {
+                steps = steps + 1;
+                lock = 0;
+                entry = 1;
+            }
+
+            // THE SAFETY PROPERTY. An address that resolves at all resolves to
+            // exactly one place.
+            invariant AtMostOneHolder: holders <= 1;
+        }
+    }
+}

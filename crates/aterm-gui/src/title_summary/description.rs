@@ -7,8 +7,33 @@
 use super::redaction::contains_sensitive_text;
 use super::{ActivityState, Snapshot};
 use crate::app_config::TitleFormat;
+use std::borrow::Cow;
 
 pub(super) const MAX_DESCRIPTION_GRAPHEMES: usize = 96;
+/// Grapheme cap on a title where a chrome surface paints it WHOLE — the window
+/// titlebar ([`super::ChromeSurface::WindowTitle`]), and a strip label wherever
+/// it leaves the strip for a surface with no fit of its own ([`whole_label`]:
+/// the native toolbar's chip and its accessibility string, the tooltip /
+/// context-menu header, the a11y tab item, the introspection mirrors) — so a
+/// 1024-byte OSC title or a PATH_MAX cwd cannot become an enormous title. The
+/// cut is a MIDDLE cut ([`chrome_presentation_text`]), `head…tail`: for a path
+/// the tail is the half that says where it ends.
+///
+/// NOT the tab strip's. The strip fits every label itself, by display cells
+/// and SIBLING-AWARE — `tab_bar::distinct_chip_labels` sheds the head and the
+/// tail the clustered tabs share and keeps what tells them apart — and a fixed
+/// cut taken here first, head or middle, is sibling-blind: it discards one
+/// region of every title, so two tabs that differ only inside that region
+/// reach the strip as one byte-identical string and paint one label, or
+/// ordinals. Measured on glass with sibling directories deeper than the cap
+/// (the head cut discards `[96, N)`), and traced again with two worktree
+/// checkouts of one repo, `wf_<id>-10` beside `wf_<id>-25` with the id
+/// sixty-nine graphemes in, which a middle cut (discarding `[48, N-48)`)
+/// collapsed where the head cut had not. So [`super::ChromeSurface::TabStrip`]
+/// composes with NO title cap: the strip's inputs are bounded upstream already
+/// (`MAX_TITLE_BYTES` for an OSC title, `META_TITLE_MAX` for `meta set title`,
+/// `MAX_CWD_PATH_BYTES` for a cwd), and its pairwise prefix/suffix scan over a
+/// strip's worth of titles is trivial.
 pub(super) const MAX_CHROME_TITLE_GRAPHEMES: usize = 96;
 const MAX_CHROME_DESCRIPTION_GRAPHEMES: usize = 96;
 
@@ -258,29 +283,38 @@ fn uppercase_first(value: &str) -> String {
 }
 
 /// The uncached full composition. Durable OSC/session metadata remains complete
-/// in its owner; only this native chrome projection is sanitized and
-/// grapheme-capped, preventing a 1024-byte authored field from becoming an
-/// enormous tab/window title.
+/// in its owner; only this native chrome projection is sanitized — and, where
+/// the surface paints the title whole, grapheme-capped at `title_cap`, so a
+/// 1024-byte authored field cannot become an enormous window title. The strip
+/// passes `None`: it fits its labels itself, sibling-aware
+/// ([`MAX_CHROME_TITLE_GRAPHEMES`]). The description is capped on every
+/// surface — it is a sentence, not a path, and the strip sheds it whole before
+/// it cuts a subject (`tab_bar::state_clause_bytes`).
 pub(super) fn compose_presentation(
     raw_title: &str,
     description: &str,
     format: TitleFormat,
     separator: &str,
+    title_cap: Option<usize>,
 ) -> String {
-    let title = chrome_presentation_text(raw_title, MAX_CHROME_TITLE_GRAPHEMES);
+    let title = match title_cap {
+        Some(max_graphemes) => chrome_presentation_text(raw_title, max_graphemes),
+        None => canonical_single_line(raw_title),
+    };
     let description = chrome_presentation_text(description, MAX_CHROME_DESCRIPTION_GRAPHEMES);
     compose_parts(&title, &description, format, separator)
 }
 
-/// True when the chrome sanitizer and grapheme cap pass `title` through
-/// byte-identical, so a composition WITHOUT a description may keep it as-is.
-/// Printable ASCII with single interior spaces and no edge spaces is exactly
-/// identity under `canonical_single_line` (nothing filtered, collapsed, or
-/// trimmed), and each such byte is one grapheme, so the cap reduces to `len()`.
-/// `compose_parts` then returns the (already-trimmed, non-empty) title verbatim
-/// for every format when the description side is empty.
-pub(super) fn title_is_presentation_clean(title: &str) -> bool {
-    title.len() <= MAX_CHROME_TITLE_GRAPHEMES
+/// True when the chrome sanitizer and the surface's grapheme cap (`title_cap`,
+/// `None` for the strip) pass `title` through byte-identical, so a composition
+/// WITHOUT a description may keep it as-is. Printable ASCII with single
+/// interior spaces and no edge spaces is exactly identity under
+/// `canonical_single_line` (nothing filtered, collapsed, or trimmed), and each
+/// such byte is one grapheme, so the cap reduces to `len()`. `compose_parts`
+/// then returns the (already-trimmed, non-empty) title verbatim for every
+/// format when the description side is empty.
+pub(super) fn title_is_presentation_clean(title: &str, title_cap: Option<usize>) -> bool {
+    title_cap.is_none_or(|max_graphemes| title.len() <= max_graphemes)
         && !title.starts_with(' ')
         && !title.ends_with(' ')
         && !title.contains("  ")
@@ -326,7 +360,7 @@ pub(super) fn normalize_description(text: &str) -> String {
 /// Apply the same spoof-resistant presentation policy used for authored session
 /// metadata, while preserving the former whitespace-to-one-space behavior expected
 /// for terminal/model summaries.
-fn canonical_single_line(text: &str) -> String {
+pub(super) fn canonical_single_line(text: &str) -> String {
     let whitespace_normalized: String = text
         .chars()
         .map(|ch| if ch.is_whitespace() { ' ' } else { ch })
@@ -380,17 +414,93 @@ pub(super) fn bounded_text(text: &str, max_chars: usize) -> String {
         .to_string()
 }
 
+/// Sanitize `text` to one canonical line and cap it at `max_graphemes`
+/// grapheme clusters, cutting from the MIDDLE: the first `max - max / 2`
+/// clusters, one `…`, then the last `max / 2`. At most `max + 1` graphemes
+/// leave here, and a text at or under the cap leaves byte-identical — the
+/// identity [`title_is_presentation_clean`] relies on. Idempotent in value: a
+/// text this cut already shaped is `max + 1` clusters with the mark seated
+/// after the head, and cutting it again drops that mark and seats the same
+/// one in its place.
+///
+/// The cut keeps the TAIL because for a path the tail is the half that says
+/// where it ends ([`MAX_CHROME_TITLE_GRAPHEMES`]); both cuts land on grapheme
+/// boundaries, so a combining mark, a ZWJ sequence or a flag stays whole on
+/// either side of the mark. The description takes the same cut: an authored
+/// sentence past the cap loses its middle, not its ending.
 pub(super) fn chrome_presentation_text(text: &str, max_graphemes: usize) -> String {
     use aterm_grapheme::GraphemeClusters as _;
 
     let sanitized = canonical_single_line(text);
-    let mut graphemes = sanitized.graphemes();
-    let head: String = graphemes.by_ref().take(max_graphemes).collect();
-    if graphemes.next().is_some() {
-        format!("{head}…")
-    } else {
-        head
+    // A cluster is at least one byte, so a text within the cap in BYTES is
+    // within it in clusters: the ordinary short title never segments.
+    if sanitized.len() <= max_graphemes {
+        return sanitized;
     }
+    let clusters: Vec<&str> = sanitized.graphemes().collect();
+    if clusters.len() <= max_graphemes {
+        return sanitized;
+    }
+    let head = max_graphemes - max_graphemes / 2;
+    let tail = max_graphemes / 2;
+    let mut out = String::with_capacity(sanitized.len());
+    out.extend(clusters[..head].iter().copied());
+    out.push('…');
+    out.extend(clusters[clusters.len() - tail..].iter().copied());
+    out
+}
+
+/// A composed TAB label on its way to a surface that paints it WHOLE — no cell
+/// fit, no sibling-aware pass: the native toolbar's chip and its accessibility
+/// string, the tooltip / context-menu header, the a11y tab item, the `tabs` /
+/// `chrome` introspection lines. The strip's composition
+/// ([`super::ChromeSurface::TabStrip`]) caps no title, so the cap those
+/// surfaces always had is applied HERE, half by half on the strip's own seam:
+/// the subject and, past [`super::TAB_LABEL_SEPARATOR`], the state clause
+/// ([`crate::tab_bar::state_clause_bytes`] — the split the strip itself makes)
+/// each take [`MAX_CHROME_TITLE_GRAPHEMES`] by the middle cut. The envelope is
+/// exactly what composing with the cap produced (at most `max + 1` graphemes a
+/// half), a label whose halves are both within it is borrowed unchanged, and
+/// the projection is idempotent in value.
+pub(crate) fn whole_label(label: &str) -> Cow<'_, str> {
+    use aterm_grapheme::GraphemeClusters as _;
+
+    let within = |half: &str| {
+        half.len() <= MAX_CHROME_TITLE_GRAPHEMES
+            || half.graphemes().nth(MAX_CHROME_TITLE_GRAPHEMES).is_none()
+    };
+    let (subject, clause) = label.split_at(label.len() - crate::tab_bar::state_clause_bytes(label));
+    // A clause is the separator plus the state, or nothing at all.
+    let state = clause
+        .strip_prefix(super::TAB_LABEL_SEPARATOR)
+        .unwrap_or(clause);
+    if within(subject) && within(state) {
+        return Cow::Borrowed(label);
+    }
+    let mut out = chrome_presentation_text(subject, MAX_CHROME_TITLE_GRAPHEMES);
+    if !clause.is_empty() {
+        out.push_str(super::TAB_LABEL_SEPARATOR);
+        out.push_str(&chrome_presentation_text(state, MAX_CHROME_TITLE_GRAPHEMES));
+    }
+    Cow::Owned(out)
+}
+
+/// [`whole_label`] over a strip's worth of labels: borrowed whole when no label
+/// is past the cap (the ordinary strip — no allocation), else one owned vector
+/// with every label projected.
+pub(crate) fn whole_labels(labels: &[String]) -> Cow<'_, [String]> {
+    if labels
+        .iter()
+        .all(|label| matches!(whole_label(label), Cow::Borrowed(_)))
+    {
+        return Cow::Borrowed(labels);
+    }
+    Cow::Owned(
+        labels
+            .iter()
+            .map(|label| whole_label(label).into_owned())
+            .collect(),
+    )
 }
 
 pub(super) fn is_bidi_control(ch: char) -> bool {

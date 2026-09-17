@@ -83,7 +83,7 @@ fn selftest_verdict_cases() -> Vec<(&'static str, SelftestCase)> {
         ..Tally::default()
     };
     let failed = || Tally {
-        gate_failures: 1,
+        gate_failures: vec!["a gate".to_string()],
         ..Tally::default()
     };
     let narrowed = || Scope::crate_only("aterm-grid");
@@ -198,10 +198,32 @@ pub fn verdict(mode: Mode, scope: &Scope, selftest: bool, t: &Tally) -> Verdict 
         };
     }
 
-    if t.gate_failures > 0 {
+    // NAMED, for the reason `Tally` gives: the ladder row that decided the run is
+    // one line in tens of thousands, and the verdict is the line a reader quotes.
+    if !t.gate_failures.is_empty() {
+        let n = t.gate_failures.len();
         text.push_str(&format!(
             "  VERIFY: FAIL (mode={mode} scope={scope_word}) — DO NOT merge\n"
         ));
+        text.push_str(&format!(
+            "          {n} gate(s) decided AGAINST the tree — this IS a finding about the\n"
+        ));
+        text.push_str("          change, and the stage's own block above says why:\n");
+        for f in &t.gate_failures {
+            text.push_str(&format!("      - {f}\n"));
+        }
+        if !t.could_not_run.is_empty() {
+            let m = t.could_not_run.len();
+            text.push_str(&format!(
+                "          ({m} further stage(s) could not execute and decided nothing:\n"
+            ));
+            for c in &t.could_not_run {
+                text.push_str(&format!("      - {c}\n"));
+            }
+            text.push_str(
+                "          fix those too, or the next run decides less than this one.)\n",
+            );
+        }
         return Verdict {
             text,
             exit: exit::FAILED,
@@ -212,8 +234,8 @@ pub fn verdict(mode: Mode, scope: &Scope, selftest: bool, t: &Tally) -> Verdict 
     // Nothing FAILED and nothing was decided either. Reported as its own verdict
     // so it can never be read as a finding about the change — the same mistake
     // .githooks/pre-push refuses to make when the driver is missing.
-    if t.could_not_run > 0 {
-        let n = t.could_not_run;
+    if !t.could_not_run.is_empty() {
+        let n = t.could_not_run.len();
         text.push_str(&format!(
             "  VERIFY: COULD NOT RUN (mode={mode} scope={scope_word}) — DO NOT merge\n"
         ));
@@ -224,6 +246,9 @@ pub fn verdict(mode: Mode, scope: &Scope, selftest: bool, t: &Tally) -> Verdict 
             "          them. This is NOT a finding about your change — the environment\n",
         );
         text.push_str("          is broken (no driver, or a helper the gate needs is missing).\n");
+        for c in &t.could_not_run {
+            text.push_str(&format!("      - {c}\n"));
+        }
         text.push_str(
             "          Fix it and run again; a gate that never ran has decided nothing.\n",
         );
@@ -284,9 +309,9 @@ pub fn verdict(mode: Mode, scope: &Scope, selftest: bool, t: &Tally) -> Verdict 
 /// the tree, that is the news, and `1` is the code the pre-push hook reads as
 /// FAILED. `3` is reserved for a run where nothing was decided at all.
 fn failure_exit(t: &Tally) -> i32 {
-    if t.gate_failures > 0 {
+    if !t.gate_failures.is_empty() {
         exit::FAILED
-    } else if t.could_not_run > 0 {
+    } else if !t.could_not_run.is_empty() {
         exit::COULD_NOT_RUN
     } else {
         exit::PASS
@@ -298,9 +323,11 @@ mod tests {
     use super::*;
 
     fn tally(fails: usize, cnr: usize, skips: &[&str]) -> Tally {
+        let named =
+            |n: usize, what: &str| (0..n).map(|i| format!("{what} {i}")).collect::<Vec<_>>();
         Tally {
-            gate_failures: fails,
-            could_not_run: cnr,
+            gate_failures: named(fails, "a finding"),
+            could_not_run: named(cnr, "a stage that could not run"),
             skips: skips.iter().map(|s| (*s).to_string()).collect(),
         }
     }
@@ -468,6 +495,51 @@ mod tests {
                 .contains("      - tippy lint (Trust stage2 toolchain not built)")
         );
         assert!(v.text.contains("      - gui smoke (macOS only)"));
+    }
+
+    /// The failure side of the skip rule above. A run is read top-to-bottom by
+    /// a human or an agent, the ladder is tens of thousands of lines, and the
+    /// verdict is the line they quote: a bare `VERIFY: FAIL` makes them grep
+    /// for `^  FAIL` to learn what the gate actually decided.
+    #[test]
+    fn a_failing_run_names_the_gates_that_decided_against_the_tree() {
+        let mut t = tally(0, 0, &[]);
+        t.gate_failures = vec![
+            "tippy --workspace -D warnings".to_string(),
+            "license_check.sh".to_string(),
+        ];
+        t.could_not_run = vec!["libc-oracle/run.sh (no cc)".to_string()];
+        let v = verdict(Mode::Fast, &Scope::workspace(), false, &t);
+        assert_eq!(v.exit, exit::FAILED);
+        assert!(!v.claims_merge_contract);
+        assert!(
+            v.text
+                .contains("VERIFY: FAIL (mode=fast scope=workspace) — DO NOT merge")
+        );
+        assert!(v.text.contains("2 gate(s) decided AGAINST the tree"));
+        assert!(v.text.contains("      - tippy --workspace -D warnings"));
+        assert!(v.text.contains("      - license_check.sh"));
+        // The could-not-runs a finding outranks are still named, or fixing the
+        // finding is followed by a run that decides LESS and looks like progress.
+        assert!(v.text.contains("1 further stage(s) could not execute"));
+        assert!(v.text.contains("      - libc-oracle/run.sh (no cc)"));
+    }
+
+    /// And the same obligation on the branch where nothing was decided at all.
+    #[test]
+    fn a_could_not_run_verdict_names_the_stages_that_never_ran() {
+        let mut t = tally(0, 0, &[]);
+        t.could_not_run = vec![
+            "targo not found".to_string(),
+            "gui smoke (no WindowServer session)".to_string(),
+        ];
+        let v = verdict(Mode::Fast, &Scope::workspace(), false, &t);
+        assert_eq!(v.exit, exit::COULD_NOT_RUN);
+        assert!(v.text.contains("      - targo not found"));
+        assert!(
+            v.text
+                .contains("      - gui smoke (no WindowServer session)")
+        );
     }
 
     #[test]

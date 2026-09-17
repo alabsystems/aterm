@@ -138,6 +138,18 @@ struct Admitted {
     roster: TrustedRoster,
 }
 
+/// One distinct roster pair Pass 1 has already weighed, and the verdict it reached.
+///
+/// A refusal (`None`) is remembered too: identical bytes under one anchor and one clock
+/// refuse identically, so re-running a doomed master verify for each repeat is the same
+/// waste as re-running a successful one — and remembering the refusal cannot turn into
+/// an admission, there being nothing here that can flip a `None` to a `Some`.
+struct Weighed {
+    roster_bytes: Vec<u8>,
+    roster_sig: Vec<u8>,
+    verdict: Option<TrustedRoster>,
+}
+
 /// Verify-then-select over `candidates` (see the module docs). `anchor` is the pinned
 /// paper-master keyset plus the durable `roster_seq` floor; `floor` is the durable
 /// `index_build` high-water **and the generation that set it** ([`BuildFloor`]); `now_unix`
@@ -174,10 +186,51 @@ pub fn select_index(
     // every generation on offer has been weighed, because which generation is newest decides
     // WHO may have signed an index — and that question has to be settled before, not after,
     // ranking by a number the signer chose.
+    //
+    // ONE ADMISSION PER DISTINCT ROSTER PAIR, not one per candidate. The candidates in a
+    // pass are successive releases of ONE repo, and each publishes the same master-signed
+    // `aterm-machines.toml` generation beside its index — on a real store all four cached
+    // candidates carry byte-identical roster bytes AND signature, so three of the four
+    // master verifies (plus parse, plus admission) only rebuilt a `TrustedRoster` already
+    // in hand, on every resolve, in every process.
+    //
+    // What the memo may NOT do is loosen the pairing rule this module exists to enforce:
+    // a candidate is still admitted by the roster published BESIDE IT, and the memo hits
+    // only on the EXACT bytes of both halves (`==`, never a digest — a hash collision must
+    // never be able to stand in for a master signature). Under one anchor and one
+    // `now_unix`, identical bytes are the same verdict: `verify_roster`, `Roster::parse`
+    // and `Roster::admit` are all pure.
+    //
+    // It also stays inside the freeze contract on `TrustedRoster` ("valid for ONE apply —
+    // do not cache"): the memo is a local, lives exactly as long as this call, and a reused
+    // generation therefore carries the very clock reading its own admission froze — the
+    // same reading every other candidate in this pass is being weighed against.
+    let mut weighed: Vec<Weighed> = Vec::new();
     let mut admitted: Vec<Admitted> = Vec::new();
     let mut observed_roster_seq = 0u64;
     for c in candidates {
-        let Ok(roster) = admit_roster(anchor, c.roster_bytes, &c.roster_sig, now_unix) else {
+        // Taken as an owned verdict, not a borrow, so the miss arm below can extend the
+        // memo. `Some(None)` is "already weighed, already refused"; `None` is "not yet
+        // weighed". The scan is linear in the number of DISTINCT pairs, which is bounded
+        // by the candidate count and is in practice 1.
+        let seen = weighed
+            .iter()
+            .find(|w| w.roster_bytes == c.roster_bytes && w.roster_sig == c.roster_sig)
+            .map(|w| w.verdict.clone());
+        let verdict = match seen {
+            Some(already) => already,
+            None => {
+                let fresh =
+                    admit_roster(anchor, c.roster_bytes.clone(), &c.roster_sig, now_unix).ok();
+                weighed.push(Weighed {
+                    roster_bytes: c.roster_bytes,
+                    roster_sig: c.roster_sig,
+                    verdict: fresh.clone(),
+                });
+                fresh
+            }
+        };
+        let Some(roster) = verdict else {
             continue;
         };
         observed_roster_seq = observed_roster_seq.max(roster.seq());
@@ -582,6 +635,82 @@ mod tests {
             .selected
             .is_none(),
             "within one generation the ratchet is exactly as monotonic as it was"
+        );
+    }
+
+    // ---------------------------------------------------------------------------------
+    // ONE ADMISSION PER DISTINCT ROSTER, not one per candidate.
+    // ---------------------------------------------------------------------------------
+
+    /// The candidates in one pass are successive releases of ONE repo, and every one of
+    /// them publishes the same master-signed roster generation beside its index — on a
+    /// real machine all four cached candidates carry byte-identical `roster_b64` and
+    /// `roster_sig_b64`. Pass 1 must weigh that generation ONCE; three further master
+    /// verifies and TOML parses only rebuild a `TrustedRoster` already in hand.
+    ///
+    /// MUTATION: drop the memo in Pass 1 and this fails with four verifies for one
+    /// generation.
+    #[test]
+    fn one_generation_costs_one_admission_however_many_candidates_carry_it() {
+        let cands = vec![
+            signed("atpkg-index-29", 29),
+            signed("atpkg-index-30", 30),
+            signed("atpkg-index-31", 31),
+            signed("atpkg-index-32", 32),
+        ];
+        // The premise, asserted rather than assumed: this fixture models the listing
+        // lane, where one generation is published beside every release.
+        assert!(
+            cands
+                .iter()
+                .all(|c| c.roster_bytes == cands[0].roster_bytes
+                    && c.roster_sig == cands[0].roster_sig),
+            "four releases, one published roster pair"
+        );
+        let before = testkit::master_verifies();
+        let out = select_index(&anchor(0), cands, no_floor(), testkit::NOW);
+        assert_eq!(
+            testkit::master_verifies() - before,
+            1,
+            "four candidates carrying ONE roster generation must cost one master verify"
+        );
+        // ...and the verdict is byte-for-byte the one the repeated verifies reached.
+        let sel = out.selected.expect("the highest signed build wins");
+        assert_eq!(sel.label, "atpkg-index-32");
+        assert_eq!(sel.index.index_build, 32);
+        assert_eq!(sel.index.attribution().machine_id, testkit::MACHINE_ID);
+        assert_eq!(
+            out.observed_roster_seq,
+            testkit::SEQ,
+            "the reused generation is observed exactly as the re-admitted one was"
+        );
+    }
+
+    /// NON-VACUITY, and the direction that must never collapse: the memo is keyed on the
+    /// EXACT bytes of BOTH halves, so two different pairs are two admissions — and a pair
+    /// whose master signature is forged is refused on its own account, never waved
+    /// through on the strength of the genuine pair sitting beside it.
+    #[test]
+    fn distinct_roster_pairs_are_each_admitted_on_their_own() {
+        // Same roster bytes, a master signature nobody made: a DIFFERENT pair.
+        let mut forged = signed("forged-master-sig", 9_000);
+        forged.roster_sig = vec![0u8; 64];
+        let before = testkit::master_verifies();
+        let out = select_index(
+            &anchor(0),
+            vec![forged, signed("genuine", 60)],
+            no_floor(),
+            testkit::NOW,
+        );
+        assert_eq!(
+            testkit::master_verifies() - before,
+            2,
+            "two distinct (roster_bytes, roster_sig) pairs are two admissions"
+        );
+        let sel = out.selected.expect("the genuine candidate still qualifies");
+        assert_eq!(
+            sel.index.index_build, 60,
+            "the forged pair carried no authority, however high its build"
         );
     }
 }

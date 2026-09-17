@@ -52,8 +52,7 @@ macro_rules! aterm_ffi_catch_unwind {
                     // Extract panic message for diagnostics (#5892, F11-2 #7941).
                     //
                     // Never silently mask an FFI panic: log to stderr *and* to
-                    // the structured log sink so observability pipelines see
-                    // it even when the `ffi-logging` feature is off.
+                    // the structured log sink so observability pipelines see it.
                     //
                     // Trust L0: extraction lives in `$crate::panic_payload_msg`
                     // (called on `&_panic` — no `Box` deref here) so the
@@ -101,9 +100,8 @@ macro_rules! aterm_ffi_catch_panic {
         $crate::aterm_ffi_catch_unwind!(
             $default,
             {
-                // F11-2 (#7941): log the prefix+fn_name even without
-                // the `ffi-logging` feature so panic attribution is
-                // never silently dropped.
+                // F11-2 (#7941): log the prefix+fn_name unconditionally so
+                // panic attribution is never silently dropped.
                 $crate::aterm_log::error!("{} {}: panic caught", $log_prefix, $fn_name);
             },
             $body

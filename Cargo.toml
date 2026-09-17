@@ -68,7 +68,7 @@ update_channel = "alabsystems/aterm"
 # clients verify against were two separately edited values that nothing compared.
 
 [workspace.package]
-version = "0.86.0"
+version = "0.87.0"
 edition = "2024"
 license = "Apache-2.0"
 repository = "https://github.com/alabsystems/aterm"
@@ -479,6 +479,31 @@ all = { level = "warn", priority = -1 }
 # The gate's OTHER consumer, tools/freeze-safety-gate, is its own workspace and
 # carries the matching `[profile.dev.build-override]` in its own manifest.
 [profile.dev.package.aterm-census]
+opt-level = 2
+
+# THE REGEX ENGINE AT OPT-LEVEL 2 IN DEV (2026-09-16, gate speed on a slow host).
+# `cargo test -p aterm-regex` runs the step-budget tests, whose default-budget
+# row scans a 3 MB haystack until the 2^26-step budget trips, once per
+# amplifier, and asserts each trip inside 5 s — a bound that holds where the
+# Pike VM runs optimized. Unoptimized on a 2017 4-core Intel MacBook Pro
+# (macOS 13.7.8, Trust toolchain) that row was the merge gate's one red test,
+# and a coin flip: measured quiet, arms alternated ABBA,
+#   the default-budget test        5.60 s (red) / 7.97 s  ->  0.85 s / 0.82 s
+#   cargo test -p aterm-regex --lib   22.99 s / 16.32 s (49/50)  ->  1.67 s / 1.67 s (50/50)
+# (the 2026-09-15 gate measured one scan at 8.09 s under its own load, and a
+# run beside a second build 22.5 s). At opt-level 2 the bound holds with a 6x
+# margin and the crate's tests cost ~1.7 s per verify.sh run instead of ~20 s.
+# Cost side: every crate that depends on aterm-regex (aterm-search and
+# aterm-observe directly, and through aterm-core most of the tree) recompiles
+# ONCE per target directory when this lands, because the dependency's
+# metadata hash changes; after that, +codegen on this 8k-line crate only when
+# it is edited.
+#
+# As for aterm-census above, `debug-assertions` (and with it overflow-checks)
+# keeps inheriting `true` from profile.dev: the step budget's arithmetic must
+# keep panicking on overflow. Only opt-level moves, and the crate's 50 lib
+# tests pass at both levels.
+[profile.dev.package.aterm-regex]
 opt-level = 2
 
 # HOST CODE AT THE SAME DEBUGINFO AS EVERYTHING ELSE (2026-09-13, gate speed).

@@ -271,14 +271,18 @@ fn bind_command_identity(command: &mut Command, identity: Option<&SocketIdentity
 /// witness that permits the ordinary binder. Parsed data gains authority only
 /// beside the existing admitted Ready/Commit gate and matching explicit plan.
 ///
-/// # Safety
-/// The caller must still be in single-threaded startup: removing an environment
-/// variable must not race another thread reading the process environment.
-pub(crate) unsafe fn consume_incoming() -> Result<Option<SocketIdentity>, String> {
-    let raw = std::env::var_os(ENV_IDENTITY);
-    // SAFETY: the caller guarantees single-threaded startup.
-    unsafe { std::env::remove_var(ENV_IDENTITY) };
-    let Some(raw) = raw else {
+/// Read-and-remove goes through the workspace's ONE lock-scoped environment
+/// mutator — the shape `env_mutation` asks for — and that helper is also the
+/// reason the pair is now ATOMIC: a split read-then-remove lets two callers both
+/// observe a value that is meant to be consumed exactly once, and a one-shot
+/// authority consumed twice is not one-shot.
+///
+/// The lock cannot serialize a bare `getenv` on another thread, so this must
+/// still be called from single-threaded startup. That is a positioning
+/// requirement on the caller, not a memory-safety contract: the mutation itself
+/// is the blessed helper's, so this function is safe to call.
+pub(crate) fn consume_incoming() -> Result<Option<SocketIdentity>, String> {
+    let Some(raw) = aterm_log::env::take(ENV_IDENTITY) else {
         return Ok(None);
     };
     let invalid = || "invalid handoff control-socket identity".to_string();
@@ -306,6 +310,51 @@ mod tests {
         let token = crate::control_auth::provision_token(&plan.token_path).unwrap();
         let listener = CtlListener::bind(&path).unwrap();
         (dir, plan, listener, token)
+    }
+
+    /// `consume_incoming` takes the launch witness ONCE, through the workspace's
+    /// lock-scoped env helper: absent and empty are `Ok(None)`, a malformed
+    /// witness is the refusal, a real one decodes to the identity the parent
+    /// captured — and after every case the variable is gone, so nothing later in
+    /// the process, and no child it spawns, can observe it. The env helpers are
+    /// serialized under one lock, so this runs beside the parallel suite. The
+    /// identity is compared with `==`, never formatted: the type carries no
+    /// `Debug` on purpose (nothing about a listener's files is for a log line).
+    #[test]
+    fn consume_incoming_takes_the_witness_once_through_the_blessed_helper() {
+        aterm_log::env::unset(ENV_IDENTITY);
+        assert!(consume_incoming() == Ok(None), "absent: nothing to consume");
+        assert!(std::env::var_os(ENV_IDENTITY).is_none());
+
+        aterm_log::env::set(ENV_IDENTITY, "");
+        assert!(consume_incoming() == Ok(None), "empty: an explicit nothing");
+        assert!(
+            std::env::var_os(ENV_IDENTITY).is_none(),
+            "and it is consumed"
+        );
+
+        aterm_log::env::set(ENV_IDENTITY, "{not a witness");
+        assert!(
+            consume_incoming() == Err("invalid handoff control-socket identity".to_string()),
+            "malformed: a refused handoff, never an absent witness"
+        );
+        assert!(
+            std::env::var_os(ENV_IDENTITY).is_none(),
+            "consumed even when refused"
+        );
+
+        let (_dir, plan, listener, token) = fixture();
+        let identity = SocketIdentity::capture(&plan, &listener, &token).expect("a witness");
+        aterm_log::env::set(ENV_IDENTITY, identity.encode().expect("encodes"));
+        assert!(
+            consume_incoming() == Ok(Some(identity)),
+            "a real witness decodes to what the parent captured"
+        );
+        assert!(
+            std::env::var_os(ENV_IDENTITY).is_none(),
+            "taken once: a second reader sees nothing"
+        );
+        assert!(consume_incoming() == Ok(None));
     }
 
     #[test]

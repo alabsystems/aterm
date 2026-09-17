@@ -1331,7 +1331,7 @@ mod tests {
             .open_active_session_in_new_window_logical()
             .expect("share the active session into another window");
         let shared_id = app.windows[&shared_window].tab_set.active_id().unwrap();
-        app.migrate_active_tab_to_next_window();
+        let _ = app.migrate_active_tab_to_next_window();
         assert_eq!(app.windows.len(), 1);
         assert_eq!(app.pool.views(0), Some(2));
 

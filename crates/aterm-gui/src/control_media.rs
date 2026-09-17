@@ -2198,6 +2198,54 @@ pub(crate) fn cmd_trail(proxy: &EventLoopProxy<Wake>, rest: &str) -> String {
     out
 }
 
+/// `kitty` -> the cursor cat's wearable COLLECTION; `kitty wear <key>` -> put
+/// one on.
+///
+/// **THE DIRECT SWITCH.** Before this the only way to change the cursor cat was
+/// View ▸ Favourite This Kitty, which pins the cat that would ride ANYWAY —
+/// this window's tenured program cat, else the launch kitty. To wear a
+/// different one you first had to make it appear: relaunch for a fresh launch
+/// kitty, or run a program long enough to earn tenure and hope you liked what
+/// turned up. Naming the cat is what switching means, and the ledger already
+/// elects by GREATEST pin stamp, so a wear is monotone — it needs no unpin, and
+/// it survives a merge from any other replica of the collection.
+///
+/// A main-thread hop like `trail`/`tone`: the collection lives in `App`.
+pub(crate) fn cmd_kitty(proxy: &EventLoopProxy<Wake>, rest: &str) -> String {
+    let rest = rest.trim();
+    if let Some(key) = rest.strip_prefix("wear") {
+        let key = key.trim();
+        if key.is_empty() {
+            return "ERR usage: kitty wear <key> (`kitty` alone lists them)\n".to_string();
+        }
+        return match call_main(proxy, |tx| Wake::KittyWear {
+            key: key.to_string(),
+            reply: tx,
+        }) {
+            // ONE FRAMING PER VERB: `kitty` is `Lines` in the catalog, so the
+            // wear form answers `OK 1` + its row, never a bare `OK <line>` a
+            // client would read as a count.
+            Ok(Ok(row)) => format!("OK 1\n{row}\n"),
+            Ok(Err(e)) => format!("ERR {e}\n"),
+            Err(e) => format!("ERR {e}\n"),
+        };
+    }
+    if !rest.is_empty() {
+        return format!("ERR usage: kitty [wear <key>] (got {rest:?})\n");
+    }
+    let rows = match call_main(proxy, |tx| Wake::KittyCollection { reply: tx }) {
+        Ok(Ok(rows)) => rows,
+        Ok(Err(e)) => return format!("ERR {e}\n"),
+        Err(e) => return format!("ERR {e}\n"),
+    };
+    let mut out = format!("OK {}\n", rows.len());
+    for row in rows {
+        out.push_str(&row);
+        out.push('\n');
+    }
+    out
+}
+
 /// `status` -> the target session's SUBJECT + classified STATUS record, one
 /// versioned key=value line (RFC: Tab Subject & Status §8).
 ///
@@ -2654,10 +2702,13 @@ impl crate::App {
         let wid = self.hosting_window(session)?;
         self.clear_tab_surface_move_license(None);
         self.close_confirm = crate::app_window::CloseConfirm::Programmatic;
+        // NOT `?`: the programmatic-close bracket below must be unwound even on
+        // a refusal, or a declined close would leave `close_confirm` pinned to
+        // `Programmatic` and the next human gesture would skip its confirm.
         let state = self.apply_tab_cmd_in(wid, action);
         self.escalate_pending_close(el);
         self.close_confirm = crate::app_window::CloseConfirm::Interactive;
-        Ok(state)
+        state
     }
 }
 
@@ -3295,18 +3346,21 @@ mod spawn_aim_app_tests {
         app.headless = false;
         let (front, back) = (WindowId(1), WindowId(0));
         // next wraps 1 -> 0; prev wraps 0 -> 1; a bare index selects.
-        assert_eq!(app.apply_tab_cmd_in(back, TabAction::Next), (0, 2));
-        assert_eq!(app.apply_tab_cmd_in(back, TabAction::Prev), (1, 2));
-        assert_eq!(app.apply_tab_cmd_in(back, TabAction::Select(0)), (0, 2));
+        assert_eq!(app.apply_tab_cmd_in(back, TabAction::Next), Ok((0, 2)));
+        assert_eq!(app.apply_tab_cmd_in(back, TabAction::Prev), Ok((1, 2)));
+        assert_eq!(app.apply_tab_cmd_in(back, TabAction::Select(0)), Ok((0, 2)));
         assert_eq!(app.windows[&back].tab_set.active_index(), Some(0));
         // The front window never moved: still one tab, still index 0, still front.
         assert_eq!(app.windows[&front].tab_set.len(), 1);
         assert_eq!(app.windows[&front].tab_set.active_index(), Some(0));
         assert_eq!(app.frontmost_window, Some(front));
         // The front-window form is the SAME entry on the front window.
-        assert_eq!(app.apply_tab_cmd(TabAction::Next), (0, 1));
+        assert_eq!(app.apply_tab_cmd(TabAction::Next), Ok((0, 1)));
         // An unknown window reports the empty state instead of guessing.
-        assert_eq!(app.apply_tab_cmd_in(WindowId(9), TabAction::Next), (0, 0));
+        assert_eq!(
+            app.apply_tab_cmd_in(WindowId(9), TabAction::Next),
+            Ok((0, 0))
+        );
         assert!(app.structural_invariants_ok());
     }
 
@@ -3320,7 +3374,7 @@ mod spawn_aim_app_tests {
         let (front, back) = (WindowId(1), WindowId(0));
         assert_eq!(
             app.apply_tab_cmd_in(back, TabAction::Close(Some(1))),
-            (0, 1)
+            Ok((0, 1))
         );
         assert_eq!(app.windows[&back].tab_set.len(), 1);
         assert!(!app.windows[&back].pending_close);

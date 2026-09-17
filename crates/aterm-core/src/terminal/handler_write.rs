@@ -913,8 +913,15 @@ impl TerminalHandler<'_> {
         // Row::set(), which sets HAS_WIDE_CHARS and DIRTY on the row.
         let wide_base =
             crate::grid::Cell::from_raw_parts(char_data, colors, base_flags.union(CellFlags::WIDE));
-        let cont_cell =
-            crate::grid::Cell::from_raw_parts(' ' as u16, colors, CellFlags::WIDE_CONTINUATION);
+        // The spacer inherits the base cell's rendition — same law as the CJK
+        // write path in `Row::write_wide_char_packed`. VS16 promotes a NARROW
+        // emoji to two columns, so without this an inverse-video ⌚️ loses its
+        // right half exactly as 漢 did.
+        let cont_cell = crate::grid::Cell::from_raw_parts(
+            ' ' as u16,
+            colors,
+            base_flags.wide_continuation_of(),
+        );
         // If the continuation column currently holds the first half of a
         // different wide character, its second half will become an orphaned
         // WIDE_CONTINUATION cell. Detect this before writing (#7656).
@@ -947,6 +954,18 @@ impl TerminalHandler<'_> {
             row_data.set(cont_col, cont_cell);
         }
 
+        // The spacer inherits the base cell's rendition VALUES, not only the
+        // flags `wide_continuation_of` just gave it. When this base was written
+        // it was NARROW, so `apply_cell_extras_preflagged` ran with `cols = 1`
+        // and left the SGR 58 underline colour and any truecolor fg/bg on the
+        // base's column alone — whereas a naturally-wide 中 takes the
+        // `width == 2` arm of that same loop and gets both columns. Without
+        // this, "what colour is the underline under the right half" has two
+        // different live answers depending on WHICH widening made the pair, and
+        // the scrollback re-derivation (which mirrors the lead unconditionally)
+        // disagrees with the live row for every VS16-widened emoji.
+        self.mirror_vs16_spacer_extras(row, col, cont_col);
+
         // Mark all affected cells as damaged.
         if let Some(oc) = orphan_col {
             self.grid.damage_mut().mark_cell(row, oc);
@@ -965,6 +984,46 @@ impl TerminalHandler<'_> {
             self.grid.advance_cursor_wrap();
         } else {
             self.grid.advance_cursor_no_wrap();
+        }
+    }
+
+    /// Copy the base cell's rendition-valued extras onto the spacer a VS16
+    /// widening just created.
+    ///
+    /// Writes exactly the three values `apply_cell_extras_preflagged` writes to
+    /// both columns when it runs on an already-wide write — the truecolor fg/bg
+    /// and the packed SGR 58 underline colour — but reads them from the BASE
+    /// CELL rather than from `self.style`/`self.transient`. That matters: VS16
+    /// can arrive after an intervening SGR reset (`\x1b[58:2::0:255:0m❤\x1b[0m` +
+    /// U+FE0F), and the current style would then colour the spacer with a
+    /// rendition the character never had. The lead is the source of truth.
+    ///
+    /// `cell_extra_mut` sets HAS_EXTRAS, which the live render path gates its
+    /// map probe on; the fg/bg overflow sentinel is already in the spacer's
+    /// `PackedColors`, copied wholesale from the base.
+    fn mirror_vs16_spacer_extras(&mut self, row: u16, lead: u16, spacer: u16) {
+        // Ring-aware: the RGB hot path stores into a dense ring, the rest into
+        // the map, and these accessors read both in that order.
+        let fg = self.grid.fg_rgb_at(row, lead);
+        let bg = self.grid.bg_rgb_at(row, lead);
+        let underline = self
+            .grid
+            .cell_extra(row, lead)
+            .and_then(crate::grid::CellExtra::underline_color_u32);
+        if fg.is_none() && bg.is_none() && underline.is_none() {
+            // Nothing to carry — and no empty entry (or HAS_EXTRAS bit) created
+            // for the overwhelmingly common plain emoji.
+            return;
+        }
+        let extra = self.grid.cell_extra_mut(row, spacer);
+        if fg.is_some() {
+            extra.set_fg_rgb(fg);
+        }
+        if bg.is_some() {
+            extra.set_bg_rgb(bg);
+        }
+        if underline.is_some() {
+            extra.set_underline_color_u32(underline);
         }
     }
 
@@ -1125,6 +1184,96 @@ pub(crate) fn is_vs16_emoji_capable(c: char) -> bool {
 #[cfg(test)]
 mod tests {
     use super::char_width;
+    use crate::terminal::Terminal;
+
+    const ENGLAND: &str = "\u{1F3F4}\u{E0067}\u{E0062}\u{E0065}\u{E006E}\u{E0067}\u{E007F}";
+
+    /// `text` written into a fresh 1×8 terminal in one `process` call — the
+    /// parser batches a run of 2+ non-ASCII scalars into `write_unicode_bulk`
+    /// — and again one scalar per call, the fragmented form it cannot batch,
+    /// so the pair covers the bulk arms and the per-char writer. The two grids
+    /// must agree (chunked-process equivalence).
+    fn whole_and_fragmented(text: &str) -> [Terminal; 2] {
+        let mut whole = Terminal::new(1, 8);
+        whole.process(text.as_bytes());
+        let mut fragmented = Terminal::new(1, 8);
+        let mut buf = [0u8; 4];
+        for c in text.chars() {
+            fragmented.process(c.encode_utf8(&mut buf).as_bytes());
+        }
+        [whole, fragmented]
+    }
+
+    /// A tag character (U+E0000..U+E007F) or a Variation Selectors Supplement
+    /// scalar (U+E0100..U+E01EF) is zero-width: it attaches to the preceding
+    /// cell as a combining mark and the cursor does not advance. Each used to
+    /// be reported narrow — it took a cell of its own and drew as tofu, and
+    /// the following glyph landed one column late.
+    #[test]
+    fn tag_and_vs_supplement_attach_to_the_previous_cell() {
+        // (text, the mark, the column X lands in = the base's width)
+        for (text, mark, x_col) in [
+            ("A\u{E0001}X", '\u{E0001}', 1u16),
+            ("A\u{E007F}X", '\u{E007F}', 1),
+            ("e\u{E0100}X", '\u{E0100}', 1),
+            ("e\u{E01EF}X", '\u{E01EF}', 1),
+            // A non-ASCII base puts the mark inside a batched run: the Latin-1
+            // arm, then the CJK wide-run batcher, ahead of the non-BMP arm.
+            ("\u{00E9}\u{E0001}X", '\u{E0001}', 1),
+            ("\u{4E00}\u{E0100}X", '\u{E0100}', 2),
+        ] {
+            for term in whole_and_fragmented(text) {
+                let grid = term.grid();
+                assert_eq!(
+                    grid.cell(0, x_col).map(|c| c.char()),
+                    Some('X'),
+                    "{text:?}: X is adjacent to the base"
+                );
+                assert_eq!(term.cursor().col, x_col + 1, "{text:?}: cursor after X");
+                assert_eq!(
+                    grid.cell_extra(0, 0).map(|e| e.combining()),
+                    Some([mark].as_slice()),
+                    "{text:?}: the mark attached to the base cell"
+                );
+                assert_eq!(
+                    grid.extras().len(),
+                    1,
+                    "{text:?}: only the base cell carries an extra"
+                );
+            }
+        }
+    }
+
+    /// England: 🏴 + gbeng + CANCEL TAG is ONE two-cell grapheme whose six
+    /// tags all attach to the lead cell (well under `MAX_COMBINING`).
+    #[test]
+    fn subdivision_flag_occupies_two_cells() {
+        for term in whole_and_fragmented(&format!("{ENGLAND}X")) {
+            let grid = term.grid();
+            assert!(
+                grid.cell(0, 0).is_some_and(|c| c.is_wide()),
+                "the flag's lead cell is wide"
+            );
+            assert_eq!(grid.cell(0, 2).map(|c| c.char()), Some('X'));
+            assert_eq!(term.cursor().col, 3);
+            assert_eq!(
+                grid.cell_extra(0, 0).map(|e| e.combining().len()),
+                Some(6),
+                "all six tags attached to the lead cell"
+            );
+        }
+    }
+
+    /// VS16 keeps its own arm: a zero-width selector that ALSO widens the base.
+    #[test]
+    fn vs16_widening_is_unchanged() {
+        for term in whole_and_fragmented("\u{2764}\u{FE0F}X") {
+            let grid = term.grid();
+            assert!(grid.cell(0, 0).is_some_and(|c| c.is_wide()));
+            assert_eq!(grid.cell(0, 2).map(|c| c.char()), Some('X'));
+            assert_eq!(term.cursor().col, 3);
+        }
+    }
 
     /// Exhaustive parity guard for the CJK fast-path block U+3000..U+A000.
     ///

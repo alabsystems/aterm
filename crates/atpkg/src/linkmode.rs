@@ -187,6 +187,12 @@ pub fn link(
 
     write_marker(&layout.link_marker(program), &marker)
         .map_err(|e| LinkError::Io(e.to_string()))?;
+    // A DEV LINK HAS TO WIN ON PATH. For an agent program (`crate::stub::AGENT_PROGRAMS`)
+    // `agents/<tool>` goes FIRST on every PATH and names the STORE build directly, so a
+    // link that re-pointed only `bin/<tool>` left the dev checkout unreachable — `claude`
+    // kept running the installed copy with nothing to say why. The reconcile lays no twin
+    // for a primary that resolves outside the store; its sweep drops the one standing.
+    crate::activate::reconcile_agents(layout);
     Ok(LinkOutcome { linked, refused })
 }
 
@@ -228,6 +234,11 @@ pub fn unlink(layout: &Layout, program: &str) -> Result<(), LinkError> {
         }
     }
     let _ = fs::remove_file(&marker_path);
+    // Symmetrically: the shims just removed were the only thing that could vouch for a
+    // twin. The cli's unlink restores the installed build's shims after this — and
+    // reconciles through `install_tools_env` — but only when there IS an installed build
+    // and a name to put back; this is what keeps `agents/` from outliving `bin/` otherwise.
+    crate::activate::reconcile_agents(layout);
     Ok(())
 }
 
@@ -547,6 +558,58 @@ mod tests {
         assert!(
             fs::symlink_metadata(shim_of(&l, "ny")).is_err(),
             "shim removed"
+        );
+        let _ = fs::remove_dir_all(&l.prefix);
+        let _ = fs::remove_dir_all(&co);
+    }
+
+    /// A DEV LINK MUST WIN AT THE FRONT OF PATH. For an agent program, `agents/<tool>` is
+    /// laid beside `bin/<tool>` and goes FIRST on every PATH — naming the store build
+    /// directly — so a `link` that re-pointed only `bin/claude` left the dev checkout
+    /// unreachable: typing `claude` still ran the installed copy. `unlink` is the mirror:
+    /// the shims it removes were the only thing vouching for a twin.
+    #[test]
+    fn link_and_unlink_sweep_the_front_of_path_agents_twin() {
+        let l = layout("agents-twin");
+        let co = checkout("agents-twin", &["claude"]);
+        let claude = crate::store::ToolName::new("claude").unwrap();
+        // The installed shape: `bin/claude` and its `agents/` twin on the same store build.
+        let store_bin = l.build_dir("claude", 2_026_091_001).join("bin");
+        fs::create_dir_all(&store_bin).unwrap();
+        let target = store_bin.join(claude.exe_file());
+        fs::write(&target, b"#!/bin/true\n").unwrap();
+        let lay_twin = || {
+            l.ensure_dir(&l.agents_dir()).unwrap();
+            crate::platform::install_shim_to(&l.agent_shim(&claude), &target).unwrap();
+        };
+        l.ensure_dir(&l.bin_dir()).unwrap();
+        crate::platform::install_shim_to(&shim_of(&l, "claude"), &target).unwrap();
+        lay_twin();
+
+        let bins = [PathBuf::from("target/release/claude")];
+        link(&l, "claude", &co, &bins).unwrap();
+        assert_eq!(
+            crate::platform::resolve_shim(&shim_of(&l, "claude")).unwrap(),
+            co.join("target/release/claude"),
+            "fixture: bin/claude is the dev link"
+        );
+        assert!(
+            fs::symlink_metadata(l.agent_shim(&claude)).is_err(),
+            "no twin shadows the dev link at the front of PATH"
+        );
+
+        // A twin an older client laid before the link goes on unlink too — the cli's
+        // restore reconciles only when there is an installed build and an owned name to
+        // put back.
+        lay_twin();
+        unlink(&l, "claude").unwrap();
+        assert!(
+            fs::symlink_metadata(shim_of(&l, "claude")).is_err(),
+            "fixture: the dev shim is gone"
+        );
+        assert!(
+            fs::symlink_metadata(l.agent_shim(&claude)).is_err(),
+            "agents/ does not outlive the bin/ shim that vouched for it"
         );
         let _ = fs::remove_dir_all(&l.prefix);
         let _ = fs::remove_dir_all(&co);

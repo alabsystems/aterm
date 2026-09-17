@@ -94,6 +94,9 @@ pub use renderer::{
 pub use renderer::{
     EFFECT_PIPELINE_COUNT, EFFECT_PIPELINE_NAMES, EFFECT_PIPELINES, EffectPipeline,
 };
+/// PRESENT → GLASS: `presentDrawable:` registration → the drawable's
+/// `presentedTime`, the compositor leg the frontend ledger could not see.
+pub mod present_glass;
 /// COLD-BUILD sub-phase probe: the ns split of the one startup phase the
 /// frontend ledger could only see as a `join()` (see `startup_probe`).
 pub mod startup_probe;
@@ -653,7 +656,7 @@ impl GpuContext {
     /// pairs), which is the same answer the wgpu Metal backend reported here.
     #[cfg(all(not(wgpu_arm), target_os = "macos"))]
     pub fn new() -> Result<Self, String> {
-        let adapter_name = metal::ffi::Device::system_default()
+        let adapter_name = metal::ffi::Device::preferred()
             .map(|d| d.name())
             .ok_or("no Metal device on this machine")?;
         let ctx = Self {

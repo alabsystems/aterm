@@ -24,6 +24,13 @@
 //! * A byte copy of a tagged executable made by an untracked process (`cat a > b`) is
 //!   clean and runs clean; `cp`/`ditto` copy the attribute along with the bytes.
 //! * `xattr -d com.apple.provenance` and `xattr -c` exit 0 and remove nothing.
+//! * (2026-09-15) A process that LOADS a tagged dynamic library becomes tracked: a
+//!   launchd-spawned, untracked `python3` that `dlopen`ed a tagged copy of the trust
+//!   bundle's `libstd-*.dylib` wrote a tagged file afterwards; the same process
+//!   without the `dlopen` wrote a clean one. `trustc` loads `librustc_driver` and
+//!   `libstd` from the bundle's `lib/`, so a bundle whose `bin/` is clean and whose
+//!   `lib/` is tagged runs tracked all the same — [`tagged_files_under`] scans `lib/`,
+//!   and the doctor and the cutter's gate read it.
 //!
 //! # Why aterm cares
 //!
@@ -206,18 +213,89 @@ pub fn tagged_files_in(dir: &Path, attr: &str) -> Scan {
     Scan { carriers, total }
 }
 
+/// Every regular file under `dir`, recursively, that carries `attr` — the shape a
+/// bundle's `lib/` scan reports (2026-09-15: a tagged dylib tracks the process that
+/// loads it, so `lib/` counts as `bin/` does). Symlinks are not followed; an unreadable
+/// directory contributes nothing.
+#[must_use]
+pub fn tagged_files_under(dir: &Path, attr: &str) -> Scan {
+    fn walk(dir: &Path, attr: &str, out: &mut Vec<PathBuf>, total: &mut usize) {
+        let Ok(entries) = std::fs::read_dir(dir) else {
+            return;
+        };
+        let mut paths: Vec<PathBuf> = entries.flatten().map(|e| e.path()).collect();
+        paths.sort();
+        for p in paths {
+            let Ok(meta) = std::fs::symlink_metadata(&p) else {
+                continue;
+            };
+            if meta.is_dir() {
+                walk(&p, attr, out, total);
+            } else if meta.is_file() {
+                *total += 1;
+                if carries(&p, attr) {
+                    out.push(p);
+                }
+            }
+        }
+    }
+    let mut carriers = Vec::new();
+    let mut total = 0usize;
+    walk(dir, attr, &mut carriers, &mut total);
+    Scan { carriers, total }
+}
+
 /// Whether THIS process is provenance-tracked — MEASURED, by writing a probe file into
 /// `scratch` and reading the attribute back, never inferred from the binary's own
 /// attributes (a clean binary under a tracked parent is tracked; that is the whole
 /// incident). Answered once per process: tracking is decided at exec and does not change.
 ///
-/// `false` when the probe cannot be written or inspected: a lane that cannot measure
-/// must not claim tracking and route an install through machinery it has no evidence it
-/// needs. The probe is removed before returning.
+/// `true` — tracked — when the probe cannot be written or inspected (2026-09-15; it
+/// was `false`): a lane that cannot measure must route the write through the machinery
+/// that measures its own outcome, never in-process where a tag would land unseen. The
+/// probe is removed before returning.
+///
+/// An UNMEASURABLE probe is NOT cached (audit 2026-09-15). The ANSWER is a property of
+/// the process, but the ability to take it is a property of the scratch dir handed in,
+/// and the lanes hand in different ones: [`crate::lay::lay_executables`] measures in
+/// `$TMPDIR`, [`crate::install::verify_and_stage`] in the staging dir beside the
+/// archive, and the spawn seam's `reroute::lay` usually gets there first. Latching one
+/// transient failure there — a `$TMPDIR` reaped between the write and the `listxattr`, a
+/// momentary ENOSPC, a `$TMPDIR` this process cannot write — pinned "untracked" for the
+/// life of the process, and the staging lane that followed, with a scratch dir that was
+/// writable by construction, then laid every shim and staged every bundle in-process and
+/// TAGGED: no `<build>.tracked-install` record for `doctor` to read, and no refusal, the
+/// v0.83.0 shape this module exists to prevent (module doc). So the step at hand still
+/// proceeds as untracked, says so once on stderr, and the next call measures again.
 #[must_use]
 pub fn process_is_tracked(scratch: &Path) -> bool {
     static MEASURED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *MEASURED.get_or_init(|| measure_tracked(scratch).unwrap_or(false))
+    if let Some(tracked) = MEASURED.get() {
+        return *tracked;
+    }
+    let Some(tracked) = measure_tracked(scratch) else {
+        // Once per process: every spawn seam with stubs to lay reaches this, and eight
+        // identical lines would bury the one that matters.
+        static NOTED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+        if !NOTED.swap(true, std::sync::atomic::Ordering::Relaxed) {
+            eprintln!(
+                "atpkg: note — provenance tracking could not be MEASURED in {} (the probe \
+                 file could not be written or read back); this step proceeds as TRACKED — \
+                 through the untracked lane, which measures its own outcome — and the next \
+                 one measures again",
+                scratch.display()
+            );
+        }
+        // FAIL CLOSED (2026-09-15): a lane that cannot measure is a lane that cannot see,
+        // and the tag's whole failure mode is being invisible — a probe refused by a full
+        // disk or a permission is answered by the untracked lane, which writes elsewhere
+        // and MEASURES what it laid, never by an in-process write that would carry the
+        // tag with nothing saying so. Not cached, so a transient failure costs one lane
+        // round trip, not the process's whole life.
+        return true;
+    };
+    // Whoever measured first wins a race; both took the same process-wide property.
+    *MEASURED.get_or_init(|| tracked)
 }
 
 /// The un-cached measurement behind [`process_is_tracked`]: `Some(tagged)` when a probe
@@ -391,12 +469,30 @@ mod tests {
         let _ = std::fs::remove_dir_all(&d);
     }
 
-    /// An unwritable scratch cannot be measured — `None`, so the cached predicate answers
-    /// `false` (never routes on a measurement it did not take).
+    /// An unwritable scratch cannot be measured — `None`, so the predicate answers `false`
+    /// for the step at hand (it never routes on a measurement it did not take).
     #[test]
     fn an_unwritable_scratch_is_unmeasurable() {
         let d = tmp("unwritable");
         assert_eq!(measure_tracked(&d.join("absent").join("deeper")), None);
+        let _ = std::fs::remove_dir_all(&d);
+    }
+
+    /// A probe that could not be TAKEN must not decide the process's answer: after a call
+    /// with an unmeasurable scratch, a call with a measurable one still agrees with a
+    /// direct measurement. The invariant is asserted in the order-independent form on
+    /// purpose — the cache is process-wide and the tests in this module share it, so this
+    /// must hold whether or not another test primed it first (audit 2026-09-15).
+    #[test]
+    fn an_unmeasurable_probe_does_not_pin_the_process_answer() {
+        let d = tmp("unpinned");
+        let _ = process_is_tracked(&d.join("absent").join("deeper"));
+        let fresh = measure_tracked(&d).expect("a writable scratch dir must be measurable");
+        assert_eq!(
+            process_is_tracked(&d),
+            fresh,
+            "a scratch dir that could not be probed must not pin the process-wide answer"
+        );
         let _ = std::fs::remove_dir_all(&d);
     }
 }

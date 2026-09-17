@@ -5,7 +5,7 @@
 //! Minimal grapheme helpers needed by search indexing.
 
 use aterm_grapheme::GraphemeClusters;
-use aterm_grapheme::str_width;
+use aterm_grapheme::grapheme_grid_columns;
 
 /// Greek small letter final sigma (U+03C2).
 const FINAL_SIGMA: char = '\u{03C2}';
@@ -106,7 +106,7 @@ pub fn byte_to_column(s: &str, byte_offset: usize) -> usize {
         if offset >= byte_offset {
             return column;
         }
-        column = column.saturating_add(str_width(grapheme).min(2));
+        column = column.saturating_add(grapheme_grid_columns(grapheme));
     }
 
     column
@@ -211,7 +211,12 @@ impl ColumnMap {
         let mut col: usize = 0;
         for (offset, grapheme) in text.grapheme_indices() {
             entries.push((offset, col));
-            col = col.saturating_add(str_width(grapheme).min(2));
+            // THE GRID'S OWN RULE, not a second model. `str_width(g).min(2)`
+            // charged a Devanagari conjunct 2 where the grid paints 3, and a
+            // keycap 1 where the grid paints 2 — so every later column on the
+            // row named a cell to the LEFT of the text, and the find bar tinted
+            // a blank cell while dropping the match's last character.
+            col = col.saturating_add(grapheme_grid_columns(grapheme));
         }
         // Sentinel so lookups at text.len() return total width.
         entries.push((text.len(), col));

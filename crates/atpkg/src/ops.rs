@@ -26,6 +26,25 @@ pub fn which(layout: &Layout, tool: &str) -> Option<PathBuf> {
     crate::platform::resolve_shim(&layout.shim(&ToolName::new(tool)?))
 }
 
+/// The file to EXEC for `tool`, for the verbs that run a tool without going through its
+/// shim — `atpkg run <tool>` (hence `aterm <tool>`) and the upstream-name reroute
+/// (`clippy` → `tippy`): [`which`]'s store target, or its clone under the build's exec
+/// root when [`crate::compat::route_for_shim`] finds one standing for this shim.
+///
+/// Those two verbs exec the store path directly, so the guard line a routed shim carries
+/// never runs for them, and on a trust build whose `bin/rustc` is a separate copy of
+/// `trustc` (bundles 8571/8589/8590/8595) `aterm tippy` and the `clippy` reroute stopped
+/// at tippy's "rustc-compatible sibling … is not the selected Trust compiler" while the
+/// shim beside them linted. The answer is the one the shim's guard gives, decided by the
+/// same `stat`s. [`which`] itself is unchanged — every reader that asks where a tool
+/// LIVES (gc, doctor, `atpkg which`) keeps reading the store.
+#[must_use]
+pub fn exec_path(layout: &Layout, tool: &str) -> Option<PathBuf> {
+    let shim = layout.shim(&ToolName::new(tool)?);
+    let target = crate::platform::resolve_shim(&shim)?;
+    Some(crate::compat::route_for_shim(&shim, &target).unwrap_or(target))
+}
+
 /// Parse `(program, build)` out of a shim target like
 /// `…/store/<program>/<build>/bin/<tool>` — the component right after `store` and the
 /// numeric one after it. `None` if the path isn't a store shim target.
@@ -281,23 +300,17 @@ pub fn list_installed(layout: &Layout) -> Vec<(String, u64)> {
     out
 }
 
-/// Uninstall `program` (`atpkg uninstall <program>`): remove every `bin/` shim that points
-/// into the program's store tree, drop any channel `current` symlink that points into it,
-/// then reclaim `store/<program>/`.
+/// The shape rule [`uninstall`] applies before it touches anything: `program` must be a
+/// single safe path component. Rejects empty, `.`, `..`, and any name carrying a separator
+/// (`/` or `\`) or NUL — the same shape rule `store::shim_allowed` enforces, minus its
+/// shim-specific sensitive-command deny-list. The store layout is always
+/// `store/<program>/<build>/`, so a legitimate program is always exactly one directory
+/// name; this changes no valid behavior.
 ///
-/// **Fail-closed:** each removal target is first confirmed to resolve *inside* the managed
-/// prefix (`store/<program>` for the tree, the prefix for shims/links); anything pointing
-/// outside is left untouched and reported, so a tampered symlink can never redirect a
-/// delete (§10.2).
-pub fn uninstall(layout: &Layout, program: &str) -> io::Result<()> {
-    // Validate `program` as a single safe path component BEFORE building any filesystem
-    // path: the lexical `starts_with` containment check below retains `..` tokens and so
-    // cannot, on its own, stop a traversal escape (e.g. `program = "../../tmp/victim"`).
-    // Reject empty, `.`, `..`, and any name carrying a separator (`/` or `\`) or NUL —
-    // the same shape rule `store::shim_allowed` enforces, minus its shim-specific
-    // sensitive-command deny-list. The store layout is always `store/<program>/<build>/`,
-    // so a legitimate program is always exactly one directory name; this changes no valid
-    // behavior.
+/// Its own function so a caller that records an intent BEFORE the destructive steps (the
+/// CLI's removed marker) can ask, first, the one question that makes `uninstall` fail
+/// without having deleted anything.
+pub(crate) fn uninstall_name_shape(program: &str) -> io::Result<()> {
     if program.is_empty()
         || program == "."
         || program == ".."
@@ -310,6 +323,23 @@ pub fn uninstall(layout: &Layout, program: &str) -> io::Result<()> {
             "program name must be a single safe path component (no separators, `.`, `..`, or NUL)",
         ));
     }
+    Ok(())
+}
+
+/// Uninstall `program` (`atpkg uninstall <program>`): remove every `bin/` shim that points
+/// into the program's store tree, drop any channel `current` symlink that points into it,
+/// then reclaim `store/<program>/` and the program's exec roots under
+/// `<prefix>/compat/<program>/` ([`crate::compat`]).
+///
+/// **Fail-closed:** each removal target is first confirmed to resolve *inside* the managed
+/// prefix (`store/<program>` for the tree, the prefix for shims/links); anything pointing
+/// outside is left untouched and reported, so a tampered symlink can never redirect a
+/// delete (§10.2).
+pub fn uninstall(layout: &Layout, program: &str) -> io::Result<()> {
+    // Validate `program` as a single safe path component BEFORE building any filesystem
+    // path: the lexical `starts_with` containment check below retains `..` tokens and so
+    // cannot, on its own, stop a traversal escape (e.g. `program = "../../tmp/victim"`).
+    uninstall_name_shape(program)?;
 
     let prog_store = layout.prefix.join("store").join(program);
 
@@ -357,6 +387,12 @@ pub fn uninstall(layout: &Layout, program: &str) -> io::Result<()> {
     if prog_store.starts_with(&layout.prefix) && prog_store.exists() {
         std::fs::remove_dir_all(&prog_store)?;
     }
+
+    // 4. And the program's exec roots (`<prefix>/compat/<program>`, `crate::compat`),
+    //    AFTER the tree, so a root lives exactly as long as its build: they are clones
+    //    of the builds just removed, and would otherwise keep every block of them
+    //    allocated. The shims went in step 1, so nothing routes into what goes here.
+    crate::compat::remove_program(layout, program)?;
     Ok(())
 }
 

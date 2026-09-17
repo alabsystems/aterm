@@ -4908,7 +4908,7 @@ fn control_text_color(state: ControlState, roles: &crate::settings::Roles) -> [u
 /// every size through the repository's named type-scale proof token, but pick
 /// the base that lands exactly on the app-shell contract rather than inheriting
 /// the terminal's monospace zoom: 24 / 20 / 13 / 13 / 11 logical pixels.
-fn native_type_px(step: crate::type_scale::TypeStep) -> crate::type_scale::StepPx {
+pub(crate) fn native_type_px(step: crate::type_scale::TypeStep) -> crate::type_scale::StepPx {
     use crate::type_scale::TypeStep;
 
     let scale = crate::native_appearance::text_scale();

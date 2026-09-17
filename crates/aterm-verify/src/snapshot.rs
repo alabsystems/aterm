@@ -1102,6 +1102,12 @@ mod tests {
         );
     }
 
+    /// Unix-pinned at the test, not at the guard: `refuse_symlinked_ancestors`
+    /// itself is portable (`symlink_metadata().file_type().is_symlink()` answers
+    /// on every target), but PLANTING the two links the law is about needs
+    /// `std::os::unix::fs::symlink`, whose Windows counterparts are two
+    /// different functions behind a privilege the test runner may not hold.
+    #[cfg(unix)]
     #[test]
     fn a_write_beneath_a_symlink_in_the_snapshot_is_refused() {
         let base = crate::mktemp_dir("atv-snap-guard").expect("mktemp");

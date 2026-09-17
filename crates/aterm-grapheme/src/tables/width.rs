@@ -610,7 +610,9 @@ static WIDTH_LEVEL2: [u8; 7104] = [
 
 /// Character display width: 0 (zero-width), 1 (narrow), or 2 (wide).
 ///
-/// For codepoints beyond U+2FFFF, returns 1 (narrow) as the default.
+/// The table covers U+0000..U+2FFFF. Beyond it, CJK Extensions G/H
+/// (U+30000..U+323AF) are wide, plane 14 (U+E0000..U+E0FFF) is zero-width,
+/// and everything else is narrow.
 /// Ambiguous-width characters return 1 (narrow) in this function;
 /// use `char_width_cjk` for CJK mode where ambiguous = 2.
 #[inline]
@@ -621,6 +623,15 @@ pub const fn char_width(c: char) -> usize {
         // Extension H (U+31350-U+323AF) are East Asian Width "W" (#7775).
         if cp <= 0x323AF {
             return 2;
+        }
+        // Plane 14 — Tags (U+E0000-U+E007F, the letters of a subdivision
+        // flag), the Variation Selectors Supplement (U+E0100-U+E01EF) and the
+        // reserved gaps between — is Default_Ignorable_Code_Point end to end:
+        // zero width, attaches to the preceding cell, draws nothing.
+        // unicode-width 0.2 says 0 for the whole block. Reported narrow by
+        // the catch-all below, a flag's six tags took six cells of tofu.
+        if matches!(cp, 0xE0000..=0xE0FFF) {
+            return 0;
         }
         return 1; // Beyond table range: default to narrow
     }
@@ -646,6 +657,10 @@ pub const fn char_width_cjk(c: char) -> usize {
         // CJK Unified Ideographs Extension G/H are wide (#7775).
         if cp <= 0x323AF {
             return 2;
+        }
+        // Plane 14 is zero-width in both modes (see `char_width`).
+        if matches!(cp, 0xE0000..=0xE0FFF) {
+            return 0;
         }
         return 1;
     }

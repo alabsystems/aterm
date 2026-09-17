@@ -130,7 +130,10 @@ impl TexelFormat {
 /// bits the pre-layer descriptors spelled (so the wgpu arm is byte-identical
 /// to what it replaced) and onto Metal's smaller usage vocabulary (Metal has
 /// no copy bits — blits need none, and `replaceRegion:` needs only non-Private
-/// storage, which every shared-mode texture has).
+/// storage, which the mint's Managed textures have; see
+/// `crate::metal::ffi::Device::new_texture_2d` for what Managed does and does
+/// NOT permit — CPU reads go through a blit into a Shared buffer, never a
+/// `getBytes:`).
 #[derive(Clone, Copy, Debug, Default)]
 pub(crate) struct TexUsage {
     /// wgpu `TEXTURE_BINDING` / Metal `ShaderRead`.
@@ -350,9 +353,10 @@ impl DeviceHandle<'_> {
                      {bytes_per_row}*{rows} bytes, got {}",
                     bytes.len()
                 );
-                // SAFETY: the mint only creates shared-storage 2-D textures;
-                // the band length is asserted just above against the stride,
-                // and `replaceRegion:` copies synchronously before returning.
+                // SAFETY: the mint only creates Managed (non-Private) 2-D
+                // textures, so `replaceRegion:` is legal on every one; the
+                // band length is asserted just above against the stride, and
+                // `replaceRegion:` copies synchronously before returning.
                 unsafe { tex.metal().upload(region, bytes, bytes_per_row as usize) };
             }
         }

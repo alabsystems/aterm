@@ -1028,7 +1028,9 @@ mod tests {
     }
 
     /// The ATERM_PROMPT_STYLE conditional block must come after autoload.
-    /// This is the specific regression from #5959.
+    /// This is the specific regression from #5959. (`${ATERM_PROMPT_STYLE:-}`
+    /// since 2026-09-16: nounset-clean, so a user's `setopt nounset` no longer
+    /// errors at every prompt and leaves the one-shot precmd installed.)
     #[test]
     fn test_zsh_prompt_style_block_after_autoload() {
         let script = scripts::ZSH;
@@ -1036,7 +1038,7 @@ mod tests {
             .find("autoload -Uz add-zsh-hook")
             .expect("must have autoload");
         let conditional = script
-            .find(r#"if [[ -n "$ATERM_PROMPT_STYLE""#)
+            .find(r#"if [[ -n "${ATERM_PROMPT_STYLE:-}""#)
             .expect("must have ATERM_PROMPT_STYLE conditional block");
 
         assert!(

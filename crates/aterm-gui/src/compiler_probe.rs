@@ -20,6 +20,24 @@ pub struct RustcVv {
     pub commit: String,
     /// The `host:` triple, e.g. `aarch64-apple-darwin`.
     pub host: String,
+    /// Trust's OWN version — the `trust:` line the Trust toolchain prints (e.g.
+    /// `0.1.0`), else the `(trustc <version>)` parenthetical the `trustc`-named
+    /// entry adds to its first line. `""` when the compiler reports neither:
+    /// upstream rustc, or a Trust build predating the marker. This is NOT the
+    /// release token of the first line (`1.99.0-dev`): that is the RUST release
+    /// Trust is compatible with, kept rustc-shaped because cargo, targo and every
+    /// version-sniffing build script parse it — which is exactly why a surface
+    /// that printed only that token read as "built by Rust 1.99".
+    pub trust_version: String,
+}
+
+/// The `(trustc <version>)` parenthetical of a `-vV` first line, if present —
+/// `rustc 1.99.0-dev (2b118046a 2026-07-29) (trustc 0.1.0)` → `0.1.0`. The
+/// `trustc`-named entry prints it; the `rustc`-named entry cargo drives does not.
+fn trustc_parenthetical(first_line: &str) -> Option<String> {
+    let rest = first_line.split_once("(trustc ")?.1;
+    let version = rest.split(')').next()?.trim();
+    (!version.is_empty()).then(|| version.to_string())
 }
 
 /// Parse `rustc -vV` output. Tolerant: missing lines yield `"unknown"`, never a panic.
@@ -39,6 +57,9 @@ pub fn parse_rustc_vv(vv: &str) -> RustcVv {
             .unwrap_or_else(|| "unknown".into()),
         commit: field("commit-hash:").unwrap_or_else(|| "unknown".into()),
         host: field("host:").unwrap_or_else(|| "unknown".into()),
+        trust_version: field("trust:")
+            .or_else(|| vv.lines().next().and_then(trustc_parenthetical))
+            .unwrap_or_default(),
     }
 }
 
@@ -53,11 +74,15 @@ pub fn parse_rustc_vv(vv: &str) -> RustcVv {
 /// remain already covered every real lane.)
 ///
 /// Priority order (first match wins):
-///   1. the compiler's own `-vV` self-identification: `binary: trustc` or a
-///      `(trustc)` / `(trustc <version>)` version-line parenthetical (the 2026-07
-///      toolchains stamp both; direct evidence from the probed binary, so it
-///      survives lanes where no env hint exists — e.g. a bare `rustc` resolved
-///      via PATH, which sets neither RUSTC nor RUSTUP_TOOLCHAIN);
+///   1. the compiler's own `-vV` self-identification: a `trust: <version>` line
+///      (what the toolchain prints under EVERY entry name — cargo and targo drive
+///      it as `rustc`, and under that name the 2026-09 toolchain prints neither
+///      of the next two markers; `trust-gate` keys on this same line), or
+///      `binary: trustc`, or a `(trustc)` / `(trustc <version>)` version-line
+///      parenthetical (the `trustc`-named entry stamps both). Direct evidence
+///      from the probed binary, so it survives lanes where no env hint exists —
+///      e.g. a bare `rustc` resolved via PATH, which sets neither RUSTC nor
+///      RUSTUP_TOOLCHAIN;
 ///   2. the `RUSTC` path contains `/trust/` (the fork lives at `$HOME/trust/build/...`,
 ///      linked as `~/.rustup/toolchains/trust/` — covers pre-marker toolchains);
 ///   3. `RUSTUP_TOOLCHAIN == "trust"` (a `rustup toolchain link trust ...` lane).
@@ -69,6 +94,8 @@ pub fn detect_flavor(vv: &str, rustc_path: &str, rustup_toolchain: Option<&str>)
     let vv_says_trust = vv.lines().any(|l| {
         l.strip_prefix("binary:")
             .is_some_and(|b| b.trim() == "trustc")
+            || l.strip_prefix("trust:")
+                .is_some_and(|v| !v.trim().is_empty())
     }) || vv
         .lines()
         .next()
@@ -115,6 +142,21 @@ mod tests {
                                    release: 1.96.0-dev\n\
                                    LLVM version: 22.1.2";
 
+    /// Verbatim `rustc -vV` from the Trust stage2 on m17-tower (x86_64 Linux,
+    /// built from trust `3a3e781fe`, 2026-09-14) — invoked under the `rustc` NAME,
+    /// which is how cargo and targo drive it (`RUSTC=…/bin/rustc`). Under that
+    /// name the toolchain prints NO `(trustc …)` parenthetical and `binary: rustc`;
+    /// its only self-identification is the `trust:` line. The same binary invoked
+    /// as `trustc` prints `(trustc 0.1.0)` and `binary: trustc` (argv0-keyed).
+    const TRUST_VV_RUSTC_NAME: &str = "rustc 1.99.0-dev (3a3e781fe 2026-09-14)\n\
+                                       binary: rustc\n\
+                                       commit-hash: 3a3e781fe082b74d3c4de0ade65b1de3cbee7255\n\
+                                       commit-date: 2026-09-14\n\
+                                       host: x86_64-unknown-linux-gnu\n\
+                                       release: 1.99.0-dev\n\
+                                       trust: 0.1.0\n\
+                                       LLVM version: 22.1.2";
+
     #[test]
     fn parses_upstream_vv() {
         let p = parse_rustc_vv(UPSTREAM_VV);
@@ -124,6 +166,45 @@ mod tests {
         );
         assert_eq!(p.commit, "ac68faa20c58cbccd01ee7208bf3b6e93a7d7f96");
         assert_eq!(p.host, "aarch64-apple-darwin");
+        assert_eq!(p.trust_version, "", "upstream rustc has no Trust version");
+    }
+
+    /// Trust's OWN version is a separate fact from the rustc-shaped release token:
+    /// the `trust:` line carries it (under the `rustc` name cargo uses), the
+    /// `(trustc <v>)` parenthetical is the fallback (the `trustc` name), a
+    /// pre-marker Trust reports neither, and the release token stays `1.99.0-dev`
+    /// — the Rust release Trust is compatible with — in every case.
+    #[test]
+    fn parses_trusts_own_version_apart_from_the_rust_compat_release() {
+        let p = parse_rustc_vv(TRUST_VV_RUSTC_NAME);
+        assert_eq!(p.trust_version, "0.1.0");
+        assert_eq!(p.version_line.split_whitespace().nth(1), Some("1.99.0-dev"));
+        assert_eq!(p.host, "x86_64-unknown-linux-gnu");
+        // The trustc-named entry: no `trust:` line in this fixture, so the
+        // parenthetical answers.
+        let named = "rustc 1.99.0-dev (2b118046a 2026-07-29) (trustc 0.1.0)\nbinary: trustc";
+        assert_eq!(parse_rustc_vv(named).trust_version, "0.1.0");
+        // A `trust:` line outranks the parenthetical when both are present.
+        let both = "rustc 1.99.0-dev (2b118046a 2026-07-29) (trustc 9.9.9)\ntrust: 0.1.0";
+        assert_eq!(parse_rustc_vv(both).trust_version, "0.1.0");
+        // Pre-marker Trust (`TRUST_VV`) and the bare `(trustc)` marker report none.
+        assert_eq!(parse_rustc_vv(TRUST_VV).trust_version, "");
+        assert_eq!(parse_rustc_vv(TRUST_VV_MARKED).trust_version, "");
+        assert_eq!(
+            trustc_parenthetical("rustc 1.99.0-dev (x 2026-01-01) (trustc )"),
+            None
+        );
+    }
+
+    /// Under the `rustc` name cargo drives — no parenthetical, `binary: rustc`,
+    /// no env hint — the `trust:` line alone classifies the compiler as Trust.
+    /// This is the lane every aterm build actually runs in.
+    #[test]
+    fn flavor_trust_from_the_trust_line_under_the_rustc_name() {
+        assert_eq!(detect_flavor(TRUST_VV_RUSTC_NAME, "rustc", None), "t");
+        // An empty `trust:` value is not a claim.
+        let empty = "rustc 1.99.0-dev (3a3e781fe 2026-09-14)\nbinary: rustc\ntrust:";
+        assert_eq!(detect_flavor(empty, "rustc", None), "r");
     }
 
     #[test]
@@ -140,6 +221,10 @@ mod tests {
         assert_eq!(p.version_line, "unknown");
         assert_eq!(p.commit, "unknown");
         assert_eq!(p.host, "unknown");
+        assert_eq!(
+            p.trust_version, "",
+            "no Trust version is the empty string, not a word"
+        );
     }
 
     #[test]

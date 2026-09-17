@@ -173,7 +173,9 @@ pub struct TerminalModes {
     /// When enabled, box drawing characters are mirrored in RTL context.
     pub bidi_box_mirroring: bool,
     /// BiDi autodetection (DEC mode ?2501).
-    /// When enabled, paragraph direction is auto-detected per line.
+    /// When enabled, paragraph direction is auto-detected per line from the
+    /// first strong character, falling back to the SCP direction. Off by
+    /// default (Terminal WG); while off, the SCP direction is used directly.
     pub bidi_autodetection: bool,
     /// Alternate scroll mode (DECSET 1007).
     /// When enabled, scroll wheel generates cursor key sequences in alternate screen.

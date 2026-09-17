@@ -156,12 +156,23 @@ impl Report {
     }
 }
 
-/// The accounting the verdict is computed from: how many findings, how many
-/// could-not-runs, and the NAME of every skip.
+/// The accounting the verdict is computed from: the NAME of every finding,
+/// every could-not-run and every skip.
+///
+/// ALL THREE ARE NAMED, for one reason (2026-09-17). The skips were named from
+/// the start because "3 stages were skipped" is how a skipped gate becomes
+/// invisible — and a bare failure count is the same sentence with a worse
+/// ending. MEASURED on the `--fast` run of ca7e3dbfe: one stage was red, the
+/// verdict said `VERIFY: FAIL (mode=fast scope=workspace) — DO NOT merge` and
+/// nothing else, and finding WHICH stage meant grepping 30,713 lines of ladder
+/// for `^  FAIL`. The row is right there in the stage's own block; the verdict
+/// is the line a reader quotes, so it says the names too.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct Tally {
-    pub gate_failures: usize,
-    pub could_not_run: usize,
+    /// Findings, named in ladder order: a gate decided against the tree.
+    pub gate_failures: Vec<String>,
+    /// Stages that decided NOTHING, named in ladder order.
+    pub could_not_run: Vec<String>,
     /// Named, in ladder order. The verdict prints these — "3 stages were skipped"
     /// without saying which is how a skipped gate becomes invisible.
     pub skips: Vec<String>,
@@ -175,7 +186,7 @@ impl Tally {
 
     #[must_use]
     pub fn failed(&self) -> bool {
-        self.gate_failures > 0 || self.could_not_run > 0
+        !self.gate_failures.is_empty() || !self.could_not_run.is_empty()
     }
 
     /// Add one decision.
@@ -183,8 +194,8 @@ impl Tally {
         match outcome {
             Outcome::Ok => {}
             Outcome::Skip => self.skips.push(label.to_string()),
-            Outcome::Fail(Severity::GateFailed) => self.gate_failures += 1,
-            Outcome::Fail(Severity::CouldNotRun) => self.could_not_run += 1,
+            Outcome::Fail(Severity::GateFailed) => self.gate_failures.push(label.to_string()),
+            Outcome::Fail(Severity::CouldNotRun) => self.could_not_run.push(label.to_string()),
         }
     }
 }
@@ -262,8 +273,8 @@ mod tests {
         let t = tally(&[a, b]);
         assert_eq!(t.skipped(), 2);
         assert_eq!(t.skips, ["targo test (no targo)", "gui smoke (macOS only)"]);
-        assert_eq!(t.gate_failures, 1);
-        assert_eq!(t.could_not_run, 1);
+        assert_eq!(t.gate_failures, ["a finding"]);
+        assert_eq!(t.could_not_run, ["no driver"]);
         assert!(t.failed());
     }
 

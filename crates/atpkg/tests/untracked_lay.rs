@@ -7,7 +7,10 @@
 //! for — the files it laid are CLEAN while the in-process control is tagged; and LAW m21
 //! is measured, not recited: a shim exec'd from an UNTRACKED parent writes clean output
 //! when the shim is clean and tagged output when the shim is tagged. A helper that cannot
-//! answer is detected inside the exit grace and lays nothing.
+//! answer is detected inside the exit grace and lays nothing. The lane is also what lets
+//! the pending-stub reconcile's identical-skip rule (`atpkg::stub`) be measured against a
+//! genuinely CLEAN stub: on a provenance-tracked machine no test can write one itself, and
+//! the tag cannot be removed by hand.
 //!
 //! macOS only: the tag and launchd exist nowhere else.
 
@@ -207,6 +210,101 @@ fn m21_a_clean_shim_exec_d_from_an_untracked_parent_writes_clean_output() {
         tracked,
         "law m21: a tagged shim tracks the tool it execs (vacuous under an untracked test process)"
     );
+    let _ = std::fs::remove_dir_all(&d);
+}
+
+/// The pending-stub reconcile's "leave an identical one alone" rule, measured against a
+/// stub that is REALLY CLEAN — which on a provenance-tracked machine (an agent's shell, a
+/// shell inside aterm.app) only this lane can produce: the tag follows every file the test
+/// process writes, and `xattr -d` exits 0 without removing it. The unit test beside the
+/// rule (`atpkg::stub`'s `an_identical_stub_is_left_alone_and_a_changed_one_is_rewritten`)
+/// hands the measurement in so both halves are asserted everywhere; here the file's tag is
+/// the real one, so the skip is exercised end to end wherever this runs — under an
+/// untracked process too, where the lane's clean stub is simply the ordinary one.
+///
+/// Both halves, in the order a machine meets them: a clean byte-identical stub keeps its
+/// inode (temp+rename would give it a new one) and stays clean, a changed body is re-laid,
+/// and a TAGGED byte-identical stub is re-laid on purpose — the only way the untracked
+/// lane gets to put a clean file on `PATH`, since a tagged stub tracks every program it
+/// execs (law m21).
+#[test]
+fn a_clean_identical_pending_stub_is_left_alone_and_a_tagged_one_is_re_laid() {
+    use atpkg::store::{Layout, ToolName};
+    use atpkg::stub::{StubKind, pending_stub_kind, write_pending_stub, write_pending_stub_kind};
+
+    fn ino(p: &Path) -> u64 {
+        use std::os::unix::fs::MetadataExt as _;
+        std::fs::metadata(p).unwrap().ino()
+    }
+
+    let d = scratch("stub-skip");
+    let layout = Layout {
+        prefix: d.join("pkg"),
+    };
+    let tool = ToolName::new("trust").expect("a roster name passes the shim gate");
+    let shim = layout.shim(&tool);
+    // The writer renders the body and lays it. This test binary is not `atpkg`/`aterm`, so
+    // it has no lane of its own and writes in-process — tagged, when the session is.
+    write_pending_stub(&layout, &tool).expect("the stub lays");
+    let body = std::fs::read(&shim).expect("the stub is on disk");
+    let tracked = measure_tracked(&d).expect("a writable scratch is measurable");
+    assert_eq!(
+        carries_provenance(&shim),
+        tracked,
+        "the in-process writer's stub carries the tag exactly when this process is tracked"
+    );
+    eprintln!(
+        "this test process is {}; the lane supplies the clean stub either way",
+        if tracked {
+            "provenance-TRACKED"
+        } else {
+            "untracked"
+        }
+    );
+    // The same bytes, laid CLEAN by the untracked job: the steady state a tracked machine
+    // reaches through the lane and cannot reach any other way.
+    lay_untracked(&helper_exe(), &[Executable::new(&shim, body.clone())], &d)
+        .unwrap_or_else(|why| panic!("the lane must run on this macOS: {why}"));
+    assert!(!carries_provenance(&shim), "the lane's stub is clean");
+    assert_eq!(std::fs::read(&shim).unwrap(), body, "and byte-identical");
+    let clean_ino = ino(&shim);
+
+    // Clean and identical: nothing is laid.
+    write_pending_stub(&layout, &tool).expect("a pass over an identical stub still succeeds");
+    assert_eq!(
+        ino(&shim),
+        clean_ino,
+        "a clean, byte-identical stub is left alone"
+    );
+    assert!(
+        !carries_provenance(&shim),
+        "nothing rewrote it, so it is still clean"
+    );
+    assert_eq!(
+        pending_stub_kind(&layout, "trust"),
+        Some(StubKind::DefaultSet)
+    );
+
+    // A changed body is laid — which in a tracked session tags the file again.
+    write_pending_stub_kind(&layout, &tool, StubKind::Extra).expect("a changed body lays");
+    let extra_ino = ino(&shim);
+    assert_ne!(extra_ino, clean_ino, "a changed body is re-laid");
+    assert_eq!(pending_stub_kind(&layout, "trust"), Some(StubKind::Extra));
+    assert_eq!(
+        carries_provenance(&shim),
+        tracked,
+        "the in-process rewrite carries the tag exactly when this process is tracked"
+    );
+    if tracked {
+        // Byte-identical NOW, and tagged: re-laid all the same.
+        write_pending_stub_kind(&layout, &tool, StubKind::Extra).expect("a tagged stub re-lays");
+        assert_ne!(
+            ino(&shim),
+            extra_ino,
+            "a tagged stub is re-laid even byte-identical, so the untracked lane can put a \
+             clean file there"
+        );
+    }
     let _ = std::fs::remove_dir_all(&d);
 }
 

@@ -88,7 +88,6 @@ fn cfg() -> GlowConfig {
         beam: false,
         head_dx: 0.5,
         pack: None,
-        wake_persist_s: aterm_effects::cursor_glow::RAINBOW_WAKE_PERSIST,
     }
 }
 
@@ -575,37 +574,108 @@ fn a_band_overwritten_with_different_text_is_retired() {
     assert!(!h.lit(5));
 }
 
-/// (v) A CJK glyph's two cells are one unit: overwrite its lead and both
-/// go on the same frame, its narrow neighbours untouched.
+/// The screenshot's word-shaped gaps: a composer repaint changes one glyph
+/// while spaces elsewhere in the live phrase remain between unchanged words.
+/// Follow the real terminal/host seam through the retirement, not only its
+/// first frame. A complete overwrite still removes the spaces with the run.
+#[test]
+fn a_composer_repaint_does_not_cut_a_live_ribbon_at_each_space() {
+    const PHRASE: &str = "git commit and git pull and work on remote main";
+    let mut h = Host::at_row(5);
+    h.type_str(PHRASE);
+    h.idle(64);
+    let spaces: Vec<u16> = PHRASE
+        .bytes()
+        .enumerate()
+        .filter_map(|(col, b)| (b == b' ').then_some(col as u16))
+        .collect();
+    assert_eq!(h.live(5).len(), PHRASE.len());
+    assert_eq!(spaces.len(), 9, "exercise several word boundaries");
+
+    // Clear and repaint in one batch, keeping the caret at the same column.
+    let edited = PHRASE.replacen('g', "G", 1);
+    h.program(format!("\x1b[6;1H\x1b[2K{edited}").as_bytes());
+    assert_eq!(h.leaving(5), vec![0], "only the replaced glyph retires");
+    for _ in 0..12 {
+        let live = h.live(5);
+        for &col in &spaces {
+            assert!(live.contains(&col), "space {col} lost its ribbon");
+            let x = (f32::from(col) + 0.5) * CW as f32;
+            let y = 5.5 * CH as f32;
+            assert!(
+                h.glow.under_quads().iter().any(|q| {
+                    q.alpha > 0
+                        && f32::from(q.x) <= x
+                        && x < f32::from(q.x) + f32::from(q.w)
+                        && f32::from(q.y) <= y
+                        && y < f32::from(q.y) + f32::from(q.h)
+                }),
+                "space {col} has a record but no painted ribbon"
+            );
+        }
+        h.idle(16);
+    }
+    assert!(h.since_key() < GRACE_S);
+    assert_eq!(h.retired(), 1);
+
+    // Negative control: keeping every blank unconditionally would strand
+    // isolated colored cells after all the words have been replaced.
+    h.program(format!("\x1b[6;1H\x1b[2K{}", PHRASE.to_ascii_uppercase()).as_bytes());
+    assert!(h.live(5).is_empty(), "a fully replaced run keeps no spaces");
+    h.idle(200);
+    assert!(h.cells(5).is_empty());
+    assert!(!h.lit(5));
+}
+
+/// (v) A CJK glyph's two cells are one unit: overwrite its lead at the
+/// run's END and both go on the same frame, its narrow neighbours untouched.
+/// Overwrite it in the MIDDLE and neither goes: a change strictly inside a
+/// standing run is not evidence (`Witness::shape_verdicts`, 2026-09-16 —
+/// the owner: *"you need to be fixing in general"*), so the band stays
+/// whole over the two new glyphs instead of carrying a two-cell hole.
 #[test]
 fn a_wide_glyph_s_two_cells_are_retired_as_one_unit() {
     let mut h = Host::at_row(5);
-    h.type_str("a\u{4f60}b");
+    h.type_str("ab\u{4f60}");
     let c = h.term.cursor();
-    assert_eq!((c.row, c.col), (5, 4), "a + wide + b = four cells");
+    assert_eq!((c.row, c.col), (5, 4), "a + b + wide = four cells");
     assert_eq!(
         h.live(5),
         vec![0, 1, 2, 3],
         "both cells of the wide glyph are laid"
     );
     h.idle(400);
-    // Two narrow glyphs over the wide one's cells.
-    h.program(b"\x1b[6;2Hxy\x1b[6;5H");
+    // Two narrow glyphs over the wide one's cells, at the run's end.
+    h.program(b"\x1b[6;3Hxy\x1b[6;5H");
     assert_eq!(
         h.leaving(5),
-        vec![1, 2],
+        vec![2, 3],
         "the wide glyph's two cells go together"
     );
-    assert_eq!(h.live(5), vec![0, 3], "its neighbours are untouched");
+    assert_eq!(h.live(5), vec![0, 1], "its neighbours are untouched");
     assert_eq!(h.retired(), 2);
 
     // And a DIFFERENT wide glyph over it: the same unit, the same verdict.
     let mut h = Host::at_row(5);
+    h.type_str("ab\u{4f60}");
+    h.idle(400);
+    h.program("\x1b[6;3H\u{597d}\x1b[6;5H".as_bytes());
+    assert_eq!(h.leaving(5), vec![2, 3]);
+    assert_eq!(h.live(5), vec![0, 1]);
+
+    // In the MIDDLE of a standing run the same overwrite is not evidence:
+    // nothing leaves, the band is whole across the new glyphs.
+    let mut h = Host::at_row(5);
     h.type_str("a\u{4f60}b");
     h.idle(400);
-    h.program("\x1b[6;2H\u{597d}\x1b[6;5H".as_bytes());
-    assert_eq!(h.leaving(5), vec![1, 2]);
-    assert_eq!(h.live(5), vec![0, 3]);
+    h.program(b"\x1b[6;2Hxy\x1b[6;5H");
+    assert_eq!(
+        h.leaving(5),
+        Vec::<u16>::new(),
+        "an interior change stays lit"
+    );
+    assert_eq!(h.live(5), vec![0, 1, 2, 3]);
+    assert_eq!(h.retired(), 0);
 }
 
 /// (vi) The box-growth wrap (the owner's ring: `licensed (41,116)->(41,7)`,
@@ -770,9 +840,11 @@ fn a_re_anchor_onto_the_pane_s_first_column_lights_nothing_in_the_pane_beside_it
 /// jump that abandons the band (its cohort rewinds into the retract and its
 /// cells stay in the pool, not `leaving`, for ~0.64 s); the key back on the
 /// row cannot join an abandoned cohort, so a SECOND live cell is minted at
-/// `(5,8)`. The witness rightly names the stale cell (`o` → `X`) — and
-/// nothing else at that position: `retire_cells` stamps by identity, so the
-/// key's own cell, born this frame, keeps its light.
+/// `(5,8)`. The stale cell (`o` → `X`) is one changed glyph strictly inside a
+/// run whose other ten letters stand, so the witness does not name it
+/// (`Witness::shape_verdicts`, 2026-09-16): it leaves on the drain its
+/// cohort is already on, and the key's own cell, born this frame, keeps its
+/// light — `retire_cells` stamps by identity, and nothing is stamped here.
 #[test]
 fn a_key_typed_over_an_abandoned_cohorts_cell_keeps_its_own_light() {
     let mut h = hello(5);
@@ -789,7 +861,7 @@ fn a_key_typed_over_an_abandoned_cohorts_cell_keeps_its_own_light() {
     // Left (+450 ms) the stale cell at (5,8) has spent to zero and the hop
     // has laid a fresh wake cell over it (a hop lights what the drain has
     // emptied). The stale cell is still resident and not `leaving`; it is
-    // the OLDEST at the position, and the one the witness must name.
+    // the OLDEST at the position.
     assert!(
         !before.is_empty() && !before[0].1,
         "the stale owner at (5,8) is resident and abandoned, not leaving: {before:?}"
@@ -806,7 +878,6 @@ fn a_key_typed_over_an_abandoned_cohorts_cell_keeps_its_own_light() {
         "the stale cell and the fresh one at (5,8): {at:?}"
     );
     assert_eq!(at[0].0, stale_born, "oldest first is the stale cell");
-    assert!(at[0].1, "the stale cell (o → X) is retired: {at:?}");
     let fresh = at[at.len() - 1];
     assert!(
         !fresh.1,
@@ -816,12 +887,17 @@ fn a_key_typed_over_an_abandoned_cohorts_cell_keeps_its_own_light() {
     assert!(fresh_born > stale_born);
     assert_eq!(
         h.retired() - retired_before,
-        2,
-        "the stale (5,8) and the blank (5,5) carried with its run — not the fresh cell"
+        0,
+        "one glyph changed inside a standing run names nothing — not the stale cell, not the fresh one, not the run's blank"
     );
+    // **THE BLANK STAYS WITH A RUN THAT IS STILL STANDING** (2026-09-15).
+    // `hello world`'s other ten glyphs are unchanged, so the space at
+    // (5,5) is still a space between lit letters: taking it with the one
+    // replaced glyph punches a hole in a whole band, which is the owner's
+    // word-block break-up. It leaves on the drain its run is already on.
     assert!(
-        h.cells(5).contains(&(5, true)),
-        "the blank went with its run: {:?}",
+        h.cells(5).contains(&(5, false)),
+        "the run is standing and its blank kept its light: {:?}",
         h.cells(5)
     );
 
@@ -832,11 +908,6 @@ fn a_key_typed_over_an_abandoned_cohorts_cell_keeps_its_own_light() {
         at,
         vec![(fresh_born, false)],
         "200 ms on: the stale cell is out of the pool, the key's cell stands"
-    );
-    assert!(
-        !h.cells(5).contains(&(5, true)) && !h.cells(5).contains(&(5, false)),
-        "…and the carried blank is out with it: {:?}",
-        h.cells(5)
     );
     assert!(h.lit(5), "the key's light is on the glass");
 }

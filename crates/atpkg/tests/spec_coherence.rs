@@ -1071,3 +1071,139 @@ fn vendor_host_allow_list_matches_the_client() {
         );
     }
 }
+
+/// The body of one `name() { … }` shell function, from its opening line to the
+/// first line that is exactly `}`. Deliberately strict: these helpers are
+/// tab-indented one-liners-and-awk, never nested closing braces at column 0.
+fn shell_fn_body(text: &str, name: &str) -> String {
+    let head = format!("{name}() {{");
+    let start = text
+        .find(&head)
+        .unwrap_or_else(|| panic!("no shell function {name}() in the file"));
+    let rest = &text[start..];
+    let end = rest
+        .lines()
+        .scan(0usize, |acc, l| {
+            let at = *acc;
+            *acc += l.len() + 1;
+            Some((at, l))
+        })
+        .find(|(at, l)| *at > 0 && *l == "}")
+        .map(|(at, _)| at)
+        .unwrap_or_else(|| panic!("shell function {name}() is never closed at column 0"));
+    rest[..end].to_string()
+}
+
+/// (i) THE PUBLIC MIRROR CARRIES EVERY TARGET'S PINS. A signed index pins builds
+/// in two keys — the platform-agnostic `pin` and the per-target `pin_by_target`
+/// overlay `Channel::for_target` lays over it — and the set of releases clients
+/// across all targets resolve is the UNION of the two
+/// (`manifest::tests::the_builds_clients_resolve_are_pin_union_every_overlay` is
+/// that law, proved against the client's own resolver).
+///
+/// tools/atpkg-mirror-public.sh is the only writer of PUBLIC atpkg releases, and
+/// until 2026-09-16 it derived its whole work list from `^pin = { … }$` — a regex
+/// the overlay's own line cannot match. A toolchain sealed on a triple that does
+/// not own `pin` publishes ENTIRELY as an overlay (that is
+/// tools/atpkg-publish-rustc-group.sh's design: "the spec's `pin` rows stay at the
+/// baseline's builds"), so its packs were signed into the staging registry, pinned
+/// by a PUBLIC index, and never mirrored — and every public client on that triple
+/// asked the public owner for a release that does not exist. The mirror reported
+/// success; nothing else backfills it.
+///
+/// This is the half no host can see for itself: an operator on the `pin` triple
+/// resolves the mirrored builds and observes nothing wrong. So the coherence is
+/// asserted from the source, on every target this crate's tests run on:
+/// ONE reader of those two keys (atpkg-publish-lib.sh), the producer and the
+/// mirror both going through it, and no private scraper anywhere.
+/// tools/test-atpkg-mirror-extras.sh is the behavioural twin (it runs the mirror).
+#[test]
+fn the_public_mirror_walks_the_per_target_pin_overlay() {
+    let root = repo_root();
+    let lib = read(&root, "tools/atpkg-publish-lib.sh");
+    let mirror = read(&root, "tools/atpkg-mirror-public.sh");
+    let indexer = read(&root, "tools/atpkg-index.sh");
+
+    // The one grammar, and it really is a union: `pin` folded together with the
+    // overlay. A union that dropped either half is the outage in both directions —
+    // without the overlay the seal triple 404s, without `pin` every OTHER target does.
+    for reader in [
+        "atpkg_index_pin_entries",
+        "atpkg_index_target_pin_entries",
+        "atpkg_index_pin_union",
+    ] {
+        assert!(
+            lib.contains(&format!("{reader}() {{")),
+            "tools/atpkg-publish-lib.sh no longer defines {reader}() — the index's two \
+             pin keys must have exactly one reader, shared by the producer and the mirror"
+        );
+    }
+    let union = shell_fn_body(&lib, "atpkg_index_pin_union");
+    for half in ["atpkg_index_pin_entries", "atpkg_index_target_pin_entries"] {
+        assert!(
+            union.contains(half),
+            "atpkg_index_pin_union no longer folds in {half} — it is not a union, and a \
+             publisher walking it would miss releases clients resolve"
+        );
+    }
+
+    // The key the shell reads is the key the client parses. A rename on either side
+    // that does not move both is an index whose overlay nothing finds.
+    let manifest = read(&root, "crates/atpkg/src/manifest.rs");
+    assert!(
+        manifest.contains("pub pin_by_target: BTreeMap<String, BTreeMap<String, u64>>"),
+        "crates/atpkg/src/manifest.rs no longer declares `pin_by_target` — if the overlay \
+         key was renamed, tools/atpkg-publish-lib.sh's readers must be renamed with it"
+    );
+    assert!(
+        shell_fn_body(&lib, "atpkg_index_target_pin_entries").contains("pin_by_target"),
+        "atpkg_index_target_pin_entries must read the `pin_by_target` key by name"
+    );
+
+    // THE MIRROR: its work list is that union and nothing narrower.
+    assert!(
+        mirror.contains("PINS=\"$(atpkg_index_pin_union "),
+        "tools/atpkg-mirror-public.sh must derive PINS from atpkg_index_pin_union — the \
+         public lane serves every target at once, so one target's pins are never its work \
+         list"
+    );
+    // …and it keeps no private reader of either key. The mirror only ever READS an
+    // index (atpkg-index.sh is the writer), so any `pin`-key text outside a comment is
+    // a scraper — which is precisely the shape that could not see the overlay.
+    for (n, line) in mirror.lines().enumerate() {
+        let t = line.trim_start();
+        if t.starts_with('#') {
+            continue;
+        }
+        assert!(
+            !t.contains("pin = {") && !t.contains("pin_by_target"),
+            "tools/atpkg-mirror-public.sh:{}: reads a pin key itself ({t:?}) — go through \
+             atpkg_index_pin_union / atpkg_index_target_pin_entries, or the two readers \
+             drift and the mirror ships less than the producer signed",
+            n + 1
+        );
+    }
+    // A per-target overlay gives ONE program several pinned builds, so the mirror's
+    // staging download dir must be keyed on the tag. Keyed on the program, build B's
+    // download lands on build A's files and every one of them reads as an
+    // "unverifiable extra" — the mirror refusing its own work.
+    assert!(
+        mirror.contains("\td=\"$WORK/$tag\"") && !mirror.contains("\td=\"$WORK/$prog\""),
+        "tools/atpkg-mirror-public.sh must stage each package under $WORK/$tag: with a \
+         per-target overlay one program has several pinned builds, and a per-PROGRAM dir \
+         mixes them"
+    );
+
+    // THE PRODUCER reads the same two keys through the same functions — the drift this
+    // whole class is made of is two dialects of one grammar.
+    for (func, reader) in [
+        ("baseline_build", "atpkg_index_pin_entries"),
+        ("baseline_target_entries", "atpkg_index_target_pin_entries"),
+    ] {
+        assert!(
+            shell_fn_body(&indexer, func).contains(reader),
+            "tools/atpkg-index.sh {func}() must read the baseline through \
+             atpkg-publish-lib.sh's {reader}, not a private copy of the grammar"
+        );
+    }
+}

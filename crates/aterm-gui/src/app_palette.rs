@@ -142,7 +142,7 @@ impl App {
             .is_some_and(|terminal| self.session_rain_enabled(terminal.session));
         // The checkmark answers "is this window's promotable kitty (the
         // tenured program cat on glass, else the launch kitty) the pinned
-        // favourite?" — the same look `App::favourite_kitty` promotes. With
+        // favourite?" — the same look `App::favourite_kitty_checked` promotes. With
         // no window at all the launch kitty is the answer. `is_favourite` is
         // `&self`: this resolver cannot poll the startup import, and the
         // render loop polls every tick anyway.
@@ -535,6 +535,16 @@ impl App {
         if self.windows.get(&wid).and_then(|ws| ws.palette()).is_none() {
             return;
         }
+        // THE KEYPAD IS ITS MAIN-BLOCK TWIN ON AN OVERLAY, as it is on a native
+        // page and in the seam's press classifier. This card reads the key for
+        // what it MEANS, and `keymap::build_key_input` hands it the keypad
+        // identity (`Numpad5`, `NumpadEnd`) so the PTY encoders can tell KP_5
+        // from 5 — which the arms below have no case for: a keypad digit
+        // typed NOTHING into the filter, where the main row's types its glyph.
+        // `InputEvent::keypad_folded` is the one fold, shared with the native
+        // pages, and a controller's `key kp5` takes the same road.
+        let folded = ev.keypad_folded();
+        let ev = folded.as_ref().unwrap_or(ev);
         match ev {
             InputEvent::Key {
                 key, event_type, ..
@@ -546,7 +556,7 @@ impl App {
                     TKey::Named(TNamed::Escape) => self.palette_exit(),
                     TKey::Named(TNamed::ArrowUp) => self.palette_move(-1),
                     TKey::Named(TNamed::ArrowDown) => self.palette_move(1),
-                    TKey::Named(TNamed::Enter | TNamed::NumpadEnter) => self.palette_activate(),
+                    TKey::Named(TNamed::Enter) => self.palette_activate(),
                     TKey::Named(TNamed::Backspace) => self.palette_backspace(),
                     TKey::Named(TNamed::Space) => self.palette_filter_push(' '),
                     TKey::Character(c) if !c.is_control() => self.palette_filter_push(*c),
@@ -709,39 +719,27 @@ mod tests {
     }
 
     #[test]
-    fn palette_is_mutually_exclusive_with_settings_and_about() {
+    fn palette_is_mutually_exclusive_with_settings() {
         let mut app = App::headless_for_test();
         let wid = WindowId(0);
         app.settings_enter();
-        app.about_enter();
-        assert!(app.windows.get(&wid).unwrap().about().is_some());
+        assert!(app.windows.get(&wid).unwrap().settings().is_some());
         app.palette_enter();
         let ws = app.windows.get(&wid).unwrap();
         assert!(ws.palette().is_some(), "palette open");
         assert!(ws.settings().is_none(), "settings closed");
-        assert!(ws.about().is_none(), "about closed");
     }
 
     #[test]
-    fn each_overlay_enter_closes_the_other_two() {
-        // The three overlays share ONE card slot and must be mutually exclusive in
-        // BOTH directions. Regression: about_enter/settings_enter used to leave a
-        // live palette, which then swallowed every key (the on_key gate checks
-        // palette first) UNDER the shown card — visible card, hidden controller.
+    fn each_overlay_enter_closes_the_other() {
+        // The overlays share ONE card slot and must be mutually exclusive in BOTH
+        // directions. Regression: settings_enter used to leave a live palette, which
+        // then swallowed every key (the on_key gate checks palette first) UNDER the
+        // shown card — visible card, hidden controller.
         let wid = WindowId(0);
 
-        // Palette open first, then About → About wins, palette must close.
+        // Palette open first, then Settings → Settings wins, palette must close.
         let mut app = App::headless_for_test();
-        app.palette_enter();
-        app.about_enter();
-        let ws = app.windows.get(&wid).unwrap();
-        assert!(ws.about().is_some(), "about open");
-        assert!(ws.palette().is_none(), "about_enter must close the palette");
-        assert!(ws.settings().is_none(), "settings closed");
-
-        // Palette open first, then Settings → Settings wins, palette+about close.
-        let mut app = App::headless_for_test();
-        app.about_enter();
         app.palette_enter();
         app.settings_enter();
         let ws = app.windows.get(&wid).unwrap();
@@ -750,7 +748,14 @@ mod tests {
             ws.palette().is_none(),
             "settings_enter must close the palette"
         );
-        assert!(ws.about().is_none(), "settings_enter must close about");
+
+        // …and the other way round.
+        let mut app = App::headless_for_test();
+        app.settings_enter();
+        app.palette_enter();
+        let ws = app.windows.get(&wid).unwrap();
+        assert!(ws.palette().is_some(), "palette open");
+        assert!(ws.settings().is_none(), "palette_enter must close settings");
     }
 
     #[test]

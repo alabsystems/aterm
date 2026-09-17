@@ -352,6 +352,58 @@ fn decdwl_truncates_right_half_and_decswl_keeps_text() {
     assert_eq!(s.row(0), format!("ZZ{}P", "a".repeat(37)));
 }
 
+#[test]
+fn ed2_erases_complete_lines_so_a_decdwl_row_comes_back_single_width() {
+    // VT510 Programmer Information, Erase in Display: "When you erase complete
+    // lines, they become single-height, single-width lines, with all visual
+    // character attributes cleared." xterm's ED 2 (`do_erase_display` case 2 ->
+    // `ClearScreen` -> `ClearBufRows(0, max_row)`) carries the same rule in its
+    // own comment: "clearing the whole row resets the doublesize characters".
+    //
+    // Until this landed, one stray `ESC#6` in the byte stream — a banner tool, a
+    // `cat` of a binary, vttest — poisoned a screen row that `clear` could not
+    // undo. Measured on glass at 40x200 with a 9x17 cell: ten characters drew
+    // 180 inked device columns after the trigger against 90 before, with
+    // byte-identical grid text, and half the row's 200 columns unreachable.
+    let mut s = Screen::new(24, 80);
+    s.feed(b"\x1b[1;1H\x1b#6"); // DECDWL poisons row 0
+    s.feed(b"\x1b[2J\x1b[H"); // ED 2 + home — the `clear` a user reaches for
+    s.feed("a".repeat(50).as_bytes());
+    // A double-width row still holds only cols/2 = 40 characters and autowraps
+    // there, so the 50 'a' would split 40/10 across two rows. All 80 columns are
+    // usable again, so they stay on row 0.
+    assert_eq!(
+        s.row(0),
+        "a".repeat(50),
+        "the erased row is single-width again"
+    );
+    assert_eq!(s.row(1), "", "nothing wrapped at the halfway mark");
+
+    // Same law, read off the line attribute itself, for DECDHL's two halves.
+    let t = term_24x80(b"\x1b[1;1H\x1b#3\x1b[2;1H\x1b#4\x1b[2J");
+    for row in 0..2 {
+        assert_eq!(
+            t.grid().row(row).expect("visible row").line_size(),
+            aterm_core::grid::LineSize::SingleWidth,
+            "ED 2 erased row {row} as a complete line"
+        );
+    }
+}
+
+#[test]
+fn el2_leaves_a_decdwl_row_double_because_xterm_does() {
+    // The asymmetry is deliberate. xterm's EL 2 (`do_erase_line` case 2 ->
+    // `ClearLine` -> `ClearInLine` -> `ClearInLine2`) never reaches
+    // `ClearBufRows` and never writes `DblCS`, and the VT510 EL page carries
+    // none of the ED page's single-width language.
+    let t = term_24x80(b"\x1b[1;1H\x1b#6\x1b[2K");
+    assert_eq!(
+        t.grid().row(0).expect("visible row").line_size(),
+        aterm_core::grid::LineSize::DoubleWidth,
+        "EL 2 clears the characters, not the line attribute"
+    );
+}
+
 // =========================================================================
 // 9. DECSC/DECRC saves charset state
 // =========================================================================

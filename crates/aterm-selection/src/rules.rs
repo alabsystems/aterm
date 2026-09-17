@@ -537,7 +537,11 @@ pub(crate) fn column_to_byte_pos(text: &str, column: usize) -> usize {
             return grapheme.byte_offset;
         }
 
-        current_col += grapheme.width;
+        // GRID cells (see `aterm_grapheme::grapheme_grid_columns`): the grid
+        // advances per CHARACTER outside emoji, so a cluster's display width is
+        // the wrong charge for an Indic conjunct and double-click landed on the
+        // wrong cells.
+        current_col += aterm_grapheme::grapheme_grid_columns(grapheme.text);
 
         // Column points inside a multi-cell grapheme; return its start.
         if current_col > column {
@@ -556,7 +560,7 @@ pub(crate) fn byte_pos_to_column(text: &str, byte_pos: usize) -> usize {
         if grapheme.byte_offset >= byte_pos {
             break;
         }
-        current_col += grapheme.width;
+        current_col += aterm_grapheme::grapheme_grid_columns(grapheme.text);
     }
 
     current_col

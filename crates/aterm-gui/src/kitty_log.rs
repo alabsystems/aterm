@@ -205,7 +205,10 @@ pub(crate) struct KittyCollectible {
 }
 
 impl KittyCollectible {
-    fn look(&self) -> Option<KittyLook> {
+    /// The composition this row wears, recovered from its durable semantic
+    /// key. `pub(crate)` because the wear menu reads it: a row the caller
+    /// cannot resolve to a look is a row it cannot offer.
+    pub(crate) fn look(&self) -> Option<KittyLook> {
         let collectible = glyph_from_key(&self.key)?;
         let default = KittyLook::default();
         let mut look = KittyLook {
@@ -684,6 +687,59 @@ impl KittyLog {
         item.iris = look.iris;
         item.age = age_key(look.age).to_string();
         item.favourite = max_ts(&item.favourite, now);
+    }
+
+    /// **WEAR A CAT THE USER ALREADY HAS.** Stamp the roster row named by `key`
+    /// as the favourite and return the look it carries.
+    ///
+    /// This is the direct answer to "switch my cursor kitty", and it is why the
+    /// election in [`Self::favourite_look`] is by GREATEST stamp rather than by
+    /// a single pinned flag: a newer stamp simply wins, on this machine and
+    /// across every replica that merges this ledger (merges take `max_ts`), so
+    /// wearing a cat is monotone and needs no tombstone to be reliable. The
+    /// existing pin path ([`Self::favourite`]) can only ever pin the cat that
+    /// would ride ANYWAY — this window's tenured program cat, else the launch
+    /// kitty — so before this there was no way to put on a cat you had already
+    /// collected without first arranging for it to appear.
+    ///
+    /// `None` when no row carries that key: the ledger is observability, and a
+    /// wear that forced a row in would mint a cat the user never met. The
+    /// caller reports the miss and lists what IS there.
+    fn wear(&mut self, key: &str, now: &str) -> Option<KittyCollectible> {
+        let item = self.collectibles.iter_mut().find(|item| item.key == key)?;
+        item.favourite = max_ts(&item.favourite, now);
+        item.look()?;
+        Some(item.clone())
+    }
+
+    /// Carry a wear that happened in [`Self::wear`] on ANOTHER copy of this
+    /// ledger into this one, WITHOUT counting a sighting.
+    ///
+    /// **THE FLUSH SENDS THE DELTA, NOT THE WHOLE LEDGER**, so a stamp written
+    /// only into `mem` is a wear that works until you quit. The pin path does
+    /// not hit this because it calls `record` first, which mints the row in the
+    /// delta; a wear deliberately does not record (the cat is already
+    /// collected, there is nothing to observe), so the row it stamps is usually
+    /// one an EARLIER RUN collected and the delta has never heard of — which is
+    /// exactly the case this feature exists for.
+    ///
+    /// `count` is zeroed on the way in because [`Self::merge_collectible`] is
+    /// ADDITIVE on counts: the delta's copy is summed into the on-disk total,
+    /// and a wear must not invent a sighting. Everything else folds the way it
+    /// always does — `favourite` by `max_ts`, so two instances wearing
+    /// different cats converge on the later pick whichever flush lands first.
+    fn adopt_wear(&mut self, row: &KittyCollectible) {
+        let mut carried = row.clone();
+        carried.count = 0;
+        self.merge_collectible(carried);
+    }
+
+    /// The roster, in the order the collection book shows it — the menu of
+    /// [`Self::wear`]'s `key` argument. Which row is WORN is not decided here:
+    /// see [`KittyLogHost::wearable`] for why that must come from the cat on
+    /// glass rather than from a second election over these stamps.
+    pub(crate) fn roster(&self) -> &[KittyCollectible] {
+        &self.collectibles
     }
 
     /// The pinned companion: the roster row with the greatest favourite stamp
@@ -1413,6 +1469,22 @@ impl KittyLogHost {
         &self.mem
     }
 
+    /// Drain the delta the way a real flush does, so a test can start from the
+    /// state every process is in for a cat collected in an EARLIER run.
+    #[cfg(test)]
+    pub(crate) fn take_delta_for_test(&mut self) {
+        self.delta = KittyLog::default();
+    }
+
+    /// The UNFLUSHED delta — what a flush would actually put on disk. Exposed
+    /// to tests because "it works until you quit" is the exact shape of the
+    /// bug `a_wear_reaches_the_delta_or_it_does_not_survive_a_restart` exists
+    /// to catch, and `mem` cannot see it.
+    #[cfg(test)]
+    pub(crate) fn pending(&self) -> &KittyLog {
+        &self.delta
+    }
+
     #[cfg(test)]
     fn await_initial_load(&mut self) {
         // BLOCKS, deliberately, with no clock. This used to spin on `yield_now()`
@@ -1662,6 +1734,74 @@ impl KittyLogHost {
         // quitting right after the click cannot lose it.
         self.last_flush = None;
         self.maybe_flush(now);
+    }
+
+    /// **WEAR A CAT FROM THE COLLECTION, BY NAME.** The direct switch: put on
+    /// the roster row called `key` and return the look now on the cursor, or
+    /// `None` when nothing in the collection answers to that name.
+    ///
+    /// The difference from [`Self::favourite`] is the whole point of this
+    /// entry. That one pins the PROMOTABLE cat — the one that would ride
+    /// anyway — so it can only ever re-pin what is already there; to put on a
+    /// different cat you first had to arrange for it to appear, by relaunching
+    /// (a fresh launch kitty) or by running a program long enough to earn
+    /// tenure. This one names the cat instead, which is what "switch my cursor
+    /// kitty" actually means.
+    ///
+    /// It takes no [`KittySighting`] because a wear is not a sighting: the row
+    /// must ALREADY be in the collection, so there is nothing to record and no
+    /// roster cap to answer to — only the pin stamp moves. That also makes it
+    /// safe for the miss to be silent at this layer.
+    ///
+    /// The durable half is stamped only when the ledger is `enabled`, exactly
+    /// as [`Self::favourite`] does, and the in-memory pin is unconditional so
+    /// a user who turned the log off can still choose their cat for this run.
+    pub(crate) fn wear(&mut self, key: &str, now: Instant, enabled: bool) -> Option<KittyLook> {
+        self.poll_initial_load();
+        // Ask the LEDGER, not the delta: `mem` is the whole collection, while
+        // `delta` holds only what this process has yet to flush.
+        let stamp = now_rfc3339();
+        let row = self.mem.wear(key, &stamp)?;
+        let look = row.look()?;
+        self.favourite = Some(look);
+        self.pinned_this_session = true;
+        if !enabled {
+            return Some(look);
+        }
+        // CARRY THE ROW, don't just stamp: the flush sends the DELTA, and the
+        // row a wear stamps is usually one an earlier run collected, which the
+        // delta has never heard of. `adopt_wear` folds a count-0 copy in, so
+        // the stamp reaches disk and the cat is still on after a restart.
+        self.delta.adopt_wear(&row);
+        self.revision = self.revision.wrapping_add(1);
+        // An explicit pick is not observability: skip the debounce so quitting
+        // right after it cannot lose it.
+        self.last_flush = None;
+        self.maybe_flush(now);
+        Some(look)
+    }
+
+    /// The collection as the wear menu sees it: the key currently WORN (if
+    /// any), then every roster row, in the collection book's own order. The
+    /// `key` of each row is exactly what [`Self::wear`] takes.
+    ///
+    /// **THE WORN KEY COMES FROM THE CAT ON GLASS, NOT FROM A SECOND ROSTER
+    /// ELECTION.** The roster elects by greatest pin stamp with the key as the
+    /// tie-break, and stamps are RFC3339 to the second — so two pins in one
+    /// second are a tie the KEY breaks, and the roster can name a different
+    /// row from the one [`Self::favourite_look`] is handing the companion. A
+    /// menu that marked the wrong row as worn would be a menu that lies about
+    /// the cat you are looking at, so this reads the same cached pin
+    /// [`Self::is_favourite`] reads and finds the row wearing it.
+    pub(crate) fn wearable(&mut self) -> (Option<String>, Vec<KittyCollectible>) {
+        self.poll_initial_load();
+        let rows: Vec<KittyCollectible> = self.mem.roster().to_vec();
+        let worn = self.favourite.and_then(|look| {
+            rows.iter()
+                .find(|row| row.look() == Some(look))
+                .map(|row| row.key.clone())
+        });
+        (worn, rows)
     }
 
     /// Whether `look` is the currently pinned favourite (the palette
@@ -3181,6 +3321,68 @@ mod tests {
             ..KittyLook::default()
         }
         .normalized()
+    }
+
+    /// **A WEAR THAT NEVER REACHES THE DELTA IS A WEAR THAT DIES AT QUIT.**
+    ///
+    /// The flush sends `delta`, not `mem`, so a stamp written only into `mem`
+    /// gives a cat that rides beautifully until the next launch and is then
+    /// gone. The pin path never meets this because it calls `record` first,
+    /// which mints the row in the delta. A WEAR DELIBERATELY DOES NOT RECORD —
+    /// the cat is already collected, there is nothing to observe — so the row
+    /// it stamps is typically one an EARLIER RUN collected, which this process
+    /// has never written and whose delta row does not exist. That is the whole
+    /// case the feature is for, so it is the case that must persist.
+    ///
+    /// Found by re-reading the flush path after the feature was written, not by
+    /// a failing test: every test in the suite passed with the wear lost.
+    #[test]
+    fn a_wear_reaches_the_delta_or_it_does_not_survive_a_restart() {
+        let lex = Lexicon::builtin();
+        let mut host = KittyLogHost::in_memory();
+        let now = Instant::now();
+        let old = coated(CatGlyphId::S100, 3);
+        let new = coated(CatGlyphId::S101, 7);
+
+        // Two cats collected, and the delta drained — the state a process is in
+        // after any flush, and the state EVERY process is in for a cat it
+        // collected in an earlier run.
+        host.observe(4, [look_sighting(11, old)], lex, now, true);
+        host.observe(4, [look_sighting(12, new)], lex, now, true);
+        let keys: Vec<String> = host
+            .log()
+            .roster()
+            .iter()
+            .map(|row| row.key.clone())
+            .collect();
+        assert_eq!(keys.len(), 2, "fixture: two heads collected");
+        host.take_delta_for_test();
+        assert!(
+            host.pending().roster().is_empty(),
+            "fixture: the delta is drained, as it is after any flush"
+        );
+
+        // Wear the first one.
+        let worn = host
+            .wear(&keys[0], now, true)
+            .expect("a collected cat can be worn");
+        assert_eq!(host.favourite_look(), Some(worn), "it is on the cursor");
+
+        // AND THE DELTA CARRIES IT. Without this the cat is on until quit.
+        let carried = host
+            .pending()
+            .roster()
+            .iter()
+            .find(|row| row.key == keys[0])
+            .expect("the worn row reached the delta");
+        assert!(
+            !carried.favourite.is_empty(),
+            "the delta row carries the pin stamp, which is the whole point"
+        );
+        // And it invents no sighting: the delta's count is SUMMED into the
+        // on-disk total, so a wear that carried a count would inflate it every
+        // time the user changed their cat.
+        assert_eq!(carried.count, 0, "a wear is not an observation");
     }
 
     /// THE HEADLINE TRAP. `KittyLog::record` reports "new" only for an unseen

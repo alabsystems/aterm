@@ -147,6 +147,9 @@ const NAME_CAP: usize = 24;
 /// it is dropped rather than shown as a stub ("these are wha…" at 80 cols was
 /// the row the 2026-09-10 review measured). Drawn whole-ish or not at all.
 const DETAIL_FLOOR: usize = 20;
+/// The joint between a detail's pieces (a sentence, a figure, a command), the
+/// one every words builder writes; [`shape_detail`] sheds pieces at it.
+const PIECE_SEP: &str = " \u{00b7} ";
 
 /// Which bar.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -296,38 +299,116 @@ fn restate_staged_bar(bar: &mut Bar, build: u64, posture: ApplyPosture, now: Ins
 }
 
 /// A detail that ALWAYS keeps its command. Sanitized like every other cell
-/// string; when longer than `cap`, the PROSE is what gives way — the tail from
-/// the first backtick-quoted command sentence (`Run \`…\` …`) to the end is kept
-/// whole and the prefix is cut to fit, with the ellipsis on the prose. A detail
-/// without a command truncates from the right as before. Pure, so the width law
-/// is testable on literal values.
+/// string; when longer than `cap`, a detail made of ` · `-joined pieces first
+/// sheds its trailing pieces WHOLE, last piece first, down to the piece that holds
+/// the command sentence (a piece is a sentence or a command; half of one — the revert
+/// row's `defaults…`, measured on a 130-column window, 2026-09-15 — reads as an
+/// error and cannot be pasted, while the pointer before it says where the whole
+/// one is). Still too long, the PROSE is what gives way — the tail from the first
+/// backtick-quoted command sentence (`Run \`…\` …`) to the end is kept whole and
+/// the prefix is cut to fit, with the ellipsis on the prose. A detail without a
+/// command truncates from the right as before. Pure, so the width law is testable
+/// on literal values.
 pub(crate) fn shape_detail(detail: &str, cap: usize) -> String {
-    let clean = sanitize_for_tty(detail, usize::MAX);
+    let mut clean = sanitize_for_tty(detail, usize::MAX);
     if clean.chars().count() <= cap {
         return clean;
     }
-    // The command sentence: "Run `…" when there is one, else the first backtick.
-    let command_at = clean.find("Run `").or_else(|| clean.find('`')).map(|at| {
-        // Back up to the start of the sentence the backtick sits in, so the
-        // kept tail reads as a sentence and not as half of one.
-        clean[..at].rfind(". ").map_or(at, |dot| dot + 2).min(at)
-    });
-    let Some(at) = command_at else {
+    if clean.contains('`') && clean.contains(PIECE_SEP) {
+        let pieces: Vec<&str> = clean.split(PIECE_SEP).collect();
+        // The piece the cut below anchors on is never shed: everything after it is
+        // a trailing figure, each worth showing only whole. The same command the
+        // cut anchors on — a `Run \`…\`` sentence anywhere first, else the LAST
+        // piece carrying a backtick (a remedy is said last: "…in every aterm tab ·
+        // 1 tab from before this update picks them up with `. ~/.aterm/…`", and
+        // it is the remedy, not the program's name in the first piece, that a
+        // person acts on; merged 2026-09-16 from the two rules that met here) — so
+        // the two stages never keep different pieces.
+        let anchor = pieces
+            .iter()
+            .position(|p| p.contains("Run `"))
+            .or_else(|| pieces.iter().rposition(|p| p.contains('`')))
+            .map_or(1, |i| i + 1);
+        for keep in (anchor..pieces.len()).rev() {
+            let joined = pieces[..keep].join(PIECE_SEP);
+            if joined.chars().count() <= cap {
+                return joined;
+            }
+        }
+        clean = pieces[..anchor.min(pieces.len())].join(PIECE_SEP);
+        if clean.chars().count() <= cap {
+            return clean;
+        }
+    }
+    let Some(command) = command_anchor(&clean) else {
         return sanitize_for_tty(&clean, cap);
     };
-    let tail = &clean[at..];
-    let tail_len = tail.chars().count();
-    if tail_len + 2 > cap {
-        // Even the command sentence alone is too long: keep as much of IT as fits
-        // from its start — the command is at its front.
-        return sanitize_for_tty(tail, cap);
+    // Back up to the start of the sentence (or ` · ` clause) the backtick sits
+    // in, so the kept tail reads as a sentence and not as half of one. When even
+    // that sentence is too long, the tail starts at the command itself — the
+    // remedy must survive the cut, not the words in front of it (2026-09-16: "1
+    // tab from before this update picks them up with `. ~/.aterm/shell.d/00-atpkg.zsh`"
+    // at 120 cols would otherwise lose the command to its own preamble).
+    let sentence = sentence_start(&clean, command);
+    for (at, head_from) in [(sentence, 0), (command, sentence)] {
+        let tail = &clean[at..];
+        let tail_len = tail.chars().count();
+        if tail_len + 2 > cap {
+            continue;
+        }
+        let head_budget = cap - tail_len - 2;
+        let head = clean[head_from..at].trim_end();
+        let mut out: String = head.chars().take(head_budget).collect();
+        // A cut head ends on a word, not inside one ("1 tab from…", not "1 tab
+        // from befo…"), when it has a word to end on.
+        if head
+            .chars()
+            .nth(head_budget)
+            .is_some_and(|next| next != ' ')
+            && let Some(space) = out.rfind(' ')
+            && space > 0
+        {
+            out.truncate(space);
+        }
+        out = out.trim_end().to_string();
+        out.push_str("\u{2026} ");
+        out.push_str(tail);
+        return out;
     }
-    let head_budget = cap - tail_len - 2;
-    let mut out: String = clean[..at].trim_end().chars().take(head_budget).collect();
-    out = out.trim_end().to_string();
-    out.push_str("\u{2026} ");
-    out.push_str(tail);
-    out
+    // Even the command's own words are too long: keep as much of THEM as fits
+    // from the backtick — the command is at the front.
+    sanitize_for_tty(&clean[command..], cap)
+}
+
+/// Where the command a cut detail must keep begins: "Run `…" when there is one,
+/// else the first backtick of the LAST ` · ` clause that carries one — a remedy
+/// is said last ("…in every aterm tab · 1 tab from before this update picks them
+/// up with `. ~/.aterm/shell.d/00-atpkg.zsh`"), and it is the remedy, not the
+/// name of the program the row is about, that a person acts on. A detail with
+/// one command keeps that one, as before.
+fn command_anchor(clean: &str) -> Option<usize> {
+    if let Some(at) = clean.find("Run `") {
+        return Some(at);
+    }
+    let mut found = None;
+    let mut start = 0;
+    for clause in clean.split(PIECE_SEP) {
+        if let Some(at) = clause.find('`') {
+            found = Some(start + at);
+        }
+        start += clause.len() + PIECE_SEP.len();
+    }
+    found
+}
+
+/// The start of the sentence or ` · ` clause that `at` sits in, whichever is
+/// nearer; `at` itself when neither precedes it.
+fn sentence_start(clean: &str, at: usize) -> usize {
+    let dot = clean[..at].rfind(". ").map(|dot| dot + 2);
+    let clause = clean[..at]
+        .rfind(PIECE_SEP)
+        .map(|sep| sep + PIECE_SEP.len());
+    dot.max(clause).unwrap_or(at).min(at)
 }
 
 /// A title without the press affordance — exact-suffix, so a version string
@@ -643,7 +724,89 @@ pub(crate) struct StatusBars {
     /// no-change pass, moving the grid a row for 30 s twice (two PTY resizes for
     /// a running TUI; UX review, 2026-09-10). The same text again is recorded
     /// in the ledger and not posted; the first pass after launch always posts.
-    last_managed_current: Option<String>,
+    /// The count of frozen tabs is part of the key (2026-09-16): the same wire
+    /// text with a changed count IS a new row — the note it carries names the
+    /// tabs that still need the hook sourced, and when the last of them closes
+    /// the row without the note is the new truth.
+    last_managed_current: Option<(String, usize)>,
+    /// The dialect of the atpkg hook the frozen-tab note tells a person to
+    /// source ([`HookDialect`]): the shell this window spawns, set once by the
+    /// app from its spawn configuration ([`Self::set_hook_shell`]). The default
+    /// is zsh, macOS's login shell since 10.15.
+    hook_shell: HookDialect,
+}
+
+/// WHICH `~/.aterm/shell.d/00-atpkg.*` A FROZEN TAB SOURCES (2026-09-16). The
+/// first cut of the frozen-tab note said `exec $SHELL`, and review showed that
+/// to be the wrong remedy twice over: aterm delivers its zsh integration through
+/// a `ZDOTDIR` wrapper that restores or unsets `ZDOTDIR` before the user's rc
+/// runs (`aterm-shell-integration`'s `ZSH_WRAPPER`; bash rides `--rcfile`), so
+/// the re-exec'd plain shell loads no integration — the tab silently loses its
+/// OSC 133/633 marks, cwd/title tracking and the live PATH re-assert — and it
+/// heals PATH at all only through the marker block `atpkg` writes into an rc
+/// file that already EXISTS (`hooks::ensure_rc_sources_hooks` never creates one,
+/// skips protected and symlinked rcs, and honours the block's own opt-out), so
+/// on a fresh Mac with no `~/.zshrc` the promise was simply false. What atpkg's
+/// own rc block does is `[ -f "<hook>" ] && . "<hook>"`; sourcing that hook in
+/// the live shell is the whole remedy — it moves `<prefix>/agents/` to the front
+/// of PATH, exports `ATPKG_AGENTS` and appends `bin/`, idempotently — and the
+/// tab keeps the integration it has. The file names are pinned from
+/// `crates/atpkg/src/hooks.rs` (`HOOK_BASENAME`, one file per dialect; POSIX
+/// `.` for zsh and bash, fish's `source`, PowerShell's dot-source), written by
+/// every pass before the marker this row is built from is printed. A shell
+/// atpkg has no hook for ([`HookDialect::None`]: nushell, xonsh, cmd) gets no
+/// command; for it the honest note is that a new tab picks the programs up.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub(crate) enum HookDialect {
+    #[default]
+    Zsh,
+    Bash,
+    Fish,
+    PowerShell,
+    None,
+}
+
+impl From<aterm_core::shell_integration::ShellType> for HookDialect {
+    fn from(shell: aterm_core::shell_integration::ShellType) -> Self {
+        use aterm_core::shell_integration::ShellType as S;
+        match shell {
+            S::Zsh => Self::Zsh,
+            S::Bash => Self::Bash,
+            S::Fish => Self::Fish,
+            S::PowerShell => Self::PowerShell,
+            // A WSL tab runs a Linux bash (`WSL_LAUNCH_SH`, `--rcfile` the bash
+            // integration), and that bash sources `$HOME/.aterm/shell.d` in the
+            // DISTRO's home — where atpkg, running on the Windows host, writes
+            // nothing (its hooks land in the Windows profile, with Windows paths
+            // in them). `. ~/.aterm/shell.d/00-atpkg.bash` in such a tab is
+            // "No such file", so it is not the remedy (review, 2026-09-16: the
+            // mapping to `Bash` was proposed and refuted on this ground).
+            S::Wsl => Self::None,
+            S::Cmd | S::Unknown => Self::None,
+            // `ShellType` is non-exhaustive: a shell added later has no hook
+            // until `hooks::hook_files` writes one for it.
+            _ => Self::None,
+        }
+    }
+}
+
+impl HookDialect {
+    /// The backtick-quoted line a person types in the frozen tab, or `None` for
+    /// a shell without a hook. The path is the one `hooks::refresh` writes,
+    /// `~/.aterm/shell.d/<HOOK_BASENAME>.<ext>`. THE ONE SPELLING: the seed
+    /// pill (`seed_pill_text` in `lib.rs`) reads it from here too, since
+    /// 2026-09-16's review closed the restated copy it used to carry.
+    pub(crate) fn remedy(self) -> Option<String> {
+        let base = atpkg::hooks::HOOK_BASENAME;
+        let (verb, ext) = match self {
+            Self::Zsh => (".", "zsh"),
+            Self::Bash => (".", "bash"),
+            Self::Fish => ("source", "fish"),
+            Self::PowerShell => (".", "ps1"),
+            Self::None => return None,
+        };
+        Some(format!("`{verb} ~/.aterm/shell.d/{base}.{ext}`"))
+    }
 }
 
 impl StatusBars {
@@ -1022,14 +1185,54 @@ impl StatusBars {
         );
     }
 
+    /// A bundle staged IN-PROCESS by a provenance-tracked installer whose untracked
+    /// lane could not run (`tracked-install:`, 2026-09-15): the install succeeded,
+    /// every executable carries `com.apple.provenance`, and `aterm pkg doctor` names
+    /// what that breaks. A Warn terminal row held like a failure's — the default
+    /// policy's recorded outcome must never be a silent one — that says INSTALLED,
+    /// never "failed": the tool runs; only a release cut through it is refused.
+    pub(crate) fn toolchain_tracked_install(&mut self, detail: &str, now: Instant) {
+        self.post_toolchain_terminal(
+            Bar {
+                text: BarText {
+                    glyph: '\u{26a0}',
+                    title: "ALab toolchain".to_string(),
+                    detail: sanitize_for_tty(
+                        &format!(
+                            "{detail} \u{2014} installed carrying com.apple.provenance; \
+                             `aterm pkg doctor` names the cause"
+                        ),
+                        160,
+                    ),
+                    stats: String::new(),
+                    tone: Tone::Warn,
+                },
+                fill: None,
+                fold_at: None,
+                stale_at: None,
+                pass_id: None,
+                staged_build: None,
+                health: false,
+            },
+            HOLD_WARN,
+            now,
+        );
+    }
+
     /// One classified `progress.json` read from the child-scoped tailer
     /// (`Wake::PkgProgress`). `None` = the file vanished at child exit.
     ///
     /// A snapshot may NOT overwrite a terminal outcome a marker already posted
     /// (`installed` / `failed` / …): atpkg prints its markers AFTER `end_pass`,
-    /// and the tailer's final read is posted after the marker line was read, so
-    /// the marker's richer sentence arrives first and must win. The meter still
-    /// completes.
+    /// and the tailer's final read is posted after the child exits, so within one
+    /// 100 ms poll the marker and this read land in EITHER order, and whichever
+    /// is second must leave the marker's richer sentence standing. The meter still
+    /// completes — for a SUCCESS row only. A Warn row that kept the live meter it
+    /// replaced ("how far the pass got before it broke", the old
+    /// [`Self::toolchain_failed`]) used to be rounded up to 100% by this very read,
+    /// so half the time the reader saw "partly installed" beside a full meter —
+    /// the 2026-09-11 contradiction again, reachable inside a single pass
+    /// (2026-09-15 audit).
     pub(crate) fn toolchain_snapshot(
         &mut self,
         snap: Option<&crate::PkgProgressSnapshot>,
@@ -1058,6 +1261,7 @@ impl StatusBars {
         if self.toolchain.as_ref().is_some_and(Bar::terminal) {
             if let Some(bar) = self.toolchain.as_mut()
                 && bar.fill.is_some()
+                && bar.text.tone == Tone::Success
             {
                 bar.fill = Some(1.0);
             }
@@ -1085,13 +1289,17 @@ impl StatusBars {
             });
             return;
         }
-        let title = match f.pass.as_str() {
-            "seed" => "Preparing the ALab toolchain",
-            "net" => "Installing the ALab toolchain",
-            _ => "Installing packages",
-        };
         let total = f.overall.programs_total;
         let done = f.overall.programs_done;
+        // ONE TITLE PER INSTALL (audit 2026-09-14): the announcement's row says
+        // "Installing…", and a seed pass that then tailed as "Preparing…" flipped the
+        // title mid-pass while gigabytes were landing from the seal. A seed pass that
+        // moves programs IS an install; only a seed with nothing to lay is preparing.
+        let title = match f.pass.as_str() {
+            "seed" if total == 0 => "Preparing the ALab toolchain",
+            "seed" | "net" => "Installing the ALab toolchain",
+            _ => "Installing packages",
+        };
         // THE NO-OP PASS STAYS INVISIBLE. atpkg begins its "net" pass BEFORE the
         // signed index resolves — at every launch and every 6 h — and the common
         // outcome is a plan of zero programs. A bar that appears for that,
@@ -1162,6 +1370,16 @@ impl StatusBars {
             .filter(|r| r.phase == Phase::Failed)
             .count();
         if f.ended_unix.is_some() {
+            // A PASS THAT ENDED WITH FAILURES DOES NOT CLAIM A FULL METER. What it
+            // may show is how far the live meter it replaces had got — this pass's
+            // own reading, from the same file — until the marker's sentence, which
+            // carries no meter, replaces it.
+            let live_fill = self
+                .toolchain
+                .as_ref()
+                .filter(|b| !b.terminal())
+                .and_then(|b| b.fill)
+                .filter(|f| *f < 1.0);
             let (detail, tone, hold) = if failed == 0 {
                 (
                     if total > 0 {
@@ -1190,7 +1408,11 @@ impl StatusBars {
                     stats: String::new(),
                     tone,
                 },
-                fill: (total > 0).then_some(1.0),
+                fill: if failed == 0 {
+                    (total > 0).then_some(1.0)
+                } else {
+                    live_fill
+                },
                 fold_at: Some(now + hold),
                 stale_at: None,
                 pass_id: None,
@@ -1227,8 +1449,9 @@ impl StatusBars {
     }
 
     /// `seed-installed:` / `net-installed:` — the toolchain is here. `text` is
-    /// the same sentence the pill used to carry (roster + the "open a new tab"
-    /// clause, or the shell-integration caveat), authored by the caller.
+    /// the same sentence the pill used to carry (roster + the readiness clause —
+    /// "ready in every aterm tab, this one too" since 2026-09-16, never "open a new
+    /// tab" — or the shell-integration caveat), authored by the caller.
     pub(crate) fn toolchain_installed(&mut self, text: &str, now: Instant) {
         // The sentence was authored for a pill with no title of its own; the
         // bar has one, so its opening is not repeated as the detail.
@@ -1280,21 +1503,25 @@ impl StatusBars {
     /// store-lock wait or its timeout — those are [`Self::toolchain_waiting`] and
     /// [`Self::toolchain_deferred`] (2026-09-10).
     pub(crate) fn toolchain_failed(&mut self, what: &str, now: Instant) {
-        // A FAILURE ROW NEVER INHERITS A FINISHED METER. Carrying the fill over is
-        // honest while the bar being replaced is this pass's LIVE meter — the reader
-        // sees how far it got before it broke. It was not honest when the bar being
-        // replaced was itself a TERMINAL row, because a terminal row's meter is
-        // always full: the owner's 2026-09-11 screenshot showed "⚠ ALab toolchain
-        // install failed" beside a 100% bar, and the 100% came from a completed-pass
-        // row the tailer had just built out of a 27-hour-old `progress.json` while
-        // the verdict came from the live child. Two passes, one bar, and a reading
-        // ("finished, and failed") that is a contradiction on its face even when the
-        // failure is real.
-        let fill = self
-            .toolchain
-            .as_ref()
-            .filter(|b| !b.terminal())
-            .and_then(|b| b.fill);
+        // A FAILURE ROW CARRIES NO METER. It used to inherit the live meter it
+        // replaced ("how far the pass got before it broke"), filtered to a
+        // non-terminal row so the 2026-09-11 screenshot — "⚠ ALab toolchain install
+        // failed" beside a 100% bar inherited from a completed-pass row the tailer
+        // had built out of a 27-hour-old `progress.json` — could not recur. Two
+        // things were wrong with keeping any of it (2026-09-15 audit, 2026-09-16
+        // review). The tailer's final read follows the child's exit, and atpkg calls
+        // `end_pass` before it prints the marker, so the marker and the ended
+        // snapshot land in either order within one poll: one order painted the
+        // inherited meter, the other none, and the terminal branch above rounded
+        // the inherited one up to 100% — the same contradiction inside a single
+        // pass. And the bar cannot tell whose pass a meter is: the tailer tails one
+        // shared `progress.json`, so the meter standing when a marker arrives may be
+        // a sibling holder's (a second window's child queued behind this one's
+        // pass), or the seed child's ended row re-posted under the update child —
+        // and a marker fused with another pass's meter is the 2026-09-11 reading
+        // again, whatever the value. No meter is the one rendering every order and
+        // every neighbour agree on; the ended-with-failures row keeps its own pass's
+        // partial meter until this sentence replaces it.
         self.replace_toolchain(Bar {
             text: BarText {
                 glyph: '\u{26a0}',
@@ -1303,7 +1530,7 @@ impl StatusBars {
                 stats: String::new(),
                 tone: Tone::Warn,
             },
-            fill,
+            fill: None,
             fold_at: Some(now + HOLD_WARN),
             stale_at: None,
             pass_id: None,
@@ -1357,26 +1584,57 @@ impl StatusBars {
         self.toolchain = Some(bar);
     }
 
+    /// The shell this window spawns, as the frozen-tab note's remedy is spelled
+    /// for ([`HookDialect`]); set once at construction from the spawn
+    /// configuration (`--shell` / config `shell` / `$SHELL`).
+    pub(crate) fn set_hook_shell(&mut self, shell: impl Into<HookDialect>) {
+        self.hook_shell = shell.into();
+    }
+
     /// `managed-current:` — every AGENT program (claude, codex) that is installed
     /// AND at the index pin, as atpkg lists it: `claude 2.1.267 (build 2026091001);
     /// codex 0.154.0 (build 2026091001)`. The row's TITLE names the programs the
     /// way a person knows them ("Claude Code 2.1.267 · Codex 0.154.0 —
-    /// aterm-managed, current"); the detail says what the parsed NAMES run and
-    /// carries the build ([`managed_current_words`]). Success, held
-    /// [`HOLD_MANAGED`], queued behind a pass row so both are read (R6,
-    /// 2026-09-10).
+    /// aterm-managed, current"); the detail says where the parsed NAMES run —
+    /// every aterm tab, this one included — and carries the build
+    /// ([`managed_current_words`]). Success, held [`HOLD_MANAGED`], queued behind
+    /// a pass row so both are read (R6, 2026-09-10).
     ///
-    /// ONCE PER TEXT PER LAUNCH: atpkg prints the marker on every pass, and the
-    /// recurring pass would otherwise raise the row — and move the grid — every
-    /// 6 h for nothing new. A repeat of the last text is recorded in the ledger
-    /// and not posted; the first pass after launch posts, as the owner wants to
-    /// see it at open.
-    pub(crate) fn toolchain_managed_current(&mut self, text: &str, now: Instant) {
-        let Some((title, detail)) = managed_current_words(text) else {
+    /// `frozen_tabs` (2026-09-16) is how many live tabs were adopted across the
+    /// update from a build whose sessions have no managed `agents/` on PATH
+    /// (`App::frozen_path_tabs`); for those the detail names the in-place remedy
+    /// — sourcing the atpkg hook, spelled for [`Self::set_hook_shell`]'s dialect
+    /// — instead of claiming this tab. `this_tab_hooked` (review, 2026-09-16)
+    /// is whether the shell integration RUNS in this window's tabs
+    /// (`App::this_tab_hooked`, the recorded runtime outcome): only its
+    /// per-prompt re-assert keeps `agents/` in front once the user's rc has
+    /// run, so a window whose integration failed is not told "this one too" —
+    /// the same honesty the seed pill keeps, on the same evidence.
+    ///
+    /// ONCE PER TEXT AND COUNT PER LAUNCH: atpkg prints the marker on every pass,
+    /// and the recurring pass would otherwise raise the row — and move the grid —
+    /// every 6 h for nothing new. A repeat of the last text with the same count
+    /// is recorded in the ledger and not posted; a changed count is a new row
+    /// (the note leaves when the last frozen tab does); the first pass after
+    /// launch posts, as the owner wants to see it at open.
+    pub(crate) fn toolchain_managed_current(
+        &mut self,
+        text: &str,
+        frozen_tabs: usize,
+        this_tab_hooked: bool,
+        now: Instant,
+    ) {
+        let Some((title, detail)) =
+            managed_current_words(text, frozen_tabs, this_tab_hooked, self.hook_shell)
+        else {
             return;
         };
         let key = text.trim();
-        if self.last_managed_current.as_deref() == Some(key) {
+        if self
+            .last_managed_current
+            .as_ref()
+            .is_some_and(|(last, count)| last == key && *count == frozen_tabs)
+        {
             self.record(LedgerRow {
                 lane: Lane::Toolchain,
                 title,
@@ -1386,26 +1644,56 @@ impl StatusBars {
             });
             return;
         }
-        self.last_managed_current = Some(key.to_string());
-        self.post_toolchain_terminal(
-            Bar {
-                text: BarText {
-                    glyph: '\u{2713}',
-                    title,
-                    detail,
-                    stats: String::new(),
-                    tone: Tone::Success,
-                },
-                fill: None,
-                fold_at: None,
-                stale_at: None,
-                pass_id: None,
-                staged_build: None,
-                health: false,
+        self.last_managed_current = Some((key.to_string(), frozen_tabs));
+        self.post_toolchain_terminal(Self::managed_current_bar(title, detail), HOLD_MANAGED, now);
+    }
+
+    /// THE COUNT CAUGHT UP WITH THE ROW (review, 2026-09-16). The atpkg launch
+    /// pass starts from `main_entry`, before the event loop, and on a warm
+    /// machine prints `managed-current:` within tens of milliseconds — while
+    /// the shells handed across a seamless update are adopted only at the
+    /// first park after first paint (`App::apply_pending_restore`). The count
+    /// the row is built with reads the pending adoptees too
+    /// (`App::frozen_path_tabs`), so the first row is right; this is the
+    /// backstop for an adoptee that did not register as it was counted (a
+    /// leaf that failed to rebuild, a shell the orphan net dropped): the last
+    /// posted text is run through again with the count the registry now
+    /// holds, and posts only when that count differs — the once-per-text-and-
+    /// count rule makes a changed count news and an unchanged one silence.
+    /// Returns whether a row was posted.
+    pub(crate) fn refresh_managed_current(
+        &mut self,
+        frozen_tabs: usize,
+        this_tab_hooked: bool,
+        now: Instant,
+    ) -> bool {
+        let Some((text, count)) = self.last_managed_current.clone() else {
+            return false;
+        };
+        if count == frozen_tabs {
+            return false;
+        }
+        self.toolchain_managed_current(&text, frozen_tabs, this_tab_hooked, now);
+        true
+    }
+
+    /// The managed-current row's bar, from its words.
+    fn managed_current_bar(title: String, detail: String) -> Bar {
+        Bar {
+            text: BarText {
+                glyph: '\u{2713}',
+                title,
+                detail,
+                stats: String::new(),
+                tone: Tone::Success,
             },
-            HOLD_MANAGED,
-            now,
-        );
+            fill: None,
+            fold_at: None,
+            stale_at: None,
+            pass_id: None,
+            staged_build: None,
+            health: false,
+        }
     }
 
     /// `machine-settings:` — the machine-level settings a pass CHANGED per
@@ -2255,13 +2543,36 @@ pub(crate) fn layout(text: &BarText, fill: Option<f32>, cols: usize) -> Layout {
 
 /// The managed-current row's words from the wire text, or `None` for an empty
 /// body. The title names the programs as a person knows them ("Claude Code
-/// 2.1.267 · Codex 0.154.0 — aterm-managed, current"); the detail says what
-/// the parsed NAMES run — "what `claude` and `codex` run in new tabs", one name
-/// "what `claude` runs in a new tab" — built from the wire and never hardcoded,
-/// so `gemini` reads as gemini. The builds ride the end: one distinct build
-/// "· build 2026091001", differing ones "· builds 2026091001 / 2026091002",
-/// nothing when the wire carried none.
-fn managed_current_words(text: &str) -> Option<(String, String)> {
+/// 2.1.267 · Codex 0.154.0 — aterm-managed, current"); the detail says where
+/// the parsed NAMES run — "what `claude` and `codex` run in every aterm tab,
+/// this one too", one name "what `claude` runs in every aterm tab, this one
+/// too" — built from the wire and never hardcoded, so `gemini` reads as gemini.
+/// The builds ride the end: one distinct build "· build 2026091001", differing
+/// ones "· builds 2026091001 / 2026091002", nothing when the wire carried none.
+///
+/// UNTIL 2026-09-16 the detail read "what `claude` and `codex` run in new tabs".
+/// Owner, that day, with the row on glass in a tab where `claude` was still the
+/// native installer's copy: "aterm atpkg DID install the latest but it didn't
+/// make them available for me. instead, it is telling me to open a new tab. NO!
+/// all the latest and best MUST WORK IN THE SAME TAB with live update! fix this
+/// and this message". The managed `agents/` is in front of every session's PATH
+/// from launch now (`spawn::managed_agents_dir`), and atpkg re-lays the twins in
+/// place, so the next invocation in ANY tab runs the build the row names — the
+/// row says so. The one exception is named rather than papered over:
+/// `frozen_tabs` live tabs adopted from a build before
+/// the self-healing sessions (the owner's tab, spawned by the
+/// previous build and carried across the update) keep the PATH they were born
+/// with; for them the detail reads "what `claude` and `codex` run in every aterm
+/// tab · builds … · 1 tab from before this update picks them up with
+/// `. ~/.aterm/shell.d/00-atpkg.zsh`" — the remedy is the command atpkg's own
+/// rc block runs, spelled for `hook` ([`HookDialect`]: why not `exec $SHELL`),
+/// said LAST so a cut keeps it ([`shape_detail`]).
+fn managed_current_words(
+    text: &str,
+    frozen_tabs: usize,
+    this_tab_hooked: bool,
+    hook: HookDialect,
+) -> Option<(String, String)> {
     let mut names: Vec<String> = Vec::new();
     let mut commands: Vec<String> = Vec::new();
     let mut builds: Vec<String> = Vec::new();
@@ -2308,10 +2619,25 @@ fn managed_current_words(text: &str) -> Option<(String, String)> {
     );
     let quoted: Vec<String> = commands.iter().map(|c| format!("`{c}`")).collect();
     let mut detail = match quoted.as_slice() {
-        [one] => format!("what {one} runs in a new tab"),
-        [head @ .., last] => format!("what {} and {last} run in new tabs", head.join(", ")),
+        [one] => format!("what {one} runs in every aterm tab"),
+        [head @ .., last] => {
+            format!("what {} and {last} run in every aterm tab", head.join(", "))
+        }
         [] => unreachable!("names and commands are pushed together"),
     };
+    // "THIS ONE TOO" IS SAID ON THE SAME EVIDENCE THE PILL USES (review,
+    // 2026-09-16): the seam's front position is undone by the user's rc, and
+    // only the integration's per-prompt re-assert restores it — so a window
+    // whose integration FAILED (unknown shell, unwritable loader cache) is told
+    // what the pill tells it, in the pill's words, instead of a claim about a
+    // tab that runs whichever `claude` its rc put first.
+    if !this_tab_hooked {
+        detail.push_str(
+            " \u{2014} but this shell isn't hooked up to them; see Settings \u{25b8} Packages",
+        );
+    } else if frozen_tabs == 0 {
+        detail.push_str(", this one too");
+    }
     match builds.as_slice() {
         [] => {}
         [one] => {
@@ -2323,6 +2649,23 @@ fn managed_current_words(text: &str) -> Option<(String, String)> {
             detail.push_str(&many.join(" / "));
         }
     }
+    // The remedy is the LAST clause, after the builds: what a cut keeps is the
+    // last clause carrying a command ([`command_anchor`]), and the builds are
+    // the part a person can do without.
+    if frozen_tabs > 0 {
+        detail.push_str(" \u{00b7} ");
+        detail.push_str(&frozen_tabs.to_string());
+        detail.push_str(if frozen_tabs == 1 { " tab" } else { " tabs" });
+        detail.push_str(" from before this update");
+        match hook.remedy() {
+            Some(command) => {
+                detail.push_str(if frozen_tabs == 1 { " picks" } else { " pick" });
+                detail.push_str(" them up with ");
+                detail.push_str(&command);
+            }
+            None => detail.push_str(": a new tab picks them up"),
+        }
+    }
     Some((title, shape_detail(&detail, DETAIL_CAP)))
 }
 
@@ -2331,7 +2674,9 @@ fn managed_current_words(text: &str) -> Option<(String, String)> {
 /// → **"Universal Control disabled"** with the undo in the detail — the
 /// pointer first (`aterm pkg doctor` prints the revert), then the revert
 /// command itself, byte-identical to [`atpkg::machine::UNIVERSAL_CONTROL_REVERT`],
-/// so a narrow row drops the command last of all; `spotlight-noindex N dir(s)
+/// as its own ` · ` piece: a row too narrow for both sheds the command WHOLE and
+/// keeps the pointer ([`shape_detail`]) — it never shows the front half of a
+/// `defaults` line and an ellipsis, which is not a revert; `spotlight-noindex N dir(s)
 /// migrated` → **"Spotlight: N build dirs moved to .noindex"**, no detail. An
 /// item this build does not know is its own title, verbatim. Info, `↻`.
 fn machine_setting_words(item: &str) -> BarText {
@@ -2511,11 +2856,11 @@ mod tests {
         );
     }
 
-    /// …while the inheritance that EARNED its place survives: a failure arriving over
-    /// this pass's own LIVE meter keeps it, so the reader sees how far the pass got
-    /// before it broke.
+    /// …and a failure arriving over a LIVE meter carries none either (2026-09-16): the
+    /// bar cannot tell whose pass a meter is — the tailer tails one shared file — so
+    /// nothing a marker replaces lends it a meter, whatever its value.
     #[test]
-    fn a_failure_row_keeps_the_live_meter_of_the_pass_it_reports() {
+    fn a_failure_row_carries_no_meter_over_a_live_one_either() {
         let mut bars = StatusBars::default();
         let now = t0();
         let snap = crate::PkgProgressSnapshot {
@@ -2531,9 +2876,88 @@ mod tests {
         bars.toolchain_failed("install failed — see Settings ▸ Packages", now);
         assert_eq!(
             bars.toolchain.as_ref().and_then(|b| b.fill),
-            live,
-            "the pass's own progress is the one honest thing to keep"
+            None,
+            "a failure row carries no meter — not even its own pass's"
         );
+    }
+
+    /// …and STAYS meterless when the tailer's final read lands on it. atpkg calls
+    /// `end_pass` before it prints `seed-partial:`, and the tailer's last read follows
+    /// the child's exit, so within one poll the ended snapshot and the marker arrive
+    /// in either order. The terminal branch of `toolchain_snapshot` used to complete
+    /// ANY terminal bar's meter, so the marker-first order painted "partly installed"
+    /// beside 100% about half the time on the likeliest real first-launch failure (a
+    /// full disk) — the 2026-09-11 contradiction reachable inside one pass (2026-09-15
+    /// audit). Both orders must render the same row; a sibling's ended row standing
+    /// when the marker arrives must lend it nothing; a Success row still completes.
+    #[test]
+    fn a_failure_row_is_never_completed_to_full_by_the_final_read_in_either_order() {
+        let ended = || {
+            let mut f = file(None, "net");
+            f.ended_unix = Some(1_700_000_100);
+            if let Some(trust) = f.programs.get_mut("trust") {
+                trust.phase = Phase::Failed;
+                trust.error = Some("no space left on device".into());
+            }
+            crate::PkgProgressSnapshot {
+                file: f,
+                running: false,
+            }
+        };
+        let live = crate::PkgProgressSnapshot {
+            file: file(Some(4242), "net"),
+            running: true,
+        };
+        // Marker first: the failure row (meterless) over the live meter, then the
+        // ended read.
+        let mut a = StatusBars::default();
+        let now = t0();
+        a.toolchain_snapshot(Some(&live), now);
+        let partial = a.toolchain.as_ref().and_then(|b| b.fill);
+        assert!(partial.is_some_and(|f| f > 0.0 && f < 1.0), "{partial:?}");
+        a.toolchain_failed("partly installed — see Settings ▸ Packages", now);
+        a.toolchain_snapshot(Some(&ended()), now);
+        let (_, bar_a) = a.bars().next().expect("a row");
+        assert_eq!(bar_a.text.tone, Tone::Warn);
+        assert_eq!(
+            bar_a.fill, None,
+            "the final read must not give a failure row a meter, full or partial"
+        );
+        assert!(bar_a.text.detail.contains("partly installed"));
+        // Ended read first: its Warn row keeps this pass's partial meter — a reading
+        // from the same file — and a SECOND ended read (the tailer's final read after
+        // the one that built the row) leaves it partial: the terminal branch's
+        // completion is gated on tone, and this is the one place that gate shows.
+        let mut b = StatusBars::default();
+        b.toolchain_snapshot(Some(&live), now);
+        b.toolchain_snapshot(Some(&ended()), now);
+        assert_eq!(
+            b.toolchain.as_ref().and_then(|x| x.fill),
+            partial,
+            "a pass that ended with failures does not claim a full meter"
+        );
+        b.toolchain_snapshot(Some(&ended()), now);
+        assert_eq!(
+            b.toolchain.as_ref().and_then(|x| x.fill),
+            partial,
+            "the final read must not round a Warn row's meter up to full"
+        );
+        // …until the marker replaces it, meterless — whoever's meter it was: a
+        // sibling window's holder whose ended row this child's tailer built, or the
+        // seed child's row under the update child, lends the marker nothing either,
+        // by the same rule.
+        b.toolchain_failed("partly installed — see Settings ▸ Packages", now);
+        let (_, bar_b) = b.bars().next().expect("a row");
+        assert_eq!(bar_b.fill, bar_a.fill, "both orders render the same meter");
+        assert_eq!(bar_b.text.detail, bar_a.text.detail);
+        // And a SUCCESS row still completes on the final read — the gate is on tone,
+        // not on being terminal. No path builds a success row short of full, so the
+        // meter is set by hand here to make the gate's other arm observable.
+        let mut c = StatusBars::default();
+        c.toolchain_ended("the pass finished; 12 ALab program(s) are installed", now);
+        c.toolchain.as_mut().expect("a success row").fill = Some(0.5);
+        c.toolchain_snapshot(Some(&ended()), now);
+        assert_eq!(c.toolchain.as_ref().and_then(|x| x.fill), Some(1.0));
     }
 
     fn file(running_pid: Option<u32>, pass: &str) -> atpkg::progress::ProgressFile {
@@ -2763,6 +3187,42 @@ mod tests {
     /// The store-lock wait row (2026-09-10): live, no meter, Info — the sibling's
     /// running snapshot replaces it with the real install, `None` clears it, an
     /// announcement replaces it, and a real refusal after the wait still wins.
+    /// A recorded tracked install is a Warn row that says INSTALLED — never "failed" —
+    /// and names doctor (2026-09-15).
+    #[test]
+    fn a_tracked_install_is_a_warn_row_that_names_doctor_not_a_failure() {
+        let mut bars = StatusBars::default();
+        let now = t0();
+        bars.toolchain_tracked_install(
+            "trust build 8595 — the untracked lane could not run (launchd submit failed)",
+            now,
+        );
+        let (_, bar) = bars.bars().next().expect("a row");
+        assert_eq!(bar.text.tone, Tone::Warn);
+        assert!(
+            bar.text
+                .detail
+                .contains("installed carrying com.apple.provenance"),
+            "{}",
+            bar.text.detail
+        );
+        assert!(
+            bar.text.detail.contains("aterm pkg doctor"),
+            "{}",
+            bar.text.detail
+        );
+        // The CAUSE may say "failed" (a launchd submit did); the row's own sentence
+        // never calls the install one.
+        assert!(
+            !bar.text
+                .detail
+                .to_ascii_lowercase()
+                .contains("install failed"),
+            "{}",
+            bar.text.detail
+        );
+    }
+
     #[test]
     fn a_lock_wait_opens_a_live_waiting_row_that_progress_replaces_and_none_clears() {
         let mut bars = StatusBars::default();
@@ -2872,7 +3332,7 @@ mod tests {
     fn a_wait_behind_a_held_row_takes_the_lane_when_that_row_folds() {
         let now = t0();
         let mut bars = StatusBars::default();
-        bars.toolchain_managed_current("claude 2.1.267 (build 2026091001)", now);
+        bars.toolchain_managed_current("claude 2.1.267 (build 2026091001)", 0, true, now);
         bars.toolchain_waiting(now + Duration::from_secs(2));
         assert_eq!(bars.rows(), 1);
         assert_eq!(
@@ -2902,7 +3362,7 @@ mod tests {
         // Behind a held row AND a queued terminal row: the queue goes first.
         let mut bars = StatusBars::default();
         bars.toolchain_deferred("another install is still running", now);
-        bars.toolchain_managed_current("claude 2.1.267 (build 2026091001)", now);
+        bars.toolchain_managed_current("claude 2.1.267 (build 2026091001)", 0, true, now);
         bars.toolchain_waiting(now + Duration::from_secs(5));
         assert!(bars.settle(now + HOLD_NOTICE));
         assert_eq!(bars.bars().next().unwrap().1.text.glyph, '\u{2713}');
@@ -2939,7 +3399,7 @@ mod tests {
             }),
         ] {
             let mut bars = StatusBars::default();
-            bars.toolchain_managed_current("claude 2.1.267 (build 2026091001)", now);
+            bars.toolchain_managed_current("claude 2.1.267 (build 2026091001)", 0, true, now);
             bars.toolchain_waiting(now + Duration::from_secs(2));
             terminal(&mut bars, now + Duration::from_secs(3));
             // Long enough for every hold in the lane to run out.
@@ -3053,7 +3513,7 @@ mod tests {
         assert!(!bars.settle(now + WAIT_STALE), "nothing left to fold");
         // Remembered behind a held row: the row stands, the wait is forgotten.
         let mut bars = StatusBars::default();
-        bars.toolchain_managed_current("claude 2.1.267 (build 2026091001)", now);
+        bars.toolchain_managed_current("claude 2.1.267 (build 2026091001)", 0, true, now);
         bars.toolchain_waiting(now + Duration::from_secs(2));
         bars.toolchain_wait_over();
         assert_eq!(bars.bars().next().unwrap().1.text.glyph, '\u{2713}');
@@ -3176,10 +3636,28 @@ mod tests {
             t0(),
         );
         let bar = bars.bars().next().unwrap().1;
-        assert_eq!(bar.text.title, "Preparing the ALab toolchain");
+        // A seed pass MOVING programs is an install and says so, like its announcement;
+        // only a seed with nothing to lay is "Preparing" (2026-09-15).
+        assert_eq!(bar.text.title, "Installing the ALab toolchain");
         let fill = bar
             .fill
             .expect("the extract meter stands in for a silent rollup");
+        let mut quiet = file(Some(7), "seed");
+        quiet.overall.programs_total = 0;
+        quiet.overall.programs_done = 0;
+        quiet.overall.bytes_total = 0;
+        quiet.overall.bytes_done = 0;
+        let mut quiet_bars = StatusBars::default();
+        quiet_bars.toolchain_snapshot(
+            Some(&crate::PkgProgressSnapshot {
+                file: quiet,
+                running: true,
+            }),
+            t0(),
+        );
+        if let Some((_, quiet_bar)) = quiet_bars.bars().next() {
+            assert_eq!(quiet_bar.text.title, "Preparing the ALab toolchain");
+        }
         assert!((fill - 120.0 / 900.0).abs() < 1e-3);
         assert_eq!(bar.text.stats, "3 of 10");
     }
@@ -3256,7 +3734,7 @@ mod tests {
         let now = t0();
         bars.toolchain_snapshot(Some(&snap(true)), now);
         bars.toolchain_installed(
-            "✓ ALab toolchain installed: ay, trust — open a new tab to use them",
+            "✓ ALab toolchain installed: ay, trust — ready in every aterm tab, this one too",
             now,
         );
         // The tailer's final read lands AFTER the marker: it may complete the
@@ -3272,7 +3750,11 @@ mod tests {
         );
         let bar = bars.bars().next().unwrap().1;
         assert_eq!(bar.text.title, "ALab toolchain installed");
-        assert!(bar.text.detail.contains("open a new tab"));
+        assert!(
+            bar.text
+                .detail
+                .contains("ready in every aterm tab, this one too")
+        );
         assert_eq!(bar.fill, Some(1.0));
         // …and the vanished-file clear keeps the last words too.
         bars.toolchain_snapshot(None, now);
@@ -3390,11 +3872,13 @@ mod tests {
         let mut bars = StatusBars::default();
         let now = t0();
         bars.toolchain_installed(
-            "\u{2713} ALab toolchain installed: claude, codex \u{2014} open a new tab to use them",
+            "\u{2713} ALab toolchain installed: claude, codex \u{2014} claude and codex already run in every aterm tab, this one too",
             now,
         );
         bars.toolchain_managed_current(
             "claude 2.1.267 (build 2026091001); codex 0.154.0 (build 2026091001)",
+            0,
+            true,
             now,
         );
         bars.toolchain_machine_settings(
@@ -3454,7 +3938,7 @@ mod tests {
         assert_eq!(bar.text.glyph, '\u{2713}');
         assert_eq!(
             bar.text.detail,
-            "what `claude` and `codex` run in new tabs \u{00b7} build 2026091001"
+            "what `claude` and `codex` run in every aterm tab, this one too \u{00b7} build 2026091001"
         );
         assert_eq!(
             bar.fold_at,
@@ -3488,7 +3972,7 @@ mod tests {
     fn the_managed_and_machine_rows_render_their_words() {
         let now = t0();
         let mut bars = StatusBars::default();
-        bars.toolchain_managed_current("claude 2.1.267 (build 2026091001)", now);
+        bars.toolchain_managed_current("claude 2.1.267 (build 2026091001)", 0, true, now);
         assert_eq!(bars.rows(), 1);
         let (_, bar) = bars.bars().next().unwrap();
         assert_eq!(
@@ -3496,26 +3980,27 @@ mod tests {
             "Claude Code 2.1.267 \u{2014} aterm-managed, current"
         );
         assert_eq!(
-            bar.text.detail, "what `claude` runs in a new tab \u{00b7} build 2026091001",
+            bar.text.detail,
+            "what `claude` runs in every aterm tab, this one too \u{00b7} build 2026091001",
             "one name reads singular"
         );
         assert_eq!(bar.fold_at, Some(now + HOLD_MANAGED));
         assert_eq!(bar.fill, None, "a notice carries no meter");
 
         let mut bars = StatusBars::default();
-        bars.toolchain_managed_current("gemini; codex 0.154.0", now);
+        bars.toolchain_managed_current("gemini; codex 0.154.0", 0, true, now);
         let (_, bar) = bars.bars().next().unwrap();
         assert_eq!(
             bar.text.title,
             "gemini \u{00b7} Codex 0.154.0 \u{2014} aterm-managed, current"
         );
         assert_eq!(
-            bar.text.detail, "what `gemini` and `codex` run in new tabs",
+            bar.text.detail, "what `gemini` and `codex` run in every aterm tab, this one too",
             "the names are the wire's, never a hardcoded pair; no builds, no build clause"
         );
 
         let mut bars = StatusBars::default();
-        bars.toolchain_managed_current("  ;  ", now);
+        bars.toolchain_managed_current("  ;  ", 0, true, now);
         assert_eq!(bars.rows(), 0, "an empty body raises nothing");
 
         let mut bars = StatusBars::default();
@@ -3542,7 +4027,7 @@ mod tests {
         // over and this is its newest truth — rather than queueing behind it.
         let mut bars = StatusBars::default();
         bars.toolchain_announced("installing 2 program(s) (about 1 GB)", now);
-        bars.toolchain_managed_current("codex 0.154.0 (build 2026091001)", now);
+        bars.toolchain_managed_current("codex 0.154.0 (build 2026091001)", 0, true, now);
         assert_eq!(bars.rows(), 1);
         assert!(
             bars.bars()
@@ -3565,7 +4050,7 @@ mod tests {
         let now = t0();
         let mut bars = StatusBars::default();
         let wire = "claude 2.1.267 (build 2026091001); codex 0.154.0 (build 2026091001)";
-        bars.toolchain_managed_current(wire, now);
+        bars.toolchain_managed_current(wire, 0, true, now);
         assert_eq!(bars.rows(), 1, "the first pass after launch posts");
         assert!(bars.settle(now + HOLD_MANAGED));
         assert_eq!(bars.rows(), 0);
@@ -3573,7 +4058,7 @@ mod tests {
 
         // Six hours on: the same text, with or without whitespace around it.
         let later = now + Duration::from_secs(6 * 3600);
-        bars.toolchain_managed_current(&format!("  {wire} "), later);
+        bars.toolchain_managed_current(&format!("  {wire} "), 0, true, later);
         assert_eq!(bars.rows(), 0, "no row, no grid move");
         let rows: Vec<_> = bars.ledger().collect();
         assert_eq!(rows.len(), 2, "but the pass is on the record");
@@ -3584,6 +4069,8 @@ mod tests {
         // A new version: a new row.
         bars.toolchain_managed_current(
             "claude 2.1.268 (build 2026091002); codex 0.154.0 (build 2026091001)",
+            0,
+            true,
             later,
         );
         assert_eq!(bars.rows(), 1);
@@ -3591,12 +4078,14 @@ mod tests {
         assert!(bar.text.title.starts_with("Claude Code 2.1.268"));
         assert_eq!(
             bar.text.detail,
-            "what `claude` and `codex` run in new tabs \u{00b7} builds 2026091002 / 2026091001",
+            "what `claude` and `codex` run in every aterm tab, this one too \u{00b7} builds 2026091002 / 2026091001",
             "differing builds are listed"
         );
         // And a repeat of THAT is ledger-only again.
         bars.toolchain_managed_current(
             "claude 2.1.268 (build 2026091002); codex 0.154.0 (build 2026091001)",
+            0,
+            true,
             later,
         );
         assert!(
@@ -3604,6 +4093,321 @@ mod tests {
             "nothing queued behind the live row"
         );
         assert_eq!(bars.ledger().count(), 3);
+    }
+
+    /// THE FROZEN-TAB NOTE, AND A CHANGED COUNT IS A NEW ROW (2026-09-16). The
+    /// owner's tab was spawned by the previous build and carried across the
+    /// update with the PATH it was born with — no managed `agents/` — while the
+    /// row said "run in new tabs" ("NO! all the latest and best MUST WORK IN THE
+    /// SAME TAB with live update!"). With such tabs alive the detail must not
+    /// claim "this one too"; it names them and the in-place remedy — sourcing
+    /// the atpkg hook, which is what atpkg's own rc block does and keeps the
+    /// tab's integration (review, 2026-09-16: `exec $SHELL` re-execs without the
+    /// `ZDOTDIR` wrapper and heals only through an rc block that may not exist).
+    /// The same wire text with the same count is ledger-only, as before; when
+    /// the last frozen tab closes, the next pass's row — same text, count 0 —
+    /// POSTS, because the row without the note is the new truth.
+    #[test]
+    fn the_managed_row_names_the_frozen_tabs_and_reposts_when_their_count_changes() {
+        let now = t0();
+        let mut bars = StatusBars::default();
+        let wire = "claude 2.1.273 (build 2026091601); codex 0.154.0 (build 2026091001)";
+        bars.toolchain_managed_current(wire, 1, true, now);
+        assert_eq!(bars.rows(), 1);
+        let (_, bar) = bars.bars().next().unwrap();
+        assert_eq!(
+            bar.text.title,
+            "Claude Code 2.1.273 \u{00b7} Codex 0.154.0 \u{2014} aterm-managed, current"
+        );
+        assert_eq!(
+            bar.text.detail,
+            "what `claude` and `codex` run in every aterm tab \u{00b7} builds 2026091601 / \
+             2026091001 \u{00b7} 1 tab from before this update picks them up with \
+             `. ~/.aterm/shell.d/00-atpkg.zsh`"
+        );
+        assert!(
+            !bar.text.detail.contains("this one too"),
+            "no claim on a tab that may be frozen"
+        );
+        assert!(
+            !bar.text.detail.contains("exec"),
+            "never `exec $SHELL`: it drops the tab's integration and needs an rc block"
+        );
+        // Same text, same count: ledger-only.
+        bars.toolchain_managed_current(wire, 1, true, now);
+        assert!(bars.toolchain_queue.is_empty());
+        assert_eq!(bars.ledger().count(), 1);
+        assert!(bars.settle(now + HOLD_MANAGED));
+        assert_eq!(bars.rows(), 0);
+
+        // Two frozen tabs (a second window's adopted shell): plural, and a new row.
+        let later = now + Duration::from_secs(6 * 3600);
+        bars.toolchain_managed_current(wire, 2, true, later);
+        assert_eq!(bars.rows(), 1, "a changed count is a new row");
+        let (_, bar) = bars.bars().next().unwrap();
+        assert!(
+            bar.text.detail.contains(
+                "\u{00b7} 2 tabs from before this update pick them up with \
+                 `. ~/.aterm/shell.d/00-atpkg.zsh`"
+            ),
+            "{}",
+            bar.text.detail
+        );
+        assert!(bars.settle(later + HOLD_MANAGED));
+
+        // The last frozen tab closed: the plain row posts once, then repeats are
+        // ledger-only again.
+        let latest = later + Duration::from_secs(6 * 3600);
+        bars.toolchain_managed_current(wire, 0, true, latest);
+        assert_eq!(bars.rows(), 1, "the note's departure is news");
+        let (_, bar) = bars.bars().next().unwrap();
+        assert_eq!(
+            bar.text.detail,
+            "what `claude` and `codex` run in every aterm tab, this one too \u{00b7} builds \
+             2026091601 / 2026091001"
+        );
+        bars.toolchain_managed_current(wire, 0, true, latest);
+        assert!(bars.toolchain_queue.is_empty());
+        assert_eq!(bars.ledger().count(), 4);
+
+        // One name, frozen: the same note.
+        let mut bars = StatusBars::default();
+        bars.toolchain_managed_current("claude 2.1.273 (build 2026091601)", 1, true, now);
+        let (_, bar) = bars.bars().next().unwrap();
+        assert_eq!(
+            bar.text.detail,
+            "what `claude` runs in every aterm tab \u{00b7} build 2026091601 \u{00b7} 1 tab from \
+             before this update picks them up with `. ~/.aterm/shell.d/00-atpkg.zsh`"
+        );
+    }
+
+    /// THE REMEDY IS SPELLED FOR THE SHELL THIS WINDOW SPAWNS (2026-09-16): the
+    /// hook atpkg writes has one file per dialect (`crates/atpkg/src/hooks.rs`
+    /// `hook_files`: `.zsh`, `.bash`, `.fish`, `.ps1`), sourced the way that
+    /// shell sources — POSIX `.`, fish's `source`, PowerShell's dot-source — and
+    /// a shell atpkg has no hook for is told the truth: a new tab.
+    #[test]
+    fn the_frozen_tab_remedy_is_the_hook_in_the_spawn_shells_dialect() {
+        use aterm_core::shell_integration::ShellType;
+        let wire = "claude 2.1.273 (build 2026091601)";
+        let note = |shell: HookDialect| {
+            let mut bars = StatusBars::default();
+            bars.set_hook_shell(shell);
+            bars.toolchain_managed_current(wire, 1, true, t0());
+            let (_, bar) = bars.bars().next().unwrap();
+            bar.text
+                .detail
+                .split(" \u{00b7} ")
+                .last()
+                .unwrap()
+                .to_string()
+        };
+        assert_eq!(
+            note(HookDialect::Zsh),
+            "1 tab from before this update picks them up with `. ~/.aterm/shell.d/00-atpkg.zsh`"
+        );
+        assert_eq!(
+            note(HookDialect::Bash),
+            "1 tab from before this update picks them up with `. ~/.aterm/shell.d/00-atpkg.bash`"
+        );
+        assert_eq!(
+            note(HookDialect::Fish),
+            "1 tab from before this update picks them up with `source ~/.aterm/shell.d/00-atpkg.fish`"
+        );
+        assert_eq!(
+            note(HookDialect::PowerShell),
+            "1 tab from before this update picks them up with `. ~/.aterm/shell.d/00-atpkg.ps1`"
+        );
+        assert_eq!(
+            note(HookDialect::None),
+            "1 tab from before this update: a new tab picks them up"
+        );
+        // The default is zsh — macOS's login shell — and the app's spawn shell
+        // maps onto the dialects; anything atpkg has no hook for is `None`.
+        assert_eq!(HookDialect::default(), HookDialect::Zsh);
+        assert_eq!(HookDialect::from(ShellType::Bash), HookDialect::Bash);
+        assert_eq!(HookDialect::from(ShellType::Fish), HookDialect::Fish);
+        assert_eq!(
+            HookDialect::from(ShellType::PowerShell),
+            HookDialect::PowerShell
+        );
+        assert_eq!(HookDialect::from(ShellType::Unknown), HookDialect::None);
+        assert_eq!(HookDialect::from(ShellType::Cmd), HookDialect::None);
+        // A WSL tab is a Linux bash whose `$HOME/.aterm/shell.d` is the DISTRO's
+        // home, where the Windows-side atpkg writes nothing: `. ~/.aterm/shell.d/
+        // 00-atpkg.bash` there is "No such file", so the honest note for it is
+        // the new tab, not bash's remedy (review, 2026-09-16, refuted mapping).
+        assert_eq!(HookDialect::from(ShellType::Wsl), HookDialect::None);
+        // The file name is atpkg's, never a spelling of our own.
+        assert_eq!(atpkg::hooks::HOOK_BASENAME, "00-atpkg");
+    }
+
+    /// "THIS ONE TOO" ON THE PILL'S EVIDENCE (review, 2026-09-16). The seed pill
+    /// withholds every promise for a window whose shell integration failed
+    /// (unknown shell, unwritable loader cache), because only the integration's
+    /// per-prompt re-assert keeps `agents/` in front once the rc has run — and
+    /// the managed row said "this one too" for the same window 15 s later, with
+    /// `claude` there being `~/.local/bin/claude`. The row now takes the same
+    /// bit and says the pill's sentence; with the integration running it is the
+    /// row it was. The ledger key is text-and-count, so the bit changes no
+    /// posting rule.
+    #[test]
+    fn the_managed_row_stops_claiming_this_tab_when_integration_failed() {
+        let now = t0();
+        let wire = "claude 2.1.273 (build 2026091601); codex 0.154.0 (build 2026091001)";
+        let mut bars = StatusBars::default();
+        bars.toolchain_managed_current(wire, 0, false, now);
+        assert_eq!(bars.rows(), 1);
+        let (_, bar) = bars.bars().next().unwrap();
+        assert_eq!(
+            bar.text.detail,
+            "what `claude` and `codex` run in every aterm tab \u{2014} but this shell isn't \
+             hooked up to them; see Settings \u{25b8} Packages \u{00b7} builds 2026091601 / \
+             2026091001"
+        );
+        assert!(
+            !bar.text.detail.contains("this one too"),
+            "{}",
+            bar.text.detail
+        );
+        // With frozen tabs alive as well, the note still comes last.
+        let mut bars = StatusBars::default();
+        bars.toolchain_managed_current(wire, 1, false, now);
+        let (_, bar) = bars.bars().next().unwrap();
+        assert!(
+            bar.text.detail.contains("isn't hooked up to them")
+                && bar.text.detail.ends_with(
+                    "\u{00b7} 1 tab from before this update picks them up with \
+                     `. ~/.aterm/shell.d/00-atpkg.zsh`"
+                ),
+            "{}",
+            bar.text.detail
+        );
+        // A hooked-up window: the claim, as before.
+        let mut bars = StatusBars::default();
+        bars.toolchain_managed_current(wire, 0, true, now);
+        let (_, bar) = bars.bars().next().unwrap();
+        assert!(
+            bar.text.detail.contains(", this one too"),
+            "{}",
+            bar.text.detail
+        );
+        assert!(
+            !bar.text.detail.contains("hooked up"),
+            "{}",
+            bar.text.detail
+        );
+    }
+
+    /// THE REFRESH POSTS ONLY A CHANGED COUNT (review, 2026-09-16): the launch
+    /// pass can print `managed-current:` before the handed-off shells are
+    /// adopted, so after the adoption the app runs the last text through again
+    /// with the registry's count. Nothing posted yet ⇒ nothing to refresh; the
+    /// same count ⇒ silence (not even a ledger row — the pass that printed the
+    /// text already wrote one); a changed count ⇒ the row, with the note.
+    #[test]
+    fn the_managed_row_refresh_posts_only_when_the_frozen_count_changed() {
+        let now = t0();
+        let wire = "claude 2.1.273 (build 2026091601)";
+        let mut bars = StatusBars::default();
+        assert!(
+            !bars.refresh_managed_current(1, true, now),
+            "nothing posted yet"
+        );
+        assert_eq!(bars.rows(), 0);
+        assert_eq!(bars.ledger().count(), 0);
+        bars.toolchain_managed_current(wire, 0, true, now);
+        assert_eq!(bars.rows(), 1);
+        assert!(bars.settle(now + HOLD_MANAGED));
+        assert!(
+            !bars.refresh_managed_current(0, true, now),
+            "same count: silence"
+        );
+        assert_eq!(bars.rows(), 0);
+        assert_eq!(bars.ledger().count(), 1);
+        let later = now + Duration::from_secs(1);
+        assert!(
+            bars.refresh_managed_current(1, true, later),
+            "a changed count is news"
+        );
+        assert_eq!(bars.rows(), 1);
+        let (_, bar) = bars.bars().next().unwrap();
+        assert_eq!(
+            bar.text.detail,
+            "what `claude` runs in every aterm tab \u{00b7} build 2026091601 \u{00b7} 1 tab from \
+             before this update picks them up with `. ~/.aterm/shell.d/00-atpkg.zsh`"
+        );
+        assert!(!bars.refresh_managed_current(1, true, later), "and once");
+    }
+
+    /// THE REMEDY SURVIVES THE CUT (2026-09-16). At 80 cols the frozen-tab row
+    /// has fewer than [`DETAIL_FLOOR`] cells after its head, so — as for every
+    /// detail — nothing is stubbed. At 120 cols the detail must be cut, and what
+    /// survives is the clause a person acts on: the tab count and the hook line,
+    /// not the program names in front of it. The command is whole wherever the
+    /// room after the head holds it plus the ellipsis; below that — the room is
+    /// narrower than the 33-character command — its head is what is kept, from
+    /// the backtick, so the path is still recognisable.
+    #[test]
+    fn the_frozen_tab_note_keeps_its_command_at_120_cols_and_drops_whole_at_80() {
+        let title = "Claude Code 2.1.273 \u{00b7} Codex 0.154.0 \u{2014} aterm-managed, current";
+        let command = "`. ~/.aterm/shell.d/00-atpkg.zsh`";
+        let (_, detail) = managed_current_words(
+            "claude 2.1.273 (build 2026091601); codex 0.154.0 (build 2026091001)",
+            1,
+            true,
+            HookDialect::Zsh,
+        )
+        .unwrap();
+        assert!(detail.ends_with(command), "{detail}");
+        let text = BarText {
+            glyph: '\u{2713}',
+            title: title.into(),
+            detail,
+            stats: String::new(),
+            tone: Tone::Success,
+        };
+        let l = layout(&text, None, 80);
+        assert_eq!(l.title, title);
+        assert!(l.detail.is_none(), "{:?}", l.detail);
+        let l = layout(&text, None, 120);
+        let (col, d) = l.detail.clone().expect("a detail at 120 cols");
+        assert_eq!(
+            d, "1 tab from before\u{2026} `. ~/.aterm/shell.d/00-atpkg.zsh`",
+            "the count and the whole command; the names and builds gave way"
+        );
+        assert!(col + d.chars().count() <= 120 - MARGIN, "{d}");
+        // Every width from the floor up keeps the command whole once the room
+        // holds it; narrower, its head from the backtick.
+        let head = 2 * MARGIN + 2 + title.chars().count() + 2;
+        for cols in (head + DETAIL_FLOOR)..200 {
+            let l = layout(&text, None, cols);
+            let (col, d) = l.detail.clone().expect("a detail at or above the floor");
+            if cols - head >= command.chars().count() + 2 {
+                assert!(d.contains(command), "cols {cols}: {d}");
+            } else {
+                assert!(d.starts_with("`. ~/.aterm/shell.d"), "cols {cols}: {d}");
+            }
+            assert!(col + d.chars().count() <= cols - MARGIN, "cols {cols}: {d}");
+        }
+        // The shaper alone, at the caps the row reaches: sentence first, then
+        // the command's own words, then the command's head.
+        let long = "what `claude` and `codex` run in every aterm tab \u{00b7} 1 tab from before \
+                    this update picks them up with `. ~/.aterm/shell.d/00-atpkg.zsh`";
+        assert_eq!(
+            shape_detail(long, 90),
+            "what\u{2026} 1 tab from before this update picks them up with \
+             `. ~/.aterm/shell.d/00-atpkg.zsh`"
+        );
+        assert_eq!(
+            shape_detail(long, 70),
+            "1 tab from before this update picks\u{2026} `. ~/.aterm/shell.d/00-atpkg.zsh`"
+        );
+        let floor = shape_detail(long, 20);
+        assert!(
+            floor.starts_with("`. ~/.aterm/shell.d") && floor.ends_with('\u{2026}'),
+            "{floor}"
+        );
     }
 
     /// MACHINE SETTINGS: ONE ROW PER CHANGED ITEM, THE UNDO-BEARING ONE FIRST,
@@ -3616,10 +4420,10 @@ mod tests {
         let now = t0();
         let mut bars = StatusBars::default();
         bars.toolchain_installed(
-            "\u{2713} ALab toolchain installed: claude, codex \u{2014} open a new tab to use them",
+            "\u{2713} ALab toolchain installed: claude, codex \u{2014} claude and codex already run in every aterm tab, this one too",
             now,
         );
-        bars.toolchain_managed_current("claude 2.1.267 (build 2026091001)", now);
+        bars.toolchain_managed_current("claude 2.1.267 (build 2026091001)", 0, true, now);
         bars.toolchain_machine_settings(
             "spotlight-noindex 1 dir(s) migrated; something-new tuned; universal-control disabled",
             now,
@@ -4517,7 +5321,7 @@ mod tests {
         let text = BarText {
             glyph: '\u{2713}',
             title: title.into(),
-            detail: "what `claude` and `codex` run in new tabs \u{00b7} build 2026091001".into(),
+            detail: "what `claude` and `codex` run in every aterm tab, this one too \u{00b7} build 2026091001".into(),
             stats: String::new(),
             tone: Tone::Success,
         };
@@ -4554,7 +5358,9 @@ mod tests {
             assert!(d.contains("`aterm pkg doctor`"), "cols {cols}: {d}");
             assert!(col + d.chars().count() <= cols - MARGIN, "cols {cols}: {d}");
         }
-        // 28 cells of head, 183 of detail (both deletes): whole from 212 cols.
+        // 28 cells of head, 2 of gap, 183 of detail (both deletes), inside the two
+        // margins: whole from 215 cols (asserted exactly in
+        // `a_detail_sheds_whole_pieces_before_it_cuts_inside_one`).
         let l = layout(&undo, None, 240);
         assert!(
             l.detail
@@ -4575,6 +5381,102 @@ mod tests {
         let (col, d) = l.detail.unwrap();
         assert!(d.ends_with('\u{2026}') && d.starts_with("xxxx"));
         assert_eq!(col + d.chars().count(), 60 - MARGIN);
+    }
+
+    /// The undo row on a 130-column window read `↻ Universal Control disabled
+    /// \`aterm pkg doctor\` prints the revert · defaults…` (2026-09-15, an Intel
+    /// MacBook Pro): the pointer's prose was cut and the revert command shown by
+    /// its front half, which is not a revert and reads as an error. Pinned: a
+    /// detail of ` · ` pieces sheds its trailing pieces whole — the command goes
+    /// entirely or stays entirely — and only cuts inside a piece once the piece
+    /// with the pointer is itself too long; a detail without a command, and a
+    /// command-first detail whose figure trails it, keep their old shapes.
+    #[test]
+    fn a_detail_sheds_whole_pieces_before_it_cuts_inside_one() {
+        let pointer = "undo: `aterm pkg doctor` prints the revert";
+        let detail = format!(
+            "{pointer} \u{00b7} {}",
+            atpkg::machine::UNIVERSAL_CONTROL_REVERT
+        );
+        let revert_len = atpkg::machine::UNIVERSAL_CONTROL_REVERT.chars().count();
+        assert!(
+            revert_len > 100,
+            "the revert is the long piece: {revert_len}"
+        );
+        // Whole when it fits.
+        assert_eq!(shape_detail(&detail, 300), detail);
+        // One cell short of whole down to exactly the pointer: the pointer, whole,
+        // and not one character of the command.
+        let whole = detail.chars().count();
+        for cap in [whole - 1, whole - 40, pointer.chars().count()] {
+            assert_eq!(shape_detail(&detail, cap), pointer, "cap {cap}");
+        }
+        // Narrower than the pointer: the old cut, inside the pointer, with its
+        // command — never the front of the revert.
+        let cut = shape_detail(&detail, 30);
+        assert!(
+            cut.starts_with("`aterm pkg doctor`") && cut.ends_with('\u{2026}'),
+            "{cut}"
+        );
+        assert!(!cut.contains("defaults"), "{cut}");
+        // Through the width law, at the measured window: the drawn detail is the
+        // pointer and ends on a word, not on `defaults…`.
+        let undo = BarText {
+            glyph: '\u{21bb}',
+            title: "Universal Control disabled".into(),
+            detail: detail.clone(),
+            stats: String::new(),
+            tone: Tone::Info,
+        };
+        for cols in [90usize, 110, 130, 150, 200] {
+            let (col, d) = layout(&undo, None, cols)
+                .detail
+                .expect("the undo row keeps a detail");
+            assert_eq!(d, pointer, "cols {cols}");
+            assert!(col + d.chars().count() <= cols - MARGIN, "cols {cols}");
+        }
+        // The boundary, exactly: the two margins, the glyph and its space, the
+        // title, the gap, and the whole detail. One cell narrower sheds the
+        // command whole; at the boundary the revert is drawn entire.
+        let whole = 2 * MARGIN + 2 + undo.title.chars().count() + 2 + detail.chars().count();
+        assert_eq!(whole, 215, "the undo row's whole width, in cells");
+        let at = layout(&undo, None, whole)
+            .detail
+            .expect("whole at the boundary");
+        assert_eq!(at.1, detail, "at {whole} cols the revert is drawn entire");
+        let under = layout(&undo, None, whole - 1)
+            .detail
+            .expect("the pointer one cell under");
+        assert_eq!(
+            under.1,
+            pointer,
+            "at {} cols the command is shed whole",
+            whole - 1
+        );
+        // The shed anchor is the cut's anchor: a `Run \`…\`` sentence outranks an
+        // earlier backtick, so a two-command detail keeps its Run sentence and
+        // sheds the figure after it, never the sentence.
+        let two = "see `aterm pkg doctor` \u{00b7} Run `aterm pkg repair` now \u{00b7} build 3";
+        assert_eq!(
+            shape_detail(two, 60),
+            "see `aterm pkg doctor` \u{00b7} Run `aterm pkg repair` now"
+        );
+        // A trailing figure sheds the same way, and the command-first cut inside
+        // the remaining piece is unchanged from before.
+        let managed = "what `claude` and `codex` run in new tabs \u{00b7} build 2026091001";
+        assert_eq!(
+            shape_detail(managed, 45),
+            "what `claude` and `codex` run in new tabs"
+        );
+        let cut = shape_detail(managed, 25);
+        assert!(
+            cut.starts_with("`claude` and `codex`") && cut.ends_with('\u{2026}'),
+            "{cut}"
+        );
+        // No command: pieces are not shed, the right truncation stands.
+        let plain = format!("{} \u{00b7} {}", "x".repeat(30), "y".repeat(30));
+        let head: String = plain.chars().take(40).collect();
+        assert_eq!(shape_detail(&plain, 40), format!("{head}\u{2026}"));
     }
 
     #[test]

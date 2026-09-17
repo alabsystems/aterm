@@ -8,11 +8,15 @@
 //! fish-breaking stray `.sh`, a world-writable login-sourced dir) is a PROBLEM → nonzero
 //! exit. Everything advisory (bin not yet on PATH, a frozen-looking index, a foreign
 //! sysroot wiring) stays a WARNING → exit 0. One kind of warning also withholds the
-//! word "healthy": a managed tool that cannot run (today, tippy refused by the Trust
-//! bundle's own `rustc` and `trustc`) is not a structural fault this machine can repair,
-//! and not health either, so the report ends "not healthy" and still exits 0. It reads no
-//! unverified index/manifest (verify-before-parse): its freshness surface reads atpkg's
-//! OWN `status.toml` + the durable [`crate::sig::Floor`].
+//! word "healthy": a managed tool that cannot run (today, tippy refused by its own Trust
+//! bundle — a `trustc` that is a symbolic link, or a `bin/rustc` that is a separate file
+//! from `trustc` with no exec root routing the shims past it), or one doctor cannot show
+//! to run (an exec root that differs from its build, a build it cannot read), is not a
+//! structural fault in the store, and not health either, so the report ends "not healthy"
+//! — counting each kind under its own words — and still exits 0, with the warn naming its
+//! own fix. It reads no unverified index/manifest
+//! (verify-before-parse): its freshness surface reads atpkg's OWN `status.toml` + the
+//! durable [`crate::sig::Floor`].
 
 use std::ffi::OsStr;
 use std::path::{Path, PathBuf};
@@ -43,9 +47,11 @@ const GIB: u64 = 1 << 30;
 ///   the tombstone shim with a real symlink.
 ///
 /// Deliberately NOT a fault: `active`, `dev-linked (skipped)` (a §13 hard-skip the user
-/// asked for), and any future informational state. The list is allow-by-prefix so an
-/// unrecognized state reads as benign rather than as a failure — a diagnostic that invents
-/// faults from states it does not understand trains people to ignore it.
+/// asked for), `held: …` (a tuple whose new pin is not published for this target, staying
+/// whole on its current builds), and any future informational state. The list is
+/// allow-by-prefix so an unrecognized state reads as benign rather than as a failure — a
+/// diagnostic that invents faults from states it does not understand trains people to
+/// ignore it.
 fn is_problem_state(state: &str) -> bool {
     state.starts_with("error:")
         || state.starts_with("unavailable:")
@@ -750,7 +756,16 @@ pub fn run_with(
         for (program, build) in &active {
             let build_dir = layout.build_dir(program, *build);
             let bin = build_dir.join("bin");
-            let scan = crate::provenance::tagged_files_in(&bin, probes.provenance_attr);
+            // `bin/` and `lib/` both: a tagged dylib tracks the process that loads it
+            // (measured 2026-09-15 — `trustc` loads the bundle's `libstd`/`librustc_driver`),
+            // so a clean `bin/` over a tagged `lib/` is a tracked compiler all the same.
+            let mut scan = crate::provenance::tagged_files_in(&bin, probes.provenance_attr);
+            let lib = crate::provenance::tagged_files_under(
+                &build_dir.join("lib"),
+                probes.provenance_attr,
+            );
+            scan.total += lib.total;
+            scan.carriers.extend(lib.carriers);
             // The CAUSE, when the store recorded one: a tracked installer that staged
             // this build in-process because its untracked lane could not run wrote
             // `<build>.tracked-install` beside it, and the line names it rather than
@@ -856,7 +871,7 @@ pub fn run_with(
         }
     }
 
-    // (5f) tippy's COMPILER IS A PLAIN FILE, AND THE RUSTUP VIEW IS ONE INODE PER TOOL.
+    // (5f) tippy's COMPILER IS A PLAIN FILE, AND THE RUSTUP VIEW IS A CLONE OF THE BUILD.
     //
     // History, because the check that stood here until 2026-09-14 was about a file
     // that no longer ships. The bundle carried `rustc` as a second COPY of `trustc` for
@@ -866,18 +881,56 @@ pub fn run_with(
     // one inside the signature blob). So this report compared the two modulo their
     // signatures to say whether tippy would refuse. Trust now ships its tools under
     // Trust's names only, tippy runs `trustc` directly, and the stock names live in
-    // atpkg's rustup VIEW ([`crate::seam::refresh_view`]) as hard links — so there are
-    // no two files to compare, and the two things left to check are cheap and exact.
+    // atpkg's rustup VIEW ([`crate::seam::refresh_view`]) as copy-on-write clones of the
+    // Trust tools — so a bundle published from 2026-09-14 on has no two files to compare.
+    //
+    // The bundles already INSTALLED do. 8571, 8589, 8590 and 8595 still ship `bin/rustc`
+    // as a separately signed copy, their tippy (before trust `e79c1142a5`) still refuses
+    // it — and that removed comparison was then the only thing that could see it, so
+    // doctor said "healthy" over a PATH tippy that stopped at a setup error on every run
+    // (measured on 8595, 2026-09-15). The store is never modified; atpkg lays a per-build
+    // EXEC ROOT — a copy-on-write clone of the build where `rustc` holds `trustc`'s bytes —
+    // and routes the trust shims through it ([`crate::compat`]). What this check says about
+    // it is file facts read with `lstat` and byte compares — never a run of tippy, whose
+    // ancestor-directory checks refuse intermittently on their own and would make the
+    // verdict flap.
     //
     // (a) `trustc` must be a plain file: tippy (and tippy-driver) refuse a symbolic
-    //     link for the selected compiler, measured. That is the one way a bundle can
-    //     still leave tippy unable to run, and it withholds "healthy" while tippy is
-    //     in the bundle to be refused.
-    // (b) For every recorded seam, each stock name rustup resolves must BE the store's
-    //     Trust tool — same device and inode — or `cargo +trust` / `rustc +trust` run
-    //     something other than the managed toolchain, or nothing. `aterm pkg repair`
-    //     rebuilds the view; a mismatch is a warn that withholds "healthy".
+    //     link for the selected compiler, measured. It withholds "healthy" while tippy
+    //     is in the bundle to be refused.
+    // (b) For every recorded seam, each stock name rustup resolves must be a clone of the
+    //     store's Trust tool holding its bytes — or `cargo +trust` / `rustc +trust` run
+    //     something other than the managed toolchain, or nothing. A view laid as hard links
+    //     before clones is not one, and reads as a mismatch until repair rebuilds it.
+    //     `aterm pkg repair` rebuilds the view; a mismatch is a warn that withholds
+    //     "healthy".
+    // (c) When the active build [`crate::compat::needs_root`] (`rustc` neither `trustc`'s
+    //     inode nor its bytes, beside a tippy): an exec root that is a clone of the build
+    //     at `Deep` depth, with every trust shim in `bin/` carrying the guard through it,
+    //     is a NOTE and the report stays healthy. No root, a root that differs from the
+    //     build, or a shim that does not route is a warn that withholds "healthy" — both
+    //     inode numbers in the line, so a reader can `stat` the claim — with the one fix,
+    //     `aterm pkg repair`, which lays the root at `Deep` and re-renders every shim.
+    //     Behind a link or a file at `compat` or `compat/trust` repair refuses on every
+    //     run, so that warn names the path and says to remove it first.
+    // (d) A root under `<prefix>/compat/trust` no build needs — its build reclaimed (its
+    //     clones keep the reclaimed blocks allocated), its build needing none, or not a
+    //     directory at all — is an advisory warn naming `aterm pkg gc`, whose closing
+    //     sweep removes exactly these ([`crate::compat::strays`] is that sweep's own
+    //     classification). It leaves a healthy report healthy: no tool fails over it.
+    // (e) A build that needs no root — every Trust-names-only bundle, a pack whose `rustc`
+    //     is a hard link of `trustc`, a byte-identical copy — gets no (c) line at all.
+    // (f) A build whose `bin/rustc` or `bin/trustc` cannot be READ is not proof of either:
+    //     a warn that withholds "healthy", naming the failed read, because nothing here can
+    //     vouch for PATH tippy — and the passes leave any root standing for it alone.
+    //
+    // A warn that says "cannot run" counts in `tools_cannot_run`; one that says "may not
+    // run" or "cannot tell" counts in `tools_unproven`, so the closing line never claims a
+    // tool cannot run where the line it summarises only failed to show that it can (a
+    // reviewer read "cannot run" under the (f) line while PATH tippy ran from its root,
+    // 2026-09-15).
     let mut tools_cannot_run = 0usize;
+    let mut tools_unproven = 0usize;
     if let Some(trust_build) = active.get("trust").copied() {
         let bin = layout.build_dir("trust", trust_build).join("bin");
         let trustc = bin.join("trustc");
@@ -900,27 +953,46 @@ pub fn run_with(
                 trustc.display()
             );
         }
-        for name in crate::seam::recorded_names(layout) {
-            let view_bin = crate::seam::view_dir(layout, &name).join("bin");
-            for (public, trust) in crate::seam::STOCK_NAMES {
-                let store_tool = bin.join(trust);
-                if !store_tool.is_file() {
-                    continue;
+        view_stock_names_check(out, p, layout, Some(bin.clone()), &mut tools_cannot_run);
+        match crate::compat::inspect(layout, trust_build) {
+            Some(Ok(inspection)) => {
+                let (line, claim) = exec_root_line(p, trust_build, &inspection);
+                match claim {
+                    ToolClaim::Runs => {}
+                    ToolClaim::CannotRun => tools_cannot_run += 1,
+                    ToolClaim::Unproven => tools_unproven += 1,
                 }
-                let view_tool = view_bin.join(public);
-                if !same_file(&view_tool, &store_tool) {
-                    tools_cannot_run += 1;
-                    let _ = writeln!(
-                        out,
-                        "{p}: warn — rustup `{name}`: {} is not the store's {} (absent, or a \
-                         separate file), so `{public} +{name}` runs something other than the \
-                         managed {trust}, or nothing; fix: `aterm pkg repair` rebuilds the view",
-                        view_tool.display(),
-                        store_tool.display()
-                    );
-                }
+                let _ = writeln!(out, "{line}");
             }
+            Some(Err(why)) => {
+                tools_unproven += 1;
+                let _ = writeln!(out, "{}", exec_root_unread_line(p, trust_build, &why));
+            }
+            None => {}
         }
+    }
+    // A DEV-LINKED trust still has a seam when no shim in `bin/` names a store build
+    // (2026-09-16: the link is a decision to present that compiler, and under a link
+    // every trust shim resolves into the checkout, so `active` has no trust build even
+    // when the store holds one), so its view is checked too — against the checkout, or
+    // against the store's `current` build under a dev-link the seam refused.
+    if !active.contains_key("trust") {
+        let current = crate::seam::store_current(layout);
+        let store_bin = std::fs::read_link(&current)
+            .ok()
+            .map(|raw| {
+                if raw.is_absolute() {
+                    raw
+                } else {
+                    current.parent().map_or(raw.clone(), |d| d.join(raw))
+                }
+            })
+            .map(|build| build.join("bin"))
+            .filter(|bin| bin.is_dir());
+        view_stock_names_check(out, p, layout, store_bin, &mut tools_cannot_run);
+    }
+    for (path, why) in crate::compat::strays(layout) {
+        let _ = writeln!(out, "{}", stray_root_line(p, &path, why));
     }
 
     // (5b) LIVE-BUILD WITNESS. `gc` reclaims a program's superseded builds only when the
@@ -1136,11 +1208,17 @@ pub fn run_with(
     // user's tree, and doctor does not mutate. It reports the exposure and names the verb
     // that measures it.
     //
-    // Depth 3 under $HOME is the zero-config compromise — it reaches `~/<repo>/target` and
-    // `~/src/<repo>/target`, which is where repos actually live. Dot-directories are
-    // pruned, and that is sound rather than merely cheap: their whole subtree is already
-    // excluded (measured 2026-09-02). Anything deeper is the deliberate
-    // `aterm pkg noindex scan <root>`, which the line below names.
+    // The depth under $HOME is the zero-config compromise, and it is
+    // `noindex::DOCTOR_DEPTH`'s to state — five since 2026-09-15, because three reached
+    // `~/<repo>/target` but not a cargo workspace's `~/<repo>/crates/<member>/target`, and
+    // this very machine had four such dirs (400 MiB) that every surface called clean. Read
+    // that constant's note for the measurement. Dot-directories are pruned, and that is
+    // sound rather than merely cheap: their whole subtree is already excluded (measured
+    // 2026-09-02). So are the six folders macOS guards with a consent dialog and `Library`
+    // (`noindex::SKIP_DIRS`) — a walk that raised aterm's name on a privacy modal at the
+    // top of an unattended pass is the one cost this scan may never impose, which is why
+    // the line below says which places were not walked. Anything deeper than the constant
+    // is the deliberate `aterm pkg noindex scan <root>`, which the line below names.
     //
     // No `cfg` here by design: `noindex::scan` returns an empty, `complete` scan on
     // non-macOS, so the whole block prints nothing there — the same discipline as
@@ -1190,13 +1268,24 @@ pub fn run_with(
                  2026-09-01 WindowServer watchdog kill; {reach} — a git checkout keeps a \
                  `target` symlink and its .cargo/config.toml untouched, the new name (and \
                  the link, when the ignore entry is directory-only) excluded via \
-                 .git/info/exclude ([machine] spotlight_noindex, default on) — now: \
-                 `aterm pkg noindex apply --all`; `aterm pkg noindex` lists them, `aterm pkg \
-                 noindex verify <dir>` measures one",
+                 .git/info/exclude ([machine] spotlight_noindex, default on){now}; `aterm pkg \
+                 noindex` lists them, `aterm pkg noindex verify <dir>` measures one",
                 exposed.len(),
                 found.targets.len(),
                 home.display(),
-                crate::noindex::human_size(&size)
+                crate::noindex::human_size(&size),
+                // THE REMEDY ONLY WHEN IT REACHES SOMETHING. `--all` walks with
+                // `require_repo`, so in the all-free case the sentence above has just
+                // finished explaining that it skips every one of these — and offering it
+                // anyway is a guaranteed no-op that leaves the warning standing, which
+                // reads as a tool that does not work.
+                now = if in_repo.is_empty() {
+                    String::new()
+                } else {
+                    " — now: `aterm pkg machine apply` (or `aterm pkg noindex apply --all`, \
+                     which walks with the verb's larger budget)"
+                        .to_string()
+                }
             );
         }
         if !found.complete {
@@ -1219,10 +1308,16 @@ pub fn run_with(
     }
 
     // (8) INDEX FREEZE / AGE (no unverified parse — atpkg's OWN diagnostics only).
-    // The clock is `last_success_at` — stamped ONLY when a pass resolved the index and
-    // applied it clean — never `updated_at`, which every writer moves: a machine whose
-    // passes all failed for a month used to read "0 day(s) since the last successful
-    // update" here off the failure row's own timestamp (2026-09-10 audit).
+    // The clock is `last_success_at`, stamped by a pass that resolved the index and RAN
+    // TO ITS END — clean, or with member failures each recorded in its own row (the
+    // update lane stamps both exits since 2026-09-14, so one failing member cannot keep
+    // every read-only verb saying "no update check has run yet"). It is never
+    // `updated_at`, which every writer moves: a machine whose passes all failed for a
+    // month used to read "0 day(s) since the last successful update" off the failure
+    // row's own timestamp (2026-09-10 audit). The line therefore says "completed pass",
+    // not "successful update": on an Intel Mac whose every pass ended in a member
+    // failure it read "0 day(s) since the last successful update" (2026-09-15), which
+    // is not what the stamp measures; the member rows below say what failed.
     if let Some(status) = crate::status::read(layout) {
         if status.last_success_at.trim().is_empty() {
             let _ = writeln!(
@@ -1241,20 +1336,57 @@ pub fn run_with(
                 Some(days) if days > 30 => {
                     let _ = writeln!(
                         out,
-                        "{p}: warn — {days} day(s) since the last successful update ({}) — \
-                         publishing looks frozen or this machine has been offline",
+                        "{p}: warn — {days} day(s) since the last completed update pass ({}) — \
+                         this machine has been off, or the app has not run",
                         status.last_success_at
                     );
                 }
                 Some(days) => {
                     let _ = writeln!(
                         out,
-                        "{p}: ok — {days} day(s) since the last successful update"
+                        "{p}: ok — {days} day(s) since the last completed update pass"
                     );
                 }
                 None => {
                     let _ = writeln!(out, "{p}: warn — could not parse the last-success time");
                 }
+            }
+            // THE TWO QUESTIONS THAT CLOCK COULD NOT ANSWER (2026-09-15): has the signed
+            // index LISTING been reached lately (a pass served from the §14 cache is a
+            // completed pass that learned nothing), and has the index itself MOVED
+            // (the publisher's pulse). Both read the freshness fields the pass end
+            // stamps from what the resolve measured; a record from before they existed
+            // is silent here rather than accused.
+            let reached_days = (!status.last_index_reached_at.is_empty())
+                .then(|| index_age_days(&status.last_index_reached_at, now))
+                .flatten();
+            match reached_days {
+                Some(days) if days > INDEX_UNREACHED_WARN_DAYS => {
+                    let _ = writeln!(
+                        out,
+                        "{p}: warn — the signed index listing has not been reached for {days} \
+                         day(s) (last: {}) — every pass since ran on the cached index and \
+                         cannot see a newer pin: offline, rate-limited (the anonymous GitHub \
+                         API shares ~60 requests/hour per address) or a proxy in the way; \
+                         `aterm pkg update` prints the transport's reason",
+                        status.last_index_reached_at
+                    );
+                }
+                _ => {}
+            }
+            if !status.index_build_changed_at.is_empty()
+                && let Some(days) = index_age_days(&status.index_build_changed_at, now)
+                && days > INDEX_FROZEN_WARN_DAYS
+                && reached_days.is_some_and(|d| d <= INDEX_UNREACHED_WARN_DAYS)
+            {
+                let _ = writeln!(
+                    out,
+                    "{p}: warn — index build {} has not changed in {days} day(s) while the \
+                     listing was reachable — publishing looks frozen: the vendor lane's launchd \
+                     job, its lock or its token upstream (a pinned claude stays at its version \
+                     until the index moves)",
+                    status.last_index_build
+                );
             }
         }
     } else {
@@ -1288,13 +1420,33 @@ pub fn run_with(
         crate::sig::Floor::new(layout.roster_floor()).current()
     );
 
-    // (9) RUSTUP + RELOCATABILITY.
-    if !rustup_present() {
+    // (9) RUSTUP + RELOCATABILITY. Two questions, kept apart: is there a rustup on
+    // this machine at all (PATH, then `$CARGO_HOME/bin`, then `~/.cargo/bin` — the
+    // binary an app-spawned pass may not have on ITS PATH), and does it answer inside
+    // the probe ceiling. On an Intel Mac under a self-update plus a seed pass (2026-09-15)
+    // the 5 s `--version` probe missed a rustup 1.29.1 that answers in 79 ms idle, and
+    // the report said "rustup not found" — false — and skipped the seam audit, which
+    // needs no rustup binary at all.
+    let rustup = rustup_binary(home);
+    let rustup_answers = rustup.as_deref().is_some_and(rustup_present);
+    if rustup.is_none() {
         let _ = writeln!(
             out,
-            "{p}: warn — rustup not found (self-contained bundles are portable)"
+            "{p}: warn — rustup not found on PATH, in $CARGO_HOME/bin or in ~/.cargo/bin \
+             (self-contained bundles are portable)"
         );
-    } else if let Some(rustup_home) =
+    } else if !rustup_answers {
+        let _ = writeln!(
+            out,
+            "{p}: warn — rustup at {} did not answer `--version` within {} s (a wedged shim, \
+             or a toolchain fetch in flight); the `trust` seam is checked below without it",
+            rustup
+                .as_deref()
+                .map_or_else(String::new, |r| r.display().to_string()),
+            PROBE_TIMEOUT.as_secs()
+        );
+    }
+    if let Some(rustup_home) =
         crate::seam::rustup_home_with(std::env::var_os("RUSTUP_HOME").as_deref(), home)
         && layout.program_current("trust").join("bin").is_dir()
         && let Some(line) = seam_line(
@@ -1310,8 +1462,9 @@ pub fn run_with(
         // the one command; it re-points nothing — an entry under `~/.rustup` that
         // aterm did not lay is the user's, by the seam module's own rule.
         let _ = writeln!(out, "{p}: {line}");
-    } else if layout.program_current("trust").join("bin").is_dir()
-        && !rustup_trust_channel_resolves()
+    } else if rustup_answers
+        && layout.program_current("trust").join("bin").is_dir()
+        && !rustup_trust_channel_resolves(rustup.as_deref().unwrap_or(Path::new("rustup")))
     {
         // The managed Trust toolchain is HERE, but rustup does not know it, so
         // `cargo +trust` and a `rust-toolchain.toml` pinning `channel = "trust"`
@@ -1441,6 +1594,26 @@ pub fn run_with(
             }
         }
     }
+    // (10g) MEMBERS HELD ON THEIR CURRENT BUILD (`held: …`, [`crate::state::held_unpublished`]):
+    // the update lane's row for an INSTALLED member whose coherence group's new pin is
+    // not published for this target. A DEFERRED state, never a fault: nothing was
+    // downloaded or staged, the group stays whole on the builds it has, and the pass
+    // that finds the build published moves it. Said here as `ok`, quoting the row, so
+    // the frozen tuple is VISIBLE — without this line the only trace of it was its
+    // siblings' `pinned by index <old>` rows, which read as stale (measured on an
+    // Intel Mac, 2026-09-15: trust-cg/-ir/-vc "pinned by index 15" beside index 32).
+    if let Some(s) = status.as_ref() {
+        for (program, row) in &s.programs {
+            if row.state.starts_with(crate::state::HELD_PREFIX) {
+                let _ = writeln!(
+                    out,
+                    "{p}: ok — {program}: {} (nothing to do here; the next pass moves the \
+                     group once the index publishes for this target)",
+                    row.state
+                );
+            }
+        }
+    }
     // (10d) SHADOWED MANAGED MEMBERS (design S5). For every managed member and every tool
     // it exposes, a foreign executable of that name EARLIER on PATH than the managed
     // bin/ is what actually runs — silently ahead of the build the index pins. Probed
@@ -1457,6 +1630,21 @@ pub fn run_with(
                     .map(|path| (tool, path))
             });
         if let Some((tool, path)) = shadow {
+            // An AGENT PROGRAM whose `agents/` twin is laid and current (2026-09-16):
+            // aterm's copy is what every tab runs (owner decision 2026-09-10), so this
+            // is THIS shell's state — a shell that has not run the hook — and the
+            // remedy is in place, CHECKED for this machine (`cli::shell_remedy_command`:
+            // the hook sourced where it stands, `. ~/.aterm/shell.d/00-atpkg.zsh`; a PATH
+            // line only where no hook file exists; never `exec $SHELL`, which drops an
+            // aterm tab's shell integration — measured 2026-09-16). Never
+            // "open a new tab", never "remove or reorder that copy" (owner, 2026-09-16:
+            // "all the latest and best MUST WORK IN THE SAME TAB").
+            if let Some(row) =
+                crate::cli::agent_shell_shadow(layout, program, *build, &path, path_var)
+            {
+                let _ = writeln!(out, "{p}: warn — {program}: {row}");
+                continue;
+            }
             // The canonical state in the canonical words, then — when `alab-<tool>` is
             // laid — the one trailing sentence that names the way to the managed copy
             // without touching PATH (`cli::alias_fix`; never part of the state).
@@ -1632,17 +1820,18 @@ pub fn run_with(
         }
     }
 
-    if fails == 0 && !toolset_problem && tools_cannot_run == 0 {
+    if fails == 0 && !toolset_problem && tools_cannot_run == 0 && tools_unproven == 0 {
         let _ = writeln!(out, "{p}: healthy");
         true
     } else if fails == 0 && !toolset_problem {
-        // Nothing structural — but a managed tool that cannot run is not health, and this
-        // line is the one a reader takes away. The warn above carries its own remedy, so no
-        // `next` line: the tail's rule for failures with an inline remedy.
+        // Nothing structural — but a managed tool that cannot run, or that doctor cannot
+        // show to run, is not health, and this line is the one a reader takes away. The
+        // warn above carries its own remedy, so no `next` line: the tail's rule for
+        // failures with an inline remedy.
         let _ = writeln!(
             out,
-            "{p}: not healthy — {tools_cannot_run} warning(s) above name a managed tool that \
-             cannot run; none is a structural problem, so the exit code stays 0"
+            "{p}: not healthy — {}; none is a structural problem, so the exit code stays 0",
+            withheld_summary(tools_cannot_run, tools_unproven)
         );
         true
     } else {
@@ -1708,25 +1897,174 @@ fn probe_version(bin: &Path) -> String {
 /// `rustc` alias it once also demanded is gone with the alias.
 const TRUST_COMPILER_FIX: &str = "ship trustc as one signed plain file, never a symbolic link";
 
-/// Whether two paths are one file — same device and inode on Unix, following links
-/// (a view entry is a hard link, so what it reaches is what matters). Elsewhere, two
-/// regular files of one length; the view is a Unix construction and this is a report.
-fn same_file(a: &Path, b: &Path) -> bool {
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::MetadataExt;
-        match (std::fs::metadata(a), std::fs::metadata(b)) {
-            (Ok(x), Ok(y)) => x.is_file() && x.dev() == y.dev() && x.ino() == y.ino(),
-            _ => false,
+/// The fix every (5f)(c) warn names but the blocked one: `repair` reconciles the exec roots
+/// at `Deep` depth (`cli::repair_store` → `compat::reconcile`), which lays or rebuilds the
+/// root and re-renders every trust shim through it, and exits 1 when it cannot. Behind a
+/// link or a file at `compat` or `compat/trust` it cannot, on any run, so that warn names
+/// [`crate::compat::Blocked::fix`] instead.
+const EXEC_ROOT_FIX: &str = "`aterm pkg repair` lays the exec root (a copy-on-write clone — the \
+                             store is never modified) and routes the shims";
+
+/// What a doctor warn about a managed tool claims, which decides the words the closing
+/// "not healthy" line counts it under.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ToolClaim {
+    /// Nothing withheld: the (5f)(c) note.
+    Runs,
+    /// The warn says the tool cannot run.
+    CannotRun,
+    /// The warn says the tool may not run, or that doctor cannot tell.
+    Unproven,
+}
+
+/// The counted clause of the closing "not healthy" line: `cannot` warns that name a
+/// managed tool that cannot run and `unproven` warns that name one that may not run or
+/// cannot be checked, each under its own words.
+fn withheld_summary(cannot: usize, unproven: usize) -> String {
+    const UNPROVEN: &str = "may not run or cannot be checked";
+    match (cannot, unproven) {
+        (c, 0) => format!("{c} warning(s) above name a managed tool that cannot run"),
+        (0, u) => format!("{u} warning(s) above name a managed tool that {UNPROVEN}"),
+        (c, u) => format!(
+            "{c} warning(s) above name a managed tool that cannot run, and {u} name one that \
+             {UNPROVEN}"
+        ),
+    }
+}
+
+/// The (5f)(c) line for an active trust build that [`crate::compat::needs_root`], and
+/// what it claims ([`ToolClaim`]): a tool that cannot run, or one it cannot show to run
+/// (both warns that withhold "healthy"), rather than a note. Pure over the inspection, so
+/// every wording is testable without a store.
+///
+/// * Root absent: every trust shim's guard is false and runs the store path, where the
+///   build's tippy refuses — PATH tippy cannot run.
+/// * Root differs from the build: a shim whose own file differs runs the store path, and
+///   the rest run a tree that is not the build — tippy MAY not run, and nothing vouches
+///   for what does; the root, the store build and the first path that differs are each
+///   named as what they are.
+/// * Root matches, some shims unrouted: those run the store path — tippy cannot run
+///   through them; the count and one name (`tippy` when it is among them) are given.
+/// * Root matches, every shim routed: the note.
+/// * `compat` or `compat/trust` not a real directory ([`crate::compat::Blocked`]): no
+///   root is laid or rendered through it, and `aterm pkg repair` refuses too, so the fix
+///   is to remove what stands there first. tippy cannot run when no shim carries a route;
+///   one routed earlier may still run through the link, which atpkg does not vouch for,
+///   so then it MAY not.
+fn exec_root_line(p: &str, build: u64, i: &crate::compat::Inspection) -> (String, ToolClaim) {
+    use crate::compat::RootState;
+    let root = i.root.display();
+    let copy = format!(
+        "bin/rustc (inode {}) is a separate file from bin/trustc (inode {}; {} byte(s) differ)",
+        i.rustc_ino, i.trustc_ino, i.differing
+    );
+    let n = i.shims.len();
+    match (&i.state, i.unrouted.is_empty()) {
+        (RootState::Blocked(blocked), _) => (
+            format!(
+                "{p}: warn — trust build {build}: PATH tippy {} run — {copy}, which this \
+                 build's tippy refuses, and {}; fix: {}",
+                if i.unrouted.len() == n {
+                    "cannot"
+                } else {
+                    "may not"
+                },
+                blocked.what(),
+                blocked.fix()
+            ),
+            if i.unrouted.len() == n {
+                ToolClaim::CannotRun
+            } else {
+                ToolClaim::Unproven
+            },
+        ),
+        (RootState::Matches, true) => (
+            format!(
+                "{p}: note — trust build {build}: {copy}, which its tippy refuses; its {n} trust \
+                 shim(s) run each tool from {root}, where rustc holds trustc's bytes (a \
+                 copy-on-write clone; the store is untouched) — removed with the build"
+            ),
+            ToolClaim::Runs,
+        ),
+        (RootState::Absent, _) => (
+            format!(
+                "{p}: warn — trust build {build}: PATH tippy cannot run — {copy}, which this \
+                 build's tippy refuses, and no exec root stands at {root}; fix: {EXEC_ROOT_FIX}"
+            ),
+            ToolClaim::CannotRun,
+        ),
+        (RootState::Differs(at), _) => (
+            format!(
+                "{p}: warn — trust build {build}: PATH tippy may not run — {copy}, which this \
+                 build's tippy refuses, and the exec root {root} is not the store build {} \
+                 file for file (first difference: {}); fix: {EXEC_ROOT_FIX}",
+                i.build_dir.display(),
+                at.display()
+            ),
+            ToolClaim::Unproven,
+        ),
+        (RootState::Matches, false) => {
+            let example = i
+                .unrouted
+                .iter()
+                .find(|name| name.as_str() == "tippy")
+                .unwrap_or(&i.unrouted[0]);
+            (
+                format!(
+                    "{p}: warn — trust build {build}: PATH tippy cannot run through {} of {n} \
+                     trust shim(s) (e.g. {example}) — {copy}, which this build's tippy refuses, \
+                     and those shims do not route through the exec root {root}; fix: \
+                     {EXEC_ROOT_FIX}",
+                    i.unrouted.len()
+                ),
+                ToolClaim::CannotRun,
+            )
         }
     }
-    #[cfg(not(unix))]
-    {
-        match (std::fs::metadata(a), std::fs::metadata(b)) {
-            (Ok(x), Ok(y)) => x.is_file() && y.is_file() && x.len() == y.len(),
-            _ => false,
-        }
-    }
+}
+
+/// The (5f)(f) line for an active trust build whose need for an exec root could not be
+/// read ([`crate::compat::inspect`]'s `Err`, which names the path and the error): a warn
+/// that withholds "healthy". No re-lay makes a store file readable, so `repair` is not
+/// offered; the line points at `aterm pkg verify trust`, which checks every file of the
+/// build against its signed tree.
+fn exec_root_unread_line(p: &str, build: u64, why: &str) -> String {
+    format!(
+        "{p}: warn — trust build {build}: cannot tell whether PATH tippy can run — {why}; any \
+         exec root standing for the build is left as it is; fix: make that store file readable \
+         again (`aterm pkg verify trust` checks the build against its signed tree)"
+    )
+}
+
+/// The (5f)(d) line for an entry under `<prefix>/compat/trust` that no build needs — an
+/// advisory warn: the next `gc` removes it ([`crate::compat::sweep`] takes exactly what
+/// [`crate::compat::strays`] classifies), and no tool fails over it.
+fn stray_root_line(p: &str, path: &Path, why: crate::compat::Stray) -> String {
+    use crate::compat::Stray;
+    let at = path.display();
+    let what = match why {
+        Stray::BuildGone(n) => format!(
+            "exec root {at} outlives trust build {n}, which is no longer in the store, and its \
+             clones keep that build's reclaimed blocks allocated"
+        ),
+        Stray::NeedsNone(n) => format!(
+            "exec root {at} stands for trust build {n}, which needs none (its bin/rustc is not \
+             a separate file from bin/trustc that its tippy refuses)"
+        ),
+        Stray::NotADirectory => format!(
+            "{at} is not a directory, and atpkg lays only exec root directories under that name"
+        ),
+    };
+    format!("{p}: warn — {what}; fix: `aterm pkg gc` removes it")
+}
+
+/// Whether the view file `at` presents the store's Trust tool `store`: a clone of it
+/// ([`crate::clone::is_clone_of`] — its length, mode and time, not its inode, so the hard
+/// link a view held before clones does NOT present it) holding its bytes (the attributes
+/// alone cannot tell it from a bundle's separately signed copy under the stock name).
+/// Reads at most the three stock names' bytes; writes nothing.
+fn presents(store: &Path, at: &Path) -> bool {
+    crate::clone::is_clone_of(store, at) && matches!(crate::clone::same_bytes(store, at), Ok(true))
 }
 
 /// Render a divergence's contested build numbers for the report line.
@@ -1739,9 +2077,109 @@ fn build_list(builds: &[u64]) -> String {
 }
 
 /// Whole days since `updated_at` (RFC3339), or `None` if it cannot be parsed.
+/// How long the signed index listing may go unreached before `doctor` says so: past
+/// this, every pass has been a cached one — the vendor lane publishes daily-ish, so
+/// three days of cache is three days a newer claude pin could have been missed.
+const INDEX_UNREACHED_WARN_DAYS: i64 = 3;
+/// How long an unchanged `index_build` — with the listing reachable — reads as a frozen
+/// publisher rather than a quiet week: the ALab pins move on releases, the vendor rows
+/// on every Claude Code and Codex release, and thirty days without either is neither.
+const INDEX_FROZEN_WARN_DAYS: i64 = 30;
+
 fn index_age_days(updated_at: &str, now: i64) -> Option<i64> {
     let then = crate::flow::rfc3339_to_unix(updated_at)?;
     Some((now - then) / 86_400)
+}
+
+/// (5f b) For every recorded seam, each stock name the view holds must present the
+/// tool it stands for — the store's while the store's build is what the view presents
+/// (a clone of it holding its bytes, [`presents`]: a hard link a view held before clones
+/// is not one), the dev-linked CHECKOUT's while
+/// trust is dev-linked to a sysroot (2026-09-16: the view is exec stubs there, so the
+/// stub's target is read rather than an inode compared). `store_bin` is the store
+/// build's `bin/` — the active one, or `current`'s when no shim names a build — or
+/// `None` when the store holds none (a store-less dev-link). A mismatch is a tool that
+/// cannot run, with the fix that applies: `repair` rebuilds the view — except under a
+/// dev-link the seam REFUSES (a checkout that is not a sysroot), where nothing rebuilds
+/// it until the link goes.
+fn view_stock_names_check(
+    out: &mut dyn std::io::Write,
+    p: &str,
+    layout: &Layout,
+    store_bin: Option<PathBuf>,
+    tools_cannot_run: &mut usize,
+) {
+    let source = crate::seam::view_source(layout);
+    const STORE_WHAT: &str = "a clone of the store's";
+    const STORE_WRONG: &str = "absent, other bytes, or the hard link a view held before clones";
+    let (presented, presented_what, wrong, fix) = match (&source, store_bin) {
+        (crate::seam::ViewSource::Linked(checkout), _) => (
+            checkout.join("bin"),
+            "the dev-linked checkout's",
+            "absent, or a separate file",
+            "`aterm pkg repair` rebuilds the view",
+        ),
+        (crate::seam::ViewSource::LinkedNoSysroot(_), Some(bin)) => (
+            bin,
+            STORE_WHAT,
+            STORE_WRONG,
+            "`aterm pkg unlink trust` — the seam refuses a dev-link whose checkout is not a \
+             sysroot, so `repair` cannot rebuild the view until the link goes",
+        ),
+        (crate::seam::ViewSource::Store, Some(bin)) => (
+            bin,
+            STORE_WHAT,
+            STORE_WRONG,
+            "`aterm pkg repair` rebuilds the view",
+        ),
+        // A refused dev-link with no store build behind the view: nothing the view
+        // could be checked against, and nothing it could correctly present — whatever
+        // it last presented is what `rustup run trust` runs. Said, with the one fix.
+        (crate::seam::ViewSource::LinkedNoSysroot(checkout), None) => {
+            for name in crate::seam::recorded_names(layout) {
+                *tools_cannot_run += 1;
+                let _ = writeln!(
+                    out,
+                    "{p}: warn — rustup `{name}`: trust is dev-linked to {}, which atpkg cannot \
+                     present (no bin/ and lib/, or a tree inside its own prefix), and no \
+                     installed build stands behind the view, so `rustc +{name}` runs whatever \
+                     the view last presented, or nothing; fix: `aterm pkg unlink trust`",
+                    checkout.display()
+                );
+            }
+            return;
+        }
+        (crate::seam::ViewSource::Store, None) => return,
+    };
+    for name in crate::seam::recorded_names(layout) {
+        let view_bin = crate::seam::view_dir(layout, &name).join("bin");
+        for (public, trust) in crate::seam::STOCK_NAMES {
+            let tool = presented.join(trust);
+            if !tool.is_file() {
+                continue;
+            }
+            let view_tool = view_bin.join(public);
+            // A linked view's entries are exec stubs into the checkout; a store view's are
+            // clones of the store's tools.
+            let presented_ok = match &source {
+                crate::seam::ViewSource::Linked(_) => {
+                    crate::platform::resolve_shim(&view_tool).is_some_and(|t| t == tool)
+                }
+                _ => presents(&tool, &view_tool),
+            };
+            if !presented_ok {
+                *tools_cannot_run += 1;
+                let _ = writeln!(
+                    out,
+                    "{p}: warn — rustup `{name}`: {} is not {presented_what} {} ({wrong}), so \
+                     `{public} +{name}` runs something other than the managed {trust}, or \
+                     nothing; fix: {fix}",
+                    view_tool.display(),
+                    tool.display()
+                );
+            }
+        }
+    }
 }
 
 /// The doctor line for a rustup `trust` entry that is NOT the managed seam, or `None`
@@ -1791,9 +2229,31 @@ fn seam_line(st: &crate::seam::SeamStatus, layout: &Layout) -> Option<String> {
     }
 }
 
-/// Whether `rustup` is on PATH and answers `--version`.
-fn rustup_present() -> bool {
-    output_bounded(std::process::Command::new("rustup").arg("--version"))
+/// Where `rustup` is: the first executable `rustup` on `PATH`, else
+/// `$CARGO_HOME/bin/rustup`, else `~/.cargo/bin/rustup` — the two places
+/// rustup-init lays it, which an app-spawned pass (no rc file read) does not
+/// have on its PATH. Existence only; whether it answers is [`rustup_present`].
+fn rustup_binary(home: Option<&Path>) -> Option<std::path::PathBuf> {
+    let on_path = std::env::var_os("PATH").and_then(|path| {
+        std::env::split_paths(&path)
+            .map(|dir| dir.join("rustup"))
+            .find(|candidate| candidate.is_file())
+    });
+    on_path
+        .or_else(|| {
+            std::env::var_os("CARGO_HOME")
+                .map(|cargo_home| Path::new(&cargo_home).join("bin").join("rustup"))
+                .filter(|candidate| candidate.is_file())
+        })
+        .or_else(|| {
+            let candidate = home?.join(".cargo").join("bin").join("rustup");
+            candidate.is_file().then_some(candidate)
+        })
+}
+
+/// Whether the `rustup` at `bin` answers `--version` inside [`PROBE_TIMEOUT`].
+fn rustup_present(bin: &Path) -> bool {
+    output_bounded(std::process::Command::new(bin).arg("--version"))
         .is_some_and(|o| o.status.success())
 }
 
@@ -1801,14 +2261,9 @@ fn rustup_present() -> bool {
 /// exits non-zero (and prints the famous `'rustc' is not installed for the
 /// custom toolchain 'trust'`) when the channel is absent or dangling; a linked
 /// channel answers with the cargo path. Bounded like every other probe here.
-fn rustup_trust_channel_resolves() -> bool {
-    output_bounded(std::process::Command::new("rustup").args([
-        "which",
-        "cargo",
-        "--toolchain",
-        "trust",
-    ]))
-    .is_some_and(|o| o.status.success() && !o.stdout.is_empty())
+fn rustup_trust_channel_resolves(bin: &Path) -> bool {
+    output_bounded(std::process::Command::new(bin).args(["which", "cargo", "--toolchain", "trust"]))
+        .is_some_and(|o| o.status.success() && !o.stdout.is_empty())
 }
 
 /// How long ONE `--version` probe may take before `doctor` gives up on it.
@@ -2363,7 +2818,9 @@ mod tests {
         // the line is printed and the report is still advisory about it.
         std::fs::remove_dir_all(&entry).unwrap();
         std::os::unix::fs::symlink(&dev, &entry).unwrap();
-        if rustup_present() && std::env::var_os("RUSTUP_HOME").is_none() {
+        if rustup_binary(Some(&home)).is_some_and(|bin| rustup_present(&bin))
+            && std::env::var_os("RUSTUP_HOME").is_none()
+        {
             let mut out = Vec::new();
             let path = std::env::join_paths([l.bin_dir()]).unwrap();
             let _ = run_with(
@@ -3134,6 +3591,9 @@ mod tests {
                 outcome: "up to date".into(),
                 seams: Vec::new(),
                 last_success_at: String::new(),
+                last_index_reached_at: String::new(),
+                last_index_build: 0,
+                index_build_changed_at: String::new(),
                 programs,
             },
         )
@@ -3221,6 +3681,9 @@ mod tests {
                 outcome: "up to date".into(),
                 seams: Vec::new(),
                 last_success_at: String::new(),
+                last_index_reached_at: String::new(),
+                last_index_build: 0,
+                index_build_changed_at: String::new(),
                 programs,
             },
         )
@@ -3312,6 +3775,9 @@ mod tests {
             outcome: "up to date".into(),
             seams: Vec::new(),
             last_success_at: String::new(),
+            last_index_reached_at: String::new(),
+            last_index_build: 0,
+            index_build_changed_at: String::new(),
             programs,
         };
         crate::status::write(&layout, &status).unwrap();
@@ -3347,6 +3813,82 @@ mod tests {
             "{text}"
         );
         assert!(text.contains("aterm pkg install brew"), "{text}");
+        let _ = std::fs::remove_dir_all(&layout.prefix);
+        let _ = std::fs::remove_dir_all(&home);
+    }
+
+    /// A member HELD on its current build (its coherence group's new pin is not
+    /// published for this target) is reported as `ok`, quoting its row, on the
+    /// owner's row and on a sibling's — never a fault, and never silent: an Intel
+    /// Mac whose trust-cg/-ir/-vc rows still read `pinned by index 15` beside a
+    /// held trust had no line saying why (2026-09-15).
+    #[test]
+    fn a_held_member_is_an_ok_line_quoting_its_row_never_a_fault() {
+        let layout = layout("doctor-held");
+        install(&layout, "trust", 6808);
+        install(&layout, "trust-cg", 3095);
+        let triple = "x86_64-apple-darwin";
+        let mut programs = std::collections::BTreeMap::new();
+        let own = crate::state::held_unpublished(None, 8595, triple, 6808);
+        let sibling = crate::state::held_unpublished(Some("trust"), 8595, triple, 3095);
+        for (p, build, state) in [("trust", 6808, &own), ("trust-cg", 3095, &sibling)] {
+            programs.insert(
+                p.to_string(),
+                crate::ProgramStatus {
+                    installed_build: Some(build),
+                    state: state.clone(),
+                    tree_root: String::new(),
+                },
+            );
+        }
+        let status = crate::Status {
+            schema: 1,
+            updated_at: "2026-09-15T00:00:00Z".into(),
+            enabled: true,
+            index_source: "x/y".into(),
+            outcome: "rustc NOT updated".into(),
+            seams: Vec::new(),
+            last_success_at: "2026-09-15T00:00:00Z".into(),
+            programs,
+            ..crate::Status::default()
+        };
+        crate::status::write(&layout, &status).unwrap();
+        assert!(
+            recorded_problems(Some(&status)).is_empty(),
+            "a held row is deferred, not a fault"
+        );
+        let home = synthetic_home("doctor-held");
+        let now = crate::flow::rfc3339_to_unix("2026-09-15T00:00:00Z").unwrap();
+        let path = std::env::join_paths([layout.bin_dir()]).unwrap();
+        let mut out: Vec<u8> = Vec::new();
+        let mut err: Vec<u8> = Vec::new();
+        let ok = run_with(
+            &layout,
+            Some(&home),
+            Some(&path),
+            now,
+            None,
+            None,
+            "doctor",
+            &Probes::default(),
+            &mut out,
+            &mut err,
+        );
+        let text = String::from_utf8_lossy(&out).into_owned();
+        assert!(ok, "a held tuple is healthy:\n{text}");
+        for (p, row) in [("trust", &own), ("trust-cg", &sibling)] {
+            assert!(
+                text.contains(&format!(
+                    "ok — {p}: {row} (nothing to do here; the next pass moves the group once \
+                     the index publishes for this target)"
+                )),
+                "{p}'s held row is said, verbatim:\n{text}"
+            );
+        }
+        assert!(
+            !text.contains("PROBLEM"),
+            "nothing about a hold is a problem:\n{text}"
+        );
         let _ = std::fs::remove_dir_all(&layout.prefix);
         let _ = std::fs::remove_dir_all(&home);
     }
@@ -3412,6 +3954,111 @@ mod tests {
         let _ = std::fs::remove_dir_all(&home);
     }
 
+    /// THE AGENT PROGRAMS' SHADOW WORDING (2026-09-16). For `claude`/`codex` aterm's copy is
+    /// what every tab runs (owner decision 2026-09-10), through `agents/` first on PATH;
+    /// a foreign copy ahead of it in THIS shell is a shell that has not run the hook, and
+    /// the remedy is the hook sourced in place — `. ~/.aterm/shell.d/00-atpkg.zsh` — never
+    /// "open a new tab" (owner, 2026-09-16), never `exec $SHELL` (it drops the tab's shell
+    /// integration; measured 2026-09-16), never "remove or reorder that copy". A warn,
+    /// never a fault; the plain SHADOWED wording returns only when the twin itself is gone.
+    #[cfg(unix)]
+    #[test]
+    fn an_agent_program_shadowed_in_this_shell_names_the_hook_source_never_a_new_tab() {
+        let l = layout("agent-shadow");
+        // An ALab member too, so the report has a toolset to be healthy about.
+        install(&l, "ay", 19);
+        install(&l, "claude", 2_026_091_601);
+        let twin = l.agent_shim(&tool("claude"));
+        assert!(twin.exists(), "install lays the agents/ twin");
+        let foreign = l
+            .prefix
+            .parent()
+            .unwrap()
+            .join(format!("atpkg-doctor-agent-foreign-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&foreign);
+        std::fs::create_dir_all(&foreign).unwrap();
+        let exe = foreign.join("claude");
+        std::fs::write(&exe, b"#!/bin/sh\nexit 0\n").unwrap();
+        std::fs::set_permissions(&exe, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let home = synthetic_home("agent-shadow");
+        let now = crate::flow::rfc3339_to_unix("2026-09-16T00:00:00Z").unwrap();
+        let run = |path: &std::ffi::OsStr| {
+            let mut out: Vec<u8> = Vec::new();
+            let mut err: Vec<u8> = Vec::new();
+            let ok = run_with(
+                &l,
+                Some(&home),
+                Some(path),
+                now,
+                None,
+                None,
+                "doctor",
+                &Probes::default(),
+                &mut out,
+                &mut err,
+            );
+            (ok, String::from_utf8_lossy(&out).into_owned())
+        };
+        // A shell from before the install: no agents/ on its PATH.
+        let no_agents = std::env::join_paths([foreign.clone(), l.bin_dir()]).unwrap();
+        let (ok, out) = run(&no_agents);
+        assert!(ok, "a warning, never a fault:\n{out}");
+        assert!(
+            out.contains(&format!(
+                "doctor: warn — claude: {}",
+                crate::state::agent_shadowed_in_shell(
+                    2_026_091_601,
+                    &exe,
+                    &l.agents_dir(),
+                    false,
+                    &crate::cli::shell_remedy_command(&l),
+                )
+            )),
+            "{out}"
+        );
+        assert!(
+            !out.contains("new tab")
+                && !out.contains("exec $SHELL")
+                && !out.contains("remove or reorder")
+                && !out.contains("not the pinned build"),
+            "the in-place remedy only: {out}"
+        );
+        // agents/ present but behind the foreign copy: named as such.
+        let behind = std::env::join_paths([foreign.clone(), l.bin_dir(), l.agents_dir()]).unwrap();
+        let (ok, out) = run(&behind);
+        assert!(ok, "{out}");
+        assert!(
+            out.contains(&crate::state::agent_shadowed_in_shell(
+                2_026_091_601,
+                &exe,
+                &l.agents_dir(),
+                true,
+                &crate::cli::shell_remedy_command(&l),
+            )),
+            "{out}"
+        );
+        // agents/ first (every aterm tab): nothing is shadowed.
+        let first = std::env::join_paths([l.agents_dir(), foreign.clone(), l.bin_dir()]).unwrap();
+        let (ok, out) = run(&first);
+        assert!(ok, "{out}");
+        assert!(!out.contains("SHADOWED"), "{out}");
+        // The twin gone (a lane that could not lay it): the machine-wide wording is the
+        // truth again, unchanged from every other program's.
+        std::fs::remove_file(&twin).unwrap();
+        let (ok, out) = run(&no_agents);
+        assert!(ok, "{out}");
+        assert!(
+            out.contains(&format!(
+                "doctor: warn — claude: {} (not the pinned build",
+                crate::state::shadowed(2_026_091_601, &exe)
+            )),
+            "{out}"
+        );
+        let _ = std::fs::remove_dir_all(&foreign);
+        let _ = std::fs::remove_dir_all(&l.prefix);
+        let _ = std::fs::remove_dir_all(&home);
+    }
+
     /// DESIGN S7 on the `doctor` surface: a managed member whose shim exports its
     /// manifest's `shim_env` gets ONE `ok` line — the canonical row (the recorded one when
     /// it is managed, else derived) and the trailing `self-update off (…)` sentence —
@@ -3453,6 +4100,9 @@ mod tests {
                 outcome: "up to date".into(),
                 seams: Vec::new(),
                 last_success_at: String::new(),
+                last_index_reached_at: String::new(),
+                last_index_build: 0,
+                index_build_changed_at: String::new(),
                 programs,
             },
         )
@@ -3932,6 +4582,17 @@ mod tests {
                 && out.contains(&home.join("repo-a/target").display().to_string()),
             "both free-standing dirs are named: {out}"
         );
+        // AND NO REMEDY THAT CANNOT REACH THEM. `--all` walks with `require_repo`, so
+        // offering it here — one clause after saying the pass renames none of these —
+        // is a guaranteed no-op that leaves the warning standing.
+        assert!(
+            !out.contains("apply --all"),
+            "a remedy that skips every dir named must not be offered: {out}"
+        );
+        assert!(
+            out.contains("`aterm pkg noindex apply <dir>` by name"),
+            "the reach clause still names the verb that DOES reach them: {out}"
+        );
 
         // All in repos: no free-standing clause at all.
         std::fs::write(home.join("repo-a/Cargo.toml"), manifest).unwrap();
@@ -3943,6 +4604,11 @@ mod tests {
             "{out}"
         );
         assert!(!out.contains("free-standing"), "{out}");
+        assert!(
+            out.contains("now: `aterm pkg machine apply`"),
+            "with dirs the pass can reach, the remedy is the pass's own verb: {out}"
+        );
+        assert!(out.contains("apply --all"), "{out}");
     }
 
     /// A Spotlight-exposed target dir is a WARNING and exit stays 0.
@@ -3963,6 +4629,12 @@ mod tests {
         // The label must not contain the word the assertions grep for: several other doctor
         // lines print $HOME, and a home named "spotlight" would satisfy them vacuously.
         let home = synthetic_home("indexed");
+        std::fs::create_dir_all(home.join("repo-a")).unwrap();
+        std::fs::write(
+            home.join("repo-a/Cargo.toml"),
+            b"[package]\nname = \"a\"\nversion = \"0.0.0\"\n",
+        )
+        .unwrap();
         let exposed = cargo_target(&home.join("repo-a"), "target");
         cargo_target(&home.join("repo-b"), "target.noindex");
         let path = std::env::join_paths([l.bin_dir()]).unwrap();
@@ -4253,26 +4925,67 @@ mod tests {
 
     /// The report withholds "healthy" for one tool that cannot run, and exits 0.
     fn assert_not_healthy_exit_0(ok: bool, out: &str, err: &str) {
+        assert_withheld_exit_0(
+            ok,
+            out,
+            err,
+            "1 warning(s) above name a managed tool that cannot run",
+        );
+    }
+
+    /// The report withholds "healthy" for one tool doctor cannot show to run — its warn
+    /// says "may not run" or "cannot tell" — and says exactly that, never "cannot run".
+    fn assert_unproven_exit_0(ok: bool, out: &str, err: &str) {
+        assert_withheld_exit_0(
+            ok,
+            out,
+            err,
+            "1 warning(s) above name a managed tool that may not run or cannot be checked",
+        );
+    }
+
+    fn assert_withheld_exit_0(ok: bool, out: &str, err: &str, counted: &str) {
         assert!(ok, "nothing structural: exit 0\n{out}{err}");
         assert!(
             !healthy(out),
             "a tool that cannot run is not health:\n{out}"
         );
         assert!(
-            out.contains(
-                "doctor: not healthy — 1 warning(s) above name a managed tool that cannot \
-                 run; none is a structural problem, so the exit code stays 0"
-            ),
+            out.contains(&format!(
+                "doctor: not healthy — {counted}; none is a structural problem, so the exit \
+                 code stays 0"
+            )),
             "{out}"
         );
         assert!(!err.contains("FAIL"), "{err}");
     }
 
+    /// The closing line counts each kind of withheld warn under its own words.
+    #[test]
+    fn the_not_healthy_line_counts_cannot_run_apart_from_unproven() {
+        assert_eq!(
+            withheld_summary(2, 0),
+            "2 warning(s) above name a managed tool that cannot run"
+        );
+        assert_eq!(
+            withheld_summary(0, 1),
+            "1 warning(s) above name a managed tool that may not run or cannot be checked"
+        );
+        assert_eq!(
+            withheld_summary(1, 1),
+            "1 warning(s) above name a managed tool that cannot run, and 1 name one that may \
+             not run or cannot be checked"
+        );
+    }
+
     /// (5f) THE VIEW. With no seam recorded the check has nothing to say. Once a seam
-    /// is attached against a synthetic rustup home, the view's stock names are the
-    /// store's tools and the report is healthy; a view whose `rustc` was replaced by a
-    /// COPY is named — with the repair — and withholds "healthy"; `repair`'s
-    /// re-assertion rebuilds the view and the report is healthy again.
+    /// is attached against a synthetic rustup home, the view's stock names are clones of
+    /// the store's tools and the report is healthy. Two wrong views are named — with the
+    /// repair — and withhold "healthy": a `rustc` that is a HARD LINK to the store's
+    /// `trustc` (the construction before clones, which moved the store's inodes), and one
+    /// with `trustc`'s length, mode and time but other bytes (bundle 8595's separately
+    /// signed copy has exactly that shape). `repair`'s re-assertion rebuilds the view each
+    /// time and the report is healthy again.
     #[cfg(unix)]
     #[test]
     fn a_rustup_view_whose_stock_names_are_not_the_stores_tools_is_not_healthy() {
@@ -4288,32 +5001,212 @@ mod tests {
         crate::seam::attach(&l, &rustup, "trust").unwrap();
         let (ok, out, err) = whole_report(&l, &home, &path);
         assert!(ok && healthy(&out), "{out}{err}");
-        assert!(!out.contains("is not the store's"), "{out}");
+        assert!(!out.contains("is not a clone of the store's"), "{out}");
+        let store_trustc = bin.join("trustc");
         let view_rustc = crate::seam::view_dir(&l, "trust").join("bin").join("rustc");
-        assert!(same_file(&view_rustc, &bin.join("trustc")));
+        assert!(presents(&store_trustc, &view_rustc));
+        let warn = format!(
+            "doctor: warn — rustup `trust`: {} is not a clone of the store's {} (absent, other \
+             bytes, or the hard link a view held before clones), so `rustc +trust` runs \
+             something other than the managed trustc, or nothing; fix: `aterm pkg repair` \
+             rebuilds the view",
+            view_rustc.display(),
+            store_trustc.display()
+        );
 
-        // A copy where the link should be: `rustc +trust` would run a different file.
+        // The hard link the view used to be.
         std::fs::remove_file(&view_rustc).unwrap();
-        std::fs::write(&view_rustc, b"trustc").unwrap();
+        std::fs::hard_link(&store_trustc, &view_rustc).unwrap();
         let (ok, out, err) = whole_report(&l, &home, &path);
         assert_not_healthy_exit_0(ok, &out, &err);
+        assert!(out.contains(&warn), "{out}");
+        // Rebuilt as clones, silently: it presents the same bytes it did.
+        let lines = crate::seam::reassert(&l, &rustup);
+        assert!(lines.is_empty(), "{lines:?}");
+        assert!(presents(&store_trustc, &view_rustc));
+        let (ok, out, err) = whole_report(&l, &home, &path);
+        assert!(ok && healthy(&out), "{out}{err}");
+
+        // The bundle's shape: the Trust tool's length, mode and time, other bytes.
+        let modified = std::fs::metadata(&store_trustc)
+            .unwrap()
+            .modified()
+            .unwrap();
+        std::fs::remove_file(&view_rustc).unwrap();
+        std::fs::write(&view_rustc, b"trustC").unwrap();
+        std::fs::set_permissions(
+            &view_rustc,
+            std::fs::metadata(&store_trustc).unwrap().permissions(),
+        )
+        .unwrap();
+        std::fs::OpenOptions::new()
+            .write(true)
+            .open(&view_rustc)
+            .unwrap()
+            .set_modified(modified)
+            .unwrap();
+        assert!(
+            crate::clone::is_clone_of(&store_trustc, &view_rustc),
+            "the attributes cannot tell it apart"
+        );
+        let (ok, out, err) = whole_report(&l, &home, &path);
+        assert_not_healthy_exit_0(ok, &out, &err);
+        assert!(out.contains(&warn), "the bytes can: {out}");
+
+        // What repair does: re-assert, which rebuilds the view — and says so, since the
+        // view's `rustc` changed (2026-09-15).
+        let lines = crate::seam::reassert(&l, &rustup);
+        assert!(
+            lines.len() == 1 && lines[0].contains("now presents"),
+            "{lines:?}"
+        );
+        assert!(presents(&store_trustc, &view_rustc));
+        let (ok, out, err) = whole_report(&l, &home, &path);
+        assert!(ok && healthy(&out), "{out}{err}");
+    }
+
+    /// (5f) THE VIEW FOLLOWS A DEV-LINK (2026-09-16). With trust dev-linked to a sysroot
+    /// checkout, the view presents the checkout, and this check compares it against the
+    /// CHECKOUT's tools — healthy, and no "is not the store's" line over a view that is
+    /// right by construction. A view left presenting the store while the link stands is
+    /// the split this fix exists for, and it is named — against the checkout's tool —
+    /// with the repair. Unlinked, the store's view is right again.
+    #[cfg(unix)]
+    #[test]
+    fn a_dev_linked_trusts_view_is_healthy_when_it_presents_the_checkout() {
+        let (l, home, path, bin) = tippy_sibling_store("view-devlink");
+        for tool in ["trustc", "targo", "trustdoc", "tippy", "tippy-driver"] {
+            std::fs::write(bin.join(tool), tool).unwrap();
+        }
+        let rustup = home.join(".rustup");
+        std::fs::create_dir_all(rustup.join("toolchains")).unwrap();
+        crate::seam::attach(&l, &rustup, "trust").unwrap();
+        let view_rustc = crate::seam::view_dir(&l, "trust").join("bin").join("rustc");
+        assert!(presents(&bin.join("trustc"), &view_rustc));
+
+        // A checkout shaped like a sysroot, dev-linked — and the seam not yet re-asserted:
+        // the view still presents the store, which is now the wrong compiler.
+        let checkout = home.join("stage2");
+        std::fs::create_dir_all(checkout.join("bin")).unwrap();
+        std::fs::create_dir_all(checkout.join("lib")).unwrap();
+        for tool in ["trustc", "targo", "tippy"] {
+            std::fs::write(checkout.join("bin").join(tool), format!("dev {tool}")).unwrap();
+        }
+        crate::linkmode::link(
+            &l,
+            "trust",
+            &checkout,
+            &[std::path::PathBuf::from("bin/trustc")],
+        )
+        .unwrap();
+        let (ok, out, err) = whole_report(&l, &home, &path);
+        // Two stock names differ (`rustc` and `cargo`; the checkout ships no trustdoc,
+        // so `rustdoc` is not compared), each a tool that cannot run.
+        assert_withheld_exit_0(
+            ok,
+            &out,
+            &err,
+            "2 warning(s) above name a managed tool that cannot run",
+        );
         assert!(
             out.contains(&format!(
-                "doctor: warn — rustup `trust`: {} is not the store's {} (absent, or a separate \
-                 file), so `rustc +trust` runs something other than the managed trustc, or \
-                 nothing; fix: `aterm pkg repair` rebuilds the view",
+                "doctor: warn — rustup `trust`: {} is not the dev-linked checkout's {}",
                 view_rustc.display(),
-                bin.join("trustc").display()
+                checkout.join("bin").join("trustc").display()
             )),
             "{out}"
         );
 
-        // What repair does: re-assert, which rebuilds the view.
+        // What `link` (and repair) does: re-assert, which lays the checkout's view.
         let lines = crate::seam::reassert(&l, &rustup);
-        assert!(lines.is_empty(), "{lines:?}");
-        assert!(same_file(&view_rustc, &bin.join("trustc")));
+        assert!(
+            lines.len() == 1 && lines[0].contains("now presents"),
+            "{lines:?}"
+        );
+        assert!(
+            std::fs::symlink_metadata(&view_rustc).unwrap().is_file(),
+            "the view's rustc is a stub, not a link"
+        );
+        assert_eq!(
+            crate::platform::resolve_shim(&view_rustc).as_deref(),
+            Some(checkout.join("bin").join("trustc").as_path()),
+            "…that execs the checkout's trustc"
+        );
         let (ok, out, err) = whole_report(&l, &home, &path);
         assert!(ok && healthy(&out), "{out}{err}");
+        assert!(!out.contains("is not the"), "{out}");
+
+        crate::linkmode::unlink(&l, "trust").unwrap();
+        let lines = crate::seam::reassert(&l, &rustup);
+        assert!(
+            lines.len() == 1 && lines[0].contains("now presents"),
+            "{lines:?}"
+        );
+        assert!(presents(&bin.join("trustc"), &view_rustc));
+        let (ok, out, err) = whole_report(&l, &home, &path);
+        assert!(ok && healthy(&out), "{out}{err}");
+    }
+
+    /// (5f) A STORE-LESS dev-link has a seam too (2026-09-16), and it is checked — against
+    /// the checkout, the only thing there is: a view that presents it is not warned
+    /// about; a stub replaced by a copy is a tool that cannot run, named with the repair.
+    #[cfg(unix)]
+    #[test]
+    fn a_store_less_dev_linked_seam_is_checked_against_the_checkout() {
+        let l = layout("view-devlink-nostore");
+        let home = synthetic_home("view-devlink-nostore");
+        let path = std::env::join_paths([l.bin_dir()]).unwrap();
+        let checkout = home.join("stage2");
+        std::fs::create_dir_all(checkout.join("bin")).unwrap();
+        std::fs::create_dir_all(checkout.join("lib")).unwrap();
+        for tool in ["trustc", "targo"] {
+            std::fs::write(checkout.join("bin").join(tool), format!("dev {tool}")).unwrap();
+        }
+        crate::linkmode::link(
+            &l,
+            "trust",
+            &checkout,
+            &[std::path::PathBuf::from("bin/trustc")],
+        )
+        .unwrap();
+        let rustup = home.join(".rustup");
+        std::fs::create_dir_all(rustup.join("toolchains")).unwrap();
+        let lines = crate::seam::reassert(&l, &rustup);
+        assert!(
+            lines.len() == 1 && lines[0].contains("attached"),
+            "{lines:?}"
+        );
+        let (_, out, _) = whole_report(&l, &home, &path);
+        assert!(!out.contains("is not the"), "{out}");
+
+        let view_rustc = crate::seam::view_dir(&l, "trust").join("bin").join("rustc");
+        std::fs::remove_file(&view_rustc).unwrap();
+        std::fs::write(&view_rustc, b"a copy").unwrap();
+        let (_, out, _) = whole_report(&l, &home, &path);
+        assert!(
+            out.contains(&format!(
+                "doctor: warn — rustup `trust`: {} is not the dev-linked checkout's {}",
+                view_rustc.display(),
+                checkout.join("bin").join("trustc").display()
+            )),
+            "{out}"
+        );
+
+        // The checkout stops being a sysroot: the seam refuses, and with no store build
+        // behind the view doctor says so with the one fix (2026-09-16 review — it said
+        // nothing, and `rustc +trust` ran a compiler with no sysroot).
+        std::fs::remove_dir_all(checkout.join("lib")).unwrap();
+        let lines = crate::seam::reassert(&l, &rustup);
+        assert!(
+            lines.len() == 1 && lines[0].contains("not a sysroot"),
+            "{lines:?}"
+        );
+        let (_, out, _) = whole_report(&l, &home, &path);
+        assert!(
+            out.contains("which atpkg cannot present")
+                && out.contains("fix: `aterm pkg unlink trust`"),
+            "{out}"
+        );
     }
 
     /// (5f) tippy runs `trustc` under its own name and refuses a symbolic link there —
@@ -4360,6 +5253,518 @@ mod tests {
             ok && healthy(&out) && !out.contains("tippy cannot run"),
             "{out}{err}"
         );
+    }
+
+    /// Trust build 8595 the way the installed bundles 8571/8589/8590/8595 ship it: `rustc`
+    /// and `cargo` SEPARATE files that differ from `trustc` and `targo`, beside `tippy`,
+    /// with a `lib/` (a driver dylib, a nested rlib, a symlink) and a `share/` — active
+    /// through PLAIN shims for `trust`, `trustc`, `targo`, `tippy` and `alab-tippy`, written
+    /// directly the way a client from before exec roots laid them. Returns the layout, the
+    /// synthetic home, `PATH` and the build's `bin/`.
+    #[cfg(unix)]
+    fn affected_trust_store(label: &str) -> (Layout, PathBuf, std::ffi::OsString, PathBuf) {
+        let l = layout(label);
+        let dir = install_build_tree(&l, "trust", 8595);
+        let bin = dir.join("bin");
+        for (file, body) in [
+            ("trustc", "frontend 8595 / code signature: trustc"),
+            ("rustc", "frontend 8595 / code signature: rustc_"),
+            ("targo", "targo 8595"),
+            ("cargo", "cargo copy 8595"),
+            ("tippy", "tippy 8595"),
+            ("tippy-driver", "tippy-driver 8595"),
+            ("targo-tippy", "targo-tippy 8595"),
+        ] {
+            std::fs::write(bin.join(file), body).unwrap();
+        }
+        let rustlib = dir.join("lib/rustlib/aarch64-apple-darwin/lib");
+        std::fs::create_dir_all(&rustlib).unwrap();
+        std::fs::write(dir.join("lib/librustc_driver-5cfd.dylib"), b"driver").unwrap();
+        std::fs::write(rustlib.join("libstd.rlib"), b"std").unwrap();
+        std::os::unix::fs::symlink("../../share", dir.join("lib/rustlib/share-link")).unwrap();
+        std::fs::create_dir_all(dir.join("share")).unwrap();
+        std::fs::write(dir.join("share/README"), b"readme").unwrap();
+        std::fs::create_dir_all(l.bin_dir()).unwrap();
+        for (name, file) in [
+            ("trust", "trust"),
+            ("trustc", "trustc"),
+            ("targo", "targo"),
+            ("tippy", "tippy"),
+            ("alab-tippy", "tippy"),
+        ] {
+            write_plain_shim(&l, name, &bin.join(file));
+        }
+        activate_channel(&l, "stable", &dir).unwrap();
+        crate::store::mark_build_ready(&dir).unwrap();
+        let home = synthetic_home(label);
+        let path = std::env::join_paths([l.bin_dir()]).unwrap();
+        (l, home, path, bin)
+    }
+
+    /// Today's plain shim at `bin/<name>`, written directly so no route is decided.
+    #[cfg(unix)]
+    fn write_plain_shim(l: &Layout, name: &str, target: &Path) {
+        let shim = l.shim(&tool(name));
+        std::fs::write(
+            &shim,
+            crate::platform::sh_shim_content_env(target, &crate::shim_env::ShimEnv::NONE),
+        )
+        .unwrap();
+        std::fs::set_permissions(&shim, std::fs::Permissions::from_mode(0o755)).unwrap();
+    }
+
+    /// Everything `lstat` says about `dirs` and every entry under them — path, inode, link
+    /// count, mode, size, mtime and ctime to the nanosecond, symlink target — sorted: what
+    /// any write, link, unlink, chmod or create would move.
+    #[cfg(unix)]
+    fn tree_snapshot(dirs: &[&Path]) -> Vec<String> {
+        use std::os::unix::fs::MetadataExt;
+        let mut out = Vec::new();
+        let mut stack: Vec<PathBuf> = dirs.iter().map(|d| d.to_path_buf()).collect();
+        while let Some(path) = stack.pop() {
+            let m = std::fs::symlink_metadata(&path).unwrap();
+            out.push(format!(
+                "{} ino={} nlink={} mode={:o} size={} mtime={}.{} ctime={}.{} link={:?}",
+                path.display(),
+                m.ino(),
+                m.nlink(),
+                m.mode(),
+                m.size(),
+                m.mtime(),
+                m.mtime_nsec(),
+                m.ctime(),
+                m.ctime_nsec(),
+                std::fs::read_link(&path).ok()
+            ));
+            if m.is_dir() {
+                for entry in std::fs::read_dir(&path).unwrap() {
+                    stack.push(entry.unwrap().path());
+                }
+            }
+        }
+        out.sort();
+        out
+    }
+
+    /// The whole report, with proof that it wrote nothing: the prefix and the home are
+    /// `lstat`-identical before and after.
+    #[cfg(unix)]
+    fn read_only_report(l: &Layout, home: &Path, path: &OsStr) -> (bool, String, String) {
+        let before = tree_snapshot(&[&l.prefix, home]);
+        let report = whole_report(l, home, path);
+        assert_eq!(
+            before,
+            tree_snapshot(&[&l.prefix, home]),
+            "doctor wrote to the fixture:\n{}",
+            report.1
+        );
+        report
+    }
+
+    /// The lines of `out` about trust build 8595's exec root.
+    fn exec_root_lines(out: &str) -> Vec<&str> {
+        out.lines()
+            .filter(|line| line.contains(" — trust build 8595: "))
+            .collect()
+    }
+
+    /// (5f)(c)-(f) THE EXEC ROOT, over the whole report, each state read-only:
+    ///
+    /// * plain shims and no root on an affected build: the warn, with both inodes and the
+    ///   one fix, and "not healthy" at exit 0;
+    /// * the pass's reconcile lays the root and routes the shims: the note, and healthy;
+    /// * an `alab-` alias laid plain again: a warn naming it, one of five;
+    /// * a file planted in the root's `lib/`: a warn naming that path; repair's `Deep`
+    ///   reconcile rebuilds the root and the report is healthy again;
+    /// * `compat/trust` replaced by a symbolic link to the whole root's directory: a warn
+    ///   naming the link and the manual fix (never `repair` alone); the reconcile refuses
+    ///   with the same path and fix and lays the shims plain, `ensure_root`'s refusal line
+    ///   says the same, and once the link is gone and the directory is back the shims
+    ///   route again;
+    /// * the build's `bin/rustc` unreadable: the (f) warn naming the failed read, not
+    ///   healthy, and the root left standing;
+    /// * roots no build needs — a build's gone, a symlink at a numeric name — warn with
+    ///   `aterm pkg gc` and leave the report healthy, and gc's sweep takes exactly them;
+    /// * the build stops needing a root (`rustc` a hard link of `trustc`): no (c) line at
+    ///   all, and its leftover root is a (d) warn until swept.
+    #[cfg(unix)]
+    #[test]
+    fn an_affected_trust_build_is_healthy_only_while_its_exec_root_routes_every_shim() {
+        use std::os::unix::fs::MetadataExt;
+        let (l, home, path, bin) = affected_trust_store("exec-root");
+        let differing = crate::compat::needs_root(bin.parent().unwrap())
+            .unwrap()
+            .unwrap();
+        assert_eq!(differing, 6, "`rustc_` against `trustc`: six positions");
+        let ino = |f: &str| std::fs::symlink_metadata(bin.join(f)).unwrap().ino();
+        let root = crate::compat::root_dir(&l, 8595);
+        let copy = format!(
+            "bin/rustc (inode {}) is a separate file from bin/trustc (inode {}; 6 byte(s) differ)",
+            ino("rustc"),
+            ino("trustc")
+        );
+        let fix = "fix: `aterm pkg repair` lays the exec root (a copy-on-write clone — the store \
+                   is never modified) and routes the shims";
+
+        // An older client's machine: plain shims, no root.
+        let (ok, out, err) = read_only_report(&l, &home, &path);
+        assert_not_healthy_exit_0(ok, &out, &err);
+        assert_eq!(
+            exec_root_lines(&out),
+            vec![format!(
+                "doctor: warn — trust build 8595: PATH tippy cannot run — {copy}, which this \
+                 build's tippy refuses, and no exec root stands at {}; {fix}",
+                root.display()
+            )],
+            "{out}"
+        );
+        assert!(
+            std::fs::symlink_metadata(crate::compat::compat_dir(&l)).is_err(),
+            "doctor lays nothing"
+        );
+
+        // The pass heals it: root laid, every trust shim routed.
+        let report = crate::compat::reconcile(&l, crate::seam::Depth::Shallow);
+        assert_eq!(report.built, vec![8595], "{report:?}");
+        assert_eq!(report.routed.len(), 5, "{report:?}");
+        let (ok, out, err) = read_only_report(&l, &home, &path);
+        assert!(ok && healthy(&out), "{out}{err}");
+        assert_eq!(
+            exec_root_lines(&out),
+            vec![format!(
+                "doctor: note — trust build 8595: {copy}, which its tippy refuses; its 5 trust \
+                 shim(s) run each tool from {}, where rustc holds trustc's bytes (a \
+                 copy-on-write clone; the store is untouched) — removed with the build",
+                root.display()
+            )],
+            "{out}"
+        );
+
+        // One alias laid plain again, as by a writer that decided no route.
+        write_plain_shim(&l, "alab-tippy", &bin.join("tippy"));
+        let (ok, out, err) = read_only_report(&l, &home, &path);
+        assert_not_healthy_exit_0(ok, &out, &err);
+        assert_eq!(
+            exec_root_lines(&out),
+            vec![format!(
+                "doctor: warn — trust build 8595: PATH tippy cannot run through 1 of 5 trust \
+                 shim(s) (e.g. alab-tippy) — {copy}, which this build's tippy refuses, and \
+                 those shims do not route through the exec root {}; {fix}",
+                root.display()
+            )],
+            "{out}"
+        );
+        let report = crate::compat::reconcile(&l, crate::seam::Depth::Shallow);
+        assert!(
+            report.built.is_empty() && report.routed.len() == 1,
+            "{report:?}"
+        );
+        let (ok, out, err) = whole_report(&l, &home, &path);
+        assert!(ok && healthy(&out), "{out}{err}");
+
+        // A file planted in the root's `lib/`: the shims still route, but what they run is
+        // not the build. Only a Deep walk sees it, and only a Deep reconcile heals it.
+        let planted = root.join("lib").join("planted.dylib");
+        std::fs::write(&planted, b"not the build's").unwrap();
+        let (ok, out, err) = read_only_report(&l, &home, &path);
+        assert_unproven_exit_0(ok, &out, &err);
+        assert_eq!(
+            exec_root_lines(&out),
+            vec![format!(
+                "doctor: warn — trust build 8595: PATH tippy may not run — {copy}, which this \
+                 build's tippy refuses, and the exec root {} is not the store build {} file for \
+                 file (first difference: {}); {fix}",
+                root.display(),
+                bin.parent().unwrap().display(),
+                planted.display()
+            )],
+            "{out}"
+        );
+        let report = crate::compat::reconcile(&l, crate::seam::Depth::Deep);
+        assert_eq!(report.built, vec![8595], "{report:?}");
+        let (ok, out, err) = whole_report(&l, &home, &path);
+        assert!(ok && healthy(&out) && out.contains("doctor: note — trust build 8595: "));
+        assert!(err.is_empty(), "{err}");
+
+        // A symbolic link at `compat/trust`, naming the very directory that stood there. No
+        // update, repair or gc follows or removes it, so `repair` refuses on every run: every
+        // line names the link and says to remove it first (the e2e run of 2026-09-15 read
+        // "update directory is a symlink; refusing" beside advice to run the repair that
+        // refused).
+        let roots = crate::compat::roots_dir(&l);
+        let aside = l.prefix.with_file_name(format!(
+            "{}-compat-trust-aside",
+            l.prefix.file_name().unwrap().to_string_lossy()
+        ));
+        std::fs::rename(&roots, &aside).unwrap();
+        std::os::unix::fs::symlink(&aside, &roots).unwrap();
+        let link_fix = "fix: remove that link (only the link: whatever it names is left as it \
+                        is), then `aterm pkg repair` lays the exec root";
+        let blocked = format!(
+            "{} is a symbolic link, not a directory — atpkg lays nothing through a link \
+             there, and no update, repair or gc removes it, so no exec root is laid at {} and \
+             no shim routes through one",
+            roots.display(),
+            root.display()
+        );
+        let (ok, out, err) = read_only_report(&l, &home, &path);
+        assert_unproven_exit_0(ok, &out, &err);
+        assert_eq!(
+            exec_root_lines(&out),
+            vec![format!(
+                "doctor: warn — trust build 8595: PATH tippy may not run — {copy}, which this \
+                 build's tippy refuses, and {blocked}; {link_fix}"
+            )],
+            "{out}"
+        );
+        let report = crate::compat::reconcile(&l, crate::seam::Depth::Deep);
+        assert_eq!(
+            report.errors,
+            vec![format!(
+                "trust build 8595: {blocked} — its trust shims render plain and run the store \
+                 path; {link_fix}"
+            )],
+            "{report:?}"
+        );
+        assert_eq!(report.routed.len(), 5, "{report:?}");
+        let refused =
+            crate::compat::ensure_root(&l, bin.parent().unwrap(), crate::seam::Depth::Shallow)
+                .unwrap_err();
+        assert_eq!(
+            crate::compat::not_laid_line(&l, 8595, &refused),
+            format!(
+                "atpkg: trust build 8595: {blocked} — this build's trust shims run the store \
+                 path, where its tippy refuses to start; {link_fix}"
+            )
+        );
+        let (ok, out, err) = read_only_report(&l, &home, &path);
+        assert_not_healthy_exit_0(ok, &out, &err);
+        assert_eq!(
+            exec_root_lines(&out),
+            vec![format!(
+                "doctor: warn — trust build 8595: PATH tippy cannot run — {copy}, which this \
+                 build's tippy refuses, and {blocked}; {link_fix}"
+            )],
+            "{out}"
+        );
+        assert!(
+            aside.join("8595").join("bin").join("tippy").is_file(),
+            "the directory behind the link is left whole"
+        );
+        std::fs::remove_file(&roots).unwrap();
+        std::fs::rename(&aside, &roots).unwrap();
+        let report = crate::compat::reconcile(&l, crate::seam::Depth::Deep);
+        assert!(
+            report.errors.is_empty() && report.built.is_empty() && report.routed.len() == 5,
+            "{report:?}"
+        );
+        let (ok, out, err) = whole_report(&l, &home, &path);
+        assert!(ok && healthy(&out), "{out}{err}");
+
+        // (f) The build's `bin/rustc` unreadable: an unanswered question is not "needs none".
+        // A warn that withholds "healthy" and names the failed read — and the root, which
+        // doctor never touches, still stands for the passes to leave alone.
+        if crate::platform::our_uid() != 0 {
+            use std::os::unix::fs::PermissionsExt;
+            let rustc = bin.join("rustc");
+            let mode = std::fs::metadata(&rustc).unwrap().permissions();
+            std::fs::set_permissions(&rustc, std::fs::Permissions::from_mode(0o000)).unwrap();
+            let (ok, out, err) = read_only_report(&l, &home, &path);
+            std::fs::set_permissions(&rustc, mode).unwrap();
+            assert_unproven_exit_0(ok, &out, &err);
+            let lines = exec_root_lines(&out);
+            assert_eq!(lines.len(), 1, "{out}");
+            assert!(
+                lines[0].starts_with(
+                    "doctor: warn — trust build 8595: cannot tell whether PATH tippy can run — \
+                     cannot compare "
+                ) && lines[0].ends_with(
+                    "; any exec root standing for the build is left as it is; fix: make that \
+                     store file readable again (`aterm pkg verify trust` checks the build \
+                     against its signed tree)"
+                ),
+                "{out}"
+            );
+            assert!(root.is_dir());
+        }
+
+        // Roots no build needs: advisory, named with gc, and exactly what gc's sweep takes.
+        let gone = crate::compat::root_dir(&l, 9999);
+        std::fs::create_dir_all(gone.join("bin")).unwrap();
+        let link = crate::compat::root_dir(&l, 42);
+        std::os::unix::fs::symlink(&home, &link).unwrap();
+        let (ok, out, err) = read_only_report(&l, &home, &path);
+        assert!(ok && healthy(&out), "advisory, never health:\n{out}{err}");
+        let strays: Vec<&str> = out.lines().filter(|l| l.contains("aterm pkg gc")).collect();
+        assert_eq!(
+            strays,
+            vec![
+                format!(
+                    "doctor: warn — {} is not a directory, and atpkg lays only exec root \
+                     directories under that name; fix: `aterm pkg gc` removes it",
+                    link.display()
+                ),
+                format!(
+                    "doctor: warn — exec root {} outlives trust build 9999, which is no longer \
+                     in the store, and its clones keep that build's reclaimed blocks \
+                     allocated; fix: `aterm pkg gc` removes it",
+                    gone.display()
+                ),
+            ],
+            "{out}"
+        );
+        let mut swept = crate::compat::sweep(&l).swept;
+        swept.sort();
+        assert_eq!(swept, vec![link.clone(), gone.clone()]);
+        assert!(home.is_dir(), "the symlink was unlinked, not followed");
+
+        // The build stops needing a root: `rustc` a hard link of `trustc`. No (c) line; the
+        // root it leaves is a (d) warn until the sweep takes it, then nothing at all.
+        std::fs::remove_file(bin.join("rustc")).unwrap();
+        std::fs::hard_link(bin.join("trustc"), bin.join("rustc")).unwrap();
+        let (ok, out, err) = read_only_report(&l, &home, &path);
+        assert!(ok && healthy(&out), "{out}{err}");
+        assert!(exec_root_lines(&out).is_empty(), "{out}");
+        assert_eq!(
+            out.lines()
+                .filter(|l| l.contains("aterm pkg gc"))
+                .collect::<Vec<_>>(),
+            vec![format!(
+                "doctor: warn — exec root {} stands for trust build 8595, which needs none (its \
+                 bin/rustc is not a separate file from bin/trustc that its tippy refuses); fix: \
+                 `aterm pkg gc` removes it",
+                root.display()
+            )],
+            "{out}"
+        );
+        assert_eq!(crate::compat::sweep(&l).swept, vec![root.clone()]);
+        let (ok, out, err) = read_only_report(&l, &home, &path);
+        assert!(ok && healthy(&out), "{out}{err}");
+        assert!(
+            !out.contains("exec root") && exec_root_lines(&out).is_empty(),
+            "{out}"
+        );
+        let _ = std::fs::remove_dir_all(&l.prefix);
+        let _ = std::fs::remove_dir_all(&home);
+    }
+
+    /// (5f)(c)'s example name prefers `tippy` — the tool the line is about — over whichever
+    /// unrouted shim sorts first; a root that differs names the root, the store build and the
+    /// first difference each as what it is; and a blocked `compat` names the manual fix.
+    #[test]
+    fn the_exec_root_warn_names_tippy_first_and_the_first_difference() {
+        use crate::compat::{Inspection, RootState};
+        let mut i = Inspection {
+            differing: 2428,
+            rustc_ino: 11,
+            trustc_ino: 12,
+            build_dir: PathBuf::from("/p/store/trust/8595"),
+            root: PathBuf::from("/p/compat/trust/8595"),
+            state: RootState::Matches,
+            shims: ["alab-tippy", "targo", "tippy", "trustc"]
+                .map(String::from)
+                .to_vec(),
+            unrouted: ["alab-tippy", "targo", "tippy"].map(String::from).to_vec(),
+        };
+        let (line, claim) = exec_root_line("doctor", 8595, &i);
+        assert_eq!(claim, ToolClaim::CannotRun);
+        assert!(
+            line.contains(
+                "PATH tippy cannot run through 3 of 4 trust shim(s) (e.g. tippy) — bin/rustc \
+                 (inode 11) is a separate file from bin/trustc (inode 12; 2428 byte(s) differ)"
+            ),
+            "{line}"
+        );
+        i.unrouted = vec!["targo".into()];
+        assert!(
+            exec_root_line("doctor", 8595, &i)
+                .0
+                .contains("(e.g. targo)")
+        );
+        // Each path labelled for what it is: the root, the store build, and the first
+        // path inside the root that is not the build's (the e2e run of 2026-09-15 read
+        // "differs from the build at <root>/bin/tippy", as if the build lived there).
+        i.state = RootState::Differs(PathBuf::from("/p/compat/trust/8595/bin/tippy"));
+        let (line, claim) = exec_root_line("status", 8595, &i);
+        assert!(
+            claim == ToolClaim::Unproven
+                && line.starts_with("status: warn — trust build 8595: PATH tippy may not run — "),
+            "{line}"
+        );
+        assert!(
+            line.ends_with(
+                "and the exec root /p/compat/trust/8595 is not the store build \
+                 /p/store/trust/8595 file for file (first difference: \
+                 /p/compat/trust/8595/bin/tippy); fix: `aterm pkg repair` lays the exec root \
+                 (a copy-on-write clone — the store is never modified) and routes the shims"
+            ),
+            "{line}"
+        );
+        // Blocked: a link (or a file) at compat/ or compat/trust. The fix is the manual
+        // step, never `repair` alone, which refuses there on every run; `cannot` while no
+        // shim carries a route, `may not` while one routed earlier might still run.
+        i.state = RootState::Blocked(crate::compat::Blocked {
+            at: PathBuf::from("/p/compat/trust"),
+            symlink: true,
+            root: PathBuf::from("/p/compat/trust/8595"),
+        });
+        let (line, claim) = exec_root_line("doctor", 8595, &i);
+        assert_eq!(claim, ToolClaim::Unproven, "{line}");
+        assert_eq!(
+            line,
+            "doctor: warn — trust build 8595: PATH tippy may not run — bin/rustc (inode 11) is \
+             a separate file from bin/trustc (inode 12; 2428 byte(s) differ), which this \
+             build's tippy refuses, and /p/compat/trust is a symbolic link, not a directory — \
+             atpkg lays nothing through a link there, and no update, repair or gc removes it, \
+             so no exec root is laid at /p/compat/trust/8595 and no shim routes through one; \
+             fix: remove that link (only \
+             the link: whatever it names is left as it is), then `aterm pkg repair` lays the \
+             exec root"
+        );
+        i.unrouted = i.shims.clone();
+        i.state = RootState::Blocked(crate::compat::Blocked {
+            at: PathBuf::from("/p/compat"),
+            symlink: false,
+            root: PathBuf::from("/p/compat/trust/8595"),
+        });
+        let (line, claim) = exec_root_line("doctor", 8595, &i);
+        assert_eq!(claim, ToolClaim::CannotRun, "{line}");
+        assert!(
+            line.contains("PATH tippy cannot run — ")
+                && line.ends_with(
+                    "and /p/compat is not a directory — no update, repair or gc removes it, so no \
+                     exec root is laid at /p/compat/trust/8595 and no shim routes through one; \
+                     fix: move that file out of the way, then `aterm pkg repair` lays the exec \
+                     root"
+                ),
+            "{line}"
+        );
+        assert!(
+            !line.contains("repair` lays the exec root (a copy-on-write clone"),
+            "{line}"
+        );
+        i.state = RootState::Matches;
+        i.unrouted.clear();
+        let (line, claim) = exec_root_line("doctor", 8595, &i);
+        assert!(
+            claim == ToolClaim::Runs && line.starts_with("doctor: note — "),
+            "{line}"
+        );
+        // Every "cannot run" line counts as one; every "may not run" line as unproven.
+        for (state, unrouted, claim) in [
+            (RootState::Absent, vec![], ToolClaim::CannotRun),
+            (
+                RootState::Matches,
+                vec!["tippy".to_string()],
+                ToolClaim::CannotRun,
+            ),
+        ] {
+            i.state = state;
+            i.unrouted = unrouted;
+            let (line, got) = exec_root_line("doctor", 8595, &i);
+            assert_eq!(got, claim, "{line}");
+            assert!(line.contains("PATH tippy cannot run "), "{line}");
+        }
     }
 
     #[test]
@@ -4473,6 +5878,89 @@ mod tests {
     /// The RECORD a tracked installer left when its lane could not run is reported as
     /// the cause on the tagged bundle's line; a record with no tagged file behind it is
     /// named as stale rather than presented as a tagged bundle.
+    #[cfg(target_os = "macos")]
+    /// The two freshness warnings (2026-09-15), separately: a listing unreached for
+    /// days is named as such — every pass since ran on the cache — and an index build
+    /// unchanged for a month WHILE the listing was reachable reads as a frozen
+    /// publisher. A record from before the fields existed says nothing new, and an
+    /// unreachable listing is never called a frozen publisher.
+    #[test]
+    fn doctor_names_an_unreached_listing_and_a_frozen_index_separately() {
+        let l = layout("freshness");
+        install(&l, "ay", 8256);
+        let home = synthetic_home("freshness");
+        let now = crate::flow::rfc3339_to_unix("2026-10-20T00:00:00Z").unwrap();
+        let run = |status: crate::Status| -> String {
+            crate::status::write(&l, &status).unwrap();
+            let path = std::env::join_paths([l.bin_dir()]).unwrap();
+            let (mut out, mut err): (Vec<u8>, Vec<u8>) = (Vec::new(), Vec::new());
+            let _ = run_with(
+                &l,
+                Some(&home),
+                Some(&path),
+                now,
+                None,
+                None,
+                "doctor",
+                &Probes::default(),
+                &mut out,
+                &mut err,
+            );
+            String::from_utf8_lossy(&out).into_owned()
+        };
+        let base = crate::Status {
+            schema: 1,
+            updated_at: "2026-10-19T00:00:00Z".into(),
+            enabled: true,
+            index_source: "alabsystems/aterm".into(),
+            outcome: "up to date".into(),
+            seams: Vec::new(),
+            last_success_at: "2026-10-19T00:00:00Z".into(),
+            last_index_reached_at: String::new(),
+            last_index_build: 0,
+            index_build_changed_at: String::new(),
+            programs: Default::default(),
+        };
+        let out = run(base.clone());
+        assert!(!out.contains("has not been reached"), "{out}");
+        assert!(!out.contains("publishing looks frozen"), "{out}");
+        let out = run(crate::Status {
+            last_index_reached_at: "2026-10-10T00:00:00Z".into(),
+            last_index_build: 32,
+            index_build_changed_at: "2026-10-01T00:00:00Z".into(),
+            ..base.clone()
+        });
+        assert!(
+            out.contains("has not been reached for 10 day(s)"),
+            "an unreached listing is named:\n{out}"
+        );
+        assert!(
+            !out.contains("publishing looks frozen"),
+            "unreachable is not frozen:\n{out}"
+        );
+        let out = run(crate::Status {
+            last_index_reached_at: "2026-10-19T00:00:00Z".into(),
+            last_index_build: 32,
+            index_build_changed_at: "2026-09-10T00:00:00Z".into(),
+            ..base
+        });
+        assert!(
+            out.contains("index build 32 has not changed in 40 day(s)"),
+            "a frozen publisher is named:\n{out}"
+        );
+        assert!(out.contains("publishing looks frozen"), "{out}");
+        assert!(!out.contains("has not been reached"), "{out}");
+        let _ = std::fs::remove_dir_all(&l.prefix);
+        let _ = std::fs::remove_dir_all(&home);
+    }
+
+    /// macOS-gated like its sibling above, and for the same reason: it mints the synthetic
+    /// `user.*` attribute through [`crate::provenance::set_xattr_for_test`], which is
+    /// `#[cfg(all(test, target_os = "macos"))]` because it calls the six-argument Darwin
+    /// `setxattr`. Without the gate this fn was compiled on every target and `cargo test -p
+    /// atpkg` would not BUILD off macOS (E0425, measured on x86_64-unknown-linux-gnu
+    /// 2026-09-16) — the whole unit-test binary lost, not one test.
+    /// `crates/atpkg/tests/platform_cfg_parity.rs` is the standing guard for that class.
     #[cfg(target_os = "macos")]
     #[test]
     fn a_tracked_install_record_is_reported_as_the_cause() {

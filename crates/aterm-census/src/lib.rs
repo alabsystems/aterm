@@ -125,7 +125,11 @@ pub const PRECISION_NOTE: &str = "    PRECISION / SCOPE (the honest limits of th
         can evade it; the realistic regression — reverting an offloaded resize
         to a synchronous `term_lock(..).resize(..)` on a main-thread path — is
         caught, with the reachability path printed.
-      - SCOPE: the call graph covers non-test `crates/aterm-gui/src` ONLY,
+      - SCOPE: the call graph covers non-test `crates/aterm-gui/src` ONLY —
+        test/bench FILES dropped by path, and in-file items whose `cfg` gate
+        ENTAILS `test`/`kani` (`all(test, ..)` yes; `any(test, unix)` and
+        `not(test)` no) blanked before segmentation, so a gate that does not
+        entail it stays visible and fails rather than skipping silently —
         plus ONE modeled `term_lock` hop into Terminal methods. It does NOT
         recurse into aterm-core/aterm-grid bodies; instead the unbounded sinks
         are pinned at their definitions by `// COST: UNBOUNDED(<dim>)` markers,
@@ -330,6 +334,126 @@ fn gui_source_files(root: &Path) -> Vec<PathBuf> {
     files.retain(|p| !is_test_file(p));
     files.sort();
     files
+}
+
+/// Blank every in-file item whose `cfg` gate proves it NEVER COMPILES into a
+/// shipped GUI process — the in-file half of this census's documented
+/// "non-test `crates/aterm-gui/src`" scope, which [`gui_source_files`] can only
+/// do by PATH.
+///
+/// WHY IT EXISTS (measured 2026-09-15, the day it was written). The main-loop
+/// census masked nothing at all: it dropped `_tests.rs` / `tests/` FILES and
+/// then graphed every remaining fn, `#[cfg(test)] mod tests` bodies included.
+/// Because the walk is name-based and merges same-named fns into one node, a
+/// TEST HELPER in a shipped file is indistinguishable from the shipped fn that
+/// shares its name. On 2026-09-15 commit 54fe06696 added
+/// `crates/aterm-gui/src/app_render.rs:10405` — `fn compose(app, wid)` inside
+/// `#[cfg(all(test, any(windows, target_os = "linux")))] mod
+/// strip_band_landing_tests`, a Windows/Linux-only test helper that composes
+/// one frame with `term_lock(..).resize(rows, cols)`. `App::tab_titles` calls
+/// `title_summaries.compose(..)` (a `title_summary::compose`), so the merged
+/// `compose` node inherited the test helper's guarded `resize` and OB-5
+/// reported `user_event -> begin_session_rename -> tab_titles -> compose` as a
+/// main-thread reach into the whole-Mac-freeze sink. The hazard is not real:
+/// that body exists only in a `cfg(test)` build, and only on two platforms the
+/// shipped macOS GUI is not. The census's MODEL had drifted from its own
+/// stated scope; this closes that, rather than renaming a peer's test helper
+/// out of a collision it will only walk back into.
+///
+/// SOUNDNESS. Masking is subtractive, so it must only ever remove code that
+/// truly cannot ship. The predicate is [`cfg_attr_never_ships`], which
+/// requires the gate to ENTAIL `test`/`kani` — `all(test, ..)` yes,
+/// `any(test, unix)` no, `not(test)` no — and every other spelling stays
+/// visible and fails the census for a human to answer, the fail-closed
+/// direction the shared masker's doc argues for. The item walker is the
+/// audited shared one ([`lock_order::mask_items_where`]), which preserves line
+/// count (spans stay correct) and RESTORES any span it cannot terminate rather
+/// than blanking to EOF.
+fn mask_unshipped_items(text: &str) -> String {
+    crate::lock_order::mask_items_where(text, &|attr| cfg_attr_never_ships(attr))
+}
+
+/// Does this trimmed attribute line prove its item is absent from a shipped
+/// build? True only for `#[cfg(<pred>)]` whose `<pred>` ENTAILS `test` or
+/// `kani` (see [`cfg_pred_entails_unshipped`]). Anything else — a `#[cfg]` the
+/// parser does not recognise, a non-`cfg` attribute — is false, so the item
+/// stays in the graph.
+fn cfg_attr_never_ships(attr: &str) -> bool {
+    let Some(rest) = attr.strip_prefix("#[cfg(") else {
+        return false;
+    };
+    let Some(pred) = rest.strip_suffix(")]") else {
+        return false;
+    };
+    cfg_pred_entails_unshipped(pred)
+}
+
+/// Does `pred` (a `cfg` predicate, without the `cfg(..)` wrapper) hold ONLY
+/// when `test` or `kani` is set? Conservative by construction — `false` means
+/// "not proven unshipped", never "shipped":
+///
+///   * the bare idents `test` / `kani` — the two gates every other census in
+///     this crate already treats as unshipped;
+///   * `all(..)` — one child entailing is enough (a conjunction is at least as
+///     strong as any conjunct): this is what makes
+///     `all(test, any(windows, target_os = "linux"))` test-only;
+///   * `any(..)` — EVERY child must entail, since a disjunction is only as
+///     strong as its weakest arm. `any(test, unix)` compiles on a shipped unix
+///     build and is therefore NOT masked;
+///   * everything else, `not(..)` included, is false. `not(test)` is the
+///     SHIPPED half of a gate and masking it would blind the census to the
+///     very code it guards.
+fn cfg_pred_entails_unshipped(pred: &str) -> bool {
+    let pred = pred.trim();
+    if pred == "test" || pred == "kani" {
+        return true;
+    }
+    for (head, all_children_required) in [("all(", false), ("any(", true)] {
+        if let Some(rest) = pred.strip_prefix(head)
+            && let Some(inner) = rest.strip_suffix(')')
+        {
+            let children = split_top_level_commas(inner);
+            if children.is_empty() {
+                return false;
+            }
+            return if all_children_required {
+                children.iter().all(|c| cfg_pred_entails_unshipped(c))
+            } else {
+                children.iter().any(|c| cfg_pred_entails_unshipped(c))
+            };
+        }
+    }
+    false
+}
+
+/// Split a `cfg` argument list on its TOP-LEVEL commas — commas inside nested
+/// parentheses or inside a string literal (`target_os = "linux"`) do not
+/// separate arguments. Empty/whitespace-only pieces are dropped.
+fn split_top_level_commas(args: &str) -> Vec<&str> {
+    let mut out = Vec::new();
+    let mut depth = 0usize;
+    let mut in_str = false;
+    let mut start = 0usize;
+    for (i, c) in args.char_indices() {
+        match c {
+            '"' => in_str = !in_str,
+            '(' if !in_str => depth += 1,
+            ')' if !in_str => depth = depth.saturating_sub(1),
+            ',' if !in_str && depth == 0 => {
+                let piece = args[start..i].trim();
+                if !piece.is_empty() {
+                    out.push(piece);
+                }
+                start = i + c.len_utf8();
+            }
+            _ => {}
+        }
+    }
+    let piece = args[start..].trim();
+    if !piece.is_empty() {
+        out.push(piece);
+    }
+    out
 }
 
 /// Strip a whole-line `//` comment and any inline ` // …` trailing comment, so
@@ -888,7 +1012,11 @@ pub fn run_mainloop_census(root: &Path) -> CensusOutcome {
             .unwrap_or(&file)
             .to_string_lossy()
             .into_owned();
-        parse_source_fns(&text, &rel, &mut fns);
+        // In-file test/kani items are blanked BEFORE segmentation: a
+        // `#[cfg(test)]`-gated helper is not part of the shipped GUI process,
+        // and under a name-based walk it would otherwise lend its body to
+        // every shipped fn that shares its name (see `mask_unshipped_items`).
+        parse_source_fns(&mask_unshipped_items(&text), &rel, &mut fns);
     }
     // name -> ALL definition indices. A name-based census MUST walk every
     // same-named def: first-def-wins would drop a hazard living in a non-first
@@ -1366,6 +1494,148 @@ mod tests {
             "the diagnostic must carry the repair options; log:\n{}",
             out.log
         );
+    }
+
+    // ------------------------------------------------------------------
+    // The in-file unshipped mask (`#[cfg(test)]` and its conjunctive kin).
+    // ------------------------------------------------------------------
+
+    #[test]
+    fn cfg_predicate_entails_unshipped_only_when_it_really_does() {
+        // Entailing: the bare gates, and any conjunction containing one —
+        // which is the shape that made this census RED on 2026-09-15
+        // (`#[cfg(all(test, any(windows, target_os = "linux")))]`).
+        for yes in [
+            "#[cfg(test)]",
+            "#[cfg(kani)]",
+            "#[cfg(all(test, unix))]",
+            "#[cfg(all(test, any(windows, target_os = \"linux\")))]",
+            "#[cfg(all(unix, all(kani, debug_assertions)))]",
+            "#[cfg(any(test, kani))]",
+        ] {
+            assert!(cfg_attr_never_ships(yes), "`{yes}` must be masked");
+        }
+        // NOT entailing: a disjunction with a shipped arm, a negation, a
+        // feature merely NAMED "test", and anything unparsed. Each stays in
+        // the graph, where a hazard under it fails the census for a human —
+        // the fail-closed direction.
+        for no in [
+            "#[cfg(any(test, unix))]",
+            "#[cfg(not(test))]",
+            "#[cfg(all(not(test), unix))]",
+            "#[cfg(feature = \"test\")]",
+            "#[cfg(target_os = \"macos\")]",
+            "#[cfg(all())]",
+            "#[test]",
+            "#[derive(Debug)]",
+            "let x = 1;",
+        ] {
+            assert!(!cfg_attr_never_ships(no), "`{no}` must NOT be masked");
+        }
+    }
+
+    #[test]
+    fn top_level_comma_split_ignores_nesting_and_string_literals() {
+        assert_eq!(
+            split_top_level_commas("test, any(windows, target_os = \"linux\")"),
+            vec!["test", "any(windows, target_os = \"linux\")"]
+        );
+        assert_eq!(
+            split_top_level_commas("target_os = \"a,b\", unix"),
+            vec!["target_os = \"a,b\"", "unix"]
+        );
+        assert!(split_top_level_commas("  ").is_empty());
+    }
+
+    // The 2026-09-15 regression, as a synthetic tree: a guarded `resize` that
+    // exists ONLY in a test build must not be read as a shipped main-thread
+    // hazard. The helper is deliberately given the SAME NAME as a fn the root
+    // reaches, because name-merging is what lent its body to the shipped node
+    // in the real failure (`title_summary::compose` + a
+    // `strip_band_landing_tests::compose`).
+    #[test]
+    fn conjunctive_cfg_test_helper_is_masked_not_graphed() {
+        let mut files = synth_base();
+        let gui = synth_gui(
+            "fn resize_helper() {\n    \
+             compose();\n}\n\
+             fn compose() {}\n\
+             fn unrelated_offload() {\n    \
+             term_lock(&s.term).finish_resize_offload(reflowed);\n}\n\
+             #[cfg(all(test, any(windows, target_os = \"linux\")))]\n\
+             mod strip_band_landing_tests {\n    \
+             fn compose() {\n        \
+             let mut term = term_lock(&s.term);\n        \
+             term.resize(rows, cols);\n    }\n}\n",
+        );
+        files.push(("crates/aterm-gui/src/main.rs".to_string(), gui));
+        let root = synth_tree("mask-cfg-all-test", &files);
+        let out = run_mainloop_census(&root);
+        let _ = std::fs::remove_dir_all(&root);
+        assert!(
+            out.ok,
+            "a `cfg(all(test, ..))` helper never enters the shipped GUI \
+             process and must not fail OB-5:\n{}",
+            out.log
+        );
+    }
+
+    // The other direction, and the one that keeps the mask honest: a gate
+    // that does NOT entail `test` leaves the hazard visible and RED.
+    #[test]
+    fn a_disjunctive_cfg_test_gate_is_not_masked_and_stays_red() {
+        let mut files = synth_base();
+        let gui = synth_gui(
+            "fn resize_helper() {\n    \
+             compose();\n}\n\
+             fn unrelated_offload() {\n    \
+             term_lock(&s.term).finish_resize_offload(reflowed);\n}\n\
+             #[cfg(any(test, unix))]\n\
+             mod maybe_shipped {\n    \
+             fn compose() {\n        \
+             let mut term = term_lock(&s.term);\n        \
+             term.resize(rows, cols);\n    }\n}\n",
+        );
+        files.push(("crates/aterm-gui/src/main.rs".to_string(), gui));
+        let root = synth_tree("no-mask-any-test", &files);
+        let out = run_mainloop_census(&root);
+        let _ = std::fs::remove_dir_all(&root);
+        assert!(
+            !out.ok,
+            "`any(test, unix)` compiles on a shipped unix build — the hazard \
+             under it must still fail OB-5:\n{}",
+            out.log
+        );
+        assert!(out.log.contains("[OB-5]"), "log:\n{}", out.log);
+    }
+
+    // The mask is SUBTRACTIVE, so its real-tree risk is blanking shipped code.
+    // Pin both halves on the file the failure lived in: the test helper's
+    // guarded resize is gone, and the shipped fns around it survive.
+    #[test]
+    fn the_real_tree_mask_drops_the_test_helper_and_keeps_shipped_code() {
+        let text = std::fs::read_to_string(repo_root().join("crates/aterm-gui/src/app_render.rs"))
+            .expect("app_render.rs");
+        let masked = mask_unshipped_items(&text);
+        assert!(
+            text.contains("mod strip_band_landing_tests"),
+            "fixture moved: this test pins the 54fe06696 module by name"
+        );
+        assert!(
+            !masked.contains("mod strip_band_landing_tests"),
+            "the `cfg(all(test, ..))` module must be blanked"
+        );
+        assert_eq!(
+            text.lines().count(),
+            masked.lines().count(),
+            "the mask must preserve line count, or every span it feeds is wrong"
+        );
+        for shipped in ["fn resize_panes_scoped", "fn splice_tab_strip"] {
+            assert!(
+                masked.contains(shipped),
+                "the mask ate shipped code: `{shipped}` is gone"
+            );
+        }
     }
 
     #[test]

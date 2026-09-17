@@ -107,9 +107,13 @@ impl Row {
             // Write main cell with WIDE flag
             *self.cells.get_unchecked_mut(col_usize) =
                 Cell::with_style_id(c, style_id, cell_flags.union(CellFlags::WIDE));
-            // Write continuation cell
+            // Write continuation cell, carrying the lead's rendition (the same law
+            // as `write_wide_char_packed`: a rendition belongs to the character,
+            // and a double-width character is one character in two columns).
+            // `with_style_id` adds USES_STYLE_ID itself, which is why
+            // `wide_continuation_of` masks bits 14-15 out rather than passing them.
             *self.cells.get_unchecked_mut(col_usize + 1) =
-                Cell::with_style_id(' ', style_id, CellFlags::WIDE_CONTINUATION);
+                Cell::with_style_id(' ', style_id, cell_flags.wide_continuation_of());
         }
 
         if col + 1 >= self.len {

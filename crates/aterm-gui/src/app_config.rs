@@ -353,15 +353,23 @@ pub(crate) struct Config {
     pub(crate) cursor_trail_radius: Option<f32>,
     /// Landing-ring "ping" on a jump (LUMEN styles). Default true.
     pub(crate) cursor_trail_ring: Option<bool>,
-    /// TYPING WAKE length, in milliseconds of recent travel. PARSED BUT INERT
-    /// since 2026-09-06: it was the previous rainbow kitty's wake dial, and
-    /// the wake walk that read it died with that engine
-    /// (`docs/design/RAINBOW-KITTY-V2.md` §17.3 phase 7); the rebuilt
-    /// ribbon's length follows typing momentum (§3) and no style reads this
-    /// number. Still accepted — a config that sets it keeps loading, and the
-    /// Settings row still edits it — so the key can be retired on its own
-    /// compatibility schedule. Default 300 ms; clamped 0..=1500.
-    pub(crate) cursor_trail_wake_ms: Option<u64>,
+    // `cursor_trail_wake_ms` IS RETIRED (2026-09-16). It was the previous
+    // rainbow kitty's typing-wake dial; `RAINBOW-KITTY-V2.md` §17.3 phase 7
+    // deleted the walk that read it and left the key "parsed but inert", with
+    // a Settings row that went on promising a plume length. Nothing read it:
+    // deleting `GlowConfig::wake_persist_s` and building `aterm-effects`
+    // returned nine struct-literal writes and one self-copy, and no read.
+    //
+    // It is retired the way this file retires keys — the field is gone, so an
+    // authored value no longer reaches anything, and
+    // `native_config_language::RETIRED_CONFIG_KEYS` carries the key so a
+    // config that sets it still LOADS and Manual tells the truth about it
+    // ("Rainbow kitty typing wake was removed; … has no effect (the authored
+    // value will be preserved)") instead of answering it as a typo. What
+    // replaced it: `cursor_trail_ms` prices every ribbon cell's life
+    // (`Ribbon::cell_life`), floored at the phrase rest the typist's own
+    // inter-key interval sets — so "how much recent typing you see" is the
+    // trail-duration dial plus the melody, not a fixed travel window.
     /// GPU-only cursor-comet BLOOM: a soft gaussian halo around the streak,
     /// composited at present time on the GPU (all wgpu backends — DX12/Vulkan/Metal);
     /// the CPU/software path is unaffected. DEFAULT ON. Set
@@ -596,12 +604,21 @@ pub(crate) struct Config {
     /// Maps to [`RightClickGesture`] via [`Config::right_click_or_default`]; an
     /// unknown value warns and falls back to the platform default.
     pub(crate) right_click: Option<String>,
-    /// Which KEYBOARD chord pops a tab's context menu (Windows only; the strip's
-    /// right-click always does): `"on"` — the dedicated Menu/Application key AND
-    /// Shift+F10, the two spellings Windows has shipped since NT; `"menu_key"` —
-    /// the Menu key ONLY, handing Shift+F10 back to the terminal (it is a real
-    /// encodable chord, F20 in the xterm tradition); or `"off"` — neither, both
-    /// keys go to the application and the menu is pointer-only. ABSENT = `"on"`.
+    /// Which KEYBOARD chord pops a tab's context menu (Windows and Linux, the
+    /// in-grid-strip platforms; the strip's right-click always does):
+    /// `"menu_key"` — the dedicated Menu/Application key ONLY; `"on"` — the
+    /// Menu key AND Shift+F10, the two spellings Windows has shipped since NT;
+    /// or `"off"` — neither, both keys go to the application and the menu is
+    /// pointer-only. ABSENT = `"menu_key"`.
+    ///
+    /// The default is the FREE spelling, not the Windows pair, because the two
+    /// keys cost different things. No legacy keyboard mode has a sequence for
+    /// the Menu key, so claiming it takes nothing from any application.
+    /// Shift+F10 is `ESC[21;2~` — terminfo `kf22`, a key xterm has delivered
+    /// for decades (it numbers Shift+F1..F12 as F13..F24) and one a program
+    /// binds expecting to receive it; a terminal that eats it by default breaks
+    /// that program with no visible cause. `"on"` is the opt-in for a hand that
+    /// wants the second spelling anyway.
     ///
     /// This exists because the chord is deliberately NOT a rebindable
     /// `[keybindings]` action (an OS convention, not an aterm command — and a
@@ -2197,8 +2214,6 @@ pub(crate) struct CursorGlowInputs {
     pub(crate) intensity: f32,
     pub(crate) radius: f32,
     pub(crate) ring: bool,
-    /// Seconds of recent travel the rainbow kitty typing wake shows (0 ⇒ wake off).
-    pub(crate) wake_persist_s: f32,
 }
 
 /// `[sparkle_words.ink]` — the animated glyph-ink shimmer (v2): matched words'
@@ -2608,7 +2623,7 @@ impl PrivacyWarmup {
 /// # notice             = true            # the one-time macOS access card (Open Settings / Not now)
 /// # report_attribution = true            # per-session responsible-pid corroboration
 /// # warmup             = "on-request"    # "never" | "on-request"  (no first-launch value, by design)
-/// # warmup_folders     = ["documents", "desktop", "downloads"]
+/// # warmup_folders     = ["documents", "desktop", "downloads", "app-data"]
 /// # warmup_hold_ms     = 120000          # hard cap on the in-place-apply hold while a warm-up runs
 /// # probe_interval_ms  = 5000            # floor on re-probing; also the worst-case posture lag
 /// # observer           = false           # the tccd log observer (§3.6) — OFF by default
@@ -3660,21 +3675,6 @@ impl Config {
         } else {
             0.0
         }
-    }
-
-    /// TYPING-WAKE length in SECONDS of recent travel, default 0.30 s (the
-    /// engine's own [`aterm_effects::cursor_glow::RAINBOW_WAKE_PERSIST`]), clamped
-    /// to 0..=1.5 s. `0` is a legitimate setting, not a failure, so — unlike
-    /// the aurora's intensity — there is nothing here that can fail open:
-    /// every representable `u64` maps into the closed range. INERT since the
-    /// v1 deletion (see [`Config::cursor_trail_wake_ms`]): still resolved
-    /// into `GlowConfig::wake_persist_s`, which no style reads.
-    pub(crate) fn cursor_trail_wake_persist_or_default(&self) -> f32 {
-        let ms = self
-            .cursor_trail_wake_ms
-            .unwrap_or((aterm_effects::cursor_glow::RAINBOW_WAKE_PERSIST * 1000.0) as u64)
-            .min(1_500);
-        ms as f32 / 1000.0
     }
 
     /// Bloom-crown radius in cells, default 0.6, clamped 0.0..=2.0.
@@ -4988,8 +4988,8 @@ impl Config {
     /// GPU cursor-comet bloom — the light CROWN around the comet head. DEFAULT ON,
     /// paired with whatever `cursor_trail` resolves to: with the comet's continuous
     /// beam this is the shipped "luminous streak" signature. The cost (a half-res
-    /// blur pass) runs only on effect frames, which the present-paced pump drives
-    /// at the display rate with ~0.2ms frame cost (measured, AMD 780M iGPU); the
+    /// blur pass) runs only on effect frames, which the trail timer paces at the
+    /// display rate with ~0.2ms frame cost (measured, AMD 780M iGPU); the
     /// `perf_reduced` load-shed latch and `motion` policy both drop it under
     /// pressure/accessibility, and `cursor_trail_bloom = false` opts out.
     ///
@@ -5534,25 +5534,27 @@ impl Config {
 
     /// Resolve the tab-context-menu KEYBOARD chord policy ([`TabMenuChord`])
     /// from config `tab_menu_chord`. The DEFAULT when the key is absent is
-    /// [`TabMenuChord::On`] — both Windows spellings, which is what an unedited
-    /// config has always meant. An unknown / malformed value warns and falls
-    /// back to that default (the `right_click` fail-safe shape).
+    /// [`TabMenuChord::MenuKey`] — the one spelling no application can receive,
+    /// so an unedited config never takes terminfo `kf22` (Shift+F10) away from
+    /// the program in the terminal. An unknown / malformed value warns and falls
+    /// back to that default (the `right_click` fail-safe shape); falling back to
+    /// `On` instead would let a typo steal a key.
     ///
-    /// Read only by the `#[cfg(windows)]` chord arms (`on_key`'s and the
-    /// convergence seam's) and by this file's own tests, so off Windows it is a
-    /// live-but-uncalled resolver rather than a missing one — the config key
-    /// still parses and validates everywhere, exactly like `right_click`'s.
-    #[cfg_attr(not(windows), allow(dead_code))]
+    /// Read only by the in-grid-strip chord arms (`on_key`'s and the convergence
+    /// seam's, Windows and Linux) and by this file's own tests, so on macOS it
+    /// is a live-but-uncalled resolver rather than a missing one — the config
+    /// key still parses and validates everywhere, exactly like `right_click`'s.
+    #[cfg_attr(not(any(windows, target_os = "linux")), allow(dead_code))]
     pub(crate) fn tab_menu_chord_or_default(&self) -> TabMenuChord {
         match self.tab_menu_chord.as_deref() {
-            None => TabMenuChord::On,
+            None => TabMenuChord::MenuKey,
             Some(s) => match TabMenuChord::parse(s) {
                 Some(g) => g,
                 None => {
                     crate::logging::stderr_line!(
-                        "aterm-gui: config tab_menu_chord: expected on|menu_key|off, got {s:?}; using on"
+                        "aterm-gui: config tab_menu_chord: expected on|menu_key|off, got {s:?}; using menu_key"
                     );
-                    TabMenuChord::On
+                    TabMenuChord::MenuKey
                 }
             },
         }
@@ -6298,29 +6300,35 @@ impl RightClickGesture {
 /// the two spellings a user wants to keep, because their costs differ. The Menu
 /// key reaches an application ONLY under a kitty enhancement (and that case is
 /// already deferred unconditionally), so claiming it is nearly free; Shift+F10
-/// is a real legacy-encodable chord (`ESC[21;2~`, F20 in the xterm tradition)
-/// that claiming genuinely takes away.
+/// is a real legacy-encodable chord (`ESC[21;2~` — terminfo `kf22`, xterm's
+/// F22, since it numbers Shift+F1..F12 as F13..F24) that claiming genuinely
+/// takes away. That asymmetry is why the DEFAULT is [`Self::MenuKey`]: the
+/// terminal contract — a key an application receives by terminfo is the
+/// application's — outranks the second Windows spelling, which stays one
+/// config line away.
 ///
 /// Compiled everywhere so the config key parses and validates on every platform
 /// (`--validate-config` must not depend on the host), but only READ by the
-/// `#[cfg(windows)]` chord arms — hence the platform-scoped dead-code allowance
+/// Windows-and-Linux chord arms — hence the platform-scoped dead-code allowance
 /// rather than a `#[cfg]` on the type itself.
-#[cfg_attr(not(windows), allow(dead_code))]
+#[cfg_attr(not(any(windows, target_os = "linux")), allow(dead_code))]
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum TabMenuChord {
     /// Both Windows spellings: the dedicated Menu/Application key AND Shift+F10.
+    /// The opt-in (`tab_menu_chord = "on"`), never the default.
     On,
-    /// The Menu key only — Shift+F10 goes to the terminal application.
+    /// The Menu key only — Shift+F10 goes to the terminal application. The
+    /// default.
     MenuKey,
     /// Neither; the menu is pointer-only and both keys reach the application.
     Off,
 }
 
-#[cfg_attr(not(windows), allow(dead_code))]
+#[cfg_attr(not(any(windows, target_os = "linux")), allow(dead_code))]
 impl TabMenuChord {
     /// Parse a config `tab_menu_chord` value (case-insensitive, trimmed):
     /// `on` / `both`, `menu_key` (aliases `menu-key`, `menu`), or `off`.
-    /// `None` on any other value (caller falls back to [`Self::On`]).
+    /// `None` on any other value (caller falls back to [`Self::MenuKey`]).
     pub(crate) fn parse(s: &str) -> Option<Self> {
         match s.trim().to_ascii_lowercase().as_str() {
             "on" | "both" => Some(Self::On),
@@ -7475,19 +7483,72 @@ pub(crate) fn load_config() -> Config {
         match crate::native_config_service::VersionedConfigService::observe_path(&path, true) {
             Ok(observation) => observation,
             Err(error) => {
-                crate::logging::stderr_line!(
-                    "aterm-gui: ignoring unreadable config {}: {error}",
-                    path.display()
-                );
+                let notice = launch_config_notice(&path, LaunchConfigProblem::Unreadable(&error));
+                crate::logging::stderr_line!("aterm-gui: {notice}");
+                note_launch_load_failed(notice);
                 return Config::default();
             }
         };
     let config: Config = aterm_toml::from_str(&observation.text).unwrap_or_else(|e| {
-        crate::logging::stderr_line!("aterm-gui: ignoring invalid config {}: {e}", path.display());
+        let notice = launch_config_notice(&path, LaunchConfigProblem::Invalid(&e));
+        crate::logging::stderr_line!("aterm-gui: {notice}");
+        note_launch_load_failed(notice);
         Config::default()
     });
     warn_deprecated_display_font_spelling(&observation.text, &config);
     config
+}
+
+/// Why the launch could not take `aterm.toml`: the file could not be read
+/// (permissions, a dangling link, a directory) or it read but is not a
+/// configuration. Borrowed so the two call sites format the error they hold.
+pub(crate) enum LaunchConfigProblem<'a> {
+    Unreadable(&'a dyn std::fmt::Display),
+    Invalid(&'a dyn std::fmt::Display),
+}
+
+/// THE LAUNCH-TIME CONFIG NOTICE — what the window's banner and the console both
+/// say when `aterm.toml` did not load at start. Until 2026-09-15 an unreadable
+/// or invalid file at launch was ONE stderr line: a windowed launch never saw it,
+/// every setting silently ran at its default, and the first thing the window
+/// then said about the file was a later reload's "running settings … were kept
+/// unchanged" — true, and useless, because nothing had ever been loaded
+/// (glass hunt, m17-tower, 2026-09-01, finding 2). The line names the path,
+/// the problem, and the consequence, and says what ends it.
+pub(crate) fn launch_config_notice(
+    path: &std::path::Path,
+    problem: LaunchConfigProblem<'_>,
+) -> String {
+    match problem {
+        LaunchConfigProblem::Unreadable(error) => format!(
+            "aterm.toml could not be read at launch ({error}) — every setting is running at its \
+             default. Make {} readable and it loads on the next change.",
+            path.display()
+        ),
+        LaunchConfigProblem::Invalid(error) => format!(
+            "aterm.toml is not a valid configuration ({error}) — every setting is running at its \
+             default. Fix {} and it loads on the next change.",
+            path.display()
+        ),
+    }
+}
+
+/// Set once by [`load_config`] when the launch load failed, read by the config
+/// watcher so a later reload refusal says the running settings are the DEFAULTS
+/// from a launch that could not read the file — not "kept unchanged" as if a
+/// loaded configuration were being protected.
+static LAUNCH_LOAD_FAILED: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+
+fn note_launch_load_failed(notice: String) {
+    LAUNCH_LOAD_FAILED.store(true, std::sync::atomic::Ordering::Release);
+    crate::config_notice::queue_deferred(notice);
+}
+
+/// Whether this process launched WITHOUT its `aterm.toml` (unreadable or invalid
+/// at start), so every setting is at its default until the file loads.
+pub(crate) fn launch_load_failed() -> bool {
+    LAUNCH_LOAD_FAILED.load(std::sync::atomic::Ordering::Acquire)
 }
 
 /// The `agents_auto_prime` knob alone, read WITHOUT [`load_config`]'s user-visible
@@ -8019,9 +8080,6 @@ pub(crate) fn resolve_cursor_glow(
         beam: presentation.beam,
         head_dx,
         pack: style.pack,
-        // The host's taste dial; the engine fails it OFF on a non-finite value,
-        // and the resolver has already clamped it into 0..=1.5 s.
-        wake_persist_s: inputs.wake_persist_s,
         // The ribbon presentation rides the RESOLVED spelling, like the beam
         // above and the pet companions do. THE TALL BODY IS THE DEFAULT
         // (owner, 2026-08-29: "WHERE IS MY TALL RIBBON"): every ordinary
@@ -8220,6 +8278,31 @@ impl App {
         } else {
             self.prepared_sparkle.resolved.clone()
         };
+    }
+
+    /// **RESOLVE THE SPARKLE RUNTIME IF IT IS STILL DIRTY**, so a gate that
+    /// asks "do cats exist?" gets the same answer a drawn frame would.
+    ///
+    /// `self.sparkle` is a RENDER-PATH CACHE: it starts `None` with
+    /// `sparkle_dirty` set, and the only thing that fills it is the per-frame
+    /// `if self.sparkle_dirty { self.recompute_sparkle(); }` in `app_render`.
+    /// In a window the first frame always precedes the first menu press, so
+    /// nothing noticed. ON THE CONTROL SOCKET IT DOES NOT: a headless instance
+    /// renders only when a capture drives its clock, so a gate reading the raw
+    /// cache answers "off" for a config that has effects ON, purely because no
+    /// frame has been drawn yet.
+    ///
+    /// MEASURED on a live `--headless` instance (2026-09-15, debug build):
+    /// `invoke FavouriteKitty` before any frame answered `OK invoked
+    /// FavouriteKitty` and pinned NOTHING — a silent no-op reported as success
+    /// — while the identical call after one `image` pinned. `kitty wear` on the
+    /// same instance refused with "effects are off" while they were on.
+    ///
+    /// Callers that gate on the cat's existence use this, never the field.
+    pub(crate) fn ensure_sparkle(&mut self) {
+        if self.sparkle_dirty {
+            self.recompute_sparkle();
+        }
     }
 
     /// Whether the Kitty Log RECORDER is on: `[sparkle_words.feline] log`
@@ -9710,15 +9793,22 @@ impl App {
 
     /// Toggle the window's full-screen state (View ▸ Enter Full Screen). Uses
     /// winit's borderless full-screen on the current monitor — the same path a
-    /// future keybinding would use. No-op before a window exists.
-    pub(crate) fn toggle_fullscreen(&self) {
-        if let Some(w) = self.front().and_then(|ws| ws.os_window.as_ref()) {
-            let next = match w.fullscreen() {
-                Some(_) => None,
-                None => Some(winit::window::Fullscreen::Borderless(None)),
-            };
-            w.set_fullscreen(next);
-        }
+    /// future keybinding would use.
+    ///
+    /// Returns the REASON it declined when no OS window exists yet, rather than
+    /// succeeding silently: the menu seam reports that refusal instead of
+    /// answering OK for a full-screen toggle that never happened. Key-path
+    /// callers, for which a refusal has nowhere to go, discard it explicitly.
+    pub(crate) fn toggle_fullscreen(&self) -> Result<(), &'static str> {
+        let Some(w) = self.front().and_then(|ws| ws.os_window.as_ref()) else {
+            return Err("no window is on screen to full-screen");
+        };
+        let next = match w.fullscreen() {
+            Some(_) => None,
+            None => Some(winit::window::Fullscreen::Borderless(None)),
+        };
+        w.set_fullscreen(next);
+        Ok(())
     }
 
     /// The path-referenced half of a BYTE-EQUAL config reload: the parsed
@@ -11384,40 +11474,24 @@ copy_on_select = true
 #[cfg(test)]
 mod descriptive_title_config_tests {
 
-    /// The TYPING-WAKE dial's config contract (Settings ▸ Cursor Kitty ▸ Rainbow
-    /// wake ▸ "Typing wake"): an absent key takes the engine's own default, `0` is a
-    /// real OFF setting rather than a failure, an absurd value clamps instead of
-    /// escaping, and the whole `u64` domain maps into the closed range — there
-    /// is nothing a config file can write here that reaches the engine unbounded.
+    /// THE RETIRED TYPING-WAKE KEY STILL LOADS. `cursor_trail_wake_ms` shipped
+    /// in the starter config for a year, so real `aterm.toml` files on disk set
+    /// it. Retiring it deleted the field, not the tolerance: `Config` takes
+    /// `#[serde(default)]` and no `deny_unknown_fields`, so the file parses,
+    /// every neighbouring key still lands, and the value is simply dropped.
+    /// The honest STORY about it is Manual's, and lives with the retirement
+    /// (`native_config_language::the_retired_typing_wake_key_loads_and_is_told_the_truth`).
     #[test]
-    fn cursor_trail_wake_dial_defaults_clamps_and_turns_off() {
+    fn a_config_that_still_sets_the_retired_typing_wake_key_keeps_loading() {
         use crate::app_config::Config;
-        let cfg = Config::default();
-        assert!(
-            (cfg.cursor_trail_wake_persist_or_default()
-                - aterm_effects::cursor_glow::RAINBOW_WAKE_PERSIST)
-                .abs()
-                < 1e-6,
-            "an unset key takes the engine default"
+        let parsed: Config =
+            aterm_toml::from_str("cursor_trail_wake_ms = 900\ncursor_trail_ms = 260\n")
+                .expect("a config authored against the old dial must still load");
+        assert_eq!(
+            parsed.cursor_trail_ms,
+            Some(260),
+            "the retired key must not swallow the keys around it"
         );
-        let with = |ms: u64| -> f32 {
-            Config {
-                cursor_trail_wake_ms: Some(ms),
-                ..Config::default()
-            }
-            .cursor_trail_wake_persist_or_default()
-        };
-        assert_eq!(with(0), 0.0, "0 ms is a real OFF setting");
-        assert!((with(600) - 0.6).abs() < 1e-6, "ms → seconds");
-        assert!((with(1_500) - 1.5).abs() < 1e-6, "the ceiling is reachable");
-        assert!(
-            (with(u64::MAX) - 1.5).abs() < 1e-6,
-            "an absurd value clamps, never escapes"
-        );
-        // Round-trips through the real TOML surface the settings writer emits.
-        let parsed: Config = aterm_toml::from_str("cursor_trail_wake_ms = 900\n").unwrap();
-        assert_eq!(parsed.cursor_trail_wake_ms, Some(900));
-        assert!((parsed.cursor_trail_wake_persist_or_default() - 0.9).abs() < 1e-6);
     }
 
     /// The effects-OFF owner must not pay the effect-pipeline warm-up on a config
@@ -14698,20 +14772,34 @@ mod tab_menu_chord_tests {
         aterm_toml::from_str(toml).expect("valid toml")
     }
 
-    /// Absent ⇒ `On` — an unedited config keeps both Windows spellings, which
-    /// is what shipped.
+    /// Absent ⇒ `MenuKey` — an unedited config claims only the spelling no
+    /// application can receive. Shift+F10 is terminfo `kf22`; a program that
+    /// binds it must get it without editing the terminal's config.
     #[test]
-    fn absent_claims_both_spellings() {
+    fn absent_claims_the_menu_key_only() {
         assert_eq!(
             Config::default().tab_menu_chord_or_default(),
-            TabMenuChord::On
+            TabMenuChord::MenuKey
         );
         assert_eq!(
             cfg("font_px = 14.0").tab_menu_chord_or_default(),
-            TabMenuChord::On
+            TabMenuChord::MenuKey
         );
-        assert!(TabMenuChord::On.claims_menu_key());
-        assert!(TabMenuChord::On.claims_shift_f10());
+        assert!(TabMenuChord::MenuKey.claims_menu_key());
+        assert!(
+            !TabMenuChord::MenuKey.claims_shift_f10(),
+            "the default never takes kf22 from the application"
+        );
+    }
+
+    /// The second Windows spelling is an OPT-IN: `"on"` is the only value that
+    /// claims Shift+F10, and it has to be written down.
+    #[test]
+    fn on_is_the_opt_in_that_claims_shift_f10() {
+        let both = cfg("tab_menu_chord = \"on\"").tab_menu_chord_or_default();
+        assert_eq!(both, TabMenuChord::On);
+        assert!(both.claims_menu_key());
+        assert!(both.claims_shift_f10());
     }
 
     /// The point of the middle value: hand ⇧F10 back (a real legacy-encodable
@@ -14734,8 +14822,10 @@ mod tab_menu_chord_tests {
 
     /// Case-insensitive, trimmed, dash alias — and an unknown value WARNS AND
     /// DEFAULTS rather than failing the config or silently disabling the menu.
+    /// The fallback is the default (`MenuKey`), not `On`: a typo must not be
+    /// the thing that steals Shift+F10 from the application.
     #[test]
-    fn parsing_is_forgiving_and_invalid_falls_back_to_on() {
+    fn parsing_is_forgiving_and_invalid_falls_back_to_menu_key() {
         assert_eq!(
             cfg("tab_menu_chord = \" Menu-Key \"").tab_menu_chord_or_default(),
             TabMenuChord::MenuKey
@@ -14746,11 +14836,11 @@ mod tab_menu_chord_tests {
         );
         assert_eq!(
             cfg("tab_menu_chord = \"nope\"").tab_menu_chord_or_default(),
-            TabMenuChord::On
+            TabMenuChord::MenuKey
         );
         assert_eq!(
             cfg("tab_menu_chord = \"\"").tab_menu_chord_or_default(),
-            TabMenuChord::On
+            TabMenuChord::MenuKey
         );
         assert_eq!(TabMenuChord::parse("nope"), None);
         assert_eq!(TabMenuChord::parse("off"), Some(TabMenuChord::Off));
@@ -16861,7 +16951,6 @@ mod trail_style_resolution_tests {
                 intensity: 0.7,
                 radius: 0.6,
                 ring: true,
-                wake_persist_s: 0.9,
             },
             resolve_trail_presentation(raw, &catalog),
             0x00FF_FFFF,
@@ -17242,6 +17331,48 @@ mod trail_style_resolution_tests {
                 catalog.presentation_for(config.cursor_trail_style_raw())
             ),
             1.8
+        );
+    }
+}
+
+#[cfg(test)]
+mod launch_notice_tests {
+    /// The launch-time notice names the path, the problem and the consequence —
+    /// "every setting is running at its default" — for both shapes of failure.
+    #[test]
+    fn launch_config_notice_names_the_consequence_and_the_path() {
+        let path = std::path::Path::new("/home/ana/.config/aterm/aterm.toml");
+        let unreadable = super::launch_config_notice(
+            path,
+            super::LaunchConfigProblem::Unreadable(&"permission denied (os error 13)"),
+        );
+        assert!(
+            unreadable.starts_with("aterm.toml could not be read at launch (permission denied"),
+            "{unreadable}"
+        );
+        assert!(
+            unreadable.contains("every setting is running at its default"),
+            "{unreadable}"
+        );
+        assert!(
+            unreadable.contains("/home/ana/.config/aterm/aterm.toml"),
+            "{unreadable}"
+        );
+        let invalid = super::launch_config_notice(
+            path,
+            super::LaunchConfigProblem::Invalid(&"expected `=` at line 3"),
+        );
+        assert!(
+            invalid.starts_with("aterm.toml is not a valid configuration (expected `=`"),
+            "{invalid}"
+        );
+        assert!(
+            invalid.contains("every setting is running at its default"),
+            "{invalid}"
+        );
+        assert!(
+            invalid.contains("Fix /home/ana/.config/aterm/aterm.toml"),
+            "{invalid}"
         );
     }
 }

@@ -15,6 +15,7 @@ use sctk::reexports::client::{Connection, Proxy, QueueHandle};
 
 use sctk::compositor::{CompositorHandler, CompositorState};
 use sctk::data_device_manager::DataDeviceManagerState;
+use sctk::primary_selection::PrimarySelectionManagerState;
 use sctk::output::{OutputHandler, OutputState};
 use sctk::registry::{ProvidesRegistryState, RegistryState};
 use sctk::seat::pointer::ThemedPointer;
@@ -26,6 +27,7 @@ use sctk::shm::slot::SlotPool;
 use sctk::shm::{Shm, ShmHandler};
 use sctk::subcompositor::SubcompositorState;
 
+use crate::platform_impl::wayland::clipboard::ClipboardState;
 use crate::platform_impl::wayland::event_loop::sink::EventSink;
 use crate::platform_impl::wayland::output::MonitorHandle;
 use crate::platform_impl::wayland::seat::data_device::DndPipe;
@@ -121,6 +123,18 @@ pub struct WinitState {
     /// drops then simply never arrive, as before this patch). See `data_device.rs`.
     pub data_device_manager_state: Option<DataDeviceManagerState>,
 
+    /// The `zwp_primary_selection_device_manager_v1`, one device per seat, for
+    /// the PRIMARY selection (see `clipboard.rs`). `None` without the global.
+    pub primary_selection_manager_state: Option<PrimarySelectionManagerState>,
+
+    /// The clipboard sources this client offers and the own-selection slots
+    /// the `WaylandClipboard` handle shares (see `clipboard.rs`).
+    pub clipboard: ClipboardState,
+
+    /// The main queue handle, for the loop-thread request handlers that are not
+    /// Wayland event callbacks (the clipboard's calloop channel).
+    pub queue_handle: QueueHandle<Self>,
+
     /// In-flight drag-and-drop `text/uri-list` reads, streamed through the event
     /// loop until EOF and then parsed into `WindowEvent::DroppedFile`s.
     pub dnd_pipes: Vec<DndPipe>,
@@ -169,6 +183,8 @@ impl WinitState {
         // The data-device manager drives drag-and-drop (and clipboard) offers. It
         // is optional: a compositor without it just never delivers file drops.
         let data_device_manager_state = DataDeviceManagerState::bind(globals, queue_handle).ok();
+        let primary_selection_manager_state =
+            PrimarySelectionManagerState::bind(globals, queue_handle).ok();
 
         let mut seats = AHashMap::default();
         for seat in seat_state.seats() {
@@ -177,6 +193,9 @@ impl WinitState {
             // `new_seat`), so drags onto our surfaces are received from the start.
             if let Some(manager) = data_device_manager_state.as_ref() {
                 winit_seat.data_device = Some(manager.get_data_device(queue_handle, &seat));
+            }
+            if let Some(manager) = primary_selection_manager_state.as_ref() {
+                winit_seat.primary_device = Some(manager.get_selection_device(queue_handle, &seat));
             }
             seats.insert(seat.id(), winit_seat);
         }
@@ -224,6 +243,9 @@ impl WinitState {
             events_sink: EventSink::new(),
             loop_handle,
             data_device_manager_state,
+            primary_selection_manager_state,
+            clipboard: ClipboardState::default(),
+            queue_handle: queue_handle.clone(),
             dnd_pipes: Vec::new(),
             dnd_next_id: 0,
             dnd_hover_window: None,

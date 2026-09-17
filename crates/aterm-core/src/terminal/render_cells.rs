@@ -491,12 +491,13 @@ impl Terminal {
                         clusters.push((col as usize, s.into_boxed_str()));
                     }
                 } else if !marks.is_empty() {
-                    // Plain combining diacritics: overlay every mark except the
-                    // VS15/VS16 presentation selectors, matching `combining_row_into`.
+                    // Plain combining diacritics: overlay every mark that has a
+                    // glyph of its own (`draws_no_glyph` names the exceptions),
+                    // matching `combining_row_into`.
                     let overlay: Box<[char]> = marks
                         .iter()
                         .copied()
-                        .filter(|&c| c != '\u{FE0E}' && c != '\u{FE0F}')
+                        .filter(|&c| !draws_no_glyph(c))
                         .collect();
                     if !overlay.is_empty() {
                         combining_out.push((col as usize, overlay));
@@ -575,9 +576,11 @@ impl Terminal {
     /// the accent shows; without this only the base code point is drawn.
     ///
     /// Excludes cells handled elsewhere: emoji sequences (a sequence marker is
-    /// present — [`cluster_row`](Self::cluster_row) shapes those) and the bare
-    /// VS15/VS16 selectors ([`RenderCell::emoji_presentation`]). Marks are kept
-    /// in arrival order so stacked diacritics layer correctly.
+    /// present — [`cluster_row`](Self::cluster_row) shapes those), the bare
+    /// VS15/VS16 selectors ([`RenderCell::emoji_presentation`]), and the
+    /// plane-14 default-ignorables that attach but draw nothing
+    /// (`draws_no_glyph`). Marks are kept in arrival order so stacked
+    /// diacritics layer correctly.
     #[must_use]
     pub fn combining_row(&self, row: usize) -> Vec<(usize, Box<[char]>)> {
         let mut out = Vec::new();
@@ -613,12 +616,13 @@ impl Terminal {
             if combining.is_empty() || combining.iter().copied().any(is_emoji_sequence_marker) {
                 continue;
             }
-            // Overlay every combining char except the presentation selectors,
-            // which only widen/narrow the base (no glyph of their own).
+            // Overlay every combining char that has a glyph of its own; the
+            // presentation selectors and plane 14 attach but draw nothing
+            // (`draws_no_glyph`).
             let marks: Box<[char]> = combining
                 .iter()
                 .copied()
-                .filter(|&c| c != '\u{FE0E}' && c != '\u{FE0F}')
+                .filter(|&c| !draws_no_glyph(c))
                 .collect();
             if marks.is_empty() {
                 continue;
@@ -1329,6 +1333,11 @@ impl Terminal {
         // boundary. A host can therefore fail closed when retained absolute-row
         // geometry no longer describes this exact frame.
         scratch.absolute_row_revision = self.absolute_row_revision();
+        // And the WHOLESALE renumbering the footer revision cannot see: a width
+        // reflow rewraps history and renumbers every retained row, moving no
+        // `absolute_row_revision` at all. Stamped at the same extraction boundary
+        // so the same host gate covers both ways a cached row number dies.
+        scratch.history_renumber_epoch = self.grid().history_renumber_epoch();
         // `clone_from` reuses the destination's existing allocation where the
         // selection's owned data permits, instead of dropping + reallocating.
         scratch.selection.clone_from(self.text_selection());
@@ -1487,13 +1496,33 @@ impl Terminal {
 
 /// A combining char that marks its cell as a multi-codepoint EMOJI sequence:
 /// ZWJ (U+200D, family/role sequences), an emoji skin-tone modifier
-/// (U+1F3FB–U+1F3FF), COMBINING ENCLOSING KEYCAP (U+20E3), or a regional
+/// (U+1F3FB–U+1F3FF), COMBINING ENCLOSING KEYCAP (U+20E3), a regional
 /// indicator (U+1F1E6–U+1F1FF, the second half of a flag pair the writer folds
-/// into one cell). VS15/VS16 are presentation selectors, not sequence markers,
-/// and are excluded on purpose.
+/// into one cell), or a tag character (U+E0020–U+E007F, the spelled-out
+/// subdivision of a 🏴 flag — gbeng, gbsct, gbwls — which the colour face
+/// ligates to one glyph or declines, leaving the bare 🏴). VS15/VS16 are
+/// presentation selectors, not sequence markers, and are excluded on purpose.
 #[inline]
 fn is_emoji_sequence_marker(c: char) -> bool {
-    matches!(c as u32, 0x200D | 0x20E3 | 0x1F3FB..=0x1F3FF | 0x1F1E6..=0x1F1FF)
+    matches!(
+        c as u32,
+        0x200D | 0x20E3 | 0x1F3FB..=0x1F3FF | 0x1F1E6..=0x1F1FF | 0xE0020..=0xE007F
+    )
+}
+
+/// A combining char that attaches to its base but has NO glyph of its own, so
+/// it must never reach the CPU/GPU mark loops — they blit whatever `glyph_key`
+/// returns for a mark, and for one of these that is the primary's `.notdef`
+/// box stamped over the base. The presentation selectors VS15/VS16
+/// (U+FE0E/U+FE0F) only widen or narrow the base; plane 14 (U+E0000–U+E0FFF:
+/// Tags, the Variation Selectors Supplement, and the reserved gaps) is
+/// Default_Ignorable_Code_Point end to end, so a lone tag after a letter or an
+/// ideographic variation selector after its ideograph draws the base alone.
+/// Filtering in this one frame builder, which both renderers consume, keeps
+/// CPU/GPU parity by construction.
+#[inline]
+fn draws_no_glyph(c: char) -> bool {
+    matches!(c as u32, 0xFE0E | 0xFE0F | 0xE0000..=0xE0FFF)
 }
 
 /// Deterministic cost meter for the two inline-image readers, in the tree's
@@ -1813,6 +1842,55 @@ mod tests {
             after.absolute_row_revision,
             term.absolute_row_revision(),
             "snapshot carries the terminal revision from its extraction boundary"
+        );
+    }
+
+    /// THE OTHER WAY A ROW NUMBER DIES, ON THE SAME FRAME.
+    ///
+    /// A WIDTH reflow rewraps retained history: the same text occupies a
+    /// different number of rows, so every retained row's absolute key slides —
+    /// and `absolute_row_revision` does not move one bit, because no
+    /// protected-footer splice happened. A host that re-anchors cached
+    /// absolute-row geometry into a frame therefore cannot fence the reflow with
+    /// the footer stamp alone; it needs the renumber epoch, which is why the
+    /// frame now carries it from the same extraction boundary.
+    #[test]
+    fn cell_frame_stamps_history_renumber_epoch() {
+        let mut term = Terminal::new(5, 10);
+        // Lines long enough to soft-wrap at width 10 and deep enough to push
+        // history into scrollback — the rows a narrowing rewrap renumbers.
+        for line in 0..8 {
+            term.process(format!("line{line:02}-{}\r\n", "x".repeat(14)).as_bytes());
+        }
+        let before = term.cell_frame(5, 10);
+        let epoch_before = term.grid().history_renumber_epoch();
+        assert_eq!(
+            before.history_renumber_epoch, epoch_before,
+            "snapshot carries the grid's epoch from its extraction boundary"
+        );
+        let revision_before = term.absolute_row_revision();
+
+        term.resize(5, 7);
+        assert!(
+            term.grid().history_renumber_epoch() > epoch_before,
+            "fixture: a width rewrap renumbers retained history"
+        );
+        assert_eq!(
+            term.absolute_row_revision(),
+            revision_before,
+            "…and the footer revision, the stamp that used to be the only gate, \
+             cannot see it"
+        );
+
+        let after = term.cell_frame(5, 7);
+        assert_eq!(
+            after.history_renumber_epoch,
+            term.grid().history_renumber_epoch(),
+            "the post-reflow frame carries the post-reflow epoch"
+        );
+        assert_ne!(
+            after.history_renumber_epoch, before.history_renumber_epoch,
+            "so a host comparing the two frames sees the renumbering"
         );
     }
 
@@ -2333,6 +2411,44 @@ mod tests {
         );
     }
 
+    /// A cell's WHOLE mark sequence reaches the frame lane, in arrival order:
+    /// the renderers stack a second mark on the first, so a lane that kept
+    /// only one (or reordered them) would still draw a single mark. The grid
+    /// bounds a cell at `CellExtra::MAX_COMBINING` marks; exactly that many
+    /// surface for a longer run.
+    #[test]
+    fn combining_row_keeps_every_stacked_mark_in_order() {
+        let mut term = Terminal::new(1, 8);
+        term.process("e\u{0301}\u{0302}\u{0323}x".as_bytes());
+        let comb = term.combining_row(0);
+        let m0 = comb.iter().find(|(c, _)| *c == 0).map(|(_, m)| m.as_ref());
+        assert_eq!(
+            m0,
+            Some(['\u{0301}', '\u{0302}', '\u{0323}'].as_slice()),
+            "acute, circumflex, dot below — all three, in arrival order"
+        );
+        assert_eq!(
+            term.cell_frame(1, 8).combining_at(0, 0).map(<[char]>::len),
+            Some(3),
+            "the render frame carries the same three"
+        );
+        assert!(
+            comb.iter().all(|(c, _)| *c != 1),
+            "the plain 'x' after the marks carries none: {comb:?}"
+        );
+
+        let mut zalgo = Terminal::new(1, 8);
+        let mut text = String::from("e");
+        text.extend(std::iter::repeat_n('\u{0301}', 20));
+        zalgo.process(text.as_bytes());
+        let m = zalgo.combining_row(0);
+        assert_eq!(
+            m.iter().find(|(c, _)| *c == 0).map(|(_, m)| m.len()),
+            Some(aterm_grid::extra::CellExtra::MAX_COMBINING),
+            "a 20-mark run surfaces exactly the grid's bound"
+        );
+    }
+
     #[test]
     fn combining_row_empty_for_plain_and_vs16() {
         let mut term = Terminal::new(2, 8);
@@ -2351,6 +2467,62 @@ mod tests {
         assert!(
             term.cluster_row(0).is_empty(),
             "plain ASCII has no emoji clusters"
+        );
+    }
+
+    /// A subdivision flag — 🏴, tag letters, CANCEL TAG — is one emoji sequence
+    /// for the colour face to shape, exactly like a ZWJ family: it surfaces as
+    /// a CLUSTER and never as overlay marks. The tags used to be reported
+    /// narrow, so each took a cell of its own and drew as tofu.
+    #[test]
+    fn tag_sequence_surfaces_as_a_cluster_not_an_overlay() {
+        const ENGLAND: &str = "\u{1F3F4}\u{E0067}\u{E0062}\u{E0065}\u{E006E}\u{E0067}\u{E007F}";
+        let mut term = Terminal::new(1, 8);
+        term.process(format!("{ENGLAND}X").as_bytes());
+        assert_eq!(
+            term.cluster_row(0),
+            vec![(0usize, Box::<str>::from(ENGLAND))],
+            "the flag is one cluster at its lead column"
+        );
+        assert!(
+            term.combining_row(0).is_empty(),
+            "no tag reaches the overlay loop"
+        );
+        // The folded `cell_frame` twin classifies through the same predicate.
+        let frame = term.cell_frame(1, 8);
+        assert_eq!(frame.clusters[0], term.cluster_row(0));
+        assert!(frame.combining[0].is_empty());
+        assert_eq!(
+            frame.cells[0][2].ch, 'X',
+            "the flag holds two cells and X follows"
+        );
+    }
+
+    /// A default-ignorable that is NOT a sequence marker — a lone tag after a
+    /// letter, an ideographic variation selector after its ideograph — attaches
+    /// to the base and is neither a cluster nor an overlay: the base draws
+    /// alone. A real diacritic still overlays (the negative control).
+    #[test]
+    fn default_ignorable_marks_are_never_overlaid() {
+        for text in ["A\u{E0001}", "\u{4E00}\u{E0100}"] {
+            let mut term = Terminal::new(1, 8);
+            term.process(text.as_bytes());
+            assert_eq!(
+                term.grid().cell_extra(0, 0).map(|e| e.combining().len()),
+                Some(1),
+                "{text:?}: the mark attached to the base"
+            );
+            assert!(term.combining_row(0).is_empty(), "{text:?}: not an overlay");
+            assert!(term.cluster_row(0).is_empty(), "{text:?}: not a cluster");
+            let frame = term.cell_frame(1, 8);
+            assert!(frame.combining[0].is_empty() && frame.clusters[0].is_empty());
+        }
+        let mut term = Terminal::new(1, 8);
+        term.process("e\u{0301}".as_bytes());
+        assert_eq!(
+            term.combining_row(0),
+            vec![(0usize, Box::<[char]>::from(['\u{0301}']))],
+            "a real diacritic still overlays"
         );
     }
 
@@ -2427,6 +2599,101 @@ mod tests {
             !cells[0].wide,
             "a protected cell is not a wide continuation"
         );
+    }
+
+    /// **A rendition belongs to the CHARACTER, not to the column.** ECMA-48 SGR
+    /// sets an attribute on a character, and a double-width character is one
+    /// character occupying two columns — so under SGR 7 the highlight band must
+    /// be continuous across both halves of a CJK glyph.
+    ///
+    /// MEASURED (2026-09-16): the spacer was built with `WIDE_CONTINUATION`
+    /// alone, so `resolve_both` swapped fg/bg for the lead and not for it. That
+    /// makes `lead.fg == spacer.bg` for EVERY colour pair — an identity, not a
+    /// coincidence — and the wide glyph's right half, which the rasterizer spills
+    /// into the spacer, was composited invisibly. On a 9x17 cell `ESC[7m[漢字]`
+    /// gave 153 of 153 flat `#111318` pixels per spacer, distinct=1, zero glyph
+    /// ink; `ESC[31;44;7m` gave 153/153 of the un-swapped blue `#3b8eea`. A CJK
+    /// user could not read a `less` search match.
+    #[test]
+    fn render_row_inverse_wide_char_highlights_both_halves() {
+        let mut term = Terminal::new(2, 8);
+        term.process("\x1b[7m\u{6F22}\x1b[0mZ".as_bytes());
+        let cells = term.render_row(0);
+
+        assert_eq!(cells[0].ch, '\u{6F22}');
+        assert!(cells[1].wide, "col 1 is the right half of one character");
+        assert_eq!(
+            cells[1].bg, cells[0].bg,
+            "the highlight band must not stop at the column seam"
+        );
+        assert_eq!(
+            cells[1].fg, cells[0].fg,
+            "the spilled right half must be drawn in the SAME swapped ink as the left"
+        );
+        assert_ne!(
+            cells[1].fg, cells[1].bg,
+            "fg == bg in the spacer is exactly the collision that erased the glyph"
+        );
+        // The negative control: the un-highlighted neighbour is not inverted, so
+        // this test cannot pass by the whole row happening to share one colour.
+        assert_ne!(cells[0].bg, cells[2].bg, "col 2 is outside the SGR 7 run");
+    }
+
+    /// The same law with explicit colours, where the identity is plainest: under
+    /// `31;44` the lead resolves fg=blue on bg=red, and an un-inverted spacer
+    /// resolved bg=blue — the lead's own foreground.
+    #[test]
+    fn render_row_inverse_wide_char_swaps_explicit_colors_in_both_halves() {
+        let mut term = Terminal::new(2, 8);
+        term.process("\x1b[31;44;7m\u{6F22}\x1b[0m".as_bytes());
+        let cells = term.render_row(0);
+
+        assert_eq!(cells[1].bg, cells[0].bg, "spacer bg == lead bg (red)");
+        assert_eq!(cells[1].fg, cells[0].fg, "spacer fg == lead fg (blue)");
+        assert_ne!(
+            cells[1].bg, cells[0].fg,
+            "the spacer must not keep the UN-swapped background"
+        );
+    }
+
+    /// The rules (SGR 4/9/53) draw across a cell, so a spacer without them leaves
+    /// a visible gap under every right half.
+    #[test]
+    fn render_row_wide_char_rules_span_both_halves() {
+        let mut term = Terminal::new(2, 8);
+        term.process("\x1b[4;9;53m\u{6F22}\x1b[0mZ".as_bytes());
+        let cells = term.render_row(0);
+
+        assert_eq!(cells[0].underline, UnderlineStyle::Single);
+        assert_eq!(
+            cells[1].underline,
+            UnderlineStyle::Single,
+            "the underline must not gap at the column seam"
+        );
+        assert!(cells[0].strikethrough && cells[1].strikethrough);
+        assert!(cells[0].overline && cells[1].overline);
+        assert_eq!(
+            cells[2].underline,
+            UnderlineStyle::None,
+            "negative control: the rules stop when the run does"
+        );
+    }
+
+    /// VS16 widens a NARROW emoji to two columns through a path of its own
+    /// (`widen_previous_cell_for_vs16`), which builds a spacer of its own.
+    #[test]
+    fn render_row_inverse_vs16_emoji_highlights_both_halves() {
+        let mut term = Terminal::new(2, 8);
+        // U+231A WATCH + VS16.
+        term.process("\x1b[7m\u{231A}\u{FE0F}\x1b[0m".as_bytes());
+        let cells = term.render_row(0);
+
+        assert!(cells[1].wide, "VS16 made the watch two columns wide");
+        assert_eq!(
+            cells[1].bg, cells[0].bg,
+            "the VS16 widening path obeys the same law as the CJK write path"
+        );
+        assert_eq!(cells[1].fg, cells[0].fg);
     }
 
     #[test]

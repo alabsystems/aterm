@@ -263,6 +263,16 @@ impl App {
         {
             return;
         }
+        // THE KEYPAD IS ITS MAIN-BLOCK TWIN ON AN OVERLAY, as it is on a native
+        // page and in the seam's press classifier. This card reads the key for
+        // what it MEANS, and `keymap::build_key_input` hands it the keypad
+        // identity (`Numpad5`, `NumpadEnd`) so the PTY encoders can tell KP_5
+        // from 5 — which the arms below have no case for: a keypad digit
+        // typed NOTHING into the filter and a keypad arrow moved no row.
+        // `InputEvent::keypad_folded` is the one fold, shared with the native
+        // pages, and a controller's `key kp5` takes the same road.
+        let folded = ev.keypad_folded();
+        let ev = folded.as_ref().unwrap_or(ev);
         match ev {
             InputEvent::Key {
                 key, event_type, ..
@@ -274,7 +284,7 @@ impl App {
                     TKey::Named(TNamed::Escape) => self.session_picker_exit(wid),
                     TKey::Named(TNamed::ArrowUp) => self.session_picker_move(wid, -1),
                     TKey::Named(TNamed::ArrowDown) => self.session_picker_move(wid, 1),
-                    TKey::Named(TNamed::Enter | TNamed::NumpadEnter) => {
+                    TKey::Named(TNamed::Enter) => {
                         self.session_picker_activate(wid);
                     }
                     TKey::Named(TNamed::Backspace) => self.session_picker_backspace(wid),

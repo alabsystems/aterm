@@ -29,10 +29,13 @@ path = "src/lib.rs"
 
 [features]
 # Upstream's feature table, reproduced so no transitive parent's request can
-# fail to resolve. Measured on the six cells with
+# fail to resolve. Measured on the seven cells with
 # `cargo tree --workspace --target <cell> -e features -i libc`:
 #   default,extra_traits,std   on the four unix cells
-#   default,std                on x86_64-pc-windows-msvc and wasm32-unknown-unknown
+#   default,std                on x86_64-pc-windows-msvc, x86_64-pc-windows-gnu
+#                              and wasm32-unknown-unknown
+# (the two Windows envs resolve identically, re-measured 2026-09-16 when the
+# gnu cell was listed)
 # `extra_traits` is REAL and is reached through nix 0.29 (termwiz -> mac_address
 # -> nix), a dev-dependency of aterm-bench, so `cargo build --all-targets`
 # compiles it. It gates the same PartialEq/Eq/Hash derives upstream gates.

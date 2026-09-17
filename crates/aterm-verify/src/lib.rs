@@ -182,6 +182,13 @@ pub struct EnvSnapshot {
     /// exactly once, on the main thread, and the policy that interprets it is a
     /// pure function with its own tests.
     pub stage_timeout: Option<OsString>,
+    /// `CARGO_BUILD_JOBS` — the caller's job count. The main lane and the lint
+    /// lane inherit it as they inherit every variable; for the SIDE lanes, whose
+    /// caps are constants ([`stages::lane_build_jobs`]), it is a CEILING
+    /// ([`stages::lane_jobs`]): a 4-core machine that exports `4` must not have
+    /// the driver lane override it back up to 8. Kept RAW, like
+    /// [`Self::stage_timeout`], and parsed by the pure function.
+    pub cargo_build_jobs: Option<OsString>,
     /// `RUSTDOC` or `CARGO_BUILD_RUSTDOC` — a caller-supplied doc-driver
     /// binding. Cargo prefers either over the config's `[build] rustdoc`, so
     /// the children inherit it and the doc-driver rule must account for it:
@@ -215,6 +222,7 @@ impl EnvSnapshot {
                 .ok()
                 .filter(|s| !s.is_empty()),
             stage_timeout: std::env::var_os(exec::CEILING_ENV),
+            cargo_build_jobs: std::env::var_os("CARGO_BUILD_JOBS"),
             // NO empty-filter, deliberately: cargo has no treat-empty-as-unset
             // rule for these (only RUSTC_WRAPPER gets one), so a set-but-empty
             // RUSTDOC still masks CARGO_BUILD_RUSTDOC and still reaches the
@@ -809,6 +817,11 @@ mod tests {
         std::fs::remove_dir_all(&tmp).ok();
     }
 
+    /// The `#[cfg(unix)]` half of [`is_executable_file`]. Gated because the
+    /// PREMISE is: a 0644 file is not executable, which is only true where a
+    /// mode exists. The `not(unix)` twin below pins the other half, so neither
+    /// arm of the predicate is unpinned on the target it ships to.
+    #[cfg(unix)]
     #[test]
     fn executable_test_matches_the_shell_test() {
         use std::os::unix::fs::PermissionsExt;
@@ -818,6 +831,28 @@ mod tests {
         assert!(!is_executable_file(&f), "0644 file is not executable");
         std::fs::set_permissions(&f, std::fs::Permissions::from_mode(0o755)).expect("chmod");
         assert!(is_executable_file(&f));
+        assert!(
+            !is_executable_file(&tmp),
+            "a directory is not an executable file"
+        );
+        assert!(!is_executable_file(&tmp.join("absent")));
+        std::fs::remove_dir_all(&tmp).ok();
+    }
+
+    /// The `not(unix)` half: no execute bit exists, so a plain file IS runnable
+    /// (`PATHEXT` decides, not a mode) and only the directory and absent cases
+    /// remain false. Until `xtask gate cells` began type-checking test targets
+    /// this arm of the shipped predicate was compiled by no test anywhere.
+    #[cfg(not(unix))]
+    #[test]
+    fn executable_test_is_existence_where_there_is_no_execute_bit() {
+        let tmp = mktemp_dir("atv-exec").expect("mktemp");
+        let f = tmp.join("script.sh");
+        std::fs::write(&f, b"#!/bin/sh\n").expect("write");
+        assert!(
+            is_executable_file(&f),
+            "no execute bit exists here: a plain file is runnable"
+        );
         assert!(
             !is_executable_file(&tmp),
             "a directory is not an executable file"

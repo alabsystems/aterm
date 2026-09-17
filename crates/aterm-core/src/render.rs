@@ -396,6 +396,24 @@ impl EffectStreamDamage {
         self.valid
     }
 
+    /// Whether the stream this metadata describes was EMPTY.
+    ///
+    /// **THIS IS THE ONLY HONEST ANSWER FOR A CACHED FRAME.**
+    /// [`RenderInput::clone_damage_cache_from`] drops the payload of every
+    /// stream whose metadata is valid, so the cached frame's `Vec` is empty
+    /// whether or not the frame it describes carried anything. A caller that
+    /// asks the `Vec` will call a frame that was covered in glow a pure-grid
+    /// frame. `None` is the compatibility path for hand-built inputs, whose
+    /// payload was cloned and is therefore the answer.
+    #[must_use]
+    pub const fn was_empty(&self) -> Option<bool> {
+        if self.valid {
+            Some(self.len == 0)
+        } else {
+            None
+        }
+    }
+
     /// Returns a content verdict only when both producers supplied trusted
     /// metadata.  `None` is the compatibility path for hand-built inputs.
     #[must_use]
@@ -1342,6 +1360,22 @@ pub struct RenderInput {
     /// Pure metadata: it does not affect rendered pixels and is excluded from
     /// `PartialEq`, like [`snapshot_seq`](Self::snapshot_seq).
     pub absolute_row_revision: u64,
+    /// `Grid::history_renumber_epoch()` at extraction, captured under the SAME
+    /// lock as [`base_y`](Self::base_y) and the cells.
+    ///
+    /// THE SECOND WAY A ROW NUMBER DIES. `absolute_row_revision` names the
+    /// piecewise one (a protected-footer splice); this names the WHOLESALE one —
+    /// a width reflow rewraps history and renumbers every retained row, and a
+    /// Kitty CSI +T unscroll drops the newest scrollback lines. Neither is a
+    /// uniform `base_y` delta, and NEITHER moves this stamp's sibling: measured
+    /// on a font zoom with the ⌘F bar open, `absolute_row_revision` sat still
+    /// while the highlight's cached `(row, col)` came to name a different,
+    /// match-shaped token four rows away — the bar read "P09=" and the tint sat
+    /// on "P05=". A host that re-anchors retained absolute-row geometry into this
+    /// frame must fail closed on BOTH stamps, never on the footer one alone.
+    /// Pure metadata: it does not affect rendered pixels and is excluded from
+    /// `PartialEq`, like [`snapshot_seq`](Self::snapshot_seq).
+    pub history_renumber_epoch: u64,
     /// M1b SUB-ROW SCROLL TRANSLATE (display-only): the SIGNED fractional-pixel
     /// residual the smooth-scroll kinematics bank below one whole row
     /// (`scroll_frac_px ∈ (-cell_h, cell_h)`). A POSITIVE value is the `frac` half
@@ -1957,6 +1991,7 @@ impl Clone for RenderInput {
             display_offset: self.display_offset,
             base_y: self.base_y,
             absolute_row_revision: self.absolute_row_revision,
+            history_renumber_epoch: self.history_renumber_epoch,
             scroll_frac_px: self.scroll_frac_px,
             grid_top_row: self.grid_top_row,
             grid_bot_row: self.grid_bot_row,
@@ -2143,9 +2178,10 @@ impl PartialEq for RenderInput {
         // `input_hot` is likewise NOT compared: it is a present-time bloom-defer hint
         // (see its doc), so a hot→settle transition must not by itself force a repaint
         // — the animating comet already differs frame-to-frame while a halo is pending.
-        // `base_y` and `absolute_row_revision` are NOT compared either: they are
-        // host-consumed re-anchor metadata (like `snapshot_seq`) that do not affect
-        // rendered pixels, so metadata-only changes must not force a raster repaint.
+        // `base_y`, `absolute_row_revision` and `history_renumber_epoch` are NOT
+        // compared either: they are host-consumed re-anchor metadata (like
+        // `snapshot_seq`) that do not affect rendered pixels, so metadata-only
+        // changes must not force a raster repaint.
         // `terminal_id` / `extract_gen` / `engine_fill_seq` / `engine_alt` /
         // `engine_row_order` (DMG-1
         // damage carrier) are extraction-continuity tokens, not rendered content:
@@ -2225,6 +2261,7 @@ impl RenderInput {
         self.display_offset = source.display_offset;
         self.base_y = source.base_y;
         self.absolute_row_revision = source.absolute_row_revision;
+        self.history_renumber_epoch = source.history_renumber_epoch;
         self.scroll_frac_px = source.scroll_frac_px;
         self.grid_top_row = source.grid_top_row;
         self.grid_bot_row = source.grid_bot_row;
@@ -2324,6 +2361,7 @@ impl RenderInput {
             display_offset: 0,
             base_y: 0,
             absolute_row_revision: 0,
+            history_renumber_epoch: 0,
             scroll_frac_px: 0,
             grid_top_row: 0,
             grid_bot_row: 0,

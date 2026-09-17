@@ -83,7 +83,8 @@ use std::time::Instant;
 use aterm_effects::cursor_glow::GlowStyle;
 use aterm_effects::tone::Tone;
 use aterm_effects::trail_sound::{
-    CHANNELS, EventMeta, SoundEvent, SoundGesture, SoundKind, SoundVoice, TimbreStops, TrailSynth,
+    CHANNELS, EventMeta, MIN_GAP, SoundEvent, SoundGesture, SoundKind, SoundVoice, TimbreStops,
+    TrailSynth,
 };
 
 const SR: u32 = 48_000;
@@ -991,23 +992,48 @@ const SCENE_ONSET: (usize, f32) = (35, 1.35);
 /// ```text
 /// rise        1.35  1.20  1.12  1.08  1.05
 /// Capital old    2     2     3     7    13    (v0.76.0: lift + letter + echo)
-/// Capital new    1     1     1     1     1    (this tree)
-/// Typed   new    1     1     1     1     8
+/// Capital 09-10  1     1     1     1     1    (the 2026-09-10 tree: one strike, one ring)
+/// Typed   09-10  1     1     1     1     8
 /// Typed@cyan     1     1     1     2    10    (1.08: the bloom's own 12 ms swell)
 /// ```
 ///
 /// So the instrument is coarse and its window is narrow: at 1.12 it sees the
 /// old engine's echo and not the new bloom's swell; at 1.08 it counts the
-/// swell; at 1.05 it counts the tine's own partial beat. It refutes the old
-/// engine (3 ≠ 1, and the lift is 2 ≠ 1 at every ratio) and passes this one,
+/// swell; at 1.05 it counts the tine's own partial beat. It refuted the old
+/// engine (3 ≠ 1, and the lift is 2 ≠ 1 at every ratio) and passed that one,
 /// which is what §8 asked of it — the EXACT statements are the unit pins
 /// `a_capital_is_one_strike_with_a_lifted_degree_and_one_ring` (one TUNE
 /// voice, nothing at 25 ms, ONE ring at 2f swelling in 60 ms on — no rise
-/// this census can count) and `a_bare_shift_is_a_pitched_pickup_that_never_steps`
+/// this census can count) and `a_bare_shift_is_a_ting_that_never_steps`
 /// (one GRAFT voice, a lone P1: since 2026-09-10 the Shift IS an onset of
-/// its own, which is why the `Capital` row now reads 2 — two KEYS).
-/// At the scene detector's 35 ms the census read `Capital 1` on the old
-/// engine too — the finding that made this constant.
+/// its own, which is why the `Capital` row reads 2 KEYS on the scene
+/// census). At the scene detector's 35 ms the census read `Capital 1` on
+/// the old engine too — the finding that made this constant.
+///
+/// RE-MEASURED 2026-09-16 FOR THE TING (the review caught the table above
+/// standing as this tree's record when it was not). Same rows, same seed,
+/// vol 0.4, the music box, the census over the unlimited difference:
+///
+/// ```text
+/// rise        1.35  1.20  1.12  1.08  1.05
+/// Capital        2     5     7    12    17    (this tree: the ting rings THROUGH the strike)
+/// Typed          1     1     1     1     2
+/// Typed@cyan     1     1     1     1     2
+/// Shift          1     1     1     1     1    (the ting alone: one strike)
+/// ```
+///
+/// The `Capital` row is not seven arrivals: it is two — the ting, then the
+/// strike 60 ms on — with the ting still at 0.49 of its peak when the strike
+/// lands, and two lattice partials a consonant interval apart ripple the
+/// summed envelope at their difference frequency (≥ 100 Hz here). A 2.67 ms
+/// RMS window counts that ripple as a rise once per refractory at 1.12 and
+/// finer (dumped: a smooth 10 ms envelope, −31 −29 −30 −31 −32 −33 −26 −24 …
+/// dB, exactly two arrivals). So since 2026-09-16 the `Capital` verdict is
+/// taken on the SCENE census ([`SCENE_ONSET`]: 35 ms, 1.35×), which reads
+/// the two keys, and the fine census stays on the `Typed` rows, where "one
+/// onset" is still what it proves. A ting-aware fine census (skip the 15 ms
+/// after each cue) would let `Capital` come back to this detector; the
+/// scene census answers the question §8 step 4 actually asks.
 ///
 /// VALID ONLY ABOVE THE BASS: the 2.7 ms RMS window holds a full period of
 /// the tune's lowest note (261 Hz) but rides the waveform of the bass dyad
@@ -1241,11 +1267,40 @@ struct Probe {
     /// Take the [`FINE_ONSET`] census on this row — valid only where the
     /// gesture has no bass under it (see the constant).
     census: bool,
+    /// PRESSES of the gesture in this row, [`RUN_TAP_MS`] apart — the
+    /// `Space×4` row is a four-space indent tapped at 10/s, so the run's
+    /// tail (the indent steps of 2026-09-16) is measured beside its head.
+    /// 1 everywhere else.
+    run: u8,
 }
+
+/// The tap rate of a multi-press probe row: 100 ms, a hand tapping space
+/// four times for an indent (8-12 taps/s is the range the indent step's own
+/// gate is fitted against).
+const RUN_TAP_MS: usize = 100;
 
 /// How long a hand holds Shift before the letter lands: §2.3 measured the
 /// lift arriving 30-100 ms ahead of the capital it precedes.
 const CAPITAL_SHIFT_LEAD_MS: usize = 60;
+
+/// The settling keystrokes before every probe row (see [`probe`]): three,
+/// so the row lands on the bar's accent.
+const PROBE_SETTLE: usize = 3;
+
+/// THE WALK REFERENCE for the ting's verdict (2026-09-16, on the review).
+/// The `Typed` row is ONE degree of the melody, and a v1 palette's letter
+/// walks its own fixed roof: at the row's degree the plain accent spreads
+/// over 4.5 dB across the palettes (Lumen −23.9 dBFS, Comet −19.4) and over
+/// 9 dB across the degrees of one palette (Comet −17.8..−27.1), while the
+/// ting — designed before the palette dispatch — sits at one level under
+/// all of them (−25.6..−26.8). Read against the one row, the ting's
+/// "−3 dB re the letter" was Lumen's luck at one degree and Comet's −7.2
+/// at the same one. So the verdict's letter is the MEAN of the `Typed`
+/// peak over these settle counts — the row's own accent and the next three
+/// accents of the walk (the engine's `a_capital_is_louder_at_every_degree_
+/// of_the_walk` fixture, on its accent slots) — and the row itself stays in
+/// the table as what one degree reads.
+const PROBE_WALK_SETTLES: [usize; 4] = [PROBE_SETTLE, 6, 9, 12];
 
 /// One gesture's takes: its row, and the four monos the row was scored on.
 struct Take {
@@ -1304,6 +1359,7 @@ fn probe(
     volume: f32,
     seed: u32,
     timbre: Timbre,
+    settle: usize,
 ) -> Take {
     let ev = |kind, shifted| SoundEvent {
         style,
@@ -1328,11 +1384,14 @@ fn probe(
         // has no hand. 0.0 is the identity.
         flow: 0.0,
     };
-    // THREE settling keystrokes, ~340 ms apart: enough that the previous
-    // note's tail is dead, and — since the bar's accents fall every third
-    // keystroke — enough that the PROBE itself lands on an accent. A gesture
-    // measured on a ghost slot would be reported against the accompaniment
-    // rather than against the tune.
+    // THREE settling keystrokes ([`PROBE_SETTLE`]), ~340 ms apart: enough
+    // that the previous note's tail is dead, and — since the bar's accents
+    // fall every third keystroke — enough that the PROBE itself lands on an
+    // accent. A gesture measured on a ghost slot would be reported against
+    // the accompaniment rather than against the tune. `settle` is a
+    // multiple of three for the same reason wherever a caller varies it
+    // ([`PROBE_WALK_SETTLES`]: the same accent, three more degrees of the
+    // walk).
     //
     // Stamped, like every other push in this bench: at 341 ms apart the
     // settling keys are three unhurried notes — but only if the engine is
@@ -1343,7 +1402,7 @@ fn probe(
         synth.set_v2_timbre_stops(timbre.stops());
         synth.set_bus_limiter(limiter);
         let mut warm = vec![0.0f32; 16_384 * CHANNELS];
-        for i in 0..3 {
+        for i in 0..settle {
             synth.push_meta(ev(SoundKind::Typed, false), stamp(i * 16_384));
             synth.render(&mut warm);
         }
@@ -1364,7 +1423,7 @@ fn probe(
         // later, exactly as two host pushes would arrive.
         let mut synth = settled(limiter);
         let mut stereo = vec![0.0f32; frames * CHANNELS];
-        let t0 = 3 * 16_384;
+        let t0 = settle * 16_384;
         let mut at = 0usize;
         if p.lift {
             synth.push_meta(ev(SoundKind::Shift, false), stamp(t0));
@@ -1373,7 +1432,17 @@ fn probe(
         }
         synth.push_meta(ev(p.kind, p.shifted), stamp(t0 + at));
         let voices = synth.live_voices();
-        synth.render(&mut stereo[at * CHANNELS..]);
+        // A multi-press row: the later presses land RUN_TAP_MS apart, each
+        // stamped at its own time, the audio rendered between them exactly
+        // as the host would.
+        let mut cursor = at;
+        for _ in 1..p.run.max(1) {
+            let next = cursor + SR as usize * RUN_TAP_MS / 1000;
+            synth.render(&mut stereo[cursor * CHANNELS..next * CHANNELS]);
+            synth.push_meta(ev(p.kind, p.shifted), stamp(t0 + next));
+            cursor = next;
+        }
+        synth.render(&mut stereo[cursor * CHANNELS..]);
         let raw = to_mono(&stereo);
 
         // WITHOUT it: the same settled synth left to ring.
@@ -1451,7 +1520,7 @@ fn probe_reel(
             at += CAPITAL_SHIFT_LEAD_MS as f32 / 1000.0;
         }
         marks.push(mark(at, SoundGesture::Trail(p.kind), p.shifted));
-        let take = probe(p, voice, style, volume, seed, timbre);
+        let take = probe(p, voice, style, volume, seed, timbre, PROBE_SETTLE);
         reel.extend_from_slice(&take.bus_with);
         reel.extend_from_slice(&gap);
         takes.push(take);
@@ -1463,7 +1532,7 @@ fn probe_reel(
 /// is the host's whole gesture — the bare Shift's cue, then the shifted
 /// `Typed` 60 ms on — and it is in the table because §8 step 4's proof is
 /// stated on it: under the shipped engine that pair was THREE onsets.
-const PROBES: [Probe; 10] = [
+const PROBES: [Probe; 11] = [
     Probe {
         label: "Typed",
         kind: SoundKind::Typed,
@@ -1471,6 +1540,7 @@ const PROBES: [Probe; 10] = [
         hue: 0.0,
         lift: false,
         census: true,
+        run: 1,
     },
     Probe {
         label: "Typed@cyan",
@@ -1479,6 +1549,7 @@ const PROBES: [Probe; 10] = [
         hue: 0.5,
         lift: false,
         census: true,
+        run: 1,
     },
     Probe {
         label: "Capital",
@@ -1487,6 +1558,7 @@ const PROBES: [Probe; 10] = [
         hue: 0.0,
         lift: true,
         census: true,
+        run: 1,
     },
     Probe {
         label: "Space",
@@ -1495,6 +1567,16 @@ const PROBES: [Probe; 10] = [
         hue: 0.0,
         lift: false,
         census: false,
+        run: 1,
+    },
+    Probe {
+        label: "Space×4",
+        kind: SoundKind::Space,
+        shifted: false,
+        hue: 0.0,
+        lift: false,
+        census: false,
+        run: 4,
     },
     Probe {
         label: "Backspace",
@@ -1503,6 +1585,7 @@ const PROBES: [Probe; 10] = [
         hue: 0.0,
         lift: false,
         census: false,
+        run: 1,
     },
     Probe {
         label: "KillWord",
@@ -1511,6 +1594,7 @@ const PROBES: [Probe; 10] = [
         hue: 0.0,
         lift: false,
         census: false,
+        run: 1,
     },
     Probe {
         label: "Shift",
@@ -1519,6 +1603,7 @@ const PROBES: [Probe; 10] = [
         hue: 0.0,
         lift: false,
         census: true,
+        run: 1,
     },
     Probe {
         label: "Kill",
@@ -1527,6 +1612,7 @@ const PROBES: [Probe; 10] = [
         hue: 0.0,
         lift: false,
         census: false,
+        run: 1,
     },
     Probe {
         label: "Land",
@@ -1535,6 +1621,7 @@ const PROBES: [Probe; 10] = [
         hue: 0.0,
         lift: false,
         census: false,
+        run: 1,
     },
     Probe {
         label: "Jump",
@@ -1543,6 +1630,7 @@ const PROBES: [Probe; 10] = [
         hue: 0.0,
         lift: false,
         census: false,
+        run: 1,
     },
 ];
 
@@ -2011,6 +2099,213 @@ fn census_row(
 
 /// The census sweep, printed.
 #[allow(clippy::too_many_arguments)]
+/// **THE SPACE-HEAD CENSUS** — "i don't always hear the space bar?" (the
+/// owner, 2026-09-16), as a count. Types the prose scenario at 6, 8 and 10
+/// cps, clean and with ±25 % hand jitter, through the engine exactly as
+/// [`render`] does, and for every Space cue asks the synth whether the push
+/// SPAWNED anything: a word-boundary HEAD that spawns nothing was thinned by
+/// v1's keystroke governor (`MIN_GAP`) or refused by a v2 lane; a run TAIL
+/// that spawns nothing likewise. Prints heads, silent heads, tails, silent
+/// tails, and the shortest letter→space gap the hand produced, per row. The
+/// engine under test is the one the flags name (the music box by default).
+fn space_census(
+    seed: u32,
+    voice: SoundVoice,
+    style: GlowStyle,
+    fix: BlockFix,
+    bed: bool,
+    timbre: Timbre,
+) {
+    println!(
+        "== space-head census ({}, {:?}/{:?}) ==",
+        timbre.name(),
+        voice,
+        style
+    );
+    println!(
+        "{:>4} {:>6} {:>6} {:>7} {:>6} {:>7} {:>9}",
+        "cps", "jitter", "heads", "silent", "tails", "silent", "min gap"
+    );
+    for cps in [6.0f32, 8.0, 10.0] {
+        for jitter in [0.0f32, 0.25] {
+            let sc = scenario_prose(cps, jitter, seed, false);
+            let frames = (sc.seconds * SR as f32) as usize;
+            let mut synth = TrailSynth::new(SR as f32, seed);
+            synth.set_v2_timbre_stops(timbre.stops());
+            let mut stereo = vec![0.0f32; BLOCK * CHANNELS];
+            let spawn: Vec<usize> = sc.cues.iter().map(|c| fix.spawn_frame(c.t)).collect();
+            let (mut heads, mut silent_heads, mut tails, mut silent_tails) = (0usize, 0, 0, 0);
+            let mut min_gap = f32::MAX;
+            let mut prev_space = false;
+            let mut prev_t = f32::MIN;
+            let (mut ci, mut f) = (0usize, 0usize);
+            while f < frames {
+                while ci < sc.cues.len() && spawn[ci] <= f {
+                    let cue = sc.cues[ci];
+                    let is_space = cue.gesture == SoundGesture::Trail(SoundKind::Space);
+                    let before = synth.live_voices();
+                    synth.push_meta(
+                        SoundEvent {
+                            style,
+                            voice,
+                            kind: cue.gesture,
+                            pan: cue.pan,
+                            heat: cue.heat,
+                            hue: (cue.t * 0.18).fract(),
+                            gain: 0.4,
+                            tone: Tone::Technical,
+                            bed,
+                            shifted: cue.shifted,
+                        },
+                        cue.meta(),
+                    );
+                    if is_space {
+                        let spoke = synth.live_voices() > before;
+                        if prev_space {
+                            tails += 1;
+                            silent_tails += usize::from(!spoke);
+                        } else {
+                            heads += 1;
+                            silent_heads += usize::from(!spoke);
+                            min_gap = min_gap.min(cue.t - prev_t);
+                        }
+                    }
+                    prev_space = is_space;
+                    prev_t = cue.t;
+                    ci += 1;
+                }
+                let next_block = (f / BLOCK + 1) * BLOCK;
+                let next_cue = spawn.get(ci).copied().unwrap_or(usize::MAX);
+                let to = frames.min(next_block).min(next_cue);
+                let n = to.saturating_sub(f).max(1).min(frames - f);
+                synth.render(&mut stereo[..n * CHANNELS]);
+                f += n;
+            }
+            println!(
+                "{cps:>4.0} {:>5.0}% {heads:>6} {silent_heads:>7} {tails:>6} {silent_tails:>7} {:>7.1} ms",
+                jitter * 100.0,
+                min_gap * 1000.0
+            );
+        }
+    }
+}
+
+/// THE SHIFT CENSUS (the review of 2026-09-16 — see the engine's
+/// `SHIFT_MIN_GAP`): the prose scenarios again, with every third word's first
+/// letter CAPITALISED and a bare `Shift` cue `lead` ms ahead of each capital
+/// (the host's measured 30-100 ms lead), counting the Shifts the engine left
+/// silent — a ting that spawned no voice. The lead is measured from the
+/// capital, so the Shift lands `IOI − lead` after the key BEFORE it: at 10
+/// cps with a 60 ms lead that is 40 ms, inside the keystroke governor's
+/// 45 ms. `min gap` is the shortest gap from the previous cue to a Shift the
+/// hand produced. The music box has no keystroke governor, so its rows read
+/// 0 by construction; the v1 rows are the measurement.
+fn shift_census(
+    seed: u32,
+    voice: SoundVoice,
+    style: GlowStyle,
+    fix: BlockFix,
+    bed: bool,
+    timbre: Timbre,
+) {
+    println!(
+        "== shift census ({}, {:?}/{:?}) ==",
+        timbre.name(),
+        voice,
+        style
+    );
+    // `in gap` counts the Shifts that landed inside the keystroke governor's
+    // [`MIN_GAP`] of the cue before them — exactly the ones the governor
+    // silenced while the bare Shift was still gated on it (before 2026-09-16's
+    // `SHIFT_MIN_GAP`), so the column is the BEFORE number and `silent` the
+    // AFTER, on one run.
+    println!(
+        "{:>4} {:>6} {:>5} {:>6} {:>6} {:>6} {:>9}",
+        "cps", "jitter", "lead", "shifts", "in gap", "silent", "min gap"
+    );
+    for cps in [6.0f32, 8.0, 10.0] {
+        for jitter in [0.0f32, 0.25] {
+            for lead_ms in [30u32, 60] {
+                let sc = scenario_prose(cps, jitter, seed, false);
+                let mut cues = sc.cues.clone();
+                let mut shifts_in = Vec::new();
+                let (mut word, mut head) = (0usize, true);
+                for c in cues.iter_mut() {
+                    let typed = c.gesture == SoundGesture::Trail(SoundKind::Typed);
+                    if typed && head {
+                        if word % 3 == 0 && c.ch.is_ascii_lowercase() {
+                            c.shifted = true;
+                            c.ch = c.ch.to_ascii_uppercase();
+                            shifts_in.push(Cue {
+                                t: c.t - lead_ms as f32 / 1000.0,
+                                gesture: SoundGesture::Trail(SoundKind::Shift),
+                                pan: c.pan,
+                                heat: c.heat,
+                                shifted: false,
+                                ch: '\0',
+                            });
+                        }
+                        word += 1;
+                    }
+                    head = !typed;
+                }
+                cues.extend(shifts_in);
+                cues.sort_by(|a, b| a.t.partial_cmp(&b.t).expect("finite cue times"));
+                let frames = (sc.seconds * SR as f32) as usize;
+                let mut synth = TrailSynth::new(SR as f32, seed);
+                synth.set_v2_timbre_stops(timbre.stops());
+                let mut stereo = vec![0.0f32; BLOCK * CHANNELS];
+                let spawn: Vec<usize> = cues.iter().map(|c| fix.spawn_frame(c.t)).collect();
+                let (mut shifts, mut in_gap, mut silent) = (0usize, 0usize, 0usize);
+                let mut min_gap = f32::MAX;
+                let mut prev_t = f32::MIN;
+                let (mut ci, mut f) = (0usize, 0usize);
+                while f < frames {
+                    while ci < cues.len() && spawn[ci] <= f {
+                        let cue = cues[ci];
+                        let is_shift = cue.gesture == SoundGesture::Trail(SoundKind::Shift);
+                        let before = synth.live_voices();
+                        synth.push_meta(
+                            SoundEvent {
+                                style,
+                                voice,
+                                kind: cue.gesture,
+                                pan: cue.pan,
+                                heat: cue.heat,
+                                hue: (cue.t * 0.18).fract(),
+                                gain: 0.4,
+                                tone: Tone::Technical,
+                                bed,
+                                shifted: cue.shifted,
+                            },
+                            cue.meta(),
+                        );
+                        if is_shift {
+                            shifts += 1;
+                            in_gap += usize::from(cue.t - prev_t < MIN_GAP);
+                            silent += usize::from(synth.live_voices() <= before);
+                            min_gap = min_gap.min(cue.t - prev_t);
+                        }
+                        prev_t = cue.t;
+                        ci += 1;
+                    }
+                    let next_block = (f / BLOCK + 1) * BLOCK;
+                    let next_cue = spawn.get(ci).copied().unwrap_or(usize::MAX);
+                    let to = frames.min(next_block).min(next_cue);
+                    let n = to.saturating_sub(f).max(1).min(frames - f);
+                    synth.render(&mut stereo[..n * CHANNELS]);
+                    f += n;
+                }
+                println!(
+                    "{cps:>4.0} {:>5.0}% {lead_ms:>3} ms {shifts:>6} {in_gap:>6} {silent:>6} {:>7.1} ms",
+                    jitter * 100.0,
+                    min_gap * 1000.0
+                );
+            }
+        }
+    }
+}
+
 fn census(
     seed: u32,
     voice: SoundVoice,
@@ -2262,7 +2557,7 @@ fn usage() -> ! {
         "keyboard_song_ab <out_dir> [--tag <name>] [--voice <name>] [--style <name>]\n\
         \x20   [--cps <rate>] [--jitter <pct>] [--seed <n>] [--bed on|off]\n\
         \x20   [--timbre plain|bloom|hue|room] [--jitterfix ship|j0|j1] [--metronome]\n\
-        \x20   [--census] [--probes] [--dump-probes]"
+        \x20   [--census] [--space-census] [--shift-census] [--probes] [--dump-probes]"
     );
     std::process::exit(2)
 }
@@ -2296,6 +2591,8 @@ fn main() {
     // the shipping behaviour and `--jitterfix ship` is the historical one.
     let mut fix = BlockFix::J1;
     let mut want_census = false;
+    let mut want_space_census = false;
+    let mut want_shift_census = false;
     let mut metronome = false;
     while let Some(a) = args.next() {
         let mut val = |what: &str| {
@@ -2395,6 +2692,8 @@ fn main() {
                 });
             }
             "--census" => want_census = true,
+            "--space-census" => want_space_census = true,
+            "--shift-census" => want_shift_census = true,
             "--probes" => want_probes = true,
             "--dump-probes" => dump_probes = true,
             "--metronome" => metronome = true,
@@ -2411,6 +2710,18 @@ fn main() {
         // No WAVs: the census needs no ear, and rendering 96 takes to print a
         // table would make the one run that must happen FIRST the slowest.
         census(seed, voice, style, fix, bed, timbre);
+        return;
+    }
+    // Each census is its own flag (2026-09-16, on the review: the shift
+    // census used to ride `--space-census` unnamed); both may be asked for
+    // in one run.
+    if want_space_census || want_shift_census {
+        if want_space_census {
+            space_census(seed, voice, style, fix, bed, timbre);
+        }
+        if want_shift_census {
+            shift_census(seed, voice, style, fix, bed, timbre);
+        }
         return;
     }
 
@@ -2678,41 +2989,141 @@ fn probe_tables(
         // census on both engines.
         let find = |name: &str| probes.iter().find(|p| p.name == name);
         let fine_of = |name: &str| find(name).and_then(|p| p.fine).unwrap_or(0);
-        let (typed, capital) = (fine_of("Typed"), fine_of("Capital"));
+        let typed = fine_of("Typed");
+        // THE CAPITAL IS COUNTED ON THE SCENE CENSUS since 2026-09-16: the
+        // ting now rings THROUGH the capital's strike, and two lattice
+        // partials a consonant interval apart ripple the envelope at their
+        // difference frequency (≥ 100 Hz here — a difference tone, not a
+        // second strike), which the fine census's 2.67 ms window counts as
+        // rises every refractory (measured 6-7 on the room and plain rungs
+        // alike, with a smooth 10 ms envelope: −31 −29 −30 −31 −32 −33 −26
+        // −24 … dB, exactly two arrivals). The 35 ms / 1.35× scene census
+        // reads the two keys.
+        let capital = find("Capital").map_or(0, |p| p.onsets);
         let caps_lock = find("CapsLockA").and_then(|p| p.fine);
         let shift_tonality = find("Shift").map_or(0.0, |p| p.tonality);
         let shift_pitched = shift_tonality >= PITCHED_TONALITY;
-        let shift_re_typed = match (find("Shift"), find("Typed")) {
-            (Some(s), Some(t)) => s.peak_db - t.peak_db,
-            _ => f64::NAN,
+        // The ting is read against the WALK-MEAN letter ([`PROBE_WALK_SETTLES`]):
+        // three more `Typed` takes on the next accents of the walk, averaged
+        // in dB with the row's own.
+        let typed_walk_db = {
+            let rows: Vec<f64> = PROBE_WALK_SETTLES
+                .iter()
+                .map(|&settle| {
+                    if settle == PROBE_SETTLE {
+                        find("Typed").map_or(f64::NAN, |t| t.peak_db)
+                    } else {
+                        probe(&PROBES[0], voice, style, volume, seed, timbre, settle)
+                            .row
+                            .peak_db
+                    }
+                })
+                .collect();
+            rows.iter().sum::<f64>() / rows.len() as f64
         };
-        const SHIFT_RE_TYPED_TARGET_DB: f64 = -6.0;
+        let shift_re_typed = find("Shift").map_or(f64::NAN, |s| s.peak_db - typed_walk_db);
+        // RE-RULED 2026-09-16 (the owner: "there is no 'shift' tone … it is
+        // supposed to be a 'ting'"): the bare Shift is the TING at the
+        // Space's own tier, −3 dB re the keystroke, in both engines. The
+        // −6 dB pickup this replaces measured −28.22 dBFS against Typed's
+        // −22.10 on this very row (music box, vol 0.4) and was cut 60 ms in
+        // by the capital it announced. "The keystroke" is the walk mean
+        // since the same day's review (`typed_walk_db` above): against the
+        // one row Comet read −7.16 dB and passed nothing, and the number
+        // was the row's degree, not the ting.
+        const SHIFT_RE_TYPED_TARGET_DB: f64 = -3.0;
         const SHIFT_RE_TYPED_TOL_DB: f64 = 1.5;
         let shift_level_ok =
             (shift_re_typed - SHIFT_RE_TYPED_TARGET_DB).abs() <= SHIFT_RE_TYPED_TOL_DB;
         let caps_lock_ok = caps_lock.is_none_or(|n| n == 1);
+        // THE TING'S OWN LINE, on both engines: §8 is the music box's
+        // acceptance and its Typed clause ("a keystroke is one onset", the
+        // fine census) has always read red on the v1 palettes — Lumen's
+        // keystroke counts 20 fine rises — so the ting's verdict is stated on
+        // its own, where a v1 run can read it green (Lumen after the
+        // 2026-09-16 refit: −2.33 dB re Typed, under its own Space's peak).
+        println!(
+            "ting (2026-09-16): Shift {shift_re_typed:+.2} dB re the walk-mean Typed \
+             ({typed_walk_db:.2} dBFS over settle {PROBE_WALK_SETTLES:?}; the row's own \
+             degree reads {:.2}), tonality {shift_tonality:.1} ({}) — {}",
+            find("Typed").map_or(f64::NAN, |t| t.peak_db),
+            if shift_pitched { "pitched" } else { "FELT" },
+            if shift_pitched && shift_level_ok {
+                "at the Space's tier, inside the −3 ± 1.5 dB window"
+            } else {
+                "OFF ITS −3 ± 1.5 dB WINDOW"
+            }
+        );
         println!(
             "onset census (fine: {} ms, rise {}; Capital = Shift then the letter \
-             {CAPITAL_SHIFT_LEAD_MS} ms on): Typed {typed}, Capital {capital}{}, Shift tonality \
-             {shift_tonality:.1} ({}) at {shift_re_typed:+.2} dB re Typed (target \
-             {SHIFT_RE_TYPED_TARGET_DB:+.1} ± {SHIFT_RE_TYPED_TOL_DB}) — {}",
+             {CAPITAL_SHIFT_LEAD_MS} ms on, on the scene census): Typed {typed}, Capital \
+             {capital}{}, Shift tonality \
+             {shift_tonality:.1} ({}) at {shift_re_typed:+.2} dB re the walk-mean Typed (target \
+             {SHIFT_RE_TYPED_TARGET_DB:+.1} ± {SHIFT_RE_TYPED_TOL_DB}, the 2026-09-16 ting) — {}",
             FINE_ONSET.0,
             FINE_ONSET.1,
             caps_lock.map_or(String::new(), |n| format!(", CapsLockA {n}")),
             if shift_pitched { "pitched" } else { "FELT" },
             if typed == 1 && capital == 2 && caps_lock_ok && shift_pitched && shift_level_ok {
-                "a keystroke is one onset, a Shift+capital is two keys, and the pickup \
-                 sings under the key (§8 step 4 as re-ruled 2026-09-10 holds)"
+                "a keystroke is one onset, a Shift+capital is two keys, and the ting \
+                 rings beside the key (§8 step 4 as re-ruled 2026-09-10 and 2026-09-16 holds)"
             } else if !shift_pitched {
                 "§8 STEP 4 (2026-09-10) FAILS: the bare Shift does not sing"
             } else if !shift_level_ok {
-                "§8 STEP 4 (2026-09-10) FAILS: the pickup is off its −6 dB window"
+                "§8 STEP 4 (2026-09-16) FAILS: the ting is off its −3 dB window"
             } else if capital != 2 {
                 "§8 STEP 4 (2026-09-10) FAILS: Shift then a capital is not two onsets"
             } else {
                 "§8 STEP 4 (2026-09-10) FAILS: a keystroke is not one onset"
             }
         );
+        // THE SPACE HEAD IS HEARD (RE-RULED 2026-09-16 — the owner: "i
+        // don't always hear the space bar?"). The 2026-09-10 fit ("felt,
+        // not heard") measured on this row, music box, vol 0.4: Space
+        // −30.82 dBFS against Typed's −22.10 — 8.7 dB under the letter,
+        // centroid 303 Hz, energy over 2 kHz 0.000 — a spectrum a laptop
+        // speaker rolls off. The re-fit (`rainbow_kitty_v2::BASS_LEVEL`
+        // −4 dB re the step, the head breath's twinkle
+        // `SPACE_TWINKLE_LEVEL`, the breath's roof) puts the head at the
+        // ting's tier and under the letter: −4..−5 dB re Typed with top.
+        // Verdict on both engines: −6.5..0 dB re Typed (the ladder test's
+        // "never over the letter" is the ceiling), centroid ≥ 450 Hz and at
+        // least a fiftieth of the energy over 2 kHz. Lumen's own space (the
+        // 2026-08-31 twinkle) reads −2.1 dB / 585 Hz / 0.026 here.
+        //
+        // THE LETTER IS THE WALK MEAN (2026-09-16, the audit's fourth
+        // observation) — `typed_walk_db` above, the ting line's own
+        // instrument. Read against the one row the verdict was the row's
+        // degree, not the space: the v1 downbeat is a FIXED bass root (its
+        // pitch and level do not walk) while the letter walks its palette's
+        // roof, so the same Space read −2.11 dB re the row on the bench's
+        // seed and −6.85 (Lumen) / −7.52 (Comet) re the same-seed letter on
+        // one other seed each — off the window on luck alone. The row's own
+        // reading is still printed beside it, as the ting line prints its.
+        const SPACE_RE_TYPED_LO_DB: f64 = -6.5;
+        const SPACE_RE_TYPED_HI_DB: f64 = 0.0;
+        const SPACE_CENTROID_FLOOR_HZ: f64 = 450.0;
+        const SPACE_HI_FLOOR: f64 = 0.02;
+        if let (Some(sp), Some(t)) = (find("Space"), find("Typed")) {
+            let re = sp.peak_db - typed_walk_db;
+            let re_row = sp.peak_db - t.peak_db;
+            let tier_ok = (SPACE_RE_TYPED_LO_DB..=SPACE_RE_TYPED_HI_DB).contains(&re);
+            let top_ok = sp.centroid_hz >= SPACE_CENTROID_FLOOR_HZ && sp.hi_frac >= SPACE_HI_FLOOR;
+            println!(
+                "space head (2026-09-16): Space {re:+.2} dB re the walk-mean Typed \
+                 ({typed_walk_db:.2} dBFS over settle {PROBE_WALK_SETTLES:?}; the row's own \
+                 degree reads {re_row:+.2}), centroid {:.0} Hz, over 2 kHz {:.3} — {}",
+                sp.centroid_hz,
+                sp.hi_frac,
+                if tier_ok && top_ok {
+                    "heard beside the letter, never over it, with top for a laptop speaker"
+                } else if !tier_ok {
+                    "OFF ITS −6.5..0 dB WINDOW re the letter"
+                } else {
+                    "NO TOP: centroid under 450 Hz or under a fiftieth of the energy over 2 kHz"
+                }
+            );
+        }
         // §8 STEP 6's PROOF, on the same row: the bloomed Typed probe's
         // centroid sits in §3.3's 1250-1400 Hz window and UNDER 1600 Hz, past
         // which the bloom has become the glass bell the v2 train retired.

@@ -659,8 +659,8 @@ fn test_char_width_table_boundaries() {
     // Soft hyphen = narrow (not zero-width)
     assert_eq!(crate::tables::width::char_width('\u{00AD}'), 1);
 
-    // Beyond table range = narrow
-    assert_eq!(crate::tables::width::char_width('\u{E0001}'), 1);
+    // Plane 14 (Tags, Variation Selectors Supplement) = zero-width
+    assert_eq!(crate::tables::width::char_width('\u{E0001}'), 0);
 
     // CJK Extension G (U+30000-U+3134A) = wide (#7775)
     assert_eq!(crate::tables::width::char_width('\u{30000}'), 2); // Extension G start
@@ -682,6 +682,80 @@ fn test_char_width_table_boundaries() {
     assert_eq!(crate::tables::width::char_width_cjk('\u{323AF}'), 2);
     assert_eq!(crate::tables::width::char_width_cjk('\u{323B0}'), 1);
     assert_eq!(crate::tables::width::char_width_cjk('\u{2EBF0}'), 2);
+}
+
+/// Plane 14 is Default_Ignorable_Code_Point end to end — the Tags block
+/// (U+E0000..U+E007F, the letters of a subdivision-flag sequence), the
+/// Variation Selectors Supplement (U+E0100..U+E01EF, ideographic variation
+/// selectors) and the reserved gaps between. Every scalar in it is zero-width
+/// in both ambiguous-width modes: it attaches to the preceding cell and draws
+/// nothing. The generated table stops at U+2FFFF, so the block fell into the
+/// hand-written catch-all and came back narrow — a 🏴 plus six tags wrote
+/// seven cells, six of them tofu.
+#[test]
+fn plane14_default_ignorables_are_zero_width() {
+    for cp in [
+        0xE0000_u32,
+        0xE0001,
+        0xE001F,
+        0xE0020,
+        0xE007F,
+        0xE0080,
+        0xE0100,
+        0xE01EF,
+        0xE01F0,
+        0xE0FFF,
+    ] {
+        let c = char::from_u32(cp).expect("plane 14 scalar");
+        assert_eq!(
+            crate::tables::width::char_width(c),
+            0,
+            "U+{cp:05X} in default mode"
+        );
+        assert_eq!(
+            crate::tables::width::char_width_cjk(c),
+            0,
+            "U+{cp:05X} in CJK mode"
+        );
+    }
+    // The first scalar past the block stays narrow, Extension G stays wide,
+    // and the BMP presentation selectors keep the zero width they had.
+    assert_eq!(crate::tables::width::char_width('\u{E1000}'), 1);
+    assert_eq!(crate::tables::width::char_width('\u{30000}'), 2);
+    assert_eq!(crate::tables::width::char_width('\u{FE0E}'), 0);
+    assert_eq!(crate::tables::width::char_width('\u{FE0F}'), 0);
+    // England: 🏴 + gbeng + CANCEL TAG is one two-cell grapheme.
+    assert_eq!(
+        crate::tables::width::str_width(
+            "\u{1F3F4}\u{E0067}\u{E0062}\u{E0065}\u{E006E}\u{E0067}\u{E007F}"
+        ),
+        2
+    );
+}
+
+/// Exhaustive, zero-tolerance parity with the declared oracle (unicode-width
+/// 0.2) across plane 14, in both ambiguous-width modes. The BMP/SMP
+/// differential tests above never reach the plane, which is how the
+/// catch-all's answer for it went unmeasured.
+#[test]
+fn test_char_width_matches_unicode_width_plane14() {
+    use unicode_width::UnicodeWidthChar;
+
+    for cp in 0xE0000_u32..=0xE0FFF {
+        let c = char::from_u32(cp).expect("plane 14 scalar");
+        let ours = crate::tables::width::char_width(c);
+        let theirs = UnicodeWidthChar::width(c).unwrap_or(0);
+        assert_eq!(
+            ours, theirs,
+            "U+{cp:05X}: ours={ours}, unicode-width={theirs}"
+        );
+        let ours_cjk = crate::tables::width::char_width_cjk(c);
+        let theirs_cjk = UnicodeWidthChar::width_cjk(c).unwrap_or(0);
+        assert_eq!(
+            ours_cjk, theirs_cjk,
+            "U+{cp:05X} in CJK mode: ours={ours_cjk}, unicode-width={theirs_cjk}"
+        );
+    }
 }
 
 // CJK aggregate function tests (#7605)

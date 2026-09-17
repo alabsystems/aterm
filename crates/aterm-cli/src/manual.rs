@@ -27,6 +27,7 @@
 //! server answers `help` from — so it never drifts from the real protocol.
 
 use std::fmt::Write as _;
+use std::path::{Path, PathBuf};
 
 /// The environment blurb printed at the top of the front page (and the agent
 /// brief). What this toolchain IS, in three sentences.
@@ -398,8 +399,10 @@ OCCASIONAL (recovery and preference)
                              env var) is named and left; a directory you name is
                              migrated regardless. A live build (cargo's flock) is
                              skipped and retried; already-excluded is a success. Every
-                             update/seed pass runs `apply --all` itself unless
-                             [machine] spotlight_noindex = false
+                             update/seed pass runs the same scan-and-apply itself, with
+                             the doctor's smaller budget (`aterm pkg machine` says "at
+                             least" when it hit it), unless [machine] spotlight_noindex
+                             = false; `apply --all` by hand walks further
   aterm pkg machine          the [machine] settings as the doctor reads them: Universal
                              Control (the cursor roaming to other Macs and iPads) and
                              Spotlight's view of cargo build output
@@ -427,7 +430,8 @@ PLUMBING (producer / operator / dev — a first hour never needs these)
   aterm pkg link <prog> <dir> | unlink | refresh
                              dev-link a sibling checkout's bins over a program; update
                              HARD-SKIPS a linked program until unlink; refresh re-asserts
-                             links after a rebuild
+                             links after a rebuild; for trust, link also points rustup's
+                             `trust` at the checkout (a sysroot) and unlink points it back
   aterm pkg tree-root <dir>  print the SHA-256 tree_root the publish pipeline signs
   aterm pkg verify-index | verify-pkg <args…>
                              run the client's full trust chain over index/roster or
@@ -453,16 +457,19 @@ WHEN TO REACH FOR IT
   Never rebuild a toolchain from source to answer that message.
   (`doctor` takes no flags: it reports, `repair` acts.)
   When a foreign shell needs the tools: every install/update pass writes a marker-bounded
-  block (`# >>> atpkg shell integration >>>`) into an EXISTING ~/.zshrc, ~/.bashrc and
-  ~/.config/fish/config.fish that sources ~/.aterm/shell.d/00-atpkg.*, so Terminal.app,
-  ssh and an agent's shell get the tools too (a shell opened before the install needs a
-  new tab). It never CREATES an rc file, and since the 2026-09-12 TCC audit it also
-  SKIPS an rc that resolves under a folder macOS guards with a consent dialog (your
-  home's Documents, Desktop, Downloads, Pictures, Movies or Music folder, iCloud Drive,
-  a cloud-sync provider's folder, a network or removable volume): opening it would
-  raise that dialog on an unattended pass, so the rc is left unwired and you wire it
-  by hand. Delete the block to opt out. Without it, prefix the command — `aterm <tool>`
-  — or read the export line `aterm pkg doctor` prints.
+  block (`# >>> atpkg shell integration >>>`) into an EXISTING ~/.zshrc, ~/.bashrc,
+  ~/.bash_profile (what a login bash reads on macOS — Terminal.app, ssh; measured
+  2026-09-15) and ~/.config/fish/config.fish that sources ~/.aterm/shell.d/00-atpkg.*,
+  so Terminal.app, ssh and an agent's shell get the tools too (a shell opened before the
+  install picks them up in place with `. ~/.aterm/shell.d/00-atpkg.<shell>` — fish:
+  `source …fish` — never a new tab, and never `exec $SHELL`, which inside an aterm tab
+  drops the tab's shell integration). It never CREATES an rc file, and since the
+  2026-09-12 TCC audit it also SKIPS an rc that resolves under a folder macOS guards
+  with a consent dialog (your home's Documents, Desktop, Downloads, Pictures, Movies or
+  Music folder, iCloud Drive, a cloud-sync provider's folder, a network or removable
+  volume): opening it would raise that dialog on an unattended pass, so the rc is left
+  unwired and you wire it by hand. Delete the block to opt out. Without it, prefix the
+  command — `aterm <tool>` — or read the export line `aterm pkg doctor` prints.
   When you want the seams spelled out — which rustup link, which PATH hook, which
   checkout pins, and what each currently points at — `aterm pkg doctor` names them, and
   `aterm pkg status` / `aterm pkg which` answer the narrower questions.
@@ -474,18 +481,58 @@ GOTCHAS (in the order they bite)
     system sudo/ssh/git). FIRST means moved there: the hook removes every earlier
     mention of <prefix>/agents before prepending it, because a macOS login shell's
     path_helper and a `~/.local/bin` line in ~/.zshrc otherwise leave /opt/homebrew/bin
-    and ~/.local/bin ahead of it, and inside an aterm session the shell integration
-    re-asserts it beside the reroute directory after your rc files ran. The hook is
+    and ~/.local/bin ahead of it, and inside an aterm window tab the shell integration
+    re-asserts it beside the reroute directory at every prompt and every command (a TTY
+    `aterm` session in another terminal has no integration and relies on the rc-sourced
+    hook alone). The hook is
     sourced inside every aterm session and from the
-    marker block atpkg writes into an existing ~/.zshrc / ~/.bashrc / config.fish (see
+    marker block atpkg writes into an existing ~/.zshrc / ~/.bashrc / ~/.bash_profile /
+    config.fish (see
     WHEN TO REACH FOR IT); in a shell neither reaches — a CI image, an rc that never
     existed — use `aterm <tool>`, or copy the export line `aterm pkg doctor` prints.
     `aterm pkg which claude` names the managed copy AND the foreign copies it out-ranks
-    (a native installer's, a brew cask's). bin/ NEVER carries a `cargo`, `rustc`, or `rustup` shim
+    (a native installer's, a brew cask's).
+  * SAME TAB, LIVE UPDATE (owner, 2026-09-16: "all the latest and best MUST WORK IN THE
+    SAME TAB with live update"): an update pass re-lays bin/ and agents/ atomically, so
+    the NEXT `claude`/`codex` you type in any tab whose PATH has <prefix>/agents runs the
+    new build — no new tab, no restart. Because that position is re-asserted at every
+    prompt and every command, a PATH prepend typed in the tab does not stick: to run a
+    different copy on purpose, call it by its path (`~/.local/bin/claude`); `ATERM_NO_REROUTE`
+    restores the upstream Rust names only, never the foreign `claude`/`codex`. While a newer build is still landing (downloading,
+    verifying, extracting, activating), a `claude` typed in that window waits for it and
+    says so on stderr — `atpkg: waiting for the claude update to land — 2.1.274 (build
+    2026091702), downloading 42% (12.3 of 29.0 MB) — Ctrl-C runs 2.1.273 now` — refreshed
+    every 2 s, bounded by ATPKG_LANDING_WAIT_SECS (default 45; 0 = warn once and run the
+    current build at once). "Landed" means bin/<program> now resolves into the new build —
+    then `atpkg: the claude update landed — running 2.1.274 (build 2026091702)` and the new
+    build runs. When the bound expires, or on Ctrl-C, the build you had runs and the line
+    says the new build runs once it lands (a `claude` typed while the update is still
+    landing waits for it again). If the update ends without landing — a failed download, a
+    rolled-back activation — the line says `atpkg: the claude update did not land (<why>)
+    — running 2.1.273 now; \`aterm pkg update\` retries it`, and the build you had runs.
+    A shell whose PATH has no <prefix>/agents (opened before the install that introduced
+    agents/, or one whose rc never sourced the hook): `aterm pkg doctor` and `aterm pkg
+    which claude` say "SHADOWED in this shell by …" and name the one fix — the same line
+    the window's status row says for a tab from before the update:
+    `. ~/.aterm/shell.d/00-atpkg.zsh` (`source …fish` for fish, `. …ps1` for pwsh),
+    typed in that shell. It moves agents/ to the front of PATH and keeps everything the
+    tab has. NOT `exec $SHELL`: inside an aterm tab the re-exec'd shell loads no shell
+    integration (measured 2026-09-16 — the zsh wrapper consumes ATERM_ORIGINAL_ZDOTDIR;
+    bash rides --rcfile), so the tab silently loses its marks, cwd tracking and the live
+    PATH re-assert. Only where no hook file exists does doctor print a PATH line instead.
+    Inside an aterm tab the shell integration re-asserts agents/ at every prompt and
+    sources the hook itself when it appears or is rewritten (zsh, bash, fish measured), so a
+    tab running the current integration needs nothing typed at all. The remedy line is in
+    the dialect of the shell that typed `aterm pkg doctor` (its parent process, not
+    $SHELL): a fish tab on a zsh-login machine gets the fish line. Windows has no landing wait:
+    the .cmd twin runs the current build at once, and the next `claude` after the pass
+    runs the new one.
+  * bin/ NEVER carries a `cargo`, `rustc`, or `rustup` shim
     (those names are on the sensitive-shim deny-list): cargo reaches the compiler
-    through rustup's `trust` toolchain link, which atpkg points at `store/trust/current`
-    and re-asserts on every install and update pass — a store update moves the
-    compiler without touching rustup.
+    through rustup's `trust` toolchain link, which atpkg points at its view of
+    `store/trust/current` (<prefix>/rustup/trust, a copy-on-write clone where rustc,
+    cargo and rustdoc are Trust's own tools) and re-asserts on every install and update
+    pass — a store update moves the compiler without touching rustup.
   * AUTOMATIC updates ride the windowed app: `aterm --window` runs the update pass at
     launch and on a 6h loop (ATPKG_UPDATE_INTERVAL_SECS); a launch pass that finds another
     aterm's install in flight (a second window, the reopened app after the macOS Full
@@ -512,21 +559,34 @@ GOTCHAS (in the order they bite)
     even that lane cannot run, the pass installs anyway, tagged, and RECORDS it beside the
     build for `aterm pkg doctor` and `aterm pkg repair` to name;
     `ATPKG_REFUSE_TRACKED_INSTALL=1` refuses instead (a release-cutting machine that would
-    rather have no toolchain than a tagged one). `aterm pkg doctor` lists every active
+    rather have no toolchain than a tagged one). `[packages] tracked_install = "refuse"`
+    in aterm.toml is the durable spelling for such a machine — it reaches the window's
+    own passes, which run from launchd's environment where no shell export does — and the
+    env var, set in a shell, wins for that one run. `aterm pkg doctor` lists every active
     build's tagged bundle and how to re-seed it.
-  * MACHINE SETTINGS ride the same pass, per `aterm pkg doctor`'s own findings — the
-    `[machine]` table of aterm.toml, both defaults ACTIVE: `spotlight_noindex = true`
-    (`aterm pkg noindex apply --all` at the end of every pass, so first open excludes
-    the cargo target dirs under $HOME from Spotlight) and `universal_control = "off"`
-    (macOS: `defaults -currentHost write com.apple.universalcontrol Disable` and
-    `DisableMagicEdges` `-bool true`, once, so the cursor stops roaming to other Macs
-    and iPads on the same Apple account. The pass writes BOTH keys, so the revert
-    deletes both — deleting one leaves the other set:
+  * MACHINE SETTINGS are applied FIRST by every pass, per `aterm pkg doctor`'s own
+    findings — before the manager gate, the index, the network and the store lock, so a
+    pass that later fails, or is refused the lock, has already done them. The `[machine]`
+    table of aterm.toml, both defaults ACTIVE: `spotlight_noindex = true` (the pass scans
+    $HOME itself, with the doctor's smaller time budget, and renames the cargo target
+    dirs it reaches to their `.noindex` form; `aterm pkg noindex apply --all` by hand
+    walks with the verb's larger budget and finishes what a pass could not reach) and
+    `universal_control = "off"` (macOS: `defaults -currentHost write
+    com.apple.universalcontrol Disable` and `DisableMagicEdges` `-bool true` — written
+    again whenever the host is not fully disabled, not once, so the cursor stops roaming
+    to other Macs and iPads on the same Apple account. The pass writes BOTH keys, so the
+    revert deletes both — deleting one leaves the other set:
       defaults -currentHost delete com.apple.universalcontrol Disable
       defaults -currentHost delete com.apple.universalcontrol DisableMagicEdges
-    Set `universal_control = "leave"` to stop the pass applying it at all.) What a
-    pass CHANGED is printed as `machine-settings: …` and shown in the window's
-    pull-down; a pass that changed nothing says nothing.
+    and set `universal_control = "leave"` with it, or the next pass disables it again.)
+    The scan does NOT walk Documents, Desktop, Downloads, Pictures, Movies, Music or
+    Library: macOS asks a human before a program reads those, and an unattended pass may
+    not raise that question — name such a directory to `aterm pkg noindex apply <dir>`
+    instead. What a pass CHANGED is printed as `machine-settings: …` and shown in the
+    window's pull-down; a pass that changed nothing prints no such line. A pass that
+    REFUSED (a home that is not the account's, an aterm.toml that does not parse) says
+    `machine settings not applied — …`, and one whose write did not land says
+    `machine settings failed — …`.
   * The root anchor is COMPILED IN — the paper master's public key, a committed constant
     (aterm-update-core::pins::PAPER_MASTER_PUBKEYS), not a build env var — so a plain
     `targo --unverified build` is fully armed. There is no atpkg-specific root and no
@@ -942,7 +1002,9 @@ fn topic_names() -> Vec<&'static str> {
 /// command map + how to go deeper.
 fn overview_page() -> String {
     let mut s = String::new();
-    s.push_str("aterm — the toolchain manual\n\n");
+    s.push_str("aterm — the toolchain manual\n");
+    s.push_str(aterm_types::identity::ORIGIN_LINE);
+    s.push_str("\n\n");
     s.push_str(OVERVIEW);
     s.push_str("\n\nONE COMMAND, MANY VERBS — `aterm <verb>`\n");
     // KEYED ON THE ROSTER, not hand-listed. `crate::Verb` calls itself "THE
@@ -1035,7 +1097,7 @@ PRECEDENCE
   over the environment — the reverse of the line above.)
 
 START ONE
-  aterm --window --write-config    writes a documented starter aterm.toml — 161
+  aterm --window --write-config    writes a documented starter aterm.toml — 160
                                    keys, each with its default and a comment (not
                                    quite every key: see THE KEY ROSTER below).
   Settings are reloaded live: save the file and the running app picks it up.
@@ -1530,9 +1592,9 @@ permissions — macOS privacy (TCC), and the EPERM that arrives with no dialog
 
 WHAT YOU ARE SEEING
   `Operation not permitted` (EPERM) is macOS PRIVACY when the path is under one of the
-  folders macOS protects ({folders}), an external or network volume, a
-  folder another app syncs for you, or another app's private data. Not a broken tool, not
-  a bad path, and not a bug in aterm. It can arrive with NO DIALOG AT ALL, so \"nothing
+  places macOS protects ({folders} \u{2014} the last is every other app's
+  own data), an external or network volume, or a folder another app syncs for you. Not a
+  broken tool, not a bad path, and not a bug in aterm. It can arrive with NO DIALOG AT ALL, so \"nothing
   popped up\" does not mean this is not a permissions wall — and when a dialog IS raised,
   it is a system modal only a human can answer, the syscall that raised it is parked until
   they do, and it never times out.
@@ -1669,8 +1731,29 @@ NOT IN THE GROUP
 /// toolchain the current directory gets, instead of restating a table that will
 /// be stale inside a year (docs/DESIGN-agent-toolchain-guidance-2026-09-08.md
 /// §7). It calls the real discovery code, `aterm_verify::toolchain::Toolchain::
-/// discover`, which is what `aterm verify` and the GUI already use, so there is
-/// no second copy of "which toolchain wins" to drift from the first.
+/// discover`, which is what the verify gate (`crates/aterm-verify`, behind
+/// `tools/verify.sh`) and `xtask gate lint` use, so there is no second copy of
+/// "which toolchain the gates pick" to drift from the first.
+///
+/// DISCOVERY IS NOT WHAT A BARE `targo` RUNS (measured 2026-09-15). Discovery
+/// ranks the rustup `trust` link ahead of the atpkg store; a shell resolves a
+/// bare `targo` through PATH. On a machine whose rustup link points into a local
+/// build tree the page printed that tree as "(wins)" while every `targo`/
+/// `trustc`/`tippy` typed in the same shell ran the store's build through
+/// atpkg's shims — a different commit — and never said so. So the discovery
+/// line is labelled as the gates' pick, `targo` is resolved separately the way
+/// the shell resolves it ([`resolve_on_path`]: PATH order, through an atpkg shim
+/// — to the exec root's clone of the store file when the shim's guard holds,
+/// which is where a routed shim runs — to the canonical file), and the two are
+/// compared ([`compare_toolchains`]):
+/// one directory, one build in two toolchain directories, a matching version
+/// line from a directory that is not a toolchain, or a DIVERGENCE naming both.
+///
+/// The gates' column is discovery under the GATES' pin ([`gates_toolchain`]: the
+/// channel aterm's own rust-toolchain.toml names), never this directory's, and
+/// the gates' `targo` is followed through a shim like PATH's — so a caller's
+/// `stable` pin, or discovery settling on atpkg's shim directory, cannot turn the
+/// comparison into a claim about something the gates do not run.
 ///
 /// The owner's instruction of 2026-09-08, verbatim: *"USE TRUST TOOLCHAIN NOT
 /// RUST! this needs to be very strongly encouraged by the aterm system itself."*
@@ -1679,11 +1762,12 @@ NOT IN THE GROUP
 /// 2026-09-08) say warn, not refuse, and `atpkg::reroute` is where that is kept.
 ///
 /// Everything printed is measured at the moment of the call: every subprocess
-/// is bounded (2 s), every file read is optional, and a probe that fails says so
-/// rather than filling in a plausible answer.
+/// the page spawns itself is bounded (2 s), every file read is optional, and a
+/// probe that fails says so rather than filling in a plausible answer.
+/// (Discovery's own `--print sysroot` checks run inside aterm-verify, and this
+/// page does not bound them.)
 fn rust_page() -> String {
-    use aterm_verify::toolchain::{Toolchain, atpkg_prefix, pinned_channel};
-    use std::path::PathBuf;
+    use aterm_verify::toolchain::{atpkg_prefix, pinned_channel};
 
     let home = std::env::var_os("HOME")
         .map(PathBuf::from)
@@ -1692,9 +1776,10 @@ fn rust_page() -> String {
     let cwd = std::env::current_dir().ok();
     let pinned = cwd.as_deref().and_then(pinned_channel);
     let explicit = std::env::var_os("TRUST_STAGE2_BIN").map(PathBuf::from);
-    let tools = Toolchain::discover(explicit.as_deref(), &home, &path_env, pinned.as_deref());
     let xdg = std::env::var_os("XDG_CONFIG_HOME").map(PathBuf::from);
     let prefix = atpkg_prefix(&home, xdg.as_deref());
+    let gates_pin = gates_pinned_channel();
+    let tools = gates_toolchain(explicit.as_deref(), &home, &prefix, &path_env);
     let store_bin = prefix.join("bin");
 
     let mut out = String::new();
@@ -1803,18 +1888,42 @@ fn rust_page() -> String {
     // `(wins)` for a toolchain every stage was about to fail closed on — this page
     // contradicting the code it exists to measure. It also requires the exec bit,
     // which a plain `is_file()` does not.
+    //
+    // LABELLED AS THE GATES' PICK, because that is all it is: discovery is what the
+    // verify gate and `xtask gate lint` run, and it ranks the rustup link ahead of
+    // the store, while a bare `targo` resolves through PATH. What PATH gives is
+    // measured separately below and compared with this.
+    //
+    // AND ASKED UNDER THE GATES' PIN, not this directory's ([`gates_toolchain`]):
+    // the gates read the pin at aterm's repo root, so a directory pinning
+    // `stable` (or nothing) must not move the column that speaks for them.
+    let gates_pin_label = gates_pin.as_deref().map_or_else(
+        || "no channel (aterm's rust-toolchain.toml names none)".to_string(),
+        |ch| format!("channel = \"{ch}\""),
+    );
+    // The gates' `targo`, followed through an atpkg shim exactly as PATH's is below:
+    // discovery can settle on the shim directory itself (`$TRUST_STAGE2_BIN` naming
+    // it, or the PATH fallback), and a shim dir is not a second toolchain.
+    let gates_targo = tools
+        .have_targo()
+        .then(|| resolve_from(tools.targo.clone()));
+    let gates_dir = gates_targo.as_ref().and_then(OnPath::real_dir);
     if tools.have_targo() {
         let _ = writeln!(
             out,
-            "  toolchain        {}  (wins)",
+            "  gates' toolchain {}  (wins for aterm's gates)\n\
+             \x20                  Toolchain::discover under aterm's own pin ({gates_pin_label}) — the pin\n\
+             \x20                  tools/verify.sh and `xtask gate lint` read at their repo root, whatever\n\
+             \x20                  this directory pins. A bare `targo` resolves through PATH instead:\n\
+             \x20                  `targo on PATH` below.",
             tools.stage2_dir.display()
         );
     } else {
         let _ = writeln!(
             out,
-            "  toolchain        NO Trust toolchain satisfies the pin on this machine\n\
-             \x20                  (looked for a sealed promote target, the rustup `trust` link, the atpkg\n\
-             \x20                  store, a from-source stage2, then PATH) — `aterm pkg doctor`, then\n\
+            "  gates' toolchain NO Trust toolchain satisfies aterm's pin ({gates_pin_label}) on this\n\
+             \x20                  machine (looked for a sealed promote target, the rustup `trust` link, the\n\
+             \x20                  atpkg store, a from-source stage2, then PATH) — `aterm pkg doctor`, then\n\
              \x20                  `aterm pkg install trust`"
         );
     }
@@ -1861,6 +1970,20 @@ fn rust_page() -> String {
             .unwrap_or_else(|| "(no answer within 2 s, or not on PATH)".to_string())
     };
     let _ = writeln!(out, "  rustc --version  {}", probe("rustc", &["--version"]));
+    // Trust's OWN version, said in so many words. `rustc --version` answers with the
+    // rustc-shaped release Trust prints for cargo's sake (`rustc 1.99.0-dev …`), which
+    // reads as "Rust 1.99" — the owner read it exactly that way (2026-09-14). The
+    // `trust:` line of `-vV` is where the toolchain says its own name and version;
+    // this row prints it beside what the line above means.
+    let _ = writeln!(
+        out,
+        "  trust version    {}",
+        trust_version_row(bounded_output(
+            "rustc",
+            &["-vV"],
+            std::time::Duration::from_secs(2)
+        ))
+    );
     let _ = writeln!(
         out,
         "  rustc sysroot    {}",
@@ -1877,19 +2000,282 @@ fn rust_page() -> String {
             "  — a real targo answers `--unverified --version`; anything else is not the Trust cargo"
         }
     );
+    // Where that bare `targo` really runs: PATH order, through an atpkg shim — to its
+    // exec root's file when the shim's guard holds, as the shell decides it — to the
+    // canonical file. No subprocess: only directory walks, one small read per shim and
+    // an `lstat` and two `stat`s per guard. `trustc` and `tippy` are resolved the same
+    // way, because nothing makes the three land in one directory but the way PATH
+    // happens to be laid out.
+    let on_path = |name: &str| resolve_on_path(name, &path_env);
+    let targo_on_path = on_path("targo");
+    let path_dir = targo_on_path.as_ref().and_then(OnPath::real_dir);
+    match &targo_on_path {
+        None => {
+            let _ = writeln!(
+                out,
+                "  targo on PATH    none — no executable `targo` in PATH order (reroute dirs skipped)"
+            );
+        }
+        Some(t) => {
+            let _ = writeln!(out, "  targo on PATH    {}", describe_on_path(t));
+        }
+    }
+    // A version line is only evidence when it IS one: the probe's failure text, or
+    // a stock cargo rejecting the flag, must not be compared as a build.
+    let as_version = |line: &str| line.starts_with("targo ").then(|| line.to_string());
+    let path_ver = as_version(&targo_ver);
+    // The gates' own targo, asked the same question — skipped when it lands in the
+    // very directory the PATH probe already answered for. When it is a shim, the
+    // hop is printed, so the directory compared below is visibly the one it execs.
+    let gates_differs = gates_dir.is_some() && gates_dir != path_dir;
+    let gates_ver = match &gates_targo {
+        Some(t) if gates_differs || !t.shims.is_empty() => {
+            let line = gates_differs
+                .then(|| {
+                    bounded_first_line(
+                        &tools.targo.to_string_lossy(),
+                        &["--unverified", "--version"],
+                        std::time::Duration::from_secs(2),
+                    )
+                })
+                .map(|line| {
+                    line.unwrap_or_else(|| {
+                        "(no answer within 2 s, or it could not be run)".to_string()
+                    })
+                });
+            let _ = writeln!(
+                out,
+                "  gates' targo     {}",
+                match (t.shims.is_empty(), &line) {
+                    (true, Some(line)) => line.clone(),
+                    (false, Some(line)) => {
+                        format!("{}\n                   answers {line}", describe_on_path(t))
+                    }
+                    (_, None) => describe_on_path(t),
+                }
+            );
+            match line {
+                Some(line) => as_version(&line),
+                None => path_ver.clone(),
+            }
+        }
+        _ => path_ver.clone(),
+    };
+    let mut path_names = Vec::new();
+    if targo_on_path.is_some() {
+        path_names.push("`targo`".to_string());
+    }
+    for name in ["trustc", "tippy"] {
+        let t = on_path(name);
+        let dir = t.as_ref().and_then(OnPath::real_dir);
+        if path_dir.is_some() && dir == path_dir {
+            path_names.push(format!("`{name}`"));
+            continue;
+        }
+        let _ = writeln!(
+            out,
+            "  {:<17}{}",
+            format!("{name} on PATH"),
+            match &t {
+                None => "none — no executable in PATH order".to_string(),
+                Some(t) if path_dir.is_some() => {
+                    format!(
+                        "{}  — NOT the directory `targo` runs from",
+                        describe_on_path(t)
+                    )
+                }
+                Some(t) => describe_on_path(t),
+            }
+        );
+    }
+
     let rustup_trust = probe("rustup", &["which", "cargo", "--toolchain", "trust"]);
+    // No answer at all is not "not linked": with `rustup` off PATH (or wedged) the
+    // channel was never asked, and the line says that instead.
+    let rustup_answered = !rustup_trust.starts_with("(no answer");
+    let rustup_linked = rustup_answered && !rustup_trust.contains("not installed");
+    // rustup answers a file path; its canonical directory is what a proxied
+    // `cargo`/`rustc` under the pin runs. Anything else resolves to no directory.
+    let rustup_dir = rustup_linked
+        .then(|| std::fs::canonicalize(&rustup_trust).ok())
+        .flatten()
+        .and_then(|p| p.parent().map(Path::to_path_buf));
     let _ = writeln!(
         out,
         "  rustup `trust`   {}",
-        if rustup_trust.contains("not installed") || rustup_trust.starts_with("(no answer") {
+        if rustup_linked {
+            rustup_trust
+        } else if !rustup_answered {
+            "(no answer within 2 s, or `rustup` not on PATH) — the channel was not measured"
+                .to_string()
+        } else {
             "NOT LINKED — `cargo +trust` will fail here; `targo` in the store still works.\n\
              \x20                  (`'rustc' is not installed for the custom toolchain 'trust'` is THIS, not a\n\
              \x20                  blocked machine: `aterm pkg doctor`, then `aterm pkg repair`.)"
                 .to_string()
-        } else {
-            rustup_trust
         }
     );
+
+    // PATH against the gates. Silence here was the defect: the page named the gates'
+    // pick "(wins)" a few lines above a `targo` from another build.
+    let rustup_clause = || match &rustup_dir {
+        Some(d) if Some(d) == gates_dir.as_ref() => "is the gates' directory".to_string(),
+        Some(d) if Some(d) == path_dir.as_ref() => "is the PATH directory".to_string(),
+        Some(d) => format!("is a third directory: {}", d.display()),
+        None => "did not resolve to a directory here (the line above says why)".to_string(),
+    };
+    match (&gates_dir, &path_dir) {
+        (_, None) => {
+            let _ = writeln!(
+                out,
+                "  PATH vs gates    nothing to compare: no `targo` on PATH resolves to a file"
+            );
+        }
+        (None, Some(_)) if tools.have_targo() => {
+            let _ = writeln!(
+                out,
+                "  PATH vs gates    nothing to compare: the gates' `targo` does not resolve to a file\n\
+                 \x20                  (`gates' targo` above says where it stops)"
+            );
+        }
+        (None, Some(_)) => {
+            let _ = writeln!(
+                out,
+                "  PATH vs gates    nothing to compare: discovery found no toolchain for the gates"
+            );
+        }
+        (Some(gates), Some(path)) => {
+            let (gates_bin, path_bin) = (is_toolchain_bin(gates), is_toolchain_bin(path));
+            let agreement = compare_toolchains(
+                &Side {
+                    dir: gates,
+                    ver: gates_ver.as_deref(),
+                    toolchain_bin: gates_bin,
+                },
+                &Side {
+                    dir: path,
+                    ver: path_ver.as_deref(),
+                    toolchain_bin: path_bin,
+                },
+            );
+            // atpkg's rustup seam points rustup at a VIEW of the store build (a
+            // copy-on-write clone under `<prefix>/rustup`), so on a machine where it is in
+            // place the gates and PATH are one build in two directories by design.
+            let in_view = std::fs::canonicalize(prefix.join("rustup"))
+                .is_ok_and(|view| gates.starts_with(view));
+            // And a routed shim runs its build from atpkg's EXEC ROOT for it (a clone
+            // under `<prefix>/compat/trust/<build>`, where rustc holds trustc's bytes), so
+            // PATH can be that root while the gates run the store's directory of the same
+            // build.
+            let exec_roots = std::fs::canonicalize(prefix.join(EXEC_ROOTS_DIR)).ok();
+            let in_exec_root = |dir: &Path| exec_roots.as_ref().is_some_and(|r| dir.starts_with(r));
+            let mut where_notes = String::new();
+            if in_view {
+                where_notes.push_str(
+                    "                   (the gates' directory is under atpkg's rustup view, <prefix>/rustup)\n",
+                );
+            }
+            for (side, dir) in [("PATH", path), ("gates'", gates)] {
+                if in_exec_root(dir) {
+                    let _ = writeln!(
+                        where_notes,
+                        "                   (the {side} directory is under atpkg's exec roots, <prefix>/compat/trust:\n\
+                         \x20                   a copy-on-write clone of a build, laid so rustc holds trustc's bytes; `aterm pkg doctor` checks them)"
+                    );
+                }
+            }
+            let build =
+                |v: &Option<String>| v.as_deref().map_or("(build unknown)", build_of).to_string();
+            let consequence = format!(
+                "PATH  is what {} typed here {};\n\
+                 \x20                  gates is what tools/verify.sh and `xtask gate lint` run.\n\
+                 \x20                  rustup's `trust` (what its `cargo`/`rustc` proxies run under a\n\
+                 \x20                  channel = \"trust\" pin) {}.\n\
+                 \x20                  Say which one produced a result.",
+                path_names.join(", "),
+                if path_names.len() == 1 { "runs" } else { "run" },
+                rustup_clause(),
+            );
+            // Only where it is true: doctor SAYS nothing about a rustup `trust` that
+            // is atpkg's managed view (`seam_line` answers `None` for it), which is
+            // exactly the one-build-two-directories shape.
+            let doctor = "\n                   `aterm pkg doctor` flags a rustup `trust` that is not atpkg's managed view.";
+            match agreement {
+                Agreement::Same => {
+                    let _ = writeln!(
+                        out,
+                        "  PATH vs gates    AGREE — a bare `targo` and aterm's gates run one directory{}",
+                        match &rustup_dir {
+                            Some(d) if d != gates => format!(
+                                "\n                   (rustup's `trust` is another: {})",
+                                d.display()
+                            ),
+                            _ => String::new(),
+                        }
+                    );
+                }
+                Agreement::SameBuild => {
+                    let _ = writeln!(
+                        out,
+                        "  PATH vs gates    ONE BUILD, TWO DIRECTORIES — {}:\n\
+                         \x20                    PATH   {}\n\
+                         \x20                    gates  {}\n\
+                         {}\
+                         \x20                  trustc takes its sysroot from the directory it runs from, so a tool\n\
+                         \x20                  can still behave differently between the two.\n\
+                         \x20                  {consequence}",
+                        build(&path_ver),
+                        path.display(),
+                        gates.display(),
+                        where_notes,
+                    );
+                }
+                Agreement::SameLine => {
+                    let _ = writeln!(
+                        out,
+                        "  PATH vs gates    SAME VERSION LINE, DIFFERENT FILES — {}:\n\
+                         \x20                    PATH   {}{}\n\
+                         \x20                    gates  {}{}\n\
+                         \x20                  A toolchain `bin` holds an executable `trustc`, with `lib/rustlib` in the\n\
+                         \x20                  directory above it; the one marked NOT does not, so its version line is\n\
+                         \x20                  only what that program prints about itself — not evidence of one build.\n\
+                         \x20                  {consequence}",
+                        build(&path_ver),
+                        path.display(),
+                        if path_bin {
+                            ""
+                        } else {
+                            "  (NOT a toolchain bin)"
+                        },
+                        gates.display(),
+                        if gates_bin {
+                            ""
+                        } else {
+                            "  (NOT a toolchain bin)"
+                        },
+                    );
+                }
+                Agreement::OtherBuild | Agreement::OtherDir => {
+                    let _ = writeln!(
+                        out,
+                        "  PATH vs gates    DIVERGENCE — {}:\n\
+                         \x20                    PATH   {}  {}\n\
+                         \x20                    gates  {}  {}\n\
+                         \x20                  {consequence}{doctor}",
+                        if agreement == Agreement::OtherBuild {
+                            "a bare `targo` and aterm's gates run DIFFERENT Trust builds"
+                        } else {
+                            "two directories; a version probe gave no targo line, so the builds are unknown"
+                        },
+                        build(&path_ver),
+                        path.display(),
+                        build(&gates_ver),
+                        gates.display(),
+                    );
+                }
+            }
+        }
+    }
 
     let _ = writeln!(
         out,
@@ -1911,10 +2297,52 @@ fn rust_page() -> String {
     out
 }
 
+/// The `trust version` row of the rust page, from a full `rustc -vV`: Trust's own
+/// version (its `trust:` line) with what the `rustc --version` row above it means;
+/// an honest NONE when the compiler on this PATH prints no such line (stock rustc,
+/// or a Trust build predating the marker); the probe's own excuse when it did not
+/// answer. Pure over the text so the three shapes are pinned without a compiler.
+fn trust_version_row(vv: Option<String>) -> String {
+    let Some(vv) = vv else {
+        return "(no answer within 2 s, or not on PATH)".to_string();
+    };
+    let field = |key: &str| {
+        vv.lines()
+            .find_map(|l| l.strip_prefix(key))
+            .map(str::trim)
+            .filter(|v| !v.is_empty())
+    };
+    match (field("trust:"), field("release:")) {
+        (Some(trust), Some(release)) => format!(
+            "{trust} — Trust's own version (the `trust:` line of `rustc -vV`); the `rustc \
+             {release}` above is the Rust release it is compatible with, not its name"
+        ),
+        (Some(trust), None) => {
+            format!("{trust} — Trust's own version (the `trust:` line of `rustc -vV`)")
+        }
+        (None, _) => {
+            "NONE — the `rustc` on this PATH prints no `trust:` line: stock Rust, or a Trust \
+                      build older than the marker (`aterm pkg doctor` says which)"
+                .to_string()
+        }
+    }
+}
+
 /// First stdout line of `cmd args…`, or `None` when it does not exit within
 /// `limit` (the child is killed) or cannot be spawned. The manual must never
 /// wedge on a wedged toolchain; a probe that cannot answer says so.
 fn bounded_first_line(cmd: &str, args: &[&str], limit: std::time::Duration) -> Option<String> {
+    bounded_output(cmd, args, limit)?
+        .lines()
+        .map(str::trim)
+        .find(|l| !l.is_empty())
+        .map(str::to_string)
+}
+
+/// The whole stdout of `cmd args…` (stderr when stdout is blank), or `None` when it
+/// does not exit within `limit` (the child is killed) or cannot be spawned — the
+/// bounded read [`bounded_first_line`] takes its first line from.
+fn bounded_output(cmd: &str, args: &[&str], limit: std::time::Duration) -> Option<String> {
     use std::io::Read as _;
     use std::process::{Command, Stdio};
     let mut child = Command::new(cmd)
@@ -1948,10 +2376,459 @@ fn bounded_first_line(cmd: &str, args: &[&str], limit: std::time::Duration) -> O
     {
         let _ = e.read_to_string(&mut text);
     }
-    text.lines()
-        .map(str::trim)
-        .find(|l| !l.is_empty())
-        .map(str::to_string)
+    Some(text)
+}
+
+/// `atpkg::reroute::DIR_MARKER_FILE`, restated: this crate links `atpkg` for its
+/// tests only, and `reroute_marker_and_shim_shape_match_atpkg` pins the spelling.
+const REROUTE_DIR_MARKER: &str = ".atpkg-reroute-dir";
+
+/// `atpkg::compat::COMPAT_DIR` joined with the trust program name — `<prefix>/compat/trust`,
+/// the directory every trust exec root is a child of — restated for the same reason as
+/// [`REROUTE_DIR_MARKER`]; `routed_shims_resolve_to_where_the_shell_execs` pins it
+/// against `atpkg::compat::roots_dir`.
+const EXEC_ROOTS_DIR: &str = "compat/trust";
+
+/// How many shim hops [`resolve_on_path`] follows before it stops and reports the
+/// last target it reached. An atpkg shim execs a binary directly — the store's, or
+/// its exec root's clone of it — so one hop is the real shape; the bound only
+/// keeps a shim loop from spinning.
+const MAX_SHIM_HOPS: usize = 4;
+
+/// A shim is a few hundred bytes; atpkg reads its own shims under the same 64 KiB
+/// bound, and a larger file is not followed.
+const MAX_SHIM_BYTES: u64 = 64 * 1024;
+
+/// Where a bare command name typed in this shell really runs.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct OnPath {
+    /// The first executable PATH entry for the name, as PATH spells it.
+    found: PathBuf,
+    /// Each followed shim, in order; empty for a plain file.
+    shims: Vec<ShimHop>,
+    /// The canonical file the last hop execs; `None` when it does not resolve.
+    real: Option<PathBuf>,
+}
+
+impl OnPath {
+    /// The canonical directory the command runs from.
+    fn real_dir(&self) -> Option<PathBuf> {
+        self.real
+            .as_deref()
+            .and_then(Path::parent)
+            .map(Path::to_path_buf)
+    }
+}
+
+/// One followed shim: the file the shell execs through it at probe time, and the
+/// exec-root guard it evaluated on the way there, if the shim carries one.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct ShimHop {
+    /// The route's root file when its guard held; otherwise the target of the
+    /// shim's store `exec` line.
+    execs: PathBuf,
+    /// What became of the shim's exec-root guard; `None` for a plain shim.
+    route: Option<Route>,
+}
+
+/// The outcome of an atpkg exec-root guard, evaluated the way `sh` evaluates it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum Route {
+    /// The guard held, so the shell execs the root's file ([`ShimHop::execs`]); this
+    /// is the store build's file that root file stands for.
+    Taken { store: PathBuf },
+    /// The guard did not hold, so the shell falls through to the store `exec`; this is
+    /// the root file it named, and why it was refused.
+    Refused { root: PathBuf, why: Refusal },
+}
+
+/// Which test of an exec-root guard was false.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Refusal {
+    /// `[ ! -h R ]`: the root file is a symbolic link.
+    Symlink,
+    /// `[ -f R ]`: nothing at `R` is a regular file.
+    Missing,
+    /// `[ -x R ]`: the root file is not executable.
+    NotExecutable,
+    /// `[ -f S ]`: the store file the root stands for is gone — a reclaimed build never
+    /// runs from a leftover root.
+    StoreGone,
+    /// `[ ! -h M ] && [ -f M ]`: the root's marker is absent or not a regular file — a
+    /// root half-way through a lay, or one laid as hard links before clones.
+    Unmarked,
+}
+
+/// One exec-root guard of an atpkg `sh` shim, as atpkg's `platform::sh_shim_content_routed`
+/// renders it:
+/// `[ ! -h 'R' ] && [ -f 'R' ] && [ -x 'R' ] && [ -f 'S' ] && [ ! -h 'M' ] && [ -f 'M' ] && exec 'R' "$@"`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct ShimGuard {
+    /// `R`, the exec root's file.
+    root: PathBuf,
+    /// `S`, the store build's file `R` stands for.
+    store: PathBuf,
+    /// `M`, the exec root's marker, written last when the root was laid.
+    marker: PathBuf,
+}
+
+/// An atpkg `sh` shim, read top to bottom the way the shell runs it: every guard line
+/// ahead of the first `exec '<path>' "$@"` line, in order, then that line's target.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct ShimScript {
+    guards: Vec<ShimGuard>,
+    target: PathBuf,
+}
+
+impl ShimScript {
+    /// The hop this shim makes NOW: the first guard that holds ([`guard_refusal`] is
+    /// `None`) execs its root, and the shell never reaches the lines after it;
+    /// when none holds, the store `exec`, carrying the first guard's refusal.
+    fn hop(&self) -> ShimHop {
+        let mut refused = None;
+        for guard in &self.guards {
+            match guard_refusal(guard) {
+                None => {
+                    return ShimHop {
+                        execs: guard.root.clone(),
+                        route: Some(Route::Taken {
+                            store: guard.store.clone(),
+                        }),
+                    };
+                }
+                Some(why) => {
+                    refused.get_or_insert(Route::Refused {
+                        root: guard.root.clone(),
+                        why,
+                    });
+                }
+            }
+        }
+        ShimHop {
+            execs: self.target.clone(),
+            route: refused,
+        }
+    }
+}
+
+/// Parse an atpkg `sh` shim ([`ShimScript`]). `None` for a script with no
+/// `exec '<path>' "$@"` line (a tombstone, or any other script). Lines of any other
+/// shape — the shebang, comments, `export`s, a guard-like line whose three `R`s
+/// differ — are passed over, and a guard line after the store `exec` is never
+/// reached, so it is not collected.
+///
+/// The store `exec` line is read as atpkg's `platform::parse_sh_shim_target` reads it
+/// (crate-private there, and atpkg is a test-only dependency here);
+/// `reroute_marker_and_shim_shape_match_atpkg` and
+/// `routed_shims_resolve_to_where_the_shell_execs` feed this shims rendered by atpkg's
+/// own `shim_executable_to_env`, plain and routed.
+fn sh_shim_script(content: &str) -> Option<ShimScript> {
+    let mut guards = Vec::new();
+    for line in content.lines().map(str::trim) {
+        if let Some(guard) = sh_guard_line(line) {
+            guards.push(guard);
+        } else if let Some(rest) = line.strip_prefix("exec '")
+            && let Some(end) = rest.rfind("' \"$@\"")
+        {
+            return Some(ShimScript {
+                guards,
+                target: PathBuf::from(rest[..end].replace("'\\''", "'")),
+            });
+        }
+    }
+    None
+}
+
+/// The target of an atpkg `sh` shim's store `exec` line — [`sh_shim_script`]'s
+/// `target`, whatever guard stands ahead of it.
+#[cfg(test)]
+fn sh_exec_target(content: &str) -> Option<PathBuf> {
+    sh_shim_script(content).map(|script| script.target)
+}
+
+/// A trimmed line that is exactly an atpkg exec-root guard,
+/// `[ ! -h 'R' ] && [ -f 'R' ] && [ -x 'R' ] && [ -f 'S' ] && [ ! -h 'M' ] && [ -f 'M' ] && exec 'R' "$@"`,
+/// with the same `R` in all four places and the same `M` in both; each path unquoted by
+/// [`sh_quoted_word`].
+fn sh_guard_line(line: &str) -> Option<ShimGuard> {
+    let (root, rest) = sh_quoted_word(line.strip_prefix("[ ! -h ")?)?;
+    let (regular, rest) = sh_quoted_word(rest.strip_prefix(" ] && [ -f ")?)?;
+    let (runnable, rest) = sh_quoted_word(rest.strip_prefix(" ] && [ -x ")?)?;
+    let (store, rest) = sh_quoted_word(rest.strip_prefix(" ] && [ -f ")?)?;
+    let (marker, rest) = sh_quoted_word(rest.strip_prefix(" ] && [ ! -h ")?)?;
+    let (marked, rest) = sh_quoted_word(rest.strip_prefix(" ] && [ -f ")?)?;
+    let (execs, rest) = sh_quoted_word(rest.strip_prefix(" ] && exec ")?)?;
+    (rest == " \"$@\"" && regular == root && runnable == root && execs == root && marked == marker)
+        .then(|| ShimGuard {
+            root: PathBuf::from(root),
+            store: PathBuf::from(store),
+            marker: PathBuf::from(marker),
+        })
+}
+
+/// The single-quoted `sh` word at the start of `s`, unquoted, and the rest of `s`:
+/// `'…'` segments and `\'` escapes with nothing between them — the one quoting atpkg's
+/// shim renderer emits (`'it'\''s'` is `it's`). `None` when `s` does not start with one.
+fn sh_quoted_word(s: &str) -> Option<(String, &str)> {
+    let mut word = String::new();
+    let mut rest = s;
+    let mut read_any = false;
+    loop {
+        if let Some(quoted) = rest.strip_prefix('\'') {
+            let end = quoted.find('\'')?;
+            word.push_str(&quoted[..end]);
+            rest = &quoted[end + 1..];
+        } else if let Some(after) = rest.strip_prefix("\\'") {
+            word.push('\'');
+            rest = after;
+        } else {
+            break;
+        }
+        read_any = true;
+    }
+    read_any.then_some((word, rest))
+}
+
+/// Why `guard` is false right now, or `None` when it holds — evaluated in the shell's
+/// order as `sh`'s `test` builtin does: `[ ! -h P ]` is false only when `P` itself is a
+/// symbolic link (`lstat`; a missing `P` is not one), `[ -f P ]` is true for a regular
+/// file (following links), and `[ -x R ]` for one with an execute bit (the shell asks
+/// `access(2)`; atpkg lays roots with the store's modes, so the bits are the answer).
+/// Elsewhere than Unix atpkg routes no shim, so no guard holds.
+fn guard_refusal(guard: &ShimGuard) -> Option<Refusal> {
+    let is_link = |p: &Path| std::fs::symlink_metadata(p).is_ok_and(|m| m.file_type().is_symlink());
+    let regular = |p: &Path| std::fs::metadata(p).is_ok_and(|m| m.is_file());
+    if is_link(&guard.root) {
+        return Some(Refusal::Symlink);
+    }
+    if !regular(&guard.root) {
+        return Some(Refusal::Missing);
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt as _;
+        let runnable =
+            std::fs::metadata(&guard.root).is_ok_and(|m| m.permissions().mode() & 0o111 != 0);
+        if !runnable {
+            return Some(Refusal::NotExecutable);
+        }
+    }
+    if !regular(&guard.store) {
+        return Some(Refusal::StoreGone);
+    }
+    if is_link(&guard.marker) || !regular(&guard.marker) {
+        return Some(Refusal::Unmarked);
+    }
+    #[cfg(unix)]
+    {
+        None
+    }
+    #[cfg(not(unix))]
+    {
+        Some(Refusal::Unmarked)
+    }
+}
+
+/// The first executable `name` in `path_env` order, skipping any directory that
+/// carries the reroute marker (its stubs exec past it to the next entry anyway).
+fn first_executable_on_path(name: &str, path_env: &std::ffi::OsStr) -> Option<PathBuf> {
+    let file = format!("{name}{}", std::env::consts::EXE_SUFFIX);
+    std::env::split_paths(path_env)
+        .filter(|dir| {
+            !std::fs::symlink_metadata(dir.join(REROUTE_DIR_MARKER)).is_ok_and(|m| m.is_file())
+        })
+        .map(|dir| dir.join(&file))
+        .find(|candidate| aterm_verify::is_executable_file(candidate))
+}
+
+/// [`first_executable_on_path`], then [`resolve_from`].
+fn resolve_on_path(name: &str, path_env: &std::ffi::OsStr) -> Option<OnPath> {
+    first_executable_on_path(name, path_env).map(resolve_from)
+}
+
+/// `found`, then through every `#!` script of at most [`MAX_SHIM_BYTES`] that
+/// [`sh_shim_script`] reads (at most [`MAX_SHIM_HOPS`] of them), each to the file the
+/// shell would exec through it now ([`ShimScript::hop`]: an exec root's file when its
+/// guard holds, the store target otherwise), then canonicalised. The one resolver for
+/// PATH's `targo` and the gates' own, so a shim directory on either side lands where
+/// the shim really runs.
+fn resolve_from(found: PathBuf) -> OnPath {
+    let mut shims = Vec::new();
+    let mut at = found.clone();
+    while shims.len() < MAX_SHIM_HOPS {
+        let small = std::fs::metadata(&at).is_ok_and(|m| m.is_file() && m.len() <= MAX_SHIM_BYTES);
+        let Some(script) = small
+            .then(|| std::fs::read(&at).ok())
+            .flatten()
+            .filter(|bytes| bytes.starts_with(b"#!"))
+            .and_then(|bytes| String::from_utf8(bytes).ok())
+            .as_deref()
+            .and_then(sh_shim_script)
+        else {
+            break;
+        };
+        let hop = script.hop();
+        at = hop.execs.clone();
+        shims.push(hop);
+    }
+    let real = std::fs::canonicalize(&at).ok();
+    OnPath { found, shims, real }
+}
+
+/// aterm's own `rust-toolchain.toml`, as this binary was built from it — the file
+/// the gates read at their repo root (`xtask`'s `trust_toolchain`, aterm-verify's
+/// `Ctx::new`: `pinned_channel(&root)`). Only its `channel` line is used.
+const ATERM_RUST_TOOLCHAIN: &str = include_str!(concat!(
+    env!("CARGO_MANIFEST_DIR"),
+    "/../../rust-toolchain.toml"
+));
+
+/// The channel aterm's gates run discovery under: [`ATERM_RUST_TOOLCHAIN`]'s.
+/// Never the current directory's — a caller's pin says what ITS project selects,
+/// and nothing about the gates (measured 2026-09-15: under a `stable` pin the
+/// page's discovery missed `~/.rustup/toolchains/stable`, fell to the store, and
+/// called that AGREE while the gates ran a local build tree).
+fn gates_pinned_channel() -> Option<String> {
+    aterm_verify::toolchain::pinned_channel_in(ATERM_RUST_TOOLCHAIN)
+}
+
+/// The toolchain aterm's gates pick on this machine: the same
+/// `Toolchain::discover_with_store` aterm-verify's `Ctx::new` makes, under
+/// [`gates_pinned_channel`]. Takes no directory, so no caller's pin can reach it.
+fn gates_toolchain(
+    explicit: Option<&Path>,
+    home: &Path,
+    prefix: &Path,
+    path_env: &std::ffi::OsStr,
+) -> aterm_verify::Toolchain {
+    aterm_verify::Toolchain::discover_with_store(
+        explicit,
+        home,
+        Some(prefix),
+        path_env,
+        gates_pinned_channel().as_deref(),
+    )
+}
+
+/// A Trust toolchain `bin`: an executable `trustc`, and the `lib/rustlib` sysroot
+/// in the directory above. A wrapper-script directory, or atpkg's shim directory,
+/// is not one — so a version line printed from there says nothing about a build.
+/// An atpkg exec root's `bin/` is one: it holds a clone of the build's `trustc`, and the
+/// root clones the build's `lib/` (`lib/rustlib` included) beside it.
+fn is_toolchain_bin(dir: &Path) -> bool {
+    aterm_verify::is_executable_file(&dir.join("trustc"))
+        && dir
+            .parent()
+            .is_some_and(|up| up.join("lib/rustlib").is_dir())
+}
+
+/// What a refused exec-root guard says about the root file it refused.
+fn refusal_words(why: Refusal) -> &'static str {
+    match why {
+        Refusal::Symlink => "is a symbolic link",
+        Refusal::Missing => "does not resolve",
+        Refusal::NotExecutable => "is not executable",
+        Refusal::StoreGone => "stands for a store file that is gone",
+        Refusal::Unmarked => {
+            "stands in a root with no marker (half-laid, or laid as hard links before clones)"
+        }
+    }
+}
+
+/// One `targo on PATH` value: the entry, each shim hop — for a routed shim, the exec
+/// root's file it runs and the store build's file that one is, or, when its guard does
+/// not hold, the store file it runs and the route refused — and the canonical file
+/// when it differs from the last spelling, or that the last hop does not resolve.
+fn describe_on_path(t: &OnPath) -> String {
+    let mut s = t.found.display().to_string();
+    for hop in &t.shims {
+        let _ = write!(
+            s,
+            "\n                   -> a shim that execs {}",
+            hop.execs.display()
+        );
+        match &hop.route {
+            None => {}
+            Some(Route::Taken { store }) => {
+                let _ = write!(
+                    s,
+                    "\n                      (atpkg exec root, standing for {})",
+                    store.display()
+                );
+            }
+            Some(Route::Refused { root, why }) => {
+                let _ = write!(
+                    s,
+                    "\n                      (the store path: the guard refused atpkg exec-root file {}, which {})",
+                    root.display(),
+                    refusal_words(*why)
+                );
+            }
+        }
+    }
+    let last = t.shims.last().map_or(&t.found, |hop| &hop.execs);
+    match &t.real {
+        Some(real) if real != last => {
+            let _ = write!(s, "\n                   = {}", real.display());
+        }
+        Some(_) => {}
+        None => s.push_str("\n                   which does NOT resolve to a file"),
+    }
+    s
+}
+
+/// The build a `targo --unverified --version` line names: through the first
+/// `)` — `targo 1.99.0-dev (43f8b339f 2026-09-12)`, the compiler version, commit
+/// and date — leaving out the `(targo 0.1.0)` driver version a store build
+/// prints after it. A line with no parenthesis is compared whole.
+fn build_of(version_line: &str) -> &str {
+    let line = version_line.trim();
+    line.find(')').map_or(line, |end| &line[..=end])
+}
+
+/// How a bare `targo` on PATH relates to the gates' toolchain.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Agreement {
+    /// One directory, and no version line says otherwise.
+    Same,
+    /// Two toolchain `bin`s ([`is_toolchain_bin`]) whose version lines name one
+    /// build — atpkg's rustup view beside the store is this shape.
+    SameBuild,
+    /// Two directories whose version lines match, but at least one is not a
+    /// toolchain `bin` (a wrapper script's directory): the line is that program's
+    /// own claim, and no sysroot sentence applies.
+    SameLine,
+    /// Different builds: the version lines differ (in two directories or one).
+    OtherBuild,
+    /// Two directories, and a version probe gave no line to compare.
+    OtherDir,
+}
+
+/// One side of [`compare_toolchains`]: a canonical directory, the version line its
+/// `targo` gave (if it gave one), and whether the directory is a toolchain `bin`.
+#[derive(Debug, Clone, Copy)]
+struct Side<'a> {
+    dir: &'a Path,
+    ver: Option<&'a str>,
+    toolchain_bin: bool,
+}
+
+/// Compare the gates' side with PATH's. Both directories are canonical, so equal
+/// paths are one directory; versions are compared by [`build_of`], and when either
+/// is missing the directories alone decide. A matching line is ONE BUILD only when
+/// both directories are toolchain `bin`s; otherwise it is only a matching line.
+fn compare_toolchains(gates: &Side<'_>, path: &Side<'_>) -> Agreement {
+    let same_build = gates
+        .ver
+        .zip(path.ver)
+        .map(|(g, p)| build_of(g) == build_of(p));
+    match (gates.dir == path.dir, same_build) {
+        (_, Some(false)) => Agreement::OtherBuild,
+        (true, _) => Agreement::Same,
+        (false, Some(true)) if gates.toolchain_bin && path.toolchain_bin => Agreement::SameBuild,
+        (false, Some(true)) => Agreement::SameLine,
+        (false, None) => Agreement::OtherDir,
+    }
 }
 
 fn introspection_page() -> String {
@@ -2047,7 +2924,9 @@ fn agent_page(sid: Option<&str>) -> String {
                 .to_string()
         }
     };
-    s.push_str("aterm — agent operating brief\n\n");
+    s.push_str("aterm — agent operating brief\n");
+    s.push_str(aterm_types::identity::ORIGIN_LINE);
+    s.push_str("\n\n");
     s.push_str(OVERVIEW);
     s.push_str("\n\nWHERE YOU ARE\n  ");
     s.push_str(&you);
@@ -2093,10 +2972,10 @@ fn agent_page(sid: Option<&str>) -> String {
     let _ = write!(
         s,
         "\nMACOS FILE PERMISSIONS (an EPERM that may arrive with no dialog)\n  \
-         `Operation not permitted` on a path under one of the folders macOS protects\n  \
-         ({}), an external or network volume, a folder another app syncs\n  \
-         for you, or another app's private data is macOS privacy — not a broken tool — and\n  \
-         it can arrive with NO DIALOG AT ALL, so \"nothing popped up\" does not mean this is\n  \
+         `Operation not permitted` on a path under one of the places macOS protects\n  \
+         ({} \u{2014} the last is every other app's own data), an external or\n  \
+         network volume, or a folder another app syncs for you is macOS privacy — not a\n  \
+         broken tool — and it can arrive with NO DIALOG AT ALL, so \"nothing popped up\" does not mean this is\n  \
          not a permissions wall. Run `aterm ctl privacy` BEFORE retrying. Do not retry in a\n  \
          loop, do not `sudo`, do not rewrite the path: macOS asks a human once and remembers\n  \
          the answer, and an unanswered dialog never times out. If `full_disk_access=denied`,\n  \
@@ -2202,6 +3081,24 @@ THE FIVE VERBS YOU NEED
   confirm the record landed and answer `OK <id> off=<n>`; that offset is the correlation
   id an answer carries back as `re=<n>`.
 
+  EXACTLY ONCE: `post key=<token>` (1–64 of `[A-Za-z0-9._:-]`, per session). A re-post
+  under the same key — after `ERR timeout`, after a bridge restart, after a broker
+  restart — answers `OK <id> off=<n> dup=1` with the ORIGINAL offset and puts nothing new
+  on the bus: the bridge reserves the producer sequence for the key before it publishes
+  and reuses it, so the broker's own dedup collapses the copy. The newest 4096 keys per
+  session are kept. `inbox`'s in-flight `post` rows show `key=`. A key names ONE record:
+  a re-post under it answers the first post's record, whatever its own kind, body or `dl=`.
+  Its ADDRESS is still resolved first, against the live roster: a re-post to one that no
+  longer routes is retired like any post (`ERR unroutable`), puts nothing on the bus, and
+  leaves the key naming its record.
+
+  A DEADLINE IS KEPT BY YOUR OWN BRIDGE: `post … kind=ask dl=<ms>`. If no answer, report
+  or ack carrying `re=<n>` reaches YOUR inbox before it passes (a reply that went to
+  another session does not count), your bridge puts a row `kind=expired re=<n> dl=<ms>`
+  in YOUR inbox (once; it checks the bus first), a reply that comes after it arrives
+  `late=1` (unless your bridge was relaunched in between: the flag is its memory, the
+  `expired` row is the record), and `aterm fabric` lists the ask under WARNINGS.
+
   TWO MARKS, NOT ONE. A bare `inbox` marks the rows it returned LISTED — per-row state,
   not a watermark: what the ring evicts first and what releases a sender's per-peer
   quota; `--peek` lists nothing. The HANDLED watermark, `seen=` in the header, moves only
@@ -2209,7 +3106,28 @@ THE FIVE VERBS YOU NEED
   `--peek`s should still `inbox seen` its mail, or the sender's quota fills. Two header
   fields are never silent about loss: `dropped=` counts unhandled rows the bounded ring
   evicted, and a row carrying `truncated=1` was cut by the bridge to fit one control
-  line — `len=` names the true size and no verb here can recover the rest.
+  line — `len=` names the true size, and `inbox get @<off>` fetches the rest.
+
+  NOTHING LOST: `inbox get @<off>` fetches a record by its BROKER OFFSET. A row the ring
+  evicted (`dropped=`), a listing cut, or the delivery cut (`truncated=1`) is gone from
+  this endpoint, not from the bus. The header's `oldest_on_bus=@<off>` is the lowest
+  offset ever delivered here, and every one of YOUR records from it to `bus_head=` is
+  fetchable while the broker holds it — the offsets in between are shared with the whole
+  fleet, so most of them are other lanes' and answer `ERR no such record`; the offsets
+  you want are the `off=` of rows you saw. The read is answered from the ring when it
+  holds the whole row, else fetched through the bridge, WHOLE up to 256 KiB (`truncated=1
+  len=` only past that): `OK <nbytes> off=<n> from=<p> kind=<k> trust=<t> …` then the
+  body; the fields ride the tail because nothing is re-appended — no id, no watermark, no
+  quota moves. `ERR no such record off=<n>` is the one answer for an offset that is not on
+  this session's lane.
+
+  RECEIPTS: `inbox seen <id> handled|refused|deferred` on an `ask` or `task` sends the
+  SENDER a receipt — `kind=ack re=<off> verdict=<v>` in their inbox — when the fabric runs
+  with receipts on (the default `aterm fabric on` writes). It is OWED until it is on the
+  bus: a verdict given while the broker is down or the bridge is restarting is sent when
+  they are back, once — you never need to say it again. Their `post --wait-ack` returns
+  it, their `await inbox re=<off>` latches on it. A `note` earns none, and a session that
+  only `--peek`s acks nothing.
 
   A WAIT THAT DOES NOT LAND HAS FOUR ANSWERS, AND THREE OF THEM MEAN QUEUED:
     queued=1        a bridge exists and will publish it — `ERR fabric stalled id=<n>
@@ -2218,8 +3136,10 @@ THE FIVE VERBS YOU NEED
     no-bridge=1     this instance has no bridge RIGHT NOW. Not a verdict on the message:
                     `aterm ctl fabric attach <command...>` drains the same outbox
     ERR timeout id= the wait expired with no landing reported
-  Those three still hold the row, and `post` has no idempotency key — so re-posting on
-  any of them is how a peer gets the same task twice. Report "queued", never "not sent".
+  Those three still hold the row, and a `post` without `key=` has no idempotency key —
+  so re-posting on any of them is how a peer gets the same task twice, unless it was
+  posted with `key=` and is re-posted under the same one. Report "queued", never "not
+  sent".
     ERR <reason> id=  THE FOURTH, AND THE ONE THAT IS NOT QUEUED: the bridge RETIRED the
                     post — `unroutable` (the address resolves to nothing), `ambiguous`
                     (two nodes claim the sid) or `undeliverable`. The row is dead, no
@@ -2311,8 +3231,11 @@ WHO IS DOING WHAT — PRESENCE WITH MEANING (round 13)
     [fabric]
     presence = "meta"       # the default; "minimal" writes attention= alone and
                             # never reads a screen (the row exactly as before)
-  `aterm link serve --presence meta|minimal` on the bridge's command line wins over
-  the file. A bridge that predates round 13 leaves every new column `-`.
+    receipts = true         # the default `aterm fabric on` writes: an `inbox seen`
+                            # verdict on an ask/task acks the sender (R8). false is off.
+  `aterm link serve --presence meta|minimal` and `--receipts`/`--no-receipts` on the
+  bridge's command line win over the file. A bridge that predates round 13 leaves every
+  new column `-`, and one that predates round 15 sends no receipts.
 
 TURNING IT ON (the operator does this once)
   aterm fabric on               ONE command, in the installed binary. It does all of the
@@ -2676,6 +3599,35 @@ mod tests {
     /// `rust` is a generated page: it must render, lead with the Trust default,
     /// state both lanes verbatim, and be reachable under the names a reader
     /// actually types (`cargo`, `targo`, `rustc`, `trustc`, `toolchain`).
+    /// The `trust version` row says Trust's own version and what the rustc-shaped
+    /// release means; NONE for a compiler with no `trust:` line; the probe's excuse
+    /// when nothing answered. Pinned on verbatim `-vV` texts, no compiler needed.
+    #[test]
+    fn trust_version_row_says_trusts_own_version_and_what_the_rustc_line_means() {
+        let trust = "rustc 1.99.0-dev (3a3e781fe 2026-09-14)\nbinary: rustc\n\
+                     commit-hash: 3a3e781fe082b74d3c4de0ade65b1de3cbee7255\ncommit-date: 2026-09-14\n\
+                     host: x86_64-unknown-linux-gnu\nrelease: 1.99.0-dev\ntrust: 0.1.0\nLLVM version: 22.1.2\n";
+        let row = trust_version_row(Some(trust.to_string()));
+        assert!(row.starts_with("0.1.0 — Trust's own version"), "{row}");
+        assert!(
+            row.contains("`rustc 1.99.0-dev` above is the Rust release it is compatible with"),
+            "{row}"
+        );
+        let stock =
+            "rustc 1.96.0 (ac68faa20 2026-05-25) (Homebrew)\nbinary: rustc\nrelease: 1.96.0\n";
+        let row = trust_version_row(Some(stock.to_string()));
+        assert!(row.starts_with("NONE — "), "{row}");
+        assert!(row.contains("no `trust:` line"), "{row}");
+        assert!(!row.contains("0.1.0"), "{row}");
+        assert_eq!(
+            trust_version_row(None),
+            "(no answer within 2 s, or not on PATH)"
+        );
+        // An empty value is not a version.
+        let empty = "rustc 1.99.0-dev (x 2026-01-01)\nrelease: 1.99.0-dev\ntrust:\n";
+        assert!(trust_version_row(Some(empty.to_string())).starts_with("NONE"));
+    }
+
     #[test]
     fn rust_topic_measures_and_leads_with_the_trust_default() {
         let (page, code) = render(Some("rust"), None);
@@ -2685,7 +3637,13 @@ mod tests {
             "targo trust <cmd>",
             "targo --unverified <cmd>",
             "MEASURED (this call, this directory, this PATH)",
+            // The gates' pick is labelled as such, and a bare `targo` is resolved
+            // and compared with it on every machine — present or not.
+            "  gates' toolchain ",
+            "  targo on PATH    ",
+            "  PATH vs gates    ",
             "rustc --version",
+            "trust version",
             "rustc sysroot",
             "aterm help reroute",
             "aterm pkg doctor",
@@ -2695,6 +3653,9 @@ mod tests {
         }
         // Never prevented: the page may call stock the exception, not forbidden.
         assert!(!page.contains("forbidden"));
+        // The bare "(wins)" implied the gates' pick is what every Rust command here
+        // gets; it is not (see `rust_page`'s doc).
+        assert!(!page.contains("(wins)"), "an unlabelled (wins) is back");
         for alias in ["cargo", "targo", "rustc", "trustc", "toolchain"] {
             let (aliased, code) = render(Some(alias), None);
             assert_eq!(code, 0, "alias {alias}");
@@ -2723,6 +3684,686 @@ mod tests {
             bounded_first_line("echo", &["hello"], std::time::Duration::from_secs(2)).as_deref(),
             Some("hello")
         );
+    }
+
+    /// A scratch directory for the PATH-resolution tests, unique per test and
+    /// process, removed by the caller.
+    fn path_scratch(tag: &str) -> PathBuf {
+        let dir =
+            std::env::temp_dir().join(format!("aterm-cli-help-rust-{tag}-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).expect("scratch dir");
+        dir
+    }
+
+    #[cfg(unix)]
+    fn write_exec(path: &Path, body: &[u8]) {
+        use std::os::unix::fs::PermissionsExt as _;
+        std::fs::create_dir_all(path.parent().expect("has a parent")).expect("mkdir");
+        std::fs::write(path, body).expect("write");
+        std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o755)).expect("chmod");
+    }
+
+    /// The two spellings this page restates from atpkg (a test-only dependency here)
+    /// cannot drift from atpkg's: the reroute marker, and the shim shape — a plain
+    /// shim, one that exports an environment first, and one whose target carries a
+    /// single quote, each RENDERED by atpkg's own writer and read back by
+    /// [`sh_exec_target`] to the exact target.
+    #[test]
+    fn reroute_marker_and_shim_shape_match_atpkg() {
+        assert_eq!(REROUTE_DIR_MARKER, atpkg::reroute::DIR_MARKER_FILE);
+        let env = atpkg::shim_env::ShimEnv::admit(&["DISABLE_AUTOUPDATER=1".to_string()])
+            .expect("a plain NAME=VALUE is admitted");
+        for target in [
+            "/prefix/store/trust/8595/bin/targo",
+            "/Users//x/Library/Application Support/aterm/pkg/store/trust/8595/bin/trustc",
+            "/odd/it's/bin/tippy",
+        ] {
+            for env in [&atpkg::shim_env::ShimEnv::NONE, &env] {
+                let shim = atpkg::platform::shim_executable_to_env(
+                    Path::new("/prefix/bin/tool"),
+                    Path::new(target),
+                    env,
+                )
+                .expect("renders");
+                let body = String::from_utf8(shim.body).expect("a shim is UTF-8");
+                assert_eq!(
+                    sh_exec_target(&body).as_deref(),
+                    Some(Path::new(target)),
+                    "atpkg's shim was not read back to its target:\n{body}"
+                );
+            }
+        }
+        // No exec line, no target: a tombstone-shaped script and a binary-ish blob.
+        assert_eq!(sh_exec_target("#!/bin/sh\necho gone >&2\nexit 127\n"), None);
+        assert_eq!(sh_exec_target("\u{7f}ELF"), None);
+        // A guard-shaped line is atpkg's only with ONE `R` in all four places, ONE `M` in
+        // both, and the exact `"$@"` tail; a guard after the store `exec` is never reached.
+        let guard = "[ ! -h '/r/bin/t' ] && [ -f '/r/bin/t' ] && [ -x '/r/bin/t' ] && [ -f \
+                     '/s/bin/t' ] && [ ! -h '/r/.atpkg-root' ] && [ -f '/r/.atpkg-root' ] && \
+                     exec '/r/bin/t' \"$@\"";
+        assert_eq!(
+            sh_guard_line(guard),
+            Some(ShimGuard {
+                root: PathBuf::from("/r/bin/t"),
+                store: PathBuf::from("/s/bin/t"),
+                marker: PathBuf::from("/r/.atpkg-root"),
+            })
+        );
+        for other in [
+            guard.replacen("[ -f '/r/bin/t' ]", "[ -f '/x/bin/t' ]", 1),
+            guard.replacen("[ -x '/r/bin/t' ]", "[ -x '/x/bin/t' ]", 1),
+            guard.replacen("exec '/r/bin/t'", "exec '/x/bin/t'", 1),
+            guard.replacen("[ -f '/r/.atpkg-root' ]", "[ -f '/x/.atpkg-root' ]", 1),
+            guard.replacen(" \"$@\"", "", 1),
+            guard.replacen("[ ! -h '/r/bin/t' ]", "[ -h '/r/bin/t' ]", 1),
+            // The inode guard atpkg rendered before clones is not this guard.
+            String::from(
+                "[ ! -h '/r/bin/t' ] && [ '/r/bin/t' -ef '/s/bin/t' ] && exec '/r/bin/t' \"$@\"",
+            ),
+        ] {
+            assert_eq!(sh_guard_line(&other), None, "{other}");
+        }
+        let late = format!("#!/bin/sh\nexec '/s/bin/t' \"$@\"\n{guard}\n");
+        assert_eq!(
+            sh_shim_script(&late),
+            Some(ShimScript {
+                guards: Vec::new(),
+                target: PathBuf::from("/s/bin/t"),
+            })
+        );
+        assert_eq!(
+            sh_quoted_word("'it'\\''s a pkg' rest"),
+            Some(("it's a pkg".to_string(), " rest"))
+        );
+        assert_eq!(sh_quoted_word("unquoted"), None);
+        assert_eq!(sh_quoted_word("'unterminated"), None);
+    }
+
+    /// A ROUTED shim runs from where its guard sends the shell, and the page says so.
+    /// A trust build shaped like bundle 8595 (`bin/rustc` a separate file from
+    /// `bin/trustc`, beside `tippy`) under a fixture prefix whose path carries a space
+    /// and a single quote; atpkg's OWN `compat::ensure_root` lays its exec root and its
+    /// OWN `shim_executable_to_env` renders the `targo` shim, so the parse is pinned
+    /// against the real renderer, not a restatement. Then, with the shim unchanged:
+    ///
+    ///  * the root atpkg laid — `bin/targo` a clone of the store file, the root's marker
+    ///    written: the route is TAKEN — the page names the root's file and the store file
+    ///    it stands for, and the root's `bin/` is a toolchain `bin`;
+    ///  * the marker gone (a root half-laid, or one laid as hard links before clones):
+    ///    REFUSED, the store path;
+    ///  * the root's file not executable: REFUSED;
+    ///  * a symbolic link to the store file there: REFUSED;
+    ///  * nothing there: REFUSED.
+    ///
+    /// Each answer is checked against `/bin/sh` itself: the fixture `targo` prints the
+    /// `$0` it was exec'd as, and running the shim must print exactly [`ShimHop::execs`].
+    #[cfg(unix)]
+    #[test]
+    fn routed_shims_resolve_to_where_the_shell_execs() {
+        let scratch = std::fs::canonicalize(path_scratch("routed")).expect("scratch");
+        let prefix = scratch.join("it's a pkg");
+        let layout = atpkg::Layout {
+            prefix: prefix.clone(),
+        };
+        assert_eq!(
+            prefix.join(EXEC_ROOTS_DIR),
+            atpkg::compat::roots_dir(&layout)
+        );
+        let build = layout.build_dir("trust", 8595);
+        let bin = build.join("bin");
+        write_exec(&bin.join("targo"), b"#!/bin/sh\nprintf '%s\\n' \"$0\"\n");
+        write_exec(
+            &bin.join("trustc"),
+            b"frontend 8595 / code signature: trustc",
+        );
+        write_exec(
+            &bin.join("rustc"),
+            b"frontend 8595 / code signature: rustc_",
+        );
+        write_exec(&bin.join("tippy"), b"tippy 8595");
+        std::fs::create_dir_all(build.join("lib/rustlib/aarch64-apple-darwin/lib")).expect("lib");
+        std::fs::write(build.join("lib/librustc_driver-5cfd.dylib"), b"driver").expect("dylib");
+        assert!(
+            atpkg::compat::needs_root(&build)
+                .expect("the fixture build reads")
+                .is_some(),
+            "the fixture is not shaped like 8595"
+        );
+        assert_eq!(
+            atpkg::compat::ensure_root(&layout, &build, atpkg::seam::Depth::Deep).expect("laid"),
+            atpkg::compat::Ensured::Built
+        );
+        let root_bin = atpkg::compat::root_dir(&layout, 8595).join("bin");
+        let (store_targo, root_targo) = (bin.join("targo"), root_bin.join("targo"));
+        let marker = atpkg::compat::root_marker(&atpkg::compat::root_dir(&layout, 8595));
+
+        let shims = prefix.join("bin");
+        let shim = shims.join("targo");
+        let body = atpkg::platform::shim_executable_to_env(
+            &shim,
+            &store_targo,
+            &atpkg::shim_env::ShimEnv::NONE,
+        )
+        .expect("renders")
+        .body;
+        write_exec(&shim, &body);
+        let body = String::from_utf8(body).expect("a shim is UTF-8");
+        assert_eq!(
+            sh_shim_script(&body),
+            Some(ShimScript {
+                guards: vec![ShimGuard {
+                    root: root_targo.clone(),
+                    store: store_targo.clone(),
+                    marker: marker.clone(),
+                }],
+                target: store_targo.clone(),
+            }),
+            "atpkg's routed shim was not read back:\n{body}"
+        );
+        let path_env = std::env::join_paths([&shims]).expect("join");
+        let shell_execs = || {
+            let run = std::process::Command::new(&shim)
+                .env_clear()
+                .output()
+                .expect("run the shim");
+            assert!(run.status.success(), "{run:?}");
+            PathBuf::from(String::from_utf8_lossy(&run.stdout).trim_end())
+        };
+
+        // Taken: the root atpkg laid.
+        let got = resolve_on_path("targo", &path_env).expect("targo is on PATH");
+        assert_eq!(
+            got.shims,
+            vec![ShimHop {
+                execs: root_targo.clone(),
+                route: Some(Route::Taken {
+                    store: store_targo.clone()
+                }),
+            }]
+        );
+        assert_eq!(shell_execs(), root_targo, "the shell disagrees");
+        assert_eq!(got.real_dir(), Some(root_bin.clone()));
+        assert!(is_toolchain_bin(&root_bin) && is_toolchain_bin(&bin));
+        let described = describe_on_path(&got);
+        assert_eq!(
+            described,
+            format!(
+                "{}\n                   -> a shim that execs {}\n                      \
+                 (atpkg exec root, standing for {})",
+                shim.display(),
+                root_targo.display(),
+                store_targo.display()
+            )
+        );
+
+        // Refused: no marker, not executable, a symbolic link, nothing. Each from the root
+        // atpkg laid, restored after.
+        let marker_body = std::fs::read(&marker).expect("the marker reads");
+        let root_body = std::fs::read(&root_targo).expect("the root file reads");
+        let restore = || {
+            let _ = std::fs::remove_file(&root_targo);
+            write_exec(&root_targo, &root_body);
+            let _ = std::fs::remove_file(&marker);
+            std::fs::write(&marker, &marker_body).expect("marker");
+        };
+        let refusals: [(&str, &dyn Fn(), Refusal); 4] = [
+            (
+                "unmarked",
+                &|| std::fs::remove_file(&marker).expect("unlink"),
+                Refusal::Unmarked,
+            ),
+            (
+                "not executable",
+                &|| {
+                    use std::os::unix::fs::PermissionsExt as _;
+                    std::fs::set_permissions(&root_targo, std::fs::Permissions::from_mode(0o644))
+                        .expect("chmod");
+                },
+                Refusal::NotExecutable,
+            ),
+            (
+                "symlink",
+                &|| {
+                    std::fs::remove_file(&root_targo).expect("unlink");
+                    std::os::unix::fs::symlink(&store_targo, &root_targo).expect("symlink");
+                },
+                Refusal::Symlink,
+            ),
+            (
+                "missing",
+                &|| std::fs::remove_file(&root_targo).expect("unlink"),
+                Refusal::Missing,
+            ),
+        ];
+        for (tag, plant, why) in refusals {
+            restore();
+            plant();
+            let got = resolve_on_path("targo", &path_env).expect("targo is on PATH");
+            assert_eq!(
+                got.shims,
+                vec![ShimHop {
+                    execs: store_targo.clone(),
+                    route: Some(Route::Refused {
+                        root: root_targo.clone(),
+                        why
+                    }),
+                }],
+                "{tag}"
+            );
+            assert_eq!(shell_execs(), store_targo, "{tag}: the shell disagrees");
+            assert_eq!(got.real_dir(), Some(bin.clone()), "{tag}");
+            let described = describe_on_path(&got);
+            assert_eq!(
+                described,
+                format!(
+                    "{}\n                   -> a shim that execs {}\n                      \
+                     (the store path: the guard refused atpkg exec-root file {}, which {})",
+                    shim.display(),
+                    store_targo.display(),
+                    root_targo.display(),
+                    refusal_words(why)
+                ),
+                "{tag}"
+            );
+        }
+        let _ = std::fs::remove_dir_all(&scratch);
+    }
+
+    /// `targo on PATH` resolves the way the shell does: the FIRST executable entry
+    /// wins (a non-executable file earlier on PATH does not), a reroute directory
+    /// is skipped, and an atpkg shim is followed to the canonical file it execs.
+    #[cfg(unix)]
+    #[test]
+    fn resolve_on_path_takes_the_first_executable_and_follows_the_shim() {
+        let root = path_scratch("resolve");
+        let reroute = root.join("reroute");
+        let plain = root.join("plain");
+        let shims = root.join("shims");
+        let store = root.join("store/trust/8595/bin");
+        // A reroute dir that (unlike the real one) carries a `targo`: skipped by marker.
+        write_exec(&reroute.join("targo"), b"#!/bin/sh\nexit 9\n");
+        std::fs::write(reroute.join(REROUTE_DIR_MARKER), "marker\n").expect("marker");
+        // A non-executable `targo` earlier on PATH does not count.
+        std::fs::create_dir_all(&plain).expect("mkdir");
+        std::fs::write(plain.join("targo"), "not executable").expect("write");
+        let real = store.join("targo");
+        write_exec(&real, b"\x7fELF not a script");
+        write_exec(
+            &shims.join("targo"),
+            atpkg::platform::shim_executable_to_env(
+                &shims.join("targo"),
+                &real,
+                &atpkg::shim_env::ShimEnv::NONE,
+            )
+            .expect("renders")
+            .body
+            .as_slice(),
+        );
+        let path_env = std::env::join_paths([&reroute, &plain, &shims]).expect("join");
+        let got = resolve_on_path("targo", &path_env).expect("targo is on PATH");
+        assert_eq!(got.found, shims.join("targo"));
+        assert_eq!(
+            got.shims,
+            vec![ShimHop {
+                execs: real.clone(),
+                route: None
+            }]
+        );
+        let canonical_store = std::fs::canonicalize(&store).expect("store exists");
+        assert_eq!(got.real, Some(canonical_store.join("targo")));
+        assert_eq!(got.real_dir(), Some(canonical_store));
+        let described = describe_on_path(&got);
+        assert!(described.contains("a shim that execs"), "{described}");
+
+        // A plain executable is its own answer, and a missing name is None.
+        let plain_only = std::env::join_paths([&store]).expect("join");
+        let got = resolve_on_path("targo", &plain_only).expect("the store file itself");
+        assert!(got.shims.is_empty());
+        assert!(resolve_on_path("trustc", &plain_only).is_none());
+
+        // A shim whose target is gone says so instead of naming a directory.
+        write_exec(
+            &root.join("dangling/targo"),
+            b"#!/bin/sh\nexec '/nonexistent/aterm-cli-test/targo' \"$@\"\n",
+        );
+        let dangling = std::env::join_paths([root.join("dangling")]).expect("join");
+        let got = resolve_on_path("targo", &dangling).expect("the shim is on PATH");
+        assert_eq!(got.real, None);
+        assert_eq!(got.real_dir(), None);
+        assert!(describe_on_path(&got).contains("does NOT resolve"));
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// The build a version line names stops at the first `)`: the compiler version,
+    /// commit and date, without the `(targo 0.1.0)` the 43f8b339f store build
+    /// prints after them — and a line with no parenthesis is compared whole.
+    #[test]
+    fn build_of_stops_at_the_commit_parenthesis() {
+        assert_eq!(
+            build_of("targo 1.99.0-dev (43f8b339f 2026-09-12) (targo 0.1.0)"),
+            "targo 1.99.0-dev (43f8b339f 2026-09-12)"
+        );
+        assert_eq!(
+            build_of("targo 1.99.0-dev (43f8b339f 2026-09-12)"),
+            "targo 1.99.0-dev (43f8b339f 2026-09-12)"
+        );
+        assert_eq!(build_of(" targo 0.1.0 "), "targo 0.1.0");
+    }
+
+    /// The classification the DIVERGENCE note hangs on, over the five shapes:
+    /// one directory; one build in two toolchain directories (a rustup view
+    /// beside the store); a matching line from a directory that is NOT a
+    /// toolchain (a wrapper script echoing the gates' line); two builds (the
+    /// 2026-09-15 machine: the rustup link into a local 07ec014cb tree, the
+    /// store's 43f8b339f on PATH); and a probe that did not answer, which is
+    /// neither agreement nor a named difference.
+    #[test]
+    fn compare_toolchains_classifies_the_five_shapes() {
+        fn side<'a>(dir: &'a str, ver: Option<&'a str>, toolchain_bin: bool) -> Side<'a> {
+            Side {
+                dir: Path::new(dir),
+                ver,
+                toolchain_bin,
+            }
+        }
+        let store = "/p/store/trust/8595/bin";
+        let view = "/p/rustup/trust/bin";
+        let tree = "/h/trust/build/aarch64-apple-darwin/stage2/bin";
+        let script = "/h/fake/script-old";
+        let new = "targo 1.99.0-dev (43f8b339f 2026-09-12) (targo 0.1.0)";
+        let old = "targo 1.99.0-dev (07ec014cb 2026-08-10)";
+        let cmp = |g: Side<'_>, p: Side<'_>| compare_toolchains(&g, &p);
+        assert_eq!(
+            cmp(side(store, Some(new), true), side(store, Some(new), true)),
+            Agreement::Same
+        );
+        assert_eq!(
+            cmp(side(store, None, true), side(store, Some(new), true)),
+            Agreement::Same
+        );
+        assert_eq!(
+            cmp(
+                side(view, Some(new), true),
+                side(store, Some("targo 1.99.0-dev (43f8b339f 2026-09-12)"), true)
+            ),
+            Agreement::SameBuild
+        );
+        // The reviewer's wrapper: a script first on PATH that echoes the gates'
+        // line is a matching LINE, never "one build", on either side.
+        assert_eq!(
+            cmp(side(tree, Some(old), true), side(script, Some(old), false)),
+            Agreement::SameLine
+        );
+        assert_eq!(
+            cmp(side(script, Some(old), false), side(tree, Some(old), true)),
+            Agreement::SameLine
+        );
+        assert_eq!(
+            cmp(side(tree, Some(old), true), side(store, Some(new), true)),
+            Agreement::OtherBuild
+        );
+        // One directory answering two different builds (rewritten between the
+        // probes) is still a measured difference, never "agree".
+        assert_eq!(
+            cmp(side(store, Some(old), true), side(store, Some(new), true)),
+            Agreement::OtherBuild
+        );
+        assert_eq!(
+            cmp(side(tree, None, true), side(store, Some(new), true)),
+            Agreement::OtherDir
+        );
+        assert_eq!(
+            cmp(side(tree, Some(old), true), side(store, None, true)),
+            Agreement::OtherDir
+        );
+    }
+
+    /// The gates' pin is aterm's OWN rust-toolchain.toml, the file `xtask`'s
+    /// `trust_toolchain` and aterm-verify's `Ctx::new` read at the repo root — not
+    /// whatever the directory the page runs in pins.
+    #[test]
+    fn gates_pin_is_the_repo_roots_pin() {
+        let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
+        assert_eq!(
+            gates_pinned_channel(),
+            aterm_verify::toolchain::pinned_channel(&root),
+            "the page's gates' pin drifted from the repo root's rust-toolchain.toml"
+        );
+    }
+
+    /// `is_toolchain_bin` is the line between ONE BUILD and a matching line: a
+    /// `trustc` with a `lib/rustlib` sysroot above it, and nothing less.
+    #[cfg(unix)]
+    #[test]
+    fn a_toolchain_bin_needs_trustc_and_a_sysroot() {
+        let root = path_scratch("toolchain-bin");
+        let bin = root.join("tc/bin");
+        write_exec(&bin.join("targo"), b"#!/bin/sh\n");
+        assert!(!is_toolchain_bin(&bin), "no trustc");
+        write_exec(&bin.join("trustc"), b"#!/bin/sh\n");
+        assert!(!is_toolchain_bin(&bin), "no lib/rustlib");
+        std::fs::create_dir_all(root.join("tc/lib/rustlib")).expect("sysroot");
+        assert!(is_toolchain_bin(&bin));
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// THE PAGE, END TO END, in a scratch world the test owns (re-executed as a
+    /// child with a clean environment and its own cwd, so no parallel test's cwd
+    /// or env is touched). A fake HOME carries rustup's `trust` link (build
+    /// `aaaaaaaaa`) and an atpkg store at a configured prefix (build `bbbbbbbbb`)
+    /// whose shim dir is on PATH. Three findings of the 2026-09-15 review:
+    ///
+    ///  1. From a directory pinning `stable`, the gates' column is still the
+    ///     rustup link (the gates' pin is aterm's), so the page says DIVERGENCE
+    ///     and never "aterm's gates run one directory".
+    ///  2. With `TRUST_STAGE2_BIN` naming atpkg's SHIM directory, the gates' targo
+    ///     is followed through the shim to the store: AGREE, not "ONE BUILD, TWO
+    ///     DIRECTORIES" with a sysroot sentence about a shim dir.
+    ///  3. A wrapper script first on PATH echoing the gates' version line gets
+    ///     SAME VERSION LINE, never ONE BUILD.
+    ///
+    /// And the doctor pointer rides only DIVERGENCE. Then 4: once the store build
+    /// needs an exec root and atpkg has laid it and routed the shims, a bare `targo`
+    /// is reported running from the root (the shim hop names the store file it is),
+    /// and against gates pointed at the store's `bin/` the page says ONE BUILD, TWO
+    /// DIRECTORIES and names the PATH side as an atpkg exec root.
+    #[cfg(unix)]
+    #[test]
+    fn page_speaks_for_the_gates_whatever_this_directory_pins() {
+        const CHILD: &str = "ATERM_TEST_HELP_RUST_PAGE_CHILD";
+        if let Some(out) = std::env::var_os(CHILD) {
+            let (page, code) = render(Some("rust"), None);
+            assert_eq!(code, 0);
+            std::fs::write(out, page).expect("write the page");
+            return;
+        }
+        let root = std::fs::canonicalize(path_scratch("page")).expect("scratch");
+        let home = root.join("home");
+        let prefix = root.join("prefix");
+        let tree = home.join("trust-tree");
+        let store = prefix.join("store/trust/9999");
+        // Two toolchain bins, each a `trustc` answering its own sysroot.
+        for (dir, commit) in [(&tree, "aaaaaaaaa"), (&store, "bbbbbbbbb")] {
+            std::fs::create_dir_all(dir.join("lib/rustlib")).expect("sysroot");
+            write_exec(
+                &dir.join("bin/trustc"),
+                format!("#!/bin/sh\necho '{}'\n", dir.display()).as_bytes(),
+            );
+            write_exec(
+                &dir.join("bin/targo"),
+                format!("#!/bin/sh\necho 'targo 1.99.0-dev ({commit} 2026-09-12)'\n").as_bytes(),
+            );
+        }
+        std::fs::create_dir_all(home.join(".rustup/toolchains")).expect("rustup");
+        std::os::unix::fs::symlink(&tree, home.join(".rustup/toolchains/trust")).expect("link");
+        std::os::unix::fs::symlink(&store, prefix.join("store/trust/current")).expect("current");
+        let shims = prefix.join("bin");
+        for tool in ["targo", "trustc"] {
+            let shim = atpkg::platform::shim_executable_to_env(
+                &shims.join(tool),
+                &store.join("bin").join(tool),
+                &atpkg::shim_env::ShimEnv::NONE,
+            )
+            .expect("renders");
+            write_exec(&shims.join(tool), &shim.body);
+        }
+        let xdg = root.join("xdg");
+        std::fs::create_dir_all(xdg.join("aterm")).expect("xdg");
+        std::fs::write(
+            xdg.join("aterm/aterm.toml"),
+            format!("[packages]\nprefix = \"{}\"\n", prefix.display()),
+        )
+        .expect("config");
+        let stable = root.join("stable");
+        std::fs::create_dir_all(&stable).expect("stable dir");
+        std::fs::write(
+            stable.join("rust-toolchain.toml"),
+            "[toolchain]\nchannel = \"stable\"\n",
+        )
+        .expect("pin");
+        let wrapper = root.join("wrapper");
+        write_exec(
+            &wrapper.join("targo"),
+            b"#!/bin/sh\necho 'targo 1.99.0-dev (aaaaaaaaa 2026-09-12)'\n",
+        );
+
+        let name = format!(
+            "{}::page_speaks_for_the_gates_whatever_this_directory_pins",
+            module_path!().split_once("::").map_or("", |(_, rest)| rest)
+        );
+        let page = |tag: &str, path: String, stage2: Option<&Path>| -> String {
+            let out = root.join(format!("{tag}.txt"));
+            let mut cmd = std::process::Command::new(std::env::current_exe().expect("test binary"));
+            cmd.args(["--exact", &name, "--nocapture", "--test-threads=1"])
+                .env_clear()
+                .env(CHILD, &out)
+                .env("HOME", &home)
+                .env("XDG_CONFIG_HOME", &xdg)
+                .env("PATH", path)
+                .current_dir(&stable)
+                .stdin(std::process::Stdio::null());
+            if let Some(dir) = stage2 {
+                cmd.env("TRUST_STAGE2_BIN", dir);
+            }
+            let run = cmd.output().expect("re-exec the test binary");
+            let text = format!(
+                "{}{}",
+                String::from_utf8_lossy(&run.stdout),
+                String::from_utf8_lossy(&run.stderr)
+            );
+            assert!(run.status.success(), "the {tag} re-exec failed:\n{text}");
+            assert!(
+                text.contains("1 passed"),
+                "the {tag} re-exec ran no test:\n{text}"
+            );
+            std::fs::read_to_string(&out).expect("the child wrote the page")
+        };
+        let sys = "/usr/bin:/bin";
+        let tree_bin = tree.join("bin");
+        let store_bin = std::fs::canonicalize(store.join("bin")).expect("store bin");
+
+        // 1. A `stable` pin here does not move the gates' column.
+        let p = page("stable-pin", format!("{}:{sys}", shims.display()), None);
+        assert!(p.contains("channel = \"stable\""), "{p}");
+        assert!(
+            p.contains(&format!(
+                "  gates' toolchain {}  (wins for aterm's gates)",
+                tree_bin.display()
+            )),
+            "the gates' column followed this directory's pin:\n{p}"
+        );
+        assert!(p.contains("PATH vs gates    DIVERGENCE"), "{p}");
+        assert!(!p.contains("aterm's gates run one directory"), "{p}");
+        assert!(p.contains("`aterm pkg doctor` flags"), "{p}");
+
+        // 2. Discovery settling on the shim dir is one directory once followed.
+        let p = page(
+            "shim-dir",
+            format!("{}:{sys}", shims.display()),
+            Some(&shims),
+        );
+        assert!(
+            p.contains(&format!(
+                "  gates' toolchain {}  (wins for aterm's gates)",
+                shims.display()
+            )),
+            "{p}"
+        );
+        assert!(p.contains("a shim that execs"), "{p}");
+        assert!(p.contains("PATH vs gates    AGREE"), "{p}");
+        assert!(!p.contains("ONE BUILD, TWO DIRECTORIES"), "{p}");
+        assert!(!p.contains("aterm pkg doctor` flags"), "{p}");
+        assert!(p.contains(&store_bin.display().to_string()), "{p}");
+
+        // 3. A wrapper echoing the gates' line is not one build.
+        let p = page(
+            "wrapper",
+            format!("{}:{}:{sys}", wrapper.display(), shims.display()),
+            None,
+        );
+        assert!(
+            p.contains("PATH vs gates    SAME VERSION LINE, DIFFERENT FILES"),
+            "{p}"
+        );
+        assert!(p.contains("(NOT a toolchain bin)"), "{p}");
+        assert!(!p.contains("ONE BUILD"), "{p}");
+        assert!(!p.contains("trustc takes its sysroot"), "{p}");
+
+        // 4. The store build turns 8595-shaped (`bin/rustc` a separate file beside
+        //    `tippy`), atpkg lays its exec root and re-renders the shims through it: a
+        //    bare `targo` runs from the root, and against gates pointed at the store's
+        //    own `bin/` that is one build in two directories, the root named as such.
+        write_exec(&store.join("bin/rustc"), b"a separately signed copy");
+        write_exec(&store.join("bin/tippy"), b"tippy 9999");
+        let layout = atpkg::Layout {
+            prefix: prefix.clone(),
+        };
+        assert_eq!(
+            atpkg::compat::ensure_root(&layout, &store, atpkg::seam::Depth::Deep).expect("laid"),
+            atpkg::compat::Ensured::Built
+        );
+        for tool in ["targo", "trustc"] {
+            let shim = atpkg::platform::shim_executable_to_env(
+                &shims.join(tool),
+                &store.join("bin").join(tool),
+                &atpkg::shim_env::ShimEnv::NONE,
+            )
+            .expect("renders");
+            write_exec(&shims.join(tool), &shim.body);
+        }
+        let root_bin = atpkg::compat::root_dir(&layout, 9999).join("bin");
+        let p = page(
+            "exec-root",
+            format!("{}:{sys}", shims.display()),
+            Some(&store.join("bin")),
+        );
+        assert!(
+            p.contains(&format!(
+                "-> a shim that execs {}\n                      (atpkg exec root, standing \
+                 for {})",
+                root_bin.join("targo").display(),
+                store.join("bin/targo").display()
+            )),
+            "{p}"
+        );
+        assert!(
+            p.contains("PATH vs gates    ONE BUILD, TWO DIRECTORIES"),
+            "{p}"
+        );
+        assert!(
+            p.contains(&format!("PATH   {}\n", root_bin.display())),
+            "{p}"
+        );
+        assert!(
+            p.contains("(the PATH directory is under atpkg's exec roots, <prefix>/compat/trust:"),
+            "{p}"
+        );
+        assert!(
+            !p.contains("the gates' directory is under atpkg's exec roots"),
+            "{p}"
+        );
+        let _ = std::fs::remove_dir_all(&root);
     }
 
     #[test]
@@ -3260,7 +4901,16 @@ mod tests {
                     .chars()
                     .take_while(|c| c.is_ascii_alphanumeric() || *c == '-')
                     .collect();
-                let step = verb.len().max(1).min(after.len());
+                // Step past the verb, or past ONE char when there is none: `.max(1)` on a
+                // byte length used to split a multibyte char (`aterm pkg …`) and panic.
+                let step = if verb.is_empty() {
+                    after.chars().next().map_or(0, char::len_utf8)
+                } else {
+                    verb.len()
+                };
+                if step == 0 {
+                    break;
+                }
                 rest = &after[step..];
                 // `aterm pkg --help` and `aterm pkg <tool>` are not verbs.
                 if verb.is_empty() || verb.starts_with('-') || roster.contains(&verb.as_str()) {

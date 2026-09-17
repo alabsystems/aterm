@@ -40,6 +40,11 @@ pub mod animal_baker;
 pub mod animal_glyphs_gen {
     include!("animal_glyphs_gen.rs");
 }
+/// Test-only: the exact-bit pins measured on Apple silicon — asserted as
+/// written on every target but x86_64 macOS, reported there instead (the
+/// module's own docs carry the measurement).
+#[cfg(test)]
+mod arm64_pin;
 pub mod cat_baker;
 /// Cat-art v4 codegen (docs/cat-art-v4-design.md §1): the generator that turns the
 /// semantic glyph asset TOMLs into the checked-in [`cat_glyphs_gen`] const drawlists.

@@ -23,7 +23,7 @@
 //! See `crates/aterm-winit-keymap/Cargo.toml` and the measurement in
 //! `crates/aterm-bench/benches/startup_exec.rs`.
 
-use winit::keyboard::{Key as WinitKey, KeyCode, NamedKey as WinitNamed, PhysicalKey};
+use winit::keyboard::{Key as WinitKey, KeyCode, KeyLocation, NamedKey as WinitNamed, PhysicalKey};
 
 use aterm_types::keyboard::{Key, NamedKey};
 
@@ -58,9 +58,11 @@ pub fn map_logical_key(key: &WinitKey) -> Option<Key> {
 ///
 /// Covers the FULL set the engine can encode: navigation, editing, locks,
 /// system keys, F1-F35, the media/audio cluster, and the modifier keys
-/// (including Super/Cmd, which the old inline match dropped). The numpad keys
-/// are NOT here — winit reports them as `NamedKey` only when they carry a
-/// logical meaning; the physical numpad mapping lives in [`map_physical_numpad`].
+/// (including Super/Cmd, which the old inline match dropped). The keypad keys
+/// are NOT here, because winit has none to map: a keypad press arrives as the
+/// main block's logical key (`Character("5")`, `Named(Enter)`, `Named(End)`)
+/// with the keypad recorded in `KeyLocation` alone. [`map_numpad_key`], which
+/// `build_key_input` asks FIRST, is the one road to the engine's `Numpad*`.
 /// Returns `None` for variants with no terminal encoding (TV, IME composition,
 /// launch/browser/phone keys, etc.).
 #[must_use]
@@ -156,35 +158,91 @@ pub fn map_named_key(named: WinitNamed) -> Option<NamedKey> {
     })
 }
 
-/// Map a physical numpad [`KeyCode`] into the engine's numpad [`NamedKey`].
+/// The keypad key a winit press IS — the one road from a physical numpad to
+/// the engine's `Numpad*` keys (DECKPAM's SS3 forms, kitty's
+/// `CSI 57399..57427 u`) — or `None` when the press is not a keypad key the
+/// engine names. winit has no keypad key of its own: KP_5 arrives as
+/// `Character("5")` and KP_Enter as `Named(Enter)`, the very keys the main
+/// block produces, with the keypad recorded in `location` alone. So this is
+/// asked BEFORE [`map_logical_key`], which cannot see the keypad at all.
 ///
-/// winit usually surfaces numpad keys via the LOGICAL key (a digit character,
-/// or `NamedKey::Enter`), but the physical-key path lets the engine drive the
-/// DECKPAM application-keypad sequences (SS3) that differ from the main row.
-/// Returns `None` for any non-numpad physical key.
+/// `location` says whether the key is on the keypad; `logical` — the event's
+/// `logical_key`, which carries NumLock — says what it means there. The
+/// identity is the GLYPH the layout typed, not the scancode: a de-DE
+/// `keypad(comma)` decimal key types `,` and is KP_Separator (SS3 `l`), which
+/// is how xterm and kitty read it, where a scancode table would type `.`.
+/// Enter on the keypad is KP_Enter; a NumLock-off navigation key is its keypad
+/// twin. `physical` settles only the nameless NumLock-off centre key — the one
+/// keypad key winit names on no platform (`Unidentified` from xkb's KP_Begin,
+/// `Clear` on Windows) — as NumpadBegin. A keypad key with no keypad identity
+/// (KP_Tab, KP_Space, a key remapped to a letter) yields `None` and takes the
+/// logical route as before.
+///
+/// The caller passes `logical_key`, never `key_without_modifiers()`: the Linux
+/// backends derive the latter from xkb's LEVEL-0 keysym, and the KEYPAD type
+/// keeps the NumLock-OFF symbol at level 0 (`types/numpad`: `map[None] =
+/// Level1`; `symbols/keypad(x11)`: `<KP1> { [ KP_End, KP_1 ] }`), so a
+/// NumLock-on keypad 1 reads back from it as End.
 #[must_use]
-pub fn map_physical_numpad(code: KeyCode) -> Option<NamedKey> {
-    Some(match code {
-        KeyCode::Numpad0 => NamedKey::Numpad0,
-        KeyCode::Numpad1 => NamedKey::Numpad1,
-        KeyCode::Numpad2 => NamedKey::Numpad2,
-        KeyCode::Numpad3 => NamedKey::Numpad3,
-        KeyCode::Numpad4 => NamedKey::Numpad4,
-        KeyCode::Numpad5 => NamedKey::Numpad5,
-        KeyCode::Numpad6 => NamedKey::Numpad6,
-        KeyCode::Numpad7 => NamedKey::Numpad7,
-        KeyCode::Numpad8 => NamedKey::Numpad8,
-        KeyCode::Numpad9 => NamedKey::Numpad9,
-        KeyCode::NumpadDecimal => NamedKey::NumpadDecimal,
-        KeyCode::NumpadDivide => NamedKey::NumpadDivide,
-        KeyCode::NumpadMultiply | KeyCode::NumpadStar => NamedKey::NumpadMultiply,
-        KeyCode::NumpadSubtract => NamedKey::NumpadSubtract,
-        KeyCode::NumpadAdd => NamedKey::NumpadAdd,
-        KeyCode::NumpadEnter => NamedKey::NumpadEnter,
-        KeyCode::NumpadEqual => NamedKey::NumpadEqual,
-        KeyCode::NumpadComma => NamedKey::NumpadSeparator,
+pub fn map_numpad_key(
+    physical: PhysicalKey,
+    logical: &WinitKey,
+    location: KeyLocation,
+) -> Option<Key> {
+    if location != KeyLocation::Numpad {
+        return None;
+    }
+    let named = match logical {
+        WinitKey::Character(s) => {
+            let mut chars = s.chars();
+            let c = chars.next()?;
+            if chars.next().is_some() {
+                // Not a single-codepoint key press (IME / composed text).
+                return None;
+            }
+            match c {
+                '0' => NamedKey::Numpad0,
+                '1' => NamedKey::Numpad1,
+                '2' => NamedKey::Numpad2,
+                '3' => NamedKey::Numpad3,
+                '4' => NamedKey::Numpad4,
+                '5' => NamedKey::Numpad5,
+                '6' => NamedKey::Numpad6,
+                '7' => NamedKey::Numpad7,
+                '8' => NamedKey::Numpad8,
+                '9' => NamedKey::Numpad9,
+                '.' => NamedKey::NumpadDecimal,
+                ',' => NamedKey::NumpadSeparator,
+                '/' => NamedKey::NumpadDivide,
+                '*' => NamedKey::NumpadMultiply,
+                '-' => NamedKey::NumpadSubtract,
+                '+' => NamedKey::NumpadAdd,
+                '=' => NamedKey::NumpadEqual,
+                _ => return None,
+            }
+        }
+        WinitKey::Named(WinitNamed::Enter) => NamedKey::NumpadEnter,
+        WinitKey::Named(WinitNamed::ArrowUp) => NamedKey::NumpadArrowUp,
+        WinitKey::Named(WinitNamed::ArrowDown) => NamedKey::NumpadArrowDown,
+        WinitKey::Named(WinitNamed::ArrowLeft) => NamedKey::NumpadArrowLeft,
+        WinitKey::Named(WinitNamed::ArrowRight) => NamedKey::NumpadArrowRight,
+        WinitKey::Named(WinitNamed::Home) => NamedKey::NumpadHome,
+        WinitKey::Named(WinitNamed::End) => NamedKey::NumpadEnd,
+        WinitKey::Named(WinitNamed::PageUp) => NamedKey::NumpadPageUp,
+        WinitKey::Named(WinitNamed::PageDown) => NamedKey::NumpadPageDown,
+        WinitKey::Named(WinitNamed::Insert) => NamedKey::NumpadInsert,
+        WinitKey::Named(WinitNamed::Delete) => NamedKey::NumpadDelete,
+        // The NumLock-off centre key: matched on "the engine has no name for
+        // what winit reported" rather than on a winit variant, so xkb's
+        // `Unidentified` and Windows' `Clear` take the same arm.
+        _ if physical == PhysicalKey::Code(KeyCode::Numpad5)
+            && map_logical_key(logical).is_none() =>
+        {
+            NamedKey::NumpadBegin
+        }
         _ => return None,
-    })
+    };
+    Some(Key::Named(named))
 }
 
 /// The character a physical key produces on a US-QWERTY layout, for the Kitty
@@ -284,17 +342,169 @@ mod tests {
         );
     }
 
+    fn ch(c: &str) -> WinitKey {
+        WinitKey::Character(SmolStr::new(c))
+    }
+
+    fn unidentified() -> WinitKey {
+        WinitKey::Unidentified(winit::keyboard::NativeKey::Unidentified)
+    }
+
+    /// A digit at the keypad location is the keypad digit — the engine key
+    /// that reaches DECKPAM's SS3 and kitty's KP codes — not the main row's
+    /// `Character('5')` that the logical key alone would give.
     #[test]
-    fn maps_physical_numpad() {
+    fn numpad_location_promotes_digit_to_numpad_key() {
         assert_eq!(
-            map_physical_numpad(KeyCode::Numpad5),
-            Some(NamedKey::Numpad5)
+            map_numpad_key(
+                PhysicalKey::Code(KeyCode::Numpad5),
+                &ch("5"),
+                KeyLocation::Numpad
+            ),
+            Some(Key::Named(NamedKey::Numpad5))
         );
         assert_eq!(
-            map_physical_numpad(KeyCode::NumpadEnter),
-            Some(NamedKey::NumpadEnter)
+            map_numpad_key(
+                PhysicalKey::Code(KeyCode::NumpadAdd),
+                &ch("+"),
+                KeyLocation::Numpad
+            ),
+            Some(Key::Named(NamedKey::NumpadAdd))
         );
-        assert_eq!(map_physical_numpad(KeyCode::KeyA), None);
+    }
+
+    /// KP_Enter arrives from every platform as the main block's `Enter`; on
+    /// the keypad it is NumpadEnter (CR / SS3 M / `CSI 57414 u`).
+    #[test]
+    fn numpad_enter_is_not_main_enter() {
+        assert_eq!(
+            map_numpad_key(
+                PhysicalKey::Code(KeyCode::NumpadEnter),
+                &WinitKey::Named(WinitNamed::Enter),
+                KeyLocation::Numpad
+            ),
+            Some(Key::Named(NamedKey::NumpadEnter))
+        );
+    }
+
+    /// NumLock off: the navigation keysym is the keypad twin of the main-block
+    /// key, and the centre key — which winit names on no platform — is
+    /// NumpadBegin by its physical code, whether xkb reports `Unidentified` or
+    /// Windows reports `Clear`. Only the centre key gets that rescue.
+    #[test]
+    fn numlock_off_navigation_gets_numpad_twin() {
+        assert_eq!(
+            map_numpad_key(
+                PhysicalKey::Code(KeyCode::Numpad4),
+                &WinitKey::Named(WinitNamed::ArrowLeft),
+                KeyLocation::Numpad
+            ),
+            Some(Key::Named(NamedKey::NumpadArrowLeft))
+        );
+        assert_eq!(
+            map_numpad_key(
+                PhysicalKey::Code(KeyCode::Numpad1),
+                &WinitKey::Named(WinitNamed::End),
+                KeyLocation::Numpad
+            ),
+            Some(Key::Named(NamedKey::NumpadEnd))
+        );
+        for centre in [unidentified(), WinitKey::Named(WinitNamed::Clear)] {
+            assert_eq!(
+                map_numpad_key(
+                    PhysicalKey::Code(KeyCode::Numpad5),
+                    &centre,
+                    KeyLocation::Numpad
+                ),
+                Some(Key::Named(NamedKey::NumpadBegin)),
+                "{centre:?} on the physical keypad 5 is KP_Begin"
+            );
+        }
+        assert_eq!(
+            map_numpad_key(
+                PhysicalKey::Code(KeyCode::Numpad4),
+                &unidentified(),
+                KeyLocation::Numpad
+            ),
+            None,
+            "an unnamed key elsewhere on the keypad stays unmapped"
+        );
+    }
+
+    /// The identity is the glyph the LAYOUT typed, not the scancode: the same
+    /// physical decimal key is KP_Decimal on a US layout and KP_Separator on a
+    /// de-DE `keypad(comma)` layout, and must type `,` there — never `.`.
+    #[test]
+    fn keypad_identity_is_the_glyph_not_the_scancode() {
+        assert_eq!(
+            map_numpad_key(
+                PhysicalKey::Code(KeyCode::NumpadDecimal),
+                &ch("."),
+                KeyLocation::Numpad
+            ),
+            Some(Key::Named(NamedKey::NumpadDecimal))
+        );
+        assert_eq!(
+            map_numpad_key(
+                PhysicalKey::Code(KeyCode::NumpadDecimal),
+                &ch(","),
+                KeyLocation::Numpad
+            ),
+            Some(Key::Named(NamedKey::NumpadSeparator))
+        );
+    }
+
+    /// A keypad key with no keypad identity — KP_Tab, or a keypad key the user
+    /// remapped to a letter — is left to the logical route.
+    #[test]
+    fn keypad_key_without_keypad_identity_takes_the_logical_route() {
+        assert_eq!(
+            map_numpad_key(
+                PhysicalKey::Unidentified(winit::keyboard::NativeKeyCode::Unidentified),
+                &WinitKey::Named(WinitNamed::Tab),
+                KeyLocation::Numpad
+            ),
+            None
+        );
+        assert_eq!(
+            map_numpad_key(
+                PhysicalKey::Code(KeyCode::Numpad1),
+                &ch("a"),
+                KeyLocation::Numpad
+            ),
+            None
+        );
+    }
+
+    /// The negative control: the main block is untouched. `5` above `R` and
+    /// the main Return are not keypad keys, and the LOCATION — not the
+    /// scancode — is what says a key is on the keypad.
+    #[test]
+    fn standard_location_is_untouched() {
+        assert_eq!(
+            map_numpad_key(
+                PhysicalKey::Code(KeyCode::Digit5),
+                &ch("5"),
+                KeyLocation::Standard
+            ),
+            None
+        );
+        assert_eq!(
+            map_numpad_key(
+                PhysicalKey::Code(KeyCode::Enter),
+                &WinitKey::Named(WinitNamed::Enter),
+                KeyLocation::Standard
+            ),
+            None
+        );
+        assert_eq!(
+            map_numpad_key(
+                PhysicalKey::Code(KeyCode::Numpad5),
+                &ch("5"),
+                KeyLocation::Standard
+            ),
+            None
+        );
     }
 
     #[test]

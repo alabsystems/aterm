@@ -363,7 +363,11 @@ impl TerminalHandler<'_> {
         self.transient.alt_screen_left_in_batch = true;
         let restored = self.grid.display_offset();
         if restored > 0 {
-            self.grid.scroll_to_bottom();
+            // The batch prologue's entry point, for the batch prologue's reason: this
+            // forced 0 is the machine's, undone by the epilogue's re-pin, and must not
+            // register as a reader gesture in `reader_live_bottom_gen`. See
+            // `Terminal::process`'s prologue.
+            self.grid.pin_viewport_to_live_for_output_batch();
             self.transient.alt_restore_pin = Some((restored, self.grid.absolute_row_counter()));
         }
         // The rest of the batch writes against THIS grid now, so it owes the same
@@ -583,10 +587,19 @@ impl TerminalHandler<'_> {
         new_grid.restore_tab_stops(self.grid.tab_stops());
         // Per xterm the cursor is shared by both screen buffers and 1049 SET
         // is CursorSave + ToAlternate + ClearScreen — none of which moves the
-        // cursor (srm_OPT_ALTBUF_CURSOR). Entering must NOT home it.
+        // cursor (charproc.c `srm_OPT_ALTBUF_CURSOR`). Entering must NOT home it.
+        // ClearScreen runs LAST and calls `ResetWrap` (util.c `ClearScreen`), so
+        // the alt screen starts with NO pending wrap even when the main screen had
+        // one: the wrap is deliberately not copied here (modes 47/1047, which do
+        // not clear, still carry it over in `enter_alternate_screen_raw`). The
+        // main screen's wrap is not lost — `snapshot_cursor_state` above saved it
+        // (xterm `CursorSave` records `do_wrap`), and 1049 RESET restores it.
         let cursor = self.grid.cursor();
         new_grid.set_cursor(cursor.row, cursor.col);
-        new_grid.set_pending_wrap(self.grid.pending_wrap());
+        debug_assert!(
+            !new_grid.pending_wrap(),
+            "1049 SET ends in ClearScreen, which resets the deferred wrap"
+        );
         // Margins are shared TScreen state in xterm — they persist onto the
         // alternate screen.
         Self::copy_margins(self.grid, &mut new_grid);

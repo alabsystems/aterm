@@ -157,7 +157,11 @@ pub fn hdr_present_plan(hdr_glow: bool, swapchain_is_f16: bool, glow_nonempty: b
 /// claim extended-linear-sRGB.
 ///
 /// This is the shipping decision bound to
-/// `aterm_spec::derive::hdr_reconfigure_retag_model` by `tests/hdr_gate.rs`.
+/// `aterm_spec::derive::hdr_reconfigure_retag_model` — exhaustively over the
+/// planner's own boolean domain by `tests/hdr_gate.rs`, and per-transition
+/// against the CONCRETE apply path by `renderer::tests`
+/// (`hdr_reconfigure_apply_conforms_to_retag_model`), which is what the
+/// `HdrReconfigureRetag` refinement anchors below name.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum HdrReconfigurePlan {
     /// The surface was already SDR; reconfiguring does not change its colour space.
@@ -169,8 +173,92 @@ pub enum HdrReconfigurePlan {
     FallbackToSdr,
 }
 
+/// Scalar projection onto the four `HdrReconfigureRetag` variables `<<stage,
+/// retagged, is_f16, capture_linear>>`.
+///
+/// Built ONLY by [`crate::WindowGpu::project_hdr_reconfigure_state`]. Exactly
+/// ONE of the four is read back off applied state — `capture_linear`, the
+/// metadata half the shipping apply reconciles. `is_f16` is the planner's
+/// resolved format and `stage`/`retagged` are the caller's drive coordinates;
+/// `aterm_spec::derive::hdr_reconfigure_retag_model` carries the per-variable
+/// accounting and names what holds the two the projection does not.
+///
+/// `capture_linear` is what makes this a binding rather than a restatement of
+/// the planner: Tier-1 must not validate a decision while skipping the effect it
+/// orders, so the modeled successor is compared against state
+/// `apply_hdr_reconfigure_plan` / `apply_hdr_surface_upgrade` actually produced,
+/// never against a table the test wrote for itself.
+///
+/// Test-only (`cfg(test)`): it is the conformance projection, not renderer
+/// state, so it adds nothing to this crate's API. The `project = ` strings on
+/// the anchors below name it in exactly the build where it exists — the same
+/// build in which `cfg(any(test, ...))` links the anchors themselves.
+#[cfg(test)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct HdrReconfigureProjection {
+    /// Model phase: confirmed HDR (0), retained eligible SDR (1), resolved (2).
+    pub(crate) stage: u8,
+    /// Whether the attempted scRGB re-tag succeeded.
+    pub(crate) retagged: bool,
+    /// Whether the plan resolved the swapchain to `Rgba16Float`. PLANNER-derived:
+    /// the configure that installs the resolved format happens on the
+    /// `GpuSurface`, which a `WindowGpu` projection cannot see.
+    pub(crate) is_f16: bool,
+    /// Whether the window's APPLIED capture metadata declares extended-linear
+    /// sRGB. Read back off the window, so an apply that forgets its half of the
+    /// fallback shows up here as a `CaptureMatchesSurfaceEncoding` violation.
+    pub(crate) capture_linear: bool,
+}
+
 /// Resolve the post-reconfigure surface encoding from the ACTUAL current format
 /// and the result of re-establishing scRGB on the recreated swapchain.
+///
+/// The five anchors bind every `HdrReconfigureRetag` action to this planner.
+/// Each action is ALSO anchored on the concrete apply that performs its
+/// metadata half (`WindowGpu::apply_hdr_reconfigure_plan`, or
+/// `WindowGpu::apply_hdr_surface_upgrade` for `UpgradeSucceeds`): plan and apply
+/// together are the transition the model describes, and binding only this half
+/// would leave the effects unwitnessed.
+#[cfg_attr(
+    any(test, feature = "spec-anchors"),
+    aterm_spec::refines(
+        machine = "HdrReconfigureRetag",
+        action = "RetagSucceeds",
+        project = "aterm_gpu::WindowGpu::project_hdr_reconfigure_state"
+    )
+)]
+#[cfg_attr(
+    any(test, feature = "spec-anchors"),
+    aterm_spec::refines(
+        machine = "HdrReconfigureRetag",
+        action = "RetagFails",
+        project = "aterm_gpu::WindowGpu::project_hdr_reconfigure_state"
+    )
+)]
+#[cfg_attr(
+    any(test, feature = "spec-anchors"),
+    aterm_spec::refines(
+        machine = "HdrReconfigureRetag",
+        action = "EnterSdrFallback",
+        project = "aterm_gpu::WindowGpu::project_hdr_reconfigure_state"
+    )
+)]
+#[cfg_attr(
+    any(test, feature = "spec-anchors"),
+    aterm_spec::refines(
+        machine = "HdrReconfigureRetag",
+        action = "UpgradeSucceeds",
+        project = "aterm_gpu::WindowGpu::project_hdr_reconfigure_state"
+    )
+)]
+#[cfg_attr(
+    any(test, feature = "spec-anchors"),
+    aterm_spec::refines(
+        machine = "HdrReconfigureRetag",
+        action = "UpgradeFails",
+        project = "aterm_gpu::WindowGpu::project_hdr_reconfigure_state"
+    )
+)]
 #[must_use]
 pub fn hdr_reconfigure_plan(swapchain_is_f16: bool, scrgb_retagged: bool) -> HdrReconfigurePlan {
     match (swapchain_is_f16, scrgb_retagged) {

@@ -76,8 +76,18 @@ pub mod appgate;
 pub mod apply;
 pub mod bundled;
 pub mod cache;
+/// The shell that typed this command (2026-09-16): the parent process's executable when
+/// it is a shell, else `$SHELL` — what `doctor`/`which` key their in-place remedy on.
+pub mod caller_shell;
 /// The `atpkg` CLI (all verbs), callable in-process by the ONE `aterm` binary.
 pub mod cli;
+/// Copy-on-write clones of a build's files — how the rustup view and the exec roots are
+/// laid, instead of hard links to the store's own inodes.
+pub(crate) mod clone;
+/// Per-build exec roots (`<prefix>/compat/trust/<build>`) for the Trust bundles that ship
+/// `bin/rustc` as a separate copy their own tippy refuses, and the stat-only route the
+/// `bin/` shims take through them.
+pub mod compat;
 pub mod config;
 pub mod cost;
 pub mod discovery;
@@ -97,6 +107,9 @@ pub mod install;
 /// The `pkg` protocol's lane: a Developer-ID-signed macOS installer package, its
 /// signer team checked with `pkgutil`, applied by `installer` with elevation.
 pub mod installer_pkg;
+/// The landing wait (2026-09-16): what an agent program's `agents/` twin does while a
+/// NEWER pinned build of that program is being fetched, staged and activated.
+pub mod landing;
 /// Laying executables (shims, stubs, tombstones) through the untracked launchd lane when
 /// this process is provenance-tracked — law m21: a tagged `#!/bin/sh` shim tracks the
 /// tool it execs — and the one refuse-by-default policy both untracked lanes share.
@@ -174,11 +187,13 @@ pub use discovery::{IndexRepo, resolve_account, resolve_account_with};
 pub use dispatch::{ApplyStrategy, strategy_for};
 pub use elevate::{Elevation, Runner};
 pub use extract::{
-    EntryKind, ExtractError, ExtractReject, extract_tar_zst, vet_entry, vet_hardlink,
+    EntryKind, ExtractError, ExtractReject, TooLargeReason, extract_tar_zst, vet_entry,
+    vet_hardlink,
 };
 pub use flow::{
     AppliedMember, ChannelApplyReport, DepOutcome, DepResult, Fetcher, FlowError, InstallReport,
-    InstallRequest, ProtocolOutcome, apply_channel, install, resolve_verified_index,
+    InstallRequest, ProtocolOutcome, apply_channel, apply_channel_with, install,
+    resolve_verified_index,
 };
 pub use gate::{ApplyDecision, decide, is_yanked};
 pub use gc::{GcReport, reclaimable, run as run_gc};

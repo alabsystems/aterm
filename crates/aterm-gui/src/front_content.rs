@@ -44,6 +44,19 @@ impl FrontContent {
             Self::Terminal { .. } => None,
         }
     }
+
+    /// The terminal SESSION behind this front, or `None` for native content —
+    /// the identity half of [`Self::native`]. Callers that need the session id
+    /// without a capability (the DEC 1004 focus-report account, which must name
+    /// a session it can no longer reach through the window) read it here rather
+    /// than re-matching the enum.
+    #[must_use]
+    pub(crate) const fn terminal_session(self) -> Option<u64> {
+        match self {
+            Self::Terminal { session, .. } => Some(session),
+            Self::Native { .. } => None,
+        }
+    }
 }
 
 /// Handles for the focused terminal leaf only.

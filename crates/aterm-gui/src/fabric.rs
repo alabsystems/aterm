@@ -244,6 +244,41 @@ const TRUSTS: &[&str] = &["human", "agent", "relayed", "screen"];
 /// `note`. A note is the class that must never wake anybody by itself.
 const AWAIT_DEFAULT_SKIP: &str = "note";
 
+/// The three words `inbox seen <id> <verdict>` accepts, which are the three a
+/// receipt (`kind=ack … verdict=`) may carry back to a sender (R8). CLOSED at
+/// both doors: `deliver` refuses any other `verdict=`, so the row an agent
+/// reads carries a word this endpoint classified.
+const VERDICTS: &[&str] = &["handled", "refused", "deferred"];
+
+/// How many `inbox get @<off>` reads one session may have PARKED for the
+/// bridge at once, and how long one waits. The bridge answers each with one
+/// bounded `Fetch` on its next drain (the idle tick, 250 ms; the roster
+/// backstop, 2 s, under load), so ten seconds is a hang detector, never a
+/// synchronisation sleep — and a slot is one offset and one bounded body.
+const FETCH_SLOTS: usize = 8;
+const FETCH_WAIT_MS: u64 = 10_000;
+
+/// How many receipts one session may OWE at once: `inbox seen <id>
+/// handled|refused|deferred` decisions on `ask`/`task` rows that the bridge has
+/// not yet put on the bus as `kind=ack` (R8) — see [`OwedReceipt`]. The ring's
+/// own bound, one per row it can hold; only deciding the same rows again under
+/// a changed word can reach it. Past it the OLDEST owed receipt is dropped: a
+/// bounded queue behind a broker that is not coming back, never an unbounded
+/// one.
+const RECEIPTS_OWED_MAX: usize = RING_CAP;
+
+/// How much longer than `dl=` a bare `post --wait-ack` waits for the ASKER's
+/// own bridge to record `expired`. The endpoint's clock starts at the landing
+/// report, which follows the publish the bridge's clock starts at, so the
+/// endpoint is never EARLY; but the bridge notices on a 250 ms sweep, reads the
+/// asker's lane, publishes the verdict, and the verdict is then delivered back
+/// here. With no grace the wait ended first every time — `ERR timeout` at
+/// 1.5–1.8 s for a 1.5 s `dl=`, the `expired` row landing just after it — while
+/// the help promised `ERR expired`. The grace bounds only the case where no
+/// verdict ever comes: a verdict (or an `ack`) that arrives ends the wait at
+/// once.
+const EXPIRY_GRACE_MS: u64 = 5_000;
+
 /// One delivered message. Every field is a wire token the `inbox` row prints
 /// verbatim; free text is pct-encoded ONCE, at delivery, so the listing never
 /// re-encodes and the body `inbox get` returns is the decoded original.
@@ -285,6 +320,14 @@ pub(crate) struct InboxRow {
     pub dl: Option<u64>,
     /// The answer arrived after the deadline had already been recorded expired.
     pub late: bool,
+    /// On a `kind=ack` row: the RECIPIENT's verdict on the `ask`/`task` at
+    /// `re=` — one of [`VERDICTS`], published by their bridge when they ran
+    /// `inbox seen <id> <verdict>` (R8). Printed as `verdict=` on the row.
+    pub verdict: Option<String>,
+    /// THIS session's verdict on the row, as `inbox seen <id> <verdict>` last
+    /// recorded it. Internal: it is what keeps a repeated `inbox seen` under
+    /// the same word from recording — and so from acking — twice.
+    pub decision: Option<String>,
     /// The kind this message CLAIMED before the receiver demoted it (a relayed
     /// row is always `note`, whatever it says it is).
     pub demoted: Option<String>,
@@ -328,6 +371,21 @@ pub(crate) struct PostRow {
     pub dl: Option<u64>,
     /// The relay chain, when the sender declared one.
     pub via: Option<String>,
+    /// The caller's idempotency key (`post key=<token>`), carried to the bridge
+    /// on every `outbox` drain — a PEEK, so a relaunched bridge reads the same
+    /// key from the same row — and cleared at retirement like the body. The
+    /// bridge maps it to a durably reserved producer sequence BEFORE publishing
+    /// and reuses that sequence on any later post under the same key, so the
+    /// broker's own `(producer_id, producer_seq)` dedup makes a re-post exactly
+    /// once and answers the ORIGINAL offset. Grammar-bounded ([`valid_key`]),
+    /// so not folded into [`PostRow::caller_sized_bytes`] for the reason `to`
+    /// is not.
+    pub key: Option<String>,
+    /// The bridge retired this post `dup=1`: the broker deduped the publish
+    /// because an earlier post under the same `key=` had already reserved the
+    /// sequence, so `off` is that earlier record's and nothing was appended.
+    /// The parked `post --wait` answers `OK <id> off=<n> dup=1`.
+    pub dup: bool,
     /// Retired as permanently undeliverable (`outbox sent … off=-`). A dead post
     /// is neither queued nor landed: it releases its `--wait` with an error and
     /// stops appearing in `inbox`'s in-flight rows.
@@ -442,10 +500,165 @@ struct Inbox {
     dropped: u64,
     /// The highest offset ever delivered here.
     bus_head: u64,
+    /// The LOWEST offset ever delivered (or fetched) here — the header's
+    /// `oldest_on_bus=@<off>`. Every one of THIS SESSION's records from it to
+    /// `bus_head` is on the broker's log whether or not the ring still holds it
+    /// (the broker keeps no retention yet, R4), so `inbox get @<off>` can fetch
+    /// any of them; the offsets in between are the whole fleet's, and most are
+    /// other lanes' (`ERR no such record`). `None` until the first delivery.
+    oldest_on_bus: Option<u64>,
     /// Offsets already delivered, newest last, capped at [`DEDUP_CAP`].
     dedup: VecDeque<u64>,
     dedup_set: HashSet<u64>,
     hold: Option<Hold>,
+    /// The `inbox get @<off>` reads parked for the bridge (`Pending`, listed on
+    /// the `outbox` peek as `fetch sid= off=`) and the ones it answered
+    /// (`Done`/`Failed`, kept so a second read of an immutable record costs no
+    /// second bus read). Bounded at [`FETCH_SLOTS`]: an answered slot is
+    /// evicted to make room, a pending one never is.
+    fetches: VecDeque<(u64, FetchSlot)>,
+    /// The receipts this session OWES a sender (R8), oldest first, bounded at
+    /// [`RECEIPTS_OWED_MAX`]: listed on every `outbox` peek as `receipt sid=
+    /// rid= off= verdict= kind= from=` until the bridge retires one with
+    /// `deliver <sid> receipt=<rid> off=<n|->`. See [`OwedReceipt`].
+    receipts: VecDeque<OwedReceipt>,
+    /// The last [`OwedReceipt::rid`] handed out. Monotone per session.
+    next_receipt_id: u64,
+}
+
+/// One receipt a session owes a sender (R8), HELD HERE — in the one process
+/// that outlives both a broker outage and a bridge relaunch — until the bridge
+/// reports the `ack` published.
+///
+/// IT USED TO RIDE THE EVENTS DIGEST ALONE: the bridge published the `ack`
+/// straight from the `inbox-seen` event, and an event is gone once it is
+/// emitted. Three ordinary moments lost it for good — a bridge reconnecting to
+/// the broker (its back-off discards every mailbox item but aterm's closure), a
+/// publish that failed (only logged), and a bridge relaunch (the new one
+/// subscribes with no replay) — and since a verdict is recorded once per row per
+/// change, the recipient could not even say it again. The `outbox` peek is how
+/// a POST survives exactly those three, so a receipt rides it too: listed on
+/// every drain until retired, and published under a producer sequence the
+/// bridge pins to `(sid, rid)`, so a retry after a crash is the broker's
+/// `deduped` rather than a second `ack` on the sender's lane.
+#[derive(Clone, Debug)]
+struct OwedReceipt {
+    /// Per-session and monotone: the bridge's pin key, and the retirement's
+    /// name.
+    rid: u64,
+    /// The decided row's broker offset — the receipt's `re=`.
+    off: u64,
+    /// One of [`VERDICTS`].
+    verdict: String,
+    /// The row's kind as this endpoint classified it: `ask` or `task`.
+    kind: String,
+    /// The row's `from=` token — what addresses the receipt.
+    from: String,
+}
+
+/// Queue one receipt, handing out its `rid` and keeping the bound.
+fn owe_receipt(inbox: &mut Inbox, off: u64, verdict: &str, kind: &str, from: &str) {
+    inbox.next_receipt_id += 1;
+    let rid = inbox.next_receipt_id;
+    inbox.receipts.push_back(OwedReceipt {
+        rid,
+        off,
+        verdict: verdict.to_string(),
+        kind: kind.to_string(),
+        from: from.to_string(),
+    });
+    while inbox.receipts.len() > RECEIPTS_OWED_MAX {
+        inbox.receipts.pop_front();
+    }
+}
+
+/// One `inbox get @<off>` read, from parked to answered.
+#[derive(Clone, Debug)]
+enum FetchSlot {
+    Pending,
+    /// The bridge is answering in chunks (`more=1`) and this much has come:
+    /// still waiting, and still listed on the `outbox` peek — a bridge that
+    /// dies mid-answer leaves it here, and its replacement starts again at
+    /// `at=0`.
+    Partial(Fetched),
+    Done(Fetched),
+    /// The bridge's one-token reason: `no-record` (not on this session's lane,
+    /// or nothing there), `unreadable`, `observer`, `forged-self`, `via`,
+    /// `oversize`, or `refused` (the bridge's follow-up to an answer this
+    /// endpoint refused) — and `malformed`, which [`refuse_fetched`] records
+    /// here itself for the read an unacceptable answer was meant for.
+    Failed(String),
+}
+
+/// One record as the bridge fetched it from the log — the fields a `msg` row
+/// carries, without a row id, because it was never (re)appended to the ring.
+#[derive(Clone, Debug)]
+struct Fetched {
+    off: u64,
+    from: String,
+    kind: String,
+    trust: String,
+    re: Option<u64>,
+    dl: Option<u64>,
+    demoted: Option<String>,
+    via: Option<String>,
+    verdict: Option<String>,
+    len: usize,
+    body: String,
+}
+
+impl Fetched {
+    /// The same answer, for a record the ring still holds.
+    fn from_row(row: &InboxRow) -> Self {
+        Self {
+            off: row.off,
+            from: row.from.clone(),
+            kind: row.kind.clone(),
+            trust: row.trust.clone(),
+            re: row.re,
+            dl: row.dl,
+            demoted: row.demoted.clone(),
+            via: row.via.clone(),
+            verdict: row.verdict.clone(),
+            len: row.len,
+            body: row.body.clone(),
+        }
+    }
+
+    /// `OK <nbytes> off=<n> from=<p> kind=<k> trust=<t> … [truncated=1 len=<n>]`
+    /// then the body: only the first token after `OK` is the frame length, so
+    /// the record's own fields ride the tail exactly as `truncated=1` does.
+    fn render(&self) -> String {
+        let mut s = format!(
+            "OK {} off={} from={} kind={} trust={}",
+            self.body.len(),
+            self.off,
+            self.from,
+            self.kind,
+            self.trust
+        );
+        if let Some(re) = self.re {
+            s.push_str(&format!(" re={re}"));
+        }
+        if let Some(dl) = self.dl {
+            s.push_str(&format!(" dl={dl}"));
+        }
+        if let Some(d) = &self.demoted {
+            s.push_str(&format!(" demoted={d}"));
+        }
+        if let Some(v) = &self.via {
+            s.push_str(&format!(" via={v}"));
+        }
+        if let Some(v) = &self.verdict {
+            s.push_str(&format!(" verdict={v}"));
+        }
+        if self.len > self.body.len() {
+            s.push_str(&format!(" truncated=1 len={}", self.len));
+        }
+        s.push('\n');
+        s.push_str(&self.body);
+        s
+    }
 }
 
 impl Inbox {
@@ -1520,6 +1733,21 @@ fn valid_via(via: &str) -> bool {
             .all(|hop| !hop.contains('@') && valid_principal(hop))
 }
 
+/// The most bytes a `post key=` may carry.
+pub(crate) const KEY_MAX: usize = 64;
+
+/// A `post key=` token: one to [`KEY_MAX`] bytes of `[A-Za-z0-9._:-]` — the
+/// charset of every id this protocol already prints (sids, `<epoch>:<producer>:
+/// <seq>` feed ids, rfc3339 stamps), so a caller can mint one from anything it
+/// already holds and it can never split a wire line or a state-dir line.
+fn valid_key(key: &str) -> bool {
+    !key.is_empty()
+        && key.len() <= KEY_MAX
+        && key
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'.' | b'_' | b':' | b'-'))
+}
+
 /// Split `k=v` and keep the value, for a token that must be exactly one `k=v`.
 fn kv<'a>(tok: &'a str, key: &str) -> Option<&'a str> {
     tok.strip_prefix(key)
@@ -1633,7 +1861,8 @@ fn apply_hold(ctx: &SessionCtx, hold: Option<Hold>, issuer: HoldIssuer) -> Appli
 /// not enough: [`link_evidence`] is reached from `deliver` and `outbox sent`,
 /// which sibling tests call OUTSIDE that mutex, and in a test there is no
 /// serving lane — so `lane_generation()` is `None`, which is exactly the shape
-/// `link_evidence`'s own gate accepts ("a bridge from before the report"). Such
+/// `link_evidence`'s own gate accepted ("a bridge from before the report")
+/// until it came to require the explicit incarnation that owns the link. Such
 /// a call found the SECTION's fresh attach (`stalled reason=starting`, a
 /// non-zero owner) and flipped it to `connected` under the test that was
 /// measuring it.
@@ -1849,8 +2078,13 @@ pub(crate) fn cmd_hold(store: &Store, rest: &str, issuer: HoldIssuer) -> String 
 // ---------------------------------------------------------------------------
 
 const DELIVER_USAGE: &str = "ERR usage: deliver <sid> off=<n> from=<p> kind=<k> trust=<t> \
-                             [re=<n>] [dl=<ms>] [late=1] [demoted=<k>] [via=<p,...>] [len=<n>] \
-                             [text=<pct>] | deliver <sid> landed=<post-id> off=<n>\n";
+                             [re=<n>] [dl=<ms>] [late=1] [demoted=<k>] [via=<p,...>] \
+                             [verdict=<handled|refused|deferred>] [len=<n>] [text=<pct>] \
+                             | deliver <sid> landed=<post-id> off=<n> \
+                             | deliver <sid> fetched=<off> (err=<token> | from=<p> kind=<k> \
+                             trust=<t> [re=<n>] [dl=<ms>] [demoted=<k>] [via=<p,...>] \
+                             [verdict=<v>] [len=<n>] [at=<n>] [more=1] [text=<pct>]) \
+                             | deliver <sid> receipt=<rid> off=<n|->\n";
 
 /// `deliver` — put one bus record in a session's inbox, or close an outbound post.
 /// BRIDGE-ONLY (the dispatch gates the scope).
@@ -1888,7 +2122,327 @@ pub(crate) fn cmd_deliver(store: &Store, rest: &str) -> String {
     if rest_toks.iter().any(|t| t.starts_with("landed=")) {
         return deliver_landed(&ctx, &rest_toks);
     }
+    if rest_toks.iter().any(|t| t.starts_with("fetched=")) {
+        return deliver_fetched(&ctx, &rest_toks);
+    }
+    if rest_toks.iter().any(|t| t.starts_with("receipt=")) {
+        return deliver_receipt(&ctx, &rest_toks);
+    }
     deliver_row(&ctx, &rest_toks)
+}
+
+/// `deliver <sid> receipt=<rid> off=<n|->` — the bridge retiring a receipt this
+/// session OWED (R8, [`OwedReceipt`]): `off=<n>` is where the `ack` landed on
+/// the sender's lane, `off=-` that the bridge decided there was none to send (it
+/// serves no `--receipts`, the sender has no lane, the kind does not wait).
+/// Either way the receipt leaves the `outbox` peek.
+///
+/// IDEMPOTENT, and a rid already retired answers `OK` as well: the bridge
+/// forgets the producer sequence it pinned to the receipt only on an `OK`, so a
+/// retirement retried after a lost reply must not strand that pin.
+fn deliver_receipt(ctx: &SessionCtx, toks: &[&str]) -> String {
+    let mut rid: Option<u64> = None;
+    let mut landed = false;
+    for tok in toks {
+        if let Some(v) = kv(tok, "receipt") {
+            match v.parse() {
+                Ok(n) => rid = Some(n),
+                Err(_) => return DELIVER_USAGE.to_string(),
+            }
+        } else if let Some(v) = kv(tok, "off") {
+            if v != "-" && v.parse::<u64>().is_err() {
+                return DELIVER_USAGE.to_string();
+            }
+            landed = true;
+        } else {
+            return DELIVER_USAGE.to_string();
+        }
+    }
+    let (Some(rid), true) = (rid, landed) else {
+        return DELIVER_USAGE.to_string();
+    };
+    ctx.fabric.lock().receipts.retain(|r| r.rid != rid);
+    "OK\n".to_string()
+}
+
+/// `deliver <sid> fetched=<off> …` — the bridge answering an `inbox get @<off>`
+/// this session parked (E3, "nothing lost"): the record as the bridge read it
+/// off the broker's log, classified by the same code that classified it at
+/// delivery, or `err=<token>` for why there is none. It TOUCHES NO RING — no
+/// row, no id, no watermark, no quota, no event: the parked read takes the
+/// answer and that is the whole effect. Idempotent: a complete answer for an
+/// offset nothing waits on is kept as an answered slot (bounded), which is
+/// exactly what a read that timed out a moment ago will ask for next.
+///
+/// IN CHUNKS WHEN THE BODY DOES NOT FIT ONE LINE. A body the delivery had to cut
+/// (`truncated=1`) is the case this verb exists for, and the control line that
+/// cut it is the same line this answer travels on — one line could only ever
+/// carry it cut again. So the bridge sends consecutive lines, each a whole
+/// `fetched=` line with the same fields: `at=<n>` is the byte offset in the
+/// DECODED body where its `text=` starts (0 when absent) and `more=1` marks
+/// every line but the last. A chunk extends the partial answer at exactly its
+/// end; `at=0` starts afresh, which is also what a bridge relaunched mid-answer
+/// does. `len=` is the record's true body length and may exceed [`BODY_MAX`] —
+/// a record over it arrives cut at [`BODY_MAX`] and reads `truncated=1 len=` —
+/// while the body carried is bounded by [`BODY_MAX`] like every other.
+///
+/// A REFUSED ANSWER ENDS THE READ WAITING ON IT (`ERR fetch failed
+/// reason=malformed`) rather than leaving it parked: a pending slot is listed on
+/// every `outbox` peek, so a refusal the bridge could only log used to be
+/// fetched again, and refused again, on every drain until the read timed out.
+fn deliver_fetched(ctx: &SessionCtx, toks: &[&str]) -> String {
+    let mut off: Option<u64> = None;
+    let mut err: Option<String> = None;
+    let mut at: usize = 0;
+    let mut more = false;
+    let mut fields: Vec<&str> = Vec::with_capacity(toks.len());
+    for tok in toks {
+        if let Some(v) = kv(tok, "fetched") {
+            match v.parse() {
+                Ok(n) => off = Some(n),
+                Err(_) => return DELIVER_USAGE.to_string(),
+            }
+        } else if let Some(v) = kv(tok, "err") {
+            // A bridge is a separate process and its output is still input:
+            // the reason is one bounded token or the line is refused.
+            if !valid_dead_reason(v) {
+                return DELIVER_USAGE.to_string();
+            }
+            err = Some(v.to_string());
+        } else if let Some(v) = kv(tok, "at") {
+            match v.parse() {
+                Ok(n) => at = n,
+                Err(_) => return DELIVER_USAGE.to_string(),
+            }
+        } else if *tok == "more=1" {
+            more = true;
+        } else {
+            fields.push(tok);
+        }
+    }
+    let Some(off) = off else {
+        return DELIVER_USAGE.to_string();
+    };
+    let slot = match err {
+        Some(why) => FetchSlot::Failed(why),
+        None => {
+            let f = match parse_deliver_fields(&fields, usize::MAX) {
+                Ok(f) if !f.late && f.off.is_none() => f,
+                Ok(_) => return refuse_fetched(ctx, off, DELIVER_USAGE),
+                Err(reply) => return refuse_fetched(ctx, off, &reply),
+            };
+            let mut inbox = ctx.fabric.lock();
+            let mut body = String::new();
+            if at > 0 {
+                let partial = inbox.fetches.iter_mut().find_map(|(o, slot)| match slot {
+                    FetchSlot::Partial(p) if *o == off && p.body.len() == at => Some(p),
+                    _ => None,
+                });
+                let Some(p) = partial else {
+                    drop(inbox);
+                    return refuse_fetched(ctx, off, "ERR fetch out of order\n");
+                };
+                body = std::mem::take(&mut p.body);
+            }
+            body.push_str(&f.body);
+            if body.len() > BODY_MAX {
+                drop(inbox);
+                return refuse_fetched(ctx, off, "ERR too large\n");
+            }
+            drop(inbox);
+            let fetched = Fetched {
+                off,
+                from: f.from,
+                kind: f.kind,
+                trust: f.trust,
+                re: f.re,
+                dl: f.dl,
+                demoted: f.demoted,
+                via: f.via,
+                verdict: f.verdict,
+                len: f.declared_len.unwrap_or(body.len()).max(body.len()),
+                body,
+            };
+            if more {
+                FetchSlot::Partial(fetched)
+            } else {
+                FetchSlot::Done(fetched)
+            }
+        }
+    };
+    let mut inbox = ctx.fabric.lock();
+    if matches!(slot, FetchSlot::Done(_)) {
+        inbox.oldest_on_bus = Some(inbox.oldest_on_bus.map_or(off, |o| o.min(off)));
+    }
+    match inbox.fetches.iter().position(|(o, _)| *o == off) {
+        Some(i) => inbox.fetches[i].1 = slot,
+        // NOTHING WAITS ON THIS OFFSET. A complete answer is kept (bounded) for
+        // the read that asks next; a chunk or a failure is not — a partial
+        // answer nobody asked for would be listed for the bridge to fetch
+        // again, and a failure is only ever consumed by the read it answers.
+        None if !matches!(slot, FetchSlot::Done(_)) => return "OK unrequested=1\n".to_string(),
+        None => {
+            evict_answered_fetch(&mut inbox);
+            if inbox.fetches.len() >= FETCH_SLOTS {
+                // Every slot is a parked read of some OTHER offset: nothing
+                // waits on this one, so keeping it would evict nothing safely.
+                return "OK unrequested=1\n".to_string();
+            }
+            inbox.fetches.push_back((off, slot));
+        }
+    }
+    drop(inbox);
+    ctx.fabric.changed.notify_all();
+    "OK\n".to_string()
+}
+
+/// Refuse one `fetched=` line, and FAIL the read parked on its offset if one
+/// is: the reply is the refusal the bridge logs, and the reader is told now —
+/// `ERR fetch failed reason=malformed` — instead of at its timeout.
+fn refuse_fetched(ctx: &SessionCtx, off: u64, reply: &str) -> String {
+    let mut inbox = ctx.fabric.lock();
+    let waiting = inbox
+        .fetches
+        .iter_mut()
+        .find(|(o, s)| *o == off && matches!(s, FetchSlot::Pending | FetchSlot::Partial(_)));
+    if let Some((_, slot)) = waiting {
+        *slot = FetchSlot::Failed("malformed".to_string());
+        drop(inbox);
+        ctx.fabric.changed.notify_all();
+    }
+    reply.to_string()
+}
+
+/// Drop the oldest ANSWERED fetch slot once the table is full. A pending one
+/// is never dropped: a parked read must find its answer or its timeout.
+fn evict_answered_fetch(inbox: &mut Inbox) {
+    if inbox.fetches.len() < FETCH_SLOTS {
+        return;
+    }
+    if let Some(i) = inbox
+        .fetches
+        .iter()
+        .position(|(_, s)| !matches!(s, FetchSlot::Pending | FetchSlot::Partial(_)))
+    {
+        inbox.fetches.remove(i);
+    }
+}
+
+/// The parsed fields of a `deliver` row line — shared by the ring form and the
+/// `fetched=` form so the two cannot admit different grammars.
+struct DeliverFields {
+    off: Option<u64>,
+    from: String,
+    kind: String,
+    trust: String,
+    re: Option<u64>,
+    dl: Option<u64>,
+    late: bool,
+    demoted: Option<String>,
+    via: Option<String>,
+    verdict: Option<String>,
+    /// Body length in bytes before any bridge-side cut (`len=`), else the
+    /// body's own.
+    len: usize,
+    /// The `len=` token itself, when the line carried one.
+    declared_len: Option<usize>,
+    body: String,
+}
+
+/// Parse the `k=v` tokens of a `deliver` row: `Err` is the reply to give.
+/// `len_max` bounds `len=`: [`BODY_MAX`] for a row the ring will hold, and
+/// nothing for a `fetched=` answer, whose `len=` is the size of a record on
+/// the log and whose carried body is bounded where it is assembled.
+fn parse_deliver_fields(toks: &[&str], len_max: usize) -> Result<DeliverFields, String> {
+    let mut f = DeliverFields {
+        off: None,
+        from: String::new(),
+        kind: String::new(),
+        trust: String::new(),
+        re: None,
+        dl: None,
+        late: false,
+        demoted: None,
+        via: None,
+        verdict: None,
+        len: 0,
+        declared_len: None,
+        body: String::new(),
+    };
+    let mut declared_len: Option<usize> = None;
+    let mut text = String::new();
+    for tok in toks {
+        if let Some(v) = kv(tok, "off") {
+            match v.parse() {
+                Ok(n) => f.off = Some(n),
+                Err(_) => return Err(DELIVER_USAGE.to_string()),
+            }
+        } else if let Some(v) = kv(tok, "from") {
+            f.from = v.to_string();
+        } else if let Some(v) = kv(tok, "kind") {
+            f.kind = v.to_string();
+        } else if let Some(v) = kv(tok, "trust") {
+            f.trust = v.to_string();
+        } else if let Some(v) = kv(tok, "re") {
+            match v.parse() {
+                Ok(n) => f.re = Some(n),
+                Err(_) => return Err(DELIVER_USAGE.to_string()),
+            }
+        } else if let Some(v) = kv(tok, "dl") {
+            match v.parse() {
+                Ok(n) => f.dl = Some(n),
+                Err(_) => return Err(DELIVER_USAGE.to_string()),
+            }
+        } else if let Some(v) = kv(tok, "late") {
+            f.late = v == "1";
+        } else if let Some(v) = kv(tok, "demoted") {
+            if !KINDS.contains(&v) {
+                return Err(DELIVER_USAGE.to_string());
+            }
+            f.demoted = Some(v.to_string());
+        } else if let Some(v) = kv(tok, "via") {
+            if !valid_via(v) {
+                return Err(DELIVER_USAGE.to_string());
+            }
+            f.via = Some(v.to_string());
+        } else if let Some(v) = kv(tok, "verdict") {
+            // CLOSED, like `trust=`: a receipt's word is one of three, and an
+            // agent never reads a verdict token this endpoint did not classify.
+            if !VERDICTS.contains(&v) {
+                return Err(DELIVER_USAGE.to_string());
+            }
+            f.verdict = Some(v.to_string());
+        } else if let Some(v) = kv(tok, "len") {
+            match v.parse::<usize>() {
+                Ok(n) if n <= len_max => declared_len = Some(n),
+                _ => return Err("ERR too large\n".to_string()),
+            }
+        } else if let Some(v) = kv(tok, "text") {
+            text = v.to_string();
+        } else {
+            return Err(DELIVER_USAGE.to_string());
+        }
+    }
+    if !valid_principal(&f.from) || !KINDS.contains(&f.kind.as_str()) {
+        return Err(DELIVER_USAGE.to_string());
+    }
+    // `trust=` is the RECEIVER's verdict, computed by the bridge from (face,
+    // sender class, relay), and the endpoint refuses a label it does not know
+    // rather than passing an uninterpreted token to an agent as if it meant
+    // something. The default is the conservative one, not the trusting one.
+    if f.trust.is_empty() {
+        f.trust = "agent".to_string();
+    }
+    if !TRUSTS.contains(&f.trust.as_str()) {
+        return Err(DELIVER_USAGE.to_string());
+    }
+    f.body = aterm_control::wire::pct_decode(&text);
+    if f.body.len() > BODY_MAX {
+        return Err("ERR too large\n".to_string());
+    }
+    f.len = declared_len.unwrap_or(f.body.len());
+    f.declared_len = declared_len;
+    Ok(f)
 }
 
 /// `deliver <sid> landed=<post-id> off=<n>` — the §11.2 spelling of a post's
@@ -1910,7 +2464,7 @@ fn deliver_landed(ctx: &SessionCtx, toks: &[&str]) -> String {
     let (Some(post_id), Some(off)) = (post_id, off) else {
         return DELIVER_USAGE.to_string();
     };
-    match retire_post(ctx, post_id, Some(off), DEAD_DEFAULT) {
+    match retire_post(ctx, post_id, Some(off), DEAD_DEFAULT, false) {
         Ok(()) => "OK\n".to_string(),
         Err(e) => e,
     }
@@ -1930,6 +2484,7 @@ fn retire_post(
     post_id: u64,
     off: Option<u64>,
     reason: &str,
+    dup: bool,
 ) -> Result<(), String> {
     let mut inbox = ctx.fabric.lock();
     let Some(row) = inbox.posts.iter_mut().find(|p| p.id == post_id) else {
@@ -1940,7 +2495,13 @@ fn retire_post(
         None => row.dead,
     };
     match off {
-        Some(n) => row.off = Some(n),
+        Some(n) => {
+            row.off = Some(n);
+            // STICKY, like the offset: a retirement retried without the flag
+            // (a bridge that died between `outbox sent` and its reply) must
+            // not turn a duplicate back into an original.
+            row.dup |= dup;
+        }
         None => {
             row.dead = true;
             row.dead_reason = reason.to_string();
@@ -1958,6 +2519,7 @@ fn retire_post(
     row.body.clear();
     row.body.shrink_to_fit();
     row.via = None;
+    row.key = None;
     if !already {
         let payload = match off {
             Some(n) => format!("{post_id} off={n}"),
@@ -1978,8 +2540,8 @@ fn retire_post(
 // outbox / outbox sent
 // ---------------------------------------------------------------------------
 
-const OUTBOX_USAGE: &str =
-    "ERR usage: outbox [<max>] | outbox sent <sid> <post-id> off=<n|-> [reason=<word>]\n";
+const OUTBOX_USAGE: &str = "ERR usage: outbox [<max>] | outbox sent <sid> <post-id> off=<n|-> \
+                            [dup=1] [reason=<word>]\n";
 
 /// The verdict a bare `off=-` carries, and the only one A2 could express.
 const DEAD_DEFAULT: &str = "undeliverable";
@@ -2050,7 +2612,7 @@ pub(crate) fn cmd_outbox(store: &Store, rest: &str) -> String {
     };
     let mut payload = String::new();
     let mut sent = 0usize;
-    for h in handles {
+    for h in &handles {
         if sent >= max || payload.len() >= OUTBOX_DRAIN_BYTES_MAX {
             break;
         }
@@ -2077,9 +2639,36 @@ pub(crate) fn cmd_outbox(store: &Store, rest: &str) -> String {
             if let Some(via) = &post.via {
                 payload.push_str(&format!(" via={via}"));
             }
+            if let Some(key) = &post.key {
+                payload.push_str(&format!(" key={key}"));
+            }
             payload.push_str(&format!(" len={}\n", post.body.len()));
             payload.push_str(&post.body);
             sent += 1;
+        }
+    }
+    // THE OWED RECEIPTS AND THE PARKED READS, AFTER EVERY POST: one bodiless
+    // `receipt sid=<sid> rid=<n> off=<n> verdict=<v> kind=<k> from=<p>` line
+    // per receipt this session owes (R8; the bridge publishes the `ack` and
+    // retires it with `deliver <sid> receipt=<rid>`), and one `fetch sid=<sid>
+    // off=<n>` line per `inbox get @<off>` waiting on the bridge. After, so a
+    // bridge from before this rung — whose parser stops at the first line
+    // without a `len=` — still drains every post. Not counted against `<max>`
+    // or the byte budget: each is one short line, and both are bounded per
+    // session ([`RECEIPTS_OWED_MAX`], [`FETCH_SLOTS`]).
+    for h in &handles {
+        let sid = h.sid.as_str();
+        let inbox = h.ctx.fabric.lock();
+        for r in &inbox.receipts {
+            payload.push_str(&format!(
+                "receipt sid={sid} rid={} off={} verdict={} kind={} from={}\n",
+                r.rid, r.off, r.verdict, r.kind, r.from
+            ));
+        }
+        for (off, slot) in &inbox.fetches {
+            if matches!(slot, FetchSlot::Pending | FetchSlot::Partial(_)) {
+                payload.push_str(&format!("fetch sid={sid} off={off}\n"));
+            }
         }
     }
     format!("OK {}\n{payload}", payload.len())
@@ -2093,7 +2682,12 @@ pub(crate) fn cmd_outbox_sent(store: &Store, rest: &str) -> String {
         return OUTBOX_USAGE.to_string();
     };
     let mut reason = DEAD_DEFAULT;
+    let mut dup = false;
     for tok in toks {
+        if tok == "dup=1" {
+            dup = true;
+            continue;
+        }
         match kv(tok, "reason") {
             Some(v) if valid_dead_reason(v) => reason = v,
             _ => return OUTBOX_USAGE.to_string(),
@@ -2112,6 +2706,11 @@ pub(crate) fn cmd_outbox_sent(store: &Store, rest: &str) -> String {
             Err(_) => return OUTBOX_USAGE.to_string(),
         },
     };
+    // A duplicate LANDED, by definition: `dup=1` names the original record's
+    // offset, and a dead post has none to name.
+    if dup && off.is_none() {
+        return OUTBOX_USAGE.to_string();
+    }
     let ctx = {
         let g = store.read().unwrap_or_else(|p| p.into_inner());
         match g.by_sid(&SessionId::new(sid)) {
@@ -2121,92 +2720,35 @@ pub(crate) fn cmd_outbox_sent(store: &Store, rest: &str) -> String {
     };
     note_bridge_touched(store, sid);
     link_evidence(lane_generation());
-    match retire_post(&ctx, post_id, off, reason) {
+    match retire_post(&ctx, post_id, off, reason, dup) {
         Ok(()) => "OK\n".to_string(),
         Err(e) => e,
     }
 }
 
 /// The ordinary `deliver`: one message row.
-#[allow(clippy::too_many_lines)]
 fn deliver_row(ctx: &SessionCtx, toks: &[&str]) -> String {
-    let mut off: Option<u64> = None;
-    let mut from = String::new();
-    let mut kind = String::new();
-    let mut trust = String::new();
-    let mut re: Option<u64> = None;
-    let mut dl: Option<u64> = None;
-    let mut late = false;
-    let mut demoted: Option<String> = None;
-    let mut via: Option<String> = None;
-    let mut declared_len: Option<usize> = None;
-    let mut text = String::new();
-    for tok in toks {
-        if let Some(v) = kv(tok, "off") {
-            match v.parse() {
-                Ok(n) => off = Some(n),
-                Err(_) => return DELIVER_USAGE.to_string(),
-            }
-        } else if let Some(v) = kv(tok, "from") {
-            from = v.to_string();
-        } else if let Some(v) = kv(tok, "kind") {
-            kind = v.to_string();
-        } else if let Some(v) = kv(tok, "trust") {
-            trust = v.to_string();
-        } else if let Some(v) = kv(tok, "re") {
-            match v.parse() {
-                Ok(n) => re = Some(n),
-                Err(_) => return DELIVER_USAGE.to_string(),
-            }
-        } else if let Some(v) = kv(tok, "dl") {
-            match v.parse() {
-                Ok(n) => dl = Some(n),
-                Err(_) => return DELIVER_USAGE.to_string(),
-            }
-        } else if let Some(v) = kv(tok, "late") {
-            late = v == "1";
-        } else if let Some(v) = kv(tok, "demoted") {
-            if !KINDS.contains(&v) {
-                return DELIVER_USAGE.to_string();
-            }
-            demoted = Some(v.to_string());
-        } else if let Some(v) = kv(tok, "via") {
-            if !valid_via(v) {
-                return DELIVER_USAGE.to_string();
-            }
-            via = Some(v.to_string());
-        } else if let Some(v) = kv(tok, "len") {
-            match v.parse::<usize>() {
-                Ok(n) if n <= BODY_MAX => declared_len = Some(n),
-                _ => return "ERR too large\n".to_string(),
-            }
-        } else if let Some(v) = kv(tok, "text") {
-            text = v.to_string();
-        } else {
-            return DELIVER_USAGE.to_string();
-        }
-    }
+    let DeliverFields {
+        off,
+        from,
+        kind,
+        trust,
+        re,
+        dl,
+        late,
+        demoted,
+        via,
+        verdict,
+        len,
+        declared_len: _,
+        body,
+    } = match parse_deliver_fields(toks, BODY_MAX) {
+        Ok(f) => f,
+        Err(reply) => return reply,
+    };
     let Some(off) = off else {
         return DELIVER_USAGE.to_string();
     };
-    if !valid_principal(&from) || !KINDS.contains(&kind.as_str()) {
-        return DELIVER_USAGE.to_string();
-    }
-    // `trust=` is the RECEIVER's verdict, computed by the bridge from (face,
-    // sender class, relay), and the endpoint refuses a label it does not know
-    // rather than passing an uninterpreted token to an agent as if it meant
-    // something. The default is the conservative one, not the trusting one.
-    if trust.is_empty() {
-        trust = "agent".to_string();
-    }
-    if !TRUSTS.contains(&trust.as_str()) {
-        return DELIVER_USAGE.to_string();
-    }
-    let body = aterm_control::wire::pct_decode(&text);
-    if body.len() > BODY_MAX {
-        return "ERR too large\n".to_string();
-    }
-    let len = declared_len.unwrap_or(body.len());
 
     let mut inbox = ctx.fabric.lock();
     // IDEMPOTENCY, before anything else: the offset decides, and a duplicate
@@ -2251,6 +2793,8 @@ fn deliver_row(ctx: &SessionCtx, toks: &[&str]) -> String {
         re_id,
         dl,
         late,
+        verdict,
+        decision: None,
         demoted,
         via,
         len,
@@ -2260,6 +2804,7 @@ fn deliver_row(ctx: &SessionCtx, toks: &[&str]) -> String {
     evict_for(&mut inbox);
     inbox.rows.push_back(row);
     inbox.bus_head = inbox.bus_head.max(off);
+    inbox.oldest_on_bus = Some(inbox.oldest_on_bus.map_or(off, |o| o.min(off)));
     remember_offset(&mut inbox, off);
     ctx.timeline
         .lock()
@@ -2340,7 +2885,8 @@ fn evict_for(inbox: &mut Inbox) {
 // inbox / inbox get / inbox seen
 // ---------------------------------------------------------------------------
 
-const INBOX_USAGE: &str = "ERR usage: inbox [<n>] [since=<id>] [--peek] [--meta] | inbox get <id> \
+const INBOX_USAGE: &str = "ERR usage: inbox [<n>] [since=<id>] [--peek] [--meta] \
+                           | inbox get <id> | inbox get @<off> \
                            | inbox seen <id> [handled|refused|deferred]\n";
 
 /// `inbox` — the whole keyword, sub-forms included. The three forms split HERE
@@ -2418,13 +2964,17 @@ pub(crate) fn cmd_inbox(ctx: &SessionCtx, rest: &str) -> String {
         .iter()
         .filter(|p| p.off.is_none() && !p.dead)
         .map(|p| {
-            format!(
+            let mut s = format!(
                 "post {} to={} kind={} off=- len={}",
                 p.id,
                 p.to,
                 p.kind,
                 p.body.len()
-            )
+            );
+            if let Some(k) = &p.key {
+                s.push_str(&format!(" key={k}"));
+            }
+            s
         })
         .collect();
 
@@ -2454,8 +3004,12 @@ pub(crate) fn cmd_inbox(ctx: &SessionCtx, rest: &str) -> String {
         }
     }
 
+    let oldest = inbox
+        .oldest_on_bus
+        .map_or_else(|| "-".to_string(), |o| format!("@{o}"));
     let header = format!(
-        "OK {} hold={hold_flag} holder={holder} seen={} bus_head={} dropped={} pending={pending}\n",
+        "OK {} hold={hold_flag} holder={holder} seen={} bus_head={} oldest_on_bus={oldest} \
+         dropped={} pending={pending}\n",
         msg_lines.len() + post_lines.len(),
         inbox.seen,
         inbox.bus_head,
@@ -2482,6 +3036,9 @@ fn render_row(row: &InboxRow, meta_only: bool) -> String {
         if let Some(re_id) = row.re_id {
             s.push_str(&format!(" re-id={re_id}"));
         }
+    }
+    if let Some(v) = &row.verdict {
+        s.push_str(&format!(" verdict={v}"));
     }
     if let Some(dl) = row.dl {
         s.push_str(&format!(" dl={dl}"));
@@ -2539,7 +3096,16 @@ fn render_row(row: &InboxRow, meta_only: bool) -> String {
 /// this crate's way of saying an answer is not a complete one.
 pub(crate) fn cmd_inbox_get(ctx: &SessionCtx, rest: &str) -> String {
     let mut toks = rest.split_whitespace();
-    let (Some(id), None) = (toks.next().and_then(|t| t.parse::<u64>().ok()), toks.next()) else {
+    let (Some(arg), None) = (toks.next(), toks.next()) else {
+        return INBOX_USAGE.to_string();
+    };
+    if let Some(off) = arg.strip_prefix('@') {
+        return match off.parse::<u64>() {
+            Ok(off) => inbox_get_at(ctx, off),
+            Err(_) => INBOX_USAGE.to_string(),
+        };
+    }
+    let Ok(id) = arg.parse::<u64>() else {
         return INBOX_USAGE.to_string();
     };
     let inbox = ctx.fabric.lock();
@@ -2552,6 +3118,126 @@ pub(crate) fn cmd_inbox_get(ctx: &SessionCtx, rest: &str) -> String {
         ),
         Some(row) => format!("OK {}\n{}", row.body.len(), row.body),
         None => "ERR no such message\n".to_string(),
+    }
+}
+
+/// `inbox get @<off>` — one record BY BROKER OFFSET, from the ring when it
+/// still holds it and from the broker's log through the bridge when it does
+/// not (E3, "nothing lost"): a row the bounded ring evicted (`dropped=`) or a
+/// listing cut (`inbox <n>`, `since=`) is gone from the endpoint, not from the
+/// bus, and the offset in the header's `oldest_on_bus=` … `bus_head=` span is
+/// still fetchable while the broker holds it.
+///
+/// THE ENDPOINT HAS NO BUS ACCESS — that is its point — so the read is
+/// PARKED: a `fetch sid=<sid> off=<n>` line rides the bridge's next `outbox`
+/// peek (the idle tick, 250 ms; the roster backstop under load), the bridge
+/// answers with `deliver <sid> fetched=<off> …` after one bounded `Fetch` on
+/// THIS session's own lane, and the wait wakes on the condvar every other
+/// parked verb uses. The bridge's filter is the authority on "yours": another
+/// session's record, another face's, or nothing at all is `ERR no such
+/// record`, and nothing says which. Bounded by [`FETCH_WAIT_MS`], refused at
+/// once when no bridge can answer (`ERR fabric <state>`), and at most
+/// [`FETCH_SLOTS`] parked per session. The answer is the WHOLE body — the
+/// bridge carries one that does not fit a control line in chunks — up to
+/// [`BODY_MAX`], and `truncated=1 len=` for a record larger than that, exactly
+/// as `inbox get <id>` says it. NOTHING IS RE-APPENDED: the record is answered,
+/// not redelivered, so no id, no watermark, no quota and no event move.
+///
+/// A ROW THE DELIVERY CUT IS NOT ANSWERED FROM THE RING. `truncated=1` is the
+/// other half of what this verb is for (E3: "`truncated=1` becomes
+/// fetchable"), and the ring holds only the cut prefix — answering from it
+/// first returned the same cut body the reader came here to get past. Such a
+/// row parks like an evicted one; only when no bridge can answer is the cut
+/// row the answer, still marked `truncated=1`, because it is then the most
+/// this endpoint holds.
+fn inbox_get_at(ctx: &SessionCtx, off: u64) -> String {
+    let mut inbox = ctx.fabric.lock();
+    if let Some(row) = inbox.rows.iter().find(|r| r.off == off)
+        && (row.len <= row.body.len() || wait_is_futile())
+    {
+        return Fetched::from_row(row).render();
+    }
+    match inbox.fetches.iter().position(|(o, _)| *o == off) {
+        // Answered already: a record is immutable, so the answer stands. A
+        // failure is consumed — the next read asks the bus again, because
+        // `unreadable` is transient even though `no-record` is not.
+        Some(i) => match &inbox.fetches[i].1 {
+            FetchSlot::Done(f) => return f.render(),
+            FetchSlot::Failed(why) => {
+                let why = why.clone();
+                inbox.fetches.remove(i);
+                return unfetched(&inbox, off, fetch_failure(&why, off));
+            }
+            FetchSlot::Pending | FetchSlot::Partial(_) => {}
+        },
+        None => {
+            if wait_is_futile() {
+                return format!("ERR fabric {} off={off}\n", fabric_state());
+            }
+            evict_answered_fetch(&mut inbox);
+            if inbox.fetches.len() >= FETCH_SLOTS {
+                return format!("ERR busy: {FETCH_SLOTS} reads already parked\n");
+            }
+            inbox.fetches.push_back((off, FetchSlot::Pending));
+        }
+    }
+    let deadline = std::time::Instant::now() + std::time::Duration::from_millis(FETCH_WAIT_MS);
+    loop {
+        let Some(i) = inbox.fetches.iter().position(|(o, _)| *o == off) else {
+            // Evicted from under a parked read: only an answered slot is ever
+            // evicted, and this one was pending — but a reader that cannot
+            // tell must say "nothing" rather than hang.
+            return fetch_failure("no-record", off);
+        };
+        match &inbox.fetches[i].1 {
+            FetchSlot::Done(f) => return f.render(),
+            FetchSlot::Failed(why) => {
+                let why = why.clone();
+                inbox.fetches.remove(i);
+                return unfetched(&inbox, off, fetch_failure(&why, off));
+            }
+            FetchSlot::Pending | FetchSlot::Partial(_) => {}
+        }
+        // THE ENTRY CHECK ON EVERY WAKE, as `post --wait` does: a bridge can
+        // die while a read is parked, and `bridge_lost` wakes every session.
+        if wait_is_futile() {
+            inbox.fetches.remove(i);
+            let why = format!("ERR fabric {} off={off}\n", fabric_state());
+            return unfetched(&inbox, off, why);
+        }
+        let now = std::time::Instant::now();
+        if now >= deadline {
+            inbox.fetches.remove(i);
+            return unfetched(&inbox, off, format!("ERR timeout off={off}\n"));
+        }
+        let (next, _) = ctx
+            .fabric
+            .changed
+            .wait_timeout(inbox, deadline - now)
+            .unwrap_or_else(|p| p.into_inner());
+        inbox = next;
+    }
+}
+
+/// A read the bus could not complete: the ring's CUT row when it holds the
+/// record — still marked `truncated=1`, because it is then the most this
+/// endpoint has — and `why` otherwise. Only a cut row ever reaches the bus
+/// path while the ring holds it, so this is never a whole row passed off as
+/// a failure's answer.
+fn unfetched(inbox: &Inbox, off: u64, why: String) -> String {
+    match inbox.rows.iter().find(|r| r.off == off) {
+        Some(row) => Fetched::from_row(row).render(),
+        None => why,
+    }
+}
+
+/// The reply a failed fetch gives: `no-record` is the one answer that is the
+/// same for "another session's" and "nothing there", on purpose.
+fn fetch_failure(why: &str, off: u64) -> String {
+    if why == "no-record" {
+        format!("ERR no such record off={off}\n")
+    } else {
+        format!("ERR fetch failed reason={why} off={off}\n")
     }
 }
 
@@ -2568,22 +3254,49 @@ pub(crate) fn cmd_inbox_get(ctx: &SessionCtx, rest: &str) -> String {
 /// refused the next message with `ERR quota` forever. The `inbox seen` verb row
 /// says so; a change here that stopped touching `listed` would silently reinstate
 /// that deadlock, so `an_ack_releases_the_senders_quota` pins it.
+///
+/// AND A VERDICT IS A RECEIPT (R8). `inbox seen <id> handled|refused|deferred`
+/// records the word on THAT row — the one the id names, not every row the
+/// watermark passes, which is why a bare `inbox seen <id>` records no verdict
+/// at all — and the `inbox-seen` event then carries `verdict=<v> kind=<k>
+/// from=<p>`, which is everything a bridge running `--receipts` needs to
+/// publish `kind=ack re=<off> verdict=<v>` onto the sender's lane. Once per
+/// row per CHANGE: the same word again records the plain event (the watermark
+/// still moves), a different word (`deferred`, later `handled`) is a new
+/// receipt. A `--peek` records nothing and so acks nothing.
 pub(crate) fn cmd_inbox_seen(ctx: &SessionCtx, rest: &str) -> String {
     let mut toks = rest.split_whitespace();
     let Some(id) = toks.next().and_then(|t| t.parse::<u64>().ok()) else {
         return INBOX_USAGE.to_string();
     };
-    match toks.next() {
-        None | Some("handled" | "refused" | "deferred") => {}
+    let verdict = match toks.next() {
+        None => None,
+        Some(v) if VERDICTS.contains(&v) => Some(v),
         Some(_) => return INBOX_USAGE.to_string(),
-    }
+    };
     if toks.next().is_some() {
         return INBOX_USAGE.to_string();
     }
     let mut inbox = ctx.fabric.lock();
-    let Some(off) = inbox.rows.iter().find(|r| r.id == id).map(|r| r.off) else {
+    let Some(at) = inbox.rows.iter().position(|r| r.id == id) else {
         return "ERR no such message\n".to_string();
     };
+    let off = inbox.rows[at].off;
+    let decided = verdict.filter(|v| inbox.rows[at].decision.as_deref() != Some(v));
+    let mut payload = format!("{id} off={off}");
+    if let Some(v) = decided {
+        let row = &mut inbox.rows[at];
+        row.decision = Some(v.to_string());
+        payload.push_str(&format!(" verdict={v} kind={} from={}", row.kind, row.from));
+        // OWED, NOT MERELY ANNOUNCED. The event is the bridge's prompt trigger;
+        // the queue is what survives a broker outage or a bridge relaunch
+        // between this moment and the publish (see [`OwedReceipt`]). Only the
+        // kinds that wait earn one — a demoted task is a `note` row here.
+        if matches!(row.kind.as_str(), "ask" | "task") {
+            let (kind, from) = (row.kind.clone(), row.from.clone());
+            owe_receipt(&mut inbox, off, v, &kind, &from);
+        }
+    }
     // MONOTONE: the watermark never goes backwards, so acknowledging an older row
     // out of order cannot re-open rows already handled.
     inbox.seen = inbox.seen.max(id);
@@ -2596,7 +3309,7 @@ pub(crate) fn cmd_inbox_seen(ctx: &SessionCtx, rest: &str) -> String {
     ctx.timeline
         .lock()
         .unwrap_or_else(|p| p.into_inner())
-        .record("inbox-seen", format!("{id} off={off}"));
+        .record("inbox-seen", payload);
     drop(inbox);
     ctx.fabric.changed.notify_all();
     format!("OK seen={seen}\n")
@@ -2608,7 +3321,8 @@ pub(crate) fn cmd_inbox_seen(ctx: &SessionCtx, rest: &str) -> String {
 
 const POST_USAGE: &str = "ERR usage: post to=<@<sid>[@<node>]|<principal>|say> \
                           kind=<ask|answer|task|report|note|ack|control> [re=<n>] [dl=<ms>] \
-                          [via=<p>] [--wait[=<ms>]] (<text> | len=<n> + <n> raw bytes)\n";
+                          [via=<p>] [key=<token>] [--wait[=<ms>]] [--wait-ack[=<ms>]] \
+                          (<text> | len=<n> + <n> raw bytes)\n";
 
 /// Whether `tok` is one of `post`'s leading OPTION tokens. Shared with the serve
 /// loop's length-prefixed-frame detector so the two parsers cannot disagree about
@@ -2617,7 +3331,9 @@ const POST_USAGE: &str = "ERR usage: post to=<@<sid>[@<node>]|<principal>|say> \
 pub(crate) fn post_option_token(tok: &str) -> bool {
     tok == "--wait"
         || tok.starts_with("--wait=")
-        || ["to=", "kind=", "re=", "dl=", "via=", "len="]
+        || tok == "--wait-ack"
+        || tok.starts_with("--wait-ack=")
+        || ["to=", "kind=", "re=", "dl=", "via=", "key=", "len="]
             .iter()
             .any(|k| tok.starts_with(k))
 }
@@ -2655,7 +3371,9 @@ pub(crate) fn cmd_post(ctx: &SessionCtx, rest: &str, body: Option<Vec<u8>>) -> S
     let mut re: Option<u64> = None;
     let mut dl: Option<u64> = None;
     let mut via: Option<String> = None;
+    let mut key: Option<String> = None;
     let mut wait: Option<Option<u64>> = None;
+    let mut wait_ack: Option<Option<u64>> = None;
     let mut declared_len: Option<usize> = None;
     let body_at = post_body_offset(rest);
     // Options lead; the first token that is not one begins the inline text, so a
@@ -2680,6 +3398,14 @@ pub(crate) fn cmd_post(ctx: &SessionCtx, rest: &str, body: Option<Vec<u8>>) -> S
             }
         } else if let Some(v) = kv(tok, "via") {
             via = Some(v.to_string());
+        } else if let Some(v) = kv(tok, "key") {
+            // BOUNDED AT THE DOOR, like `to`: it is printed onto the `outbox`
+            // line and into the bridge's state dir, so its charset is the
+            // charset of the ids those already carry, and nothing longer.
+            if !valid_key(v) {
+                return POST_USAGE.to_string();
+            }
+            key = Some(v.to_string());
         } else if let Some(v) = kv(tok, "len") {
             match v.parse::<usize>() {
                 Ok(n) if n <= BODY_MAX => declared_len = Some(n),
@@ -2692,11 +3418,24 @@ pub(crate) fn cmd_post(ctx: &SessionCtx, rest: &str, body: Option<Vec<u8>>) -> S
                 Ok(n) => wait = Some(Some(n.min(WAIT_MAX_MS))),
                 Err(_) => return POST_USAGE.to_string(),
             }
+        } else if tok == "--wait-ack" {
+            wait_ack = Some(None);
+        } else if let Some(v) = kv(tok, "--wait-ack") {
+            match v.parse::<u64>() {
+                Ok(n) => wait_ack = Some(Some(n.min(WAIT_MAX_MS))),
+                Err(_) => return POST_USAGE.to_string(),
+            }
         }
     }
     let (Some(to), Some(kind)) = (to, kind) else {
         return POST_USAGE.to_string();
     };
+    // `--wait-ack` IS FOR THE KINDS THAT WAIT: a receipt is published for an
+    // `ask` or a `task` and nothing else (R8), so waiting for one on a `note`
+    // would be a guaranteed timeout.
+    if wait_ack.is_some() && !matches!(kind.as_str(), "ask" | "task") {
+        return POST_USAGE.to_string();
+    }
     // [`POSTABLE`], NOT [`KINDS`]: `expired` and `undeliverable` are verdicts a
     // bridge records on a sender's behalf, never something a sender may claim.
     if !POSTABLE.contains(&kind.as_str()) {
@@ -2769,8 +3508,11 @@ pub(crate) fn cmd_post(ctx: &SessionCtx, rest: &str, body: Option<Vec<u8>>) -> S
 
     // `--wait` is ON by default for the two kinds whose whole point is a reply:
     // an `ask`/`task` sender that does not learn its offset cannot recognize the
-    // answer when it comes back as `re=`.
-    let wait = wait.or_else(|| matches!(kind.as_str(), "ask" | "task").then_some(None));
+    // answer when it comes back as `re=`. And `--wait-ack` implies it: the
+    // receipt names the offset, so the offset has to be known first.
+    let wait = wait.or_else(|| {
+        (matches!(kind.as_str(), "ask" | "task") || wait_ack.is_some()).then_some(None)
+    });
 
     let mut inbox = ctx.fabric.lock();
     // REFUSED AT THE DOOR. A full outbox is answered, not absorbed: see
@@ -2797,6 +3539,8 @@ pub(crate) fn cmd_post(ctx: &SessionCtx, rest: &str, body: Option<Vec<u8>>) -> S
         re,
         dl,
         via: via.clone(),
+        key: key.clone(),
+        dup: false,
         dead: false,
         dead_reason: String::new(),
         body,
@@ -2811,6 +3555,9 @@ pub(crate) fn cmd_post(ctx: &SessionCtx, rest: &str, body: Option<Vec<u8>>) -> S
     }
     if let Some(v) = &via {
         payload.push_str(&format!(" via={v}"));
+    }
+    if let Some(k) = &key {
+        payload.push_str(&format!(" key={k}"));
     }
     ctx.timeline
         .lock()
@@ -2833,11 +3580,49 @@ pub(crate) fn cmd_post(ctx: &SessionCtx, rest: &str, body: Option<Vec<u8>>) -> S
     }
     let deadline = std::time::Instant::now()
         + std::time::Duration::from_millis(wait.unwrap_or(WAIT_DEFAULT_MS));
+    let (off, dup) = match wait_landing(ctx, id, deadline) {
+        Ok(landed) => landed,
+        Err(reply) => return reply,
+    };
+    let Some(wait_ack) = wait_ack else {
+        return format!("OK {id} off={off}{dup}\n");
+    };
+    // THE RECEIPT'S BOUND IS THE DEADLINE, unless the caller said otherwise:
+    // `dl=` is the time the sender gave the recipient, so it is the time the
+    // sender waits for the recipient's word. The asker's own bridge records
+    // `expired` at that moment, and that verdict releases the wait — so the
+    // bound is `dl=` plus the time the verdict takes to come back
+    // ([`EXPIRY_GRACE_MS`]), or the wait would end first and answer `ERR
+    // timeout` for a deadline the bus says `expired`. An explicit
+    // `--wait-ack=<ms>` is the caller's own bound and is kept exactly.
+    let bound = match wait_ack {
+        Some(ms) => ms,
+        None => dl.map_or(WAIT_DEFAULT_MS, |d| d.saturating_add(EXPIRY_GRACE_MS)),
+    }
+    .min(WAIT_MAX_MS);
+    wait_receipt(ctx, id, off, dup, bound)
+}
+
+/// Park until the post `id` LANDS: `Ok((off, " dup=1" | ""))`, or the reply to
+/// give instead — a verdict, a futile link, or the timeout.
+fn wait_landing(
+    ctx: &SessionCtx,
+    id: u64,
+    deadline: std::time::Instant,
+) -> Result<(u64, &'static str), String> {
     let mut guard = ctx.fabric.lock();
     loop {
         let row = guard.posts.iter().find(|p| p.id == id);
         if let Some(off) = row.and_then(|p| p.off) {
-            return format!("OK {id} off={off}\n");
+            // `dup=1` IS THE BRIDGE'S REPORT of the broker's verdict: this post
+            // re-used a sequence an earlier `key=` reserved, the broker deduped
+            // it, and `off` is the ORIGINAL record's. One record on the bus.
+            let dup = if row.is_some_and(|p| p.dup) {
+                " dup=1"
+            } else {
+                ""
+            };
+            return Ok((off, dup));
         }
         // A post the bridge retired as undeliverable releases its wait with a
         // verdict, not a timeout: the caller learns the difference between "the
@@ -2851,7 +3636,7 @@ pub(crate) fn cmd_post(ctx: &SessionCtx, rest: &str, body: Option<Vec<u8>>) -> S
             } else {
                 row.dead_reason.as_str()
             };
-            return format!("ERR {reason} id={id}\n");
+            return Err(format!("ERR {reason} id={id}\n"));
         }
         // THE ENTRY CHECK, ON EVERY WAKE — checked AFTER the landing and the
         // verdict, so a post that landed just before the bridge died still
@@ -2862,11 +3647,52 @@ pub(crate) fn cmd_post(ctx: &SessionCtx, rest: &str, body: Option<Vec<u8>>) -> S
         // `WAIT_MAX_MS` = 600 s) for the `ERR timeout` the check exists to
         // replace. `bridge_lost` wakes every registered session so this runs.
         if wait_is_futile() {
-            return fabric_wait_refusal(id);
+            return Err(fabric_wait_refusal(id));
         }
         let now = std::time::Instant::now();
         if now >= deadline {
-            return format!("ERR timeout id={id}\n");
+            return Err(format!("ERR timeout id={id}\n"));
+        }
+        let (next, _) = ctx
+            .fabric
+            .changed
+            .wait_timeout(guard, deadline - now)
+            .unwrap_or_else(|p| p.into_inner());
+        guard = next;
+    }
+}
+
+/// `post --wait-ack`'s second wait: the post has landed at `off`, and the
+/// caller wants the RECIPIENT's word (R8). Released by an `ack` row carrying
+/// `re=<off>` — `OK <id> off=<n> ack=<verdict> msg=<inbox id>` — or by the
+/// asker's own bridge recording the deadline passed, `ERR expired id=<n>
+/// off=<n>`. A timeout and a futile link both name the offset, because the
+/// post DID land: `await inbox re=<off>` picks the wait up later, and nothing
+/// here is a reason to re-post.
+fn wait_receipt(ctx: &SessionCtx, id: u64, off: u64, dup: &str, bound_ms: u64) -> String {
+    let deadline = std::time::Instant::now() + std::time::Duration::from_millis(bound_ms);
+    let mut guard = ctx.fabric.lock();
+    loop {
+        // The NEWEST word wins: `deferred` then `handled` is two receipts, and
+        // the later one is the recipient's current answer.
+        let reply = guard
+            .rows
+            .iter()
+            .rev()
+            .find(|r| r.re == Some(off) && matches!(r.kind.as_str(), "ack" | "expired"));
+        if let Some(row) = reply {
+            if row.kind == "expired" {
+                return format!("ERR expired id={id} off={off}\n");
+            }
+            let verdict = row.verdict.as_deref().unwrap_or("-");
+            return format!("OK {id} off={off}{dup} ack={verdict} msg={}\n", row.id);
+        }
+        if wait_is_futile() {
+            return format!("ERR fabric {} id={id} off={off}\n", fabric_state());
+        }
+        let now = std::time::Instant::now();
+        if now >= deadline {
+            return format!("ERR timeout id={id} off={off}\n");
         }
         let (next, _) = ctx
             .fabric
@@ -2885,8 +3711,10 @@ pub(crate) fn cmd_post(ctx: &SessionCtx, rest: &str, body: Option<Vec<u8>>) -> S
 /// `outbox` is a PEEK that removes nothing, so the new bridge drains the same
 /// queue and `outbox sent` retires it seconds later. Answering a bare `ERR fabric
 /// disconnected` for a message that is still queued reads as "not sent", and the
-/// documented remedy for "not sent" is to send again: `post` carries no
-/// idempotency key, so the peer's inbox ends up holding the same `ask` twice.
+/// documented remedy for "not sent" is to send again: a `post` without `key=`
+/// carries no idempotency key, so the peer's inbox ends up holding the same
+/// `ask` twice (and one WITH `key=` should still not be re-posted on this
+/// answer — it is queued, and a re-post only costs a deduped publish).
 /// This refusal says the only two things the endpoint actually knows — nothing
 /// can report the landing, and the message is still in the outbox.
 ///
@@ -2944,21 +3772,35 @@ fn fabric_wait_refusal(id: u64) -> String {
 // await inbox
 // ---------------------------------------------------------------------------
 
-/// `await inbox since=<id> [kinds=<k,...>]` — the fabric wake predicate.
+/// `await inbox since=<id> [kinds=<k,...>] | await inbox re=<off> [since=<id>]
+/// [kinds=<k,...>]` — the fabric wake predicate.
 ///
 /// MONOTONE: it latches only on a row whose id is strictly greater than `since`,
 /// so a row the agent read and chose to ignore cannot latch the same wait twice.
 /// A `hold` transition latches only when `hold` is one of the listed kinds — a
 /// halt reaches an agent through the events digest, never by pretending to be
 /// mail. `OK timeout` on expiry, which the client exits 124 on.
+///
+/// `re=<off>` NARROWS IT TO THE REPLIES TO ONE POST: a row carrying that
+/// `re=` of any kind — an `answer`, a `report`, a receipt (`ack … verdict=`),
+/// the asker's own bridge's `expired` — and `since=` may then be omitted (0),
+/// because the offset is already a thing that happens once. `kinds=` still
+/// narrows it further when given.
 pub(crate) fn cmd_await_inbox(ctx: &SessionCtx, args: &[&str], timeout_ms: u64) -> String {
-    const USAGE: &str = "ERR usage: await inbox since=<id> [kinds=<k,...>] [timeout=<ms>]\n";
+    const USAGE: &str = "ERR usage: await inbox since=<id> [kinds=<k,...>] [timeout=<ms>] \
+                         | await inbox re=<off> [since=<id>] [kinds=<k,...>] [timeout=<ms>]\n";
     let mut since: Option<u64> = None;
+    let mut re: Option<u64> = None;
     let mut kinds: Option<Vec<String>> = None;
     for tok in args {
         if let Some(v) = kv(tok, "since") {
             match v.parse() {
                 Ok(n) => since = Some(n),
+                Err(_) => return USAGE.to_string(),
+            }
+        } else if let Some(v) = kv(tok, "re") {
+            match v.parse() {
+                Ok(n) => re = Some(n),
                 Err(_) => return USAGE.to_string(),
             }
         } else if let Some(v) = kv(tok, "kinds") {
@@ -2974,15 +3816,19 @@ pub(crate) fn cmd_await_inbox(ctx: &SessionCtx, args: &[&str], timeout_ms: u64) 
             return USAGE.to_string();
         }
     }
-    let Some(since) = since else {
-        return USAGE.to_string();
+    let since = match (since, re) {
+        (Some(s), _) => s,
+        (None, Some(_)) => 0,
+        (None, None) => return USAGE.to_string(),
     };
     let watch_hold = kinds
         .as_ref()
         .is_some_and(|k| k.iter().any(|k| k == "hold"));
     let accepts = |kind: &str| match &kinds {
         Some(list) => list.iter().any(|k| k == kind),
-        None => kind != AWAIT_DEFAULT_SKIP,
+        // A reply to a named post is wanted whatever its kind; an unnamed
+        // wait skips the class that must never wake anybody by itself.
+        None => re.is_some() || kind != AWAIT_DEFAULT_SKIP,
     };
 
     let deadline = std::time::Instant::now() + std::time::Duration::from_millis(timeout_ms);
@@ -2992,7 +3838,7 @@ pub(crate) fn cmd_await_inbox(ctx: &SessionCtx, args: &[&str], timeout_ms: u64) 
         if let Some(id) = guard
             .rows
             .iter()
-            .filter(|r| r.id > since && accepts(&r.kind))
+            .filter(|r| r.id > since && accepts(&r.kind) && re.is_none_or(|n| r.re == Some(n)))
             .map(|r| r.id)
             .max()
         {
@@ -4605,6 +5451,120 @@ mod inbox_hold {
         });
     }
 
+    /// **`post key=` IS BOUNDED AT THE DOOR, RIDES EVERY `outbox` DRAIN, AND A
+    /// `dup=1` RETIREMENT REACHES THE PARKED WAIT AS `OK <id> off=<n> dup=1`.**
+    ///
+    /// The endpoint's half of exactly-once (R7): it never dedups itself — the
+    /// bridge maps the key to a durably reserved producer sequence and the
+    /// BROKER answers `deduped` with the original offset — so what the endpoint
+    /// owes is to carry the key to the bridge on every peek (a relaunched bridge
+    /// reads the same key from the same row), to refuse a key that could split a
+    /// wire line or a state-dir line, and to report the bridge's verdict without
+    /// losing it to a retried retirement.
+    #[test]
+    fn post_key_is_bounded_rides_the_outbox_and_a_dup_retirement_reaches_the_wait() {
+        with_link(|| {
+            let store = new_store();
+            let (sid, ctx) = registered(&store);
+            // THE GRAMMAR: ids' charset, one to KEY_MAX bytes.
+            assert!(valid_key("k-1") && valid_key("0123:abcd:99") && valid_key("a.b_c"));
+            assert!(valid_key(&"k".repeat(KEY_MAX)));
+            assert!(!valid_key(""));
+            assert!(!valid_key(&"k".repeat(KEY_MAX + 1)));
+            assert!(!valid_key("k/1") && !valid_key("k@1") && !valid_key("k=1"));
+            assert!(!valid_key("kä"), "not ASCII");
+            for bad in ["key= x", "key=k/1 x", "key=a@b x"] {
+                assert_eq!(
+                    cmd_post(&ctx, &format!("to=@s-b kind=note {bad}"), None),
+                    POST_USAGE,
+                    "{bad}"
+                );
+            }
+            assert_eq!(
+                cmd_post(
+                    &ctx,
+                    &format!("to=@s-b kind=note key={} x", "k".repeat(KEY_MAX + 1)),
+                    None
+                ),
+                POST_USAGE
+            );
+
+            // CARRIED: on the outbox line (a peek, so on every drain) and on the
+            // in-flight `post` row an agent reads at turn start.
+            assert_eq!(
+                cmd_post(&ctx, "to=@s-b kind=note key=k-1 hi", None),
+                "OK 1\n"
+            );
+            let (_, posts) = parse_outbox(&cmd_outbox(&store, ""));
+            assert_eq!(posts.len(), 1);
+            assert!(
+                posts[0].0.ends_with(" key=k-1 len=2"),
+                "the key rides the outbox line, before len=: {:?}",
+                posts[0].0
+            );
+            let (_, again) = parse_outbox(&cmd_outbox(&store, ""));
+            assert_eq!(
+                again, posts,
+                "a peek: the key is there on the next drain too"
+            );
+            assert!(
+                cmd_inbox(&ctx, "--peek").contains("post 1 to=@s-b kind=note off=- len=2 key=k-1"),
+                "{}",
+                cmd_inbox(&ctx, "--peek")
+            );
+            // A post without a key carries none.
+            assert_eq!(cmd_post(&ctx, "to=@s-b kind=note plain", None), "OK 2\n");
+            let (_, both) = parse_outbox(&cmd_outbox(&store, ""));
+            assert!(!both[1].0.contains("key="), "{:?}", both[1].0);
+
+            // THE VERDICT, AND ITS GRAMMAR. `dup=1` names the original record's
+            // offset, so it cannot ride the dead form.
+            assert_eq!(
+                cmd_outbox_sent(&store, &format!("{sid} 1 off=- dup=1")),
+                OUTBOX_USAGE
+            );
+            assert_eq!(
+                cmd_outbox_sent(&store, &format!("{sid} 1 off=42 dup=1")),
+                "OK\n"
+            );
+            {
+                let inbox = ctx.fabric.lock();
+                let row = inbox.posts.iter().find(|p| p.id == 1).expect("post 1 kept");
+                assert_eq!((row.off, row.dup), (Some(42), true));
+                assert_eq!(row.key, None, "the key goes with the body at retirement");
+            }
+            // STICKY: a retirement retried without the flag does not un-dup it.
+            assert_eq!(cmd_outbox_sent(&store, &format!("{sid} 1 off=42")), "OK\n");
+            assert!(ctx.fabric.lock().posts.iter().any(|p| p.id == 1 && p.dup));
+
+            // THE PARKED WAIT hears it. `--wait` is on by default for a task.
+            attach_up(&store, next_bridge_generation());
+            let poster = {
+                let ctx = ctx.clone();
+                std::thread::spawn(move || {
+                    cmd_post(
+                        &ctx,
+                        "to=h-andrew kind=task key=k-2 --wait=30000 ship it",
+                        None,
+                    )
+                })
+            };
+            loop {
+                let reply = cmd_outbox_sent(&store, &format!("{sid} 3 off=42 dup=1"));
+                if reply == "OK\n" {
+                    break;
+                }
+                assert_eq!(reply, "ERR no such post\n");
+                std::thread::yield_now();
+            }
+            assert_eq!(
+                poster.join().expect("the poster finished"),
+                "OK 3 off=42 dup=1\n",
+                "the re-post answers the ORIGINAL offset and says it was a duplicate"
+            );
+        });
+    }
+
     /// `post`'s grammar: the kinds are closed, the address must be a principal,
     /// there is no `to=fleet` (a node holds no fleet write grant — an agent may
     /// only ASK a human to halt), and the body may contain anything, `=` and
@@ -4701,10 +5661,660 @@ mod inbox_hold {
                     .unwrap_or_default()
             };
             assert_eq!(by("inbox"), "1 from=h-andrew kind=task off=11");
-            assert_eq!(by("inbox-seen"), "1 off=11");
+            // A DECIDED row's event carries the verdict and the two tokens a
+            // receipt is addressed by — the same `from=`/`kind=` the `inbox`
+            // event already put on the digest, never a body.
+            assert_eq!(
+                by("inbox-seen"),
+                "1 off=11 verdict=handled kind=task from=h-andrew"
+            );
             assert_eq!(by("post"), "1 to=h-a kind=note");
             assert_eq!(by("post-landed"), "1 off=90");
             assert_eq!(by("hold"), "1 reason=main%20broken origin=fleet");
+        });
+    }
+
+    /// **A VERDICT IS RECORDED ONCE PER ROW PER CHANGE, ON THE ROW THE ID
+    /// NAMES, AND THE BARE FORM RECORDS NONE (R8).** The `inbox-seen` event is
+    /// what a `--receipts` bridge acks from, so what it carries is the whole
+    /// receipt policy: a bare `inbox seen 3` moves the watermark over rows 1–3
+    /// and names no verdict for any of them; `inbox seen 3 handled` names one
+    /// for row 3 alone; the same word again records the plain event; a
+    /// changed word is a new one; and a `--peek` records nothing at all.
+    #[test]
+    fn inbox_seen_records_a_verdict_once_per_change_and_the_bare_form_records_none() {
+        with_link(|| {
+            let store = new_store();
+            let (sid, ctx) = registered(&store);
+            deliver(&store, &sid, 10, "h-andrew", "task", "one");
+            deliver(&store, &sid, 11, "s-peer@n-lab", "ask", "two");
+            deliver(&store, &sid, 12, "h-andrew", "note", "three");
+            cmd_inbox(&ctx, "--peek");
+            assert_eq!(cmd_inbox_seen(&ctx, "2"), "OK seen=2\n");
+            assert_eq!(cmd_inbox_seen(&ctx, "3 handled"), "OK seen=3\n");
+            assert_eq!(cmd_inbox_seen(&ctx, "3 handled"), "OK seen=3\n");
+            assert_eq!(cmd_inbox_seen(&ctx, "2 deferred"), "OK seen=3\n");
+            assert_eq!(cmd_inbox_seen(&ctx, "2 handled"), "OK seen=3\n");
+            assert_eq!(cmd_inbox_seen(&ctx, "2 later"), INBOX_USAGE);
+            let seen: Vec<String> = ctx
+                .timeline
+                .lock()
+                .unwrap_or_else(|p| p.into_inner())
+                .since(None)
+                .filter(|e| e.kind == "inbox-seen")
+                .map(|e| e.payload.clone())
+                .collect();
+            assert_eq!(
+                seen,
+                [
+                    "2 off=11",
+                    "3 off=12 verdict=handled kind=note from=h-andrew",
+                    "3 off=12",
+                    "2 off=11 verdict=deferred kind=ask from=s-peer@n-lab",
+                    "2 off=11 verdict=handled kind=ask from=s-peer@n-lab",
+                ],
+                "one verdict per row per CHANGE; the bare form and a repeat carry none"
+            );
+        });
+    }
+
+    /// **AN `ack` ROW CARRIES THE RECIPIENT'S VERDICT, AND `await inbox re=<off>`
+    /// LATCHES ON ANY REPLY TO THAT OFFSET.** The receipt arrives as an ordinary
+    /// row, resolved to `re-id=` against this session's own post; `verdict=` is
+    /// a closed word (`deliver` refuses a fourth); and a wait named by offset
+    /// wakes on it — and on an `answer` or an `expired` naming the same offset —
+    /// without a `since=`, while a wait on another offset sleeps through it.
+    #[test]
+    fn an_ack_row_carries_its_verdict_and_await_inbox_re_latches_on_it() {
+        with_link(|| {
+            let store = new_store();
+            let (sid, ctx) = registered(&store);
+            // A note queues without waiting; landing it gives post 1 an offset,
+            // which is what a later `re=70` resolves to `re-id=1`. (The kind of
+            // the sent post does not change how a reply's `re=` is read.)
+            assert_eq!(cmd_post(&ctx, "to=@s-peer kind=note do it", None), "OK 1\n");
+            assert_eq!(
+                cmd_deliver(&store, &format!("{sid} landed=1 off=70")),
+                "OK\n"
+            );
+            // A verdict outside the three words is refused at the door.
+            assert_eq!(
+                cmd_deliver(
+                    &store,
+                    &format!("{sid} off=80 from=s-peer@n-lab kind=ack re=70 verdict=maybe text=x")
+                ),
+                DELIVER_USAGE
+            );
+            let waiter = {
+                let ctx = ctx.clone();
+                std::thread::spawn(move || cmd_await_inbox(&ctx, &["re=70"], 30_000))
+            };
+            let other = {
+                let ctx = ctx.clone();
+                std::thread::spawn(move || cmd_await_inbox(&ctx, &["re=71", "since=0"], 200))
+            };
+            assert_eq!(
+                cmd_deliver(
+                    &store,
+                    &format!(
+                        "{sid} off=81 from=s-peer@n-lab kind=ack re=70 verdict=refused \
+                         text=ack%20re%3D70%20verdict%3Drefused"
+                    )
+                ),
+                "OK 1\n"
+            );
+            assert_eq!(waiter.join().expect("the waiter finished"), "OK inbox 1\n");
+            assert_eq!(other.join().expect("the other finished"), "OK timeout\n");
+            let listing = cmd_inbox(&ctx, "--peek --meta");
+            let row = listing.lines().nth(1).expect("the ack row");
+            assert!(
+                row.starts_with("msg 1 off=81 ")
+                    && row.contains(" kind=ack trust=agent re=70 re-id=1 verdict=refused "),
+                "{row}"
+            );
+            // `await inbox re=` is monotone like the rest: the row that latched it
+            // does not latch a wait that starts above it.
+            assert_eq!(
+                cmd_await_inbox(&ctx, &["re=70", "since=1"], 100),
+                "OK timeout\n"
+            );
+            assert_eq!(
+                cmd_await_inbox(&ctx, &["kinds=ack"], 100),
+                "ERR usage: await inbox since=<id> [kinds=<k,...>] [timeout=<ms>] \
+                 | await inbox re=<off> [since=<id>] [kinds=<k,...>] [timeout=<ms>]\n"
+            );
+        });
+    }
+
+    /// **`post --wait-ack` RETURNS THE RECIPIENT'S VERDICT, OR THE EXPIRY, AND
+    /// IS BOUNDED BY `dl=` WHEN GIVEN BARE.** The landing is waited for first
+    /// (the receipt names the offset); the parked wait is released by an `ack`
+    /// naming it — `OK <id> off=<n> ack=<verdict> msg=<row>` — or by the
+    /// asker's own bridge's `expired`; a timeout names the offset, because the
+    /// post DID land; and a `note` may not ask for one.
+    #[test]
+    fn post_wait_ack_returns_the_verdict_or_the_expiry_and_is_bounded_by_dl() {
+        with_link(|| {
+            let store = new_store();
+            let (sid, ctx) = registered(&store);
+            attach_up(&store, next_bridge_generation());
+            assert_eq!(
+                cmd_post(&ctx, "to=@s-peer kind=note --wait-ack hello", None),
+                POST_USAGE
+            );
+            // Acked.
+            let poster = {
+                let ctx = ctx.clone();
+                std::thread::spawn(move || {
+                    cmd_post(&ctx, "to=@s-peer kind=task --wait-ack=30000 ship it", None)
+                })
+            };
+            loop {
+                if cmd_deliver(&store, &format!("{sid} landed=1 off=42")) == "OK\n" {
+                    break;
+                }
+                std::thread::yield_now();
+            }
+            assert_eq!(
+                cmd_deliver(
+                    &store,
+                    &format!(
+                        "{sid} off=50 from=s-peer@n-lab kind=ack re=42 verdict=handled text=ok"
+                    )
+                ),
+                "OK 1\n"
+            );
+            assert_eq!(
+                poster.join().expect("the poster finished"),
+                "OK 1 off=42 ack=handled msg=1\n"
+            );
+            // Expired before any ack: the verdict, not a timeout.
+            let poster = {
+                let ctx = ctx.clone();
+                std::thread::spawn(move || {
+                    cmd_post(&ctx, "to=@s-peer kind=ask dl=30000 --wait-ack why?", None)
+                })
+            };
+            loop {
+                if cmd_deliver(&store, &format!("{sid} landed=2 off=43")) == "OK\n" {
+                    break;
+                }
+                std::thread::yield_now();
+            }
+            assert_eq!(
+                cmd_deliver(
+                    &store,
+                    &format!("{sid} off=51 from=n-lab kind=expired re=43 dl=30000 text=expired")
+                ),
+                "OK 2\n"
+            );
+            assert_eq!(
+                poster.join().expect("the poster finished"),
+                "ERR expired id=2 off=43\n"
+            );
+            // Bare `--wait-ack` is bounded by `dl=` PLUS THE GRACE the asker's
+            // bridge needs to notice, check the bus and deliver its `expired`:
+            // nobody answers here, and the wait ends then, naming the offset
+            // the post landed at.
+            let poster = {
+                let ctx = ctx.clone();
+                std::thread::spawn(move || {
+                    cmd_post(&ctx, "to=@s-peer kind=task dl=150 --wait-ack quick", None)
+                })
+            };
+            loop {
+                if cmd_deliver(&store, &format!("{sid} landed=3 off=44")) == "OK\n" {
+                    break;
+                }
+                std::thread::yield_now();
+            }
+            let started = std::time::Instant::now();
+            assert_eq!(
+                poster.join().expect("the poster finished"),
+                "ERR timeout id=3 off=44\n"
+            );
+            let waited = started.elapsed();
+            assert!(
+                waited >= std::time::Duration::from_millis(EXPIRY_GRACE_MS)
+                    && waited < std::time::Duration::from_secs(10),
+                "bounded by dl=150 + the {EXPIRY_GRACE_MS} ms grace, not by dl= alone and not \
+                 by the 30 s default: waited {waited:?}"
+            );
+            // THE CASE THE GRACE EXISTS FOR: the asker's bridge records `expired`
+            // AFTER `dl=` has passed — its sweep runs on a 250 ms tick and the
+            // verdict still has to be delivered back — and the wait answers the
+            // verdict, not `ERR timeout`. (Reviewed: with the bound at `dl=`
+            // alone this answered `ERR timeout` every time.)
+            let poster = {
+                let ctx = ctx.clone();
+                std::thread::spawn(move || {
+                    cmd_post(&ctx, "to=@s-peer kind=ask dl=100 --wait-ack late?", None)
+                })
+            };
+            loop {
+                if cmd_deliver(&store, &format!("{sid} landed=4 off=45")) == "OK\n" {
+                    break;
+                }
+                std::thread::yield_now();
+            }
+            // The scenario is the delay: the verdict lands well past `dl=100`.
+            std::thread::sleep(std::time::Duration::from_millis(600));
+            assert_eq!(
+                cmd_deliver(
+                    &store,
+                    &format!("{sid} off=52 from=n-lab kind=expired re=45 dl=100 text=expired")
+                ),
+                "OK 3\n"
+            );
+            assert_eq!(
+                poster.join().expect("the poster finished"),
+                "ERR expired id=4 off=45\n"
+            );
+            // An explicit `--wait-ack=<ms>` is the caller's own bound, kept
+            // exactly: no grace is added to it.
+            let poster = {
+                let ctx = ctx.clone();
+                std::thread::spawn(move || {
+                    cmd_post(
+                        &ctx,
+                        "to=@s-peer kind=ask dl=100 --wait-ack=200 exact",
+                        None,
+                    )
+                })
+            };
+            loop {
+                if cmd_deliver(&store, &format!("{sid} landed=5 off=46")) == "OK\n" {
+                    break;
+                }
+                std::thread::yield_now();
+            }
+            let started = std::time::Instant::now();
+            assert_eq!(
+                poster.join().expect("the poster finished"),
+                "ERR timeout id=5 off=46\n"
+            );
+            assert!(
+                started.elapsed() < std::time::Duration::from_millis(EXPIRY_GRACE_MS),
+                "an explicit bound gets no grace"
+            );
+        });
+    }
+
+    /// **A DECIDED `ask`/`task` OWES A RECEIPT, AND THE ENDPOINT HOLDS IT ON THE
+    /// `outbox` PEEK UNTIL THE BRIDGE RETIRES IT (R8).** Reviewed defect: the
+    /// receipt rode the `inbox-seen` event alone, so a verdict given while the
+    /// broker was down or the bridge was being replaced never reached the
+    /// sender, and — the endpoint recording a word once per row per change —
+    /// the recipient could not resend it. Now it is QUEUED: listed on every
+    /// drain (a peek), in order, with a per-session `rid`; a note, a bare
+    /// `inbox seen` and a repeated word owe nothing; `deliver <sid>
+    /// receipt=<rid> off=<n|->` retires one, idempotently; and the queue is
+    /// bounded, oldest out.
+    #[test]
+    fn a_decided_ask_owes_a_receipt_on_the_outbox_until_the_bridge_retires_it() {
+        with_link(|| {
+            let store = new_store();
+            let (sid, ctx) = registered(&store);
+            deliver(&store, &sid, 10, "h-andrew", "task", "one");
+            deliver(&store, &sid, 11, "s-peer@n-lab", "ask", "two");
+            deliver(&store, &sid, 12, "s-peer@n-lab", "note", "three");
+            // The `receipt` lines of one drain, read by the FRAMING — a post's
+            // body is `len=` raw bytes with no newline of its own, so a line
+            // scan would glue the next line onto it.
+            let receipts = |store: &Store| -> Vec<String> {
+                let reply = cmd_outbox(store, "");
+                let (_, mut rest) = reply.split_once('\n').expect("a header");
+                let mut out = Vec::new();
+                while let Some((line, tail)) = rest.split_once('\n') {
+                    rest = tail;
+                    if line.starts_with("receipt ") {
+                        out.push(line.to_string());
+                    } else if let Some((_, n)) = line.rsplit_once(" len=") {
+                        let n: usize = n.parse().expect("a post's len=");
+                        rest = &rest[n..];
+                    }
+                }
+                out
+            };
+            assert!(receipts(&store).is_empty(), "nothing decided, nothing owed");
+            assert_eq!(cmd_inbox_seen(&ctx, "3"), "OK seen=3\n");
+            assert_eq!(cmd_inbox_seen(&ctx, "3 handled"), "OK seen=3\n");
+            assert!(
+                receipts(&store).is_empty(),
+                "a bare seen and a note owe nothing"
+            );
+            assert_eq!(cmd_inbox_seen(&ctx, "2 deferred"), "OK seen=3\n");
+            assert_eq!(cmd_inbox_seen(&ctx, "2 deferred"), "OK seen=3\n");
+            assert_eq!(cmd_inbox_seen(&ctx, "1 handled"), "OK seen=3\n");
+            assert_eq!(cmd_inbox_seen(&ctx, "2 handled"), "OK seen=3\n");
+            let owed = receipts(&store);
+            assert_eq!(
+                owed,
+                [
+                    format!(
+                        "receipt sid={sid} rid=1 off=11 verdict=deferred kind=ask from=s-peer@n-lab"
+                    ),
+                    format!(
+                        "receipt sid={sid} rid=2 off=10 verdict=handled kind=task from=h-andrew"
+                    ),
+                    format!(
+                        "receipt sid={sid} rid=3 off=11 verdict=handled kind=ask from=s-peer@n-lab"
+                    ),
+                ],
+                "one per decision, in order; the repeated word owes nothing"
+            );
+            assert_eq!(
+                receipts(&store),
+                owed,
+                "a PEEK: the next drain lists them again"
+            );
+            // RETIRED by the bridge, idempotently, and only by a well-formed line.
+            for bad in [
+                "receipt=x off=5",
+                "receipt=1",
+                "receipt=1 off=x",
+                "receipt=1 off=5 more=1",
+            ] {
+                assert_eq!(
+                    cmd_deliver(&store, &format!("{sid} {bad}")),
+                    DELIVER_USAGE,
+                    "{bad}"
+                );
+            }
+            assert_eq!(
+                cmd_deliver(&store, &format!("{sid} receipt=1 off=90")),
+                "OK\n"
+            );
+            assert_eq!(
+                cmd_deliver(&store, &format!("{sid} receipt=1 off=90")),
+                "OK\n",
+                "a retried retirement is OK, so the bridge's pin is never stranded"
+            );
+            assert_eq!(
+                cmd_deliver(&store, &format!("{sid} receipt=3 off=-")),
+                "OK\n"
+            );
+            assert_eq!(
+                receipts(&store),
+                [format!(
+                    "receipt sid={sid} rid=2 off=10 verdict=handled kind=task from=h-andrew"
+                )]
+            );
+            // THE RECEIPT LINES RIDE AFTER EVERY POST, like the `fetch` lines, so
+            // a parser from before them still drains every post.
+            assert_eq!(cmd_post(&ctx, "to=@s-peer kind=note after", None), "OK 1\n");
+            let reply = cmd_outbox(&store, "");
+            let post_at = reply.find("post sid=").expect("the post");
+            let receipt_at = reply.find("receipt sid=").expect("the receipt");
+            assert!(post_at < receipt_at, "{reply}");
+            // BOUNDED, oldest out.
+            for n in 0..u64::try_from(RECEIPTS_OWED_MAX).expect("fits") + 5 {
+                let word = if n % 2 == 0 { "refused" } else { "handled" };
+                assert_eq!(cmd_inbox_seen(&ctx, &format!("2 {word}")), "OK seen=3\n");
+            }
+            let owed = receipts(&store);
+            assert_eq!(owed.len(), RECEIPTS_OWED_MAX);
+            assert!(
+                !owed.iter().any(|l| l.contains(" rid=2 ")),
+                "the oldest owed receipt is the one dropped"
+            );
+        });
+    }
+
+    /// **`inbox get @<off>` ANSWERS FROM THE RING WHILE IT CAN, PARKS FOR THE
+    /// BRIDGE WHEN THE RING LET THE RECORD GO, AND THE HEADER NAMES THE OLDEST
+    /// OFFSET THE LOG STILL HOLDS FOR THIS SESSION (E3).** 513 deliveries evict
+    /// the first row (`dropped=1`); its offset is still `oldest_on_bus=`, the
+    /// read for it rides the `outbox` peek as `fetch sid= off=`, the bridge's
+    /// `deliver … fetched=` fills it with the full body and touches no ring,
+    /// and a record the bridge cannot find is `ERR no such record`.
+    #[test]
+    fn inbox_get_at_an_offset_answers_the_ring_or_the_bus_and_the_header_names_the_oldest() {
+        with_link(|| {
+            let store = new_store();
+            let (sid, ctx) = registered(&store);
+            attach_up(&store, next_bridge_generation());
+            // Park a fetch, then wait — bounded — for it to ride the `outbox`
+            // peek, so a record that answers from the ring instead of parking
+            // fails here loudly rather than spinning this poll forever.
+            let await_fetch = |off: u64| {
+                let deadline = std::time::Instant::now() + std::time::Duration::from_secs(20);
+                loop {
+                    let peek = cmd_outbox(&store, "");
+                    if peek.contains(&format!("fetch sid={sid} off={off}\n")) {
+                        return;
+                    }
+                    assert!(
+                        std::time::Instant::now() < deadline,
+                        "no `fetch off={off}` on the outbox peek within 20s; drain:\n{peek}"
+                    );
+                    std::thread::yield_now();
+                }
+            };
+            // Fill past the 512 cap by eight, so the eight oldest offsets
+            // (1000..1007) are evicted from the ring while the bus keeps them.
+            // List every 60 so the per-peer quota (64 unlisted) never refuses one.
+            let total = RING_CAP as u64 + 8;
+            for i in 0..total {
+                let off = 1000 + i;
+                assert_eq!(
+                    deliver(
+                        &store,
+                        &sid,
+                        off,
+                        "s-peer@n-lab",
+                        "note",
+                        &format!("body-{off}")
+                    ),
+                    format!("OK {}\n", i + 1)
+                );
+                if i % 60 == 59 {
+                    cmd_inbox(&ctx, "--meta");
+                }
+            }
+            let newest = 1000 + total - 1;
+            let header = cmd_inbox(&ctx, "0 --peek --meta");
+            assert!(
+                header.contains(&format!(
+                    " bus_head={newest} oldest_on_bus=@1000 dropped=8 "
+                )),
+                "the evicted rows' oldest offset is still the oldest on the bus: {header}"
+            );
+            // From the ring: the newest row, by offset, with its fields on the tail.
+            assert_eq!(
+                cmd_inbox_get(&ctx, &format!("@{newest}")),
+                format!("OK 9 off={newest} from=s-peer@n-lab kind=note trust=agent\nbody-{newest}")
+            );
+            // Evicted: parks, and the peek lists the read for the bridge.
+            let reader = {
+                let ctx = ctx.clone();
+                std::thread::spawn(move || cmd_inbox_get(&ctx, "@1000"))
+            };
+            await_fetch(1000);
+            assert_eq!(
+                cmd_deliver(
+                    &store,
+                    &format!(
+                        "{sid} fetched=1000 from=s-peer@n-lab kind=note trust=agent \
+                         text=body-1000"
+                    )
+                ),
+                "OK\n"
+            );
+            assert_eq!(
+                reader.join().expect("the reader finished"),
+                "OK 9 off=1000 from=s-peer@n-lab kind=note trust=agent\nbody-1000"
+            );
+            // Answered once, answered again without a second parked read; and no
+            // row was appended for it.
+            assert_eq!(
+                cmd_inbox_get(&ctx, "@1000"),
+                "OK 9 off=1000 from=s-peer@n-lab kind=note trust=agent\nbody-1000"
+            );
+            assert!(!cmd_outbox(&store, "").contains("fetch "));
+            assert_eq!(cmd_inbox_get(&ctx, "1"), "ERR no such message\n");
+            // The bridge found nothing at that offset on this session's lane.
+            let reader = {
+                let ctx = ctx.clone();
+                std::thread::spawn(move || cmd_inbox_get(&ctx, "@7"))
+            };
+            await_fetch(7);
+            assert_eq!(
+                cmd_deliver(&store, &format!("{sid} fetched=7 err=no-record")),
+                "OK\n"
+            );
+            assert_eq!(
+                reader.join().expect("the reader finished"),
+                "ERR no such record off=7\n"
+            );
+            // A bridge-side cut is said, exactly as `inbox get <id>` says it —
+            // offset 1001 is evicted too (the eight oldest were dropped).
+            let reader = {
+                let ctx = ctx.clone();
+                std::thread::spawn(move || cmd_inbox_get(&ctx, "@1001"))
+            };
+            await_fetch(1001);
+            assert_eq!(
+                cmd_deliver(
+                    &store,
+                    &format!(
+                        "{sid} fetched=1001 from=h-andrew kind=task trust=human len=99 text=cut"
+                    )
+                ),
+                "OK\n"
+            );
+            assert_eq!(
+                reader.join().expect("the reader finished"),
+                "OK 3 off=1001 from=h-andrew kind=task trust=human truncated=1 len=99\ncut"
+            );
+            assert_eq!(cmd_inbox_get(&ctx, "@x"), INBOX_USAGE);
+
+            // IN CHUNKS: a body that does not fit one control line comes back
+            // whole, `at=` placing each piece and `more=1` on all but the last —
+            // and a chunk out of place is refused AND fails the read at once.
+            let reader = {
+                let ctx = ctx.clone();
+                std::thread::spawn(move || cmd_inbox_get(&ctx, "@1002"))
+            };
+            await_fetch(1002);
+            let line = |tail: &str| {
+                cmd_deliver(
+                    &store,
+                    &format!("{sid} fetched=1002 from=s-peer@n-lab kind=note trust=agent {tail}"),
+                )
+            };
+            assert_eq!(line("more=1 text=abc"), "OK\n");
+            assert!(
+                cmd_outbox(&store, "").contains(&format!("fetch sid={sid} off=1002\n")),
+                "a partial answer is still waited on, so still listed"
+            );
+            assert_eq!(line("at=3 more=1 text=def"), "OK\n");
+            assert_eq!(line("at=6 text=gh%20i"), "OK\n");
+            assert_eq!(
+                reader.join().expect("the reader finished"),
+                "OK 10 off=1002 from=s-peer@n-lab kind=note trust=agent\nabcdefgh i"
+            );
+            let reader = {
+                let ctx = ctx.clone();
+                std::thread::spawn(move || cmd_inbox_get(&ctx, "@1003"))
+            };
+            await_fetch(1003);
+            let line = |tail: &str| {
+                cmd_deliver(
+                    &store,
+                    &format!("{sid} fetched=1003 from=s-peer@n-lab kind=note trust=agent {tail}"),
+                )
+            };
+            assert_eq!(line("more=1 text=abc"), "OK\n");
+            assert_eq!(line("at=2 text=xyz"), "ERR fetch out of order\n");
+            assert_eq!(
+                reader.join().expect("the reader finished"),
+                "ERR fetch failed reason=malformed off=1003\n",
+                "a refused answer ends the read now, not at its 10 s timeout"
+            );
+            // A RECORD OVER BODY_MAX: `len=` is the log's size and may exceed the
+            // bound on this form (the carried body may not), so it reads
+            // `truncated=1 len=` instead of a refusal nothing ever answers.
+            let reader = {
+                let ctx = ctx.clone();
+                std::thread::spawn(move || cmd_inbox_get(&ctx, "@1004"))
+            };
+            await_fetch(1004);
+            let big = BODY_MAX + 44_000;
+            assert_eq!(
+                cmd_deliver(
+                    &store,
+                    &format!(
+                        "{sid} fetched=1004 from=s-peer@n-lab kind=note trust=agent len={big} \
+                         text=head"
+                    )
+                ),
+                "OK\n"
+            );
+            assert_eq!(
+                reader.join().expect("the reader finished"),
+                format!(
+                    "OK 4 off=1004 from=s-peer@n-lab kind=note trust=agent truncated=1 \
+                     len={big}\nhead"
+                )
+            );
+            // AND A ROW THE DELIVERY CUT IS NOT ANSWERED FROM THE RING (E3:
+            // "`truncated=1` becomes fetchable"): it parks for the bridge, which
+            // answers it whole.
+            // List everything first, so the per-peer quota has room.
+            cmd_inbox(&ctx, "--meta");
+            assert!(
+                cmd_deliver(
+                    &store,
+                    &format!(
+                        "{sid} off=5000 from=s-peer@n-lab kind=note trust=agent len=12 text=cut-"
+                    )
+                )
+                .starts_with("OK ")
+            );
+            let reader = {
+                let ctx = ctx.clone();
+                std::thread::spawn(move || cmd_inbox_get(&ctx, "@5000"))
+            };
+            await_fetch(5000);
+            assert_eq!(
+                cmd_deliver(
+                    &store,
+                    &format!(
+                        "{sid} fetched=5000 from=s-peer@n-lab kind=note trust=agent \
+                         text=cut-no-more%21"
+                    )
+                ),
+                "OK\n"
+            );
+            assert_eq!(
+                reader.join().expect("the reader finished"),
+                "OK 12 off=5000 from=s-peer@n-lab kind=note trust=agent\ncut-no-more!"
+            );
+            // A cut row the bus CANNOT complete still answers what the ring
+            // holds, marked cut — never an error in place of the prefix.
+            assert!(
+                cmd_deliver(
+                    &store,
+                    &format!(
+                        "{sid} off=5001 from=s-peer@n-lab kind=note trust=agent len=40 text=prefix"
+                    )
+                )
+                .starts_with("OK ")
+            );
+            let reader = {
+                let ctx = ctx.clone();
+                std::thread::spawn(move || cmd_inbox_get(&ctx, "@5001"))
+            };
+            await_fetch(5001);
+            assert_eq!(
+                cmd_deliver(&store, &format!("{sid} fetched=5001 err=unreadable")),
+                "OK\n"
+            );
+            assert_eq!(
+                reader.join().expect("the reader finished"),
+                "OK 6 off=5001 from=s-peer@n-lab kind=note trust=agent truncated=1 len=40\nprefix"
+            );
         });
     }
 
@@ -4778,6 +6388,12 @@ mod inbox_hold {
         let mut rest = payload;
         while !rest.is_empty() {
             let (line, tail) = rest.split_once('\n').expect("a post line");
+            // The bodiless trailer lines (owed receipts, parked reads) ride after
+            // every post and carry no `len=`.
+            if line.starts_with("receipt ") || line.starts_with("fetch ") {
+                rest = tail;
+                continue;
+            }
             let len: usize = line
                 .rsplit_once(" len=")
                 .and_then(|(_, n)| n.parse().ok())
@@ -5759,8 +7375,9 @@ mod inbox_hold {
     /// A bridge EXIT is the ordinary relaunch path: the supervisor brings a
     /// replacement up, `outbox` is a peek that removed nothing, and the post is
     /// published seconds later. A bare `ERR fabric disconnected` reads as "not
-    /// sent", the remedy for "not sent" is to send again, and `post` carries no
-    /// idempotency key — so the peer's inbox ends up holding the same `ask` twice.
+    /// sent", the remedy for "not sent" is to send again, and a `post` without
+    /// `key=` carries no idempotency key — so the peer's inbox ends up holding
+    /// the same `ask` twice.
     #[test]
     fn a_post_refused_for_want_of_a_link_says_it_is_still_queued() {
         with_link(|| {
@@ -5961,6 +7578,16 @@ mod inbox_hold {
                  no bytes on a PTY and retires no session",
             ),
             ("rain", "a visual effect on the window"),
+            (
+                "kitty",
+                "chooses which collected cat rides the cursor. It puts no bytes on \
+                 a PTY, retires no session and drives no program — the same class \
+                 as `rain` and `fx`, a LOOK. It does write the machine-owned toy \
+                 ledger (`kitty-collectibles.toml`), which is why the verb is \
+                 `Write` and not `Read`, but a halt stops DRIVERS and a halted \
+                 agent changing the cat changes nothing the halted program can \
+                 see",
+            ),
             (
                 "fx",
                 "arms or reports a window effect; puts no bytes on a PTY and cannot \

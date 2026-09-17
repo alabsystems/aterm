@@ -813,7 +813,12 @@ impl App {
             crate::logging::stderr_line!(
                 "aterm-gui: backend-build thread panicked; no renderer — exiting"
             );
-            std::process::exit(1);
+            // The launch-fatal terminator, not `exit(3)`: this fires with the OS
+            // window already created and the GPU driver loaded, so running the
+            // driver's static destructors here aborts underneath its own live
+            // threads — the same death `fatal_launch_error` was measured taking.
+            // See `crate::exit_without_process_teardown`.
+            crate::exit_without_process_teardown(1);
         });
         assert!(
             backend.admitted_font_sources_sealed(),
@@ -3041,7 +3046,7 @@ impl App {
             authored_description.as_deref(),
             self.config.window_title_format_or_default(),
             &self.config,
-            " — ",
+            crate::title_summary::ChromeSurface::WindowTitle,
             &mut scratch,
         );
         // No "[active/total]" tab counter in the title: the visible tab strip already
@@ -4183,7 +4188,7 @@ mod tests {
                 description.as_deref(),
                 app.config.window_title_format_or_default(),
                 &app.config,
-                " — ",
+                crate::title_summary::ChromeSurface::WindowTitle,
             ),
             "/aterm-proof/window-title — Runs the focused release checks",
             "OSC-7 cwd remains the stable title while Description stays distinct"

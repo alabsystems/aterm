@@ -62,14 +62,47 @@
 //!
 //! `ATERM_WATCHDOG=off` disables the sampler entirely; `ATERM_WATCHDOG=abort`
 //! still `process::abort()`s on a detected stall (CI / repro). Everything else
-//! logs at error level and keeps going. [`beat`] is two relaxed atomic writes
-//! in every build either way (negligible on the hot event path), and the
-//! sampler is one thread asleep 99.99% of the time.
+//! logs at error level and keeps going. [`beat`] is one monotonic clock read and
+//! a handful of relaxed atomic writes in every build either way (negligible on
+//! the hot event path, and the clock read is what buys the turn census below),
+//! and the sampler is one thread asleep 99.99% of the time.
 //!
 //! A stall that PERSISTS is re-reported every [`STALL_REPEAT_INTERVAL`] with
 //! the accumulated frozen duration, so the log distinguishes "wedged for a
 //! moment" from "wedged for an hour and never recovered" — the distinction the
 //! 0.65.0 log could not make, because it said nothing at all.
+//!
+//! ## The TURN CENSUS: the band between a slow frame and a wedge
+//!
+//! The sampler above reports a park that is STILL going after 5 s in a shipped
+//! build, and `metrics` publishes `max_redraw_total_ms` for a park INSIDE a
+//! redraw. Between those two bars lay a band no instrument in the process could
+//! name: a main thread parked 100–600 ms inside a NON-redraw handler — the
+//! `Wake::Output` arm runs status observation, bulk-scrollback routing, title
+//! drift and search refresh before the redraw fan-out — recovers long before
+//! the watchdog's threshold and never enters the redraw timer, so it left no
+//! attributable trace at all. The user still waited for it, and so did
+//! `present_latency` and `input_present`: that is how a live line came to read
+//! `max_present_latency_ms=560.54` beside `max_redraw_total_ms=13.84` with
+//! `present_drops=0`, a reading whose producer nothing published could name and
+//! which was duly read as a GPU problem.
+//!
+//! [`beat`] already knows WHERE the main thread is and WHEN it got there, so it
+//! is the one place that can close that band for free. Each beat stamps the
+//! clock; the NEXT beat prices the span that just ended and books it to the root
+//! that owned it ([`TurnLedger`]), published on the same `metrics` line as
+//! `max_turn_ms` / `max_turn_owner` / `max_turn_at_ms`, `last_turn_ms`,
+//! `turns`, and `long_turns` over [`LONG_TURN_THRESHOLD_NS`]. A
+//! `max_turn_ms=312 max_turn_owner=user_event` beside `max_redraw_total_ms=13.84`
+//! says the park was in the Output arm's bookkeeping rather than the GPU, and
+//! says it on the line the reader was already looking at.
+//!
+//! The census and the sampler are complements, and neither replaces the other:
+//! the census prices parks that END (it is closed by the next beat), the sampler
+//! names parks that do NOT (nothing closes those, which is the point). A park
+//! point's span is never booked — an idle wait, a modal dialog and the
+//! update-handoff park are designed freezes, and pricing them would be the same
+//! noise the sampler's park-point exemption exists to avoid.
 
 use std::sync::atomic::{AtomicU8, AtomicU64, Ordering};
 use std::time::{Duration, Instant};
@@ -163,6 +196,24 @@ impl Breadcrumb {
             6 => Breadcrumb::UpdateHandoff,
             7 => Breadcrumb::Modal,
             _ => Breadcrumb::Startup,
+        }
+    }
+
+    /// The same root as a published METRIC label: snake_case, matching the owner
+    /// vocabulary the rest of the `metrics` line already speaks
+    /// (`deadline_owner=frame_cap`, `wake_owner=session_status`), so a reader
+    /// never has to know that one field spells its owners differently from its
+    /// neighbours. Stable like [`Breadcrumb::name`] — it is a wire label.
+    pub fn metric_name(self) -> &'static str {
+        match self {
+            Breadcrumb::Startup => "startup",
+            Breadcrumb::AboutToWait => "about_to_wait",
+            Breadcrumb::WindowEvent => "window_event",
+            Breadcrumb::UserEvent => "user_event",
+            Breadcrumb::NewEvents => "new_events",
+            Breadcrumb::ResizeSettle => "resize_settle",
+            Breadcrumb::UpdateHandoff => "update_handoff",
+            Breadcrumb::Modal => "modal",
         }
     }
 
@@ -283,14 +334,237 @@ impl Sampler {
     }
 }
 
-/// Record that the main thread just entered `bc`. Two relaxed atomic writes — cheap
-/// enough to sit on the hot event path in every build. The breadcrumb is stamped
-/// BEFORE the heartbeat bumps so the sampler never reads a fresh count against a
-/// stale location.
+/// A main-loop turn at or over this is COUNTED as long. One 30 fps frame budget
+/// — the same bar [`crate::metrics::SLOW_FRAME_THRESHOLD_NS`] applies to a
+/// frame's render, so "long" means one thing across the whole `metrics` line:
+/// this turn cannot have been part of a frame delivered on time.
+const LONG_TURN_THRESHOLD_NS: u64 = crate::metrics::SLOW_FRAME_THRESHOLD_NS;
+
+/// The main-loop TURN census: how long the main thread spent in each work root,
+/// attributed to that root. See the module header for the band it closes.
+///
+/// A "turn" is the span from one [`beat`] to the next, charged to the root that
+/// was current when it opened. That is the span the USER waited, which is why it
+/// is the span booked: the handler body PLUS whatever the winit loop did after
+/// the handler returned and before the next root opened. It is deliberately not
+/// a handler-body timer — a park between two handlers is still a main thread
+/// that is not painting, and a census with a hole in it invites exactly the
+/// "this outlier has no producer" reading it exists to end.
+///
+/// A `WindowEvent` turn therefore CONTAINS the redraw when the event was
+/// `RedrawRequested`, so `max_turn_ms` is read AGAINST `max_redraw_total_ms`:
+/// both large is a slow frame (already attributable, already published), a large
+/// `max_turn_ms` with a small `max_redraw_total_ms` is a park no other
+/// instrument in the process reaches — the finding this census answers.
+///
+/// Every field is written by the main thread alone (the only caller of [`beat`]),
+/// so a max and its owner cannot tear against each other. A concurrent
+/// [`reset_turn_census`] from the control socket can at worst clear a max between
+/// its two writes, leaving a fresh window with a stale owner label on a zero —
+/// the same benign race every `max_`/owner pair on that line already accepts.
+struct TurnLedger {
+    /// When the CURRENT root was entered (`crate::metrics::now_ns` clock).
+    /// 0 = disarmed: no turn is open, so the next beat books nothing. That is
+    /// the state at process start and immediately after a reset, both of which
+    /// would otherwise book a span that began outside the window.
+    open_ns: AtomicU64,
+    /// The most recently booked turn.
+    last_ns: AtomicU64,
+    /// The worst booked turn since reset, the root that owned it, and when it
+    /// ended. A max with no owner and no instant cannot end an investigation —
+    /// the lesson `max_present_latency_ms=560.54` already taught this line.
+    max_ns: AtomicU64,
+    max_owner: AtomicU8,
+    max_at_ns: AtomicU64,
+    /// How many turns were booked, and how many were at or over
+    /// [`LONG_TURN_THRESHOLD_NS`]. READ THE MAX WITH THESE: one 600 ms turn in a
+    /// window of 40,000 is a hitch; the same max with `long_turns=3000` is a main
+    /// thread that is late all the time.
+    turns: AtomicU64,
+    long_turns: AtomicU64,
+}
+
+impl TurnLedger {
+    const fn new() -> Self {
+        Self {
+            open_ns: AtomicU64::new(0),
+            last_ns: AtomicU64::new(0),
+            max_ns: AtomicU64::new(0),
+            max_owner: AtomicU8::new(Breadcrumb::Startup as u8),
+            max_at_ns: AtomicU64::new(0),
+            turns: AtomicU64::new(0),
+            long_turns: AtomicU64::new(0),
+        }
+    }
+
+    /// The span a turn that just ended is ATTRIBUTABLE for, or `None` when it is
+    /// not this census's to price: a park point (idle, startup, a modal dialog,
+    /// the update-handoff wait — all designed freezes), or a disarmed stamp (no
+    /// turn was open, so the span began outside this window).
+    ///
+    /// Pure, so the attribution rule is testable without the process-global
+    /// ledger that every other test in this binary also writes.
+    fn attributable_span(previous: Breadcrumb, open_ns: u64, now_ns: u64) -> Option<u64> {
+        if open_ns == 0 || previous.is_park_point() {
+            return None;
+        }
+        Some(now_ns.saturating_sub(open_ns))
+    }
+
+    /// Close the turn `previous` owned at `now_ns` and open one for the root
+    /// being entered. Returns the span booked, or `None` when there was nothing
+    /// attributable to book.
+    fn close(&self, previous: Breadcrumb, now_ns: u64) -> Option<u64> {
+        let open = self.open_ns.swap(now_ns, Ordering::Relaxed);
+        let span = Self::attributable_span(previous, open, now_ns)?;
+        self.last_ns.store(span, Ordering::Relaxed);
+        self.turns.fetch_add(1, Ordering::Relaxed);
+        if span >= LONG_TURN_THRESHOLD_NS {
+            self.long_turns.fetch_add(1, Ordering::Relaxed);
+        }
+        if self.max_ns.fetch_max(span, Ordering::Relaxed) < span {
+            self.max_owner.store(previous as u8, Ordering::Relaxed);
+            self.max_at_ns.store(now_ns, Ordering::Relaxed);
+        }
+        Some(span)
+    }
+
+    fn snapshot(&self) -> TurnCensus {
+        let turns = self.turns.load(Ordering::Relaxed);
+        TurnCensus {
+            last_ns: self.last_ns.load(Ordering::Relaxed),
+            max_ns: self.max_ns.load(Ordering::Relaxed),
+            // No booked turn means no owner: `startup` (the atomic's initial
+            // value) would be a claim about a root that never ran.
+            max_owner: (turns != 0)
+                .then(|| Breadcrumb::from_u8(self.max_owner.load(Ordering::Relaxed))),
+            max_at_ns: self.max_at_ns.load(Ordering::Relaxed),
+            turns,
+            long_turns: self.long_turns.load(Ordering::Relaxed),
+        }
+    }
+
+    /// Clear the window, INCLUDING the open stamp: the turn straddling a reset
+    /// began before the window it would be booked to, and a driver that resets,
+    /// drives a workload and reads must see that workload's worst turn.
+    fn reset(&self) {
+        self.open_ns.store(0, Ordering::Relaxed);
+        self.last_ns.store(0, Ordering::Relaxed);
+        self.max_ns.store(0, Ordering::Relaxed);
+        self.max_owner
+            .store(Breadcrumb::Startup as u8, Ordering::Relaxed);
+        self.max_at_ns.store(0, Ordering::Relaxed);
+        self.turns.store(0, Ordering::Relaxed);
+        self.long_turns.store(0, Ordering::Relaxed);
+    }
+}
+
+/// The process-global turn census. See [`TurnLedger`].
+static TURNS: TurnLedger = TurnLedger::new();
+
+/// A read of [`TURNS`] for the `metrics` verb.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct TurnCensus {
+    /// The most recently booked turn.
+    pub last_ns: u64,
+    /// The worst booked turn since the last reset.
+    pub max_ns: u64,
+    /// The root that owned the worst turn, or `None` when none was booked.
+    pub max_owner: Option<Breadcrumb>,
+    /// When the worst turn ended, on the `crate::metrics::now_ns` process clock.
+    pub max_at_ns: u64,
+    /// Turns booked since the last reset, and the subset at or over
+    /// [`LONG_TURN_THRESHOLD_NS`].
+    pub turns: u64,
+    pub long_turns: u64,
+}
+
+/// Record that the main thread just entered `bc`, and price the turn that ended.
+/// A monotonic clock read and a handful of relaxed atomic writes — cheap enough
+/// to sit on the hot event path in every build, and the only place in the process
+/// that can price a park OUTSIDE the redraw (see the module header). The
+/// breadcrumb is stamped BEFORE the heartbeat bumps so the sampler never reads a
+/// fresh count against a stale location.
 #[inline]
 pub fn beat(bc: Breadcrumb) {
-    BREADCRUMB.store(bc as u8, Ordering::Relaxed);
+    beat_at(bc, crate::metrics::now_ns());
+}
+
+/// [`beat`] with the clock passed IN, returning the span it booked — a real clock
+/// would make any assertion about a span a race.
+#[inline]
+fn beat_at(bc: Breadcrumb, now_ns: u64) -> Option<u64> {
+    beat_into(&TURNS, bc, now_ns)
+}
+
+/// The beat path with its LEDGER passed in too, on the [`Sampler`] precedent:
+/// factored out so the stamp-close-bump sequence is testable against a ledger no
+/// other test in this binary can write, and no `metrics reset` can clear
+/// mid-assertion.
+#[inline]
+fn beat_into(turns: &TurnLedger, bc: Breadcrumb, now_ns: u64) -> Option<u64> {
+    let previous = Breadcrumb::from_u8(BREADCRUMB.swap(bc as u8, Ordering::Relaxed));
+    let booked = turns.close(previous, now_ns);
     HEARTBEAT.fetch_add(1, Ordering::Relaxed);
+    booked
+}
+
+/// The turn census, for the `metrics` verb.
+#[must_use]
+pub fn turn_census() -> TurnCensus {
+    TURNS.snapshot()
+}
+
+/// Clear the turn census. Called by [`crate::metrics::reset`], so the census is a
+/// window stat like every other `max_` on that line.
+pub fn reset_turn_census() {
+    TURNS.reset();
+}
+
+/// The turn-census fields of the `metrics` summary, text form.
+///
+/// Spliced as ONE fragment (the `echo_rtt::percentile_fields_text` discipline) so
+/// the text and JSON summaries cannot drift apart and neither giant `format!`
+/// grows seven more positional holes.
+///
+/// `max_turn_at_ms` is on the `crate::metrics::now_ns` PROCESS clock — the one
+/// `metrics_now_ms` reads at the same instant — so "how long ago" is one
+/// subtraction, the rule every other `_at_ms` on the line already follows.
+#[must_use]
+pub fn turn_census_fields_text() -> String {
+    let c = turn_census();
+    let ms = |ns: u64| ns as f64 / 1e6;
+    format!(
+        " max_turn_ms={:.2} max_turn_owner={} max_turn_at_ms={:.2} last_turn_ms={:.2} \
+         turns={} long_turns={} long_turn_threshold_ms={:.1}",
+        ms(c.max_ns),
+        c.max_owner.map_or("none", Breadcrumb::metric_name),
+        ms(c.max_at_ns),
+        ms(c.last_ns),
+        c.turns,
+        c.long_turns,
+        ms(LONG_TURN_THRESHOLD_NS),
+    )
+}
+
+/// Field-for-field JSON twin of [`turn_census_fields_text`] — a leading comma, so
+/// it splices straight in before the closing brace.
+#[must_use]
+pub fn turn_census_fields_json() -> String {
+    let c = turn_census();
+    let ms = |ns: u64| ns as f64 / 1e6;
+    format!(
+        ",\"max_turn_ms\":{:.2},\"max_turn_owner\":\"{}\",\"max_turn_at_ms\":{:.2},\
+         \"last_turn_ms\":{:.2},\"turns\":{},\"long_turns\":{},\
+         \"long_turn_threshold_ms\":{:.1}",
+        ms(c.max_ns),
+        c.max_owner.map_or("none", Breadcrumb::metric_name),
+        ms(c.max_at_ns),
+        ms(c.last_ns),
+        c.turns,
+        c.long_turns,
+        ms(LONG_TURN_THRESHOLD_NS),
+    )
 }
 
 /// The breadcrumb the main thread last stamped.
@@ -408,6 +682,19 @@ pub fn start() {
 mod tests {
     use super::*;
 
+    /// [`BREADCRUMB`] and [`HEARTBEAT`] are process-global and the tests in this
+    /// binary run in parallel, so every test that BEATS takes this first. Without
+    /// it a beat from a sibling test lands between two of this one's and swaps the
+    /// breadcrumb out from under the assertion — a green run under one filter and
+    /// a red one under another.
+    static BEAT_SERIAL: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+    fn beat_serial() -> std::sync::MutexGuard<'static, ()> {
+        BEAT_SERIAL
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+    }
+
     /// The modal park point never reports, however long the dialog stays up:
     /// a user reading a confirm sheet for a minute is not a stall.
     #[test]
@@ -434,6 +721,7 @@ mod tests {
     /// the guard drops, and it comes back with a fresh beat.
     #[test]
     fn park_modal_restores_the_outer_root_with_a_fresh_beat() {
+        let _serial = beat_serial();
         beat(Breadcrumb::WindowEvent);
         let before = HEARTBEAT.load(Ordering::Relaxed);
         {
@@ -512,6 +800,216 @@ mod tests {
             "the stall line must NAME the breadcrumb; got: {}",
             saw.lock().unwrap()
         );
+    }
+
+    /// THE ATTRIBUTION RULE (2026-09-15 responsiveness audit). A turn that ended
+    /// inside a WORK root is the span this census exists to name — the 100–600 ms
+    /// band that is too short for the release sampler's 5 s bar and never enters
+    /// the redraw timer, so before this it left no attributable trace while still
+    /// being charged to `present_latency` and `input_present`.
+    ///
+    /// A PARK POINT's span is never booked, however long it lasts: idling in the
+    /// OS event wait, a modal dialog the user is reading, and the update-handoff
+    /// wait are designed freezes, and pricing them would be exactly the noise the
+    /// sampler's park-point exemption exists to avoid.
+    #[test]
+    fn a_work_root_turn_is_attributable_and_a_designed_park_is_never_booked() {
+        const OPEN: u64 = 1_000_000;
+        const PARK_NS: u64 = 600 * 1_000_000_000; // ten minutes
+        for work in [
+            Breadcrumb::WindowEvent,
+            Breadcrumb::UserEvent,
+            Breadcrumb::NewEvents,
+            Breadcrumb::ResizeSettle,
+        ] {
+            assert_eq!(
+                TurnLedger::attributable_span(work, OPEN, OPEN + 300_000_000),
+                Some(300_000_000),
+                "a 300 ms park in `{}` is the exact reading this census exists to \
+                 name: the release sampler ignores it and the redraw timer never \
+                 sees it",
+                work.metric_name()
+            );
+        }
+        for park in [
+            Breadcrumb::Startup,
+            Breadcrumb::AboutToWait,
+            Breadcrumb::UpdateHandoff,
+            Breadcrumb::Modal,
+        ] {
+            assert_eq!(
+                TurnLedger::attributable_span(park, OPEN, OPEN + PARK_NS),
+                None,
+                "`{}` is a DESIGNED freeze — booking it would make every reading \
+                 on this line meaningless",
+                park.metric_name()
+            );
+        }
+        // A disarmed stamp — process start, or the turn straddling a reset —
+        // books nothing: that span began outside the window it would be
+        // charged to.
+        assert_eq!(
+            TurnLedger::attributable_span(Breadcrumb::UserEvent, 0, OPEN + PARK_NS),
+            None,
+            "a turn that began before this window is not this window's to price"
+        );
+    }
+
+    /// THE READING THAT HAD NO PRODUCER. A `Wake::Output` turn parks 312 ms in
+    /// the bookkeeping that runs ahead of the redraw fan-out; `present_latency`
+    /// and `input_present` both book it, `redraw_total` cannot see it, and the
+    /// 5 s release sampler never fires. This is the census that names it, with
+    /// the counts that say whether it was one hitch or a habit.
+    ///
+    /// Driven against a LOCAL ledger on a synthetic clock: the process-global one
+    /// is written by every other test in this binary and cleared by
+    /// `metrics::reset`, so asserting against it would be schedule-dependent —
+    /// exactly the flake the key-queue split was rewritten to avoid.
+    #[test]
+    fn the_turn_census_names_the_worst_root_and_counts_the_long_turns() {
+        const T0: u64 = 5_000_000_000;
+        const LONG: u64 = 312_000_000;
+        const SHORT: u64 = 2_000_000;
+        let ledger = TurnLedger::new();
+
+        // The first beat only OPENS a turn; there is nothing to close yet.
+        assert_eq!(ledger.close(Breadcrumb::AboutToWait, T0), None);
+        let c = ledger.snapshot();
+        assert_eq!(c.turns, 0);
+        assert_eq!(
+            c.max_owner, None,
+            "an empty census must name no owner at all: `startup` would be a \
+             claim about a root that never ran"
+        );
+
+        // …then the Output arm parks for 312 ms and the next root closes it.
+        assert_eq!(ledger.close(Breadcrumb::UserEvent, T0 + LONG), Some(LONG));
+        let c = ledger.snapshot();
+        assert_eq!(c.max_ns, LONG);
+        assert_eq!(
+            c.max_owner,
+            Some(Breadcrumb::UserEvent),
+            "a max that cannot name its root sends the next reader to the GPU"
+        );
+        assert_eq!(c.max_at_ns, T0 + LONG, "the worst turn says WHEN it ended");
+        assert_eq!(c.last_ns, LONG);
+        assert_eq!((c.turns, c.long_turns), (1, 1));
+
+        // A short turn moves `last` and the count, never the max or its owner.
+        assert_eq!(
+            ledger.close(Breadcrumb::WindowEvent, T0 + LONG + SHORT),
+            Some(SHORT)
+        );
+        let c = ledger.snapshot();
+        assert_eq!((c.max_ns, c.last_ns), (LONG, SHORT));
+        assert_eq!(
+            c.max_owner,
+            Some(Breadcrumb::UserEvent),
+            "a shorter turn must never steal the max's owner label"
+        );
+        assert_eq!(
+            (c.turns, c.long_turns),
+            (2, 1),
+            "the count is what separates one hitch from a main thread that is \
+             late all the time"
+        );
+
+        // Ten minutes idle at the park point books nothing at all.
+        assert_eq!(
+            ledger.close(Breadcrumb::AboutToWait, T0 + LONG + SHORT + 600_000_000_000),
+            None
+        );
+        assert_eq!(ledger.snapshot().turns, 2);
+
+        // A reset clears the window AND disarms the open stamp, so the turn
+        // straddling it is not charged to the fresh window.
+        ledger.reset();
+        let c = ledger.snapshot();
+        assert_eq!((c.max_ns, c.last_ns, c.turns, c.long_turns), (0, 0, 0, 0));
+        assert_eq!(c.max_owner, None);
+        assert_eq!(
+            ledger.close(Breadcrumb::UserEvent, T0 + 900_000_000_000),
+            None,
+            "the turn open across a `metrics reset` began outside the new window"
+        );
+    }
+
+    /// THE CENSUS IS ON THE HOT PATH, not beside it. The rule above is only
+    /// worth anything if the winit roots actually feed it: `beat` is what every
+    /// root calls, so this drives the real stamp-close-bump sequence and pins
+    /// that the turn it closes is booked to the root that OWNED it — the
+    /// `user_event` park, not the `about_to_wait` that ended it.
+    ///
+    /// The ledger is local and the beat path is serialized, so nothing here
+    /// depends on test order. What is left uncovered is the one-line binding of
+    /// `beat` to the global ledger and the process clock.
+    #[test]
+    fn a_beat_books_the_turn_it_closes_to_the_root_that_owned_it() {
+        let _serial = beat_serial();
+        const T0: u64 = 7_000_000_000;
+        const PARKED: u64 = 250_000_000;
+        let turns = TurnLedger::new();
+
+        // Enter the Output arm's root; nothing is closed yet.
+        assert_eq!(beat_into(&turns, Breadcrumb::UserEvent, T0), None);
+        assert_eq!(current(), Breadcrumb::UserEvent);
+
+        // 250 ms of bookkeeping later the loop reaches its park point, and the
+        // beat that gets there prices what just happened.
+        assert_eq!(
+            beat_into(&turns, Breadcrumb::AboutToWait, T0 + PARKED),
+            Some(PARKED),
+            "the beat that ends a 250 ms `user_event` turn must book it"
+        );
+        let c = turns.snapshot();
+        assert_eq!(c.max_ns, PARKED);
+        assert_eq!(
+            c.max_owner,
+            Some(Breadcrumb::UserEvent),
+            "the turn belongs to the root that HELD the thread, not to the one \
+             that ended it"
+        );
+        assert_eq!((c.turns, c.long_turns), (1, 1));
+
+        // The idle park that follows books nothing, however long the user is away.
+        assert_eq!(
+            beat_into(&turns, Breadcrumb::NewEvents, T0 + PARKED + 600_000_000_000),
+            None
+        );
+        assert_eq!(turns.snapshot().turns, 1);
+
+        // Leave the global breadcrumb where the rest of the suite expects it.
+        beat(Breadcrumb::AboutToWait);
+    }
+
+    /// The long-turn bar is ONE FRAME, and it is the same frame budget the rest
+    /// of the `metrics` line already uses — so `long_turns` and `slow_frames`
+    /// cannot mean two different things by "late".
+    #[test]
+    fn the_long_turn_bar_is_one_frame_budget() {
+        assert_eq!(
+            LONG_TURN_THRESHOLD_NS,
+            crate::metrics::SLOW_FRAME_THRESHOLD_NS
+        );
+        let ledger = TurnLedger::new();
+        assert_eq!(ledger.close(Breadcrumb::AboutToWait, 1), None);
+        assert_eq!(
+            ledger.close(Breadcrumb::UserEvent, 1 + LONG_TURN_THRESHOLD_NS - 1),
+            Some(LONG_TURN_THRESHOLD_NS - 1)
+        );
+        assert_eq!(
+            ledger.snapshot().long_turns,
+            0,
+            "a turn that still fits in a frame is not a long turn"
+        );
+        assert_eq!(
+            ledger.close(
+                Breadcrumb::UserEvent,
+                1 + LONG_TURN_THRESHOLD_NS - 1 + LONG_TURN_THRESHOLD_NS
+            ),
+            Some(LONG_TURN_THRESHOLD_NS)
+        );
+        assert_eq!(ledger.snapshot().long_turns, 1, "a whole frame late counts");
     }
 
     #[test]
@@ -655,6 +1153,7 @@ mod tests {
 
     #[test]
     fn beat_advances_the_heartbeat_and_stamps_the_breadcrumb() {
+        let _serial = beat_serial();
         let before = HEARTBEAT.load(Ordering::Relaxed);
         beat(Breadcrumb::ResizeSettle);
         assert!(HEARTBEAT.load(Ordering::Relaxed) > before);

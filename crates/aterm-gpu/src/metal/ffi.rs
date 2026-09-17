@@ -93,6 +93,96 @@ pub(crate) type Sel = *const c_void;
 /// are the same shape; the alias exists to make the message target obvious.
 pub(crate) type ClassPtr = *mut c_void;
 
+/// The C type `BOOL` widens to on this target: C99 `_Bool` on arm64, `signed
+/// char` everywhere else Apple ships.
+#[cfg(target_arch = "aarch64")]
+type BoolRepr = bool;
+/// See the `aarch64` arm.
+#[cfg(not(target_arch = "aarch64"))]
+type BoolRepr = i8;
+
+/// The Objective-C `BOOL`, at the width and value set THIS target uses — the
+/// type every `BOOL` argument and return in a [`msg`] prototype is spelled
+/// with. It is `aterm-objc`'s `encode::Bool` reached by the same reasoning;
+/// this module keeps its own because `aterm-gpu` does not depend on that
+/// crate, and [`msg`] carries no `Encode` bound that could enforce the rule.
+///
+/// # Why Rust's `bool` is not this type
+///
+/// Measured with the SDK 13.3 clang on the Intel Mac that motivated this
+/// (`tools/metal-storage-probe/probe.m`, 2026-09-06): `-arch x86_64` gives
+/// `sizeof(BOOL)=1`,
+/// `@encode(BOOL)="c"`, `__OBJC_BOOL_IS_BOOL=0` — `BOOL` is `signed char`,
+/// 256 representable values; `-arch arm64` gives `"B"`, C99 `_Bool`. A Rust
+/// `bool` in an `extern "C"` prototype is `i1 zeroext`: the compiler may
+/// assume the byte is 0 or 1, so a `BOOL` of 2 returned by (or handed to) a
+/// method through a `bool` slot is undefined behaviour, not a wrong answer.
+/// Such a byte is reachable: `tools/metal-storage-probe/probe_bool.m`
+/// (2026-09-08, same machine) reads the FULL x86_64 return register of every
+/// `BOOL` getter this crate sends — `isLowPower`, `isHeadless`,
+/// `preserveInvariance`, `framebufferOnly`, `displaySyncEnabled`,
+/// `wantsExtendedDynamicRangeContent`, `allowsNextDrawableTimeout`,
+/// `isOpaque` — and once its setter is handed the byte 3,
+/// `preserveInvariance`, `displaySyncEnabled` and `allowsNextDrawableTimeout`
+/// each hand 3 straight back (the other three normalise it to 1; the upper
+/// 56 bits are clean in every case). The old `bool` prototypes never
+/// misbehaved only because this crate's own setters write nothing but 0/1 —
+/// a property of the callers, not of the IMPs. This type makes the
+/// prototypes right at zero cost: on aarch64 it IS `bool`, so codegen there
+/// is unchanged.
+#[repr(transparent)]
+#[derive(Clone, Copy, PartialEq, Eq, Default)]
+pub(crate) struct ObjcBool(BoolRepr);
+
+#[cfg(target_arch = "aarch64")]
+impl ObjcBool {
+    /// A `BOOL` from a Rust `bool`. Exact: they are the same type here.
+    #[inline]
+    pub(crate) const fn new(value: bool) -> Self {
+        Self(value)
+    }
+
+    /// The Rust `bool` this `BOOL` means.
+    #[inline]
+    pub(crate) const fn get(self) -> bool {
+        self.0
+    }
+}
+
+#[cfg(not(target_arch = "aarch64"))]
+impl ObjcBool {
+    /// A `BOOL` from a Rust `bool`. Exact: `bool` is a subset of `signed char`.
+    #[inline]
+    pub(crate) const fn new(value: bool) -> Self {
+        Self(value as BoolRepr)
+    }
+
+    /// The Rust `bool` this `BOOL` means — `!= 0`, C's own rule, which is why
+    /// the byte is never transmuted.
+    #[inline]
+    pub(crate) const fn get(self) -> bool {
+        self.0 != 0
+    }
+}
+
+impl ObjcBool {
+    /// The raw byte a method could hand back — so a test can put a `2` in
+    /// the slot and read YES, which is the value set a `bool` cannot hold.
+    /// Gated like its only caller: on aarch64 the slot IS `bool`, and there
+    /// is no such byte to put.
+    #[cfg(all(test, not(target_arch = "aarch64")))]
+    pub(crate) const fn from_raw(raw: BoolRepr) -> Self {
+        Self(raw)
+    }
+}
+
+impl From<bool> for ObjcBool {
+    #[inline]
+    fn from(value: bool) -> Self {
+        Self::new(value)
+    }
+}
+
 #[link(name = "objc")]
 unsafe extern "C" {
     /// Declared with NO parameter list on purpose — see the module docs. Every
@@ -112,6 +202,10 @@ unsafe extern "C" {
     /// The one C entry point in Metal. `CF_RETURNS_RETAINED`: the caller owns
     /// the +1 and must release it, which [`Device`] does on drop.
     fn MTLCreateSystemDefaultDevice() -> Id;
+    /// Every Metal device on the machine, as a +1 `NSArray<id<MTLDevice>>`
+    /// (`CF_RETURNS_RETAINED`, like its sibling). The elements are +0 —
+    /// borrowed from the array — until retained.
+    fn MTLCopyAllDevices() -> Id;
 }
 
 /// Cast the untyped `objc_msgSend` to a concrete prototype.
@@ -568,6 +662,10 @@ pub(crate) enum LanguageVersion {
 
 /// `MTLResourceOptions`: `MTLResourceStorageModeShared` is `0 << 4`.
 pub(crate) const RESOURCE_STORAGE_MODE_SHARED: usize = 0;
+/// `MTLStorageMode`: `MTLStorageModeManaged` is `1` (Shared 0, Private 2,
+/// Memoryless 3 — SDK 13.3 `MTLResource.h`). The mode every texture
+/// [`Device::new_texture_2d`] mints; its docs say why, and what it forbids.
+pub(crate) const TEXTURE_STORAGE_MODE_MANAGED: usize = 1;
 
 /// `MTLTextureUsage` bits.
 pub(crate) const TEXTURE_USAGE_SHADER_READ: usize = 1;
@@ -637,8 +735,8 @@ impl CompileOptions {
     pub(crate) fn set_preserve_invariance(&self, on: bool) {
         // SAFETY: plain `BOOL` property write on a live `MTLCompileOptions`.
         unsafe {
-            let f: unsafe extern "C" fn(Id, Sel, bool) = msg();
-            f(self.0.id(), sel(c"setPreserveInvariance:"), on);
+            let f: unsafe extern "C" fn(Id, Sel, ObjcBool) = msg();
+            f(self.0.id(), sel(c"setPreserveInvariance:"), on.into());
         }
     }
 
@@ -655,8 +753,8 @@ impl CompileOptions {
     pub(crate) fn preserve_invariance(&self) -> bool {
         // SAFETY: `-preserveInvariance` is a `BOOL` getter on a live object.
         unsafe {
-            let f: unsafe extern "C" fn(Id, Sel) -> bool = msg();
-            f(self.0.id(), sel(c"preserveInvariance"))
+            let f: unsafe extern "C" fn(Id, Sel) -> ObjcBool = msg();
+            f(self.0.id(), sel(c"preserveInvariance")).get()
         }
     }
 
@@ -675,8 +773,88 @@ impl CompileOptions {
 pub(crate) struct Device(Obj);
 
 impl Device {
+    /// The GPU aterm renders on.
+    ///
+    /// A terminal needs no discrete GPU, and on a dual-GPU MacBook Pro the
+    /// system default IS the discrete one: `MTLCreateSystemDefaultDevice`
+    /// answered "AMD Radeon Pro 560" on a 2017 15" with an Intel HD Graphics
+    /// 630 beside it (macOS 13.7, measured 2026-09-06), so every window kept
+    /// the discrete chip powered — fan and battery — for nothing the
+    /// integrated GPU could not draw. The wgpu arm always asked for
+    /// `PowerPreference::LowPower` (`power_preference_from_env`) and honoured
+    /// `ATERM_GPU_POWER=low|high`; this is the same policy on the first-party
+    /// arm: the first low-power, non-headless device `MTLCopyAllDevices`
+    /// lists, when there is one and the override does not say `high`, else
+    /// [`Self::system_default`]. A single-GPU machine (every Apple-silicon
+    /// Mac) has one device either way, so the choice is invisible there.
+    ///
+    /// The system default is deliberately NOT created when a low-power device
+    /// exists. Apple documents that on a Mac with automatic graphics switching
+    /// `MTLCreateSystemDefaultDevice` switches the machine to the discrete GPU
+    /// and `MTLCopyAllDevices` does not, although the array it answers holds
+    /// the discrete device too; so the pick lists devices rather than creating
+    /// the default one. The app bundle's `NSSupportsAutomaticGraphicsSwitching`
+    /// is the other half: per Apple's documentation, an app without it keeps a
+    /// switching Mac on the discrete GPU for its whole life, whichever device
+    /// the renderer picked. Both halves are DOCUMENTED, not measured here:
+    /// nothing observed the mux, and no bundle was built and run with or
+    /// without the key. What was measured is which device each call answers.
+    pub(crate) fn preferred() -> Option<Self> {
+        let want_high = matches!(
+            std::env::var("ATERM_GPU_POWER").as_deref(),
+            Ok(v) if v.eq_ignore_ascii_case("high")
+        );
+        if !want_high && let Some(low) = Self::low_power() {
+            return Some(low);
+        }
+        Self::system_default()
+    }
+
+    /// The first low-power, non-headless GPU on the machine, or `None` (no
+    /// such device, or no Metal at all). Says which one it picked, once, when
+    /// the machine has more than one GPU.
+    fn low_power() -> Option<Self> {
+        static SAID: std::sync::Once = std::sync::Once::new();
+        let _pool = AutoreleasePool::new();
+        // SAFETY: `MTLCopyAllDevices` is `CF_RETURNS_RETAINED`, so the array
+        // is ours and `Obj` releases it once. `-count` and
+        // `-objectAtIndexedSubscript:` are NSArray's documented getters; the
+        // element is +0, borrowed from the array, and is retained to +1 BEFORE
+        // the array drops. `-isLowPower` / `-isHeadless` are `BOOL` getters on
+        // `MTLDevice`, read through [`ObjcBool`].
+        unsafe {
+            let all = Obj::from_owned(MTLCopyAllDevices())?;
+            let count: unsafe extern "C" fn(Id, Sel) -> usize = msg();
+            let at: unsafe extern "C" fn(Id, Sel, usize) -> Id = msg();
+            let flag: unsafe extern "C" fn(Id, Sel) -> ObjcBool = msg();
+            let n = count(all.id(), sel(c"count"));
+            for i in 0..n {
+                let d = at(all.id(), sel(c"objectAtIndexedSubscript:"), i);
+                if d.is_null() {
+                    continue;
+                }
+                if flag(d, sel(c"isLowPower")).get() && !flag(d, sel(c"isHeadless")).get() {
+                    let dev = Obj::retain(d).map(Self)?;
+                    if n > 1 {
+                        SAID.call_once(|| {
+                            crate::stderr_line!(
+                                "aterm-gpu: {n} Metal devices on this machine; rendering on {} \
+                                 (low-power) — ATERM_GPU_POWER=high picks the discrete GPU",
+                                dev.name()
+                            );
+                        });
+                    }
+                    return Some(dev);
+                }
+            }
+            None
+        }
+    }
+
     /// The system default GPU, or `None` when the process has no Metal device
-    /// (a headless CI box with no GPU, or a denied sandbox).
+    /// (a headless CI box with no GPU, or a denied sandbox). Raw
+    /// `MTLCreateSystemDefaultDevice`: the discrete GPU on a dual-GPU Mac —
+    /// production goes through [`Self::preferred`].
     pub(crate) fn system_default() -> Option<Self> {
         // Device creation walks the IORegistry and builds the driver's own
         // object graph; measured under `OBJC_DEBUG_MISSING_POOLS=YES` it
@@ -816,7 +994,43 @@ impl Device {
         }
     }
 
-    /// A 2-D `MTLTexture`.
+    /// A 2-D `MTLTexture`, in `MTLStorageModeManaged`.
+    ///
+    /// Managed is set EXPLICITLY, and it is what every texture this crate ever
+    /// minted already was: SDK 13.3 `MTLResource.h` calls it "the default
+    /// storage mode for OS X Textures", and measured on the Intel Mac that made
+    /// the implicit default worth spelling out (`tools/metal-storage-probe/
+    /// probe.m`, 2026-09-06, Intel HD Graphics 630 `hasUnifiedMemory=1` and
+    /// AMD Radeon Pro 560 `hasUnifiedMemory=0`): a fresh
+    /// `texture2DDescriptorWith...` reports
+    /// `storageMode=1`, and the texture created from it reports 1 on both
+    /// GPUs with or without the setter below. So this is a restatement, not a
+    /// change — and the test `textures_are_minted_managed_and_managed_is_the_
+    /// platform_default` keeps it one. What the restatement BUYS is a true
+    /// contract for the SAFETY comments downstream, which used to call these
+    /// textures "shared":
+    ///
+    /// * Managed is non-Private, so `replaceRegion:` ([`texture_upload`]) is
+    ///   legal and driver-synchronised; the upload path needs nothing more.
+    /// * Managed is NOT CPU-coherent. On a discrete GPU (the Radeon above) it
+    ///   keeps a system copy AND a VRAM copy, and a CPU read of the system
+    ///   copy after GPU writes is stale until a `synchronizeResource:` blit.
+    ///   This crate never reads texture bytes directly — there is no
+    ///   `getBytes:` anywhere in it — and every readback is a
+    ///   `copyFromTexture:...toBuffer:` into a Shared `MTLBuffer` (the
+    ///   [`Pass`] readback and its siblings), which reads the GPU-side copy
+    ///   and needs no synchronise. Keep it that way: a `getBytes:` on one of
+    ///   these would hand back stale bytes on the dGPU.
+    /// * `MTLStorageModeShared` is not the alternative: Shared TEXTURES are
+    ///   an Apple-family-GPU feature, outside the contract of that machine's
+    ///   Intel and AMD parts. Measured there (`tools/metal-storage-probe/
+    ///   probe_shared.m`, same day): under `MTL_DEBUG_LAYER=1` the
+    ///   descriptor validation logs
+    ///   "MTLStorageModeShared not allowed for textures" and
+    ///   `newTextureWithDescriptor:` returns nil on both GPUs; without the
+    ///   layer the framework hands back an unvalidated `storageMode=0` object
+    ///   on both. A mode the validator refuses is not a portable macOS
+    ///   choice, whatever the release driver tolerates.
     pub(crate) fn new_texture_2d(
         &self,
         format: PixelFormat,
@@ -831,20 +1045,22 @@ impl Device {
         // +1 and is the only value that escapes.
         unsafe {
             let dcls = class(c"MTLTextureDescriptor");
-            let mk: unsafe extern "C" fn(ClassPtr, Sel, usize, usize, usize, bool) -> Id = msg();
+            let mk: unsafe extern "C" fn(ClassPtr, Sel, usize, usize, usize, ObjcBool) -> Id =
+                msg();
             let d = mk(
                 dcls,
                 sel(c"texture2DDescriptorWithPixelFormat:width:height:mipmapped:"),
                 format as usize,
                 width,
                 height,
-                false,
+                false.into(),
             );
             if d.is_null() {
                 return None;
             }
-            let set_usage: unsafe extern "C" fn(Id, Sel, usize) = msg();
-            set_usage(d, sel(c"setUsage:"), usage);
+            let set_usize: unsafe extern "C" fn(Id, Sel, usize) = msg();
+            set_usize(d, sel(c"setUsage:"), usage);
+            set_usize(d, sel(c"setStorageMode:"), TEXTURE_STORAGE_MODE_MANAGED);
             let f: unsafe extern "C" fn(Id, Sel, Id) -> Id = msg();
             Obj::from_owned(f(self.id(), sel(c"newTextureWithDescriptor:"), d))
         }
@@ -987,8 +1203,8 @@ impl RenderPipelineDescriptor {
             let setf: unsafe extern "C" fn(Id, Sel, usize) = msg();
             setf(a, sel(c"setPixelFormat:"), format as usize);
             setf(a, sel(c"setWriteMask:"), write_mask.bits());
-            let setb: unsafe extern "C" fn(Id, Sel, bool) = msg();
-            setb(a, sel(c"setBlendingEnabled:"), blend.is_some());
+            let setb: unsafe extern "C" fn(Id, Sel, ObjcBool) = msg();
+            setb(a, sel(c"setBlendingEnabled:"), blend.is_some().into());
             if let Some(blend) = blend {
                 let set: unsafe extern "C" fn(Id, Sel, usize) = msg();
                 set(
@@ -1931,5 +2147,126 @@ pub(crate) unsafe fn buffer_bytes(buf: &Obj, len: usize) -> Vec<u8> {
             return Vec::new();
         }
         std::slice::from_raw_parts(p, len).to_vec()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// [`Device::preferred`] is the low-power GPU exactly when the machine has
+    /// one and `ATERM_GPU_POWER` does not ask for `high`. On a dual-GPU Mac
+    /// that is the difference between the integrated chip and the discrete one
+    /// `MTLCreateSystemDefaultDevice` answers; on a single-GPU machine the one
+    /// device is both, and the assertion holds trivially. The pick is printed so
+    /// a transcript names the device.
+    #[test]
+    fn preferred_is_the_low_power_gpu_unless_asked_for_high() {
+        let Some(dev) = Device::preferred() else {
+            crate::stderr_line!("SKIP: no Metal device on this machine");
+            return;
+        };
+        // SAFETY: `dev.0` is a live, retained `MTLDevice`; `-isLowPower` is a
+        // `BOOL` getter on it, read through `ObjcBool` exactly as `low_power`
+        // reads it.
+        let is_low = unsafe {
+            let flag: unsafe extern "C" fn(Id, Sel) -> ObjcBool = msg();
+            flag(dev.0.id(), sel(c"isLowPower")).get()
+        };
+        let low = Device::low_power().map(|d| d.name());
+        crate::stderr_line!(
+            "aterm-gpu: preferred() = {} (isLowPower={is_low}); the machine's first \
+             low-power, non-headless GPU = {low:?}",
+            dev.name()
+        );
+        let want_high = matches!(
+            std::env::var("ATERM_GPU_POWER").as_deref(),
+            Ok(v) if v.eq_ignore_ascii_case("high")
+        );
+        if !want_high {
+            assert_eq!(
+                is_low,
+                low.is_some(),
+                "preferred() must be a low-power GPU exactly when the machine has one"
+            );
+            if let Some(name) = low {
+                assert_eq!(dev.name(), name, "and it must be that one");
+            }
+        }
+    }
+
+    /// The ObjC `BOOL` slot at this target's width: one byte, `bool` in and
+    /// out, and — on the `signed char` targets — ANY non-zero byte reads YES,
+    /// which is the value set a Rust `bool` cannot hold and the whole reason
+    /// [`ObjcBool`] exists. No GPU needed.
+    #[test]
+    fn objc_bool_is_one_byte_and_reads_c_style() {
+        assert_eq!(std::mem::size_of::<ObjcBool>(), 1, "BOOL is one byte");
+        assert!(ObjcBool::from(true).get());
+        assert!(!ObjcBool::from(false).get());
+        assert!(!ObjcBool::default().get(), "the default is NO");
+        #[cfg(not(target_arch = "aarch64"))]
+        {
+            assert!(ObjcBool::from_raw(2).get(), "a BOOL of 2 is YES");
+            assert!(ObjcBool::from_raw(-1).get(), "a BOOL of -1 is YES");
+            assert!(!ObjcBool::from_raw(0).get());
+        }
+    }
+
+    /// `-[MTLTexture storageMode]`.
+    fn texture_storage_mode(tex: &Obj) -> usize {
+        // SAFETY: `NSUInteger` getter on a live texture.
+        unsafe {
+            let f: unsafe extern "C" fn(Id, Sel) -> usize = msg();
+            f(tex.id(), sel(c"storageMode"))
+        }
+    }
+
+    /// The `storageMode` a fresh `texture2DDescriptorWith...` carries BEFORE any
+    /// setter — the platform default [`Device::new_texture_2d`] restates.
+    fn texture_descriptor_default_storage_mode() -> usize {
+        let _pool = AutoreleasePool::new();
+        // SAFETY: the descriptor factory returns an AUTORELEASED object, borrowed
+        // and left to the pool above; `storageMode` is an `NSUInteger` getter.
+        unsafe {
+            let mk: unsafe extern "C" fn(ClassPtr, Sel, usize, usize, usize, ObjcBool) -> Id =
+                msg();
+            let d = mk(
+                class(c"MTLTextureDescriptor"),
+                sel(c"texture2DDescriptorWithPixelFormat:width:height:mipmapped:"),
+                PixelFormat::Rgba8Unorm as usize,
+                16,
+                16,
+                false.into(),
+            );
+            let get: unsafe extern "C" fn(Id, Sel) -> usize = msg();
+            get(d, sel(c"storageMode"))
+        }
+    }
+
+    /// Every texture the crate mints is Managed — explicitly, AND equal to the
+    /// descriptor's own platform default, so the explicit `setStorageMode:` in
+    /// [`Device::new_texture_2d`] is a restatement and not a behaviour change
+    /// on any Mac this runs on. If the descriptor-default assertion ever fails,
+    /// the platform default moved, and that fact belongs in its docs.
+    #[test]
+    fn textures_are_minted_managed_and_managed_is_the_platform_default() {
+        let Some(dev) = Device::preferred() else {
+            crate::stderr_line!("SKIP: no Metal device on this machine");
+            return;
+        };
+        assert_eq!(
+            texture_descriptor_default_storage_mode(),
+            TEXTURE_STORAGE_MODE_MANAGED,
+            "a fresh MTLTextureDescriptor's storageMode on this OS"
+        );
+        let tex = dev
+            .new_texture_2d(PixelFormat::Rgba8Unorm, 16, 16, TEXTURE_USAGE_SHADER_READ)
+            .expect("texture");
+        assert_eq!(
+            texture_storage_mode(&tex),
+            TEXTURE_STORAGE_MODE_MANAGED,
+            "the minted texture's storageMode"
+        );
     }
 }

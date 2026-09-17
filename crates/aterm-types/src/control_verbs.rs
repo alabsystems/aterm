@@ -207,7 +207,15 @@ pub const SUMMARY_MAX_CHARS: usize = summary_max_chars!();
 /// verb the bridge reports its broker link on, taking the table from 101
 /// entries to 102. The GUI's short `help` MEASURES 9 838 B with the row; same
 /// accounting as the three raises above, and the shape is unchanged.
-pub const SHORT_CATALOG_MAX_BYTES: usize = 9856;
+///
+/// RAISED AGAIN FROM 9856 on 2026-09-15, for round 15's three summary rows —
+/// `inbox get <id> | inbox get @<off>`, `inbox seen … (and ack)` and `outbox
+/// sent … [dup=1]`, 25 bytes between them, no new verb. The GUI's short `help`
+/// MEASURES 9 863 B; `help_short_form_is_bounded_and_is_the_summary_catalog`
+/// was red on the commits that grew them, whose runs filtered the suite to
+/// `--lib fabric` and so never ran it. Same accounting as the four raises
+/// above, and the shape is unchanged.
+pub const SHORT_CATALOG_MAX_BYTES: usize = 9984;
 /// The column a catalog row's text starts in: a 28-wide name plus one space.
 pub const CATALOG_TEXT_COLUMN: usize = 29;
 /// The width a `help <verb>` entry is wrapped to.
@@ -335,8 +343,13 @@ pub const VERBS: &[VerbSpec] = &[
         Meta,
         AnyScopeMeta,
         "build provenance (version, commit, trustc, flavor, signature)",
-        "The compiler keys are `trustc=`/`trustc_commit=`/`trustc_host=` — renamed from rustc in \
-         v0.10.0, so a script parsing `rustc=` finds nothing.",
+        "The compiler keys: `flavor=t|r` says Trust or upstream Rust; `trust=` is Trust's OWN \
+         version (the `trust:` line of `-vV`; `none` on an upstream build); `rust_compat=` is \
+         the Rust release the compiler is compatible with; `trustc=`/`trustc_commit=`/\
+         `trustc_host=` carry the compiler's rustc-shaped release token, commit and host — \
+         renamed from rustc in v0.10.0, so a script parsing `rustc=` finds nothing. \
+         `trustc=` and `rust_compat=` are the same value: Trust prints a rustc-shaped release \
+         for cargo's sake, and `trust=` is where it says its own.",
     ),
     va(
         "update",
@@ -872,10 +885,20 @@ pub const VERBS: &[VerbSpec] = &[
          this process compiled ON DEMAND (the nine that only ever draw a cursor trail / fire / \
          rain / sparkle / sprite layer are built the first frame that binds one, never at launch \
          — a default `cursor_trail = false` run reads 0/0.00 for its whole life, and a non-zero \
-         reading with no effect enabled means the demand gate has re-eagerised), and the line \
-         ends first_present_ms= (compatibility GUI main_entry->the same successful-present \
+         reading with no effect enabled means the demand gate has re-eagerised), then \
+         first_present_ms= (compatibility GUI main_entry->the same successful-present \
          publication; dyld/compositor/scanout unobserved) first_visible_ms= (GUI main_entry->the \
-         same reveal instant). READ THE SLICES HONESTLY: present_* and input_* are OPEN INTERVALS closed by the next qualifying present, so any stretch in which nothing presented is INSIDE the number (only a 5 s discard bounds it) — a multi-second present_latency means \"nothing presented for that long\", not \"a frame took that long\"; input_* closes on the next CONTENT present, which under concurrent streaming output may be a log-line frame rather than the key's echo, so it reads LOW rather than high. Quote n_* with the percentiles, never a lone last_/max_, and note both stop at application-present return (no compositor selection, scanout or photons)",
+         same reveal instant) and the CHILD's own round trip: n_echo= \
+         echo_p50_ms=/echo_p95_ms=/echo_p99_ms= echo_last_ms=/echo_max_ms= with the \
+         echo_total=/echo_arms=/echo_coalesced=/echo_expired=/echo_dropped_locked= ledger that \
+         qualifies them — bytes out to the PTY->the first bytes back, the ONE slice on this \
+         line that is not aterm. The line ENDS with the main-loop TURN census max_turn_ms= \
+         max_turn_owner= max_turn_at_ms= last_turn_ms= turns= long_turns= \
+         long_turn_threshold_ms= (a main thread parked OUTSIDE the redraw: read the max against \
+         max_redraw_total_ms). IT NAMES WHO OWES THE TIME: echo_* high with input_* low means the PROGRAM \
+         is behind (a TUI sharing its scheduling band with a build has been measured echoing at \
+         p99 150ms while aterm wrote every key at p99 6.29ms), the reverse means aterm is; a \
+         lone max_present_latency_ms is not evidence of either. READ THE SLICES HONESTLY: present_* and input_* are OPEN INTERVALS closed by the next qualifying present, so any stretch in which nothing presented is INSIDE the number (only a 5 s discard bounds it) — a multi-second present_latency means \"nothing presented for that long\", not \"a frame took that long\"; input_* closes on the next CONTENT present, which under concurrent streaming output may be a log-line frame rather than the key's echo, so it reads LOW rather than high. Quote n_* with the percentiles, never a lone last_/max_, and note both stop at application-present return (no compositor selection, scanout or photons)",
     ),
     // drive input
     v(
@@ -1133,7 +1156,10 @@ pub const VERBS: &[VerbSpec] = &[
         "drive a window's tabs (new|N|next|prev|close [N]|move <from> <to>)",
         "- flagless drives the FRONT window; `@<sid> tab …` drives the window hosting <sid> \
          (the same aim as `@<sid> spawn`), so an agent in a background window walks its own \
-         tabs without touching the human's. Replies `OK <active> <count>`; a --headless \
+         tabs without touching the human's. Replies `OK <active> <count>` when the action \
+         HAPPENED, and `ERR <reason>` when it did not: an index no tab holds, or a tab \
+         host that declined the close (a native document waiting on a durable \
+         checkpoint, or a close deferred behind a pending update handoff). A --headless \
          instance drives its one logical window like a real one (no `ERR headless`)",
     ),
     // `pane` is `tab`'s within-a-window twin and carries `tab`'s class for `tab`'s
@@ -1262,6 +1288,32 @@ pub const VERBS: &[VerbSpec] = &[
          `inferences` separates \"the model ran and said technical\" from \"the model never \
          ran\", audio=wedged means the audio worker is stuck inside one platform call and cues \
          are being dropped (dropped= counts them). The typed window's TEXT is never reported)",
+    ),
+    // The cursor cat's COLLECTION, and the direct way to put one on. `Write`
+    // rather than `Read` because the wear form changes what the user sees and
+    // stamps the durable collection; not `ConfigWrite`, which is reserved for
+    // `aterm.toml` and the security knobs a keystroke edge must never reach.
+    // The cursor cat's COLLECTION, and the direct way to put one on. `Write`
+    // rather than `Read` because the wear form changes what the user sees and
+    // stamps the durable collection; not `ConfigWrite`, which is reserved for
+    // `aterm.toml` and the security knobs a keystroke edge must never reach.
+    v(
+        "kitty",
+        Write,
+        Lines,
+        App,
+        "kitty [wear <key>]: the cursor cat collection, and which one to wear",
+        "Bare `kitty` lists the collection, one `cat key= coat= iris= age= seen= worn=` row \
+         per collected cat, `worn=1` marking the one on the cursor now. `kitty wear <key>` \
+         puts that cat on and answers `worn key= coat= iris=`. The key is the row's own \
+         `key=`, so the list is the menu. THIS IS THE DIRECT SWITCH: Favourite This Kitty \
+         pins the cat that would ride ANYWAY (the focused window's tenured program cat, \
+         else the launch kitty), so wearing a different one used to mean making it appear \
+         first — relaunching for a fresh launch kitty, or running a program long enough to \
+         earn tenure. The collection elects by GREATEST pin stamp, so a wear is monotone: \
+         it needs no unpin, and it survives a merge of the collection from another \
+         instance. Refused, never silent, when effects or `[sparkle_words.feline]` are off \
+         (there is no cat to dress) or when no row answers to that key.",
     ),
     // Read-only observability for the cursor-trail engine: the last N
     // licensed/declined verdicts from the fixed-size admission diagnosis ring,
@@ -1525,7 +1577,11 @@ pub const VERBS: &[VerbSpec] = &[
          session no window hosts reads 0.00 at once; `await inbox since=<id> [kinds=<k,...>]` — the FABRIC predicate: \
          it latches on an inbox row with id > `since` of an accepted kind (default: every kind \
          but `note`), or on a `hold` transition when `hold` is one of the listed kinds. Monotone, \
-         so a row the agent chose to ignore cannot latch the same wait twice. And `await consent` \
+         so a row the agent chose to ignore cannot latch the same wait twice. `await inbox \
+         re=<off> [since=<id>] [kinds=<k,...>]` narrows it to THE REPLIES TO ONE POST — a row \
+         carrying that `re=` of any kind: an `answer`, a `report`, the recipient's receipt \
+         (`ack … verdict=`), the asker's own bridge's `expired` — and `since=` may then be \
+         omitted. And `await consent` \
          — the macOS privacy posture of THIS session: the instance's Full Disk Access state, this \
          session's `fs_consent=` and its `attribution=` (see `privacy`). Its deadline starts when \
          the request arrives. The first completed observation establishes the baseline; a cold \
@@ -1590,22 +1646,33 @@ pub const VERBS: &[VerbSpec] = &[
         Lines,
         Session,
         "inbox [<n>] [since=<id>] [--peek] [--meta]: this session's message rows",
-        "Header `OK <n> hold=<0|1> holder=<p|-> seen=<id> bus_head=<off> dropped=<n> pending=<n>`, \
+        "Header `OK <n> hold=<0|1> holder=<p|-> seen=<id> bus_head=<off> oldest_on_bus=<@off|-> \
+         dropped=<n> pending=<n>`, \
          then one `msg <id> off=<n> t=<ms> from=<p> kind=<k> \
-         trust=<human|agent|relayed|screen> [re=<n> re-id=<id>] [dl=<ms>] [late=1] [demoted=<k>] \
+         trust=<human|agent|relayed|screen> [re=<n> re-id=<id>] [verdict=<v>] [dl=<ms>] [late=1] \
+         [demoted=<k>] \
          [via=<p,...>] len=<n> [more=1] [truncated=1] text=<pct>` row per message and one `post \
-         <id> to=<> kind=<> off=- len=<n>` row per outbound post that has not landed yet (`off=` \
-         is always `-` on that row: a post with an offset has landed and is no longer listed). \
+         <id> to=<> kind=<> off=- len=<n> [key=<token>]` row per outbound post that has not \
+         landed yet (`off=` is always `-` on that row: a post with an offset has landed and is \
+         no longer listed; `key=` is the post's idempotency key, when it has one). \
          `trust=` is the \
          RECEIVER's verdict on what the content is, never a sender's claim, and it is printed \
          before the text on purpose. `text=` is pct-encoded and cut at 512 B with `more=1`; \
          `inbox get <id>` returns the whole of what this endpoint HOLDS. `truncated=1` means the \
          endpoint never received the rest: the delivering bridge cut the body to fit one control \
-         line and `len=` names the true size, so that message is NOT recoverable in full here — \
-         a cut row carries `more=1` too, even when what survived is under 512 B. `dropped=` \
+         line and `len=` names the true size — `inbox get @<off>` fetches it whole from the bus \
+         — and a cut row carries `more=1` too, even when what survived is under 512 B. `dropped=` \
          counts UNHANDLED rows the bounded ring evicted (never silently) — every evicted row \
          above `seen=`, not merely one nobody listed — and `pending=` the unlisted delivered \
-         rows this reply did not carry. `inbox <n>` selects the NEWEST n rows matching `since=`, \
+         rows this reply did not carry. A DROPPED ROW IS NOT LOST: every one of this session's \
+         records from `oldest_on_bus=@<off>` (the lowest offset ever delivered here) to \
+         `bus_head=` is on the broker's durable log whether or not the ring still holds it, and \
+         `inbox get @<off>` fetches it through the bridge — the offsets in between are shared \
+         with the whole fleet, so most belong to other lanes (`ERR no such record`). \
+         `verdict=<handled|refused|deferred>` rides a \
+         `kind=ack` row: the RECIPIENT's word on the ask/task at `re=`, published by their \
+         bridge when they ran `inbox seen <id> <verdict>` (a receipt; `re-id=` names your post). \
+         `inbox <n>` selects the NEWEST n rows matching `since=`, \
          returned in increasing id order; it is not a FIFO batch. Without `--peek`, only the \
          returned message rows become LISTED — per-row state used by eviction and the per-peer \
          quota. `--peek` changes no listed state and `--meta` omits `text=`. The HANDLED \
@@ -1618,22 +1685,52 @@ pub const VERBS: &[VerbSpec] = &[
         Read,
         Bytes,
         Session,
-        "inbox get <id>: one message's body as this endpoint holds it, length-prefixed",
+        "inbox get <id> | inbox get @<off>: one message's body, by row id or by broker offset",
         "`OK <nbytes>` then that many raw bytes (up to 256 KiB) — the un-PREVIEWED form of the \
          `inbox` row's `text=`, which the row cuts at 512 B. Reading a body moves no watermark. \
          NOT ALWAYS THE WHOLE MESSAGE, and it says which: a body the delivering bridge had to cut \
-         to fit one control line is answered `OK <nbytes> truncated=1 len=<true-size>`, and the \
-         missing bytes are NOT recoverable by any verb — they are on the bus, which the recipient \
-         has no access to. Only the first token after `OK` is the frame length, so the marker \
-         does not change the framing.",
+         to fit one control line is answered `OK <nbytes> truncated=1 len=<true-size>` — the \
+         missing bytes are on the bus, and `inbox get @<off>` fetches them. Only the first token \
+         after `OK` is the frame length, so the marker does not change the framing. `inbox get \
+         @<off>` is the SAME record BY BROKER OFFSET, for a row the bounded ring evicted \
+         (`dropped=`), a listing cut, or the delivery cut (`truncated=1`): answered from the \
+         ring when it holds the WHOLE row, else FETCHED through the bridge from the broker's \
+         durable log — one bounded read on this session's own lane, carried back in chunks when \
+         it does not fit one control line — and answered `OK <nbytes> off=<n> from=<p> kind=<k> \
+         trust=<t> [re=<n>] [dl=<ms>] [demoted=<k>] [via=<p,...>] [verdict=<v>] [truncated=1 \
+         len=<n>]` then the body, whole up to 256 KiB (`truncated=1` only for a record larger \
+         than that), the record's fields on the tail because it has no row id: nothing is \
+         re-appended, no watermark, quota or event moves. Every one of this session's records \
+         from the header's `oldest_on_bus=` to `bus_head=` is fetchable while the broker holds \
+         it; the offsets in between are shared with the whole fleet, so most answer `ERR no \
+         such record`. The read PARKS for the bridge's next drain (its 250 ms idle tick; up \
+         to 2 s under load) and is bounded at 10 s (`ERR timeout off=<n>`); with no bridge that \
+         can read it answers `ERR fabric <state> off=<n>` at once; at most 8 reads park per \
+         session (`ERR busy`). `ERR no such record off=<n>` is the ONE answer for an offset that \
+         is not on this session's lane — another session's record, another face's, or nothing \
+         there — and nothing says which.",
     ),
     v(
         "inbox seen",
         Write,
         Status,
         Session,
-        "inbox seen <id> [handled|refused|deferred]: advance the HANDLED watermark",
+        "inbox seen <id> [handled|refused|deferred]: advance the HANDLED watermark (and ack)",
         "`OK seen=<id>`, and pushes `EVENT <local> inbox-seen <id> off=<n>` on the events digest. \
+         A VERDICT IS A RECEIPT (R8): with `handled|refused|deferred` the event also carries \
+         `verdict=<v> kind=<k> from=<p>` for THE ROW THE ID NAMES (not every row the watermark \
+         passes — a bare `inbox seen <id>` names no verdict for any of them), and a bridge \
+         running `--receipts` (`[fabric] receipts = true`, which `aterm fabric on` writes) then \
+         publishes `kind=ack re=<off> verdict=<v>` onto the SENDER's inbox lane for an `ask` or \
+         `task` row — never for a `note`, a demoted task included — so the sender's `post \
+         --wait-ack` returns, their `await inbox re=<off>` latches and their `inbox` lists `ack … \
+         re=<off> verdict=<v>`. The receipt is OWED until it is on the bus: the endpoint lists it \
+         on the bridge's `outbox` peek until the bridge retires it, so a verdict given while the \
+         broker is down or the bridge is being replaced is acked when they return — exactly once, \
+         under a producer sequence pinned to it. Once per row per CHANGE of word: the same verdict again acks \
+         nothing, `deferred` then `handled` acks twice and the newer word is the answer. A \
+         session that only `--peek`s never acks, and `aterm fabric` shows its unhandled mail's \
+         age. \
          It ALSO LISTS every row at or below `<id>`, which is a second effect and not a side \
          effect: listing is what the ring counts as read for eviction and what RELEASES the \
          sender's per-peer quota, so an agent that only ever `--peek`s can still acknowledge its \
@@ -1651,13 +1748,44 @@ pub const VERBS: &[VerbSpec] = &[
          answered, `dl=<ms>` is an advisory deadline, `via=<p>` marks a relay, and `--wait[=<ms>]` \
          (ON by default for `ask` and `task`) blocks until the bridge reports the record landed \
          and answers `OK <id> off=<n>` — the broker-assigned offset is the correlation id an \
-         answer carries back as `re=`. When the link cannot report a landing the wait ends at \
-         once with `ERR fabric <absent|disconnected> id=<n> <queued=1|no-bridge=1>`, and WHICH \
+         answer carries back as `re=`. `--wait-ack[=<ms>]` (`ask`/`task` only; implies the \
+         landing wait) then ALSO waits for the RECIPIENT's word: their bridge's receipt, `kind=ack \
+         re=<off> verdict=<v>`, published when they run `inbox seen <id> handled|refused|deferred` \
+         under `--receipts`, answers `OK <id> off=<n> ack=<verdict> msg=<inbox id>`; the asker's \
+         own bridge recording the deadline passed answers `ERR expired id=<n> off=<n>`; and the \
+         bound is `<ms>` when given, else `dl=` plus 5 s for that verdict to come back, else 30 s \
+         — a timeout is `ERR timeout id=<n> \
+         off=<n>`, naming the offset because the post DID land (`await inbox re=<off>` picks it \
+         up later; a recipient whose bridge runs without receipts never acks, so bound it). \
+         `key=<token>` (1–64 of `[A-Za-z0-9._:-]`) is the \
+         IDEMPOTENCY KEY, per session: the bridge reserves a producer sequence for the key \
+         durably BEFORE publishing and reuses it on any later post under the same key, so the \
+         broker's own `(producer_id, producer_seq)` dedup — rebuilt from its log on a broker \
+         restart — appends nothing and answers the ORIGINAL offset; that post answers `OK <id> \
+         off=<n> dup=1`, one record is on the bus, and it holds across a bridge restart and a \
+         broker restart alike (`outbox` is a peek that carries the key on every drain). A key \
+         names ONE record: a re-post under it answers the first post's record whatever its own \
+         kind, body or `dl=` (and so starts no deadline of its own). Its ADDRESS is still \
+         resolved first, against the live roster: a re-post to one that no longer routes is \
+         retired like any post the bridge cannot route (`ERR unroutable`, or `ambiguous`), \
+         appends nothing, and leaves the key naming its record. The \
+         newest 4096 keys per session are kept; a re-post under an older key is a new record. \
+         `dl=<ms>` on an `ask`/`task` is a DEADLINE the asker's OWN bridge keeps (the broker \
+         holds no timers): when it passes with no `answer|report|ack` carrying `re=<off>` on \
+         the asker's lane (a reply delivered to another session settles nothing), that bridge \
+         puts `kind=expired re=<off> dl=<ms>` in the asker's inbox \
+         — exactly once, checked against the bus before it is written — a reply arriving after \
+         it is delivered `late=1` (by the bridge that recorded the verdict; one relaunched since \
+         delivers it unflagged), and `aterm fabric` lists such asks under WARNINGS. When the \
+         link cannot report a landing the wait ends at \
+         once with `ERR fabric <absent|stalled|disconnected> id=<n> <queued=1|no-bridge=1>`, and \
+         WHICH \
          of those two tokens it carries is the instruction. `queued=1` says the message is STILL \
          IN THE OUTBOX and a bridge will publish it (a bridge exit is the ordinary relaunch \
          path, and `outbox` is a peek that removes nothing), so it must not be read as `not \
-         sent` and re-posted — `post` carries no idempotency key that would collapse the \
-         duplicate. `no-bridge=1` says something NARROWER about the same queued \
+         sent` and re-posted — a `post` without `key=` carries no idempotency key that would \
+         collapse the duplicate, and one with it is still queued. `no-bridge=1` says \
+         something NARROWER about the same queued \
          message, and the difference is the whole report an agent makes: this instance has no \
          `[fabric] command`, so no bridge exists to drain the outbox RIGHT NOW and none is \
          coming ON ITS OWN. It is not a verdict on the message. `fabric attach <command...>` \
@@ -1700,7 +1828,21 @@ pub const VERBS: &[VerbSpec] = &[
          sending node chooses — so one peer cannot evict a human's unread `task` under a burst of \
          `note`s by rotating pseudo-sids, and eviction never drops an `h-*` row ahead of an \
          agent's. `deliver <sid> landed=<post-id> off=<n>` is the \
-         other form: it closes an outbound `post` and releases its `--wait`.",
+         other form: it closes an outbound `post` and releases its `--wait`. \
+         `verdict=<handled|refused|deferred>` on a `kind=ack` row is the recipient's receipt (R8); any other word \
+         is `ERR usage`. `deliver <sid> fetched=<off> …` is the THIRD form: the bridge answering \
+         an `inbox get @<off>` this session parked (listed on the `outbox` peek as `fetch sid= \
+         off=`) with the record as read from the broker's log — the row fields without `off=`, \
+         and `len=<true size>` when the record is over 256 KiB and the body is cut there — or \
+         `err=<token>` (`no-record`, `unreadable`, `observer`, `forged-self`, `via`, `malformed`, \
+         `oversize`, `refused`) for why there is none. A body that does not fit one line arrives \
+         in CHUNKS, each a whole `fetched=` line with the same fields: `at=<n>` is the byte \
+         offset where its `text=` starts in the decoded body and `more=1` marks all but the \
+         last. It touches no ring: the parked read takes the answer, nothing is appended, and a \
+         complete answer nothing waits on is kept (bounded) for the read that asks next; a \
+         refused answer fails the read parked on it. `deliver <sid> receipt=<rid> off=<n|->` is \
+         the FOURTH form: the bridge retiring a receipt the session owed (R8) — `off=` where the \
+         `ack` landed, `-` for none sent — idempotently.",
     ),
     // `link`: the bridge's report of ITS OWN broker link — what turns `fabric=`
     // from "a bridge process is attached" into "mail can move". Bridge-only
@@ -1780,9 +1922,17 @@ pub const VERBS: &[VerbSpec] = &[
         "outbox [<max>]: drain the queued outbound posts, bodies included",
         "BRIDGE-ONLY, and the mirror image of `deliver`: `deliver` is how a record enters the \
          instance, `outbox` is how one leaves it. `OK <nbytes>` then that many raw bytes, holding \
-         one `post sid=<s> id=<n> to=<pct> kind=<k> [re=<n>] [dl=<ms>] [via=<p,...>] len=<n>` \
-         line per queued post followed by that post's `len` body bytes — a length prefix and not \
+         one `post sid=<s> id=<n> to=<pct> kind=<k> [re=<n>] [dl=<ms>] [via=<p,...>] \
+         [key=<token>] len=<n>` line per queued post followed by that post's `len` body bytes — \
+         `key=` is the caller's idempotency key, carried on EVERY drain so a relaunched bridge \
+         maps it to the same reserved producer sequence — a length prefix and not \
          a row, because a body may contain newlines and a line-framed listing could not carry it. \
+         AFTER every post, one bodiless `receipt sid=<s> rid=<n> off=<n> verdict=<v> kind=<k> \
+         from=<p>` line per receipt a session OWES (an `inbox seen <id> <verdict>` on an \
+         ask/task, until the bridge publishes the `ack` and retires it with `deliver <sid> \
+         receipt=<rid>`), and one bodiless `fetch sid=<s> off=<n>` line per `inbox get @<off>` a \
+         session has parked for the bridge (after, so a parser from before these lines still \
+         drains every post); the bridge answers each with `deliver <sid> fetched=<off> …`. \
          A PEEK: it moves no watermark and drops nothing, so a bridge that dies mid-publish \
          re-reads the same posts on restart and republishes them under the same producer \
          sequence. `outbox sent` is what retires one. One drain is BOUNDED IN BYTES as well as \
@@ -1799,11 +1949,16 @@ pub const VERBS: &[VerbSpec] = &[
         Status,
         Meta,
         BridgeOnly,
-        "outbox sent <sid> <id> off=<n|->: retire one queued outbound post",
+        "outbox sent <sid> <id> off=<n|-> [dup=1]: retire one queued outbound post",
         "BRIDGE-ONLY. `off=<n>` is the broker offset the post landed at: it fills the `post` \
          row's `off=`, releases a `post --wait` parked on it, and lets the endpoint drop the \
          retained body — the body is kept only until this arrives, which is what bounds the \
-         queue's memory. `off=-` retires it as permanently undeliverable instead, with an \
+         queue's memory. `dup=1` beside it is the broker's verdict that the publish was DEDUPED \
+         — the post re-used a producer sequence an earlier post under the same `key=` had \
+         reserved, so `off=` is that earlier record's and nothing was appended — and the parked \
+         wait answers `OK <id> off=<n> dup=1`; it is sticky across a retried retirement and \
+         refused on the `off=-` form (a duplicate landed, by definition). `off=-` retires it \
+         as permanently undeliverable instead, with an \
          `undeliverable` row explaining why arriving separately through `deliver`. An optional \
          `reason=<word>` on the `off=-` form names WHICH refusal it was, and a `post --wait` \
          parked on that post wakes with `ERR <reason> id=<n>` instead of a uniform `ERR \
@@ -2983,9 +3138,11 @@ mod tests {
     /// than the code delivered, and each promise had a reachable failure:
     ///
     /// * `inbox get` said "the FULL body" while the bridge had begun delivering
-    ///   over-budget bodies TRUNCATED. Nothing recovers the rest — the record is
-    ///   on the bus, which the recipient cannot reach — so the answer has to say
-    ///   so, and the row has to say that it does.
+    ///   over-budget bodies TRUNCATED, so the answer has to say so, and the row
+    ///   has to say that it does. (Round 15 then made the rest recoverable —
+    ///   `inbox get @<off>` fetches the record whole from the bus — and the row
+    ///   that said "NOT recoverable by any verb" would now send an agent away
+    ///   from the one verb that recovers it; so it must say where the rest IS.)
     /// * `deliver` said "exactly-once at the endpoint" with no qualifier over a
     ///   1024-offset dedup window that ordinary refills reach, and stated its
     ///   quota per `from=` when `from=`'s first half is the sending node's own
@@ -3019,8 +3176,17 @@ mod tests {
         );
         assert!(get.contains("truncated=1") && get.contains("len=<true-size>"));
         assert!(
-            get.contains("NOT recoverable by any verb"),
-            "the row must say the rest cannot be fetched, not merely that it is missing"
+            !get.contains("NOT recoverable") && get.contains("`inbox get @<off>` fetches them"),
+            "the row must say where the rest is and which verb fetches it, not merely \
+             that it is missing"
+        );
+        assert!(
+            get.contains("whole up to 256 KiB"),
+            "a fetch by offset answers the WHOLE body, in chunks, up to the endpoint's bound"
+        );
+        assert!(
+            !help("inbox").contains("NOT recoverable"),
+            "the `inbox` row must not contradict `inbox get @<off>`"
         );
 
         let inbox = help("inbox");
@@ -3070,6 +3236,31 @@ mod tests {
         );
 
         assert!(help("outbox").contains("BOUNDED IN BYTES"));
+        // ROUND 15: the idempotency key exists now, and the row says what it
+        // costs to leave it off rather than claiming none exists.
+        assert!(
+            help("post").contains("key=<token>")
+                && help("post").contains("dup=1")
+                && help("post").contains("without `key=`")
+                && help("post").contains("kind=expired re=<off>")
+                && help("post").contains("late=1"),
+            "the post row names the key, the dup reply, and the deadline verdict"
+        );
+        assert!(help("outbox").contains("[key=<token>]"));
+        assert!(help("outbox sent").contains("dup=1"));
+        // AS REVIEWED: a receipt is owed until it is on the bus (it rides the
+        // `outbox` peek, retired by `deliver … receipt=`), and a bare
+        // `--wait-ack` waits past `dl=` for the verdict to come back.
+        assert!(
+            help("inbox seen").contains("OWED until it is on the bus")
+                && help("outbox").contains("receipt sid=<s> rid=<n>")
+                && help("deliver").contains("receipt=<rid> off=<n|->"),
+            "the receipt's durability is stated on the three rows it spans"
+        );
+        assert!(
+            help("post").contains("else `dl=` plus 5 s"),
+            "the --wait-ack bound names the grace the verdict needs"
+        );
 
         let send = help("send");
         assert!(

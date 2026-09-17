@@ -25,7 +25,7 @@ use std::time::Duration;
 
 use aterm_time::Instant;
 
-use aterm_effects::cursor_glow::{CursorGlow, Geom, GlowConfig, GlowStyle, RAINBOW_WAKE_PERSIST};
+use aterm_effects::cursor_glow::{CursorGlow, Geom, GlowConfig, GlowStyle};
 
 const CW: usize = 14;
 const CH: usize = 28;
@@ -122,7 +122,6 @@ fn main() {
         beam: aterm_effects::cursor_glow::style_has_beam(&raw),
         head_dx: 0.5,
         pack: None,
-        wake_persist_s: RAINBOW_WAKE_PERSIST,
         ribbon_tall: false,
         ribbon_flat: false,
         classic_mono: GlowStyle::style_names_classic_mono(&raw),

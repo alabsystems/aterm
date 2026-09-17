@@ -2061,6 +2061,51 @@ const fn transport_never_started(out: &RunOut) -> bool {
     out.status == CURL_EXIT_FAILED_INIT
 }
 
+/// curl's exit for "the server answered, and its answer was an HTTP error"
+/// (`--fail`). The request was delivered and processed; only the RESPONSE was a
+/// refusal.
+const CURL_EXIT_HTTP_ERROR: i32 = 22;
+
+/// Did the server ANSWER THIS REQUEST WITH A REFUSAL, so that nothing can have
+/// been created by it?
+///
+/// The sibling of [`transport_never_started`], and the other case where the
+/// one-shot design's conservative assumption — "assume the server saw it, never
+/// repeat" — is simply false. There the request never left; here it arrived, was
+/// understood, and was REFUSED with a 4xx. A refusal creates nothing, so a later
+/// invocation may post again: if the object does not exist the retry makes the one
+/// we want, and if it does exist (a `422 already_exists` whose object has not
+/// become visible yet) the retry is refused in exactly the same way. Neither
+/// outcome can mint a duplicate, which is the property the intent protects.
+///
+/// FOUR-HUNDREDS ONLY, deliberately. A 5xx is a server-side failure that can hide a
+/// write the server applied before it fell over, and a proxy's 502/504 can hide a
+/// delivered request entirely; both keep the conservative reading. So does a
+/// timeout, a reset, and a killed process, none of which reach this function.
+///
+/// MEASURED, 2026-09-15, the v0.86.0 cut: the draft-create POST was answered `422`
+/// seconds after the release commit was pushed — GitHub had not converged on the
+/// commit yet — and the journal recorded only that an intent had been ISSUED. The
+/// cut could then neither retry (the intent says "discover, never post") nor
+/// abandon (that verb requires the claim commit, which a fix for the failure moves),
+/// and it took a hand-edited journal to get out. The outcome of the POST is
+/// knowledge the journal was throwing away.
+fn server_refused_without_creating(out: &RunOut) -> bool {
+    if out.status != CURL_EXIT_HTTP_ERROR {
+        return false;
+    }
+    http_status_from_curl_failure(&out.stderr_utf8()).is_some_and(|code| (400..500).contains(&code))
+}
+
+/// The status code out of curl's own `--fail` diagnostic, whose wording has been
+/// `The requested URL returned error: <code>` for the life of this pipeline. A
+/// message this does not recognise reads as UNKNOWN, never as a refusal.
+fn http_status_from_curl_failure(stderr: &str) -> Option<u16> {
+    let tail = stderr.rsplit_once("returned error: ")?.1;
+    let digits: String = tail.chars().take_while(char::is_ascii_digit).collect();
+    digits.parse().ok()
+}
+
 /// How curl is told to find the request body — the ONE decision that separates a
 /// request whose memory cost is its payload from one whose cost is constant.
 /// See [`OneShotPost::prepare_binary`] for the gigabyte that made it matter.
@@ -6295,6 +6340,20 @@ impl CutCtx {
                 ));
             }
             journal.release_id = Some(id);
+            journal.save(&self.journal_path)?;
+        }
+        Ok(())
+    }
+
+    /// Undo [`Self::persist_draft_create_intent`] for the one outcome that proves the
+    /// POST created nothing: the server answered it with a 4xx
+    /// ([`server_refused_without_creating`]). Not a general "clear the flag" — there is
+    /// deliberately no caller for that, because every other failure can hide a
+    /// delivered request.
+    pub(crate) fn release_draft_create_intent(&mut self) -> Result<()> {
+        self.draft_create_issued = false;
+        if let Some(journal) = &mut self.journal {
+            journal.draft_create_issued = false;
             journal.save(&self.journal_path)?;
         }
         Ok(())
@@ -10590,6 +10649,20 @@ fn create_draft(ctx: &mut CutCtx) -> Result<ReleaseObjectIdentity> {
         )?;
         return Ok(release);
     }
+    // THE SERVER ANSWERED AND REFUSED: nothing was created, so the one-shot intent
+    // this invocation persisted is spent on nothing and must not wedge the cut. Release
+    // it, so the next invocation may post once more (see
+    // `server_refused_without_creating` for why that cannot mint a duplicate).
+    if server_refused_without_creating(&out) {
+        ctx.release_draft_create_intent()?;
+        return Err(Error::new(format!(
+            "draft create for {} was REFUSED by the server ({}); nothing was created, so the \
+             create intent has been released and `--resume` may post once more. If this keeps \
+             happening the refusal itself is the thing to read, not the intent.",
+            ctx.tag,
+            out.stderr_utf8().trim()
+        )));
+    }
     Err(Error::new(format!(
         "draft create returned {} but no exact release object is visible for {}; refusing an ambiguous retry in this invocation (resume after GitHub converges): {}",
         if out.success() { "success" } else { "failure" },
@@ -12506,6 +12579,58 @@ mod transport_body_tests {
                 "exit {status} ({why}) must NOT license a retry"
             );
         }
+    }
+
+    /// A SERVER REFUSAL IS KNOWLEDGE, and the one-shot intent must spend it.
+    ///
+    /// The v0.86.0 cut wedged here: the draft-create POST was answered `422`
+    /// seconds after the release commit was pushed, and because the journal
+    /// recorded only that an intent had been ISSUED, every later invocation chose
+    /// "discover, never post" against an object that did not exist. This pins the
+    /// discrimination that fixes it — an answered 4xx created nothing, everything
+    /// else may have.
+    #[test]
+    fn a_four_hundred_is_a_refusal_and_everything_else_is_unknown() {
+        let out = |status: i32, stderr: &str| RunOut {
+            status,
+            stdout: Vec::new(),
+            stderr: stderr.as_bytes().to_vec(),
+        };
+        let refused = out(22, "curl: (22) The requested URL returned error: 422\n");
+        assert!(
+            server_refused_without_creating(&refused),
+            "an answered 422 created nothing"
+        );
+        assert!(
+            server_refused_without_creating(&out(
+                22,
+                "curl: (22) The requested URL returned error: 404\n"
+            )),
+            "so did an answered 404"
+        );
+        // Everything that can hide a delivered request keeps the conservative reading.
+        for unknown in [
+            out(22, "curl: (22) The requested URL returned error: 500\n"),
+            out(22, "curl: (22) The requested URL returned error: 502\n"),
+            out(28, "curl: (28) Operation timed out\n"),
+            out(56, "curl: (56) Recv failure: Connection reset by peer\n"),
+            out(
+                22,
+                "curl: (22) some future wording this code has never seen\n",
+            ),
+            out(2, "curl: (2) failed to initialise\n"),
+        ] {
+            assert!(
+                !server_refused_without_creating(&unknown),
+                "{:?} must read as UNKNOWN, not as a refusal",
+                unknown.stderr_utf8().trim()
+            );
+        }
+        assert_eq!(
+            http_status_from_curl_failure("curl: (22) The requested URL returned error: 422\n"),
+            Some(422)
+        );
+        assert_eq!(http_status_from_curl_failure("no status here"), None);
     }
 
     /// A retracted intent has to put the pipeline back where it was BEFORE the

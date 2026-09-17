@@ -89,7 +89,6 @@ fn cfg(style: GlowStyle) -> GlowConfig {
         beam: !matches!(style, GlowStyle::Water | GlowStyle::RainbowKitty),
         head_dx: 0.5,
         pack: None,
-        wake_persist_s: 1.2,
     }
 }
 
@@ -647,15 +646,17 @@ fn a_licensed_typed_move_is_byte_identical_across_the_license_commit() {
     //
     // AND RE-DERIVED AGAIN on the crossing work: entry 2 alone moved a second
     // time — `GlowStyle::RainbowKitty` is the one style that reads
-    // `crate::spectrum`, and `SPECTRUM_CROSSING_ROOF` stopped sagging (its six
-    // interior samples rose to the roof's own `V 235` peak). The other eight
+    // `crate::spectrum`, and the crossing roof (deleted 2026-09-15) stopped
+    // sagging (its six interior samples rose to the roof's own `V 235` peak).
+    // The other eight
     // are byte-identical to the song lane's values above, which is the check
     // that makes this a COLOUR change and not a licence-seam one.
     //
     // AND ONCE MORE (2026-08-31, the grey band): entry 2 alone,
     // `4_785_… -> 2_656_…`, for two changes that are both the rainbow and
-    // nothing else — `SPECTRUM_CROSSING_ROOF` re-paced to carry the exit past
-    // the cyan window's own shoulder, and `cursor_glow::rainbow_bed_true_hue`
+    // nothing else — the crossing roof (deleted 2026-09-15) re-paced to carry
+    // the exit past the cyan window's own shoulder, and
+    // `cursor_glow::rainbow_bed_true_hue`
     // giving the ribbon's bed back the hue the ground steals. The other eight
     // came back byte-identical from the same capture, which is the whole point
     // of keeping them here: a bed-colour transform that had leaked into the
@@ -849,7 +850,62 @@ fn a_licensed_typed_move_is_byte_identical_across_the_license_commit() {
         // tree's own run with `ATERM_CAPTURE_TYPED_PARITY=1`: entry 2 is
         // `6_195_508_255_605_043_548` here, and the other EIGHT came back
         // byte-identical, which is this re-capture's control.
-        6_195_508_255_605_043_548,
+        // RE-CAPTURED 2026-09-15, THE EDIT ROUND'S ANSWER LANE (the owner's
+        // four reports on 0.86: backspacing breaks the trail apart, the
+        // new-line transition, part of the trail drawing while editing, the
+        // blocky green→blue). This script types, ERASES and FOLDS, and TWO
+        // of the round's laws — no more — reach it:
+        //
+        //   * THE FOLD KEEPS ITS ROW (`Ribbon::folded_down` /
+        //     `Ribbon::leave_row`): a one-row-down echo retracts only the
+        //     cells the re-wrap moved instead of abandoning the whole row
+        //     the hand came off. The script folds, so it crosses this.
+        //   * THE WALK IS RE-PACED ACROSS GREEN→BLUE
+        //     (`rk::ribbon::CROSS_PACE`): a walk position inside that ONE
+        //     leg resolves to a different stop. The script draws a band on
+        //     every frame, so it crosses this too.
+        //
+        // DECOMPOSED, NOT ASSUMED (measured by switching each law of the
+        // round off in turn and re-reading this array): with BOTH of those
+        // forced back to their shipped expression and every other law of
+        // the round left in place, entry 2 reads
+        // `6_195_508_255_605_043_548` — the byte v0.86.0 shipped
+        // (`de9846727`), to the bit. The round's other laws (the repaint's
+        // home, the witness's blank cells, the scroll-followed re-anchor
+        // guard) move NO byte of this script, and the ERASE is v0.86.0's
+        // own `retract_suffix` again — the slide this round first built was
+        // dropped after measurement, so it moves nothing either.
+        //
+        // The green→blue confinement is
+        // `the_crossing_is_smoothed_out_of_its_own_legs_cells_and_nothing_else_moves`:
+        // `moved_off_leg == 0`, every anchor keeps its residency, and the
+        // warm end sits on the stops it shipped with.
+        //
+        // The bake was taken AFTER a defect it would otherwise have pinned
+        // was fixed: `Ribbon::typed_landing` was reading the engine's cold
+        // caret MIRROR (`(0, 0)`, before any caret has been observed) as
+        // "the hand" and redirecting the first key of a session onto row 0
+        // — the stray the law exists to prevent. It now requires the hand's
+        // row to be a row the ribbon holds a cell on.
+        //
+        // Entry 2 is `1_827_068_178_512_366_064` here — AND THE OTHER EIGHT
+        // CAME BACK BYTE-IDENTICAL, which is this round's proof that no
+        // other trail style moved.
+        //
+        // **RE-BASELINED 2026-09-15, THE CYAN-LAW DELETION ROUND, AND AGAIN
+        // ONLY ENTRY `2`.** `crate::spectrum` lost the green→blue crossing's
+        // authored roof, its four pacing knots and its EXEMPTION from the
+        // perceptual pace — the retired no-cyan ruling's last machinery — so
+        // the crossing is drawn in HSV between its own two anchors (through
+        // `#00FFFF` at `S 1.00, V 1.00` instead of the roof's `S 0.53,
+        // V 0.92`) and every entry of the table is re-spent: the seven anchors
+        // moved `[0, 63, 142, 258, 394, 471, 510]` ->
+        // `[0, 50, 112, 204, 419, 479, 510]`. `GlowStyle::RainbowKitty` is the
+        // one style that reads the arc, so it is the one entry that may move,
+        // and the other eight came back byte-identical from this tree's own
+        // capture (`ATERM_CAPTURE_TYPED_PARITY=1`) — which is the whole reason
+        // the eight are kept here.
+        750_028_201_522_132_832,
         12_359_376_227_302_100_357,
         17_288_162_128_308_037_669,
         13_741_658_660_564_044_123,
@@ -915,7 +971,27 @@ fn the_flat_spelling_keeps_the_pre_comet_typed_fold() {
     // comet branches, so they move the flat fold alongside v3's ungated laws; read off
     // the merged tree's own run as `18_065_821_225_995_789_763`. The `assert_ne!`
     // control below held: the default body still folds this script elsewhere.
-    const PRE_COMET: u64 = 18_065_821_225_995_789_763;
+    // RE-CAPTURED 2026-09-15, THE EDIT ROUND'S ANSWER LANE: the fold's kept
+    // row and the walk's green→blue pace are not comet branches — the flag
+    // gates the comet profile, the vivid rail and the from-the-hand wipe,
+    // not which row a fold abandons or which stop a walk position resolves
+    // to — so they stand under the flat body exactly as under the comet and
+    // the flat fold moves with them, entry 2 for entry 2. Decomposed the
+    // same way as `GOLDEN` above: with both of those laws forced back to
+    // their shipped expression this reads `18_065_821_225_995_789_763`, the
+    // byte v0.86.0 shipped, to the bit — so those two laws are the whole of
+    // the move here too. Read off this tree's own run as
+    // `17_458_915_969_075_301_022`; the `assert_ne!` control below still
+    // holds, which is what keeps this a pin on the COLLAPSE.
+    // RE-CAPTURED 2026-09-15, THE CYAN-LAW DELETION ROUND: the arc's own table
+    // is not a comet branch either — the flag gates the comet profile, the
+    // vivid rail and the from-the-hand wipe, not which colour a spectrum
+    // position resolves to — so deleting the green→blue crossing's roof, its
+    // pacing knots and its exemption from the perceptual pace (see `GOLDEN`'s
+    // entry 2 above) moves the flat fold with the comet one. Read off this
+    // tree's own run as `15_974_855_624_796_755_313`; the `assert_ne!` control
+    // below still holds.
+    const PRE_COMET: u64 = 3_217_110_197_472_841_106;
     let mut flat = cfg(GlowStyle::RainbowKitty);
     flat.ribbon_flat = true;
     let a = typed_script_with(&flat, true);

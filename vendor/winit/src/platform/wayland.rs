@@ -1,3 +1,5 @@
+//! Modified by the aterm project in 2026; see the repository NOTICE.
+//!
 //! # Wayland
 //!
 //! **Note:** Windows don't appear on Wayland until you draw/present to them.
@@ -22,6 +24,8 @@ use crate::monitor::MonitorHandle;
 use crate::window::{Window, WindowAttributes};
 
 pub use crate::window::Theme;
+#[cfg(wayland_platform)]
+pub use crate::platform_impl::wayland::{WaylandClipboard, WaylandSelection};
 
 /// Additional methods on [`ActiveEventLoop`] that are specific to Wayland.
 pub trait ActiveEventLoopExtWayland {
@@ -40,12 +44,24 @@ impl ActiveEventLoopExtWayland for ActiveEventLoop {
 pub trait EventLoopExtWayland {
     /// True if the [`EventLoop`] uses Wayland.
     fn is_wayland(&self) -> bool;
+
+    /// The Wayland CLIPBOARD / PRIMARY selection handle — a cloneable, thread-safe
+    /// [`WaylandClipboard`] backed by the event loop's own seat and data devices.
+    /// `None` on any other backend. (An aterm addition: upstream winit has no
+    /// clipboard, and a Wayland session without XWayland had none at all.)
+    #[cfg(wayland_platform)]
+    fn wayland_clipboard(&self) -> Option<WaylandClipboard>;
 }
 
 impl<T: 'static> EventLoopExtWayland for EventLoop<T> {
     #[inline]
     fn is_wayland(&self) -> bool {
         self.event_loop.is_wayland()
+    }
+
+    #[cfg(wayland_platform)]
+    fn wayland_clipboard(&self) -> Option<WaylandClipboard> {
+        self.event_loop.wayland_clipboard()
     }
 }
 

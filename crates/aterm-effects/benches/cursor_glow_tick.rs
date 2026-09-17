@@ -180,9 +180,7 @@
 use std::time::Duration;
 use std::time::Instant as WallInstant;
 
-use aterm_effects::cursor_glow::{
-    CursorGlow, Geom, GlowConfig, GlowStyle, RAINBOW_WAKE_PERSIST, TrailParams,
-};
+use aterm_effects::cursor_glow::{CursorGlow, Geom, GlowConfig, GlowStyle, TrailParams};
 use aterm_effects::rainbow_kitty::ribbon::RIBBON_QUAD_BUDGET;
 use aterm_effects::trail_pack::{HaloChannel, ParticlePop, RampParams};
 use aterm_render::GlowQuad;
@@ -354,7 +352,6 @@ fn cfg_for(style: GlowStyle) -> GlowConfig {
         beam: beam_for(style),
         head_dx: 0.5,
         pack: None,
-        wake_persist_s: RAINBOW_WAKE_PERSIST,
     }
 }
 
@@ -1272,13 +1269,18 @@ fn workloads() -> Vec<Workload> {
             build: f_rainbow_underline_retina,
             arm: arm_typing,
             bounds: [
-                // Re-pinned 2026-09-14 (38fd5de93). The quieter underline body
-                // stays UNDER the ribbon's budget (peak 8_171 against the tall
-                // default's saturated 10_239), so the count itself now tells
-                // the two presentations apart; `ribbon_tall=0` below remains
-                // the non-vacuity guard for the explicit alternate.
+                // Re-pinned 2026-09-16: the underline body now SATURATES the
+                // ribbon's budget like the tall default (peak 10_239, per-frame
+                // mean 9_757, where 38fd5de93 pinned 8_171). The move is the
+                // ribbon's — the Rainbow Path v3 body laws that landed between
+                // 38fd5de93 and f402dc1f6 (the band under the caret block, the
+                // kept spaces, the wrap); stardust writes `out` and never
+                // `under` — and it left the bench unable to run at all from
+                // f402dc1f6 on. The count no longer tells the two
+                // presentations apart, so `ribbon_tall=0` below is the whole
+                // non-vacuity guard for the explicit alternate.
                 (320, 405),
-                (7_190, 9_150),
+                AT_RIBBON_BUDGET_EDGE,
                 (82, 105),
                 (0, 0),
                 (0, 0),
@@ -1302,12 +1304,14 @@ fn workloads() -> Vec<Workload> {
             build: f_rainbow_lodpi,
             arm: arm_typing,
             bounds: [
-                // Re-pinned 2026-09-14 (38fd5de93): peaks 301 / 6_713 / 93. At
-                // 1x the body is inside the budget (the budget is in quads and
-                // a 1x cell is a quarter the pixels), so `under` is a real
-                // two-sided guard here.
+                // Re-pinned 2026-09-16: `under` peaks 9_096 (per-frame mean
+                // 7_300) where 38fd5de93 pinned 6_713 — the same ribbon body
+                // move as the underline row above, at 1x still inside the
+                // budget (the budget is in quads and a 1x cell is a quarter
+                // the pixels), so `under` stays a real two-sided guard here.
+                // `out` 316 and `halos` 93 are inside their 2026-09-14 pins.
                 (265, 337),
-                (5_900, 7_520),
+                (8_000, 10_190),
                 (82, 105),
                 (0, 0),
                 (0, 0),
@@ -1334,10 +1338,12 @@ fn workloads() -> Vec<Workload> {
                 (0, 0),
                 // The ribbon body is one emitter for both themes, with a
                 // theme-solved ink table (`ribbon.rs`, `lut`): it writes
-                // `under` on a light theme too, and stays inside the budget
-                // there (peak 8_840 against the dark tall default's edge).
-                (7_780, 9_900),
-                // The ink fork's halos: 176 at peak, well under the cap.
+                // `under` on a light theme too. Re-pinned 2026-09-16: it now
+                // saturates the budget here as well (peak 10_239, per-frame
+                // mean 10_015, where 38fd5de93 measured 8_840) — the same
+                // ribbon body move as the two rows above.
+                AT_RIBBON_BUDGET_EDGE,
+                // The ink fork's halos: 175 at peak, well under the cap.
                 (155, 197),
                 (0, 0),
                 // `charred` is v1's glyph tint (`emit_fresh_ink_glyphs`, gone

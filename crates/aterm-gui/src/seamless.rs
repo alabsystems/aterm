@@ -3227,6 +3227,26 @@ fn take_incoming_as(shape: ReceiverShape) -> IncomingHandoff {
                 nonce: LaunchNonce::generate(),
                 checkpoint: Some(checkpoint),
                 control,
+                // FROZEN PATH (2026-09-16): the sender wrote no `outgoing_build`
+                // at all — the one build before the field, whose sessions had no
+                // `agents/` in front (presence is the whole test; the number is
+                // never compared) — or the sender itself adopted this shell
+                // frozen and said so per record. A conservative bound: every
+                // session of that old build is marked, a tab it opened after the
+                // hooks existed included; sourcing the hook there is a no-op.
+                // THE SAME BOUND COVERS A ROLLBACK (review, 2026-09-16): a
+                // downgrade to a pre-field build reads this manifest fine (no
+                // `deny_unknown_fields`) and writes none of it back, so when
+                // that build is updated again EVERY tab it hands across is
+                // marked — the tabs this build spawned, with the live re-assert
+                // running in them, included — and the per-record carry keeps
+                // the mark through every later handoff. Accepted: the mark is a
+                // bound, never lowered by the remedy (the hook is a no-op in
+                // such a tab, and the tab keeps the managed copies it runs),
+                // and it leaves when the tab closes. Nothing compares a build
+                // number to sort the two cases apart, by the rule above.
+                frozen_path: crate::session_store::predates_path_self_heal(manifest.outgoing_build)
+                    || rec.frozen_path,
             })
         })
         .collect::<Option<Vec<_>>>();
@@ -4848,6 +4868,7 @@ mod tests {
                 role: None,
                 attention: None,
                 control: None,
+                frozen_path: false,
             });
             live.push((local_id, master, 4000 + index as i32));
             if let Some(carry) = carry {
@@ -4890,6 +4911,7 @@ mod tests {
             },
             sessions: records,
             next_turn_id: carry.and_then(|c| c.next_turn_id),
+            outgoing_build: Some(crate::build_info::BUILD_NUMBER.parse::<u64>().unwrap_or(0)),
         };
         let fds = HandoffFds {
             entries: live.clone(),

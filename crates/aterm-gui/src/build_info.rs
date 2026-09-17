@@ -18,6 +18,9 @@ use std::sync::OnceLock;
 pub(crate) const AUTHOR_ATTRIBUTION: &str = "By Andrew Yates";
 pub(crate) const COMPANY: &str = "ALab";
 pub(crate) const AUTHOR_COMPANY_BYLINE: &str = "By Andrew Yates · ALab";
+/// The project site About prints in its byline (a live link) and its `Project`
+/// row — `alab.systems`, from the one identity every surface shares.
+pub(crate) const SITE: &str = aterm_types::identity::SITE;
 
 /// Application identity shared across the one binary. Release builds use the
 /// private app-channel claim; ordinary builds use Cargo's source version.
@@ -70,6 +73,17 @@ pub const COMPILER_COMMIT: &str = env!("ATERM_COMPILER_COMMIT");
 
 /// The producing compiler's host triple (`host:` from `-vV`). Stamped by `build.rs`.
 pub const COMPILER_HOST: &str = env!("ATERM_COMPILER_HOST");
+
+/// Trust's OWN version — the `trust:` line of the producing compiler's `-vV`
+/// (e.g. `0.1.0`). This is NOT the `1.99.0-dev` in [`COMPILER_VERSION_LINE`]:
+/// that token is the RUST release Trust is compatible with, and it stays
+/// rustc-shaped on purpose — cargo, targo and every version-sniffing build
+/// script parse `rustc <release>` off the first line, and rustup refuses a
+/// toolchain without a `bin/rustc` — so the compatibility protocol cannot be
+/// where Trust says its own name. It says it here. `""` when the compiler
+/// reported no such line (upstream rustc, or a Trust build predating the
+/// marker). Stamped by `build.rs`.
+pub const COMPILER_TRUST_VERSION: &str = env!("ATERM_COMPILER_TRUST_VERSION");
 
 /// Compiler flavor: `"r"` = upstream Rust, `"t"` = Trust (trustc). Detection order
 /// (see `build.rs` / `compiler_probe.rs`): the `-vV` self-identification,
@@ -152,34 +166,51 @@ fn compiler_release() -> &'static str {
         .unwrap_or("unknown")
 }
 
-/// The producing compiler's real NAME: `trustc` for a Trust build, `rustc` for
-/// upstream. The `-vV` first line leads with the canonical `rustc` token by
-/// ecosystem contract, so the honest display name comes from the flavor — the
-/// classifier that already weighs the compiler's own self-identification.
-fn compiler_name() -> &'static str {
+/// The toolchain's OWN name and version, as About leads with it: `Trust 0.1.0`
+/// for a Trust build (`Trust (version unreported)` when the compiler predates
+/// the `trust:` marker), `Rust 1.96.0` for upstream. The one place the display
+/// decides what to call the compiler; the flavor classifier already weighed the
+/// compiler's own self-identification, so this is a rendering, not a guess.
+fn toolchain_display() -> String {
     if COMPILER_FLAVOR == "t" {
-        "trustc"
+        if COMPILER_TRUST_VERSION.is_empty() {
+            "Trust (version unreported)".to_string()
+        } else {
+            format!("Trust {COMPILER_TRUST_VERSION}")
+        }
     } else {
-        "rustc"
+        format!("Rust {}", compiler_release())
     }
 }
 
-/// One human line of compiler provenance for the About panel, e.g.
-/// `trustc 1.99.0-dev (2b118046) · trust · release · trust_verify on` (or
-/// `rustc … · rust · …` on the upstream-stable compat slice).
+/// One human line of compiler provenance for About and `--diagnose`, e.g.
+/// `Trust 0.1.0 · trustc 3a3e781f · compatible with Rust 1.99.0-dev · release ·
+/// trust_verify on` for a Trust build, or `Rust 1.96.0 · rustc ac68faa2 · release
+/// · trust_verify off` for upstream.
+///
+/// It LEADS with the toolchain's own name and version, and states the Rust
+/// release as a separate, labelled fact. Until 2026-09-14 the row read
+/// `trustc 1.99.0-dev (3a3e781f) · trust · …`: the rustc-shaped release token
+/// Trust prints for cargo's sake, presented as if it were Trust's version — the
+/// owner read it as "built by Rust 1.99" and ruled that the surface must be
+/// compatible AND explicit: keep the `rustc` protocol, but SAY Trust, say
+/// Trust's own version, and say what it is compatible with, as three facts.
+/// The release cutter's provenance gate keys on the leading `Trust`.
 #[must_use]
 pub fn compiler_summary() -> String {
-    let flavor_word = if COMPILER_FLAVOR == "t" {
-        "trust"
+    let slug = compiler_commit_short();
+    if COMPILER_FLAVOR == "t" {
+        format!(
+            "{} \u{00b7} trustc {slug} \u{00b7} compatible with Rust {} \u{00b7} {BUILD_PROFILE} \u{00b7} trust_verify {TRUST_VERIFY}",
+            toolchain_display(),
+            compiler_release(),
+        )
     } else {
-        "rust"
-    };
-    format!(
-        "{} {} ({}) \u{00b7} {flavor_word} \u{00b7} {BUILD_PROFILE} \u{00b7} trust_verify {TRUST_VERIFY}",
-        compiler_name(),
-        compiler_release(),
-        compiler_commit_short(),
-    )
+        format!(
+            "{} \u{00b7} rustc {slug} \u{00b7} {BUILD_PROFILE} \u{00b7} trust_verify {TRUST_VERIFY}",
+            toolchain_display(),
+        )
+    }
 }
 
 /// A content signature of the RUNNING binary: a 16-hex FxHash of `current_exe()`,
@@ -221,6 +252,9 @@ pub fn about_fields() -> Vec<(&'static str, String)> {
         ),
         ("author", AUTHOR_ATTRIBUTION.to_string()),
         ("company", COMPANY.to_string()),
+        // The byline's live link and the native route's `Project` row / "Open
+        // Project Site" button — where aterm comes from (owner, 2026-09-14).
+        ("site", SITE.to_string()),
         ("version", version_display().to_string()),
         ("build", BUILD_NUMBER.to_string()),
         ("commit", GIT_COMMIT.to_string()),
@@ -275,8 +309,23 @@ pub(crate) fn which_copy_rows(
 /// compiler data — `flavor=r` marks it). `version=` carries the display suffix
 /// (`+r.<slug>`/`+t.<slug>`) — nothing machine-side compares it (the updater
 /// orders by `build=`, which stays the bare monotonic counter).
+///
+/// 2026-09-14 ADDED two keys, so the line says what `trustc=1.99.0-dev` never
+/// could on its own: `trust=` is Trust's OWN version (the `trust:` line of
+/// `-vV` — `none` on an upstream build, `unreported` on a Trust build predating
+/// the marker), and `rust_compat=` is the Rust release the compiler is
+/// compatible with — the SAME value `trustc=` has always carried, now under a
+/// name that says what it is. `trustc=` keeps carrying that rustc-shaped
+/// release token, unchanged, for every script that already parses it.
 #[must_use]
 pub fn control_line() -> String {
+    let trust = if COMPILER_FLAVOR != "t" {
+        "none"
+    } else if COMPILER_TRUST_VERSION.is_empty() {
+        "unreported"
+    } else {
+        COMPILER_TRUST_VERSION
+    };
     let update_pin_sha256 = aterm_update::compiled_update_pin_sha256();
     // `master_pin_sha256=` (2026-09-14): the paper master this build trusts — the
     // anchor that actually authorizes a release once the roster tier is armed.
@@ -292,12 +341,14 @@ pub fn control_line() -> String {
     format!(
         "OK version={} build={BUILD_NUMBER} commit={GIT_COMMIT} built={BUILD_TIME} \
          arch={} trustc={} trustc_commit={} trustc_host={COMPILER_HOST} flavor={COMPILER_FLAVOR} \
+         trust={trust} rust_compat={} \
          profile={BUILD_PROFILE} trust_verify={TRUST_VERIFY} update_pin_sha256={update_pin_sha256} \
          master_pin_sha256={master_pin_sha256} objc_contained={objc_contained} signature={}\n",
         version_display(),
         std::env::consts::ARCH,
         compiler_release(),
         compiler_commit_short(),
+        compiler_release(),
         binary_signature()
     )
 }
@@ -441,7 +492,11 @@ mod tests {
         );
     }
 
-    /// About gains exactly one `compiler` row, in the documented shape.
+    /// About gains exactly one `compiler` row, in the documented shape: it LEADS
+    /// with the toolchain's own name (`Trust <own version>` / `Rust <release>`),
+    /// names the compiler binary and its slug, and — for Trust — states the Rust
+    /// release it is compatible with as a separate, labelled fact, so the
+    /// rustc-shaped `1.99.0-dev` token can never again read as Trust's version.
     #[test]
     fn about_fields_has_the_compiler_row() {
         let fields = about_fields();
@@ -452,22 +507,60 @@ mod tests {
             .collect();
         assert_eq!(compiler.len(), 1, "exactly one compiler row");
         let row = compiler[0];
-        assert!(
-            row.starts_with("trustc ") || row.starts_with("rustc "),
-            "leads with the real compiler name (trustc for a Trust build): {row}"
-        );
+        assert_eq!(row, &compiler_summary());
         assert!(
             row.contains(compiler_commit_short()),
             "carries the slug: {row}"
         );
         assert!(
-            row.contains(" \u{00b7} rust") || row.contains(" \u{00b7} trust"),
+            row.contains(&format!(
+                " \u{00b7} {BUILD_PROFILE} \u{00b7} trust_verify {TRUST_VERIFY}"
+            )),
             "{row}"
         );
-        assert!(
-            row.contains("trust_verify on") || row.contains("trust_verify off"),
-            "{row}"
-        );
+        if COMPILER_FLAVOR == "t" {
+            assert!(row.starts_with("Trust"), "leads with Trust: {row}");
+            assert!(
+                row.contains(&format!(
+                    " \u{00b7} trustc {} \u{00b7} ",
+                    compiler_commit_short()
+                )),
+                "names the trustc binary: {row}"
+            );
+            assert!(
+                row.contains(&format!(
+                    " \u{00b7} compatible with Rust {} \u{00b7} ",
+                    compiler_release()
+                )),
+                "the Rust release is a labelled compatibility fact: {row}"
+            );
+            if !COMPILER_TRUST_VERSION.is_empty() {
+                assert!(
+                    row.starts_with(&format!("Trust {COMPILER_TRUST_VERSION} \u{00b7} ")),
+                    "Trust's own version, from the trust: line: {row}"
+                );
+                assert_ne!(
+                    COMPILER_TRUST_VERSION,
+                    compiler_release(),
+                    "Trust's own version is not the rust-compat release"
+                );
+            } else {
+                assert!(
+                    row.starts_with("Trust (version unreported) \u{00b7} "),
+                    "{row}"
+                );
+            }
+            assert!(!row.starts_with("Rust "), "{row}");
+        } else {
+            assert!(
+                row.starts_with(&format!("Rust {} \u{00b7} rustc ", compiler_release())),
+                "upstream leads with Rust and its release: {row}"
+            );
+            assert!(
+                !row.contains("Trust"),
+                "an upstream build claims no Trust: {row}"
+            );
+        }
         // And the version row is the suffixed display form.
         let version = fields
             .iter()
@@ -476,11 +569,54 @@ mod tests {
         assert_eq!(version, Some(version_display()));
     }
 
-    /// The ctl line stays greppable key=value and gains the compiler keys.
+    /// About's header rows say where aterm comes from: author, company and the
+    /// site (`alab.systems`) — the site row is what the byline links and the
+    /// native route's "Open Project Site" opens.
+    #[test]
+    fn about_fields_carry_the_origin() {
+        let fields = about_fields();
+        let row = |k: &str| {
+            fields
+                .iter()
+                .find(|(key, _)| *key == k)
+                .map(|(_, v)| v.as_str())
+                .unwrap_or_else(|| panic!("no {k} row: {fields:?}"))
+        };
+        assert_eq!(row("site"), aterm_types::identity::SITE);
+        assert_eq!(row("company"), aterm_types::identity::COMPANY);
+        assert!(
+            row("author").ends_with(aterm_types::identity::AUTHOR),
+            "{}",
+            row("author")
+        );
+        assert_eq!(
+            fields.iter().filter(|(k, _)| *k == "site").count(),
+            1,
+            "exactly one site row"
+        );
+    }
+
+    /// The ctl line stays greppable key=value and gains the compiler keys —
+    /// including `trust=` (Trust's own version) and `rust_compat=` (the Rust
+    /// release), which together say what `trustc=` alone never could.
     #[test]
     fn control_line_carries_compiler_provenance() {
         let line = control_line();
         assert!(line.starts_with("OK version="), "framing preserved");
+        let value = |key: &str| {
+            line.split(' ')
+                .find_map(|kv| kv.strip_prefix(key))
+                .map(str::trim_end)
+                .unwrap_or_else(|| panic!("no {key} in {line}"))
+        };
+        // `rust_compat=` is the same token `trustc=` has always carried.
+        assert_eq!(value("rust_compat="), value("trustc="));
+        assert_eq!(value("rust_compat="), compiler_release());
+        match COMPILER_FLAVOR {
+            "t" if COMPILER_TRUST_VERSION.is_empty() => assert_eq!(value("trust="), "unreported"),
+            "t" => assert_eq!(value("trust="), COMPILER_TRUST_VERSION),
+            _ => assert_eq!(value("trust="), "none"),
+        }
         for key in [
             "build=",
             "commit=",
@@ -489,6 +625,8 @@ mod tests {
             "trustc_commit=",
             "trustc_host=",
             "flavor=",
+            "trust=",
+            "rust_compat=",
             "profile=",
             "trust_verify=",
             "update_pin_sha256=",

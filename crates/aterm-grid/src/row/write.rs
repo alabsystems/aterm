@@ -331,8 +331,15 @@ impl Row {
         unsafe {
             *self.cells.get_unchecked_mut(col_usize) =
                 Cell::from_raw_parts(char_data, colors, flags.union(CellFlags::WIDE));
+            // The spacer carries the LEAD'S rendition, not a bare role bit. A
+            // rendition belongs to the character, and a double-width character is
+            // one character in two columns; `wide_continuation_of` states that law
+            // and the measurement behind it. Built with WIDE_CONTINUATION alone,
+            // this cell resolved un-inverted while the lead resolved swapped, and
+            // since lead.fg == spacer.bg under that split the glyph's right half
+            // was painted invisible — 153/153 flat pixels under `\033[7m漢`.
             *self.cells.get_unchecked_mut(col_usize + 1) =
-                Cell::from_raw_parts(' ' as u16, colors, CellFlags::WIDE_CONTINUATION);
+                Cell::from_raw_parts(' ' as u16, colors, flags.wide_continuation_of());
         }
 
         if col + 1 >= self.len {
@@ -403,8 +410,11 @@ impl Row {
         unsafe {
             *self.cells.get_unchecked_mut(col_usize) =
                 Cell::from_raw_parts(char_data, colors, flags.union(CellFlags::WIDE));
+            // Same law as `write_wide_char_packed`: the spacer inherits the lead's
+            // rendition. This is the emoji/CJK batch-run path, so a divergence here
+            // would show as a run that highlights correctly only when it was slow.
             *self.cells.get_unchecked_mut(col_usize + 1) =
-                Cell::from_raw_parts(' ' as u16, colors, CellFlags::WIDE_CONTINUATION);
+                Cell::from_raw_parts(' ' as u16, colors, flags.wide_continuation_of());
         }
     }
 

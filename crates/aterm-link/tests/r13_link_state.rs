@@ -280,10 +280,22 @@ fn a_broker_that_accepts_but_never_acks_is_stalled_after_the_ack_deadline() {
     std::fs::create_dir_all(&dir).expect("stub dir");
     let stub = format!("{dir}/s.sock");
     let listener = UnixListener::bind(&stub).expect("bind the stub");
-    // Accept everything, read everything, answer nothing.
+    // Accept everything, read everything, answer nothing — and say WHEN the
+    // first accept happened: the bridge starts its ack deadline the moment it
+    // connects (bridge.rs, right after the dial), so the stub's accept is the
+    // deadline's true origin. The first poll that sees `state=stalled` trails
+    // it by however long the harness took to boot and answer `fabric_status`;
+    // on a loaded 4-core Intel Mac that lag was 1.149 s (2026-09-15 gate), one
+    // slack second short of the assertion below, while the bridge itself had
+    // honoured its 5 s deadline exactly.
+    let (accepted_tx, accepted_rx) = std::sync::mpsc::channel::<Instant>();
     std::thread::spawn(move || {
+        let mut first = Some(accepted_tx);
         for stream in listener.incoming() {
             let Ok(mut stream) = stream else { return };
+            if let Some(tx) = first.take() {
+                let _ = tx.send(Instant::now());
+            }
             std::thread::spawn(move || {
                 let mut sink = [0u8; 4096];
                 while stream.read(&mut sink).is_ok_and(|n| n > 0) {}
@@ -292,10 +304,19 @@ fn a_broker_that_accepts_but_never_acks_is_stalled_after_the_ack_deadline() {
     });
 
     let w = World::boot_at("r13-stub", &[], &[], Some(&stub));
-    let attached_at = until("the bridge to attach", || {
+    let seen_at = until("the bridge to attach", || {
         let fs = fabric_status(&w);
         (kv(&fs, "state") == Some("stalled")).then(Instant::now)
     });
+    // The accept precedes the attach the poll saw, so it is already in the
+    // channel; measure from it, and record how far behind it the poll was.
+    let attached_at = accepted_rx
+        .recv_timeout(Duration::from_secs(1))
+        .expect("the stub accepted the bridge's dial before the attach was seen");
+    eprintln!(
+        "MEASURED the first poll saw the attach {} ms after the stub accepted",
+        seen_at.saturating_duration_since(attached_at).as_millis()
+    );
     let no_ack_by = attached_at + ACK_DEADLINE + Duration::from_secs(10);
     let fs = loop {
         let fs = fabric_status(&w);
@@ -311,12 +332,13 @@ fn a_broker_that_accepts_but_never_acks_is_stalled_after_the_ack_deadline() {
     };
     let waited = attached_at.elapsed();
     eprintln!(
-        "MEASURED stub that never acks -> stalled reason=no-ack: {} ms after the attach",
+        "MEASURED stub that never acks -> stalled reason=no-ack: {} ms after the stub accepted",
         waited.as_millis()
     );
-    // The dial began before the first poll could see the attach, so the lower
-    // bound carries a second of slack; the upper bound is the deadline plus one
-    // redial's worth of back-off.
+    // The deadline's clock started at the bridge's connect, which the stub's
+    // accept trails by a scheduler hop at most, so the lower bound keeps a
+    // second of slack purely as margin; the upper bound is the deadline plus
+    // one redial's worth of back-off.
     assert!(
         waited >= ACK_DEADLINE - Duration::from_secs(1),
         "no-ack must wait out the ack deadline: {waited:?}"

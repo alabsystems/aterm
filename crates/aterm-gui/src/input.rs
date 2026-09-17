@@ -221,6 +221,38 @@ pub enum InputEvent {
     Focus(bool),
 }
 
+impl InputEvent {
+    /// This event with a KEYPAD key folded onto its main-block twin
+    /// (`Key::main_block_twin`): `Numpad5` -> `Character('5')`, `NumpadEnter`
+    /// -> `Enter`, `NumpadEnd` -> `End`. `None` when there is nothing to fold —
+    /// a main-block key, a non-key event, or `NumpadBegin`, which has no twin.
+    ///
+    /// For the consumers that read the engine key for its MEANING rather than
+    /// its bytes: the native pages (`App::native_input_event`) and the seam's
+    /// press classifier (`classify_press` / `is_plain_enter`). The PTY encoder
+    /// never sees the folded event — the keypad identity
+    /// `keymap::build_key_input` resolves is exactly what DECKPAM's SS3 forms
+    /// and kitty disambiguate exist to report.
+    pub(crate) fn keypad_folded(&self) -> Option<InputEvent> {
+        let InputEvent::Key {
+            key,
+            mods,
+            base_layout,
+            event_type,
+        } = self
+        else {
+            return None;
+        };
+        let key = key.main_block_twin()?;
+        Some(InputEvent::Key {
+            key,
+            mods: *mods,
+            base_layout: *base_layout,
+            event_type: *event_type,
+        })
+    }
+}
+
 /// Sub-cell pixel offset of the pointer INSIDE its grid cell, carried on every
 /// mouse event so the seam can produce a genuine PIXEL coordinate for DEC 1016
 /// (SGR-pixel) mouse mode without re-reading any winit/GUI state.
@@ -1202,8 +1234,19 @@ fn seam_egress_inner(
         InputEvent::Focus(focused) => {
             // SOLE focus-report egress: ESC[I / ESC[O under DEC 1004, byte-identical
             // to the engine's `encode_focus_state`.
+            //
+            // LOCK-FREE like the Key/Text arms, and for a sharper reason than
+            // they had. This arm is now reached from `App::recompute_focus_reports`
+            // on the winit thread on EVERY tab switch and pane-focus move, and
+            // `App::sync_window` — the caller — states in its own body that it
+            // must never acquire the engine mutex (a flooding background pane's
+            // reader holds its terminal for a whole `process()` slice, so a
+            // blocking read here would park the user's gesture behind it). The
+            // armed bit is a published mode, so read it from the mirror: the
+            // common case is nobody having set DEC 1004 at all, and the old
+            // `term_lock` paid a full acquisition per holder move to learn it.
             let mut d = Delivery::Full;
-            if term_lock(term).focus_reporting_enabled() {
+            if modes.focus_reporting_enabled() {
                 let seq: &[u8] = if *focused { b"\x1b[I" } else { b"\x1b[O" };
                 d = emit(sink, mode, seq, accepted_order);
             }

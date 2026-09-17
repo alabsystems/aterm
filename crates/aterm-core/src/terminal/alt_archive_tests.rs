@@ -482,6 +482,533 @@ fn eviction_counts_lost_and_advances_first() {
     assert_eq!(c.gaps().count(), 0);
 }
 
+// ----------------------------------------------------------- shared budget
+
+/// One session's archive with its own budget, shaped like the live one the GUI
+/// spawns but counted in rows rather than megabytes.
+fn session(budget: usize) -> AltArchive {
+    AltArchive::with_limits(budget, ALT_ARCHIVE_MAX_ROWS)
+}
+
+/// Scroll `n` transcript rows off the top of a 20-row region: rows `tx(0)` to
+/// `tx(n - 1)` are archived, newest last.
+fn scroll(a: &mut AltArchive, n: usize) {
+    for s in 0..=n {
+        commit(a, &frame(s, 20));
+    }
+}
+
+/// What a share of `share` bytes can actually retain: whole rows, never a
+/// fraction of one.
+fn whole_rows(share: usize, cost: usize) -> usize {
+    share / cost * cost
+}
+
+/// The charge for one transcript row — the unit every pool size here is in.
+fn row_cost() -> usize {
+    alt_archive_row_charge(tx(0).len())
+}
+
+#[test]
+fn a_pool_shares_one_total_where_per_session_budgets_charged_it_n_times() {
+    const N: usize = 4;
+    const KEPT: usize = 12;
+    let cost = row_cost();
+    let total = KEPT * cost;
+
+    // Per session: each of N sessions retains the whole budget, so the process
+    // pays N times for one 4 MiB policy — what eight tabs of a fullscreen app
+    // cost before the pool (measured: 8 x 4 MiB retained).
+    let mut alone: Vec<AltArchive> = (0..N).map(|_| session(total)).collect();
+    for a in &mut alone {
+        scroll(a, 40);
+    }
+    assert_eq!(
+        alone.iter().map(AltArchive::bytes).sum::<usize>(),
+        N * total
+    );
+
+    // Sharing: the same N sessions, the same frames, ONE total between them.
+    let pool = AltArchiveBudget::new(total, cost);
+    let mut tabs: Vec<AltArchive> = (0..N).map(|_| session(total)).collect();
+    for a in &mut tabs {
+        a.share_budget(Some(Arc::clone(&pool)));
+    }
+    // JOINING IS NOT USING. Four tabs are open and none is in a full-screen
+    // app, so none is drawing on the pool and the first one that needs it gets
+    // the whole total — the case the count-on-enabled rule got wrong.
+    assert_eq!(pool.live(), 0, "four tabs open, no archive holding a row");
+    assert_eq!(pool.share(), total);
+
+    for a in &mut tabs {
+        scroll(a, 40);
+    }
+    assert_eq!(pool.live(), N, "now all four hold rows");
+    assert_eq!(pool.share(), total / N);
+    // Each drew while fewer were live, so each comes within the equal share on
+    // the next frame IT commits — never on another session's thread.
+    for a in &mut tabs {
+        commit(a, &frame(41, 20));
+    }
+    assert_eq!(tabs.iter().map(AltArchive::bytes).sum::<usize>(), total);
+    for a in &tabs {
+        // Equal shares, and each session still keeps its NEWEST rows: eviction
+        // is oldest-first inside a session as before, only the line moved.
+        assert_eq!(a.bytes(), total / N);
+        assert_eq!(a.texts(), range(tx, 41 - KEPT / N..41));
+    }
+
+    // Closing every tab hands the whole total to the session that opens next.
+    drop(tabs);
+    assert_eq!(pool.live(), 0);
+    assert_eq!(pool.share(), total);
+}
+
+#[test]
+fn a_tab_opening_lowers_the_others_on_their_next_frame_and_closing_gives_it_back() {
+    const KEPT: usize = 12;
+    let cost = row_cost();
+    let total = KEPT * cost;
+    let pool = AltArchiveBudget::new(total, cost);
+    let mut first = session(total);
+    first.share_budget(Some(Arc::clone(&pool)));
+    scroll(&mut first, 40);
+    assert_eq!(first.len(), KEPT, "alone in the pool: the whole total");
+
+    // A second tab opens. An EMPTY archive takes nothing: until that tab runs
+    // something that fills it, the session using the pool keeps all of it.
+    let mut second = session(total);
+    second.share_budget(Some(Arc::clone(&pool)));
+    assert_eq!(first.len(), KEPT);
+    assert_eq!(
+        first.effective_budget(),
+        total,
+        "an open tab holding nothing must not shrink the tab using the archive"
+    );
+
+    // The second session starts drawing. Joining the live count reaches into
+    // no other session's archive — the share is lowered, not the rows...
+    scroll(&mut second, 40);
+    assert_eq!(first.len(), KEPT, "still holding what it held");
+    assert_eq!(first.effective_budget(), total / 2);
+    // ...so the first session comes within its half on the next frame it
+    // commits, dropping the OLDEST rows it holds.
+    commit(&mut first, &frame(41, 20));
+    assert_eq!(first.len(), KEPT / 2);
+    assert_eq!(first.texts(), range(tx, 41 - KEPT / 2..41));
+
+    // And the second comes within its own half the same way: one total across
+    // both, once each has drawn with the other live.
+    commit(&mut second, &frame(41, 20));
+    assert_eq!(second.len(), KEPT / 2);
+    assert_eq!(first.bytes() + second.bytes(), total);
+
+    // The tab closes — dropping the archive is the whole deregistration — and
+    // the first session grows back into the returned share as it draws.
+    drop(second);
+    assert_eq!(pool.live(), 1);
+    assert_eq!(first.effective_budget(), total);
+    for s in 42..=60 {
+        commit(&mut first, &frame(s, 20));
+    }
+    assert_eq!(first.len(), KEPT);
+    assert_eq!(first.texts(), range(tx, 60 - KEPT..60));
+}
+
+#[test]
+fn a_crowded_pool_floors_the_share_instead_of_starving_a_session() {
+    const N: usize = 16;
+    let cost = row_cost();
+    let total = 4 * cost; // sixteen sessions, four rows of room between them
+    let pool = AltArchiveBudget::new(total, cost);
+    let mut tabs: Vec<AltArchive> = (0..N).map(|_| session(total)).collect();
+    for a in &mut tabs {
+        a.share_budget(Some(Arc::clone(&pool)));
+        // Every one of the sixteen is really running a full-screen app: this
+        // is the crowd, not sixteen idle tabs (those cost the pool nothing).
+        scroll(a, 40);
+    }
+    assert_eq!(pool.live(), N);
+    assert!(
+        total / pool.live() < cost,
+        "an unfloored share would not hold one row"
+    );
+    assert_eq!(pool.share(), cost, "the floor, not a quarter of a row");
+    for a in &mut tabs {
+        commit(a, &frame(41, 20));
+    }
+    for a in &tabs {
+        assert!(a.enabled(), "a crowded pool never turns a session off");
+        assert_eq!(a.texts(), range(tx, 40..41), "the newest row, not none");
+    }
+    // The floor is a deliberate overshoot: past `total / min_share` sessions
+    // the process total grows again, because sixteen archives that answer
+    // nothing would be worse than four times the bytes.
+    assert_eq!(tabs.iter().map(AltArchive::bytes).sum::<usize>(), N * cost);
+    assert_eq!(
+        AltArchiveBudget::process().min_share(),
+        ALT_ARCHIVE_TOTAL_BUDGET / 16,
+        "the live pool's floor is the documented sixteenth"
+    );
+}
+
+#[test]
+fn a_share_is_a_ceiling_and_not_an_allowance() {
+    let cost = row_cost();
+    let total = 12 * cost;
+    let pool = AltArchiveBudget::new(total, cost);
+    let mut small = session(3 * cost);
+    small.share_budget(Some(Arc::clone(&pool)));
+    assert_eq!(
+        small.effective_budget(),
+        3 * cost,
+        "its own budget is under the share and still binds"
+    );
+    scroll(&mut small, 40);
+    assert_eq!(small.len(), 3);
+
+    // And a session cannot buy itself out of the pool with a bigger number.
+    small.set_budget(usize::MAX);
+    assert_eq!(small.effective_budget(), total);
+    assert_eq!(small.budget(), usize::MAX, "its own budget is what was set");
+    scroll(&mut small, 40);
+    assert_eq!(small.len(), 12);
+}
+
+#[test]
+fn a_share_that_moves_mid_stream_never_leaves_more_than_it_allows() {
+    let cost = row_cost();
+    let total = 16 * cost;
+    let pool = AltArchiveBudget::new(total, cost);
+    let mut drawing = session(total);
+    drawing.share_budget(Some(Arc::clone(&pool)));
+    let mut crowd: Vec<AltArchive> = Vec::new();
+    for s in 0..=60 {
+        // Tabs open (the share falls) and close (it rises again) under a
+        // session that is drawing the whole time.
+        match s {
+            10 | 20 | 30 => {
+                let mut tab = session(total);
+                tab.share_budget(Some(Arc::clone(&pool)));
+                // A tab that DRAWS: an open one holding nothing takes no
+                // share, so it would not move the line under `drawing` at all.
+                scroll(&mut tab, 4);
+                crowd.push(tab);
+            }
+            40 | 50 => {
+                crowd.pop();
+            }
+            _ => {}
+        }
+        commit(&mut drawing, &frame(s, 20));
+        let allowed = drawing.effective_budget();
+        assert!(
+            drawing.bytes() <= allowed,
+            "step {s}: {} retained over {allowed}",
+            drawing.bytes()
+        );
+        // However the share moved, what is left is the NEWEST unbroken run:
+        // the rows a shrinking share drops are the oldest, and a growing one
+        // resumes where the scroll is, never re-opening a hole.
+        let kept = drawing.len();
+        assert_eq!(drawing.texts(), range(tx, s - kept..s), "step {s}");
+        assert_eq!(drawing.gaps().count(), 0, "step {s}: a scroll has no gap");
+    }
+    assert_eq!(pool.live(), 2, "three tabs opened, one closed twice");
+}
+
+#[test]
+fn an_archive_that_is_off_takes_no_share() {
+    let cost = row_cost();
+    let total = 12 * cost;
+    let pool = AltArchiveBudget::new(total, cost);
+    let mut on = session(total);
+    on.share_budget(Some(Arc::clone(&pool)));
+    scroll(&mut on, 40);
+    let mut off = session(total);
+    off.share_budget(Some(Arc::clone(&pool)));
+    scroll(&mut off, 40);
+    assert_eq!(pool.live(), 2, "both hold rows");
+
+    off.set_enabled(false);
+    assert_eq!(pool.live(), 1, "an archive that is off retains nothing");
+    assert_eq!(on.effective_budget(), total);
+    // Turning it back ON is not the same as filling it: `set_enabled(true)`
+    // starts from a fresh baseline, holding nothing, so it takes no share
+    // until it draws again.
+    off.set_enabled(true);
+    assert_eq!(pool.live(), 1, "on, and holding nothing");
+    assert_eq!(on.effective_budget(), total);
+    scroll(&mut off, 40);
+    assert_eq!(pool.live(), 2);
+    assert_eq!(on.effective_budget(), total / 2);
+
+    // `set_budget(0)` says the same thing by the other route.
+    off.set_budget(0);
+    assert_eq!(pool.live(), 1);
+    off.set_budget(total);
+    scroll(&mut off, 40);
+    assert_eq!(pool.live(), 2);
+    assert_eq!(on.effective_budget(), total / 2);
+
+    // Leaving the pool is not the same as being off: it takes its own budget
+    // back with it.
+    off.share_budget(None);
+    assert_eq!(pool.live(), 1);
+    assert!(off.bytes() > 0, "leaving the pool keeps the rows");
+    assert_eq!(off.effective_budget(), total);
+    assert!(off.shared_budget().is_none());
+}
+
+/// THE CASE THE POOL EXISTS FOR, AND THE ONE IT MUST NOT BREAK. Eight tabs are
+/// open and exactly one is running a full-screen app. Charging a share to the
+/// seven holding nothing would hand the one that needs the archive an eighth of
+/// the pool and make it evict rows there was room for — the feature taken away
+/// from its only user by the accounting meant to protect it.
+#[test]
+fn seven_idle_tabs_do_not_shrink_the_one_running_a_full_screen_app() {
+    const KEPT: usize = 16;
+    let cost = row_cost();
+    let total = KEPT * cost;
+    let pool = AltArchiveBudget::new(total, cost);
+
+    let mut idle: Vec<AltArchive> = (0..7).map(|_| session(total)).collect();
+    for a in &mut idle {
+        a.share_budget(Some(Arc::clone(&pool)));
+    }
+    let mut working = session(total);
+    working.share_budget(Some(Arc::clone(&pool)));
+    scroll(&mut working, 40);
+
+    assert_eq!(pool.live(), 1, "seven tabs are open; one is using the pool");
+    assert_eq!(working.effective_budget(), total);
+    assert_eq!(working.len(), KEPT, "the whole total, not a KEPT / 8 of it");
+
+    // And the moment one of them really needs the archive, the two split it.
+    scroll(&mut idle[0], 40);
+    assert_eq!(pool.live(), 2);
+    commit(&mut working, &frame(41, 20));
+    assert_eq!(working.len(), KEPT / 2);
+}
+
+/// **WHAT THE RULE COSTS, MEASURED AND PINNED.** Counting only archives that
+/// HOLD rows means a session can fill up while it is alone and keep those rows
+/// after others join: it comes within the smaller share on the next frame IT
+/// commits, because reaching into another session's archive from this thread is
+/// how deadlocks are written (see the module docs). So the pool is a bound that
+/// CONVERGES, not one that holds at every instant, and the worst case is every
+/// session filling up in turn and then going idle forever: session `k` keeps
+/// `total / k`, and the sum is `total * H_n`.
+///
+/// This is the honest price of the fix above. Under the rule it replaced — count
+/// every ENABLED archive — the sum held at `total` in this scenario, and the
+/// seven idle tabs in the test above stole seven eighths of the pool from the
+/// one tab using it. The exchange is a bounded, self-correcting overshoot for a
+/// feature that works, and the arithmetic is pinned here so it can never quietly
+/// get worse.
+#[test]
+fn a_session_that_fills_up_alone_and_goes_idle_is_the_pool_s_worst_case() {
+    const N: usize = 8;
+    let cost = row_cost();
+    let total = 64 * cost;
+    let pool = AltArchiveBudget::new(total, cost);
+
+    let mut tabs: Vec<AltArchive> = Vec::new();
+    for k in 1..=N {
+        let mut a = session(total);
+        a.share_budget(Some(Arc::clone(&pool)));
+        // Fills up while `k - 1` others are already live, then never commits
+        // again — the only way to hold more than an equal share.
+        scroll(&mut a, 200);
+        // Whole rows only: a share of 21.3 rows retains 21 of them.
+        assert_eq!(
+            a.bytes(),
+            whole_rows(total / k, cost),
+            "session {k} filled to the share it saw"
+        );
+        tabs.push(a);
+    }
+
+    let held: usize = tabs.iter().map(AltArchive::bytes).sum();
+    let harmonic: usize = (1..=N).map(|k| whole_rows(total / k, cost)).sum();
+    assert_eq!(held, harmonic, "the sum is total * H_n, exactly");
+    assert!(
+        held <= 3 * total,
+        "H_8 is 2.72: {held} against a {total} pool"
+    );
+
+    // AND IT CONVERGES. One more frame each — the tabs are being used again —
+    // and the pool is back inside its total.
+    for a in &mut tabs {
+        commit(a, &frame(201, 20));
+    }
+    assert_eq!(
+        tabs.iter().map(AltArchive::bytes).sum::<usize>(),
+        total,
+        "one frame per session is all it takes"
+    );
+}
+
+/// **TIER-1 BINDING FOR `AltArchivePool`** — the REAL archives, driven beside
+/// the model, step for step.
+///
+/// The model (`aterm-spec`'s `alt_archive_pool_model`, discharged by
+/// `derived_alt_archive_pool_proves_catches_and_multiplies` under the
+/// prove/catch/MULTIPLY protocol and machine-checked by Trust `ty`) proves the
+/// sentence. This test is what ties the sentence to the code: a theorem about a
+/// state machine nobody runs is worth nothing if the shipped `AltArchive` does
+/// something else.
+///
+/// The projection is exact and unit-free: the model counts ROWS with
+/// `Total = 4` and `Half = 2`, so the pool is built at `4 * row_cost()` with
+/// `min_share = row_cost()` (a floor under `Half`, so it never re-raises the
+/// share and the projection stays 1:1). Each `CommitA` is one real committed
+/// frame, and `a.len()` must equal the model's `a` after every single step —
+/// including the two steps that are the whole point:
+///
+///   * B joins and starts drawing while A is already full. A is over its new
+///     share and does NOT shed it, because an archive can only lower its OWN
+///     retention. The model calls A unsettled there and `PoolBounded` holds
+///     vacuously; the real archive holds exactly the same rows.
+///   * A commits once more and comes within the share. The bound CONVERGES,
+///     and that is the frame it converges on.
+#[test]
+fn alt_archive_pool_conformance_real_archives_project_onto_model() {
+    let m = aterm_spec::derive::alt_archive_pool_model();
+    let cost = row_cost();
+    let pool = AltArchiveBudget::new(4 * cost, cost);
+    let mut real_a = session(4 * cost);
+    let mut real_b = session(4 * cost);
+    real_a.share_budget(Some(Arc::clone(&pool)));
+    real_b.share_budget(Some(Arc::clone(&pool)));
+
+    let mut st = m.init_state();
+    let (mut fa, mut fb) = (0usize, 0usize);
+    let model = |st: &std::collections::BTreeMap<&'static str, i64>, v: &str| -> i64 {
+        *st.get(v).expect("the model declares this variable")
+    };
+
+    // BASELINE FIRST, and it is not a model step. The first frame committed to
+    // an archive establishes what the screen holds; nothing has scrolled off
+    // it yet, so it archives no row. The model's `CommitA` is a row LEAVING
+    // the viewport, which is every frame after this one.
+    commit(&mut real_a, &frame(fa, 20));
+    fa += 1;
+    commit(&mut real_b, &frame(fb, 20));
+    fb += 1;
+    assert_eq!(real_a.len(), 0, "the baseline frame archives nothing");
+    assert_eq!(real_b.len(), 0);
+
+    // Five frames into A while it is ALONE in the pool: it may fill the whole
+    // Total, and the fifth changes nothing because it is already there.
+    for step in 1..=5 {
+        assert!(
+            m.fire("CommitA", &mut st),
+            "step {step}: the model admits it"
+        );
+        commit(&mut real_a, &frame(fa, 20));
+        fa += 1;
+        assert_eq!(
+            real_a.len() as i64,
+            model(&st, "a"),
+            "step {step}: the real archive and the model must retain the same rows"
+        );
+        assert!(m.check_invariant("PoolBounded", &st));
+        assert!(m.check_invariant("IdleTakesNothing", &st));
+    }
+    assert_eq!(real_a.len(), 4, "alone in the pool: the whole total");
+    assert_eq!(pool.live(), 1, "and B, holding nothing, is not counted");
+
+    // B starts drawing. A is now over its halved share and keeps its rows
+    // until its own next frame — the model's `unsettled`, the code's "an
+    // archive can only lower its OWN retention".
+    assert!(m.fire("CommitB", &mut st));
+    // B's LAST frame — the rest of this test is A converging while B sits
+    // settled — so `fb` is not advanced past it, exactly as `fa` is not
+    // advanced past A's last frame below.
+    commit(&mut real_b, &frame(fb, 20));
+    assert_eq!(real_b.len() as i64, model(&st, "b"));
+    assert_eq!(real_a.len() as i64, model(&st, "a"), "A did not shed a row");
+    assert_eq!(pool.live(), 2, "both hold rows now");
+    assert!(
+        real_a.bytes() + real_b.bytes() > pool.total(),
+        "fixture: this is the transient the model states over SETTLED archives \
+         only — if it did not happen, PoolBounded would be proving something \
+         easier than the code does"
+    );
+    assert!(m.check_invariant("PoolBounded", &st));
+
+    // A commits again: the bound converges, on this frame.
+    assert!(m.fire("CommitA", &mut st));
+    commit(&mut real_a, &frame(fa, 20));
+    assert_eq!(
+        real_a.len() as i64,
+        model(&st, "a"),
+        "A came within its half"
+    );
+    assert_eq!(real_a.len(), 2);
+    assert!(
+        real_a.bytes() + real_b.bytes() <= pool.total(),
+        "converged, exactly as `PoolBounded` says of two settled archives"
+    );
+    assert!(m.check_invariant("PoolBounded", &st));
+    assert!(m.check_invariant("IdleTakesNothing", &st));
+}
+
+/// The ONE test in this binary that touches the process-wide pool, so the live
+/// count it asserts on is this session's own arithmetic.
+#[test]
+fn a_live_session_joins_the_process_budget_and_leaves_when_it_closes() {
+    let pool = AltArchiveBudget::process();
+    assert_eq!(pool.total(), ALT_ARCHIVE_TOTAL_BUDGET);
+    let base = pool.live();
+
+    let mut t = Terminal::new(25, COLS);
+    t.set_alt_archive_enabled(true); // regardless of ATERM_ALT_ARCHIVE
+    t.set_alt_archive_shared(true);
+    assert_eq!(
+        pool.live(),
+        base,
+        "a tab that has not entered the alt screen holds nothing, and a share \
+         it does not need is a share taken from the tab that does"
+    );
+
+    // It runs a full-screen app: NOW it is drawing on the pool.
+    t.process(b"\x1b[?1049h");
+    for s in 0..=40 {
+        t.process(&sync_frame(&frame(s, 20)));
+    }
+    assert!(t.alt_archive().bytes() > 0, "the archive filled");
+    assert_eq!(pool.live(), base + 1);
+    assert!(
+        t.alt_archive()
+            .shared_budget()
+            .is_some_and(|p| Arc::ptr_eq(p, &pool)),
+        "the session draws on THE process pool"
+    );
+    assert_eq!(
+        t.alt_archive().effective_budget(),
+        ALT_ARCHIVE_TOTAL_BUDGET / (base + 1),
+        "one total, divided by the sessions drawing on it"
+    );
+
+    t.set_alt_archive_shared(false);
+    assert_eq!(pool.live(), base);
+    assert_eq!(
+        t.alt_archive().effective_budget(),
+        ALT_ARCHIVE_DEFAULT_BUDGET
+    );
+
+    // Re-joining counts it again straight away — it is still holding the rows,
+    // so there is nothing to wait for.
+    t.set_alt_archive_shared(true);
+    assert_eq!(pool.live(), base + 1);
+    drop(t); // the tab closes: nothing else has to say so
+    assert_eq!(pool.live(), base);
+}
+
+// ------------------------------------------------------------------ differ
+
 #[test]
 fn resize_flushes_the_old_screen_and_records_a_gap() {
     let mut a = AltArchive::new();

@@ -228,21 +228,37 @@ pub fn retire_smoke_child(child: &mut Child) -> (bool, String) {
 /// finite product retry policy parks, and the gate falsely reports `frames=0`.
 /// `activate` returning is not enough either — this waits until NSWorkspace
 /// independently reports THIS pid as frontmost, then fails closed.
+///
+/// The program is run FROM A FILE, never through `swift -e`: `-e` is a
+/// swift-driver flag, and the Command Line Tools' Swift on macOS 13 (5.8.1,
+/// no swift-driver) prints `option '-e' is only supported in swift-driver`,
+/// runs nothing and exits 1 — measured on an Intel MacBook Pro, 2026-09-15,
+/// where every `--fast` run therefore recorded `skip: gui smoke (could not
+/// make the test window frontmost)` and the merge-contract sentence was
+/// unreachable. `swift <file>` interprets the same source on both toolchains.
 #[must_use]
 pub fn activate_macos_gui_pid(pid: u32) -> bool {
     const SWIFT: &str = "/usr/bin/swift";
     if !Path::new(SWIFT).exists() {
         return false;
     }
-    Command::new(SWIFT)
-        .arg("-e")
-        .arg(ACTIVATE_SWIFT)
+    let script = std::env::temp_dir().join(format!(
+        "aterm-verify-activate-{}-{pid}.swift",
+        std::process::id()
+    ));
+    if std::fs::write(&script, ACTIVATE_SWIFT).is_err() {
+        return false;
+    }
+    let ok = Command::new(SWIFT)
+        .arg(&script)
         .arg(pid.to_string())
         .stdout(Stdio::null())
         .stderr(Stdio::null())
         .status()
         .map(|s| s.success())
-        .unwrap_or(false)
+        .unwrap_or(false);
+    let _ = std::fs::remove_file(&script);
+    ok
 }
 
 /// The activation program, byte-identical to the one the script inlined.
@@ -513,6 +529,11 @@ mod tests {
         std::fs::remove_dir_all(&tmp).ok();
     }
 
+    /// The `#[cfg(unix)]` half of [`is_socket_or_symlink`]. Gated on the
+    /// SYMLINK, not on the socket: `std::os::unix::fs::symlink` has no portable
+    /// spelling, and the Windows analogue needs a privilege a test runner has
+    /// no claim to. The `not(unix)` twin below keeps the negative half pinned.
+    #[cfg(unix)]
     #[test]
     fn only_a_socket_or_a_symlink_counts_as_a_bound_socket() {
         let tmp = crate::mktemp_dir("atv-sock").expect("mktemp");
@@ -526,6 +547,25 @@ mod tests {
         let link = tmp.join("link.sock");
         std::os::unix::fs::symlink(&plain, &link).expect("symlink");
         assert!(is_socket_or_symlink(&link), "the script accepted a symlink");
+        std::fs::remove_dir_all(&tmp).ok();
+    }
+
+    /// The `not(unix)` half, negative side only — and that limit is the honest
+    /// one: minting a reparse point to prove the positive side needs a
+    /// privilege the runner may not hold, while the FALSE answers are what the
+    /// smoke actually depends on (a plain file must never read as a bound
+    /// socket, or the GUI smoke would wait forever on a socket nobody bound).
+    #[cfg(not(unix))]
+    #[test]
+    fn a_plain_file_is_never_a_bound_socket_where_there_is_no_s_ifsock() {
+        let tmp = crate::mktemp_dir("atv-sock").expect("mktemp");
+        let plain = tmp.join("aterm.sock");
+        assert!(!is_socket_or_symlink(&plain), "absent is not bound");
+        std::fs::write(&plain, b"not a socket").expect("write");
+        assert!(
+            !is_socket_or_symlink(&plain),
+            "a regular file is not a bound socket"
+        );
         std::fs::remove_dir_all(&tmp).ok();
     }
 

@@ -423,10 +423,28 @@ impl OutputEchoTracker {
             let Some(slot) = slots.next() else {
                 break;
             };
-            *slot = Some((
-                stamp_on_frame_clock(r.delivered_us, clock_us, now),
-                r.ticket,
-            ));
+            // A RECEIPT IS NEVER BEFORE ITS DISPATCH, so the reconstruction is
+            // clamped to the dispatch instant. The stamp above is rebuilt from a
+            // SECOND clock (`clock_us`, sampled at the top of this function)
+            // against a frame instant the caller sampled EARLIER, and
+            // `stamp_on_frame_clock` subtracts the age measured to the later
+            // reference from the earlier instant — so it carries a systematic
+            // EARLY bias equal to the gap between the two samples, which grows
+            // with load. `dispatched_at` is observed directly, on one clock, and
+            // carries no such error; where the two disagree it is the better
+            // measurement. Causally nothing can be received before it was sent,
+            // so this corrects measurement error and hides no real ordering.
+            //
+            // It matters beyond tidiness: the only production reader
+            // (`read_deliveries` -> the cursor-glow insert/hop claim) decides
+            // whether a hop refused BEFORE the key was dispatched may be lit as
+            // that key's completion, and an early-biased receipt is exactly what
+            // lets it. Observed as a flake in
+            // `a_queued_ticket_carries_its_dispatch_instant`, whose third
+            // assertion is this invariant.
+            let at =
+                stamp_on_frame_clock(r.delivered_us, clock_us, now).max(r.ticket.dispatched_at);
+            *slot = Some((at, r.ticket));
             out.latest = r.serial;
         }
         // The serials past the baseline the ring no longer holds: evicted
@@ -701,6 +719,72 @@ mod output_echo_tracker_tests {
             mods,
             base_layout: None,
             event_type,
+        }
+    }
+
+    /// A RECEIPT IS NEVER REPORTED BEFORE ITS DISPATCH. The receipt instant is
+    /// RECONSTRUCTED — `now` less the age of the stamp measured against a second
+    /// clock sampled at the top of `deliveries_after` — and because that second
+    /// sample happens AFTER the caller took `now`, the subtraction removes the
+    /// caller's own gap as well as the real age. The reconstruction therefore
+    /// runs systematically early, by an amount that grows with load.
+    ///
+    /// This drives it deterministically instead of waiting for load to do it: a
+    /// ticket dispatched AFTER the frame's `now` snapshot is exactly the skew
+    /// case, and without the clamp the reported instant lands before the
+    /// dispatch it is a receipt for. The live-clock version of this is
+    /// `a_queued_ticket_carries_its_dispatch_instant`, which flaked on precisely
+    /// this assertion.
+    #[cfg(unix)]
+    #[test]
+    fn a_receipt_is_never_reported_before_the_dispatch_it_receipts() {
+        let mut pipe = [0; 2];
+        assert_eq!(unsafe { libc::pipe(pipe.as_mut_ptr()) }, 0, "pipe");
+        let sink = SinkWriter::new(pipe[1]);
+        let term = Mutex::new(Terminal::new(24, 80));
+        let tracker = OutputEchoTracker::default();
+        let now = std::time::Instant::now();
+        // The dispatch is recorded AFTER the frame clock the reader will pass —
+        // the ordinary case when input is dispatched during a frame, and the
+        // extreme of the skew the reconstruction suffers from.
+        let dispatched_at = now + std::time::Duration::from_millis(50);
+        let ev = InputEvent::KeySequence(b"x".to_vec());
+        let write = tracker.begin_ticketed(
+            OutputEchoInput::Echoable,
+            Some(DeliveryTicket {
+                insert: Some(InsertWidth::Cells(1)),
+                window: None,
+                key: None,
+                dispatched_at,
+            }),
+        );
+        let receipt = input::seam_egress_receipt(
+            &term,
+            &crate::mode_mirror_of(&term),
+            &sink,
+            &ev,
+            input::EgressMode::Interactive,
+        );
+        write.finish(receipt, &sink);
+
+        let batch = tracker.deliveries_after(&sink, Some(0), now);
+        let (at, ticket) = batch
+            .items
+            .iter()
+            .flatten()
+            .copied()
+            .next()
+            .expect("the ticketed write published a receipt");
+        assert_eq!(ticket.dispatched_at, dispatched_at);
+        assert!(
+            at >= dispatched_at,
+            "the receipt was reported {:?} BEFORE the dispatch it receipts",
+            dispatched_at.saturating_duration_since(at)
+        );
+
+        unsafe {
+            libc::close(pipe[0]);
+            libc::close(pipe[1]);
         }
     }
 
@@ -2259,15 +2343,33 @@ fn wheel_viewport_lines(notch_lines: i32, page_rows: u16) -> i32 {
 /// on all three; the cfg twin below is the fallback for platforms without that
 /// extension. It returns an OWNED key so the borrow on `ev` ends before
 /// `on_key`'s later `&ev.logical_key` matches.
+///
+/// THE KEYPAD IS NOT LAYOUT-SHIFTED, IT IS NUMLOCK-SWITCHED, so it takes
+/// `logical_key` instead. The supplement exists to undo a LEVEL shift the
+/// layout composed on one key; on the keypad there is no one key —
+/// `key_without_modifiers()` is xkb's LEVEL-0 keysym, and the KEYPAD type puts
+/// the NumLock-OFF symbol at level 0 (`types/numpad`: `map[None] = Level1`;
+/// `symbols/keypad(x11)`: `<KP1> { [ KP_End, KP_1 ] }`). So on X11/Wayland this
+/// answered `End` for a NumLock-ON keypad 1 and `PageDown` for a keypad 3: a
+/// user who bound `ctrl+pagedown` to `next_tab` had Ctrl+keypad-3 switching
+/// tabs, and no binding on `1` could ever fire from the keypad. `logical_key`
+/// is the NumLock-aware key — `Character("1")` on, `Named(End)` off — which is
+/// what a binding names, and it is `Unidentified` for exactly one key (the
+/// NumLock-off centre, which no binding can name anyway). It agrees with the
+/// PTY encoder too: `keymap::build_key_input` resolves the same `logical_key`
+/// into `Numpad1`, whose `Key::main_block_twin` is that `1`.
 #[cfg(any(target_os = "macos", target_os = "linux", target_os = "windows"))]
 pub(crate) fn base_logical_key(ev: &KeyEvent) -> Key {
     use winit::platform::modifier_supplement::KeyEventExtModifierSupplement;
+    if ev.location == winit::keyboard::KeyLocation::Numpad {
+        return ev.logical_key.clone();
+    }
     ev.key_without_modifiers()
 }
 
 /// Fallback for platforms WITHOUT the modifier-supplement extension (not macOS,
 /// not Linux X11/Wayland, not Windows): the plain logical key is the closest
-/// equivalent.
+/// equivalent — which is what the keypad takes on every platform above.
 #[cfg(not(any(target_os = "macos", target_os = "linux", target_os = "windows")))]
 pub(crate) fn base_logical_key(ev: &KeyEvent) -> Key {
     ev.logical_key.clone()
@@ -2441,7 +2543,10 @@ fn scrollback_chord(mods: ModifiersState, ev: &KeyEvent) -> Option<ScrollIntent>
 /// allowed to CLAIM: the dedicated Menu / Application key, or Shift+F10 (the
 /// keyboard equivalent Windows has shipped since NT, and the one every Windows
 /// accessibility guide names). Shift is required for the F10 spelling because
-/// bare F10 is a real terminal function key an app is entitled to receive.
+/// bare F10 is a real terminal function key an app is entitled to receive —
+/// and Shift+F10 is one too (terminfo `kf22`, `ESC[21;2~`), which is why the
+/// default `policy` claims the Menu key alone and the F10 spelling is the
+/// opt-in `tab_menu_chord = "on"`.
 ///
 /// Written over the ENGINE key rather than the winit one so the physical route
 /// (`on_key`) and the convergence seam (`tab_menu_input_event`, where
@@ -2557,12 +2662,16 @@ fn font_zoom_repeat_action(
 
 /// A bare submitted-turn boundary. Modified Enter variants belong to the
 /// foreground application (for example Shift+Enter's multiline composer) and
-/// must not cancel the interactive-echo discount.
+/// must not cancel the interactive-echo discount. KP_Enter IS Enter here —
+/// through `InputEvent::keypad_folded`, the one keypad fold — so a turn
+/// submitted from the keypad is a turn boundary exactly as it was before the
+/// winit seam began handing the PTY encoder `NumpadEnter`.
 fn is_plain_enter(ev: &InputEvent) -> bool {
     use aterm_types::keyboard::{Key as TKey, Modifiers as TMods, NamedKey as TNamed};
 
+    let folded = ev.keypad_folded();
     matches!(
-        ev,
+        folded.as_ref().unwrap_or(ev),
         InputEvent::Key {
             key: TKey::Named(TNamed::Enter),
             mods,
@@ -2776,8 +2885,8 @@ struct PressClass<'ev> {
     ///
     /// Classified off the KEY IDENTITY, never off a modifier-state snapshot:
     /// on macOS winit queues the bare modifier's `KeyboardInput` BEFORE the
-    /// matching `ModifiersChanged` (`vendor/winit/.../macos/view.rs:1026` vs
-    /// `:1045`), so `ws.mods` is still stale when the ⌘ keydown is processed
+    /// matching `ModifiersChanged` (`vendor/winit/.../macos/view.rs:1476` vs
+    /// `:1495`), so `ws.mods` is still stale when the ⌘ keydown is processed
     /// and `mods.super_key()` reads `false`. Any gate spelled in terms of the
     /// modifier snapshot is therefore wrong on the exact press it must catch.
     ///
@@ -2972,6 +3081,26 @@ fn committed_char_cells(ch: char, ambiguous_width_double: bool) -> u16 {
 
 fn classify_press(ev: &InputEvent) -> PressClass<'_> {
     use aterm_types::keyboard::{Key as TKey, Modifiers as TMods, NamedKey as TNamed};
+    // A committed IME run is typed text. Read off the ORIGINAL event, before
+    // the keypad fold rebinds `ev` below: the fold only ever yields a `Key`,
+    // and this is the one borrow `PressClass` carries out of the function, so
+    // it must come from the caller's event, never from the folded local.
+    let ime: Option<&str> = match ev {
+        InputEvent::Text(t) if !t.is_empty() => Some(t),
+        _ => None,
+    };
+    // THE KEYPAD IS CLASSIFIED AS ITS MAIN-BLOCK TWIN. `keymap::build_key_input`
+    // hands the seam the keypad identity (`Numpad5`, `NumpadEnter`,
+    // `NumpadEnd`) so the PTY encoders can tell KP_1 from 1; every class
+    // below is about what the press MEANS to the hand — a typed glyph, a
+    // submit, a caret move, a kill — and there the keypad is a second copy of
+    // the main block. Unfolded, a keypad digit was "neither types nor edits"
+    // (no predictive echo, no typed licence), KP_Enter armed no `note_return`
+    // and no pet Submit, and a NumLock-off keypad arrow carried no nav hint —
+    // none of which the PTY bytes ever depended on. `PressClass` NEVER gates
+    // bytes, so the fold cannot reach the encoder.
+    let folded = ev.keypad_folded();
+    let ev = folded.as_ref().unwrap_or(ev);
     let predict_candidate: Option<(Option<char>, bool)> = match ev {
         InputEvent::Key { key, mods, .. }
             if !mods.contains(TMods::CTRL)
@@ -3100,7 +3229,6 @@ fn classify_press(ev: &InputEvent) -> PressClass<'_> {
             InputEvent::KeySequence(bytes) if bytes.last().is_some_and(|b| matches!(b, b'\r' | b'\n'))
         );
     let mut typed: Option<char> = None;
-    let mut ime: Option<&str> = None;
     let mut backspace = false;
     let mut brk = false;
     let mut glyph_shifted = false;
@@ -3146,8 +3274,9 @@ fn classify_press(ev: &InputEvent) -> PressClass<'_> {
                 _ => {}
             }
         }
-        // A committed IME run is typed text.
-        InputEvent::Text(t) if !t.is_empty() => ime = Some(t),
+        // A committed IME run is typed text: `ime`, read above the keypad
+        // fold from the caller's event.
+        InputEvent::Text(_) => {}
         // Raw controller byte payloads are not classified
         // typing — break the run rather than guess.
         InputEvent::KeySequence(_) => brk = true,
@@ -3786,6 +3915,13 @@ impl App {
         // tenure gate, the ledger's lazy load poll), before `sparkle` is held
         // below.
         let look = self.companion_verdict(wid, session, now).normalized();
+        // Resolve the render-path cache before reading it as a gate. `sparkle`
+        // starts `None` with `sparkle_dirty` set and is only filled by a drawn
+        // frame, so reading it raw answers "effects are off" for a config that
+        // has them on, on any instance that has not presented yet — and every
+        // caller of this reaches it from the control socket's input path, where
+        // a headless instance renders only when a capture drives its clock.
+        self.ensure_sparkle();
         // EFFECTS MASTER GATE: with sparkle words off (config or the panic
         // toggle) no cat machinery can draw — `kitty_enabled` requires
         // `sparkle_on` — so the summon is wholly inert, exactly like the
@@ -3864,18 +4000,35 @@ impl App {
     /// `aterm-ctl invoke FavouriteKitty` (legacy spelling
     /// `FavouriteSessionKitty` still accepted) all land here. `wid` is the
     /// window whose cat is promoted and whose companion presents the hello.
-    pub(crate) fn favourite_kitty(&mut self, wid: WindowId, now: std::time::Instant) {
+    /// SAYS WHY WHEN IT DECLINES, and every caller wants to know.
+    ///
+    /// The two gates below are real refusals, and a menu press has nowhere to
+    /// print them — but `invoke FavouriteKitty` over the control socket mints a
+    /// reply, and answering `OK` over a refusal tells a driver the cat was
+    /// pinned when nothing was. There used to be a `()`-returning wrapper for
+    /// the menu path, which genuinely has no channel and answers on glass; it
+    /// was deleted 2026-09-16 with no callers left — the menu path discards the
+    /// `Err` at its own call site, where a reader can see that it does.
+    pub(crate) fn favourite_kitty_checked(
+        &mut self,
+        wid: WindowId,
+        now: std::time::Instant,
+    ) -> Result<(), String> {
         use aterm_effects::kitty_registry::{KittyMagic, KittyShownAs, KittySighting, KittyType};
+        // Resolve the render-path cache first, or this gate answers "no cats"
+        // for a config that has them, on any instance that has not drawn a
+        // frame yet — and this path's refusal is SILENT.
+        self.ensure_sparkle();
         // EFFECTS MASTER GATE, then the FELINE SUB-GATE — the exact pair
         // `record_typed_kitty` documents: nothing can draw ⇒ nothing may log,
         // and `feline.enabled = false` means cats do not exist, so a synthetic
         // row for a category the config can never produce would poison the
         // ledger.
         let Some(rs) = self.sparkle.as_ref() else {
-            return;
+            return Err("effects are off, so there is no cursor cat to pin".to_string());
         };
         if !rs.cfg.feline {
-            return;
+            return Err("[sparkle_words.feline] is off, so cats do not exist".to_string());
         }
         // THE PROMOTABLE KITTY — the verdict BELOW the pin rung — deliberately
         // not the current verdict: on a ledger that already carries a pin the
@@ -3917,6 +4070,129 @@ impl App {
                 w.request_redraw();
             }
         }
+        Ok(())
+    }
+
+    /// **PUT ON A CAT FROM THE COLLECTION, BY NAME, RIGHT NOW.**
+    ///
+    /// The switch the pin path cannot make. `favourite_kitty_checked` promotes the cat
+    /// that would ride anyway (this window's tenured program cat, else the
+    /// launch kitty), so the only way to end up wearing a DIFFERENT cat was to
+    /// first make that cat appear — relaunch for a fresh launch kitty, or run a
+    /// program long enough to earn tenure and hope you liked the result. Naming
+    /// the cat is what "switch my cursor kitty" means, and this is that.
+    ///
+    /// `Ok(look)` is the cat now on the cursor. `Err` names why not, in words
+    /// the caller can print: the effects master gate or the feline sub-gate is
+    /// off (cats do not exist, so there is nothing to wear), or the collection
+    /// has no row by that name.
+    ///
+    /// The window-side half is `favourite_kitty_checked`'s exactly — `on_collect`, the
+    /// immediate hello, because a deliberate pick IS a reason to change the
+    /// identity — plus the explicit redraw a no-echo prompt needs to present
+    /// the hello's first frame.
+    pub(crate) fn wear_kitty(
+        &mut self,
+        wid: WindowId,
+        key: &str,
+        now: std::time::Instant,
+    ) -> Result<aterm_effects::kitty_registry::KittyLook, String> {
+        // Same reason as `favourite_kitty_checked`: the field is a render-path cache,
+        // and reading it raw makes the answer depend on whether a frame has
+        // been drawn rather than on the config.
+        self.ensure_sparkle();
+        let Some(rs) = self.sparkle.as_ref() else {
+            return Err("effects are off, so there is no cursor cat to dress".to_string());
+        };
+        if !rs.cfg.feline {
+            return Err("[sparkle_words.feline] is off, so cats do not exist".to_string());
+        }
+        let enabled = self.kitty_log_enabled();
+        let Some(look) = self.kitty_log.wear(key, now, enabled) else {
+            return Err(format!("no cat named {key:?} in the collection"));
+        };
+        if let Some(ws) = self.windows.get_mut(&wid) {
+            ws.cursor_cat.on_collect(now, look);
+            if let Some(w) = ws.os_window.as_ref() {
+                w.request_redraw();
+            }
+        }
+        Ok(look)
+    }
+
+    /// **WEAR THE NEXT CAT IN THE COLLECTION** — View ▸ Next Kitty, and a
+    /// picker you can use without a picker.
+    ///
+    /// Walks the roster in the collection book's own order, one press per cat,
+    /// wrapping at the end; with nothing worn yet it starts at the first row.
+    /// That order is `collectible_order` — FIRST SEEN, then the key — and
+    /// `first_seen` never moves once a row exists, so the walk is the order you
+    /// collected them in and the same press sequence always visits the same
+    /// cats. A cycle ordered by anything that moves (last seen, the pin stamp)
+    /// would re-order itself under the user as they pressed.
+    /// A collection of one is a no-op that still answers `Ok` — wearing the cat
+    /// you are already wearing is what "next" means there, and refusing it
+    /// would make a one-cat collection look broken.
+    ///
+    /// `Err` for the same three reasons [`Self::wear_kitty`] gives, plus an
+    /// EMPTY collection: there is nothing to walk to before the user has
+    /// collected a cat, and minting one here would hand them a cat they never
+    /// met.
+    pub(crate) fn wear_next_kitty(
+        &mut self,
+        wid: WindowId,
+        now: std::time::Instant,
+    ) -> Result<aterm_effects::kitty_registry::KittyLook, String> {
+        let (worn, rows) = self.kitty_log.wearable();
+        if rows.is_empty() {
+            return Err("no cats collected yet".to_string());
+        }
+        // The row AFTER the worn one, wrapping. An unknown or absent worn key
+        // starts at the first row rather than failing: the collection is the
+        // menu, and "somewhere in it" is always a legal place to begin.
+        let at = worn
+            .as_ref()
+            .and_then(|key| rows.iter().position(|row| &row.key == key));
+        let next = at.map_or(0, |i| (i + 1) % rows.len());
+        let key = rows[next].key.clone();
+        self.wear_kitty(wid, &key, now)
+    }
+
+    /// `kitty` — the wearable COLLECTION, one `key=` row per collected cat,
+    /// with `worn=1` on the one currently on the cursor.
+    ///
+    /// The menu of [`Self::wear_kitty`]'s argument, and deliberately the whole
+    /// roster rather than the sightings ledger: what you may WEAR is what you
+    /// have collected, and a row you cannot wear would be a row that lies.
+    pub(crate) fn kitty_collection_rows(&mut self) -> Result<Vec<String>, String> {
+        let (worn, rows) = self.kitty_log.wearable();
+        Ok(rows
+            .iter()
+            .map(|row| {
+                let worn = u8::from(Some(&row.key) == worn.as_ref());
+                format!(
+                    "cat key={} coat={} iris={} age={} seen={} worn={worn}",
+                    row.key, row.coat, row.iris, row.age, row.count
+                )
+            })
+            .collect())
+    }
+
+    /// `kitty wear <key>` — put on that cat, on the FRONTMOST window, and say
+    /// which cat is now on the cursor.
+    ///
+    /// Frontmost because a cat is a property of the window you are looking at:
+    /// the pin itself is process-wide (the ledger is one collection), and this
+    /// is only about which window presents the hello.
+    pub(crate) fn wear_kitty_on_front(&mut self, key: &str) -> Result<String, String> {
+        let Some(wid) = self.frontmost_window else {
+            return Err("no window to dress".to_string());
+        };
+        let look = self.wear_kitty(wid, key, std::time::Instant::now())?;
+        Ok(format!(
+            "worn key={key} coat={} iris={}",
+            look.coat, look.iris
+        ))
     }
 
     /// The cat "Favourite This Kitty" promotes and its checkmark reports on:
@@ -3952,6 +4228,13 @@ impl App {
         now: std::time::Instant,
         hit: crate::kitty_summon::TypedHit,
     ) {
+        // Resolve the render-path cache before reading it as a gate. `sparkle`
+        // starts `None` with `sparkle_dirty` set and is only filled by a drawn
+        // frame, so reading it raw answers "effects are off" for a config that
+        // has them on, on any instance that has not presented yet — and every
+        // caller of this reaches it from the control socket's input path, where
+        // a headless instance renders only when a capture drives its clock.
+        self.ensure_sparkle();
         // Same master + family gates the ambient sightings respect: with
         // sparkle words or the feline family off, no cat machinery may move.
         let Some(rs) = self.sparkle.as_ref() else {
@@ -3990,6 +4273,13 @@ impl App {
     /// which breed appears, nothing else — so OB-17's declaration channel has
     /// nothing to pin.
     fn summon_typed_dog(&mut self, wid: WindowId, session: u64, now: std::time::Instant) {
+        // Resolve the render-path cache before reading it as a gate. `sparkle`
+        // starts `None` with `sparkle_dirty` set and is only filled by a drawn
+        // frame, so reading it raw answers "effects are off" for a config that
+        // has them on, on any instance that has not presented yet — and every
+        // caller of this reaches it from the control socket's input path, where
+        // a headless instance renders only when a capture drives its clock.
+        self.ensure_sparkle();
         let Some(rs) = self.sparkle.as_ref() else {
             return;
         };
@@ -4163,6 +4453,14 @@ impl App {
         target_session: Option<u64>,
         phase: PressPhase,
     ) -> InputOutcome {
+        // RESOLVE THE RENDER-PATH CACHE BEFORE THE WORD DETECTOR READS IT. This
+        // function reads `sparkle` for the compiled lexicon and the scan
+        // options, and an unresolved cache reads as "sparkle words off ⇒ no
+        // vocabulary" — so on an instance that has not presented yet, typing
+        // detects nothing, from a config that has the vocabulary ON. One bool
+        // test on the ordinary path (`ensure_sparkle` returns immediately
+        // unless `sparkle_dirty`), which is exactly what the frame path pays.
+        self.ensure_sparkle();
         // Every real input advances the automatic-update quiet clock, but a
         // PENDING overlap BUFFERS THROUGH byte-producing input rather than
         // revoking on it. Keys/text/raw sequences encode against the (frozen)
@@ -4264,7 +4562,10 @@ impl App {
         // Every other input class still closes the license cohort, so a
         // swallowed key cannot license the move that follows a different
         // gesture.
-        if !release_only {
+        // Buttonless motion is decided at its own arm: a local selection or an
+        // actual mouse report supersedes typing, while byte-silent hover does
+        // neither. Held-button motion still owns a gesture at this boundary.
+        if !release_only && !matches!(&ev, InputEvent::MouseMove { buttons: 3, .. }) {
             let class = classify_press(&ev);
             let plain_typed_glyph = class.typed_forward == Some(true) && !class.enter_like;
             // Presses that ARM THEIR OWN LICENSE CLASS downstream join the
@@ -4356,10 +4657,6 @@ impl App {
                     Some(OverlayKind::ConnectionMap) => {
                         self.connection_map_input_event(wid, &ev);
                     }
-                    #[cfg(test)]
-                    Some(OverlayKind::About) => self.about_input_event(wid, &ev),
-                    #[cfg(test)]
-                    Some(OverlayKind::Update) => self.update_input_event(wid, &ev),
                     #[cfg(test)]
                     Some(OverlayKind::Settings) => self.settings_input_event(wid, &ev),
                     None => {}
@@ -4530,6 +4827,12 @@ impl App {
                 // is exactly the `!is_release` gate: a release still pays no clock
                 // read and runs no press side-effect.
                 debug_assert_eq!(input_now.is_some(), !is_release);
+                // The keypad folded onto its main-block twin, for the cosmetic
+                // readers below that ask what a press MEANS rather than what it
+                // encodes — the same `InputEvent::keypad_folded` `classify_press`
+                // applies to itself. Bound once here because a second one of
+                // those (the rain's reading gate) matches the event by hand.
+                let folded_gate = ev.keypad_folded();
                 // ONE pure classification of this press (see `PressClass`),
                 // shared by the pre-egress hint/predictor block and the
                 // post-egress cosmetic feeds.
@@ -4938,7 +5241,9 @@ impl App {
                         // nothing".
                         if !inert_modifier {
                             ws.last_key_at = Some(input_now);
-                            crate::metrics::note_input();
+                            // Per-window: only THIS window's content present may
+                            // close the key's input→present slice.
+                            crate::metrics::note_window_input(&mut ws.pending_input);
                         }
                         // Stamp the arrival for the `metrics` verb's input→present
                         // slice — the latency a human FEELS when typing. The same
@@ -5381,10 +5686,15 @@ impl App {
                             // "scroll to read" gesture — the wheel funnel already
                             // stamps; paging a transcript must quiet the rain,
                             // not read as streaming (the page-echo would
-                            // otherwise inflate the activity signal).
+                            // otherwise inflate the activity signal). The KEYPAD's
+                            // PgUp/PgDn is the same gesture by the same hand, so
+                            // it reads the same fold `classify_press` does —
+                            // unfolded, the NumLock-off keypad 3 the reader is
+                            // actually holding arrives as `NumpadPageDown` and
+                            // matched nothing here.
                             if is_alt
                                 && matches!(
-                                    &ev,
+                                    folded_gate.as_ref().unwrap_or(&ev),
                                     InputEvent::Key {
                                         key: aterm_types::keyboard::Key::Named(
                                             aterm_types::keyboard::NamedKey::PageUp
@@ -5899,8 +6209,6 @@ impl App {
                     unreachable!()
                 };
                 if let Some(ws) = self.windows.get_mut(&wid) {
-                    ws.cursor_glow.clear_typed(std::time::Instant::now());
-                    ws.cursor_trail.clear_typed();
                     // `last_mouse_cell` is the PANE-LOCAL cell already published by
                     // `on_cursor_moved` (window cell minus the focused pane origin); do
                     // NOT clobber it with this event's coordinates — a follow-up press
@@ -5912,16 +6220,32 @@ impl App {
                 // (regardless of mode — finishing a drag the app started tracking
                 // mid-gesture still settles locally).
                 if self.windows.get(&wid).is_some_and(|ws| ws.selecting) {
+                    self.clear_move_license(wid);
                     self.drag_selection(wid, row, col);
                     return InputOutcome::Ok;
                 }
-                egress_to_outcome(input::seam_egress(
+                let receipt = input::seam_egress_receipt(
                     &term,
                     &modes,
                     &sink,
                     &ev,
                     input::EgressMode::Interactive,
-                ))
+                );
+                // Full with no accepted bytes also means the tracking mode
+                // ignores this motion (DEC1000, or buttonless DEC1002). Such a
+                // hover cannot revoke a key waiting for its own echo. Actual
+                // reports, including accepted spill writes, remain boundaries;
+                // failed report attempts conservatively remain boundaries too.
+                if receipt.accepted_order().is_some()
+                    || !matches!(
+                        receipt.egress,
+                        input::Egress::TrackingOff { .. }
+                            | input::Egress::Reported(input::Delivery::Full)
+                    )
+                {
+                    self.clear_move_license(wid);
+                }
+                egress_to_outcome(receipt.egress)
             }
             // --- Wheel: N reports/line when tracking ON else scroll viewport (e) -
             ev @ InputEvent::Wheel { .. } => self.input_wheel(wid, &ev, &term, &modes, &sink),
@@ -8047,8 +8371,8 @@ impl App {
         // CAUTION (SELECTION CUSTODY): this snapshot is STALE for the press that
         // establishes a modifier. On macOS winit queues the bare modifier's
         // `KeyboardInput` before the matching `ModifiersChanged`
-        // (`vendor/winit/.../macos/view.rs:1026` vs `:1045`, dispatched in order
-        // by `app_state.rs:344`), so on the ⌘ keydown `mods.super_key()` is
+        // (`vendor/winit/.../macos/view.rs:1476` vs `:1495`, dispatched in order
+        // by `app_state.rs:539`), so on the ⌘ keydown `mods.super_key()` is
         // `false`. Never gate "is this a modifier press" on it — use
         // `keymap::press_is_inert` below, which reads the key identity.
         let Some(mods) = self.windows.get(&wid).map(|ws| ws.mods) else {
@@ -8122,20 +8446,23 @@ impl App {
             self.note_press_disposition(wid, &ev, None);
             return;
         }
-        // C5 — Shift+F10 / the Menu key POPS that same menu for the focused
-        // window's active tab. This is the Windows-wide "context menu for the
-        // focused thing" chord, and it is what makes the popup reachable
-        // without a mouse at all. It is deliberately NOT a rebindable `Action`:
-        // it is an OS convention like Alt+Space, not an aterm command, and
-        // seeding it into the keybinding table would let a config typo SHADOW
-        // the only keyboard route to the menu. `tab_menu_chord`'s `policy`
-        // argument is the escape hatch instead — a knob that can only surrender
-        // keys, never re-point them.
+        // C5 — the Menu key (and, under `tab_menu_chord = "on"`, Shift+F10)
+        // POPS that same menu for the focused window's active tab. This is the
+        // OS "context menu for the focused thing" chord, and it is what makes
+        // the popup reachable without a mouse at all. It is deliberately NOT a
+        // rebindable `Action`: it is an OS convention like Alt+Space, not an
+        // aterm command, and seeding it into the keybinding table would let a
+        // config typo SHADOW the only keyboard route to the menu.
+        // `tab_menu_chord`'s `policy` argument is the escape hatch instead — a
+        // knob that can only surrender keys, never re-point them. Its default
+        // claims only the Menu key: Shift+F10 is terminfo `kf22`, a sequence a
+        // legacy application receives and binds, so a terminal may not eat it
+        // unless its owner said so.
         //
         // WINDOWS AND LINUX (the in-grid-strip platforms; audit-2 item 10
-        // widened it from Windows-only). macOS chips carry a real `NSMenu` (⇧F10 is not a menu
-        // chord there); Linux has no ratified lane for a new modal surface —
-        // see the note on the `RightPressPlan::Chrome` arm in `app_mouse`.
+        // widened it from Windows-only — see the note on the
+        // `RightPressPlan::Chrome` arm in `app_mouse`). macOS chips carry a
+        // real `NSMenu` (⇧F10 is not a menu chord there).
         //
         // Two things can decline the claim, and both matter: `front_defers_…`
         // hands the key back to a kitty-protocol client that negotiated for it,
@@ -8189,9 +8516,16 @@ impl App {
         // dispatch is threaded with the routed `wid`.
         if !self.keybindings.is_empty() || !self.key_sequences.is_empty() {
             // Match on the modifier-independent BASE key (e.g. `]` under Shift, not `}`)
-            // so a binding the user wrote matches across layouts — the same base key
-            // `build_key_input` encodes with. The keybindings-first-then-key_sequences-
-            // else-fallthrough MAP precedence is the pure `keybinding::resolve_chord`;
+            // so a binding the user wrote matches across layouts. For the main block
+            // that is the same base key `build_key_input` encodes with; for the keypad
+            // the encoder keeps the KEYPAD identity (`Numpad5`, `NumpadEnter`) while
+            // `base_logical_key` hands this lookup the NumLock-aware `logical_key` —
+            // the main-block key the keypad stands in for (`5`, `End`, `Enter`), i.e.
+            // exactly `Key::main_block_twin` of what the encoder built. So a binding
+            // on `enter` fires for KP_Enter, one on `1` fires for a NumLock-ON
+            // keypad 1, and one on `end` fires for it with NumLock off. The
+            // keybindings-first-then-key_sequences-else-fallthrough MAP precedence is
+            // the pure `keybinding::resolve_chord`;
             // the match-arm ORDERING here — this whole block runs BEFORE the hardcoded
             // Cmd shortcut block below, so a key_sequences rule SHADOWS the built-in
             // chord — is policy on_key owns and the helper cannot capture.
@@ -8702,7 +9036,7 @@ impl App {
                 // needed — call the move directly (no Wake round-trip). A <2-window
                 // app is a no-op.
                 "m" | "M" => {
-                    self.migrate_active_tab_to_next_window();
+                    let _ = self.migrate_active_tab_to_next_window();
                     return true;
                 }
                 _ => {}
@@ -9068,6 +9402,16 @@ impl App {
         let Some(session) = self.inline_rename_edit(wid).map(|edit| edit.session) else {
             return false;
         };
+        // THE KEYPAD IS ITS MAIN-BLOCK TWIN IN THE RENAME FIELD, as it is on a
+        // native page and in the seam's press classifier. The field reads the
+        // key for what it MEANS, and `keymap::build_key_input` hands it the
+        // keypad identity (`Numpad5`, `NumpadEnd`) so the PTY encoders can tell
+        // KP_5 from 5 — which the arms below have no case for: a keypad digit
+        // typed NOTHING into the name and a NumLock-off keypad arrow moved no
+        // caret. `InputEvent::keypad_folded` is the one fold, shared with the
+        // native pages, and a controller's `key kp5` takes the same road.
+        let folded = ev.keypad_folded();
+        let ev = folded.as_ref().unwrap_or(ev);
         match ev {
             InputEvent::Key {
                 key, event_type, ..
@@ -9079,7 +9423,7 @@ impl App {
                 }
                 match key {
                     TKey::Named(TNamed::Escape) => self.cancel_session_rename(wid, session),
-                    TKey::Named(TNamed::Enter | TNamed::NumpadEnter | TNamed::Tab) => {
+                    TKey::Named(TNamed::Enter | TNamed::Tab) => {
                         let text = self
                             .inline_rename_edit(wid)
                             .map(|edit| edit.text.clone())
@@ -9455,10 +9799,6 @@ impl App {
             Some(OverlayKind::SessionPicker) => self.on_key_session_picker_mode(wid, ev),
             Some(OverlayKind::ConnectionMap) => self.on_key_connection_map_mode(wid, ev),
             #[cfg(test)]
-            Some(OverlayKind::About) => self.on_key_about_mode(wid, ev),
-            #[cfg(test)]
-            Some(OverlayKind::Update) => self.on_key_update_mode(wid, ev),
-            #[cfg(test)]
             Some(OverlayKind::Settings) => self.on_key_settings_mode(wid, _mods, ev),
             None => false,
         }
@@ -9570,10 +9910,11 @@ impl App {
     /// or `REPORT_ALL_KEYS_AS_ESC` — in every other mode the legacy encoder has
     /// no sequence for it and the press produces zero bytes, so binding it to
     /// chrome takes nothing from anybody. Shift+F10 is different: it encodes as
-    /// `ESC[21;2~` in plain legacy too, so only the strongest contract —
-    /// `REPORT_ALL_KEYS_AS_ESC`, literally "report every key" — buys it back
-    /// automatically; a user who wants it back unconditionally sets
-    /// `tab_menu_chord = "menu_key"`.
+    /// `ESC[21;2~` (terminfo `kf22`) in plain legacy too, which is why the
+    /// default policy never claims it at all. The deference matters for a hand
+    /// that opted in with `tab_menu_chord = "on"`: even then only the strongest
+    /// contract — `REPORT_ALL_KEYS_AS_ESC`, literally "report every key" — buys
+    /// it back automatically.
     ///
     /// Reads the two NARROW read-only projections on `Terminal`
     /// (`kitty_reports_functional_keys` / `kitty_report_all_keys`) under ONE
@@ -10369,8 +10710,14 @@ impl App {
             // last accepted query and resume after its anchor — the identical
             // reducer `MenuAction::FindNext` runs, so a chord and the menu item
             // cannot diverge.
-            Action::FindNext => self.search_find_again(true),
-            Action::FindPrev => self.search_find_again(false),
+            // Key paths have no refusal surface (no menu invoke is awaiting an
+            // answer), so the reason is discarded explicitly rather than ignored.
+            Action::FindNext => {
+                let _ = self.search_find_again(true);
+            }
+            Action::FindPrev => {
+                let _ = self.search_find_again(false);
+            }
             // Same verb + same find gate as the menu's SelectAll arm: the find
             // bar borrows the terminal selection for its match highlight, so
             // under an open find this is deliberately inert rather than wrong.
@@ -10384,7 +10731,9 @@ impl App {
             }
             // The same winit borderless-fullscreen toggle the View menu row
             // fires (keyboard audit #3: F11 seeded off macOS).
-            Action::ToggleFullscreen => self.toggle_fullscreen(),
+            Action::ToggleFullscreen => {
+                let _ = self.toggle_fullscreen();
+            }
         }
     }
 
@@ -10729,8 +11078,17 @@ impl App {
         let mut p = crate::palette::PaletteState::new();
         p.resolve(&self.palette_live());
         let action = p.action_by_name(name)?;
+        // Clear first: a refusal left by an EARLIER invocation must never be
+        // reported against this one.
+        self.pending_action_refusal = None;
         self.dispatch_menu_action(el, action);
-        Ok(format!("invoked {name}"))
+        // AN ARM THAT DECLINED SAYS SO HERE. A menu press has nowhere to print
+        // and answers on glass; `invoke` mints a reply, so reporting `OK` over
+        // a refusal tells a driver the action happened when it did not.
+        match self.pending_action_refusal.take() {
+            Some(why) => Err(format!("{name}: {why}")),
+            None => Ok(format!("invoked {name}")),
+        }
     }
 
     /// Convert one exact picker-approved path into the existing capability-bounded
@@ -10905,7 +11263,11 @@ impl App {
             // Window ▸ Move Tab to Next Window: move the active tab into the NEXT
             // EXISTING window (wrapping). The destination already exists, so there is
             // no OS-window attach and no `el` is needed.
-            MenuAction::MoveTabToNextWindow => self.migrate_active_tab_to_next_window(),
+            MenuAction::MoveTabToNextWindow => {
+                if let Err(why) = self.migrate_active_tab_to_next_window() {
+                    self.pending_action_refusal = Some(why.to_string());
+                }
+            }
             // Window ▸ Open Session in New Window: show the active session in a SECOND
             // window (same live grid in two windows). `dispatch_menu_action` already
             // has `el`, so the logical attach + OS-window create run directly.
@@ -11040,10 +11402,18 @@ impl App {
             MenuAction::Find => self.find_requested(),
             // Find Next/Previous step an open search or resume the last accepted
             // query after Enter closed the bar (standard Cmd-G behavior).
-            MenuAction::FindNext => self.search_find_again(true),
-            MenuAction::FindPrev => self.search_find_again(false),
+            MenuAction::FindNext | MenuAction::FindPrev => {
+                let forward = matches!(action, MenuAction::FindNext);
+                if let Err(why) = self.search_find_again(forward) {
+                    self.pending_action_refusal = Some(why.to_string());
+                }
+            }
             // View ------------------------------------------------------------
-            MenuAction::ToggleFullScreen => self.toggle_fullscreen(),
+            MenuAction::ToggleFullScreen => {
+                if let Err(why) = self.toggle_fullscreen() {
+                    self.pending_action_refusal = Some(why.to_string());
+                }
+            }
             // Font size — identical to on_key_font_zoom (⌘= / ⌘- / ⌘0).
             MenuAction::FontIncrease => self.set_font_px(self.font_px + FONT_ZOOM_STEP),
             MenuAction::FontDecrease => self.set_font_px(self.font_px - FONT_ZOOM_STEP),
@@ -11062,11 +11432,26 @@ impl App {
             // Promote the frontmost window's promotable kitty (its tenured
             // program cat, else the launch kitty) into the durable registry
             // and pin it; that window presents the hello.
-            MenuAction::FavouriteKitty => {
-                if let Some(wid) = self.frontmost_window {
-                    self.favourite_kitty(wid, std::time::Instant::now());
+            MenuAction::FavouriteKitty => match self.frontmost_window {
+                Some(wid) => {
+                    if let Err(why) = self.favourite_kitty_checked(wid, std::time::Instant::now()) {
+                        self.pending_action_refusal = Some(why);
+                    }
                 }
-            }
+                None => self.pending_action_refusal = Some("no window to dress".to_string()),
+            },
+            // Walk to the next collected cat — the switch the pin above cannot
+            // make. A refusal (effects off, feline off, nothing collected yet)
+            // is silent HERE because a menu press has nowhere to print; the
+            // `kitty wear` control verb is the arm that answers in words.
+            MenuAction::NextKitty => match self.frontmost_window {
+                Some(wid) => {
+                    if let Err(why) = self.wear_next_kitty(wid, std::time::Instant::now()) {
+                        self.pending_action_refusal = Some(why);
+                    }
+                }
+                None => self.pending_action_refusal = Some("no window to dress".to_string()),
+            },
             MenuAction::ToggleSeriousMode => {
                 self.user_toggle_serious_mode();
             }
@@ -11084,17 +11469,21 @@ impl App {
             // Window ----------------------------------------------------------
             MenuAction::NextTab => self.cycle_tab(true),
             MenuAction::PrevTab => self.cycle_tab(false),
-            MenuAction::Minimize => {
-                if let Some(w) = self.front().and_then(|ws| ws.os_window.as_ref()) {
-                    w.set_minimized(true);
+            MenuAction::Minimize => match self.front().and_then(|ws| ws.os_window.as_ref()) {
+                Some(w) => w.set_minimized(true),
+                None => {
+                    self.pending_action_refusal =
+                        Some("no window is on screen to minimise".to_string());
                 }
-            }
-            MenuAction::Zoom => {
+            },
+            MenuAction::Zoom => match self.front().and_then(|ws| ws.os_window.as_ref()) {
                 // Zoom toggles maximised, like the green-button / Window ▸ Zoom.
-                if let Some(w) = self.front().and_then(|ws| ws.os_window.as_ref()) {
-                    w.set_maximized(!w.is_maximized());
+                Some(w) => w.set_maximized(!w.is_maximized()),
+                None => {
+                    self.pending_action_refusal =
+                        Some("no window is on screen to zoom".to_string());
                 }
-            }
+            },
         }
     }
 
@@ -12494,6 +12883,102 @@ mod rain_turn_boundary_tests {
                 "modified Enter {mods:?} stays an application key"
             );
         }
+    }
+}
+
+/// The seam classifies a KEYPAD press as its main-block twin. Since
+/// `keymap::build_key_input` began keeping the keypad identity for the PTY
+/// encoders, the classifier receives `Numpad5` / `NumpadEnter` / `NumpadEnd`
+/// where it used to receive `Character('5')` / `Enter` / `End` — and every
+/// class here (turn boundary, typed glyph, nav hint, kill) must read the same
+/// as it did for that press before the seam. `PressClass` never gates bytes.
+#[cfg(test)]
+mod keypad_press_class_tests {
+    use super::{OutputEchoInput, PetInputKind, classify_press, is_plain_enter};
+    use crate::input::InputEvent;
+    use aterm_types::keyboard::{Key, KeyEventType, Modifiers, NamedKey};
+
+    fn press(key: NamedKey, mods: Modifiers) -> InputEvent {
+        InputEvent::Key {
+            key: Key::Named(key),
+            mods,
+            base_layout: None,
+            event_type: KeyEventType::Press,
+        }
+    }
+
+    /// KP_Enter is a submitted turn: turn boundary, `enter_like`,
+    /// `keyed_enter`, the pet's Submit, forward momentum — exactly what the
+    /// same press classified as when it arrived as `Enter`. Modified, it
+    /// stays an application key like the main Shift+Enter.
+    #[test]
+    fn keypad_enter_is_a_plain_enter_and_a_turn_boundary() {
+        let kp_enter = press(NamedKey::NumpadEnter, Modifiers::empty());
+        assert!(is_plain_enter(&kp_enter));
+        assert_eq!(
+            OutputEchoInput::of(&kp_enter),
+            OutputEchoInput::TurnBoundary
+        );
+        let class = classify_press(&kp_enter);
+        assert!(class.enter_like && class.keyed_enter);
+        assert!(matches!(class.console_input, Some(PetInputKind::Submit)));
+        assert_eq!(class.typed_forward, Some(true));
+        let shifted = press(NamedKey::NumpadEnter, Modifiers::SHIFT);
+        assert!(!is_plain_enter(&shifted));
+        assert!(classify_press(&shifted).enter_like);
+    }
+
+    /// A keypad digit is a typed glyph — predictive-echo candidate, forward
+    /// momentum, the cosmetic `typed` witness, the pet's Text — where the
+    /// unfolded `Numpad5` classified as "neither types nor edits".
+    #[test]
+    fn keypad_digit_is_a_typed_glyph() {
+        let five_ev = press(NamedKey::Numpad5, Modifiers::empty());
+        let class = classify_press(&five_ev);
+        assert_eq!(class.typed, Some('5'));
+        assert_eq!(class.predict_candidate, Some((Some('5'), false)));
+        assert_eq!(class.typed_forward, Some(true));
+        assert!(matches!(class.console_input, Some(PetInputKind::Text)));
+        assert!(!class.brk);
+        let decimal_ev = press(NamedKey::NumpadDecimal, Modifiers::empty());
+        let decimal = classify_press(&decimal_ev);
+        assert_eq!(decimal.typed, Some('.'));
+    }
+
+    /// NumLock off, the keypad is a second navigation block: its arrows and
+    /// Home/End carry the nav hint and KP_Delete is a (stationary, word-tier)
+    /// kill key, as their main-block twins are.
+    #[test]
+    fn keypad_navigation_and_delete_classify_as_their_twins() {
+        let left_ev = press(NamedKey::NumpadArrowLeft, Modifiers::empty());
+        let left = classify_press(&left_ev);
+        assert!(left.navigation_key && left.brk);
+        assert!(matches!(left.console_input, Some(PetInputKind::Navigate)));
+        let end_ev = press(NamedKey::NumpadEnd, Modifiers::empty());
+        assert!(classify_press(&end_ev).navigation_key);
+        let del_ev = press(NamedKey::NumpadDelete, Modifiers::empty());
+        let del = classify_press(&del_ev);
+        assert!(del.kill_key && !del.kill_moves && del.kill_word);
+        assert!(matches!(del.console_input, Some(PetInputKind::Delete)));
+    }
+
+    /// The negative controls: KP_Begin has no main-block twin and classifies
+    /// as nothing, and the main-block keys are untouched by the fold.
+    #[test]
+    fn keypad_begin_and_the_main_block_are_untouched() {
+        let begin_ev = press(NamedKey::NumpadBegin, Modifiers::empty());
+        let begin = classify_press(&begin_ev);
+        assert_eq!(begin.typed, None);
+        assert!(!begin.navigation_key && !begin.enter_like && !begin.kill_key);
+        assert!(begin.console_input.is_none());
+        let five = InputEvent::Key {
+            key: Key::Character('5'),
+            mods: Modifiers::empty(),
+            base_layout: None,
+            event_type: KeyEventType::Press,
+        };
+        assert_eq!(classify_press(&five).typed, Some('5'));
+        assert!(is_plain_enter(&press(NamedKey::Enter, Modifiers::empty())));
     }
 }
 
@@ -15154,6 +15639,45 @@ mod press_path_lock_elision_tests {
         bytes[..read as usize].to_vec()
     }
 
+    /// A keypad press and its release carry ONE identity. `build_key_input`
+    /// resolves a physical KP_5 to `Numpad5` at press time, the press owner
+    /// stores that key, and the release replays it — so under kitty
+    /// `DISAMBIGUATE | REPORT_EVENT_TYPES` the pair is `CSI 57404 u` then
+    /// `CSI 57404;1:3 u`, never a keypad press paired with a main-row release.
+    /// Before the keypad seam the same press typed `5` and released as
+    /// `CSI 53;1:3u`, indistinguishable from the `5` above `R`.
+    #[cfg(unix)]
+    #[test]
+    fn a_keypad_press_and_its_release_report_the_same_keypad_key() {
+        let (mut app, pipe) = app_observing_pty();
+        let wid = WindowId(0);
+        let term = app.front_terminal(wid).expect("terminal").term.clone();
+        term_lock(&term).process(b"\x1b[>3u");
+        let kp5 = |state: ElementState| {
+            let five = winit::keyboard::SmolStr::new("5");
+            winit::event::KeyEvent::synthetic_for_test(
+                PhysicalKey::Code(KeyCode::Numpad5),
+                winit::keyboard::Key::Character(five.clone()),
+                (state == ElementState::Pressed).then_some(five),
+                winit::keyboard::KeyLocation::Numpad,
+                state,
+                false,
+            )
+        };
+        app.on_key(wid, kp5(ElementState::Pressed));
+        assert_eq!(
+            drain(pipe),
+            b"\x1b[57404u".to_vec(),
+            "press: the keypad 5, not the main-row 5"
+        );
+        app.on_key(wid, kp5(ElementState::Released));
+        assert_eq!(
+            drain(pipe),
+            b"\x1b[57404;1:3u".to_vec(),
+            "release: the stored keypad key is replayed"
+        );
+    }
+
     /// GATE (lane-license, deliverable 1 — Enter): a plain Enter at the real
     /// input boundary arms `note_return` (its coalesced response move is
     /// licensed, consume-once) WITHOUT wiping the banked typed stamps of keys
@@ -16074,8 +16598,8 @@ mod press_path_lock_elision_tests {
     /// to every gate spelled in terms of `ws.mods`.
     ///
     /// winit queues the bare modifier's `KeyboardInput` BEFORE the matching
-    /// `ModifiersChanged` (`vendor/winit/.../macos/view.rs:1026` vs `:1045`,
-    /// dispatched in order by `app_state.rs:344`), so on the ⌘ keydown
+    /// `ModifiersChanged` (`vendor/winit/.../macos/view.rs:1476` vs `:1495`,
+    /// dispatched in order by `app_state.rs:539`), so on the ⌘ keydown
     /// `ws.mods.super_key()` is still `false`: the bare-Cmd swallow does not
     /// fire, the press reaches the seam, and the seam used to snap the viewport
     /// and clear the selection. By the time `c` arrived there was nothing left
@@ -16964,6 +17488,93 @@ mod pet_console_input_tests {
     fn observed(app: &App) -> (u64, Option<PetInputKind>) {
         let pet = &app.windows[&WindowId(0)].cursor_pet;
         (pet.console_input_seq(), pet.console_input_kind())
+    }
+
+    /// One row of the typed-wake table: what the hand did, the event it
+    /// lowers to, and whether that arms `cursor_fx_focus`'s stamp.
+    type WakeCase = (&'static str, fn() -> InputEvent, bool);
+
+    /// **THE TYPED WAKE IS ARMED BY WHAT THE HAND ACTUALLY DID** — the three
+    /// claims `App::cursor_fx_focus`'s doc makes about its own stamp, proven
+    /// through `App::input_to_session` itself rather than by reading it.
+    ///
+    /// The wake exists because W11b hard-zeroes cursor effects on a window
+    /// that does not hold OS key focus, and a window being TYPED INTO is
+    /// being driven: control-socket typing never grants key focus at all, and
+    /// a handoff-adopted window may never observe a `Focused(true)`. So:
+    ///
+    /// 1. a `Source::Controller` key arms it (the whole point — the v0.48–v0.50
+    ///    blackout was exactly this window);
+    /// 2. a PASTE arms it (fixed 2026-08-25; `ctl paste`, the TEXT phase of
+    ///    `ctl turn`, Cmd-V and the X11 async paste worker all lower to
+    ///    `InputEvent::Paste`, and every one of them reaches this one arm);
+    /// 3. a BARE MODIFIER does not — stamping it meant every Cmd-Tab AWAY
+    ///    from a window re-armed 60 fps effects on the window being left, the
+    ///    modifier press that opens the switcher being the last thing that
+    ///    window ever sees.
+    ///
+    /// Item 16 of `docs/EFFECTS-AND-WAKE-FOLLOWUPS-2026-08-24.md` recorded
+    /// that none of the three had any test at all and all three rested on
+    /// reading. They rest on this now.
+    ///
+    /// THE TWINS: drop the stamp from the `Paste` arm and (2) goes red; move
+    /// it above the `inert_modifier` guard and (3) goes red.
+    #[test]
+    fn the_typed_wake_is_armed_by_a_controller_key_and_a_paste_but_not_a_bare_modifier() {
+        use std::time::Duration;
+
+        let cases: [WakeCase; 3] = [
+            ("a controller key", || press(Key::Character('n')), true),
+            (
+                "a paste",
+                || InputEvent::Paste("echo hi".into(), PasteFraming::AtDrain),
+                true,
+            ),
+            (
+                "a bare modifier",
+                || InputEvent::Key {
+                    key: Key::Named(NamedKey::SuperLeft),
+                    mods: Modifiers::SUPER,
+                    base_layout: None,
+                    event_type: KeyEventType::Press,
+                },
+                false,
+            ),
+        ];
+        for (what, build, arms) in cases {
+            let (mut app, _fds) = observing_app();
+            let wid = WindowId(0);
+            // UNFOCUSED: the only state in which the wake decides anything.
+            // With OS focus held `cursor_fx_focus` is true whatever the stamp
+            // says, so a focused fixture cannot tell the three cases apart.
+            app.windows.get_mut(&wid).expect("window").focused = false;
+            let before = std::time::Instant::now();
+            assert!(
+                !app.cursor_fx_focus(wid, false, before),
+                "{what}: precondition — an unfocused, untyped window is demoted"
+            );
+
+            assert_eq!(app.input(wid, build(), CTL), InputOutcome::Ok, "{what}");
+
+            let after = std::time::Instant::now();
+            assert_eq!(
+                app.cursor_fx_focus(wid, false, after),
+                arms,
+                "{what}: the typed wake"
+            );
+            // …and when it IS armed it EXPIRES, so an idle unfocused window
+            // still demotes — the wake is a hold on typing, not a pin.
+            if arms {
+                assert!(
+                    !app.cursor_fx_focus(
+                        wid,
+                        false,
+                        after + crate::app_render::CURSOR_FX_TYPED_WAKE + Duration::from_secs(1)
+                    ),
+                    "{what}: the wake never expired"
+                );
+            }
+        }
     }
 
     #[test]
@@ -18610,8 +19221,12 @@ mod typed_kitty_summon_tests {
     /// process-global registry keyed by the PTY master, and every plain
     /// `headless_for_test` shares master `-1`, so pinning that key would steer
     /// concurrently running tests' keystrokes onto the deferred writer.
+    ///
+    /// `pub(super)` because the tab-menu modules borrow it (with a strip on
+    /// top) to witness what the PTY received — one owner of the fd recipe and
+    /// of the reason above, not a third copy of the `unsafe`.
     #[cfg(unix)]
-    fn app_with_private_pty() -> (
+    pub(super) fn app_with_private_pty() -> (
         App,
         std::sync::Arc<aterm_session::sink::SinkWriter>,
         [i32; 2],
@@ -18634,7 +19249,7 @@ mod typed_kitty_summon_tests {
     }
 
     #[cfg(unix)]
-    fn drain(pipe: [i32; 2]) -> Vec<u8> {
+    pub(super) fn drain(pipe: [i32; 2]) -> Vec<u8> {
         let mut bytes = [0u8; 64];
         let read = unsafe { libc::read(pipe[0], bytes.as_mut_ptr().cast(), bytes.len()) };
         if read <= 0 {
@@ -20150,13 +20765,40 @@ mod typed_kitty_summon_tests {
         use aterm_session::sink::SinkWriter;
         use std::sync::Arc;
 
+        // THE STIMULUS NEEDS ONE FD WITH TWO PROPERTIES: `tcgetattr` must answer
+        // no-echo canonical (so the press counts as swallowed) AND the inline
+        // write must HARD-FAIL (so the outcome is `WriteFailed`). `SinkWriter`
+        // holds a single fd for both, so both facts must come out of it.
+        //
+        // This used to close the slave and hand over the master, which is a
+        // BSD/macOS coincidence: there a slave-less master still answers
+        // `tcgetattr` while `write(2)` returns EIO. Linux hangs up only the
+        // master's READ side — `pty_write` keeps pushing into the link's flip
+        // buffer and returns success forever (measured on 7.0.0-30-generic:
+        // three writes to a slave-less master, n=1 every time) — so the test
+        // died at this setup and the rule below had never once run here.
+        //
+        // A SECOND fd opened READ-ONLY on the same slave has both properties on
+        // every POSIX system: the tty is alive so `tcgetattr` answers, and a
+        // write to an O_RDONLY descriptor is EBADF, which `write_some_nonparking`
+        // classifies `Fatal` exactly as it classifies macOS's EIO.
         let (master, slave) = pty_pair_with_lflag(|l| *l &= !libc::ECHO);
-        // SAFETY: the slave is ours and open; closing it is the point.
-        unsafe {
-            libc::close(slave);
-        }
-        let sink = Arc::new(SinkWriter::new(master));
-        let echo = sink.tty_echo().expect("a slave-less master still answers");
+        // SAFETY: `ptsname` reads the master's pty number into its static
+        // buffer; the pointer is valid until the next `ptsname` call on this
+        // thread, and it is copied before anything else can run.
+        let path = unsafe {
+            let name = libc::ptsname(master);
+            assert!(!name.is_null(), "ptsname(master)");
+            std::ffi::CStr::from_ptr(name).to_owned()
+        };
+        // SAFETY: `path` is a NUL-terminated device path that names our own
+        // slave; opening it read-only creates a second descriptor on it.
+        let read_only = unsafe { libc::open(path.as_ptr(), libc::O_RDONLY | libc::O_NOCTTY) };
+        assert!(read_only >= 0, "open({path:?}, O_RDONLY)");
+        let sink = Arc::new(SinkWriter::new(read_only));
+        let echo = sink
+            .tty_echo()
+            .expect("a read-only tty fd still answers tcgetattr");
         assert!(echo.swallows_input(), "the press is withheld regardless");
         let mut app = App::headless_for_test_with_sink(sink.clone());
         app.recompute_sparkle();
@@ -20175,6 +20817,12 @@ mod typed_kitty_summon_tests {
             "a press that never reached the tty was not swallowed by it"
         );
         assert!(!ws.cursor_glow.move_licensed(Instant::now()));
+        // SAFETY: the three descriptors are ours and still open.
+        unsafe {
+            libc::close(read_only);
+            libc::close(slave);
+            libc::close(master);
+        }
         drop(app);
         drop(sink);
         // SAFETY: the master is ours and open; the borrowed-fd sink did not
@@ -20567,17 +21215,57 @@ mod typed_kitty_summon_tests {
         );
     }
 
-    /// EFFECTS MASTER GATE: with sparkle words unresolved (off) nothing could
-    /// draw a cat, so the summon is wholly inert — no hello, no log entry —
-    /// exactly like the ambient sightings it mirrors.
+    /// EFFECTS MASTER GATE: with sparkle words genuinely OFF nothing can draw a
+    /// cat, so the summon is wholly inert — no hello, no log entry — exactly
+    /// like the ambient sightings it mirrors.
+    ///
+    /// THIS TEST USED TO SAY "unresolved (off)" AND MEAN IT, which is the bug
+    /// it now guards against instead. `sparkle` is a render-path cache that
+    /// starts `None`; reading it raw conflates *no frame has been drawn yet*
+    /// with *the user turned effects off*, and on the control socket's input
+    /// path the first is the ordinary state. The master-off arm therefore
+    /// resolves the config the way its feline-family sibling below already
+    /// does, and the unresolved case became its own arm with the OPPOSITE
+    /// expectation.
     #[test]
     fn summon_is_inert_with_sparkle_words_off() {
         let mut app = App::headless_for_test();
-        assert!(app.sparkle.is_none(), "headless default: not yet resolved");
+        app.config.sparkle_words = Some(crate::app_config::SparkleWordsConfig {
+            enabled: Some(false),
+            ..Default::default()
+        });
+        app.prepared_sparkle = app.config.prepare_sparkle_runtime();
+        app.sparkle_dirty = true;
+        app.recompute_sparkle();
+        assert!(
+            app.sparkle.is_none(),
+            "the master is OFF in the config, not merely unread"
+        );
         let wid = WindowId(0);
         type_word(&mut app, wid, "kitty");
         assert!(!app.windows[&wid].cursor_cat.is_active());
         assert_eq!(app.kitty_log.log().sightings, 0);
+    }
+
+    /// AND UNRESOLVED IS NOT OFF — the arm the test above used to assert the
+    /// wrong way round. A config with the vocabulary ON must summon on the
+    /// FIRST keystroke, before any frame has filled the cache, because that is
+    /// the state every instance is in at launch and the only state a headless
+    /// one driven over the control socket is ever in until a capture runs.
+    #[test]
+    fn a_typed_summon_before_the_first_frame_is_not_taken_for_effects_off() {
+        let mut app = App::headless_for_test();
+        assert!(
+            app.sparkle.is_none() && app.sparkle_dirty,
+            "fixture: the cache is unread, exactly as it is at launch"
+        );
+        let wid = WindowId(0);
+        type_word(&mut app, wid, "kitty");
+        assert!(
+            app.kitty_log.log().sightings > 0,
+            "a config with cats ON must summon on the first keystroke, drawn \
+             frame or not"
+        );
     }
 
     /// FELINE SUB-GATE: `[sparkle_words.feline] enabled = false` disables every
@@ -20787,7 +21475,8 @@ mod favourite_kitty_tests {
             "…and the verdict says so"
         );
 
-        app.favourite_kitty(wid, now);
+        app.favourite_kitty_checked(wid, now)
+            .expect("the pin these assertions read");
 
         assert_eq!(
             app.kitty_log.favourite_look(),
@@ -20825,6 +21514,330 @@ mod favourite_kitty_tests {
         assert_eq!(frame.look, look, "and the hello wears the promoted cat");
     }
 
+    /// **A MENU ARM THAT DECLINES MUST SAY SO, BECAUSE `invoke` ANSWERS FOR
+    /// IT.** `dispatch_menu_action` returns `()` — a menu press has no reply
+    /// channel and answers on glass — but `invoke <Action>` over the control
+    /// socket reaches the same arms and minted `OK invoked <Action>`
+    /// unconditionally. A driver was told the cat was pinned when nothing was.
+    ///
+    /// `NextKitty` was the worst of it, and it was mine: the arm spelled the
+    /// refusal away as `let _ = self.wear_next_kitty(...)` with a comment
+    /// saying a menu press has nowhere to print it — true of the menu, false of
+    /// `invoke`, which is the seam that mints the reply.
+    ///
+    /// This pins the half a headless test can reach: the refusal now EXISTS as
+    /// a value at the point the arm reads it. The arms hand it to
+    /// `pending_action_refusal`, which `invoke_menu_action_by_name` takes and
+    /// returns as its `Err`.
+    #[test]
+    fn a_declining_cat_action_produces_a_refusal_rather_than_silence() {
+        let wid = WindowId(0);
+        let now = std::time::Instant::now();
+
+        // FELINE OFF: cats do not exist, so both actions must refuse IN WORDS.
+        let mut app = App::headless_for_test();
+        app.config.sparkle_words = Some(crate::app_config::SparkleWordsConfig {
+            feline: Some(crate::app_config::SparkleFelineConfig {
+                enabled: Some(false),
+                ..Default::default()
+            }),
+            ..Default::default()
+        });
+        app.prepared_sparkle = app.config.prepare_sparkle_runtime();
+        app.sparkle_dirty = true;
+        app.recompute_sparkle();
+
+        let pinned = app
+            .favourite_kitty_checked(wid, now)
+            .expect_err("feline off must refuse, not silently do nothing");
+        assert!(pinned.contains("feline"), "{pinned:?}");
+        // The walk refuses too. Its message names the EMPTY COLLECTION rather
+        // than the family, because it asks what there is to walk to before it
+        // asks whether cats exist — both are true here, and either is a refusal
+        // in words rather than a silent OK, which is what this test is about.
+        let worn = app
+            .wear_next_kitty(wid, now)
+            .expect_err("and so must the walk");
+        assert!(!worn.is_empty(), "the refusal carries a reason");
+
+        // AND AN EMPTY COLLECTION, which is the other real refusal: cats exist,
+        // there is simply nothing collected to walk to yet.
+        let mut app = App::headless_for_test();
+        app.recompute_sparkle();
+        let empty = app
+            .wear_next_kitty(wid, now)
+            .expect_err("nothing collected yet");
+        assert!(empty.contains("collected"), "{empty:?}");
+
+        // The channel starts clean, so a refusal can never be reported against
+        // a LATER invocation than the one that raised it.
+        assert!(app.pending_action_refusal.is_none());
+    }
+
+    /// **THE TYPED-INPUT CAT PATHS ANSWER FROM THE CONFIG, NOT FROM WHETHER A
+    /// FRAME HAS BEEN DRAWN.** The sibling of the `FavouriteKitty` silent no-op,
+    /// on the paths a keystroke takes.
+    ///
+    /// `App::sparkle` is a RENDER-PATH CACHE: `None` with `sparkle_dirty` set
+    /// until a frame fills it. Four typed-input gates read it raw as "are
+    /// effects on?", and every one is reachable from the control socket's
+    /// `key`/`send`/`feed` before any frame — a headless instance renders only
+    /// when a capture drives its clock. So an agent that spawns an instance and
+    /// types into it got no kitty record, no word reaction and no dog, from a
+    /// config that has all three ON.
+    ///
+    /// THIRTY-FIVE existing tests call `recompute_sparkle()` by hand before
+    /// driving these paths, which is exactly why none of them could see this.
+    /// This one deliberately does NOT, because that is the state a real
+    /// instance is in at its first keystroke.
+    #[test]
+    fn a_typed_kitty_is_recorded_before_the_first_frame_is_drawn() {
+        let mut app = App::headless_for_test();
+        let wid = WindowId(0);
+        let now = std::time::Instant::now();
+        assert!(
+            app.sparkle.is_none() && app.sparkle_dirty,
+            "fixture: the cache is unread, exactly as it is at launch — this test \
+             must NOT call recompute_sparkle, or it reproduces nothing"
+        );
+        let before = app.kitty_log.log().sightings;
+
+        app.record_typed_kitty(wid, 0, now);
+
+        assert!(
+            app.kitty_log.log().sightings > before,
+            "a typed summon must be recorded on a config that has cats on, drawn \
+             frame or not"
+        );
+    }
+
+    /// THE LAST THREE ARMS THAT ANSWERED `OK` OVER A DECLINE. A menu press has
+    /// nowhere to print, so these were written to no-op quietly — which is right
+    /// for a menu and wrong for `invoke`, which mints a reply a driver reads as
+    /// "the action happened". Each now reports the reason it declined, and
+    /// `invoke_menu_action_by_name` turns that into an `Err`.
+    ///
+    /// The three were left out of the commit that built the refusal channel
+    /// because each needed its own honest wording rather than one shared
+    /// apology; this is that wording, pinned.
+    ///
+    /// Every case carries its POSITIVE control in the same test. A refusal path
+    /// is trivially satisfiable by a function that always refuses, and that
+    /// would be a worse bug than the silence it replaced — so each assertion
+    /// that something declines is paired with the state in which it must act.
+    #[test]
+    fn a_declining_window_or_search_action_refuses_in_words() {
+        let mut app = App::headless_for_test();
+
+        // FULL SCREEN: the harness has no OS surface, so there is nothing to
+        // toggle. (No positive control here: a real winit window is exactly what
+        // a headless harness cannot make. The refusal is the branch under test;
+        // the acting branch is the one every windowed run takes.)
+        let why = app
+            .toggle_fullscreen()
+            .expect_err("no OS window must refuse, not silently do nothing");
+        assert!(why.contains("window"), "{why:?}");
+
+        // MOVE TAB TO NEXT WINDOW: one window means nowhere to move it to.
+        let why = app
+            .migrate_active_tab_to_next_window()
+            .expect_err("a single window must refuse");
+        assert!(why.contains("other window"), "{why:?}");
+        // ...and with a second window it MUST act.
+        app.open_active_session_in_new_window_logical()
+            .expect("share the active session into a second window");
+        app.migrate_active_tab_to_next_window()
+            .expect("two windows: the move must happen, not refuse");
+
+        // FIND NEXT/PREV: no open bar and no remembered query is nothing to step.
+        let mut app = App::headless_for_test();
+        assert!(app.search_last_query.is_empty(), "the harness starts cold");
+        for forward in [true, false] {
+            let why = app
+                .search_find_again(forward)
+                .expect_err("nothing to step must refuse");
+            assert!(!why.is_empty(), "the refusal carries a reason");
+        }
+        // ...and with a remembered query it MUST act, taking the resume path
+        // rather than the refusal.
+        app.search_last_query = "a".to_string();
+        app.search_find_again(true)
+            .expect("a remembered query resumes, it does not refuse");
+    }
+
+    /// **WEARING A CAT BY NAME IS THE SWITCH THE PIN PATH CANNOT MAKE.**
+    ///
+    /// The whole reason this exists: `favourite_kitty_checked` promotes the cat that
+    /// would ride ANYWAY — the tenured program cat, else the launch kitty — so
+    /// it can never put on a THIRD cat. This test is that third cat: pin the
+    /// program cat first so the collection holds two rows and the companion is
+    /// the program's, then wear the other one by key and watch the verdict
+    /// move to it. The `on_collect` hello rides along, because a deliberate
+    /// pick is a reason to change the identity.
+    #[test]
+    fn wearing_a_collected_cat_by_name_switches_the_companion() {
+        use crate::app_kitty::{AppIdentity, TENURE};
+        let mut app = App::headless_for_test();
+        app.recompute_sparkle();
+        let wid = WindowId(0);
+        let t0 = std::time::Instant::now();
+
+        // Row one: the launch kitty, collected by pinning it. Its look is set
+        // here rather than taken from the harness's mint, because the roster is
+        // keyed by the cat's HEAD and the fixture needs two DIFFERENT heads —
+        // a second composition of one head would overwrite the first row, which
+        // is the collection's own rule, not a thing this test is about.
+        app.launch_kitty = KittyLook::for_app("python");
+        let launch = app.promotable_kitty(wid);
+        app.favourite_kitty_checked(wid, t0)
+            .expect("the pin these assertions read");
+        assert_eq!(app.kitty_log.favourite_look(), Some(launch));
+
+        // Row two: a program cat, collected the same way, and now worn.
+        let claude = AppIdentity {
+            id: "claude".into(),
+            basename: "claude".into(),
+            look: KittyLook::for_app("claude"),
+        };
+        {
+            let gate = &mut app.windows.get_mut(&wid).expect("window").kitty_tenure;
+            gate.observe(Some(&claude), t0);
+            assert!(
+                gate.observe(Some(&claude), t0 + TENURE).is_some(),
+                "fixture: tenure served"
+            );
+        }
+        app.favourite_kitty_checked(wid, t0 + TENURE)
+            .expect("the pin these assertions read");
+        assert_eq!(
+            app.companion_verdict(wid, 0, t0 + TENURE),
+            claude.look,
+            "fixture: the program cat is the one worn, and the launch kitty is \
+             collected but not on the cursor"
+        );
+        assert_ne!(
+            launch, claude.look,
+            "fixture: the two rows are different cats"
+        );
+
+        // The menu, and the key the user reads off it.
+        let (worn, rows) = app.kitty_log.wearable();
+        assert!(rows.len() >= 2, "two cats collected: {rows:?}");
+        let want = rows
+            .iter()
+            .find(|row| row.look() == Some(launch))
+            .expect("the launch kitty is a row in the collection")
+            .key
+            .clone();
+        assert_ne!(
+            Some(&want),
+            worn.as_ref(),
+            "fixture: the cat we are about to wear is NOT the one already on"
+        );
+
+        // Wear it. No relaunch, no program, no waiting for tenure.
+        let got = app
+            .wear_kitty(wid, &want, t0 + TENURE)
+            .expect("a collected cat can be worn");
+        assert_eq!(got, launch, "the cat asked for is the cat put on");
+        assert_eq!(
+            app.companion_verdict(wid, 0, t0 + TENURE),
+            launch,
+            "and the companion verdict moved to it, over a SERVED program tenure"
+        );
+        let (worn, _) = app.kitty_log.wearable();
+        assert_eq!(worn.as_deref(), Some(want.as_str()), "the list agrees");
+
+        // The hello, exactly as the pin path earns one.
+        let frame = app
+            .windows
+            .get_mut(&wid)
+            .expect("the window is live")
+            .cursor_cat
+            .static_frame(t0 + TENURE);
+        assert!(
+            frame.collection_hello,
+            "a deliberate pick is a reason to change the identity"
+        );
+
+        // A name nothing answers to is refused, and changes nothing.
+        let before = app.companion_verdict(wid, 0, t0 + TENURE);
+        let refused = app
+            .wear_kitty(wid, "no-such-cat", t0 + TENURE)
+            .expect_err("an uncollected cat cannot be worn");
+        assert!(refused.contains("no-such-cat"), "{refused:?}");
+        assert_eq!(
+            app.companion_verdict(wid, 0, t0 + TENURE),
+            before,
+            "a refused wear leaves the cat where it was"
+        );
+    }
+
+    /// **NEXT KITTY WALKS THE COLLECTION AND WRAPS** — the picker you can use
+    /// without a picker, and the View-menu half of `kitty wear`.
+    ///
+    /// Two cats collected, so one press must land on the OTHER one and the next
+    /// press must come back: a "next" that stuck, or that needed the collection
+    /// ordered a particular way, would be a button that does nothing the second
+    /// time you press it.
+    #[test]
+    fn next_kitty_walks_the_collection_and_comes_back_round() {
+        use crate::app_kitty::{AppIdentity, TENURE};
+        let mut app = App::headless_for_test();
+        app.recompute_sparkle();
+        let wid = WindowId(0);
+        let t0 = std::time::Instant::now();
+
+        // Nothing collected yet: there is nowhere to walk to, and minting a cat
+        // here would hand the user one they never met.
+        assert!(
+            app.wear_next_kitty(wid, t0).is_err(),
+            "an empty collection has no next"
+        );
+
+        // Collect two cats with DIFFERENT heads (the roster is keyed by head).
+        app.launch_kitty = KittyLook::for_app("python");
+        let a = app.promotable_kitty(wid);
+        app.favourite_kitty_checked(wid, t0)
+            .expect("the pin these assertions read");
+        let claude = AppIdentity {
+            id: "claude".into(),
+            basename: "claude".into(),
+            look: KittyLook::for_app("claude"),
+        };
+        {
+            let gate = &mut app.windows.get_mut(&wid).expect("window").kitty_tenure;
+            gate.observe(Some(&claude), t0);
+            assert!(gate.observe(Some(&claude), t0 + TENURE).is_some());
+        }
+        app.favourite_kitty_checked(wid, t0 + TENURE)
+            .expect("the pin these assertions read");
+        let b = claude.look;
+        assert_ne!(a, b, "fixture: two different cats");
+        assert_eq!(
+            app.kitty_log.favourite_look(),
+            Some(b),
+            "fixture: wearing b"
+        );
+
+        // One press: the other cat.
+        let first = app
+            .wear_next_kitty(wid, t0 + TENURE)
+            .expect("two collected cats have a next");
+        assert_eq!(first, a, "next from b is a");
+
+        // Another press: back round.
+        let second = app
+            .wear_next_kitty(wid, t0 + TENURE)
+            .expect("and a next again");
+        assert_eq!(second, b, "and next from a wraps to b");
+        assert_eq!(
+            app.companion_verdict(wid, 0, t0 + TENURE),
+            b,
+            "the cat on the cursor followed both presses"
+        );
+    }
+
     /// With a PROGRAM CAT on glass (tenure served), "Favourite This Kitty"
     /// promotes THAT cat — the one the user can see — and the checkmark asks
     /// about the same look; the launch kitty is only what it promotes when no
@@ -20856,7 +21869,8 @@ mod favourite_kitty_tests {
         );
         assert!(!app.palette_live().kitty_favourited, "not pinned yet");
 
-        app.favourite_kitty(wid, t0 + TENURE);
+        app.favourite_kitty_checked(wid, t0 + TENURE)
+            .expect("the pin these assertions read");
 
         assert_eq!(app.kitty_log.favourite_look(), Some(claude.look));
         assert!(
@@ -20879,13 +21893,50 @@ mod favourite_kitty_tests {
         let wid = WindowId(0);
         let now = std::time::Instant::now();
 
-        // (a) SPARKLE MASTER unresolved.
+        // (a) SPARKLE MASTER genuinely OFF — `sparkle_words.enabled = false`,
+        // resolved, so the cache says what the CONFIG says.
         let mut app = App::headless_for_test();
-        assert!(app.sparkle.is_none(), "headless default: not yet resolved");
-        app.favourite_kitty(wid, now);
+        app.config.sparkle_words = Some(crate::app_config::SparkleWordsConfig {
+            enabled: Some(false),
+            ..Default::default()
+        });
+        app.prepared_sparkle = app.config.prepare_sparkle_runtime();
+        app.sparkle_dirty = true;
+        app.recompute_sparkle();
+        assert!(
+            app.sparkle.is_none(),
+            "the master is off, not merely unread"
+        );
+        let refused = app.favourite_kitty_checked(wid, now);
+        assert!(
+            refused.is_err(),
+            "the gate refuses, and says so: {refused:?}"
+        );
         assert_eq!(app.kitty_log.favourite_look(), None, "master off: no pin");
         assert_eq!(app.kitty_log.log().sightings, 0);
         assert!(!app.windows[&wid].cursor_cat.is_active());
+
+        // (a2) UNRESOLVED IS NOT OFF, and this arm is the whole reason the one
+        // above had to be rewritten. `sparkle` is a RENDER-PATH CACHE that
+        // starts `None` with `sparkle_dirty` set, and only a drawn frame fills
+        // it. In a window the first frame always precedes the first press, so
+        // nothing noticed; on the control socket it does not. MEASURED on a
+        // live `--headless` instance: `invoke FavouriteKitty` before any frame
+        // answered `OK invoked FavouriteKitty` and pinned NOTHING — a silent
+        // no-op reported as success. The gate now resolves the cache first, so
+        // the answer comes from the CONFIG rather than from whether a frame has
+        // been drawn.
+        let mut app = App::headless_for_test();
+        assert!(
+            app.sparkle.is_none() && app.sparkle_dirty,
+            "fixture: the cache is unread, exactly as it is at launch"
+        );
+        app.favourite_kitty_checked(wid, now)
+            .expect("the cache is merely unread, not off — the pin lands");
+        assert!(
+            app.kitty_log.favourite_look().is_some(),
+            "a config with cats ON must pin on the first press, drawn frame or not"
+        );
 
         // (b) FELINE SUB-GATE off while the other families keep the master ON.
         let mut app = App::headless_for_test();
@@ -20906,7 +21957,11 @@ mod favourite_kitty_tests {
                 .cfg
                 .feline
         );
-        app.favourite_kitty(wid, now);
+        let refused = app.favourite_kitty_checked(wid, now);
+        assert!(
+            refused.is_err(),
+            "the feline gate refuses, and says so: {refused:?}"
+        );
         assert_eq!(app.kitty_log.favourite_look(), None, "feline off: no pin");
         assert_eq!(app.kitty_log.log().sightings, 0);
         assert!(!app.windows[&wid].cursor_cat.is_active());
@@ -21110,7 +22165,8 @@ mod favourite_kitty_tests {
             "and the live predicate agrees"
         );
 
-        app.favourite_kitty(wid, std::time::Instant::now());
+        app.favourite_kitty_checked(wid, std::time::Instant::now())
+            .expect("the pin these assertions read");
 
         let listed = row(&app.palette_snapshot(wid));
         assert!(
@@ -21718,11 +22774,14 @@ mod full_kitty_sing_seam_tests {
 }
 
 /// C5 — KEYBOARD parity for the tab context menu, driven through the shipping
-/// `on_key` routing with real winit events. WINDOWS only: the chord is
-/// `#[cfg]`-ed out elsewhere (macOS's native strip carries a real `NSMenu`;
-/// Linux is not offered the card at all).
-#[cfg(all(test, windows))]
+/// `on_key` routing with real winit events. WINDOWS AND LINUX — gated exactly
+/// like the chord arm itself, so the platform the arm runs on is the platform
+/// that asserts what it does (macOS's native strip carries a real `NSMenu` and
+/// compiles the arm out).
+#[cfg(all(test, any(windows, target_os = "linux")))]
 mod tab_menu_key_tests {
+    #[cfg(unix)]
+    use super::typed_kitty_summon_tests::drain;
     use crate::{App, WindowId};
     use winit::event::{ElementState, KeyEvent};
     use winit::keyboard::{
@@ -21747,12 +22806,94 @@ mod tab_menu_key_tests {
         (app, wid)
     }
 
-    /// Shift+F10 is the Windows-wide "context menu for the focused thing"
-    /// chord; bare F10 is a terminal function key an app is entitled to receive
-    /// and must NOT be stolen.
+    /// [`app_with_strip`] whose session sink writes to a pipe THIS TEST OWNS —
+    /// `typed_kitty_summon_tests`' private-PTY app with a strip on top — so a
+    /// test can say what the PTY received: the only witness that a key the
+    /// chrome declined really reached the program. Shared with the seam module
+    /// next door, which pins the same bytes on the controller route.
+    #[cfg(unix)]
+    pub(super) fn app_with_private_pty() -> (App, WindowId, [i32; 2]) {
+        let (mut app, _sink, pipe) = super::typed_kitty_summon_tests::app_with_private_pty();
+        let wid = WindowId(0);
+        app.tab_strip_rows = 1;
+        (app, wid, pipe)
+    }
+
+    #[cfg(unix)]
+    pub(super) fn close(pipe: [i32; 2]) {
+        unsafe {
+            libc::close(pipe[0]);
+            libc::close(pipe[1]);
+        }
+    }
+
+    /// THE DEFAULT. Shift+F10 is terminfo `kf22`, a key a legacy application
+    /// binds expecting to receive, so an unedited config lets it through: no
+    /// card, the press not booked as consumed, and — on the wire — exactly
+    /// `ESC[21;2~` on the PTY. The negative twin is the opt-in: the same press
+    /// under `tab_menu_chord = "on"` pops the card and writes nothing, so the
+    /// bytes above are about the default and not about a route that could
+    /// never have written.
+    #[cfg(unix)]
+    #[test]
+    fn shift_f10_reaches_the_program_by_default() {
+        let (mut app, wid, pipe) = app_with_private_pty();
+        app.windows.get_mut(&wid).unwrap().mods = ModifiersState::SHIFT;
+        app.on_key(wid, named(NamedKey::F10));
+        assert!(
+            app.windows[&wid].tab_menu.is_none(),
+            "an unedited config pops no card on ⇧F10"
+        );
+        assert!(
+            !app.windows[&wid]
+                .consumed_press_keys
+                .contains(&PhysicalKey::Code(KeyCode::KeyA)),
+            "…and does not book the press as swallowed"
+        );
+        assert_eq!(
+            drain(pipe),
+            b"\x1b[21;2~".to_vec(),
+            "the program receives terminfo kf22"
+        );
+
+        // NEGATIVE CONTROL: the opt-in claims it, and the PTY stays silent.
+        app.config.tab_menu_chord = Some("on".to_string());
+        app.on_key(wid, named(NamedKey::F10));
+        assert!(
+            app.windows[&wid].tab_menu.is_some(),
+            "`on` pops the card on the same press"
+        );
+        assert!(
+            drain(pipe).is_empty(),
+            "…and a claimed press writes nothing"
+        );
+        close(pipe);
+    }
+
+    /// The same default, without a PTY: on every platform the arm compiles on,
+    /// an unedited config lets ⇧F10 fall through the chord arm untouched.
+    #[test]
+    fn shift_f10_falls_through_the_chord_arm_by_default() {
+        let (mut app, wid) = app_with_strip();
+        app.windows.get_mut(&wid).unwrap().mods = ModifiersState::SHIFT;
+        app.on_key(wid, named(NamedKey::F10));
+        assert!(app.windows[&wid].tab_menu.is_none());
+        assert!(
+            !app.windows[&wid]
+                .consumed_press_keys
+                .contains(&PhysicalKey::Code(KeyCode::KeyA)),
+            "the press took the ordinary encoder path"
+        );
+    }
+
+    /// THE OPT-IN. Under `tab_menu_chord = "on"` Shift+F10 is the Windows-wide
+    /// "context menu for the focused thing" chord; bare F10 is a terminal
+    /// function key an app is entitled to receive and must NOT be stolen even
+    /// then.
     #[test]
     fn shift_f10_pops_the_menu_and_bare_f10_does_not() {
         let (mut app, wid) = app_with_strip();
+        app.config.tab_menu_chord = Some("on".to_string());
         app.on_key(wid, named(NamedKey::F10));
         assert!(
             app.windows[&wid].tab_menu.is_none(),
@@ -21861,12 +23002,15 @@ mod tab_menu_key_tests {
     }
 
     /// ⇧F10 is a DIFFERENT bargain: it encodes as `ESC[21;2~` in plain legacy,
-    /// so only the strongest contract — `REPORT_ALL_KEYS_AS_ESC`, literally
-    /// "report every key" — buys it back automatically. Disambiguate alone does
-    /// not, or the accessibility chord would blink out under every modern TUI.
+    /// which is why the default never claims it. For a hand that opted in with
+    /// `tab_menu_chord = "on"`, only the strongest contract —
+    /// `REPORT_ALL_KEYS_AS_ESC`, literally "report every key" — buys it back
+    /// automatically. Disambiguate alone does not, or the accessibility chord
+    /// the user asked for would blink out under every modern TUI.
     #[test]
     fn shift_f10_defers_only_to_report_all_keys() {
         let (mut app, wid) = app_with_strip();
+        app.config.tab_menu_chord = Some("on".to_string());
         let term = app.pool.get(0).expect("session 0").term.clone();
         app.windows.get_mut(&wid).unwrap().mods = ModifiersState::SHIFT;
 
@@ -21887,9 +23031,10 @@ mod tab_menu_key_tests {
     }
 
     /// KEY THEFT, half two: the ESCAPE HATCH. The chord is deliberately not a
-    /// rebindable `Action`, so `tab_menu_chord` is the only way a user gives
-    /// the keys back — and its middle value has to surrender ⇧F10 while keeping
-    /// the Menu key, because their costs differ.
+    /// rebindable `Action`, so `tab_menu_chord` is the only way a user changes
+    /// what the chrome claims — its middle value keeps the Menu key and
+    /// surrenders ⇧F10 (their costs differ), `on` is the one value that claims
+    /// both, and an absent key means the middle value.
     #[test]
     fn the_config_knob_hands_each_spelling_back() {
         let shift_f10 = |app: &mut App, wid| {
@@ -21920,9 +23065,16 @@ mod tab_menu_key_tests {
         assert!(!menu_key(&mut app, wid), "off surrenders the Menu key");
         assert!(!shift_f10(&mut app, wid), "…and ⇧F10");
 
+        app.config.tab_menu_chord = Some("on".to_string());
+        assert!(menu_key(&mut app, wid), "on claims the Menu key");
+        assert!(shift_f10(&mut app, wid), "…and ⇧F10, by request");
+
         app.config.tab_menu_chord = None;
-        assert!(menu_key(&mut app, wid), "the default claims both");
-        assert!(shift_f10(&mut app, wid));
+        assert!(menu_key(&mut app, wid), "the default claims the Menu key");
+        assert!(
+            !shift_f10(&mut app, wid),
+            "…and leaves ⇧F10 (terminfo kf22) to the application"
+        );
     }
 
     /// A bare MODIFIER press must not dismiss the card. Reaching for ⇧F10 to
@@ -21979,8 +23131,8 @@ mod tab_menu_key_tests {
 /// PTY — the introspection mirror and the glass disagreeing about the same key,
 /// which makes the feature unverifiable through aterm's own control surface.
 ///
-/// Windows only, mirroring the chord's own gate.
-#[cfg(all(test, windows))]
+/// Windows and Linux, mirroring the chord's own gate.
+#[cfg(all(test, any(windows, target_os = "linux")))]
 mod tab_menu_seam_tests {
     use crate::input::{InputEvent, Source};
     use crate::{App, WindowId};
@@ -22034,11 +23186,12 @@ mod tab_menu_seam_tests {
         );
     }
 
-    /// …and ⇧F10 through the seam, with the same modifier rule the glass uses:
-    /// bare F10 belongs to the program.
+    /// …and ⇧F10 through the seam under the opt-in, with the same modifier
+    /// rule the glass uses: bare F10 belongs to the program.
     #[test]
     fn ctl_key_shift_f10_pops_it_and_bare_f10_does_not() {
         let (mut app, wid) = app_with_strip();
+        app.config.tab_menu_chord = Some("on".to_string());
         app.input(wid, key(ENamed::F10, Modifiers::empty()), CTL);
         assert!(
             app.windows[&wid].tab_menu.is_none(),
@@ -22046,6 +23199,50 @@ mod tab_menu_seam_tests {
         );
         app.input(wid, key(ENamed::F10, Modifiers::SHIFT), CTL);
         assert!(app.windows[&wid].tab_menu.is_some(), "⇧F10 pops it");
+    }
+
+    /// THE DEFAULT ON THE WIRE, both sources. `aterm ctl key shift+f10` with an
+    /// unedited config writes terminfo `kf22` (`ESC[21;2~`) to the PTY and pops
+    /// nothing, and a human-sourced press through the same seam agrees byte for
+    /// byte — the glass and the introspection mirror answering alike for the
+    /// same key. The negative twin is the opt-in: under `tab_menu_chord = "on"`
+    /// the controller's press pops the card and the PTY sees nothing.
+    #[cfg(unix)]
+    #[test]
+    fn shift_f10_reaches_the_program_by_default_on_both_sources() {
+        use super::tab_menu_key_tests::{app_with_private_pty, close};
+        use super::typed_kitty_summon_tests::drain;
+
+        let (mut app, wid, pipe) = app_with_private_pty();
+        for src in [Source::Human, CTL] {
+            assert_eq!(
+                app.input(wid, key(ENamed::F10, Modifiers::SHIFT), src),
+                crate::input::InputOutcome::Ok,
+                "{src:?}: the press was delivered"
+            );
+            assert!(
+                app.windows[&wid].tab_menu.is_none(),
+                "{src:?}: an unedited config pops no card on ⇧F10"
+            );
+            assert_eq!(
+                drain(pipe),
+                b"\x1b[21;2~".to_vec(),
+                "{src:?}: the program receives terminfo kf22"
+            );
+        }
+
+        // NEGATIVE CONTROL: the opt-in claims it on this route too.
+        app.config.tab_menu_chord = Some("on".to_string());
+        app.input(wid, key(ENamed::F10, Modifiers::SHIFT), CTL);
+        assert!(
+            app.windows[&wid].tab_menu.is_some(),
+            "`on` pops the card for the controller"
+        );
+        assert!(
+            drain(pipe).is_empty(),
+            "…and the claimed press writes nothing"
+        );
+        close(pipe);
     }
 
     /// The card is DRIVABLE from the controller once up — the whole point of

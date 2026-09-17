@@ -10,7 +10,8 @@
 //! reads a clock, mutates the terminal, or contributes an animation deadline.
 
 use aterm_core::grid::LineSize;
-use aterm_core::render::{RenderInput, SelectionClip};
+use aterm_core::grid::extra::ImageRef;
+use aterm_core::render::{DefaultBgSpan, LineSizeSpan, RenderInput, SelectionClip};
 use aterm_core::selection::TextSelection;
 use aterm_core::terminal::{
     BlockState, ContentScrollDelta, ContentScrollState, RenderCell, Terminal, UnderlineStyle,
@@ -502,12 +503,25 @@ impl PetWorld {
         };
         self.cells.fill(PetCell::Unknown);
         self.glyphs.fill(None);
+        // A frame with no selection at all answers `false` for every cell (a
+        // `TextSelection` in state `None` contains nothing, clipped or not), and
+        // that is the overwhelmingly common frame. Ask once instead of walking
+        // the clip rectangle and the anchor arithmetic 8,600 times.
+        let any_selection = input.any_selection();
         for r in 0..rows {
             let local_r = self.coverage.row + r;
             let frame_r = pane.row + local_r;
             let Some(row) = input.cells.get(frame_r) else {
                 continue;
             };
+            // The row's sidecars, fetched once and walked with a cursor as the
+            // columns ascend — see `RowScan`. Byte-identical to the per-cell
+            // `input.*_at` calls it replaces.
+            let mut scan = RowScan::new(input, frame_r);
+            // The implicit cell is a pure function of `default_bg`, which only
+            // moves at a pane seam — never at all on a single-terminal frame.
+            let mut implicit_bg = None;
+            let mut implicit = RenderCell::default();
             for c in 0..cols {
                 let local_c = self.coverage.col + c;
                 let frame_c = pane.col + local_c;
@@ -516,23 +530,27 @@ impl PetWorld {
                 // under the live default colors, by the renderer's sparse-row
                 // contract. Images and selection can still cover that tail.
                 // A missing ROW above remains unknown, as does map overflow.
-                let default_bg = input.default_bg_at(frame_r, frame_c);
-                let implicit = RenderCell {
-                    bg: [
-                        (default_bg >> 16) as u8,
-                        (default_bg >> 8) as u8,
-                        default_bg as u8,
-                    ],
-                    ..RenderCell::default()
-                };
+                let default_bg = scan.default_bg(frame_c);
+                if implicit_bg != Some(default_bg) {
+                    implicit_bg = Some(default_bg);
+                    implicit = RenderCell {
+                        bg: [
+                            (default_bg >> 16) as u8,
+                            (default_bg >> 8) as u8,
+                            default_bg as u8,
+                        ],
+                        ..RenderCell::default()
+                    };
+                }
                 let cell = row.get(frame_c).unwrap_or(&implicit);
                 self.examined_cells += 1;
-                let selected = input.selection_contains_cell(
-                    frame_r,
-                    frame_c,
-                    row.get(frame_c + 1).is_some_and(|n| n.wide),
-                    cell.wide,
-                );
+                let selected = any_selection
+                    && input.selection_contains_cell(
+                        frame_r,
+                        frame_c,
+                        row.get(frame_c + 1).is_some_and(|n| n.wide),
+                        cell.wide,
+                    );
                 if selected {
                     let rect = PetRect::new(local_r as f32, local_c as f32, 1.0, 1.0);
                     self.selection_rect =
@@ -556,11 +574,10 @@ impl PetWorld {
                     | u32::from(cell.bg[2]);
                 let decorated =
                     cell.underline != UnderlineStyle::None || cell.strikethrough || cell.overline;
-                let compound = input.cluster_at(frame_r, frame_c).is_some()
-                    || input.combining_at(frame_r, frame_c).is_some();
+                let compound = scan.cluster(frame_c).is_some() || scan.combining(frame_c).is_some();
                 // Nonstandard line geometry is conservatively all protected.
                 // A logical single cell is not a proof about its expanded pixels.
-                let line = input.line_size_run_at(frame_r, frame_c).0;
+                let line = scan.line_size(frame_c);
                 let glyph = cell.ch != ' ' || cell.wide || decorated || compound;
                 // Occupancy and protection are independent facts. Moving the
                 // caret/selection off a glyph must not look like arriving ink.
@@ -576,6 +593,10 @@ impl PetWorld {
                     // the pane or coverage edge cannot certify isolation.
                     && c > 0
                     && c + 1 < cols
+                    // These two probes step BACKWARDS, so they are the one place
+                    // that asks `input` directly rather than through `scan`,
+                    // whose cursors answer ascending columns only. An isolated
+                    // braille dot is rare enough that the search is not a cost.
                     && [frame_c - 1, frame_c + 1].into_iter().all(|column| {
                         // A present row's implicit tail is certified blank,
                         // just like the cell being classified above.
@@ -599,7 +620,7 @@ impl PetWorld {
                     });
                 let others = selected
                     || excluded
-                    || input.image_at(frame_r, frame_c).is_some()
+                    || scan.image(frame_c).is_some()
                     || line != LineSize::SingleWidth;
                 // Recorded so the visibility layer can forgive a cell the
                 // LIVE CARET'S RING alone protects, without forgiving
@@ -1086,6 +1107,202 @@ impl PetWorld {
             }
         }
         best
+    }
+}
+
+/// **ONE ROW FETCH AND ONE CURSOR PER SIDECAR, INSTEAD OF A SEARCH PER CELL.**
+///
+/// The classification walk asks `RenderInput` five questions about EVERY cell
+/// it visits, and each of those methods starts by re-fetching the ROW
+/// (`self.clusters.get(row)`, `self.default_bg_spans.get(row)`, …) and then
+/// binary-searches or partitions inside it. Columns ascend by exactly one
+/// across a row, so the row fetch is loop-invariant and every search is a
+/// one-step advance from where the last one landed. This holds the row slices
+/// for the life of the row and walks each with its own cursor, which makes each
+/// question amortised O(1) with no search at all — and collapses the ordinary
+/// single-terminal frame, where four of the five sidecars are empty and the
+/// fifth is uniform, to a constant read.
+///
+/// EXACTNESS IS THE POINT: the emitted classification must be byte-identical,
+/// not merely similar. A cursor is equivalent to the method it replaces only
+/// while the row's list is ordered the way that method's own search requires,
+/// so each list is checked ONCE per row — the lists are empty or tiny — and an
+/// unordered one falls back to calling the method itself. A frame whose
+/// producer handed over an unordered row therefore still gets exactly the bytes
+/// the binary search gave it, unspecified result and all.
+///
+/// The cursors answer a NON-DECREASING column sequence only. The speck probe's
+/// two neighbours (`col - 1`, `col + 1`) deliberately keep calling `input`
+/// directly: they step backwards, and they are reached only by an isolated
+/// braille dot, so they are not on the hot path they would invalidate.
+struct RowScan<'a> {
+    input: &'a RenderInput,
+    row: usize,
+    bg: BgRow<'a>,
+    line: LineRow<'a>,
+    clusters: SparseRow<'a, Box<str>>,
+    combining: SparseRow<'a, Box<[char]>>,
+    images: SparseRow<'a, ImageRef>,
+}
+
+/// The live default background along one row — `RenderInput::default_bg_at`.
+enum BgRow<'a> {
+    /// No spans on this row (every single-terminal frame, and every composed
+    /// row the compositor left alone): one frame-wide default governs it.
+    Uniform(u32),
+    /// Pane spans, ascending by `end_col` as `partition_point` requires.
+    Spans {
+        spans: &'a [DefaultBgSpan],
+        cursor: usize,
+    },
+    /// Spans whose `end_col` is not non-decreasing: `partition_point` is then
+    /// unspecified, so reproduce it by calling it rather than approximating it.
+    Unordered,
+}
+
+/// The DEC line size along one row — `RenderInput::line_size_run_at().0`.
+enum LineRow<'a> {
+    /// The ordinary path: no runs on this row, so `line_sizes[row]` governs it
+    /// end to end.
+    Uniform(LineSize),
+    /// Composed runs, strictly ascending by `start_col` as `binary_search`
+    /// requires to be a well-defined exact probe.
+    Runs {
+        spans: &'a [LineSizeSpan],
+        cursor: usize,
+    },
+    /// Runs that are not strictly ascending; defer to the method.
+    Unordered,
+}
+
+/// A sparse `(col, value)` sidecar row: clusters, combining marks, images.
+struct SparseRow<'a, T> {
+    items: &'a [(usize, T)],
+    /// Strictly ascending — what `binary_search_by_key` needs to be a
+    /// well-defined exact-match probe rather than an arbitrary hit.
+    ordered: bool,
+    cursor: usize,
+}
+
+impl<'a, T> SparseRow<'a, T> {
+    fn new(items: Option<&'a Vec<(usize, T)>>) -> Self {
+        let items = items.map_or([].as_slice(), Vec::as_slice);
+        Self {
+            ordered: items.windows(2).all(|w| w[0].0 < w[1].0),
+            items,
+            cursor: 0,
+        }
+    }
+
+    /// The value at `col`. Exactly `binary_search_by_key(&col, ..).ok()`, for a
+    /// non-decreasing sequence of `col`.
+    fn get(&mut self, col: usize) -> Option<&'a T> {
+        let items = self.items;
+        if !self.ordered {
+            return items
+                .binary_search_by_key(&col, |(c, _)| *c)
+                .ok()
+                .map(|i| &items[i].1);
+        }
+        while items.get(self.cursor).is_some_and(|(c, _)| *c < col) {
+            self.cursor += 1;
+        }
+        match items.get(self.cursor) {
+            Some((c, v)) if *c == col => Some(v),
+            _ => None,
+        }
+    }
+}
+
+impl<'a> RowScan<'a> {
+    fn new(input: &'a RenderInput, row: usize) -> Self {
+        let bg = match input.default_bg_spans.get(row).map(Vec::as_slice) {
+            // A missing row AND an empty one both resolve every column to the
+            // frame-wide default, which is what `partition_point` on an empty
+            // slice plus the failed `get` already did.
+            None | Some([]) => BgRow::Uniform(input.default_bg),
+            Some(spans) if spans.windows(2).all(|w| w[0].end_col <= w[1].end_col) => {
+                BgRow::Spans { spans, cursor: 0 }
+            }
+            Some(_) => BgRow::Unordered,
+        };
+        let line = match input.line_size_spans.get(row).map(Vec::as_slice) {
+            None | Some([]) => {
+                LineRow::Uniform(input.line_sizes.get(row).copied().unwrap_or_default())
+            }
+            Some(spans) if spans.windows(2).all(|w| w[0].start_col < w[1].start_col) => {
+                LineRow::Runs { spans, cursor: 0 }
+            }
+            Some(_) => LineRow::Unordered,
+        };
+        Self {
+            input,
+            row,
+            bg,
+            line,
+            clusters: SparseRow::new(input.clusters.get(row)),
+            combining: SparseRow::new(input.combining.get(row)),
+            images: SparseRow::new(input.images.get(row)),
+        }
+    }
+
+    fn default_bg(&mut self, col: usize) -> u32 {
+        let input = self.input;
+        match &mut self.bg {
+            BgRow::Uniform(bg) => *bg,
+            BgRow::Spans { spans, cursor } => {
+                while spans.get(*cursor).is_some_and(|s| s.end_col <= col) {
+                    *cursor += 1;
+                }
+                // The same validity filter the method applies: a malformed span
+                // yields the frame-wide default, it does not claim the column.
+                spans
+                    .get(*cursor)
+                    .filter(|s| {
+                        s.start_col < s.end_col
+                            && s.end_col <= input.cols
+                            && s.start_col <= col
+                            && col < s.end_col
+                    })
+                    .map_or(input.default_bg, |s| s.default_bg)
+            }
+            BgRow::Unordered => input.default_bg_at(self.row, col),
+        }
+    }
+
+    fn line_size(&mut self, col: usize) -> LineSize {
+        let input = self.input;
+        match &mut self.line {
+            LineRow::Uniform(size) => *size,
+            LineRow::Runs { spans, cursor } => {
+                while spans.get(*cursor).is_some_and(|s| s.start_col <= col) {
+                    *cursor += 1;
+                }
+                // `cursor` is now the method's `binary_search` insertion point.
+                // `Err(0)` — nothing starts at or before `col` — is unclaimed
+                // composite space, which renders single-width. Otherwise the
+                // last run starting at or before `col` is the only candidate,
+                // and it governs the column either as the exact `Ok` hit on its
+                // own `start_col` or by covering it.
+                match cursor.checked_sub(1).map(|i| &spans[i]) {
+                    Some(s) if s.start_col == col || col < s.end_col => s.line_size,
+                    _ => LineSize::SingleWidth,
+                }
+            }
+            LineRow::Unordered => input.line_size_run_at(self.row, col).0,
+        }
+    }
+
+    fn cluster(&mut self, col: usize) -> Option<&'a str> {
+        self.clusters.get(col).map(AsRef::as_ref)
+    }
+
+    fn combining(&mut self, col: usize) -> Option<&'a [char]> {
+        self.combining.get(col).map(AsRef::as_ref)
+    }
+
+    fn image(&mut self, col: usize) -> Option<&'a ImageRef> {
+        self.images.get(col)
     }
 }
 
@@ -1599,5 +1816,404 @@ mod tests {
         term.process(&vec![b'X'; 12 * 50]);
         let world = observe(&mut term);
         assert!(world.nearest_perch(body, 0.2, 50.0).is_none());
+    }
+
+    /// Sidecars shaped to hit EVERY branch the row cursors must reproduce:
+    /// absent rows, empty rows, ordered multi-pane spans, individually
+    /// malformed spans, run gaps, a zero-width run, and rows that are not
+    /// ordered at all (where the method's own search is the only answer).
+    fn adversarial_sidecars(input: &mut RenderInput) {
+        let cols = input.cols;
+        input.default_bg_spans = vec![
+            // A row of spans is EMPTY: the frame-wide default governs it.
+            Vec::new(),
+            // Two panes ABUTTING at column 20 — what a compositor actually
+            // emits, and the case that separates "first span ending after this
+            // column" from "first span not ending before it".
+            vec![
+                DefaultBgSpan::new(0, 20, 0x0011_2233),
+                DefaultBgSpan::new(20, cols, 0x0044_5566),
+            ],
+            // Two panes with an unclaimed divider column between them.
+            vec![
+                DefaultBgSpan::new(0, 19, 0x0077_8899),
+                DefaultBgSpan::new(20, cols, 0x00AA_BBCC),
+            ],
+            // Ordered by `end_col`, yet individually malformed: empty, inverted,
+            // and past the frame's own width. Each must fall back, not claim.
+            vec![
+                DefaultBgSpan::new(0, 0, 0x00AA_AAAA),
+                DefaultBgSpan::new(3, 2, 0x00BB_BBBB),
+                DefaultBgSpan::new(10, 20, 0x00CC_CCCC),
+                DefaultBgSpan::new(30, cols + 60, 0x00DD_DDDD),
+            ],
+            // NOT ascending by `end_col`: `partition_point` is unspecified here,
+            // so the cursor must not try to be cleverer than the method.
+            vec![
+                DefaultBgSpan::new(20, cols, 0x0011_1111),
+                DefaultBgSpan::new(0, 10, 0x0022_2222),
+            ],
+        ];
+        input.line_sizes = vec![
+            LineSize::SingleWidth,
+            LineSize::DoubleWidth,
+            LineSize::SingleWidth,
+            LineSize::DoubleHeightTop,
+            LineSize::DoubleHeightBottom,
+        ];
+        input.line_size_spans = vec![
+            // Empty: `line_sizes[0]` governs the whole row.
+            Vec::new(),
+            vec![
+                LineSizeSpan::new(0, 20, LineSize::DoubleWidth),
+                LineSizeSpan::new(20, cols, LineSize::SingleWidth),
+            ],
+            // Gaps before, between and after the runs: unclaimed composite
+            // space, which is single-width whatever `line_sizes[2]` says.
+            vec![
+                LineSizeSpan::new(5, 10, LineSize::DoubleHeightTop),
+                LineSizeSpan::new(20, 25, LineSize::DoubleWidth),
+            ],
+            // A ZERO-WIDTH run. `binary_search` still finds column 10 by its
+            // `start_col`, so the run governs a column it does not cover — the
+            // one case a plain "does it cover the column" cursor gets wrong.
+            vec![LineSizeSpan::new(10, 10, LineSize::DoubleWidth)],
+            // Two runs sharing a `start_col`, and two in DESCENDING order:
+            // neither is a sorted slice, so `binary_search` answers whatever it
+            // answers and the cursor must not invent a tidier reading.
+            vec![
+                LineSizeSpan::new(0, 10, LineSize::DoubleWidth),
+                LineSizeSpan::new(0, 20, LineSize::DoubleHeightBottom),
+            ],
+            vec![
+                LineSizeSpan::new(20, 30, LineSize::DoubleWidth),
+                LineSizeSpan::new(0, 10, LineSize::DoubleHeightBottom),
+            ],
+        ];
+        input.clusters = vec![
+            Vec::new(),
+            vec![(3, "a".into()), (4, "bb".into()), (cols - 1, "tail".into())],
+            // A duplicated column is not strictly ascending.
+            vec![(5, "x".into()), (5, "y".into())],
+            // Descending.
+            vec![(9, "z".into()), (2, "w".into())],
+        ];
+        input.combining = vec![
+            vec![(0, vec!['\u{301}'].into()), (7, vec!['\u{308}'].into())],
+            Vec::new(),
+            vec![(11, vec!['\u{327}'].into()), (11, vec!['\u{300}'].into())],
+        ];
+        let image = |col: usize| {
+            (
+                col,
+                ImageRef {
+                    image: Arc::new(ImageData {
+                        bytes: Vec::new(),
+                        format: ImageFormat::Png,
+                        cols: 1,
+                        rows: 1,
+                        z_index: 0,
+                        band_lift_px: 0,
+                    }),
+                    cell_row: 0,
+                    cell_col: u16::try_from(col).expect("test column"),
+                },
+            )
+        };
+        input.images = vec![
+            Vec::new(),
+            vec![image(0), image(1), image(30)],
+            vec![image(30), image(1)],
+        ];
+    }
+
+    /// THE EQUIVALENCE THE WALK'S SPEED NOW RESTS ON. `RowScan` exists only
+    /// because it answers exactly what the per-cell `RenderInput` lookups
+    /// answer; anything less is a wrong classification, not a faster one. Every
+    /// column of every row — including rows past the end of each sidecar — is
+    /// compared against the method it replaced.
+    #[test]
+    fn the_row_cursors_answer_exactly_what_the_per_cell_lookups_do() {
+        let mut term = Terminal::new(12, 40);
+        term.process(b"\x1b[?25l");
+        let (mut input, _) = snapshot(&mut term);
+        adversarial_sidecars(&mut input);
+        for row in 0..input.rows + 2 {
+            let mut scan = RowScan::new(&input, row);
+            // Ascending columns, which is the contract the cursors answer, and
+            // two past the frame's width because the walk's own neighbour
+            // arithmetic can reach there on a clamped pane.
+            for col in 0..input.cols + 2 {
+                let at = (row, col);
+                assert_eq!(
+                    scan.default_bg(col),
+                    input.default_bg_at(row, col),
+                    "default_bg at {at:?}"
+                );
+                assert_eq!(
+                    scan.line_size(col),
+                    input.line_size_run_at(row, col).0,
+                    "line size at {at:?}"
+                );
+                assert_eq!(
+                    scan.cluster(col),
+                    input.cluster_at(row, col),
+                    "cluster at {at:?}"
+                );
+                assert_eq!(
+                    scan.combining(col),
+                    input.combining_at(row, col),
+                    "combining at {at:?}"
+                );
+                assert_eq!(
+                    scan.image(col).map(std::ptr::from_ref),
+                    input.image_at(row, col).map(std::ptr::from_ref),
+                    "image at {at:?}"
+                );
+            }
+        }
+    }
+
+    /// The same equivalence seen from OUTSIDE, through `observe`: a pane-local
+    /// live default background decides Ink from Clear column by column, so a
+    /// cursor that lands one column early or late changes what the pet may
+    /// stand on. The seam is at column 20 and the test reads both sides of it.
+    #[test]
+    fn a_pane_local_default_background_decides_ink_column_by_column() {
+        let mut term = Terminal::new(10, 40);
+        term.process(b"\x1b[?25l");
+        let (mut input, facts) = snapshot(&mut term);
+        let pane_bg = 0x0012_3456;
+        input.default_bg_spans = vec![Vec::new(); input.rows];
+        input.default_bg_spans[5] = vec![
+            DefaultBgSpan::new(0, 20, 0x00FF_FFFF),
+            DefaultBgSpan::new(20, input.cols, pane_bg),
+        ];
+        input.cells[5] = vec![
+            RenderCell {
+                bg: [0x12, 0x34, 0x56],
+                ..RenderCell::default()
+            };
+            input.cols
+        ];
+        let mut world = PetWorld::default();
+        assert!(world.observe(&input, &facts, PetPane::full(&input)));
+        // Left of the seam a different pane's default rules, so this pane's
+        // background reads there as painted ink.
+        assert_eq!(world.cell(5, 0), PetCell::Ink);
+        assert_eq!(world.cell(5, 19), PetCell::Ink);
+        // From the seam on it is that pane's EMPTY.
+        assert_eq!(world.cell(5, 20), PetCell::Clear);
+        assert_eq!(world.cell(5, 39), PetCell::Clear);
+    }
+
+    /// ADVERSARIAL REVIEW TEST (not part of the change under review).
+    /// The shipped equivalence test queries all five accessors at EVERY column
+    /// in lockstep. The real walk does not: `cluster`/`combining` short-circuit
+    /// on `||`, and `image` is skipped whenever `selected || excluded` already
+    /// holds, so a cursor can be asked for column 40 having last seen column 3.
+    #[test]
+    fn review_row_cursors_survive_skipped_and_sparse_query_orders() {
+        let mut seed = 0x2545_F491_4F6C_DD1Du64;
+        let mut rnd = move || {
+            seed ^= seed << 13;
+            seed ^= seed >> 7;
+            seed ^= seed << 17;
+            seed
+        };
+        for trial in 0..400u32 {
+            let mut term = Terminal::new(8, 24);
+            term.process(b"\x1b[?25l");
+            let (mut input, _) = snapshot(&mut term);
+            let cols = input.cols;
+            let mut bg_rows = Vec::new();
+            let mut ls_rows = Vec::new();
+            let mut cl_rows = Vec::new();
+            let mut cb_rows = Vec::new();
+            let mut im_rows = Vec::new();
+            for _ in 0..input.rows {
+                let n = (rnd() % 5) as usize;
+                let mut bg = Vec::new();
+                let mut cur = 0usize;
+                for _ in 0..n {
+                    let start = cur + (rnd() % 3) as usize;
+                    let end = start + (rnd() % 8) as usize;
+                    bg.push(DefaultBgSpan::new(
+                        start.min(cols + 4),
+                        end.min(cols + 4),
+                        (rnd() % 0x00FF_FFFF) as u32,
+                    ));
+                    cur = end;
+                }
+                if rnd().is_multiple_of(4) {
+                    bg.reverse();
+                }
+                if rnd().is_multiple_of(6) && bg.len() > 1 {
+                    bg.swap(0, 1);
+                }
+                bg_rows.push(bg);
+
+                let n = (rnd() % 4) as usize;
+                let mut ls = Vec::new();
+                let mut cur = 0usize;
+                for _ in 0..n {
+                    let start = cur + (rnd() % 3) as usize;
+                    let end = start + (rnd() % 6) as usize;
+                    ls.push(LineSizeSpan::new(
+                        start.min(cols + 4),
+                        end.min(cols + 4),
+                        match rnd() % 4 {
+                            0 => LineSize::SingleWidth,
+                            1 => LineSize::DoubleWidth,
+                            2 => LineSize::DoubleHeightTop,
+                            _ => LineSize::DoubleHeightBottom,
+                        },
+                    ));
+                    cur = end;
+                }
+                if rnd().is_multiple_of(5) {
+                    ls.reverse();
+                }
+                if rnd().is_multiple_of(7) && !ls.is_empty() {
+                    let d = ls[0];
+                    ls.push(d);
+                }
+                ls_rows.push(ls);
+
+                let cols_of = |rnd: &mut dyn FnMut() -> u64| {
+                    let n = (rnd() % 6) as usize;
+                    let mut v: Vec<usize> = Vec::new();
+                    let mut c = 0usize;
+                    for _ in 0..n {
+                        c += (rnd() % 5) as usize;
+                        v.push(c.min(cols + 3));
+                    }
+                    if rnd().is_multiple_of(5) {
+                        v.reverse();
+                    }
+                    if rnd().is_multiple_of(6) && !v.is_empty() {
+                        v.push(v[0]);
+                    }
+                    v
+                };
+                let a = cols_of(&mut rnd);
+                let b = cols_of(&mut rnd);
+                let d = cols_of(&mut rnd);
+                cl_rows.push(
+                    a.into_iter()
+                        .map(|c| (c, format!("g{c}").into_boxed_str()))
+                        .collect::<Vec<_>>(),
+                );
+                cb_rows.push(
+                    b.into_iter()
+                        .map(|c| (c, vec!['\u{301}'].into_boxed_slice()))
+                        .collect::<Vec<_>>(),
+                );
+                im_rows.push(
+                    d.into_iter()
+                        .map(|c| {
+                            (
+                                c,
+                                ImageRef {
+                                    image: Arc::new(ImageData {
+                                        bytes: Vec::new(),
+                                        format: ImageFormat::Png,
+                                        cols: 1,
+                                        rows: 1,
+                                        z_index: 0,
+                                        band_lift_px: 0,
+                                    }),
+                                    cell_row: 0,
+                                    cell_col: u16::try_from(c.min(65535)).unwrap_or(0),
+                                },
+                            )
+                        })
+                        .collect::<Vec<_>>(),
+                );
+            }
+            if trial % 3 == 0 {
+                ls_rows.truncate(input.rows.saturating_sub(2));
+                cl_rows.truncate(input.rows.saturating_sub(3));
+            }
+            input.default_bg_spans = bg_rows;
+            input.line_size_spans = ls_rows;
+            input.clusters = cl_rows;
+            input.combining = cb_rows;
+            input.images = im_rows;
+
+            for row in 0..input.rows + 1 {
+                let mut scan = RowScan::new(&input, row);
+                let mut col = 0usize;
+                while col < cols + 2 {
+                    if rnd().is_multiple_of(2) {
+                        assert_eq!(
+                            scan.default_bg(col),
+                            input.default_bg_at(row, col),
+                            "trial {trial} default_bg ({row},{col})"
+                        );
+                    }
+                    if rnd().is_multiple_of(2) {
+                        assert_eq!(
+                            scan.line_size(col),
+                            input.line_size_run_at(row, col).0,
+                            "trial {trial} line_size ({row},{col})"
+                        );
+                    }
+                    if rnd().is_multiple_of(2) {
+                        assert_eq!(
+                            scan.cluster(col),
+                            input.cluster_at(row, col),
+                            "trial {trial} cluster ({row},{col})"
+                        );
+                    }
+                    if rnd().is_multiple_of(2) {
+                        assert_eq!(
+                            scan.combining(col),
+                            input.combining_at(row, col),
+                            "trial {trial} combining ({row},{col})"
+                        );
+                    }
+                    if rnd().is_multiple_of(2) {
+                        assert_eq!(
+                            scan.image(col).map(std::ptr::from_ref),
+                            input.image_at(row, col).map(std::ptr::from_ref),
+                            "trial {trial} image ({row},{col})"
+                        );
+                    }
+                    col += 1 + (rnd() % 3) as usize;
+                }
+            }
+        }
+    }
+
+    /// ADVERSARIAL REVIEW TEST (not part of the change under review).
+    /// The implicit sparse-tail cell is now REBUILT only when the row's default
+    /// background moves. Nothing in the change pins that: the shipped
+    /// `a_pane_local_default_background_decides_ink_column_by_column` fully
+    /// materializes its row, so `implicit` is never read there. This row has an
+    /// EMPTY materialized prefix, so every cell is the implicit one, and a
+    /// stale implicit paints the second pane's blank tail as Ink.
+    #[test]
+    fn review_sparse_tail_implicit_cell_tracks_a_mid_row_background_seam() {
+        let mut term = Terminal::new(10, 40);
+        term.process(b"\x1b[?25l");
+        let (mut input, facts) = snapshot(&mut term);
+        input.default_bg_spans = vec![Vec::new(); input.rows];
+        input.default_bg_spans[5] = vec![
+            DefaultBgSpan::new(0, 20, 0x00FF_FFFF),
+            DefaultBgSpan::new(20, input.cols, 0x0012_3456),
+        ];
+        // NO materialized cells: the whole row is the sparse tail, which the
+        // renderer's contract says is EMPTY under each pane's live default.
+        input.cells[5] = Vec::new();
+        let mut world = PetWorld::default();
+        assert!(world.observe(&input, &facts, PetPane::full(&input)));
+        for col in [0, 19, 20, 39] {
+            assert_eq!(
+                world.cell(5, col),
+                PetCell::Clear,
+                "sparse tail at column {col} is its own pane's EMPTY, not ink"
+            );
+        }
     }
 }

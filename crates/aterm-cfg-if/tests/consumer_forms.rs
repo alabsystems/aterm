@@ -159,8 +159,21 @@ mod cpu {
 // evaluated. If the body matcher were `item` or `stmt` instead of `tt`, this
 // invocation would fail at the match, on every cell, with no arm selected.
 // -------------------------------------------------------------------------
+//
+// THE CONSUMER HALF IS UNIX-GATED; THE CHAIN ITSELF IS NOT, and that split is
+// the point rather than a concession. The eight arms name only unix-family
+// operating systems, because the file this is copied from is one upstream
+// getrandom compiles nowhere else — so on Windows NO arm is selected and the
+// chain must expand to nothing at all, which is exactly the property SHAPE 6
+// (no final `else`) exists to pin, and the only cell that can witness it is a
+// non-unix one. What cannot survive there is `get_errno`, whose `else` arm
+// calls the `errno_location` no arm defined: before this gate that was
+// ``error[E0425]: cannot find function `errno_location` in this scope`` and
+// `cfg-if`'s test target did not COMPILE for x86_64-pc-windows-msvc — invisible
+// until `xtask gate cells` began type-checking every cell's test targets.
 #[allow(unsafe_op_in_unsafe_fn)]
 mod getrandom_0_2_util_libc {
+    #[cfg(unix)]
     use crate::libc;
 
     cfg_if! {
@@ -189,6 +202,7 @@ mod getrandom_0_2_util_libc {
 
     // getrandom-0.2.17/src/util_libc.rs:35-40 — a two-arm chain whose `else`
     // defines a function rather than importing one.
+    #[cfg(unix)]
     cfg_if! {
         if #[cfg(target_os = "vxworks")] {
             use libc::errnoGet as get_errno;
@@ -199,6 +213,7 @@ mod getrandom_0_2_util_libc {
 
     /// Proof that exactly one `get_errno` exists and is callable: a duplicate
     /// or a missing one would not compile.
+    #[cfg(unix)]
     pub fn errno_is_reachable() -> libc::c_int {
         unsafe { get_errno() }
     }
@@ -1379,6 +1394,11 @@ fn a_macro_defined_inside_an_arm_is_callable_after_it() {
 
 #[test]
 fn the_remaining_scaffolded_forms_are_live() {
+    // Unix only: the eight-arm chain that defines `errno_location` names unix
+    // operating systems and nothing else, so off unix there is no `get_errno`
+    // to reach — and the chain expanding to NOTHING there is itself the shape
+    // SHAPE 6 pins. See the note on `getrandom_0_2_util_libc`.
+    #[cfg(unix)]
     assert_eq!(getrandom_0_2_util_libc::errno_is_reachable(), 0);
     assert!(getrandom_0_3_error::both_aliases_exist(0).is_none());
     assert!(libloading_get::get() || !libloading_get::get());

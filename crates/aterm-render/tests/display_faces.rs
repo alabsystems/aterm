@@ -432,3 +432,205 @@ fn every_registry_face_has_an_open_licence_notice() {
          deleted without its licence, or vice versa"
     );
 }
+
+/// THE FIT IS A PROPERTY OF THE FONT, NOT OF THE ALLOCATION. `display_face_fit`
+/// identified a bundled face with `std::ptr::eq` against the `DISPLAY_FACES`
+/// statics, so it recognised only the ONE copy of the bytes the registry itself
+/// holds. Every rebuild path rebuilds from a copy — `rebuild_from_admitted` goes
+/// through `shared_parsed_face`'s `Arc::from(bytes)`, `fork_semantic_surface`
+/// calls it, and the config worker copies twice more — so each silently dropped
+/// the WHOLE policy: px_scale, widest-advance cell, ink centring, embolden
+/// headroom.
+///
+/// It was reachable in the shipped GUI through `rebuild_backend_with_prepared`,
+/// which the config/theme hot-reload calls: a user with `display_font` set got
+/// the correct fitted grid at launch and permanently lost it the first time the
+/// config file was saved or the theme flipped. Measured for `engraved` at 16 px,
+/// the rebuilt cell went (21, 19) -> (15, 22) with a widest printable-ASCII
+/// raster of 24 px — 9 px of ink over the cell edge, per cell.
+///
+/// `proportional_display_faces_are_fitted` above guards the policy going inert
+/// for the STATIC bytes. This guards the copies, which is where it actually went.
+#[test]
+fn the_fit_survives_a_rebuild_and_a_copy_of_the_bytes() {
+    let bytes = display_face_bytes("engraved").expect("registry id resolves");
+
+    // The root: identity must be the CONTENT. A byte-for-byte copy is the same
+    // font and must take the same policy.
+    let copy = bytes.to_vec();
+    assert!(
+        display_face_fit(copy.as_slice()).is_some(),
+        "a byte-for-byte copy of a bundled face is the same font and must keep \
+         its fit — matching by pointer made the policy an accident of which \
+         allocation the caller happened to hold"
+    );
+
+    // And the seam that actually carried the loss into the GUI.
+    let mut base = Renderer::from_bytes(bytes, 16.0, Theme::default()).expect("engraved at 16px");
+    let before = base.cell_size();
+    let _ = base.seal_admitted_font_sources();
+    let rebuilt = base
+        .rebuild_from_admitted(16.0, Theme::default())
+        .expect("a sealed generation rebuilds");
+    assert_eq!(
+        rebuilt.cell_size(),
+        before,
+        "`rebuild_from_admitted` promises to preserve the font appearance knobs, \
+         and the display fit is one of them"
+    );
+
+    let forked = base
+        .fork_semantic_surface(16.0, Theme::default())
+        .expect("a sealed generation forks");
+    assert_eq!(
+        forked.cell_size(),
+        before,
+        "a semantic fork rebuilds through the same seam and must not lose the fit"
+    );
+}
+
+/// A VARIATION CHANGE IS NOT AN EXCUSE TO FORGET THE FIT. `refresh_variations`
+/// re-derived the cell with the bare `cell_w_from_advance` — the one derivation
+/// that ignores FONT-DISPLAY-FIT — while every sibling site (the constructor,
+/// `set_px`, `activate_px`, both `cell_geometry` arms) goes through
+/// `fitted_cell_w`. On a fitted face it therefore threw away the widest-advance
+/// cell: measured for `engraved` at 16 px, cell 21 -> 13 against a 22 px widest
+/// raster.
+///
+/// It is reachable on the one generation that carries a live fit — STARTUP:
+/// `apply_font_config_to_backend` calls `set_font_variations` immediately after
+/// construction, so any non-empty `font_variation`/`font_weight`, or a non-zero
+/// `font_weight_dark_nudge`, runs it past its early-out.
+///
+/// Two assertions, because the defect had two distinct faces: the cell must
+/// still clear the ink (the overrun this whole policy exists to prevent), and
+/// the PURE read must still agree with paint — `cell_geometry` documents that it
+/// "equal[s] exactly what the renderer produces once activated to `px`", and
+/// while this was broken it reported the fitted 21 against a painted 13, putting
+/// grid sizing, hit-testing and IME positioning 8 px per column out of step.
+#[test]
+fn a_variation_change_keeps_the_fit_and_the_pure_read_agrees() {
+    let mut renderer =
+        Renderer::from_configured_font_family("display:engraved", 16.0, Theme::default())
+            .expect("the display scheme resolves");
+    // A heavier instance than the constructor resolved, so the coords really
+    // differ and `refresh_variations` runs past its early-out.
+    renderer.set_font_variations(&[(aterm_render::variation::WGHT_TAG, 600.0)], 0.0);
+
+    let (cell_w, cell_h) = renderer.cell_size();
+    assert_eq!(
+        renderer.cell_geometry(16.0),
+        (cell_w, cell_h, renderer.baseline()),
+        "the pure read must equal what the renderer actually paints"
+    );
+
+    for ch in '!'..='~' {
+        let key = renderer.glyph_key(ch);
+        if !matches!(
+            key.source,
+            aterm_render::FaceId::Primary | aterm_render::FaceId::DisplayMix
+        ) {
+            continue;
+        }
+        let img = renderer.glyph_image(key);
+        let right = img.xmin() + img.width() as i32;
+        assert!(
+            right <= cell_w as i32,
+            "after a variation change {ch:?} ends at {right} past the {cell_w}px \
+             cell — it would paint over the next character"
+        );
+    }
+}
+
+/// A FACE SWAP RE-PROBES THE FIT. `set_primary_font` re-probes the new bytes'
+/// ligature features, OS/2 typo metrics and decoration tables, but left
+/// `display_fit` holding the face that had just been replaced — so a swap
+/// carried the previous face's px_scale, widest-advance cell, ink centring and
+/// embolden headroom onto bytes they were never measured from.
+///
+/// Both directions, because the defect is symmetric and each has a distinct
+/// failure: leaving a fit behind makes the new face render at 0.87 px in a cell
+/// sized for someone else, and failing to pick one up reopens the overrun the
+/// policy exists to prevent. The comparison is against a renderer CONSTRUCTED
+/// from the same bytes, which is the definition of right here — a swap must land
+/// exactly where a fresh construction would.
+#[test]
+fn a_primary_swap_reprobes_the_fit_for_the_new_face() {
+    let engraved = display_face_bytes("engraved").expect("registry id resolves");
+    let plain = aterm_render::embedded_font();
+
+    let fresh_fitted = Renderer::from_bytes(engraved, 16.0, Theme::default())
+        .expect("engraved")
+        .cell_size();
+    let fresh_plain = Renderer::from_bytes(plain, 16.0, Theme::default())
+        .expect("dejavu")
+        .cell_size();
+    assert_ne!(
+        fresh_fitted, fresh_plain,
+        "the two faces must differ for this test to be able to fail"
+    );
+
+    let mut fitted_to_plain =
+        Renderer::from_bytes(engraved, 16.0, Theme::default()).expect("engraved");
+    fitted_to_plain
+        .set_primary_font(plain)
+        .expect("the embedded face installs");
+    assert_eq!(
+        fitted_to_plain.cell_size(),
+        fresh_plain,
+        "swapping AWAY from a fitted face must drop its fit — an ordinary user \
+         font is one this policy promises to leave exactly as it found it"
+    );
+
+    let mut plain_to_fitted = Renderer::from_bytes(plain, 16.0, Theme::default()).expect("dejavu");
+    plain_to_fitted
+        .set_primary_font(engraved)
+        .expect("the display face installs");
+    assert_eq!(
+        plain_to_fitted.cell_size(),
+        fresh_fitted,
+        "swapping TO a fitted face must pick its fit up — a swap has to land \
+         where a fresh construction from the same bytes would"
+    );
+}
+
+/// A `display_font` VALUE IS A HUMAN-TYPED CONFIG STRING, so it folds case like
+/// every other one. The comparison used to be exact, and the failure was silent
+/// in the worst way: an unrecognised id is not an error — it falls through to
+/// ordinary `font_family` resolution — so `display_font = "Pixel"` did not warn,
+/// did not fail, and did not apply. The setting simply had no effect, which is
+/// indistinguishable from never having written it.
+///
+/// Legacy ids fold too: they are the migration path for configs written a year
+/// ago, which is exactly where an unconventional spelling survives.
+///
+/// The negative control is in the same test: folding must not start ACCEPTING
+/// things, only spelling the same id differently.
+#[test]
+fn a_display_face_id_folds_ascii_case_like_every_other_config_value() {
+    for (typed, want) in [
+        ("pixel", "pixel"),
+        ("Pixel", "pixel"),
+        ("PIXEL", "pixel"),
+        ("  Engraved  ", "engraved"),
+        // A legacy game id, canonicalized to its successor.
+        ("Minecraft", "pixel"),
+        ("ZELDA", "engraved"),
+    ] {
+        assert_eq!(
+            display_face_canonical_id(typed),
+            Some(want),
+            "{typed:?} names the {want} face"
+        );
+    }
+
+    // NEGATIVE CONTROL: case folding must not widen what is accepted.
+    for nonsense in ["pixelated", "pix el", "", "mariokart", "MARIOKART"] {
+        assert_eq!(
+            display_face_canonical_id(nonsense),
+            None,
+            "{nonsense:?} names no face (mariokart is the retired id with no \
+             successor, and folding must not resurrect it)"
+        );
+    }
+}

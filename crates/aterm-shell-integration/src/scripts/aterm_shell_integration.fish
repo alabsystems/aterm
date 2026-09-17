@@ -11,6 +11,9 @@
 # Features enabled:
 # - Directory tracking (OSC 7): tab title updates, "Open Terminal Here" support
 # - Command tracking (OSC 133): command history indexing, timing, notifications
+# - The managed dirs, LIVE: an already-running session shell resolves `claude`/`codex`
+#   to atpkg's <prefix>/agents twins (and cargo/rustc to <prefix>/reroute) the moment
+#   atpkg lays them — no new tab, no `exec fish` (owner ask 2026-09-16; see "LIVE" below)
 #
 # Compatible with: fish 3.1+ (string escape --style=url requires 3.1)
 
@@ -241,18 +244,209 @@ function __aterm_path_front --argument-names dir
     end
     set -gx PATH "$dir" $rest
 end
+#
+# It also records, in $__aterm_managed_want (a list, in order), the dirs it put in
+# front, which is what the per-prompt hot path below compares the head of $PATH
+# against, and in $__aterm_managed_agents_on / $__aterm_managed_reroute_on whether
+# each dir WAS there to front. A dir that was absent is re-probed by the hot path
+# (one `test -d` per prompt, only while it stays absent — review finding
+# 2026-09-16: a hook that predates agents/ set $ATPKG_AGENTS, the `test -d` here
+# failed once, and the shell never looked again) and fronted the moment it
+# appears. The `test -d` stats of the steady state live HERE, on the change path,
+# never on the per-prompt one.
+set -g __aterm_managed_want
+set -g __aterm_managed_agents_on 0
+set -g __aterm_managed_reroute_on 0
 function __aterm_reroute_path_front
+    set -g __aterm_managed_want
+    set -g __aterm_managed_agents_on 0
+    set -g __aterm_managed_reroute_on 0
     if test -n "$ATPKG_AGENTS"; and test -d "$ATPKG_AGENTS"
         __aterm_path_front "$ATPKG_AGENTS"
+        set -g __aterm_managed_want "$ATPKG_AGENTS"
+        set -g __aterm_managed_agents_on 1
     end
     if test -n "$ATERM_REROUTE_DIR"; and test -d "$ATERM_REROUTE_DIR"
         __aterm_path_front "$ATERM_REROUTE_DIR"
+        set -g __aterm_managed_want "$ATERM_REROUTE_DIR" $__aterm_managed_want
+        set -g __aterm_managed_reroute_on 1
     end
 end
 __aterm_reroute_path_front
 function __aterm_reroute_first_prompt --on-event fish_prompt
     functions -e __aterm_reroute_first_prompt
     __aterm_reroute_path_front
+end
+
+# ─── LIVE: the tab that is ALREADY OPEN picks the managed dirs up the moment atpkg lays them ───
+#
+# Owner, 2026-09-16, looking at a status row that read "✓ Claude Code 2.1.273 ·
+# Codex 0.154.0 — aterm-managed, current   what `claude` and `codex` run in new
+# tabs": "HEY! this is a bad experience. aterm atpkg DID install the latest but it
+# didn't make them available for me. instead, it is telling me to open a new tab.
+# NO! all the latest and best MUST WORK IN THE SAME TAB with live update! fix this
+# and this message and audit that this is the actual behavior."
+#
+# What was measured in that tab: its shell (pid 1784) was spawned at 10:44:24 by
+# the PREVIOUS app build and ADOPTED across the seamless update — the running app
+# (0.86.0, pid 1868) started at 10:44:32 — and <prefix>/agents plus the shell.d
+# hooks were created at 10:46 by the new build's first pass. The asserts above fire
+# ONCE each (load, first prompt), gated on $ATPKG_AGENTS / $ATERM_REROUTE_DIR being
+# set and the directories existing AT THAT INSTANT; that shell had neither variable
+# and no directory to find, so `claude` resolved to a foreign copy and the only way
+# to the build atpkg had just installed was a new tab. The same freeze hits EVERY
+# fresh machine: the first tab opens before the seed pass creates agents/.
+#
+# The fix is a per-prompt AND per-command re-assert — from fish_prompt and from
+# fish_preexec, because a command typed at an idle prompt after the dirs appear
+# runs BEFORE the next prompt — in three steps, all builtin-only (`test`, `set`,
+# `math`, `read`, `source`: no external stat/dirname/readlink; pinned by a grep
+# test):
+#
+#  1. THE HOOK IS THE SOURCE OF TRUTH when the environment is missing or stale.
+#     ~/.aterm/shell.d/00-atpkg.fish is what atpkg generates (crates/atpkg/src/hooks.rs;
+#     the spelling is pinned from that crate's side): it exports $ATPKG_AGENTS and
+#     $ATPKG_BIN, moves agents/ to the front and appends bin/, and it is idempotent.
+#     It is (re)sourced when the TEXT on disk is not the text last sourced — it
+#     appeared (a shell spawned before the file existed), or atpkg rewrote it on a
+#     later pass. fish has no builtin that reads an mtime or an inode, so unlike
+#     zsh (one zstat) the copy is compared by CONTENT: `read -z` — a builtin, on a
+#     builtin redirection — takes the whole file into one variable, and that is
+#     compared to the text recorded at the last source. Measured 2026-09-16 (fish
+#     4.9.3, the 9-line hook, 10000 calls): 22 µs per call, one `test -f` stat
+#     plus one open/read/close; a fork is ~1300 µs. The `test -nt` stamp
+#     alternative (two stats) was rejected for the STATE it carries: a per-shell
+#     file this shell must mint symlink-safely in a possibly shared /tmp, own,
+#     and delete at exit — a leak for every shell killed without one. A hook that
+#     predates R1 (no ATPKG_AGENTS) is sourced ONCE per copy, not once per
+#     prompt. An absent hook sources nothing; the empty text is recorded so a
+#     hook that appears later is seen as new.
+#  2. A DIR THAT WAS ABSENT when the front was last laid is probed again — one
+#     `test -d` per prompt, only in that degraded state — and fronted when it
+#     appears: a hook that names an agents/ atpkg has not created yet, or a
+#     session whose seam exported no $ATERM_REROUTE_DIR. Nothing is assigned
+#     while it stays absent.
+#  3. THE ORDER. $__aterm_managed_want holds the dirs that must lead $PATH; the hot
+#     path compares them element-wise against the head of $PATH and assigns ONLY
+#     on a mismatch.
+#
+# No twin watch is needed here, unlike zsh and bash: fish keeps no command hash —
+# every invocation walks $PATH — so a twin that lands in an agents/ already
+# leading $PATH is what the very next `claude` runs.
+#
+# $ATERM_REROUTE_DIR is derived for a shell that predates it — the sibling
+# `<dir of $ATPKG_AGENTS>/reroute`, when it is a directory and $ATERM_NO_REROUTE is
+# not engaged (non-empty and not "0": atpkg::reroute::engaged) — so the final order
+# is reroute, agents, everything else, bin/ last (the hook appends it). The parent
+# is cut with `string` (a builtin — its substitution forks nothing) and captured
+# into a local before it is interpolated, this file's glue rule.
+#
+# Gated on BEING INSIDE AN ATERM SESSION ($ATERM_CHILD=1, which the spawn seam sets
+# for every child, or $ATERM_SESSION_ID) — NOT on $ATERM_REROUTE_DIR, which is
+# precisely what the adopted shell lacks. Inert everywhere else. `test -n`, this
+# file's rule for every ATERM_* variable.
+#
+# The twin itself needs nothing from here: atpkg re-lays <prefix>/agents/claude
+# atomically, and the NEXT invocation follows the path — so once agents/ leads
+# $PATH, every later update is live too.
+set -g __aterm_atpkg_hook "$HOME/.aterm/shell.d/00-atpkg.fish"
+set -g __aterm_atpkg_hook_seen ""
+set -g __aterm_managed_live 0
+if test -n "$ATERM_CHILD"; or test -n "$ATERM_SESSION_ID"
+    set -g __aterm_managed_live 1
+end
+
+# Leaves the hook's text in $__aterm_atpkg_hook_now, or the empty string when it
+# is absent. Builtin `read -z` (to NUL or EOF: the whole file, newlines kept) on
+# a builtin redirection, behind the `test -f` that keeps a missing file from
+# printing fish's redirection error. Its own global, not a local of the hot
+# path, so the compare below reads one string, never a list.
+set -g __aterm_atpkg_hook_now ""
+function __aterm_atpkg_hook_read
+    set -g __aterm_atpkg_hook_now ""
+    if test -f "$__aterm_atpkg_hook"
+        read -z -g __aterm_atpkg_hook_now < "$__aterm_atpkg_hook"
+    end
+    return 0
+end
+# The copy the shell.d loop above sourced at load is the copy last sourced —
+# whatever it exported (a pre-R1 hook exports no $ATPKG_AGENTS, and is still not
+# sourced again until atpkg rewrites it).
+if test "$__aterm_managed_live" = 1
+    __aterm_atpkg_hook_read
+    set -g __aterm_atpkg_hook_seen "$__aterm_atpkg_hook_now"
+end
+
+# Exports $ATERM_REROUTE_DIR (status 0) or leaves it alone (status 1).
+function __aterm_managed_derive_reroute
+    if test -n "$ATERM_REROUTE_DIR"; or test -z "$ATPKG_AGENTS"
+        return 1
+    end
+    if test -n "$ATERM_NO_REROUTE"; and test "$ATERM_NO_REROUTE" != 0
+        return 1
+    end
+    set -l parent (string replace -r '/[^/]*$' '' -- "$ATPKG_AGENTS")
+    set -l dir "$parent/reroute"
+    if not test -d "$dir"
+        return 1
+    end
+    set -gx ATERM_REROUTE_DIR "$dir"
+    return 0
+end
+# A session shell whose seam exported no $ATERM_REROUTE_DIR but whose rc block
+# sourced the hook derives it now, so the load-time order is final too.
+if test "$__aterm_managed_live" = 1; and __aterm_managed_derive_reroute
+    __aterm_reroute_path_front
+end
+
+# The hot path: every fish_prompt and every fish_preexec. Builtin-only — see above.
+function __aterm_managed_path_live
+    if test "$__aterm_managed_live" != 1
+        return 0
+    end
+    # 1. The hook: sourced when the text on disk is not the text last sourced. An
+    #    ABSENT hook falls through: steps 2 and 3 keep the reroute dir in front
+    #    regardless (review finding 2026-09-16: an early return here left a PATH
+    #    prepend at the prompt shadowing the reroute stubs for the shell's life).
+    __aterm_atpkg_hook_read
+    if test "$__aterm_atpkg_hook_now" != "$__aterm_atpkg_hook_seen"
+        set -g __aterm_atpkg_hook_seen "$__aterm_atpkg_hook_now"
+        if test -n "$__aterm_atpkg_hook_now"
+            source "$__aterm_atpkg_hook"
+            __aterm_managed_derive_reroute
+            __aterm_reroute_path_front
+            return 0
+        end
+    end
+    # 2. A dir that was absent when the front was last laid: probe it again.
+    set -l refront 0
+    if test "$__aterm_managed_agents_on" != 1; and test -n "$ATPKG_AGENTS"; and test -d "$ATPKG_AGENTS"
+        set refront 1
+    end
+    if test "$__aterm_managed_reroute_on" != 1
+        if test -n "$ATERM_REROUTE_DIR"
+            if test -d "$ATERM_REROUTE_DIR"
+                set refront 1
+            end
+        else if __aterm_managed_derive_reroute
+            set refront 1
+        end
+    end
+    if test "$refront" = 1
+        __aterm_reroute_path_front
+        return 0
+    end
+    # 3. The order: assign only on a mismatch. An out-of-range $PATH index expands
+    #    to nothing, which never equals a directory, so a short $PATH mismatches.
+    set -l i 1
+    for d in $__aterm_managed_want
+        if test "$PATH[$i]" != "$d"
+            __aterm_reroute_path_front
+            return 0
+        end
+        set i (math $i + 1)
+    end
+    return 0
 end
 
 # State tracking
@@ -582,6 +776,9 @@ end
 functions -c fish_prompt __aterm_original_fish_prompt 2>/dev/null
 
 function fish_prompt
+    # The managed dirs, live (see "LIVE" above): one probe, an assign only on change.
+    __aterm_managed_path_live
+
     # Mark prompt start
     __aterm_mark_prompt_start
 
@@ -705,6 +902,10 @@ end
 
 # fish_preexec - runs before command execution
 function __aterm_fish_preexec --on-event fish_preexec
+    # The managed dirs, live — BEFORE this command resolves: a `claude` typed at a
+    # prompt that was drawn before atpkg laid agents/ must already run the twin.
+    __aterm_managed_path_live
+
     # Report command text for session memory (OSC 633;E).
     #
     # The encoded command line is captured into a QUOTED local before it is

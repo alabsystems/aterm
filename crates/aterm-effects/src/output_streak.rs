@@ -135,7 +135,7 @@ use std::time::Duration;
 use crate::cursor_glow::Geom;
 use crate::effect_util::{lerp_rgb, push_grid_quad};
 use crate::genome;
-use crate::spectrum::{clear_light_of_cyan, spectrum, spectrum_stop, spectrum_stop_position};
+use crate::spectrum::{spectrum, spectrum_stop, spectrum_stop_position};
 use crate::trail_sound::OutputGesture;
 use crate::typing_momentum::TypingMomentum;
 
@@ -289,8 +289,8 @@ pub struct StreakConfig {
     /// light ones (additive light cannot darken a pale ground, so on a light
     /// theme it would simply not exist).
     pub dark_theme: bool,
-    /// The resolved theme background `0x00RRGGBB` — the real ground the cyan law
-    /// is judged against, and the pole the light-theme shimmer is mixed toward.
+    /// The resolved theme background `0x00RRGGBB` — the pole the light-theme
+    /// shimmer is mixed toward.
     pub theme_bg: u32,
     /// The resolved theme foreground `0x00RRGGBB` — the legibility grounding mix
     /// on light themes.
@@ -1164,8 +1164,7 @@ impl OutputStreak {
         let (w, h) = (geom.cw as i32, geom.ch as i32);
 
         if cfg.dark_theme {
-            let premul = clear_light_of_cyan(premul_rgb(base, a), 0, cfg.theme_bg);
-            push_grid_quad(out, geom, x, y, w, h, premul, 0);
+            push_grid_quad(out, geom, x, y, w, h, premul_rgb(base, a), 0);
         } else {
             // SHADOW-SHIMMER: the spectrum hue pulled toward the near-black pole
             // and grounded toward the theme's own ink for legibility, composited

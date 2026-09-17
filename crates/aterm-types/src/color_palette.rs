@@ -128,8 +128,15 @@ impl ColorPalette {
     /// over `overrides` was not free in practice).
     #[must_use]
     pub fn get(&self, index: u8) -> Rgb {
-        // `u8 -> usize` is always < 256, so this index is in bounds by type.
-        self.cache[usize::from(index)]
+        // `u8 -> usize` is always < 256, so this index is in bounds by type —
+        // and spelled as a PRIMITIVE CAST that fact is machine-checked rather
+        // than asserted in this comment. `usize::from` is a trait call whose
+        // body is not in the lowered bundle, so Trust cannot see through it and
+        // files the bounds obligation `unsupported`; `index as usize` is the
+        // identical infallible widening and PROVES. Measured on the shipped
+        // compiler, the two spellings side by side in one file: `usize::from`
+        // leaves 2 obligations unproved, `as usize` leaves none.
+        self.cache[index as usize]
     }
 
     /// Set the RGB value for an indexed color.
@@ -162,7 +169,7 @@ impl ColorPalette {
         // Keep the dense cache in step. Correct for BOTH arms: on the
         // remove-override arm `color == default`, which is precisely the value
         // `get` must now return, so the single unconditional write covers it.
-        self.cache[usize::from(index)] = color;
+        self.cache[index as usize] = color;
     }
 
     /// Reset a single color to its default value.
@@ -175,7 +182,7 @@ impl ColorPalette {
         // "get() falls through to the default" behaviour either way. Keyed by
         // COLOR INDEX, not by position in `overrides`, so `swap_remove`'s
         // reshuffle needs no fixup.
-        self.cache[usize::from(index)] = Self::default_color(index);
+        self.cache[index as usize] = Self::default_color(index);
     }
 
     /// Reset the entire palette to defaults.

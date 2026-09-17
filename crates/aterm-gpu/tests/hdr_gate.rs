@@ -111,6 +111,27 @@ fn hdr_gate_exhaustive_attach_present_chain() {
 /// reconfiguration or checked after a same-size Windows HDR-state change. Drive
 /// the genuine shipping policy, project its result onto the derived model, and
 /// require the exact modeled successor for both re-tag outcomes.
+///
+/// THE PLANNER HALF. This file can only reach `hdr_reconfigure_plan`, which
+/// decides; the metadata each decision must actually apply lives on
+/// `WindowGpu::apply_hdr_reconfigure_plan` / `apply_hdr_surface_upgrade`, both
+/// private. So the other half of the `HdrReconfigureRetag` binding — the one
+/// that drives those applies on a real window and reads `capture_linear` back
+/// off them rather than off the plan the test already holds — is the in-crate
+/// `renderer::tests::hdr_reconfigure_apply_conforms_to_retag_model`. Every
+/// action of the machine is `#[refines]`-anchored on both halves; neither alone
+/// is the binding. Widening `WindowGpu`'s API with two HDR metadata mutators
+/// purely to pull that test in here is the trade that was deliberately refused.
+///
+/// Neither half can reach the `GpuSurface`, so the model's remaining two
+/// surface-side obligations — installing the resolved format, and the
+/// `if surf.is_hdr()` guard that separates `UpgradeSucceeds` from
+/// `UpgradeFails` — are held by ORDER, in
+/// [`every_live_surface_reconfigure_routes_through_hdr_recovery`] below. That is
+/// a source-order gate, NOT a `#[refines]` anchor: it witnesses no state, so it
+/// is deliberately not counted as a third half.
+/// `aterm_spec::derive::hdr_reconfigure_retag_model` carries the per-variable
+/// accounting of which instrument holds what.
 #[test]
 fn hdr_reconfigure_retag_policy_conforms_and_old_ignore_failure_is_rejected() {
     let model = hdr_reconfigure_retag_model();
@@ -330,6 +351,17 @@ fn hdr_live_upgrade_gate_is_complete_and_hot_reloadable() {
 /// This intentionally scans source rather than mocking wgpu: the regression was
 /// a call-site omission, and neither CI nor non-Windows unit tests can force the
 /// DX12 swapchain recreation that clears the colour-space tag.
+///
+/// For the same reason this test also carries the SURFACE-SIDE obligations of
+/// the `HdrReconfigureRetag` binding — by order, not by anchor, since a source
+/// scan witnesses no state. The two model-bound conformance tests project
+/// a `WindowGpu`, which never sees the surface, so two obligations reach no
+/// projection at all: `FallbackToSdr` must install the retained SDR format
+/// before it flips capture metadata (`is_f16` in the projection is the planner's
+/// answer, not a read-back), and the live upgrade must publish extended-linear
+/// metadata only if configure+tag actually left an f16 surface. Both are pinned
+/// below as ORDER within their region — a weaker instrument than a projection,
+/// named as such rather than left implied by a green anchor count.
 #[test]
 fn every_live_surface_reconfigure_routes_through_hdr_recovery() {
     let source = include_str!("../src/renderer.rs");
@@ -381,6 +413,52 @@ fn every_live_surface_reconfigure_routes_through_hdr_recovery() {
         "post-configure and same-size live validation must share one recovery decision"
     );
 
+    // THE FORMAT HALF of every `HdrReconfigureRetag` transition. The in-crate
+    // conformance reads `capture_linear` back off the window, but `is_f16` there
+    // is the PLANNER's resolved format: the configure that actually installs it
+    // lives on the `GpuSurface`, here, behind a DX12 swapchain recreation no unit
+    // test can force. So the atomic fallback is held by order, not by projection.
+    let recovery = source
+        .split_once("    fn finish_surface_color_space_recovery(")
+        .expect("the shared recovery decision must remain present")
+        .1
+        .split_once("    fn reconcile_live_hdr_state_if_due(")
+        .expect("live HDR-state reconciliation must follow the shared recovery decision")
+        .0;
+    let decide = recovery
+        .find("hdr_reconfigure_plan(was_hdr, scrgb_retagged)")
+        .expect("recovery must drive the model-bound shipping policy");
+    let select_sdr = recovery
+        .find("surf.config.format = surf.sdr_format;")
+        .expect("the SDR escape must install the retained SDR format on the surface");
+    let configure_sdr = recovery
+        .find("surf.surface.configure(")
+        .expect("the SDR escape must configure the surface it just retargeted");
+    let publish_sdr = recovery
+        .find("self.cached_surface_format = Some(surf.sdr_format);")
+        .expect("the SDR escape must publish the retained format to later presents");
+    let reconcile_metadata = recovery
+        .find("win.apply_hdr_reconfigure_plan(plan);")
+        .expect("recovery must reconcile capture/HDR metadata");
+    assert!(
+        decide < select_sdr
+            && select_sdr < configure_sdr
+            && configure_sdr < publish_sdr
+            && publish_sdr < reconcile_metadata,
+        "FallbackToSdr must decide, retarget the surface to the retained SDR format, \
+         configure it, publish it, and only then flip capture metadata — the two halves \
+         of the atomic fallback, in that order"
+    );
+    assert_eq!(
+        recovery.matches("surf.surface.configure(").count(),
+        1,
+        "recovery configures only for the SDR escape"
+    );
+    assert!(
+        !recovery.contains("Self::tag_swapchain_scrgb("),
+        "the SDR escape must leave the 8-bit swapchain on DXGI's gamma-2.2 default"
+    );
+
     let reconcile = source
         .split_once("    fn reconcile_live_hdr_state_if_due(")
         .expect("live HDR-state reconciliation must remain present")
@@ -408,6 +486,38 @@ fn every_live_surface_reconfigure_routes_through_hdr_recovery() {
     assert!(
         probe < select_f16 && select_f16 < configure,
         "probe must precede f16 selection, which must precede shared configure+tag"
+    );
+
+    // THE BRANCH that separates `UpgradeSucceeds` from `UpgradeFails`. Whether
+    // the upgrade publishes extended-linear capture metadata is decided HERE, by
+    // re-reading the surface after configure+tag — not by the planner and not by
+    // the conformance test, which selects the apply itself. Leave this guard off
+    // and a failed scRGB tag still publishes linear capture over an SDR
+    // swapchain: exactly the model's `Buggy = 1` defect, violating
+    // `CaptureMatchesSurfaceEncoding` and `AwaitingUpgradeIsSdr`.
+    assert_eq!(
+        reconcile.matches("if surf.is_hdr() {").count(),
+        2,
+        "reconciliation branches on the live surface twice: revalidate an f16 surface, \
+         and publish an upgrade only if configure+tag actually left one"
+    );
+    let publish_guard = reconcile
+        .rfind("if surf.is_hdr() {")
+        .expect("the upgrade's publication must be guarded on the resulting surface");
+    let publish = reconcile
+        .find("win.apply_hdr_surface_upgrade();")
+        .expect("a confirmed upgrade must publish the new capture encoding");
+    assert_eq!(
+        reconcile
+            .matches("win.apply_hdr_surface_upgrade();")
+            .count(),
+        1,
+        "exactly one publication boundary for the SDR->HDR upgrade"
+    );
+    assert!(
+        configure < publish_guard && publish_guard < publish,
+        "the upgrade must configure+tag, then re-read the surface, and publish metadata \
+         only inside that guard"
     );
 
     let present = source

@@ -61,8 +61,14 @@ trust-gate = { path = "../trust-gate" }
 # cells --cell win` type-checks `-p aterm` for x86_64-pc-windows-msvc and
 # would have failed on the `std::os::unix` imports, but it lives behind
 # `tools/verify.sh --full` and nothing ran it between v0.82.0 and 2026-09-14;
-# the x86_64-pc-windows-gnu cfg-validation lane has been dead since the libc
-# swap (crates/aterm-libc has no windows-gnu cell). On non-unix targets the
+# the x86_64-pc-windows-gnu cfg-validation lane (.cargo/config.toml's
+# `[target.x86_64-pc-windows-gnu]` linker/ar pair) was dead too, from the libc
+# swap until 2026-09-16, because crates/aterm-libc listed no windows-gnu cell
+# and the lane therefore died on a `compile_error!` at the BOTTOM of the graph,
+# before one line of `cfg(windows)` code was read. That cell is listed now —
+# `cargo +stable check --target x86_64-pc-windows-gnu -p aterm` is green — and
+# crates/aterm-libc/tests/target_gate.rs is the standing guard that keeps a
+# configured lane and that cell list in step from any box. On non-unix targets the
 # `link` verb stays on the roster and refuses by name (src/main.rs
 # `link_unavailable`) instead of failing to exist.
 [target.'cfg(unix)'.dependencies]

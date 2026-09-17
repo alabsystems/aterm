@@ -159,35 +159,50 @@ impl SessionPickerState {
     /// Indices into `rows` passing the fuzzy filter, in listing order — the
     /// SAME subsequence match the palette uses, over `"title"  @sid`.
     pub(crate) fn filtered(&self) -> Vec<usize> {
+        self.filtered_indices().collect()
+    }
+
+    fn filtered_indices(&self) -> impl Iterator<Item = usize> + '_ {
         let q = self.query.to_ascii_lowercase();
-        (0..self.rows.len())
-            .filter(|&i| {
-                let hay = Self::row_line(&self.rows[i]);
-                fuzzy_subsequence(&q, hay.chars().map(|c| c.to_ascii_lowercase()))
-            })
-            .collect()
+        (0..self.rows.len()).filter(move |&i| {
+            // Opening the picker shows every session. No display-string formatting
+            // or title sanitization is needed to answer an empty filter.
+            if q.is_empty() {
+                return true;
+            }
+            let hay = Self::row_line(&self.rows[i]);
+            fuzzy_subsequence(&q, hay.chars().map(|c| c.to_ascii_lowercase()))
+        })
+    }
+
+    fn filtered_count(&self) -> usize {
+        if self.query.is_empty() {
+            self.rows.len()
+        } else {
+            self.filtered_indices().count()
+        }
     }
 
     fn body(&self) -> usize {
-        self.filtered().len().min(MAX_ROWS)
+        self.filtered_count().min(MAX_ROWS)
     }
 
     /// Move the cursor over the FILTERED set (wrapping), keeping it on-screen.
     pub(crate) fn move_selection(&mut self, delta: isize) {
         self.pointer_over = None;
         self.pointer_armed = None;
-        let n = self.filtered().len();
+        let n = self.filtered_count();
         if n == 0 {
             return;
         }
         self.selected = (self.selected as isize + delta).rem_euclid(n as isize) as usize;
-        self.clamp_scroll();
+        self.clamp_scroll_for_count(n);
     }
 
     /// Scroll the band without wrapping (wheel); the cursor keeps its slot.
     pub(crate) fn scroll_by(&mut self, delta: isize) -> bool {
-        let n = self.filtered().len();
-        let body = self.body();
+        let n = self.filtered_count();
+        let body = n.min(MAX_ROWS);
         let before = (
             self.selected,
             self.scroll,
@@ -204,7 +219,7 @@ impl SessionPickerState {
             let relative = self.selected.saturating_sub(self.scroll).min(body - 1);
             self.scroll = self.scroll.saturating_add_signed(delta).min(max_scroll);
             self.selected = (self.scroll + relative).min(n - 1);
-            self.clamp_scroll();
+            self.clamp_scroll_for_count(n);
         }
         before
             != (
@@ -220,22 +235,22 @@ impl SessionPickerState {
     pub(crate) fn select(&mut self, idx: usize) {
         self.pointer_over = None;
         self.pointer_armed = None;
-        let n = self.filtered().len();
+        let n = self.filtered_count();
         if n == 0 {
             return;
         }
         self.selected = idx.min(n - 1);
-        self.clamp_scroll();
+        self.clamp_scroll_for_count(n);
     }
 
     /// Hover a filtered row, dragging the selection with the pointer.
     pub(crate) fn pointer_hover(&mut self, idx: Option<usize>) -> bool {
         let before = (self.selected, self.scroll, self.pointer_over);
         if let Some(idx) = idx {
-            let n = self.filtered().len();
+            let n = self.filtered_count();
             if n > 0 {
                 self.selected = idx.min(n - 1);
-                self.clamp_scroll();
+                self.clamp_scroll_for_count(n);
             }
         }
         self.pointer_over = idx;
@@ -264,9 +279,8 @@ impl SessionPickerState {
         self.pointer_over.is_some()
     }
 
-    fn clamp_scroll(&mut self) {
-        let n = self.filtered().len();
-        let body = self.body();
+    fn clamp_scroll_for_count(&mut self, n: usize) {
+        let body = n.min(MAX_ROWS);
         if self.selected >= n {
             self.selected = n.saturating_sub(1);
         }
@@ -287,19 +301,12 @@ impl SessionPickerState {
 
     /// The cursor's row, or `None` when the filter matches nothing.
     pub(crate) fn selected_row(&self) -> Option<&PickerRow> {
-        let vis = self.filtered();
-        vis.get(self.selected).map(|&i| &self.rows[i])
+        self.row_at_filtered(self.selected)
     }
 
     /// The row at an exact FILTERED index (pointer release path).
     pub(crate) fn row_at_filtered(&self, idx: usize) -> Option<&PickerRow> {
-        let vis = self.filtered();
-        vis.get(idx).map(|&i| &self.rows[i])
-    }
-
-    /// The overlay height: chrome + the (capped) filtered band, never `0`.
-    pub(crate) fn wanted_rows(&self) -> usize {
-        CHROME_ROWS + self.filtered().len().clamp(1, MAX_ROWS)
+        self.filtered_indices().nth(idx).map(|i| &self.rows[i])
     }
 
     /// `(scroll, total, visible)` for `controls front`.
@@ -380,21 +387,21 @@ impl SessionPickerState {
         let slot = usize::try_from(node.0 & u64::from(u32::MAX))
             .ok()?
             .checked_sub(1)?;
-        (a11y_node_id_for(self.a11y_epoch(), slot) == node && slot < self.filtered().len())
+        (a11y_node_id_for(self.a11y_epoch(), slot) == node && slot < self.filtered_count())
             .then_some(slot)
     }
 }
 
 /// One pure geometry projection shared by paint and hit-testing — the
 /// palette's centred, width-capped, content-height card.
-fn picker_layout(state: &SessionPickerState, g: &SettingsGeom) -> PickerLayout {
+fn picker_layout_for_count(count: usize, g: &SettingsGeom) -> PickerLayout {
     let tray_w = (g.cols as f32 * g.cw).max(0.0);
     let tray_h = (g.panel_rows as f32 * g.ch).max(0.0);
     let desired_margin = (g.cw * 2.0).max(16.0);
     let max_margin = (tray_w * 0.5 - g.cw.max(0.0)).max(0.0);
     let margin = desired_margin.min(max_margin);
     let card_w = (tray_w - margin * 2.0).clamp(0.0, MAX_CARD_WIDTH);
-    let card_rows = state.wanted_rows().min(g.panel_rows);
+    let card_rows = (CHROME_ROWS + count.clamp(1, MAX_ROWS)).min(g.panel_rows);
     let card_h = (card_rows as f32 * g.ch).clamp(0.0, tray_h);
     PickerLayout {
         card: (
@@ -404,8 +411,15 @@ fn picker_layout(state: &SessionPickerState, g: &SettingsGeom) -> PickerLayout {
             card_h,
         ),
         card_rows,
-        body_rows: state.body().min(card_rows.saturating_sub(CHROME_ROWS)),
+        body_rows: count
+            .min(MAX_ROWS)
+            .min(card_rows.saturating_sub(CHROME_ROWS)),
     }
+}
+
+#[cfg(test)]
+fn picker_layout(state: &SessionPickerState, g: &SettingsGeom) -> PickerLayout {
+    picker_layout_for_count(state.filtered_count(), g)
 }
 
 /// Exact painted selection/hit rectangle for one VISIBLE slot.
@@ -434,13 +448,13 @@ pub(crate) fn picker_row_hit(
     x: f32,
     y: f32,
 ) -> Option<usize> {
-    let visible = state.filtered();
-    let layout = picker_layout(state, g);
+    let count = state.filtered_count();
+    let layout = picker_layout_for_count(count, g);
     for slot in 0..layout.body_rows {
         let (rx, ry, rw, rh) = picker_row_rect_in(&layout, g, slot)?;
         if x >= rx && x < rx + rw && y >= ry && y < ry + rh {
             let filtered = state.scroll + slot;
-            return visible.get(filtered).map(|_| filtered);
+            return (filtered < count).then_some(filtered);
         }
     }
     None
@@ -451,7 +465,8 @@ pub(crate) fn picker_row_hit(
 pub(crate) fn picker_tray(state: &SessionPickerState, g: &SettingsGeom, theme: Theme) -> TrayInput {
     let r = Roles::from_theme(theme);
     let (cw, ch, px) = (g.cw, g.ch, g.font_px);
-    let layout = picker_layout(state, g);
+    let vis = state.filtered();
+    let layout = picker_layout_for_count(vis.len(), g);
     let (card_x, card_y, card_w, card_h) = layout.card;
     let radius = (ch * 0.6).min(14.0);
     let mut prims: Vec<DrawPrim> = vec![
@@ -540,7 +555,6 @@ pub(crate) fn picker_tray(state: &SessionPickerState, g: &SettingsGeom, theme: T
     }
 
     // Pinned query row (the palette's framed field).
-    let vis = state.filtered();
     let qy = card_y + ch;
     prims.push(DrawPrim::Stroke {
         x: card_x + cw * 1.5,

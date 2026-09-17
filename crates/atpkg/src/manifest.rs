@@ -184,9 +184,25 @@ pub struct Channel {
     /// Monotonic no-downgrade gate for the channel's coherence group.
     #[serde(default)]
     pub channel_build: u64,
-    /// Yank floor: a pinned build below this is force-upgraded / tombstoned at apply (§7).
+    /// CHANNEL-WIDE yank floor: a pinned build below this is force-upgraded / tombstoned at
+    /// apply (§7). It is compared against EVERY program's OWN build counter, so it is only
+    /// meaningful on a channel whose members share one numbering — the app channel (§16.1),
+    /// where the only member is `aterm`. The toolchain channel's members count
+    /// independently (the live index pins `nn = 108` beside `trust-mc = 20065`), so a scalar
+    /// floor raised to revoke ONE program's builds would tombstone every program numbered
+    /// below it; floor those through [`Self::min_build_by_program`], which is per program.
     #[serde(default)]
     pub min_build: u64,
+    /// PER-PROGRAM yank floors (`program -> floor`) — the floor to use on a channel whose
+    /// members have INDEPENDENT build counters. A program's effective floor is
+    /// [`Self::min_build_for`]: the MAX of its entry here and the channel-wide
+    /// [`Self::min_build`]. Max, not override, so this key can only ever RAISE a floor —
+    /// an entry can never lower a program below the channel-wide floor an older client
+    /// already enforces, and a client that predates the key is never stricter than one that
+    /// knows it. Absent ⇒ every program's floor is the channel-wide one (the old
+    /// behaviour, byte for byte).
+    #[serde(default)]
+    pub min_build_by_program: BTreeMap<String, u64>,
     /// Per-program revocations (`"trust@4790"`), enforced at apply (§7).
     #[serde(default)]
     pub yanked: Vec<String>,
@@ -212,6 +228,24 @@ pub struct Channel {
 }
 
 impl Channel {
+    /// The effective yank floor for ONE program: the MAX of the channel-wide
+    /// [`Self::min_build`] and that program's [`Self::min_build_by_program`] entry.
+    ///
+    /// EVERY floor comparison in the client goes through here — [`crate::gate::decide`],
+    /// [`crate::gate::current_build_ok`], the rollback target predicate
+    /// ([`crate::flow::rollback`]) and the app-apply gate ([`crate::appgate`]) — because a
+    /// build number is only comparable to another build number OF THE SAME PROGRAM. The
+    /// counters in one channel are independent (`nn = 108` and `trust-mc = 20065` are both
+    /// current), so comparing one program's pin against a floor meant for another is a
+    /// category error: it would tombstone every working tool whose numbering happens to be
+    /// smaller. A channel that sets no per-program entry keeps the channel-wide floor for
+    /// every program, exactly as before the key existed.
+    #[must_use]
+    pub fn min_build_for(&self, program: &str) -> u64 {
+        self.min_build
+            .max(self.min_build_by_program.get(program).copied().unwrap_or(0))
+    }
+
     /// This channel as seen from ONE target: [`Self::pin`] with `pin_by_target[triple]`
     /// laid over it — an overlay entry REPLACES the platform-agnostic pin for that program
     /// and an entry for a program `pin` never named ADDS it. Every other field is carried
@@ -875,6 +909,57 @@ trust_mc_rev = "0.67.0"
         )
     }
 
+    /// REGRESSION (audit 2026-09-15): the yank floor a multi-program channel needs is PER
+    /// PROGRAM. A channel-wide floor is compared against every program's own counter, and the
+    /// counters are independent (`nn = 108` beside `trust-mc = 20065` on the live index), so
+    /// the only channel-wide value that did not tombstone unrelated programs was 0.
+    #[test]
+    fn a_per_program_min_build_floors_one_program_only() {
+        let body = format!(
+            r#"
+schema = 2
+index_build = 41
+valid_until = "2026-07-05T12:00:00Z"
+machine_id = "{id}"
+roster_seq = {seq}
+
+[programs.trust]
+repo = "trust"
+policy = "prebuilt-only"
+
+[programs.nn]
+repo = "nn"
+policy = "prebuilt-only"
+
+[[channels]]
+name = "stable"
+channel_build = 137
+min_build = 0
+min_build_by_program = {{ trust = 7000 }}
+pin = {{ trust = 7100, nn = 108 }}
+"#,
+            id = testkit::MACHINE_ID,
+            seq = testkit::SEQ
+        );
+        let idx = parse_index(&verified(&body)).expect("a per-program floor parses");
+        let ch = &idx.channels[0];
+        assert_eq!(ch.min_build_for("trust"), 7000, "the floored program");
+        assert_eq!(ch.min_build_for("nn"), 0, "a program the floor never named");
+        // The floor rides the per-target view like every other field.
+        let view = idx
+            .channel_for("stable", "aarch64-apple-darwin")
+            .expect("stable exists");
+        assert_eq!(view.min_build_for("trust"), 7000);
+        assert_eq!(view.min_build_for("nn"), 0);
+        // And an index WITHOUT the key is unchanged: every program keeps the channel-wide
+        // floor, so an old published index decides exactly as it did before the key existed.
+        let old = parse_index(&verified(&full_index())).expect("valid index parses");
+        let och = &old.channels[0];
+        assert!(och.min_build_by_program.is_empty());
+        assert_eq!(och.min_build_for("ay"), och.min_build);
+        assert_eq!(och.min_build_for("trust"), och.min_build);
+    }
+
     #[test]
     fn parses_a_full_index_and_its_attribution() {
         let idx = parse_index(&verified(&full_index())).expect("valid index parses");
@@ -962,6 +1047,88 @@ trust_mc_rev = "0.67.0"
             idx.channel_for("nightly", "x86_64-unknown-linux-gnu")
                 .is_none(),
             "no such channel"
+        );
+    }
+
+    /// THE SET A PUBLISHER MUST CARRY: over every triple an index names, the builds
+    /// clients resolve are `pin` UNION every `pin_by_target` overlay — never one of the
+    /// two, and never one target's view.
+    ///
+    /// This is the law tools/atpkg-mirror-public.sh's work list is derived from
+    /// (`atpkg_index_pin_union`, tools/atpkg-publish-lib.sh). The mirror read the `pin`
+    /// line alone until 2026-09-16, so a toolchain sealed on a triple that does not own
+    /// `pin` — which publishes ENTIRELY as an overlay, by
+    /// tools/atpkg-publish-rustc-group.sh's design — was signed into the staging registry,
+    /// pinned by a PUBLIC index, and then never mirrored: every client on that triple
+    /// asked the public owner for a release that is not there. The two halves below are
+    /// exactly what makes a union necessary, and a change to either invalidates that
+    /// reader:
+    ///
+    ///   * an overlay build is resolvable and appears in NO `pin` row (so `pin` alone is
+    ///     not enough), and
+    ///   * the `pin` build an overlay MASKS is still resolvable from every other triple
+    ///     (so the overlays alone are not enough, and a masked build may never be dropped).
+    #[test]
+    fn the_builds_clients_resolve_are_pin_union_every_overlay() {
+        use std::collections::BTreeSet;
+
+        let body = full_index().replace(
+            "[channels.meta]",
+            "pin_by_target = { \"x86_64-unknown-linux-gnu\" = { trust = 9122, nn = 108 }, \
+             \"aarch64-unknown-linux-gnu\" = { trust = 9123 } }\n[channels.meta]",
+        );
+        let idx = parse_index(&verified(&body)).expect("an index with two overlays parses");
+        let ch = &idx.channels[0];
+
+        // The named triples: `pin` serves every target, each overlay key one more.
+        let mut triples: BTreeSet<&str> = ch.pin_by_target.keys().map(String::as_str).collect();
+        assert_eq!(triples.len(), 2, "the fixture names two overlaid triples");
+        triples.insert("aarch64-apple-darwin"); // a target no overlay names
+
+        // What some client somewhere actually resolves.
+        let resolvable: BTreeSet<(String, u64)> = triples
+            .iter()
+            .flat_map(|t| {
+                idx.channel_for(&ch.name, t)
+                    .expect("stable exists")
+                    .pin
+                    .into_iter()
+            })
+            .collect();
+
+        // What a publisher reading the two keys would carry.
+        let declared: BTreeSet<(String, u64)> = ch
+            .pin
+            .iter()
+            .map(|(p, b)| (p.clone(), *b))
+            .chain(
+                ch.pin_by_target
+                    .values()
+                    .flat_map(|o| o.iter().map(|(p, b)| (p.clone(), *b))),
+            )
+            .collect();
+
+        assert_eq!(
+            resolvable, declared,
+            "the resolvable set IS `pin` ∪ every overlay — if this stops holding, \
+             tools/atpkg-publish-lib.sh's atpkg_index_pin_union no longer describes \
+             what the public mirror has to carry"
+        );
+
+        // …and neither key alone covers it, which is the whole reason for a union.
+        let pin_only: BTreeSet<(String, u64)> =
+            ch.pin.iter().map(|(p, b)| (p.clone(), *b)).collect();
+        assert!(
+            resolvable.contains(&("trust".to_string(), 9122))
+                && resolvable.contains(&("nn".to_string(), 108))
+                && !pin_only.contains(&("trust".to_string(), 9122))
+                && !pin_only.contains(&("nn".to_string(), 108)),
+            "an overlay build is resolvable and appears in no `pin` row"
+        );
+        assert!(
+            resolvable.contains(&("trust".to_string(), 4821)),
+            "the `pin` build an overlay masks is still resolved by every other target, \
+             so a publisher may never drop it in favour of the overlay"
         );
     }
 

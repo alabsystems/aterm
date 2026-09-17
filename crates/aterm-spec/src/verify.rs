@@ -1637,6 +1637,45 @@ fn transition_trace_json(
     )
 }
 
+/// PER-INVARIANT non-vacuity: the invariants of `m` that NO `Buggy = 1` member
+/// falsifies when each is checked ALONE, in model order.
+///
+/// **Why isolating them matters.** `prove_and_catch` stops at the FIRST violated
+/// invariant, so a model passes it with one live property carrying the whole
+/// catch while every other invariant is a GHOST — true by construction,
+/// unfalsifiable by any mutant, stating nothing about the code. That is not
+/// hypothetical: `press_custody_model` shipped it once over a self-reported flag,
+/// and `selection_custody_model` shipped it again with five of eight invariants
+/// unfalsifiable. Both were caught by hand, in the one test file someone thought
+/// to check.
+///
+/// A non-empty result is NOT automatically a defect. A model's SPACE guards
+/// (`StateBounds` and friends) state the bounds rather than a design claim, and
+/// are expected here — which is why the two callers differ in what they do with
+/// the list: the per-model gates name their space guards and demand the rest be
+/// empty, while the workspace ratchet holds the whole set flat.
+///
+/// # Panics
+///
+/// Propagates the interpreter's own panic for a model it cannot evaluate (a
+/// function-valued `Expr` is TLA+-generation only). That is deliberate: an
+/// uninterpretable model must be VISIBLE to the caller, never quietly reported
+/// as carrying no ghosts — which is the same silence this whole check exists to
+/// refuse.
+#[must_use]
+pub fn uncaught_invariants(m: &Model) -> Vec<&'static str> {
+    let buggy = interp::with_buggy(m, 1);
+    m.invariants
+        .iter()
+        .filter(|inv| {
+            let mut alone = buggy.clone();
+            alone.invariants.retain(|other| other.name == inv.name);
+            interp::bmc(&alone).is_ok()
+        })
+        .map(|inv| inv.name)
+        .collect()
+}
+
 #[cfg(test)]
 mod tests {
     use super::is_pending_stub;

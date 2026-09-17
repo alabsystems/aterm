@@ -181,7 +181,11 @@ a11y-appkit = []
 # CROSS-PLATFORM accessibility via AccessKit: native tab apps and the command palette
 # map their renderer-owned semantic models to native a11y trees (UIA on Windows, AT-SPI
 # on Linux, NSAccessibility on macOS) from the SAME data the pixels consume.
-# ON by default (see `default` above) now that it links cleanly against the vendored winit
+# OFF by default since 2026-08-25 (see the `default` note above, which measures what
+# dropping it saved). It is NOT the whole story of whether the tree is built: `build.rs`
+# folds this feature together with a Linux PLATFORM FACT into one `a11y_tree` cfg, so a
+# LINUX build publishes the tree whether or not the feature is named, and on macOS and
+# Windows this row is the only way to get it. It links cleanly against the vendored winit
 # 0.30.13 (single winit instance via the workspace patch). Mutually exclusive with
 # `a11y-appkit` on macOS (both would claim the content view's accessibility tree), enforced
 # by a `compile_error!` in `accesskit_tree.rs`.
@@ -290,7 +294,8 @@ aterm-update-core = { workspace = true }
 atpkg = { workspace = true }
 libc = { workspace = true }
 winit = { workspace = true }
-# Cross-platform accessibility tree (behind the default-on `a11y-accesskit` feature).
+# Cross-platform accessibility tree (behind the opt-in `a11y-accesskit` feature —
+# NOT default-on since 2026-08-25; see the `[features]` note above).
 # accesskit_winit =0.33.1 targets winit ^0.30.5, satisfied by the vendored winit 0.30.13
 # through the workspace `[patch.crates-io]` redirect (so a SINGLE winit instance links).
 # EXACT-pinned: a bump to winit 0.31 would split the winit graph and break the patch (see

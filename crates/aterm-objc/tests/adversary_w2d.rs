@@ -50,6 +50,8 @@ unsafe extern "C" {
     fn method_getTypeEncoding(m: *const c_void) -> *const c_char;
     fn class_getInstanceVariable(cls: ClassPtr, name: *const c_char) -> *const c_void;
     fn ivar_getOffset(ivar: *const c_void) -> isize;
+    fn method_copyArgumentType(m: *const c_void, index: u32) -> *mut c_char;
+    fn free(p: *mut c_void);
 }
 
 /// The type encoding the runtime holds for `cls`'s `name`.
@@ -411,13 +413,59 @@ fn the_three_real_block_shapes_all_satisfy_the_new_encode_bounds() {
     // cannot live in a test binary. `tests/blocks.rs` carries the positive
     // form: `enumerateLinesUsingBlock:`'s `stop` is `*mut Bool`, and it used to
     // be `*mut bool` until this bound refused it.
+    // `^c`, not `*`, on x86_64: clang encodes the `BOOL` typedef, not the
+    // `signed char *` it aliases — measured against Foundation's own
+    // `-[NSFileManager fileExistsAtPath:isDirectory:]` (`c32@0:8@16^c24`) on
+    // an Intel Mac, 2026-09-06. This pin only transcribes that measurement;
+    // the next test asks the runtime for it on every run.
     assert_eq!(
         <*mut Bool as Encode>::ENCODING,
         if cfg!(target_arch = "aarch64") {
             "^B"
         } else {
-            "*"
+            "^c"
         }
+    );
+}
+
+/// `BOOL *`'s encoding, asked of the RUNTIME instead of transcribed.
+///
+/// The pin above compares the constant with a literal typed from a
+/// measurement, and it was green while the x86_64 literal was wrong (`*`),
+/// because the constant and the literal agreed with each other and with
+/// nothing else. This reads Foundation's own compiled method instead: argument
+/// 3 of `-[NSFileManager fileExistsAtPath:isDirectory:]` is its
+/// `BOOL *isDirectory`, encoded by clang when Apple built Foundation. On
+/// x86_64 that is `^c` (the method is `c32@0:8@16^c24`, measured on an Intel
+/// Mac, macOS 13.7.8), and this test is red there against the old `*`. On
+/// arm64 the EXPECTED answer is `^B`, inferred from the arm64
+/// `@encode(BOOL *)` that `encode.rs` records rather than measured: the test
+/// is armed on both arches, but it was written and run on an Intel Mac and has
+/// not been run on arm64.
+#[test]
+fn bool_ptr_encodes_what_foundation_compiled_for_its_bool_out_parameter() {
+    let cls = aterm_objc::class(c"NSFileManager");
+    assert!(!cls.is_null(), "Foundation's NSFileManager is registered");
+    let name = c"fileExistsAtPath:isDirectory:";
+    // SAFETY: side-effect-free runtime queries on a registered class.
+    // `method_copyArgumentType` answers a `malloc`ed copy (null past the last
+    // argument), which is read and then freed exactly once.
+    let arg3 = unsafe {
+        let m = class_getInstanceMethod(cls, sel_uncached(name));
+        assert!(!m.is_null(), "{name:?} is a method of NSFileManager");
+        let p = method_copyArgumentType(m, 3);
+        assert!(!p.is_null(), "{name:?} has an argument 3");
+        let s = CStr::from_ptr(p).to_string_lossy().into_owned();
+        free(p.cast());
+        s
+    };
+    let whole = encoding_of(cls, name);
+    eprintln!("-[NSFileManager fileExistsAtPath:isDirectory:] = {whole}; argument 3 = {arg3}");
+    assert_eq!(
+        <*mut Bool as Encode>::ENCODING,
+        arg3,
+        "`*mut Bool` must encode what Foundation's own `BOOL *` argument does \
+         (-[NSFileManager fileExistsAtPath:isDirectory:] is {whole})"
     );
 }
 

@@ -252,7 +252,7 @@ pub enum MenuAction {
     /// Promote the front window's PROMOTABLE kitty — the tenured program cat
     /// on its glass, else the launch kitty (the base cat generated at launch,
     /// per computer; owner rulings 2026-08-17) — into the durable kitty
-    /// registry and pin it as the cursor companion (`App::favourite_kitty`).
+    /// registry and pin it as the cursor companion (`App::favourite_kitty_checked`).
     /// Owner: "if somebody really likes that kitty it goes into the kitty
     /// registry" — and since a pinned favourite outranks both program cats
     /// and the launch kitty, this is also how a cat you like is KEPT across
@@ -262,6 +262,16 @@ pub enum MenuAction {
     /// pin is transferable, not toggleable. Wire id 46 and the legacy invoke
     /// spelling `FavouriteSessionKitty` are kept ([`canonical_invoke_name`]).
     FavouriteKitty,
+    /// **WEAR THE NEXT CAT IN THE COLLECTION.** The switch
+    /// [`Self::FavouriteKitty`] cannot make: that one pins the cat that would
+    /// ride ANYWAY (the focused window's tenured program cat, else the launch
+    /// kitty), so pressing it never puts on a DIFFERENT cat — to wear another
+    /// you had to make it appear first, by relaunching or by running a program
+    /// long enough to earn tenure. This walks the collection instead, one cat
+    /// per press, wrapping at the end, which is a picker you can use without
+    /// a picker. `kitty wear <key>` on the control socket is the addressed
+    /// form for anyone who knows which cat they want.
+    NextKitty,
     /// Toggle the process-wide serious-mode policy. While enabled it suppresses
     /// every audible and decorative effect without overwriting the underlying
     /// preferences; disabling it restores those requested settings exactly.
@@ -392,6 +402,7 @@ impl MenuAction {
             MenuAction::ShowConnectionMap => 54,
             MenuAction::ConfigureConnection => 55,
             MenuAction::DisconnectSession => 56,
+            MenuAction::NextKitty => 57,
         }
     }
 
@@ -453,6 +464,7 @@ impl MenuAction {
             54 => MenuAction::ShowConnectionMap,
             55 => MenuAction::ConfigureConnection,
             56 => MenuAction::DisconnectSession,
+            57 => MenuAction::NextKitty,
             _ => return None,
         })
     }
@@ -650,6 +662,11 @@ impl MenuAction {
             // and its `kitty-log.toml` mirror) — never `aterm.toml`, no security
             // knob, no capability escalation. That is why it is not `ConfigWrite`.
             | MenuAction::FavouriteKitty
+            // Same ledger, same reasoning: walking to the next collected cat
+            // moves one pin stamp in the toy ledger and changes what the user
+            // is looking at. Nothing durable outside it, so `WriteInput`, which
+            // is also the class the `kitty` control verb carries.
+            | MenuAction::NextKitty
             // Opens the inline pin editor. Its eventual write is `meta set title`,
             // which the control layer's own `escalated_op` already classifies as
             // `WriteInput` (not `ConfigWrite` — nothing durable on disk is
@@ -706,6 +723,7 @@ impl MenuAction {
             "SplitHorizontal" => Some(MenuAction::SplitHorizontal),
             "ToggleMatrixRain" => Some(MenuAction::ToggleMatrixRain),
             "FavouriteKitty" => Some(MenuAction::FavouriteKitty),
+            "NextKitty" => Some(MenuAction::NextKitty),
             "ToggleSeriousMode" => Some(MenuAction::ToggleSeriousMode),
             "ToggleSettings" => Some(MenuAction::ToggleSettings),
             "Packages" => Some(MenuAction::Packages),
@@ -1006,6 +1024,12 @@ const VIEW_MENU: &[MenuEntry] = &[
     Item {
         label: "Favourite This Kitty",
         action: MenuAction::FavouriteKitty,
+        key: "",
+        mods: MenuMods::None,
+    },
+    Item {
+        label: "Next Kitty",
+        action: MenuAction::NextKitty,
         key: "",
         mods: MenuMods::None,
     },
@@ -3285,6 +3309,7 @@ mod tests {
         MenuAction::ToggleSeriousMode,
         MenuAction::ToggleMatrixRain,
         MenuAction::FavouriteKitty,
+        MenuAction::NextKitty,
         MenuAction::ToggleSettings,
         MenuAction::Packages,
         MenuAction::OpenPalette,

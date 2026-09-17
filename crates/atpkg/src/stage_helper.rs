@@ -112,8 +112,11 @@ const SPEC_HEADER: &str = "atpkg-stage-spec v1";
 
 /// How long the parent tolerates "no result, no status AND no running job" before calling
 /// the lane dead — covers launchd's start latency (the wrapper's `status` file, written
-/// the moment the helper exits, is what normally ends the wait on a failure).
-const EXIT_GRACE: Duration = Duration::from_secs(3);
+/// the moment the helper exits, is what normally ends the wait on a failure). Ten
+/// seconds, not three (audit 2026-09-14): under load launchd has taken longer than three
+/// to start a submitted job, and a job called dead before it ran was a lane "failure"
+/// that sent a clean install down the in-process path.
+const EXIT_GRACE: Duration = Duration::from_secs(10);
 
 /// The absolute ceiling on one staged extraction (the shipped `trust` member is 3.4 GB;
 /// a slow disk is minutes, never hours). Past this the lane is declared wedged — a lane
@@ -224,7 +227,9 @@ pub fn decode_spec(text: &str) -> Result<(StageSpec, PathBuf, PathBuf), String> 
     Ok((spec, archive, dest))
 }
 
-fn unhex(s: &str) -> Result<Vec<u8>, String> {
+/// Hex (lowercase, as [`crate::tree::hex`] renders) back to bytes; shared with the
+/// view lane's spec ([`crate::seam`]).
+pub(crate) fn unhex(s: &str) -> Result<Vec<u8>, String> {
     let bytes = s.as_bytes();
     if !bytes.len().is_multiple_of(2) {
         return Err(format!("odd-length hex value: {s:?}"));
@@ -250,14 +255,15 @@ fn utf8(raw: Vec<u8>, what: &str) -> Result<String, String> {
     String::from_utf8(raw).map_err(|_| format!("{what} is not UTF-8"))
 }
 
+/// Raw bytes as a path (OS bytes on unix); shared with the view lane's spec.
 #[cfg(unix)]
-fn path_of(raw: Vec<u8>) -> PathBuf {
+pub(crate) fn path_of(raw: Vec<u8>) -> PathBuf {
     use std::os::unix::ffi::OsStringExt as _;
     PathBuf::from(std::ffi::OsString::from_vec(raw))
 }
 
 #[cfg(not(unix))]
-fn path_of(raw: Vec<u8>) -> PathBuf {
+pub(crate) fn path_of(raw: Vec<u8>) -> PathBuf {
     PathBuf::from(String::from_utf8_lossy(&raw).into_owned())
 }
 
@@ -269,8 +275,11 @@ fn path_of(raw: Vec<u8>) -> PathBuf {
 /// the ONE producer ([`crate::install::stage_payload_spec`]), and answers in
 /// `<spec-dir>/result` — `ok\n<tree_root>\n` or `err\n<message>\n`, written temp+rename so
 /// the parent never reads a half-written answer. Touches nothing else: no config, no store
-/// lock, no status.
-pub fn run_helper(args: &[String]) -> ExitCode {
+/// lock, no status. The argument is the spec PATH, taken as the OS bytes it is: a prefix
+/// under a non-UTF-8 name reached the helper through a lossy conversion before
+/// 2026-09-15 and could not be opened, which the lane then counted as its own failure.
+pub fn run_helper(args: &[std::ffi::OsString]) -> ExitCode {
+    arm_parent_watchdog();
     let Some(spec_path) = args.first().map(PathBuf::from) else {
         eprintln!("atpkg {HIDDEN_VERB}: usage: {HIDDEN_VERB} <spec-file>");
         return ExitCode::from(2);
@@ -369,28 +378,44 @@ pub fn stage_untracked(
     let spec_text = encode_spec(spec, archive, dest);
     std::fs::write(&job.spec, spec_text).map_err(|e| format!("write spec: {e}"))?;
     job.submit(helper_exe, HIDDEN_VERB)?;
-    let waited = job.wait_for_result();
-    let root = match waited {
-        Ok(()) => job.read_result()?,
-        Err(why) => {
-            clear_dir(dest);
-            return Err(why);
-        }
-    };
-    let root = match root {
-        Ok(root) => root,
-        Err(refusal) => {
+    let outcome = (|| -> Result<Result<String, String>, String> {
+        job.wait_for_result()?;
+        job.read_result()
+    })();
+    // THE JOB IS DROPPED — its label removed, a still-running helper stopped — BEFORE
+    // `dest` is emptied for the caller: on the [`CEILING`] path the helper is by
+    // definition still extracting into `dest`, and an in-process fallback that then
+    // extracts into the same directory would race it (audit 2026-09-14).
+    drop(job);
+    let root = match outcome {
+        Ok(Ok(root)) => root,
+        Ok(Err(refusal)) => {
             clear_dir(dest);
             return Err(format!(
                 "the untracked helper refused the payload: {refusal}"
             ));
         }
+        Err(why) => {
+            clear_dir(dest);
+            return Err(why);
+        }
     };
     // MEASURE THE OUTCOME, do not assume it: the first regular file the job laid down
     // is read back for the tag. The caller decides what a tagged witness means under its
     // policy; this lane only reports it.
-    let witness_tagged = first_regular_file(dest)
-        .is_some_and(|witness| crate::provenance::carries_provenance(&witness));
+    let witness_tagged = match first_regular_file(dest) {
+        Ok(Some(witness)) => crate::provenance::carries_provenance(&witness),
+        // A tree with no regular file at all is not a tree the signed root would have
+        // matched; nothing to measure, nothing tagged.
+        Ok(None) => false,
+        // An unmeasured witness is not a clean one (audit 2026-09-14): a walk that
+        // failed is a lane whose outcome nobody saw.
+        Err(e) => {
+            return Err(format!(
+                "the untracked lane laid the tree, but its files cannot be inspected: {e}"
+            ));
+        }
+    };
     Ok(StagedUntracked {
         root,
         witness_tagged,
@@ -427,26 +452,27 @@ fn clear_dir(dir: &Path) {
     }
 }
 
-/// The first regular file under `dir`, depth-first in name order.
-pub(crate) fn first_regular_file(dir: &Path) -> Option<PathBuf> {
-    let mut entries: Vec<PathBuf> = std::fs::read_dir(dir)
-        .ok()?
-        .flatten()
+/// The first regular file under `dir`, depth-first in name order — `Ok(None)` for a
+/// tree with none, `Err` for a walk that could not look (an error, never "clean").
+pub(crate) fn first_regular_file(dir: &Path) -> std::io::Result<Option<PathBuf>> {
+    let mut entries: Vec<PathBuf> = std::fs::read_dir(dir)?
+        .collect::<Result<Vec<_>, _>>()?
+        .into_iter()
         .map(|e| e.path())
         .collect();
     entries.sort();
     for p in entries {
-        let meta = std::fs::symlink_metadata(&p).ok()?;
+        let meta = std::fs::symlink_metadata(&p)?;
         if meta.is_file() {
-            return Some(p);
+            return Ok(Some(p));
         }
         if meta.is_dir()
-            && let Some(found) = first_regular_file(&p)
+            && let Some(found) = first_regular_file(&p)?
         {
-            return Some(found);
+            return Ok(Some(found));
         }
     }
-    None
+    Ok(None)
 }
 
 /// How the launchd job runs the helper — decided by [`plan_helper`] from a MEASUREMENT
@@ -549,6 +575,24 @@ pub fn plan_for_exe(exe: &Path) -> Result<HelperPlan, String> {
     ))
 }
 
+/// Where THIS process keeps its bundle replica: `<lanes scratch>/replica-<pid>-0-<nonce>/`,
+/// a name the dead-pid sweep ([`Job::sweep_dead_job_dirs`]) reclaims once the process is
+/// gone. Decided once per process; the directory itself is made by the first wrapper.
+#[cfg(target_os = "macos")]
+fn process_replica_dir() -> PathBuf {
+    static DIR: std::sync::OnceLock<PathBuf> = std::sync::OnceLock::new();
+    DIR.get_or_init(|| {
+        let nonce = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_nanos() as u64)
+            .unwrap_or(0);
+        lanes_scratch()
+            .unwrap_or_else(std::env::temp_dir)
+            .join(format!("replica-{}-0-{nonce:x}", std::process::id()))
+    })
+    .clone()
+}
+
 /// The wrapper `/bin/sh -c` runs, positional: `$1` helper, `$2` spec, `$3` verb,
 /// `$4` status file, `$5` this job's label, `$6` the copy path (empty to run in place),
 /// `$7` the bundle root to replicate (empty for a free-standing helper).
@@ -560,24 +604,40 @@ pub fn plan_for_exe(exe: &Path) -> Result<HelperPlan, String> {
 /// copy's `Contents/MacOS/<name of $1>`. `find … -exec sh -c '…' "$6" {} +` rather than a
 /// `while read` loop so a name with a space or a newline cannot split; `$0` inside is
 /// the copy root. The helper's own path is absolute, as are the spec and the status
-/// file, so the `cd` into the bundle (in a subshell) changes nothing that follows. A
-/// replica that fails at any step runs nothing and is recorded as
-/// [`STATUS_COPY_FAILED`], exactly like a lone copy that could not be made.
+/// file, so the `cd` into the bundle (in a subshell) changes nothing that follows.
+/// When the ORIGINAL bundle carries a seal (`codesign --verify` passes on it), the
+/// replica is verified the same way before it runs and replicated once more if the
+/// first copy fails the check — a self-update swapping the bundle under the copy is
+/// the shape that produces a torn replica, and a torn replica is SIGKILLed at exec
+/// with nothing to say why (audit 2026-09-14); an unsealed bundle (a test's fake, a
+/// dev build) is never verified, because it could not pass. A replica that fails at
+/// every step runs nothing and is recorded as [`STATUS_COPY_FAILED`], exactly like a
+/// lone copy that could not be made.
 ///
-/// It runs the helper, records the helper's exit status — `128 + n` for a signal, the
+/// The helper runs as a CHILD the wrapper waits on, with `TERM`/`INT` trapped to kill
+/// it: `launchctl remove` (the parent's `Drop`, the [`CEILING`]) signals the wrapper,
+/// and without the trap the helper kept extracting into a directory the parent was
+/// about to empty. It records the helper's exit status — `128 + n` for a signal, the
 /// shell's convention — in `$4` (temp + rename), removes its own label and exits 0. The
 /// unconditional 0 is deliberate: `launchctl submit` keeps a job alive on failure, and a
 /// helper that could not run became a label launchd re-spawned every ten seconds; the
 /// status file, not launchd's opinion of the wrapper, is the record of what happened.
 /// The self-removal is what makes a parent killed before its `Drop` leak nothing.
 #[cfg(target_os = "macos")]
-const WRAPPER: &str = r#"exe="$1"
+const WRAPPER: &str = r#"replicate() { rm -rf "$2" && mkdir -p "$2" && ( cd "$1" && find . -type d -exec sh -c 'for d; do mkdir -p "$0/$d" || exit 1; done' "$2" {} + && find . -type l -exec sh -c 'for l; do ln -s "$(readlink "$l")" "$0/$l" || exit 1; done' "$2" {} + && find . -type f -exec sh -c 'for f; do cat "$f" > "$0/$f" || exit 1; if [ -x "$f" ]; then chmod 755 "$0/$f" || exit 1; fi; done' "$2" {} + ) && { [ "$sealed" = 0 ] || /usr/bin/codesign --verify --deep --strict "$2" >/dev/null 2>&1; }; }
+exe="$1"
 if [ -n "$7" ]; then
-  if mkdir -p "$6" && ( cd "$7" && find . -type d -exec sh -c 'for d; do mkdir -p "$0/$d" || exit 1; done' "$6" {} + && find . -type l -exec sh -c 'for l; do ln -s "$(readlink "$l")" "$0/$l" || exit 1; done' "$6" {} + && find . -type f -exec sh -c 'for f; do cat "$f" > "$0/$f" || exit 1; if [ -x "$f" ]; then chmod 755 "$0/$f" || exit 1; fi; done' "$6" {} + ); then exe="$6/Contents/MacOS/$(basename "$1")"; else exe=""; fi
+  sealed=0; /usr/bin/codesign --verify --deep --strict "$7" >/dev/null 2>&1 && sealed=1
+  if [ -x "$6/Contents/MacOS/$(basename "$1")" ] && { [ "$sealed" = 0 ] || /usr/bin/codesign --verify --deep --strict "$6" >/dev/null 2>&1; }; then exe="$6/Contents/MacOS/$(basename "$1")"
+  elif replicate "$7" "$6" || replicate "$7" "$6"; then exe="$6/Contents/MacOS/$(basename "$1")"; else exe=""; fi
 elif [ -n "$6" ]; then
   if cat "$1" > "$6" && chmod 755 "$6"; then exe="$6"; else exe=""; fi
 fi
-if [ -n "$exe" ]; then "$exe" "$3" "$2"; s=$?; else echo "atpkg-untracked: could not copy $1 to $6" >&2; s=125; fi
+if [ -n "$exe" ]; then
+  ATPKG_LANE_PARENT="$8" "$exe" "$3" "$2" & child=$!
+  trap 'kill "$child" 2>/dev/null' TERM INT
+  wait "$child"; s=$?
+else echo "atpkg-untracked: could not copy $1 to $6" >&2; s=125; fi
 printf '%s\n' "$s" > "$4.tmp" && mv -f "$4.tmp" "$4"
 /bin/launchctl remove "$5"
 exit 0
@@ -586,6 +646,47 @@ exit 0
 /// The wrapper's status when the helper could not be copied (before any exec).
 #[cfg(target_os = "macos")]
 const STATUS_COPY_FAILED: i32 = 125;
+
+/// The environment variable the wrapper hands the helper: the SUBMITTING process's pid.
+/// A helper is launchd's child, not the submitter's, so the store lock being free no
+/// longer means its writer is gone (audit 2026-09-14): a successor that swept a dead
+/// parent's `<build>.incoming-<pid>` could sweep under a helper still extracting into
+/// it. The helper watches the pid and stops the moment it is gone.
+pub const LANE_PARENT_ENV: &str = "ATPKG_LANE_PARENT";
+
+/// Arm the helper's parent watchdog from [`LANE_PARENT_ENV`]: a thread that polls the
+/// submitting pid every 100 ms and ends this process — exit 3, no result file, which the
+/// parent (were it alive) would read as a lane failure — the moment the pid is gone.
+/// Every hidden verb calls it first. No variable (a helper run by hand, an old parent)
+/// arms nothing.
+pub fn arm_parent_watchdog() {
+    #[cfg(not(target_os = "macos"))]
+    {
+        return;
+    }
+    #[cfg(target_os = "macos")]
+    let Some(parent) = std::env::var(LANE_PARENT_ENV)
+        .ok()
+        .and_then(|v| v.trim().parse::<u32>().ok())
+    else {
+        return;
+    };
+    #[cfg(target_os = "macos")]
+    let _ = std::thread::Builder::new()
+        .name("atpkg-lane-parent-watch".into())
+        .spawn(move || {
+            loop {
+                if !pid_exists(parent) {
+                    eprintln!(
+                        "atpkg lane helper: the submitting process (pid {parent}) is gone — \
+                         stopping"
+                    );
+                    std::process::exit(3);
+                }
+                std::thread::sleep(Duration::from_millis(100));
+            }
+        });
+}
 
 /// One submitted job: its scratch dir, label and files. Shared by the two hidden verbs —
 /// the staging lane here and the executable-laying lane ([`crate::lay`]) — so there is
@@ -608,6 +709,32 @@ pub(crate) struct Job {
 /// The label prefix every job of this crate carries; the sweep looks for it.
 #[cfg(target_os = "macos")]
 const LABEL_PREFIX: &str = "systems.alab.atpkg.";
+
+/// The stems a job directory or label can carry — the three lanes' and the
+/// process-wide bundle replica's — and the ONLY names the dead-pid sweep removes: a
+/// name whose stem is not one of these is not a job of ours, whatever the rest of it
+/// looks like; the sweep DELETES what it accepts.
+#[cfg(target_os = "macos")]
+const JOB_STEMS: &[&str] = &["stage-helper", "lay-helper", "view-helper", "replica"];
+
+/// The scratch the executable-laying and view lanes use when this process has a store:
+/// `<prefix>/staging/.lanes/`, `0700` under a `0700` prefix and dot-hidden (Spotlight
+/// skips it) — never `$TMPDIR`, which is shared with every other program on the machine
+/// (audit 2026-09-14) and world-visible. `None` when no store resolves (no `HOME`); the
+/// callers fall back to the temp dir then.
+#[cfg(target_os = "macos")]
+pub(crate) fn lanes_scratch() -> Option<PathBuf> {
+    let layout = crate::store::resolve_configured()?;
+    let dir = layout.prefix.join("staging").join(".lanes");
+    layout.ensure_dir(&dir).ok()?;
+    Some(dir)
+}
+
+/// See the macOS body.
+#[cfg(not(target_os = "macos"))]
+pub(crate) fn lanes_scratch() -> Option<PathBuf> {
+    None
+}
 
 #[cfg(target_os = "macos")]
 impl Job {
@@ -683,6 +810,11 @@ impl Job {
     /// store's `gc` sweeps regular files, never these directories (audit 2026-09-14).
     /// Only directories, only our naming, only a dead pid — an archive or a `.part`
     /// beside them never parses as a label, and a live sibling's job is left alone.
+    /// `scratch` is not always a directory of ours: the laying lane passes the shared
+    /// per-user `$TMPDIR` ([`crate::lay::lay_untracked`]), so "our naming" is a test
+    /// [`owner_pid_of_label`] ENFORCES against [`JOB_STEMS`], never an assumption about
+    /// who else writes there — a foreign `<anything>-<dead pid>-<x>-<y>` directory
+    /// beside ours is left alone.
     fn sweep_dead_job_dirs(scratch: &Path) {
         let Ok(entries) = std::fs::read_dir(scratch) else {
             return;
@@ -696,6 +828,17 @@ impl Job {
             let Some(name) = entry.file_name().to_str().map(str::to_owned) else {
                 continue;
             };
+            // OUR stems only (audit 2026-09-14): the shape `<word>-<u32>-<x>-<y>` is
+            // one any directory in a shared scratch could take, and the lay lane's
+            // scratch was `$TMPDIR` — the sweep would have removed a stranger's
+            // `build-1234-0-1` there. The lanes' scratch is under the prefix now, and
+            // the name's stem must be one of the lanes' anyway.
+            if !JOB_STEMS
+                .iter()
+                .any(|stem| name.starts_with(&format!("{stem}-")))
+            {
+                continue;
+            }
             let Some(pid) = owner_pid_of_label(&format!("{LABEL_PREFIX}{name}")) else {
                 continue;
             };
@@ -717,16 +860,17 @@ impl Job {
         let (copy, bundle): (PathBuf, PathBuf) = match plan {
             HelperPlan::ExecOriginal => (PathBuf::new(), PathBuf::new()),
             HelperPlan::CopyThenExec => (self.copy.clone(), PathBuf::new()),
-            // The replica keeps the bundle's own name (`aterm.app`) inside the job's
-            // scratch: the name is not part of the seal, but a `.app` suffix is what
-            // every tool that looks at it expects.
-            HelperPlan::CopyBundleThenExec { bundle } => {
-                let name = bundle.file_name().map_or_else(
-                    || std::ffi::OsString::from("bundle.app"),
-                    |n| n.to_os_string(),
-                );
-                (self.dir.join(name), bundle)
-            }
+            // The replica is NOT named `.app`: the seal does not cover the name
+            // (measured 2026-09-15 — `codesign --verify --deep --strict` passes on a
+            // replica called `replica`, it runs, and what it lays is clean), and a
+            // second `aterm.app` in a directory LaunchServices or Spotlight can walk
+            // is one they would register (audit 2026-09-14).
+            // ONE replica per process (audit 2026-09-14): a pass submits several jobs
+            // (the bundle, the shims, the twins, the stubs, the view), and each used to
+            // copy the 51 MB bundle again. The first job's wrapper builds the replica
+            // under a process-owned directory the dead-pid sweep reclaims; every later
+            // job's wrapper finds it verified and skips the copy.
+            HelperPlan::CopyBundleThenExec { bundle } => (process_replica_dir(), bundle),
         };
         let out = std::process::Command::new("/bin/launchctl")
             .arg("submit")
@@ -747,6 +891,9 @@ impl Job {
             .arg(&self.label)
             .arg(copy)
             .arg(bundle)
+            // `$8`: this process's pid, for the helper's parent watchdog
+            // ([`arm_parent_watchdog`]).
+            .arg(std::process::id().to_string())
             .output()
             .map_err(|e| format!("spawn /bin/launchctl: {e}"))?;
         if !out.status.success() {
@@ -1022,10 +1169,18 @@ fn signal_name(signal: i32) -> &'static str {
     }
 }
 
-/// The `<pid>` in a label of ours — `systems.alab.atpkg.<stem>-<pid>-<seq>-<nonce>`,
-/// where `<stem>` may itself carry dashes (`stage-helper`, `lay-helper`), so the fields
-/// are read from the right. `None` for any other label, including the integration tests'
-/// `systems.alab.atpkg.test.<name>.<pid>`, which clean up after themselves.
+/// The `<pid>` in a label of OURS — `systems.alab.atpkg.<stem>-<pid>-<seq>-<nonce>`,
+/// where `<stem>` is one of [`JOB_STEMS`] (each of which itself carries a dash), so the
+/// fields are read from the right. `None` for any other label, including the integration
+/// tests' `systems.alab.atpkg.test.<name>.<pid>`, which clean up after themselves.
+///
+/// The stem is the whole test, and it is why this reads every field instead of the pid
+/// alone: [`Job::sweep_dead_job_dirs`] hands this the name of EVERY directory in a
+/// scratch that, for the laying lane, is the shared per-user `$TMPDIR`
+/// ([`crate::lay::lay_untracked`]) — and what this accepts, that sweep `remove_dir_all`s.
+/// Until 2026-09-15 the stem was parsed and discarded and the other fields never looked
+/// at, so any `<anything>-<dead pid>-<x>-<y>` directory another tool had left in
+/// `$TMPDIR` — `mytool-48213-1-a7f3` — read as a dead job of ours and was deleted whole.
 #[cfg(target_os = "macos")]
 fn owner_pid_of_label(label: &str) -> Option<u32> {
     let rest = label.strip_prefix(LABEL_PREFIX)?;
@@ -1033,10 +1188,21 @@ fn owner_pid_of_label(label: &str) -> Option<u32> {
         return None;
     }
     let mut fields = rest.rsplitn(4, '-');
-    let _nonce = fields.next()?;
-    let _seq = fields.next()?;
+    let nonce = fields.next()?;
+    let seq = fields.next()?;
     let pid = fields.next()?;
-    let _stem = fields.next()?;
+    let stem = fields.next()?;
+    if !JOB_STEMS.contains(&stem) {
+        return None;
+    }
+    // `Job::prepare` mints the nonce as `{:x}` of a u64 and the seq off a u64 counter: a
+    // name carrying anything else in those fields is not one of ours either.
+    if nonce.is_empty() || !nonce.bytes().all(|b| b.is_ascii_hexdigit()) {
+        return None;
+    }
+    if seq.parse::<u64>().is_err() {
+        return None;
+    }
     pid.parse().ok()
 }
 
@@ -1060,12 +1226,38 @@ impl Drop for Job {
     /// failed, a result that would not parse — leaves a registered job or a scratch dir
     /// behind.
     fn drop(&mut self) {
-        let _ = std::process::Command::new("/bin/launchctl")
-            .args(["remove", &self.label])
-            .output();
+        self.teardown();
         let _ = std::fs::remove_dir_all(&self.dir);
     }
 }
+
+#[cfg(target_os = "macos")]
+impl Job {
+    /// Stop the job and WAIT for it to be gone: `launchctl remove` signals the wrapper,
+    /// the wrapper's trap kills the helper, and the label disappears when both have
+    /// exited — polled here for up to [`TEARDOWN_BOUND`], so a caller that empties the
+    /// job's destination afterwards (the stage lane on its failure path) never races a
+    /// helper still extracting into it (audit 2026-09-14). A job that already removed
+    /// its own label costs one `launchctl list`.
+    pub(crate) fn teardown(&self) {
+        let _ = std::process::Command::new("/bin/launchctl")
+            .args(["remove", &self.label])
+            .output();
+        let started = Instant::now();
+        while started.elapsed() < TEARDOWN_BOUND {
+            if matches!(self.liveness(), Liveness::Unknown) {
+                return;
+            }
+            std::thread::sleep(Duration::from_millis(50));
+        }
+    }
+}
+
+/// How long a teardown waits for launchd to forget a removed job: the wrapper dies at
+/// the signal, its child at the trap, and launchd unloads the label in well under a
+/// second; a job that outlives this bound is reported by the next sweep.
+#[cfg(target_os = "macos")]
+const TEARDOWN_BOUND: Duration = Duration::from_secs(5);
 
 #[cfg(test)]
 mod tests {
@@ -1159,7 +1351,7 @@ mod tests {
         std::fs::create_dir_all(&d).unwrap();
         let spec_path = d.join("spec");
         std::fs::write(&spec_path, "not a spec\n").unwrap();
-        let code = run_helper(&[spec_path.display().to_string()]);
+        let code = run_helper(&[spec_path.clone().into_os_string()]);
         assert_eq!(code, ExitCode::from(1));
         let result = std::fs::read_to_string(d.join("result")).unwrap();
         assert!(result.starts_with("err\n"), "{result}");
@@ -1276,6 +1468,7 @@ mod tests {
                 .arg("systems.alab.atpkg.test.no-such-label")
                 .arg(copy)
                 .arg(bundle)
+                .arg(std::process::id().to_string())
                 .output()
                 .unwrap();
             let recorded = std::fs::read_to_string(&status).unwrap_or_default();
@@ -1370,6 +1563,19 @@ mod tests {
             replica_tool.display().to_string(),
             "the replica's executable ran, not the original"
         );
+        // The SAME replica again: reused, not rebuilt — the tool inside runs a second
+        // time and the replica's inode is the one from before (one copy per process).
+        let before = std::fs::metadata(&replica_tool).unwrap().len();
+        std::fs::remove_file(d.join("ran-from")).unwrap();
+        let (wrapper_exit, recorded) = run(&tool, &replica, &src, "bundle-again");
+        assert_eq!(wrapper_exit, 0);
+        assert_eq!(recorded.trim(), "0");
+        assert_eq!(
+            std::fs::read_to_string(d.join("ran-from")).unwrap().trim(),
+            replica_tool.display().to_string(),
+            "the replica's executable ran again"
+        );
+        assert_eq!(std::fs::metadata(&replica_tool).unwrap().len(), before);
         // A bundle that cannot be replicated (its root is gone) is 125 and runs nothing.
         let (wrapper_exit, recorded) = run(
             &tool,
@@ -1434,7 +1640,9 @@ mod tests {
     }
 
     /// The sweep reads the owning pid off our labels only: the two shapes the lanes mint
-    /// (a dashed stem), never the integration tests' `test.` labels or a foreign label.
+    /// (a dashed stem), never the integration tests' `test.` labels, a foreign label, or
+    /// a foreign name that merely has our SHAPE — the stem and the seq and nonce fields
+    /// are read, not discarded, because the answer decides what gets deleted.
     #[cfg(target_os = "macos")]
     #[test]
     fn the_sweep_reads_the_owning_pid_off_our_labels_only() {
@@ -1452,7 +1660,83 @@ mod tests {
         );
         assert_eq!(owner_pid_of_label("com.apple.Finder"), None);
         assert_eq!(owner_pid_of_label("systems.alab.atpkg.odd"), None);
+        // A foreign name of our shape is NOT ours: the stem is the only thing that says
+        // so, and until 2026-09-15 it was thrown away, so a directory named like this in
+        // `$TMPDIR` — where the laying lane's job scratch lives — was `remove_dir_all`ed
+        // by the next shim laying whenever that pid was dead.
+        assert_eq!(
+            owner_pid_of_label("systems.alab.atpkg.mytool-48213-1-a7f3"),
+            None
+        );
+        assert_eq!(owner_pid_of_label("systems.alab.atpkg.a-b-4281-0-ab"), None);
+        assert_eq!(
+            owner_pid_of_label("systems.alab.atpkg.com.example.tool-4281-0-ab"),
+            None
+        );
+        // Our stem with fields `Job::prepare` never mints is not a job of ours either.
+        assert_eq!(
+            owner_pid_of_label("systems.alab.atpkg.lay-helper-4281-x-18d4bf61"),
+            None
+        );
+        assert_eq!(
+            owner_pid_of_label("systems.alab.atpkg.lay-helper-4281-0-nonce"),
+            None
+        );
+        assert_eq!(
+            owner_pid_of_label("systems.alab.atpkg.stage-helper-4281-0-"),
+            None
+        );
         assert!(pid_exists(std::process::id()), "this process exists");
         assert!(pid_exists(1), "launchd exists (EPERM is not ESRCH)");
+    }
+
+    /// The dead-job sweep DELETES, and the scratch it walks for the laying lane is the
+    /// shared per-user `$TMPDIR` ([`crate::lay::lay_executables_with`]), not a `0700`
+    /// directory of ours — so a foreign directory that merely looks pid-stamped, left by
+    /// any other tool under a pid that has since exited, must survive it, while our own
+    /// dead job's scratch is still taken and a live sibling's is still left alone.
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn the_dead_job_sweep_spares_a_foreign_directory_of_the_same_shape() {
+        // Dots, not dashes: this scratch itself must never read as a job name.
+        let scratch =
+            std::env::temp_dir().join(format!("atpkg.sweep.scratch.{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&scratch);
+        std::fs::create_dir_all(&scratch).unwrap();
+        // A pid nothing runs under, measured rather than guessed and taken WITHOUT
+        // spawning: macOS pids stay below 99999, and a fork here would hand the child a
+        // copy of every fd this binary holds open, a released store lock included.
+        let dead = (90_000..99_999u32)
+            .rev()
+            .find(|p| !pid_exists(*p))
+            .expect("some pid below 99999 is unused");
+        let me = std::process::id();
+
+        let foreign = scratch.join(format!("mytool-{dead}-1-a7f3"));
+        let ours_dead = scratch.join(format!("lay-helper-{dead}-0-18d4bf618a493520"));
+        let ours_live = scratch.join(format!("lay-helper-{me}-0-18d4bf61975232a8"));
+        for d in [&foreign, &ours_dead, &ours_live] {
+            std::fs::create_dir(d).unwrap();
+            std::fs::write(d.join("keep"), b"x").unwrap();
+        }
+
+        Job::sweep_dead_job_dirs(&scratch);
+
+        assert!(
+            foreign.join("keep").exists(),
+            "a directory atpkg never created was deleted: {}",
+            foreign.display()
+        );
+        assert!(
+            !ours_dead.exists(),
+            "our own dead job's scratch is still swept: {}",
+            ours_dead.display()
+        );
+        assert!(
+            ours_live.join("keep").exists(),
+            "a live sibling's job is still left alone: {}",
+            ours_live.display()
+        );
+        let _ = std::fs::remove_dir_all(&scratch);
     }
 }

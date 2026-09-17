@@ -32,7 +32,7 @@ use aterm_core::terminal::Terminal;
 use aterm_render::{HaloMode, RainHalo, Theme, WindowCpu};
 
 mod common;
-use common::{backends, bb, gg, max_channel_delta, rr};
+use common::{assert_byte_exact, backends, bb, gg, max_channel_delta, rr};
 
 /// Emit one halo as its legal per-row-band quads (the producer contract): the
 /// covered rect `centre ± (rx, ry)` is clamped to the grid interior, then
@@ -414,9 +414,12 @@ fn over_veils_byte_exact_over_dark_and_light_frames() {
             input.glow_halo.len()
         );
         if gpu.additive_is_byte_exact() {
-            assert_eq!(
-                delta, 0,
-                "({label}) Over veils must be BYTE-EXACT CPU==GPU (got {delta})"
+            assert_byte_exact(
+                "over_veils_byte_exact_over_dark_and_light_frames",
+                &format!("glow_halo Over ({label})"),
+                &gpu,
+                delta,
+                format_args!("({label}) Over veils must be BYTE-EXACT CPU==GPU (got {delta})"),
             );
         } else {
             eprintln!("SKIP byte-exact Over gate ({label}): downlevel sRGB offscreen");
@@ -500,9 +503,12 @@ fn damaged_path_over_veil_parity_cpu_matches_gpu() {
     let delta = max_channel_delta(&cpu_b, &gpu_b);
     eprintln!("damaged-path Over veil CPU vs GPU max per-channel delta = {delta}");
     if gpu.additive_is_byte_exact() {
-        assert_eq!(
-            delta, 0,
-            "Over veil via the cached path must be BYTE-EXACT CPU==GPU (got {delta})"
+        assert_byte_exact(
+            "damaged_path_over_veil_parity_cpu_matches_gpu",
+            "damaged-path Over veil",
+            &gpu,
+            delta,
+            format_args!("Over veil via the cached path must be BYTE-EXACT CPU==GPU (got {delta})"),
         );
     } else {
         eprintln!("SKIP damaged-path byte-exact Over gate: downlevel sRGB offscreen");

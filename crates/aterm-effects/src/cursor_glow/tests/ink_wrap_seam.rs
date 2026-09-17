@@ -29,10 +29,13 @@
 //! Every frame prints the v2 cells per row (`v2_cols`) from just before the
 //! wrap to 3 s after it, and the seam's ring rows (with their `licence=`)
 //! around the wrap. The assertions state what SHOULD hold (the owner's
-//! expectation, the task's brief): the old row's light retracts within
-//! ~1.5 s of the wrap although the hand keeps typing on the new row;
-//! nothing stays lit on the old row past its last glyph; and the new row's
-//! cells are contiguous from Ink's inset column while it is being typed.
+//! expectation, the task's brief): the band SPANS the wrap — a second on,
+//! with the hand typing below, the row it wrapped off still carries the
+//! light its glyphs were typed with (2026-09-15); that light is gone within
+//! ~2 s although the hand keeps typing on the new row; nothing stays lit on
+//! the old row past its last glyph — the cells the re-wrap MOVED leave with
+//! their text; and the new row's cells are contiguous from Ink's inset
+//! column while it is being typed.
 
 use super::*;
 use std::collections::BTreeSet;
@@ -140,7 +143,7 @@ fn replay(shape: WrapShape) -> Replay {
 
     let mut log = Vec::new();
     let mut violations = Vec::new();
-    let mut law_hits = [0usize; 3];
+    let mut law_hits = [0usize; 4];
     let mut now = t0;
     let mut key_at = t0;
     let mut caret: (u16, u16) = (ROW, INSET);
@@ -312,9 +315,30 @@ fn replay(shape: WrapShape) -> Replay {
                             ));
                         }
                     }
-                    // (1) the old row's light retracts within ~1.5 s of the
-                    // wrap — the hand left the row.
-                    if since >= Duration::from_millis(1500) && !old.is_empty() && law_hits[0] < 4 {
+                    // (0) **THE BAND SPANS THE WRAP** (2026-09-15, the
+                    // owner: *"awkward transitions when going to a new line
+                    // still with the rainbow"* — his screenshot with the
+                    // first row bare and the second coloured). A second
+                    // after the wrap, with the hand typing on the new row,
+                    // the row it wrapped off STILL CARRIES the light it was
+                    // typed with: wrapping is one input continuing, and the
+                    // glyphs on that row have not moved. Under the shipped
+                    // abandon that row was empty inside 0.7 s.
+                    if (Duration::from_millis(1000)..Duration::from_millis(1200)).contains(&since)
+                        && old.is_empty()
+                        && law_hits[3] < 4
+                    {
+                        law_hits[3] += 1;
+                        violations.push(format!(
+                            "wrap+{:.2}s: row {old_row} is DARK although its text is still on glass — the band does not span the wrap",
+                            since.as_secs_f32()
+                        ));
+                    }
+                    // (1) the old row's light is gone within ~2 s of the
+                    // wrap — the hand left the row and no key on the new one
+                    // renews it. Measured 2026-09-15: lit to +1.7 s, its own
+                    // swoosh; under the shipped abandon, +0.7 s.
+                    if since >= Duration::from_millis(2000) && !old.is_empty() && law_hits[0] < 4 {
                         law_hits[0] += 1;
                         violations.push(format!(
                             "wrap+{:.2}s: row {old_row} (the row the hand left) still carries light: {}",

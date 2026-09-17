@@ -13,7 +13,7 @@
 //! report's own reading of the config, the broker and the bus.
 
 use std::io::{BufRead, BufReader};
-use std::os::unix::net::UnixListener;
+use std::os::unix::net::{UnixListener, UnixStream};
 use std::path::{Path, PathBuf};
 use std::process::{Child, ChildStdout, Command, Output, Stdio};
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -263,6 +263,39 @@ fn with_no_command_the_fabric_is_off_says_where_it_looked_and_exits_2() {
     assert!(err.contains("the command is not a bridge"), "{err}");
 }
 
+/// The listening socket is CLOSED HERE, and still ACCEPTS over there.
+///
+/// Dropping a `UnixListener` closes this process's descriptor for it — but a
+/// `fork`/`posix_spawn` anywhere else in this binary copies every open
+/// descriptor into the child, which holds them until it `exec`s (`FD_CLOEXEC`
+/// closes at exec, never at fork). For the length of someone else's spawn the
+/// listener is still alive, `connect` still SUCCEEDS, and the fabric report
+/// says `reachable  NO — the socket accepted but no broker answered: broker
+/// closed` instead of the `connect:` refusal the test below is about — both
+/// are `reachable NO`, a warning and exit 1, so the only thing that moved is
+/// WHICH refusal. Measured: that is how
+/// `a_dead_socket_file_is_unreachable_and_a_warning` failed in the workspace
+/// `--tests` run of 2026-09-17, having passed 5/5 alone.
+///
+/// So the fixture PROVES its own precondition before the CLI is asked: an
+/// abandoned socket is one a raw connect refuses. Bounded by [`DEADLINE`] —
+/// a socket that never stops accepting is a finding, not a slow machine.
+fn wait_until_abandoned(sock: &str) {
+    let deadline = Instant::now() + DEADLINE;
+    loop {
+        match UnixStream::connect(sock) {
+            Err(_) => return,
+            Ok(live) => drop(live),
+        }
+        assert!(
+            Instant::now() < deadline,
+            "the abandoned socket at {sock} still accepts connections after {DEADLINE:?} — \
+             nothing is listening, so this is not the spawn window it is meant to outwait"
+        );
+        std::thread::sleep(Duration::from_millis(20));
+    }
+}
+
 /// A SOCKET FILE IS NOT A BROKER. A socket that was bound and abandoned — the
 /// leftover of a broker that died — refuses the connect: `reachable NO`, a
 /// warning naming the socket, exit 1. The config is read in the spelling
@@ -273,6 +306,7 @@ fn a_dead_socket_file_is_unreachable_and_a_warning() {
     let sock = s.sock();
     drop(UnixListener::bind(&sock).expect("bind"));
     assert!(Path::new(&sock).exists(), "the socket FILE is still there");
+    wait_until_abandoned(&sock);
     s.write_config(&format!(
         "# the operator's file\n[fabric]\ncommand = \"{}\"\n",
         s.command(&sock, false)

@@ -47,7 +47,7 @@ use crate::effect_util::{
 // of the rainbow family resolves its colour through `spectrum` and every
 // point-mark snaps to a name through `spectrum_snap`; this file no longer owns
 // an interpolation of its own.
-use crate::spectrum::{SPECTRUM_STOPS, spectrum, spectrum_clear_of_cyan, spectrum_snap};
+use crate::spectrum::{SPECTRUM_STOPS, spectrum, spectrum_snap};
 // The LUT's length and the named stops are only ever asked for by the
 // proofs — the emit path carries indices and reads colours. Test-gated so
 // the lint tells the truth about the shipping binary.
@@ -579,15 +579,26 @@ pub struct GlowConfig {
     /// looks a `pack:<id>` up in its registry once, off the frame path, and
     /// fills this in.
     pub pack: Option<TrailParams>,
-    /// TYPING-WAKE persistence in SECONDS: how much of your recent travel the
-    /// Rainbow kitty plume shows, and therefore how LONG it is (the plume is literally
-    /// the last `wake_persist_s` seconds of typing, to scale — see
-    /// [`RAINBOW_WAKE_PERSIST`], the default this carries). Host-tunable because it
-    /// is the effect's one genuine TASTE dial: everything else about the wake is
-    /// craft (what keeps it off the letters, what keeps it from lagging), but
-    /// how much trail you want behind your hand is a preference. `0.0` (or any
-    /// non-finite value) turns the wake OFF entirely — no plume, no cost.
-    pub wake_persist_s: f32,
+    // THE TYPING-WAKE PERSISTENCE DIAL IS DELETED (`wake_persist_s`, retired
+    // 2026-09-16). It promised "the plume is literally the last
+    // `wake_persist_s` seconds of typing, to scale" — the v1 rainbow kitty's
+    // model, where a continuous plume replayed a fixed window of recent
+    // travel. `RAINBOW-KITTY-V2.md` §17.3 phase 7 deleted the walk that read
+    // it, and this field survived that deletion as a value every construction
+    // site wrote and no frame ever read: a compiler proof (delete the field,
+    // build the crate) returned nine struct-literal WRITES and one read that
+    // was the field copying itself forward across a reconfigure.
+    //
+    // There is no duration to re-wire it to. The v2 mark's extent is the set
+    // of cells the hand actually laid (one per key, uncapped) and its clock is
+    // the cohort's — `Ribbon::cell_life` prices a cell from `cfg.duration`
+    // (`cursor_trail_ms`, a shipped dial) and floors it at the phrase rest the
+    // typist's own inter-key interval sets, so "how much recent typing you
+    // see" is now the trail-duration dial plus the melody, not a window.
+    // `WAKE_LIFE_S` / `WAKE_MAX_CELLS` in `rainbow_kitty::ribbon` are the only
+    // live things still called a wake, and they are the JUMP corridor
+    // (`RAINBOW-PATH-V3.md` §2.7) — a different effect with design-law
+    // constants, not this dial's mechanism under a new name.
     /// The rainbow ribbon's DARK-THEME TRANSVERSE PRESENTATION — tall body or
     /// explicit underline/highlighter.
     ///
@@ -752,9 +763,9 @@ const COMET_GLINT_COV: f32 = 0.5;
 /// legibility ceiling. Seven authored anchors need no such special case — green
 /// and blue are adjacent stops on a continuous ramp, exactly as they are in the
 /// sky — so the handoff is deleted rather than retuned, and no cyan STRIPE is
-/// authored anywhere. What the arc may still do is CROSS the wedge on its way
-/// from green to blue; that crossing is bounded, not forbidden (see
-/// [`crate::spectrum`]'s dense-walk censuses).
+/// authored anywhere. What the arc does is CROSS the wedge on its way from green
+/// to blue, at full chroma and full value since 2026-09-15 (the owner, retiring
+/// the last of the anti-cyan machinery: *"this is legacy cruft. delete it"*).
 const RAINBOW_BANDS: [u32; SPECTRUM_STOPS] = [
     0x00FF_0000, // red
     0x00FF_7F00, // orange
@@ -767,8 +778,8 @@ const RAINBOW_BANDS: [u32; SPECTRUM_STOPS] = [
 
 // ---- ADDITIVE-LIGHT BUDGET OVER TEXT (the legibility bound) ---------------
 //
-// TWO caps below, not one budget divided, because the layers compose along
-// DIFFERENT streams and their contrast models differ:
+// The bed and the transients compose along DIFFERENT streams and their contrast
+// models differ:
 //
 //   * the continuous bed rides `glow_under` (beneath the glyph pass), so it
 //     lifts only the GROUND — contrast is (unlit ink) vs (lit ground);
@@ -777,37 +788,8 @@ const RAINBOW_BANDS: [u32; SPECTRUM_STOPS] = [
 //     only 55/44/10 per-channel headroom) the ground keeps climbing while the
 //     glyph is pinned at white, collapsing contrast.
 //
-// Each cap is derived against the same 5.25:1 bar for its own stream, so they
-// are NOT interchangeable and must not be merged.
-
-/// Hard additive-light budget for the rainbow kitty BODY over an occupied text cell —
-/// the CONTINUOUS under-ink bed a whole typed line sits on.
-///
-/// Contrast-derived: on the default dark palette (`#1A1B26` behind `#C8D3F5`,
-/// unlit 11.4:1) the worst of the six saturated bands at 56/255 leaves 5.37:1,
-/// certified by the pixel oracle in
-/// `rainbow_hot_body_preserves_default_text_contrast`. The cat, off-glyph stars,
-/// and the short jump-zoom keep their own budgets, so this bound alone does not
-/// make rainbow kitty timid. Keep the production clamp in [`rainbow_occupied_coverage`] and
-/// the derived model + real-emitter conformance tests in lockstep.
-///
-/// Do NOT lower this to buy legibility headroom: the bed rides `glow_under`,
-/// beneath the glyph pass, so it lifts only the ground and can never wash glyph
-/// ink. Cutting it to 34 also flattens the specular glint against its own
-/// ceiling (the sweep measures `on 34 vs off 0`, failing
-/// `rainbow_glint_sweeps_with_momentum`'s `on >= 50`) to buy headroom for a co-peak
-/// that does not occur: the ribbon crests at `RAINBOW_CREST_POS` = 0.62, four to
-/// seven cells BEHIND the head, where the fresh-ink pop has expired. The
-/// legibility bound belongs on [`OVER_INK_COV_CAP`], the layers that actually
-/// land on the ink.
-///
-/// RETIRED as a production clamp, superseded by [`RAINBOW_BAND_COV_CAPS`].
-/// Retained as the certified BASELINE the per-band table is measured against:
-/// `rainbow_hot_body_preserves_default_text_contrast` asserts the new mean
-/// ceiling beats this number by a real margin, which is what makes "the rainbow
-/// is brighter" a proved claim rather than a retune.
-#[allow(dead_code)]
-const RAINBOW_OCCUPIED_COV_CAP: f32 = 56.0;
+// A cap is derived against the 5.25:1 bar for its own stream, so a cap from one
+// stream is NOT interchangeable with a cap from the other.
 
 /// The TRANSIENT over-ink share (fresh-ink pop, crown, starfield, and — via
 /// `crate::cursor_glow::OVER_INK_COV_CAP` — the rainbow cursor's halo and
@@ -965,8 +947,7 @@ const _: () = assert!(RAINBOW_FIELD_LEVEL > 144.0 && RAINBOW_FIELD_LEVEL < 146.0
 /// **HOW FAR THE FIELD MAY DISAGREE UNDER THE JUMP STREAK BEFORE THE MARK STOPS
 /// SPENDING CHROMA** — in `t`, the arc's own parameter.
 ///
-/// See [`rainbow_streak_chroma`] for what it bounds and
-/// `the_jump_streak_is_never_cyan_on_glass` for the walk that fixes it. `0.02`
+/// See [`rainbow_streak_chroma`] for what it bounds. `0.02`
 /// is a fortieth of the arc, which is **1.6 keystrokes** at the shipped lay rate
 /// ([`RAINBOW_KITTY_HUE_STEP`]) — so the law is silent along a row (neighbouring
 /// columns are `0.0125` apart and the mark keeps every level of its chroma) and
@@ -1004,18 +985,15 @@ const _: () = assert!(RAINBOW_FIELD_LEVEL > 144.0 && RAINBOW_FIELD_LEVEL < 146.0
 /// be two different runs mixing.
 ///
 /// **AND THE FLOOR IS A THIRD OF THE SPECTRUM, WHICH THE CYAN CENSUS PAID FOR.**
-/// The number is not a taste: with the fold switched off ENTIRELY, every gate
-/// that exists because of it stays green — `the_jump_streak_is_never_cyan_on_glass`
-/// (`lit=1,678,001 unruled=24,224 cyan=0`), `no_visible_cyan_on_the_cold_streak_at_any_latch_phase`,
-/// `the_band_is_never_cyan_on_glass`, and the caret's rim gate of the day
-/// (`the_caret_rim_is_never_cyan_where_its_own_layers_meet`, since replaced by
-/// `the_rim_light_is_hue_invariant_and_monotone_in_paint` when the caret's
-/// private cyan law was retired on 2026-09-08) —
-/// and `the_zoom_streak_resolves_its_colour_on_the_arc` returns `0.000` loss on a
-/// population that is `S = 1.000` pure. The seven-anchor palette retired the
-/// cyan hazard this fold was insurance against (the emit site says so in as many
-/// words: *"the cyan-window ceiling is RETIRED here (ROYGBIV merge)"*), so the
-/// fold is kept ONLY for the case the corpus cannot stage — a streak whose taps
+/// The number is not a taste: with the fold switched off ENTIRELY, every cyan
+/// census that existed because of it measured zero on the emitter's own corpus
+/// (`lit=1,678,001 unruled=24,224 cyan=0` on the jump streak's own walk), and
+/// the zoom streak's on-arc census returned `0.000` loss on a population that is
+/// `S = 1.000` pure. Those censuses are all retired now — the anti-cyan rulings
+/// they enforced were what greyed the arc — so what is recorded here is the
+/// MEASUREMENT, which still stands: the seven-anchor palette retired the cyan
+/// hazard this fold was insurance against, and the fold is kept ONLY for the
+/// case the corpus cannot stage — a streak whose taps
 /// straddle two different runs on adjacent rows, where two readings are
 /// genuinely uncorrelated and average half the spectrum apart. A third of the
 /// cycle is past anything one mark's own slope can produce at any traverse and
@@ -1038,31 +1016,9 @@ const _: () = assert!(
      and the fold must complete no later than the farthest two readings can be"
 );
 
-// ---- THE STREAK'S CYAN-WINDOW CEILING IS RETIRED (ROYGBIV merge) --------------
-// `RAINBOW_STREAK_SAT_PAIR`, `RAINBOW_STREAK_PAIR_LO`/`_HI`/`_N`/`_SLACK`,
-// `rainbow_streak_sat_pair`, `rainbow_streak_env_chroma` and
-// `certify_rainbow_streak_sat_pair` are deleted together.
-//
-// The table solved, per hue, the saturation at which TWO overlapping dim layers
-// of one colour compose into HSV `[165, 200]` at `S > 0.3` — the depth the jump
-// streak actually reaches, where each layer alone reads under the floor and only
-// the pair crosses it. Against the six-anchor arc it was a narrow, honest cap
-// that left red, orange, yellow and violet bit-identical.
-//
-// Re-solved against the seven authored ROYGBIV anchors it collapses: the derived
-// bound is `0` for every hue from roughly `116°` onward, so applying it would
-// drive the streak's entire green-through-violet half to grey. That is the same
-// defect as the retired "neutralized handoff" and the retired
-// `SPECTRUM_SAT_ENV`, reached through a third door — buying a zero cyan count by
-// spending all the chroma — and it is what the owner's ruling forbids: cyan is a
-// bounded CROSSING, not a colour to be destroyed. The streak's crossing is
-// bounded and reported by `the_jump_streak_is_never_cyan_on_glass` instead.
-//
-// `rainbow_streak_chroma(drift)` is NOT part of this and stays live: it bounds
-// how far two adjacent samples may drift before their SUM leaves the arc, which
-// is a statement about mixing two different colours rather than about which
-// colours the palette authors.
-
+// **`rainbow_streak_chroma(drift)` bounds how far two adjacent samples may
+// drift before their SUM leaves the arc** — a statement about mixing two
+// different colours, not about which colours the palette authors.
 // **THE ONE TRANSVERSE PROFILE LIVES IN THE RENDERER** (step 11).
 // `rainbow_ribbon_across` stood here through step 10 and is now
 // [`aterm_render::ribbon_profile`], beside [`aterm_render::ribbon_beam`], which
@@ -1385,10 +1341,8 @@ pub(crate) fn rainbow_sweep_reflect(x: f32) -> f32 {
 // `spectrum` directly, in this file, where the position they read it at is
 // resolved. A door that only a thing walked through is a door in the wrong wall.
 
-/// Resolve a reflected spectrum position for a persistent mark. This wrapper
-/// preserves the named call site while [`spectrum_clear_of_cyan`] remains the
-/// canonical ROYGBIV identity; the cursor block's final mixed fill is constrained
-/// separately in `cursor_rainbow`.
+/// Resolve a reflected spectrum position for a persistent mark — the caret's
+/// read of the same field the ribbon paints, past the cycle's turnaround.
 #[inline]
 pub(crate) fn rainbow_thing_of(sweep: f32) -> u32 {
     // THE CARET WEARS THE CYCLE, NOT THE OPEN ARC. This is the caret's and the
@@ -1401,25 +1355,7 @@ pub(crate) fn rainbow_thing_of(sweep: f32) -> u32 {
     if phase > 1.0 {
         return rainbow_cycle_ink(phase);
     }
-    spectrum_clear_of_cyan(phase)
-}
-
-/// Legacy mapping from the rainbow-kitty rolling hue clock to an acyclic
-/// spectrum position. The visible kitty ribbon and streaks do not call this:
-/// they read each spark's cached, run-local [`Spark::classic_t`]. This helper
-/// remains only for compatibility tests around the ancillary hue lattice.
-#[cfg_attr(not(test), allow(dead_code))]
-#[inline]
-fn rainbow_laid_sweep(hue: f32) -> f32 {
-    let raw = rainbow_end_dwell(rainbow_sweep_reflect(hue * RAINBOW_LAID_HUE_SWEEP));
-    let reach = RAINBOW_LAID_END_PULL;
-    // Full strength exactly where the lattice's closest approach is, zero a
-    // whole lay out — so the cell nearest a turnaround lands ON the anchor and
-    // every cell further in is untouched.
-    let top = smoothstep01((raw - (1.0 - 2.0 * reach)) / reach);
-    let bottom = smoothstep01((2.0 * reach - raw) / reach);
-    let pulled = raw + (1.0 - raw) * top;
-    pulled - pulled * bottom
+    spectrum(phase)
 }
 
 /// **THE DWELL IS OFF — the owner, 2026-08-30: "NO we don't want 'dwell' at
@@ -1440,12 +1376,6 @@ fn rainbow_laid_sweep(hue: f32) -> f32 {
 /// its middle; every derived bound below is parametric on the constant, so
 /// `0.0` degrades each to the bare-triangle reading.)
 const RAINBOW_END_DWELL: f32 = 0.0;
-
-/// [`RAINBOW_END_DWELL`], applied. Monotone `0..1 → 0..1`, fixing both ends.
-#[inline]
-fn rainbow_end_dwell(x: f32) -> f32 {
-    x - RAINBOW_END_DWELL * (core::f32::consts::TAU * x).sin() / core::f32::consts::TAU
-}
 
 // ---- THE ONE VISIBLE FIELD (§2.1) -----------------------------------------
 //
@@ -1535,11 +1465,14 @@ pub(crate) fn rainbow_phase_from_unit_turn(turn: f32) -> f32 {
     ((turn.rem_euclid(1.0) * 2.0) / RAINBOW_LIGHT_RAIL_FLOW).rem_euclid(RAINBOW_PHASE_RING)
 }
 
-/// How long a photon persists in the plume (seconds) — the DEFAULT for
-/// [`GlowConfig::wake_persist_s`], which a host may override from its own
-/// settings. The plume therefore shows the last ~0.3 s of travel — long enough to read as a trail, short enough that
-/// it tracks the hand rather than smearing a whole sentence.
-pub const RAINBOW_WAKE_PERSIST: f32 = 0.30;
+// THE WAKE'S OWN PERSISTENCE IS DELETED TOO (`RAINBOW_WAKE_PERSIST = 0.30`,
+// retired 2026-09-16 with `GlowConfig::wake_persist_s`). It was the default
+// that dial carried — "the plume shows the last ~0.3 s of travel" — and after
+// §17.3 phase 7 deleted the walk that replayed a travel window it was a
+// default for nothing: every construction site in the tree wrote it into a
+// field no frame read. What decides how much recent typing you see today is
+// `Ribbon::cell_life` (priced from `cfg.duration`, floored at the phrase rest)
+// — see the tombstone on `GlowConfig` above.
 // THE WAKE'S OWN SPATIAL RATE IS DELETED (§2.1). `RAINBOW_WAKE_SWEEP_SPREAD`,
 // `RAINBOW_WAKE_SWEEP_TRAVEL`, `RAINBOW_WAKE_SWEEP_MIN` and
 // `rainbow_wake_sweep_spread` gave the plume a spectrum of its own, resolved at
@@ -1668,12 +1601,18 @@ const _: () = assert!(
 /// several seconds" the ruling asks for, and it is `2.25x` slower than the rate
 /// the owner called too fast.
 ///
-/// **AND WHY IT MAY NOT GO MUCH HIGHER.** The green→blue crossing is the arc's
-/// steepest leg at `1420°` per unit of traverse, so it spends `1420/T` per cell
-/// and is kept to ONE ribbon slab by `the_crossing_is_a_seam_not_a_region`,
-/// whose own census pins the seam at one slab for traverses `26..=72` and two at
-/// `80` and beyond. `36` sits in the middle of the one-slab range with room on
-/// both sides; `80` would cost the crossing ruling a slab.
+/// **AND WHY IT MAY NOT GO MUCH HIGHER.** The bound was the green→blue
+/// crossing: on the retired arc it was far and away the steepest leg — `1420°`
+/// per unit of traverse, spending `1420/T` per cell — and a census kept its
+/// desaturated seam to ONE ribbon slab for traverses `26..=72`, two at `80` and
+/// beyond. `36` sits in the middle of that range with room on both sides.
+/// **THAT SEAM NO LONGER EXISTS** (2026-09-15): the crossing's authored roof,
+/// its saturation taper and its exemption from the spectrum's perceptual pace
+/// were the retired no-cyan ruling's machinery and are deleted, so the crossing
+/// is drawn at full chroma and spent at the same pace as every other leg — it
+/// is no longer the arc's steepest, and there is no pale seam for a traverse to
+/// widen. The number stands on the ruling above it (the rate the owner asked
+/// for) rather than on a crossing bound that has gone quiet.
 const RAINBOW_TRAVERSE_SETTLED: f32 = 36.0;
 
 /// **THE WRAP, IN CELLS** — violet back to red, the one adjacency the arc has
@@ -1741,8 +1680,13 @@ fn rainbow_cycle_phase(p: f32) -> f32 {
     }
     let folded = p - RAINBOW_CYCLE * (p * RAINBOW_CYCLE_INV).floor();
     // The subtraction can land exactly on the period through rounding; the
-    // domain is half-open, so fold that one value down rather than out.
-    if folded >= RAINBOW_CYCLE || folded < 0.0 {
+    // domain is half-open, so fold that one value down rather than out. Spelled
+    // as the same `contains` the fast path above uses, which is exact here
+    // rather than merely tidy: the two forms are De Morgan duals only when NaN
+    // is absent, and it is — `p` was proved finite three lines up, and the only
+    // way this expression reaches NaN is `inf - inf`, which needs an infinite
+    // `p`. An overflow to `-inf` lands outside the range either way.
+    if !(0.0..RAINBOW_CYCLE).contains(&folded) {
         return 0.0;
     }
     folded
@@ -1808,7 +1752,7 @@ const RAINBOW_ROLL_HUE_STEP: f32 = 0.07;
 ///
 /// The two constants above are a HUE step; this is what the fold makes of it, and
 /// it is the number the adjacency ceiling and every per-cell pin are about.
-/// `0.14`, unchanged: [`rainbow_laid_sweep`]'s end-pull touches only the
+/// `0.14`, unchanged: the laid fold's end-pull touches only the
 /// outermost [`RAINBOW_LAID_END_REACH`] of the arc, so the pace between cells
 /// anywhere else is exactly what it always was.
 ///
@@ -1860,7 +1804,7 @@ const RAINBOW_LAID_END_PULL: f32 = 0.003;
 ///
 /// **AND THE HALF-STEP IS NOW TAKEN THROUGH THE DWELL.** The lattice still
 /// straddles the turnaround by half a lay, but that half-lay is measured in the
-/// RAW triangle and [`rainbow_end_dwell`] compresses it by `1 - a` on the way
+/// RAW triangle and the end-dwell re-pacing compresses it by `1 - a` on the way
 /// out, so the shortfall on the arc is that much smaller. This is the worst case
 /// over the whole clamp range — the FASTEST lay
 /// ([`RAINBOW_TRAVERSE_MIN_CELLS`]), because a fast lay is the one whose cells
@@ -1868,8 +1812,8 @@ const RAINBOW_LAID_END_PULL: f32 = 0.003;
 /// anchor is allowed to be wrong by.
 const RAINBOW_LAID_END_REACH: f32 = (1.0 - RAINBOW_END_DWELL) * 0.5 / RAINBOW_TRAVERSE_MIN_CELLS;
 
-/// TURNS OF LAID HUE → SPECTRUM POSITION, the gain [`rainbow_laid_sweep`] folds
-/// through. One turn of the engine's rolling hue therefore paints one complete
+/// TURNS OF LAID HUE → SPECTRUM POSITION, the gain the laid fold applies.
+/// One turn of the engine's rolling hue therefore paints one complete
 /// red→violet→red ping-pong.
 ///
 /// IT MUST BE AN EVEN INTEGER, and that is the whole reason it is a named
@@ -8906,7 +8850,7 @@ impl CursorGlow {
     /// every seat frame (`the_caret_settles_on_its_own_stop_without_a_pop`
     /// pins the landing frame).
     fn v2_caret_stop_rgb(t: f32, cfg: &rk::Config) -> u32 {
-        let arc = crate::spectrum::spectrum(rk::meteor::tri(t));
+        let arc = crate::spectrum::spectrum(rk::ribbon::walk_arc(t));
         if cfg.dark_theme {
             arc
         } else {
@@ -12925,7 +12869,8 @@ impl CursorGlow {
                 // the rainbow kitty's ribbon must read as a rainbow even at a stroll, but its
                 // DYNAMIC RANGE is wide: a CALM cold floor (a stroll lays a quiet
                 // trail) that climbs steeply with momentum (a hot run blazes),
-                // still under the RAINBOW_OCCUPIED_COV_CAP that guards text in `emit_rainbow`.
+                // still under the per-band legibility ceiling that guards text in
+                // `emit_rainbow`.
                 // Rides the EASED spine, so a new spark's brightness swells with
                 // momentum instead of stepping to full on the first fast key —
                 // floored at the decaying peak memory so a resumed key opens at
@@ -16641,10 +16586,11 @@ impl CursorGlow {
     /// exact tiles over ~1.5 k white-heat quads — against ≈ 20 µs for the
     /// engine itself and 74 µs for v1's whole tick. The owner's standing
     /// order (2026-09-05) is that v2 is never slower than v1, and this arm is
-    /// what lets the seam keep it; the cyan clear is a memoised identity on
-    /// the spectrum (≈ 2 µs) and stays because the caret's own tick reads the
-    /// stream after it. `tests::a_v2_ping_pong_tick_through_the_seam_is_never_
-    /// slower_than_v1` pins both halves.
+    /// what lets the seam keep it. (A memoised cyan-clear identity used to
+    /// cost ≈ 2 µs here as well; it went with the rest of the anti-cyan
+    /// machinery on 2026-09-15.)
+    /// `tests::a_v2_ping_pong_tick_through_the_seam_is_never_slower_than_v1`
+    /// pins it.
     /// The polyline scratch v2 is lent ([`rk::Frame::beams`]): the meteor's
     /// 96 stations and the ring's polyline, with room to spare.
     const V2_BEAM_SCRATCH: usize = 512;
@@ -18228,7 +18174,6 @@ mod tests {
             beam: !matches!(style, GlowStyle::Water | GlowStyle::RainbowKitty),
             head_dx: 0.5,
             pack: None,
-            wake_persist_s: RAINBOW_WAKE_PERSIST,
             // This enum-only fixture has no raw spelling to resolve, so it
             // starts on the DEFAULT tall presentation. Tests of shipping
             // presentation resolution use
@@ -24216,18 +24161,47 @@ mod tests {
             (walk_step(&vis, 3, 15, 16) - step).abs() < 1e-4,
             "the hue continues across the placeholder into the key after it"
         );
-        // A re-lay of the row with OTHER text under the placeholder is still
-        // a retirement: the witness was re-armed, not disarmed. The changed
-        // glyph's cell goes on its own record, and the run's two never-armed
-        // blanks (the placeholder's spaces at 11 and 15) go with it.
+        // A re-lay of the row with OTHER text under ONE cell of the
+        // placeholder is NOT a retirement (2026-09-16, `Witness::shape_verdicts`
+        // — the owner: *"you need to be fixing in general"*). Until then the
+        // changed glyph's cell retired on its own record, a one-cell hole in a
+        // band whose letters stood lit either side; the run's two never-armed
+        // blanks (the placeholder's spaces at 11 and 15) were already kept
+        // (2026-09-15: *"odd logic of drawing a part of the trail when moving
+        // the cursor and editing text"*, measured on glass as
+        // `..######.#####.###.#.-###.####....`). A change strictly inside a
+        // standing run is not evidence: the light stays whole and the record
+        // takes the glyph standing there now.
         let mut other = typed.clone();
         other[12] = '2';
         vis.observe_ribbon_row(3, &other);
         vis.tick(Some((3, 17)), at(1600), &c, g, &mut out);
         assert_eq!(
             vis.v2_status().map_or(0, |s| s.retired),
-            3,
-            "the changed glyph's cell retires on its own record, its run's blanks with it"
+            0,
+            "one interior glyph changed under a standing run is not evidence"
+        );
+        let lit = v2_cols(&vis, 3);
+        assert!(
+            (2..17u16).all(|col| lit.contains(&col)),
+            "the band is whole across the changed glyph and the run's spaces: {lit:?}"
+        );
+        // The witness was re-armed, not disarmed: a re-lay that reaches the
+        // run's END — its last recorded cell, the key typed after the
+        // placeholder — is a suffix and still retires.
+        let mut tail = other.clone();
+        tail[16] = 'Z';
+        vis.observe_ribbon_row(3, &tail);
+        vis.tick(Some((3, 17)), at(1700), &c, g, &mut out);
+        assert_eq!(
+            vis.v2_status().map_or(0, |s| s.retired),
+            1,
+            "a rewrite reaching the run's end retires the cell under it"
+        );
+        let lit = v2_cols(&vis, 3);
+        assert!(
+            (2..16u16).all(|col| lit.contains(&col)),
+            "…and nothing left of it: {lit:?}"
         );
     }
 
@@ -28062,38 +28036,6 @@ mod tests {
         (glow, out, t)
     }
 
-    /// **HOW FAR ONE KEYSTROKE MOVES THE FIELD AT HUE `h`** — the wider of the
-    /// two lays that meet at this cell, which is the width its own ramp may
-    /// have.
-    ///
-    /// [`RAINBOW_LAID_SWEEP_PER_CELL`] is the rate the fold is *paced* at and it
-    /// is right away from the turnarounds; it is NOT the answer at one, where
-    /// [`RAINBOW_LAID_END_REACH`]'s smoothstep pull spends the outermost cell
-    /// landing exactly on the anchor. Reading the bound off the law at the cell
-    /// being measured is the difference between a gate that measures the mark
-    /// and a gate that measures a coincidence — and it stays TIGHT, where the
-    /// arc's global worst (`0.0385`, at hue `0.480`) would be `1.54x` slack
-    /// everywhere else.
-    ///
-    /// **AND THE STEP IS THE MARK'S OWN, PASSED IN.** Since
-    /// [`RAINBOW_TRAVERSE_PER_MARK`] one keystroke is not one constant: it is
-    /// `1 / T` for the traverse this mark's length solved to, and
-    /// [`rainbow_end_dwell`] then re-paces it again along the arc. Both are
-    /// answered by evaluating the fold one step either side AT THE RATE THE
-    /// ENGINE LAID — [`CursorGlow::rainbow_lay_step`] — so the bound stays the
-    /// tight one the caller wants rather than the clamp's global worst.
-    #[allow(
-        dead_code,
-        reason = "the named statement of the one-lay law the docs cite; its last \
-                  caller retired with the classic rework's mark-anchored field"
-    )]
-    fn one_lay_sweep_at(h: f32, step: f32) -> f32 {
-        let here = rainbow_laid_sweep(h);
-        let back = (here - rainbow_laid_sweep(h - step)).abs();
-        let fwd = (rainbow_laid_sweep(h + step) - here).abs();
-        back.max(fwd)
-    }
-
     #[test]
     fn the_brightest_pixel_in_the_frame_is_under_the_cursor() {
         use crate::cursor_rainbow::{CursorRainbow, RainbowConfig};
@@ -29800,58 +29742,6 @@ mod tests {
             .map(|q| (q.x - g.origin_x) / g.cw as u16)
             .collect()
     }
-
-    // RETIRED ON THE MERGE: `hot_momentum_spectrum_carries_no_cyan`.
-    //
-    // This census was the momentum-rotated twin of the caret's, and its whole
-    // subject was `rainbow_momentum_bands` — the law that rotated the palette by
-    // up to `RAINBOW_HUE_SWING` (±14.4°) with typing speed. Its own header says
-    // what it was for: azure (204°) reaching 189.6° on the downward half of the
-    // swing, "as a saturated segment ENDPOINT no crossing bridge could shade",
-    // and the clamp that held azure at its own hue. It existed to make that clamp
-    // permanent.
-    //
-    // There is no swing on this lane. Step 1's surviving obligation is *"momentum
-    // must not move hue"*, and it was met by deleting the rotation rather than by
-    // clamping it: `RAINBOW_HUE_SWING`, `rotate_hue`, `RAINBOW_BANDS_HSV` and
-    // `rainbow_momentum_bands` are all gone, momentum drives coverage and
-    // geometry only, and the anchors are compile-time constants at every typing
-    // speed. The subject of the census does not exist, and the failure it guards
-    // is unrepresentable rather than merely absent — there is no expression that
-    // could put an anchor at 189.6°.
-    //
-    // The ANCHOR half of its law is not lost: it is asserted, once and without a
-    // sweep, by `rainbow_palette_has_no_cyan_anchor_and_no_grey_hole`, which
-    // checks all seven authored stops against the same forbidden wedge and keeps
-    // the retired azure `#0099FF` as its negative control. What is gone with the
-    // rotation is only the 129-fold repetition of that check across an excursion
-    // whose amplitude is now zero.
-
-    // RETIRED ON THE MERGE: `rainbow_mark_bloom_stays_on_the_smooth_no_cyan_palette`.
-    //
-    // Its law is the ON-RAMP law and it is the right law — the mark's bloom may
-    // only ever show an authored rainbow colour, never a chord between two of
-    // them. It is retired because on this lane the law is discharged by
-    // CONSTRUCTION rather than by measurement, and the function it measured does
-    // not exist here.
-    //
-    // Upstream's mark resolved its bloom through `rainbow_mark_gradient_at`, a
-    // four-argument blend (laid coordinate, bloom, vertical coordinate, momentum
-    // rotation) whose retired predecessor was a straight RGB chord from the laid
-    // hue to the vertical one — and a chord between two points of a curved ramp
-    // leaves the ramp, which is what that test caught and pinned. Step 10 removed
-    // the chord's PREMISE: the mark is one polyline, every vertex resolves its
-    // own colour as `spectrum(pos)`, and the rasterizer interpolates BETWEEN
-    // vertices at the slab stride the arc's own resolution sets. There is no
-    // four-argument blend and no endpoint pair to cut across, so "the sample is
-    // on the ramp" is not a property this lane can fail — every emitted colour is
-    // a `spectrum` read by construction.
-    //
-    // The negative control it carried (the retired chord red→blue landing on
-    // `#7F007F`, off-ramp magenta) is preserved as a live law in
-    // `rainbow_palette_has_no_cyan_anchor_and_no_grey_hole` above, whose magenta
-    // ban runs over the whole field and over every consumer, and which would
-    // still catch any future code that reintroduced a chord.
 
     /// UNIFIED-READERS PROOF: ONE canonical metric ([`crate::typing_momentum`])
     /// drives all three rainbow kitty "earned drama" consumer groups. The glow engine's
@@ -33026,26 +32916,6 @@ halo = "add"
         assert!(!owned.line().contains('\n'));
     }
 
-    // NOT PORTED FROM origin/main, 2026-08-27, and this is a DEBT not a
-    // dismissal: `rainbow_underline_confines_the_neutral_handoff_below_cell_scale`
-    // guards the grey hole this branch's cyan fix introduced -- the green->blue
-    // crossing is desaturated rather than jumped, and roughly a tenth of the arc
-    // now washes toward neutral. Its three claims are the right ones: the green
-    // side survives, the blue side survives, and no neutral block fills a cell.
-    //
-    // It does not fit this emitter as written. It samples ONE cell and bounds the
-    // flat run by a fixed 4 px grain, both of which assume their per-cell raster.
-    // This branch's ribbon is a polyline whose stride solver gives ONE sample per
-    // cell at `cw = 7` by construction (`samples` clamps to `cw / SAMPLE_MIN`), so
-    // a single-cell window cannot hold two colours at that width however the
-    // handoff behaves. Widening the window to four cells then trips its
-    // dark-pixel precondition, which is keyed to their band's vertical profile.
-    //
-    // Porting it means restating all three claims against the beam's own geometry,
-    // not adjusting a constant. Until then the grey handoff is UNGATED -- it is
-    // measured on glass (S dips 0.75 -> 0.25 over ~40 px and recovers, smooth, no
-    // seam at 8x) and it is a known, reported imperfection rather than a proven one.
-
     // ===================================================================
     // RAINBOW KITTY v2 — the seam (`RAINBOW-KITTY-V2.md` §17.2, D14).
     // ===================================================================
@@ -33257,6 +33127,28 @@ halo = "add"
     /// the control that says the other nine trail styles did not move
     /// either.
     ///
+    /// **RE-BAKED 2026-09-16 — THE CROSSING'S SHARE CAP.** All four kitty
+    /// rows moved and the eight non-kitty rows held. The cause is the ONE
+    /// SPECTRUM's table and nothing in this file:
+    /// [`crate::spectrum::SPECTRUM_CROSSING_SHARE_CAP`] holds the green→blue
+    /// leg to `167` of the table's `510` steps so that yellow keeps its share
+    /// of the arc, which re-spends every leg and so moves every entry of
+    /// `SPECTRUM_LUT` from index `50` on. Every quad a rainbow emitter writes
+    /// moves with it. That is the change, not a side effect of one, and no
+    /// smaller re-bake exists: a kitty row IS the arc's bytes.
+    ///
+    /// THE CONTROLS THAT HELD, read off this tree's own run:
+    ///
+    /// * the eight non-kitty rows of this table are unchanged to the bit, and
+    ///   `the_other_nine_styles_are_byte_identical_with_v2_unconditional` is
+    ///   green over them — the other trail styles do not read the arc;
+    /// * `licensed_typed_parity`'s nine-style golden moved **only entry 2**
+    ///   (RainbowKitty); the other eight are byte-identical, which is that
+    ///   test's own non-vacuity control and it still separates them;
+    /// * `checked == 4`, so the pin is not vacuous, and
+    ///   `the_flat_spelling_collapses_every_comet_branch_byte_for_byte`'s own
+    ///   `assert_ne!` still separates the flat body from the default one.
+    ///
     /// THE RE-BAKE LAW. A v2 change that moves a kitty byte re-reads exactly
     /// the kitty rows it moves — and the flat spelling's twins,
     /// [`FLAT_GOLDENS`], the same way — with the eight non-kitty rows
@@ -33276,19 +33168,44 @@ halo = "add"
     /// by it: the one paragraph a bake must leave behind is the current
     /// one, and that is the paragraph above. The table's name for the flat
     /// twins is `FLAT_GOLDENS`, not `PRE_COMET_GOLDENS` — see its doc.)
+    /// **RE-BAKED 2026-09-15 (the four kitty rows only), AND THE REASON IS
+    /// THE ARC ITSELF.** `crate::spectrum`'s table moved: the green→blue
+    /// crossing's authored roof, its four pacing knots and — the part that
+    /// moves every entry — its exemption from the perceptual pace were
+    /// deleted as the retired no-cyan ruling's last machinery, so all seven
+    /// anchors landed at new indices (`[0, 63, 142, 258, 394, 471, 510]` ->
+    /// `[0, 50, 112, 204, 419, 479, 510]`) and every kitty row that reads a
+    /// colour off the arc folds a different byte. The eight non-kitty rows
+    /// are UNCHANGED, which is this pin doing its job: the deletion reached
+    /// the rainbow family and nothing else.
+    /// **RE-BAKED 2026-09-16, THE EXHAUST (§33), and the four kitty rows
+    /// stand where its last law left them.** The round's laws in order —
+    /// `Stardust::sow_exhaust` (one transient grain per key), the sky's share
+    /// `rk::stardust::STREAM_SHARE_CW` 0.35 → 1.05, the blank-frontier clamp
+    /// reading the band's row off the flight's own pixels, the grain yielding
+    /// within `rk::stardust::EXHAUST_HEADROOM` of the cap, and the grain
+    /// needing the cell behind the caret proved blank — moved dark, light and
+    /// underline; **reduced never moved**, which is the decomposition: the
+    /// exhaust's first gate is `cfg.reduced_motion` and the slipstream is a
+    /// position law `Star::pos` ignores under it. The last two laws moved
+    /// underline (and, for the headroom, dark) alone: the script's ~28 cps
+    /// tail sits in the headroom band, and under `underline` every grain was
+    /// a sub-cell twitch behind the just-echoed glyph. Each was decomposed
+    /// by switching it off and reading the previous number. The eight
+    /// non-kitty rows never moved. See `FLAT_GOLDENS` for the same bakes.
     const DELETION_GOLDENS: [(&str, u64); 12] = [
         ("Lumen dark", 1_264_411_311_373_267_895),
         ("Phaser dark", 2_726_566_909_586_900_035),
-        ("RainbowKitty dark", 4_461_815_233_714_909_726),
+        ("RainbowKitty dark", 13_957_692_697_408_025_534),
         ("Sparkle dark", 14_969_905_489_495_276_903),
         ("Fire dark", 12_618_090_056_209_866_428),
         ("Laser dark", 1_955_324_598_530_313_952),
         ("Beam dark", 15_086_158_732_367_022_435),
         ("Water dark", 482_165_703_607_766_578),
         ("Comet dark", 14_523_124_226_784_523_753),
-        ("RainbowKitty light", 15_435_435_340_954_993_666),
-        ("RainbowKitty underline", 7_623_959_890_164_863_941),
-        ("RainbowKitty reduced", 380_128_264_356_753_282),
+        ("RainbowKitty light", 16_474_978_137_331_214_836),
+        ("RainbowKitty underline", 11_627_668_675_227_657_479),
+        ("RainbowKitty reduced", 11_365_708_919_978_438_696),
     ];
 
     /// THE FLAT SPELLING'S GOLDENS: the four RainbowKitty rows of
@@ -33318,6 +33235,24 @@ halo = "add"
     /// the four rows fold to THESE numbers, under the default body to four
     /// others — so the comet's A/B gate is still byte-exact.
     ///
+    /// RE-BAKED 2026-09-15 WITH [`DELETION_GOLDENS`], AND FOR ITS ONE
+    /// REASON. The green→blue re-pace ([`rk::ribbon::CROSS_PACE`]) is not a
+    /// comet branch — the flag gates the comet profile, the vivid rail and
+    /// the from-the-hand wipe, not WHICH STOP a walk position resolves to —
+    /// so all four flat rows move with the four default ones, which is
+    /// exactly what the paragraph above says must happen. Measured the same
+    /// way: with the walk forced to the identity these four read
+    /// `13_180_914_282_442_234_019`, `16_869_065_810_935_775_429`,
+    /// `6_565_210_254_762_879_397` and `6_253_451_302_876_110_283` — the
+    /// bytes v0.86.0 shipped, to the bit — so the walk is the whole of the
+    /// move here too. The `assert_ne!` control in
+    /// `the_flat_spelling_collapses_every_comet_branch_byte_for_byte` is
+    /// green over the new numbers: the comet body still folds every one of
+    /// these four rows somewhere else, so the collapse is still a
+    /// measurement and not a vacuous pin.
+    ///
+    /// (The catch-up note below is kept for the history it records.)
+    ///
     /// NOT RE-BAKED AT THE 0.86 CANDIDATE'S FINAL CATCH-UP WITH MAIN
     /// (2026-09-15), for the same measured reason [`DELETION_GOLDENS`]
     /// was not: main's incoming round moved no byte of either spelling, so
@@ -33331,11 +33266,24 @@ halo = "add"
     /// this table and are kept verbatim but for the name; the candidate's
     /// rename and its reason are kept because the code uses `FLAT_GOLDENS`
     /// and "pre-comet" is no longer true of these bytes.)
+    ///
+    /// RE-BAKED 2026-09-16 WITH THE DEFAULT ROWS, THE EXHAUST (§33). The
+    /// exhaust is a STARDUST population and the flat spelling is a RIBBON
+    /// BODY, so the two are orthogonal: every law of the round moves the
+    /// same rows here as on [`DELETION_GOLDENS`] (dark, light and underline
+    /// for the exhaust and the sky's share; underline alone for the frontier
+    /// clamp and the blank-cell gate; dark and underline for the headroom),
+    /// with reduced byte-identical on both tables throughout. The
+    /// `assert_ne!` control in
+    /// `the_flat_spelling_collapses_every_comet_branch_byte_for_byte` is
+    /// green over every bake: the comet body still folds all four rows
+    /// somewhere else, so the collapse is a measurement and not a vacuous
+    /// pin.
     const FLAT_GOLDENS: [(&str, u64); 4] = [
-        ("RainbowKitty dark", 13_180_914_282_442_234_019),
-        ("RainbowKitty light", 16_869_065_810_935_775_429),
-        ("RainbowKitty underline", 6_565_210_254_762_879_397),
-        ("RainbowKitty reduced", 6_253_451_302_876_110_283),
+        ("RainbowKitty dark", 14_766_156_058_099_546_727),
+        ("RainbowKitty light", 15_009_626_345_715_177_661),
+        ("RainbowKitty underline", 18_121_524_929_398_043_921),
+        ("RainbowKitty reduced", 9_256_275_961_493_287_119),
     ];
 
     /// The four kitty rows of the deletion script — dark, light, underline,
@@ -33380,7 +33328,16 @@ halo = "add"
         let mut moved = Vec::new();
         for ((name, got), (want_name, want)) in flat.iter().zip(FLAT_GOLDENS) {
             assert_eq!(*name, want_name);
-            if *got != want {
+            // The four flat rows are Apple-silicon exact bits like the deletion
+            // goldens above them (`arm64_pin`): asserted everywhere but x86_64
+            // macOS, where a miss is reported and the render's determinism is
+            // what is asserted instead.
+            if crate::arm64_pin::moved(
+                "cursor_glow::tests::the_flat_spelling_collapses_every_comet_branch_byte_for_byte",
+                name,
+                *got,
+                want,
+            ) {
                 moved.push(format!("{name}: got {got} want {want}"));
             }
         }
@@ -33389,6 +33346,9 @@ halo = "add"
             "the flat spelling is no longer the flat body:\n{}",
             moved.join("\n")
         );
+        crate::arm64_pin::deterministic_on_x86_64("the four flat kitty rows", &flat, || {
+            kitty_rows(true)
+        });
         for ((name, got), (_, pre)) in kitty_rows(false).iter().zip(FLAT_GOLDENS) {
             assert_ne!(
                 *got, pre,
@@ -33415,7 +33375,13 @@ halo = "add"
             if name.starts_with("RainbowKitty") {
                 continue;
             }
-            assert_eq!(*got, want, "{name}: the deletion moved a byte");
+            crate::arm64_pin::assert_pinned(
+                "cursor_glow::tests::the_other_nine_styles_are_byte_identical_with_v2_unconditional",
+                name,
+                *got,
+                want,
+                format_args!("{name}: the deletion moved a byte"),
+            );
         }
     }
 
@@ -33427,12 +33393,67 @@ halo = "add"
     /// this pin is what makes any later drift a decision instead of a
     /// surprise.
     ///
+    /// RE-BAKED 2026-09-15, THE EDIT ROUND'S ANSWER LANE, AND THE WALK IS
+    /// THE WHOLE OF IT. All four kitty rows move, and what moved them is
+    /// ONE law: [`rk::ribbon::CROSS_PACE`], the re-pace of the walk across
+    /// the green→blue leg (the owner: *"some blending smoothness in green
+    /// to blue where the gradient sometimes looked blocky"*). The script
+    /// draws the band on every frame, so a change to WHICH STOP a walk
+    /// position resolves to reaches every one of them.
+    ///
+    /// **DECOMPOSED, NOT ASSUMED** (measured 2026-09-15 by switching each
+    /// of the round's laws off in turn and re-reading this table):
+    ///
+    /// * with [`rk::ribbon::walk_pace`] forced to the IDENTITY and every
+    ///   other law of the round left in place, these four rows read
+    ///   `4_461_815_233_714_909_726`, `15_435_435_340_954_993_666`,
+    ///   `7_623_959_890_164_863_941` and `380_128_264_356_753_282` — the
+    ///   bytes v0.86.0 shipped (`de9846727`), to the bit. The round's other
+    ///   laws — the fold that keeps its row, the repaint's home, the
+    ///   witness's blank cells, the erase (which is v0.86.0's own
+    ///   `retract_suffix` again, the slide having been dropped after
+    ///   measurement) — move NO byte of this script.
+    /// * the green→blue confinement is `rk::ribbon::tests::`
+    ///   `the_crossing_is_smoothed_out_of_its_own_legs_cells_and_nothing_else_moves`:
+    ///   every step the shipped walk placed outside green→blue is unchanged
+    ///   to the bit (`moved_off_leg == 0`), all seven anchors keep their
+    ///   residency, and cells 0–4 — the warm end the owner asked to see
+    ///   more of — sit on exactly the stops they shipped with.
+    /// * THE EIGHT NON-KITTY ROWS ARE UNTOUCHED
+    ///   (`the_other_nine_styles_are_byte_identical_with_v2_unconditional`
+    ///   is green over them), and `licensed_typed_parity`'s nine-style
+    ///   golden moved ONLY its entry 2: no other trail style moved.
+    ///
+    /// The bake was taken AFTER a defect it would otherwise have pinned was
+    /// fixed. `Ribbon::typed_landing` — the round's "a key lays where the
+    /// hand is" — read [`Ribbon::caret`] as the hand, and that field is
+    /// seeded from the engine's caret MIRROR, which is `(0, 0)` until a
+    /// caret has been observed at all. Traced on this very script, the
+    /// FIRST key of the session (`caret=(2, 5)`, mirror `(0, 0)`) was
+    /// redirected to `(0, 1)`: a stray on a row the hand has never been on,
+    /// which is the defect the law exists to prevent. The law now requires
+    /// the hand's row to be a row this ribbon holds a cell on, and with
+    /// that guard it moves no byte here.
+    ///
     /// At the 0.86 candidate's final catch-up with main (2026-09-15) this
     /// pin was read and NOT re-baked: main's incoming round moved none of
     /// the four, so the numbers on [`DELETION_GOLDENS`] are the merged
     /// tree's own — measured on its run, `checked == 4`. (The stray `)` a
     /// previous hand-merge left on "surprise.)" is gone with it: main's
     /// spelling of the sentence was the whole one.)
+    ///
+    /// RE-BAKED 2026-09-16, THE EXHAUST (§33) — five laws, each landed as
+    /// its own commit and each decomposed by switching it off and reading
+    /// the previous number; the paragraph on [`DELETION_GOLDENS`] names them
+    /// and which rows each moved. The control that held throughout:
+    /// **reduced did not move one byte** — the exhaust's first gate is
+    /// `cfg.reduced_motion` and the slipstream is a position law `Star::pos`
+    /// ignores under it — and the light row moved by a DIFFERENT number
+    /// from dark, which is `light_keeps` thinning the population to
+    /// [`rk::stardust::LIGHT_COUNT_SCALE`]; a bake that moved light and dark
+    /// by one law would have been the tell that something other than the
+    /// exhaust moved. The eight non-kitty rows are untouched
+    /// (`the_other_nine_styles_are_byte_identical_with_v2_unconditional`).
     #[test]
     fn rainbow_kitty_is_byte_identical_to_the_seam_era_v2() {
         let rows = deletion_goldens();
@@ -33446,7 +33467,12 @@ halo = "add"
                 continue;
             }
             checked += 1;
-            if *got != want {
+            if crate::arm64_pin::moved(
+                "cursor_glow::tests::rainbow_kitty_is_byte_identical_to_the_seam_era_v2",
+                name,
+                *got,
+                want,
+            ) {
                 moved.push(format!("{name}: got {got} want {want}"));
             }
         }
@@ -34133,10 +34159,19 @@ halo = "add"
         // a busy re-arm. Measured 2026-09-06 on this schedule: 474 brisk
         // wakes against 502 lane ticks (7 960 ms of gestures + 399 ms of
         // cadence at 16.667 ms).
+        //
+        // This fixture feeds the engine NO glyph probe, so not one stardust
+        // star of any lane is born in the whole script and the brisk wakes
+        // counted here are the RIBBON's and the METEOR's: 346 with
+        // `sow_exhaust` compiled out and 346 with it in (measured
+        // 2026-09-16). The exhaust's frame-train cost is bounded where it can
+        // be seen, over a probed sky — `rk::stardust::tests::`
+        // `the_exhaust_costs_the_frame_train_its_own_window_and_no_more`.
         let train_v2 = v2.wakes.get(&SeamOwner::V2Brisk).copied().unwrap_or(0);
         let last_ms = census_schedule().last().map_or(0, |s| s.0);
         let lane_ticks =
             ((last_ms + cadence_false) as f64 / (lane.as_secs_f64() * 1_000.0)).ceil() as u32 + 1;
+        println!("seam census v2: brisk wakes {train_v2} over {lane_ticks} lane ticks");
         assert!(
             train_v2 > 0 && train_v2 <= lane_ticks,
             "v2 held the frame train for {train_v2} wakes where the lane ticked {lane_ticks} \

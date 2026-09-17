@@ -306,25 +306,57 @@ fn encode_numpad_named_legacy(
         NamedKey::NumpadMultiply => encode_numpad(b'j', '*', app_keypad, vt52, modifiers),
         NamedKey::NumpadSubtract => encode_numpad(b'm', '-', app_keypad, vt52, modifiers),
         NamedKey::NumpadAdd => encode_numpad(b'k', '+', app_keypad, vt52, modifiers),
-        // NumpadEnter: SS3 M in DECKPAM, CR otherwise. Per VT420 spec,
-        // this distinguishes numpad Enter from main Enter (#7558).
-        NamedKey::NumpadEnter => encode_numpad(b'M', '\r', app_keypad, vt52, modifiers),
+        // NumpadEnter: SS3 M in DECKPAM (VT52: ESC ? M), which is what tells
+        // the keypad's Enter from the main Return (#7558); Shift cancels
+        // application keypad mode as it does for every keypad key. OUTSIDE
+        // application mode — and under Alt, which `encode_numpad` ranks ahead
+        // of it — KP_Enter is the main Enter BYTE FOR BYTE: CR, aterm's
+        // Shift+Enter LF imposition, Alt's ESC CR. The keypad's Enter is a
+        // second Return to the hand on it, and it reaches this arm from the
+        // keyboard now (`aterm_winit_keymap::map_numpad_key`), not only from a
+        // controller's `key kpenter`; before that seam a physical Shift+KP_Enter
+        // typed LF, and it still must.
+        NamedKey::NumpadEnter => {
+            let effective_app = app_keypad && !modifiers.contains(Modifiers::SHIFT);
+            if !effective_app || modifiers.contains(Modifiers::ALT) {
+                return encode_control_named_legacy(NamedKey::Enter, modifiers, mode);
+            }
+            if vt52 {
+                [0x1b, b'?', b'M'].to_vec()
+            } else {
+                [0x1b, b'O', b'M'].to_vec()
+            }
+        }
         NamedKey::NumpadEqual => encode_character_legacy('=', modifiers, mode),
         // NumpadSeparator: comma on some international keyboards (SS3 l in DECKPAM).
         NamedKey::NumpadSeparator => encode_numpad(b'l', ',', app_keypad, vt52, modifiers),
-        // NumpadBegin (KP_BEGIN / center 5 key): SS3 E in DECKPAM, '5' otherwise.
-        // xterm encodes this as ESC O E in app mode, ESC [E in normal mode.
+        // NumpadBegin (KP_BEGIN / centre 5 key): SS3 E in DECKPAM, CSI E
+        // otherwise — xterm's `kb2`, and what this arm's own comment has always
+        // said it sends. It emitted a bare `5` instead, which nothing could
+        // reach while the GUI had no road to `NumpadBegin`; the winit seam
+        // (`aterm_winit_keymap::map_numpad_key`) opened one, and a NumLock-OFF
+        // centre key would have started TYPING A DIGIT at the shell prompt
+        // where it had written nothing before — a new defect of exactly the
+        // class the seam exists to remove. The key has no glyph (that is why
+        // xkb reports `Unidentified` for it and why `main_block_twin` refuses
+        // it), so there is no digit for it to send. `CSI E` also agrees with
+        // the kitty encoder, which has always answered
+        // `letter_final(b'E', ..)` here.
+        //
+        // ALT is the `altSendsEscape` prefix on the sequence the key would
+        // otherwise send, as it is for every keypad key in `encode_numpad`;
+        // VT52 application keypad keeps `ESC ? 5`, its keypad-character form.
         NamedKey::NumpadBegin => {
             let effective_app = app_keypad && !modifiers.contains(Modifiers::SHIFT);
             if modifiers.contains(Modifiers::ALT) {
-                vec![0x1b, b'5']
+                [0x1b, 0x1b, b'[', b'E'].to_vec()
             } else if vt52 && effective_app {
                 // VT52 application keypad: ESC ? 5
-                vec![0x1b, b'?', b'5']
+                [0x1b, b'?', b'5'].to_vec()
             } else if effective_app {
-                vec![0x1b, b'O', b'E']
+                [0x1b, b'O', b'E'].to_vec()
             } else {
-                vec![b'5']
+                [0x1b, b'[', b'E'].to_vec()
             }
         }
         // Numpad navigation (NumpadArrow*, NumpadHome, etc.) is handled by

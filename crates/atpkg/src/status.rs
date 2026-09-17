@@ -83,9 +83,56 @@ pub struct Status {
     /// success stamps it.
     #[serde(default)]
     pub last_success_at: String,
+    /// RFC3339 UTC time the signed index LISTING was last REACHED over the network —
+    /// as against served from the §14 cache after a rate limit, an outage or a proxy
+    /// refused it. Stamped by [`stamp_index_freshness`] from what the resolve measured
+    /// ([`crate::flow::last_resolve`]); a pass that ran on the cache leaves it where
+    /// it was. `last_success_at` could not say this: a cached resolve is a pass that
+    /// "succeeded", and every surface stayed green while the managed `claude` could
+    /// freeze at an old pin (audit 2026-09-14). Empty before 2026-09-15.
+    #[serde(default)]
+    pub last_index_reached_at: String,
+    /// The `index_build` the last pass resolved, and when it last CHANGED — the
+    /// publisher's own pulse. `doctor`'s "publishing looks frozen" used to read a clock
+    /// that advances on every no-op pass, so a dead vendor lane, a stuck lock or an
+    /// expired token upstream was undetectable from a client (audit 2026-09-14).
+    #[serde(default)]
+    pub last_index_build: u64,
+    /// See [`Self::last_index_build`]. Empty before 2026-09-15.
+    #[serde(default)]
+    pub index_build_changed_at: String,
     /// Per-program states, keyed by program name.
     #[serde(default)]
     pub programs: BTreeMap<String, ProgramStatus>,
+}
+
+/// Stamp what the pass's index resolve MEASURED: `last_index_reached_at = now` when the
+/// listing answered over the network (`reached`), and `last_index_build` /
+/// `index_build_changed_at` when `index_build` differs from the one recorded (a `None`
+/// build — a pass with no index in hand — changes neither). Best-effort like every
+/// status write; `updated_at` moves with it. Seeded through [`seed_for_rewrite`], so an
+/// existing record this process cannot READ is left alone rather than replaced.
+///
+/// # Errors
+/// [`read_checked`]'s diagnostic for an unreadable record, or the write's.
+pub fn stamp_index_freshness(
+    layout: &Layout,
+    now: &str,
+    reached: bool,
+    index_build: Option<u64>,
+) -> io::Result<()> {
+    let mut status = seed_for_rewrite(layout)?;
+    if reached {
+        status.last_index_reached_at = now.to_string();
+    }
+    if let Some(build) = index_build
+        && build != status.last_index_build
+    {
+        status.last_index_build = build;
+        status.index_build_changed_at = now.to_string();
+    }
+    status.updated_at = now.to_string();
+    write(layout, &status)
 }
 
 /// The stderr line every read-only verb (`list`, `which`, `status`, `doctor`, the
@@ -113,12 +160,13 @@ pub fn never_checked(layout: &Layout) -> bool {
 /// "packages can be updated on this machine" true. A member that FAILED inside such a
 /// pass is recorded in its own row, not here: until 2026-09-14 only a zero-failure pass
 /// stamped this, so one refused member kept every verb saying no check had ever run.
-/// Best-effort like every status write.
+/// Best-effort like every status write, and seeded through [`seed_for_rewrite`]: an
+/// existing record this process cannot READ is left alone rather than replaced.
+///
+/// # Errors
+/// [`read_checked`]'s diagnostic for an unreadable record, or the write's.
 pub fn stamp_success(layout: &Layout, now: &str) -> io::Result<()> {
-    let mut status = read(layout).unwrap_or(Status {
-        schema: 1,
-        ..Default::default()
-    });
+    let mut status = seed_for_rewrite(layout)?;
     status.last_success_at = now.to_string();
     status.updated_at = now.to_string();
     write(layout, &status)
@@ -144,7 +192,8 @@ impl Status {
 }
 
 /// Atomically write `status` to `layout.status()` (temp + rename). Best-effort: a failure
-/// is returned but is never fatal to an apply (status is diagnostics).
+/// is returned but is never fatal to an apply (status is diagnostics) — and leaves nothing
+/// behind, the temp being reclaimed on both failure arms.
 pub fn write(layout: &Layout, status: &Status) -> io::Result<()> {
     if status.programs.len() > MAX_STATUS_PROGRAMS {
         return Err(io::Error::new(
@@ -176,8 +225,22 @@ pub fn write(layout: &Layout, status: &Status) -> io::Result<()> {
     // callee named `write` against the libc `write(2)` FFI-boundary contracts,
     // which do not apply to this safe std function (see `lib.rs`). Same
     // function, same arguments; behavior identical.
-    crate::call2(std::fs::write, &tmp, text)?;
-    std::fs::rename(&tmp, &dest)
+    //
+    // BOTH failure arms reclaim the temp. The name carries this process's pid, so a
+    // leftover is never overwritten by a later pass, and nothing sweeps it: neither `gc`
+    // nor `doctor` scans the prefix root for `status.toml.tmp-*`. A machine whose disk
+    // stays full writes status several times per pass and would strand one more file on
+    // every pass, for as long as the condition lasted. Same rule as `progress.rs` and
+    // `shim_env.rs`, which already clean up after themselves.
+    if let Err(error) = crate::call2(std::fs::write, &tmp, text) {
+        let _ = std::fs::remove_file(&tmp);
+        return Err(error);
+    }
+    if let Err(error) = std::fs::rename(&tmp, &dest) {
+        let _ = std::fs::remove_file(&tmp);
+        return Err(error);
+    }
+    Ok(())
 }
 
 /// Read + parse `status.toml` with explicit admission/parse diagnostics.
@@ -217,6 +280,31 @@ pub fn read(layout: &Layout) -> Option<Status> {
     read_checked(layout).ok().flatten()
 }
 
+/// Seed a writer that REBUILDS the whole record: the record on disk, or a minimal
+/// schema-1 one when this store has none yet.
+///
+/// The `Err` arm is the point of the function. [`read`] collapses EVERY failure — a
+/// symlinked or otherwise non-regular path (the `O_NOFOLLOW` open), non-UTF-8 bytes, an
+/// oversize file, a TOML parse error, a permission denial — into the same `None` an
+/// ABSENT file yields, so a writer seeded with `read(layout).unwrap_or_default()` answers
+/// an unreadable record by REPLACING it: [`write`]'s temp + rename drops every other
+/// program's row and its signed `tree_root`, the [`Status::seams`] vector `uninstall
+/// --all` walks, and [`Status::last_success_at`] — from one diagnostic write inside a
+/// failed pass, with nothing said on stderr. Diagnostics are best-effort to WRITE, which
+/// is not a licence to destroy the record an operator is about to read. A rewriting
+/// writer takes this seed and gives up on `Err`, leaving the bytes exactly where they
+/// are; a writer that only EDITS an existing record already returns early on `None` and
+/// needs no seed.
+///
+/// # Errors
+/// [`read_checked`]'s diagnostic when `status.toml` exists but could not be read.
+pub fn seed_for_rewrite(layout: &Layout) -> io::Result<Status> {
+    Ok(read_checked(layout)?.unwrap_or(Status {
+        schema: 1,
+        ..Default::default()
+    }))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -230,6 +318,42 @@ mod tests {
         #[cfg(unix)]
         std::fs::set_permissions(&p, std::fs::Permissions::from_mode(0o700)).unwrap();
         Layout { prefix: p }
+    }
+
+    /// The freshness stamps (2026-09-15): the reach time moves only when the listing
+    /// answered; the build-changed time moves only when the build differs from the one
+    /// recorded; a pass with no index in hand moves neither.
+    #[test]
+    fn index_freshness_stamps_only_what_the_resolve_measured() {
+        let dir = std::env::temp_dir().join(format!("atpkg-status-fresh-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let layout = Layout {
+            prefix: dir.clone(),
+        };
+        stamp_index_freshness(&layout, "2026-09-15T10:00:00Z", true, Some(32)).unwrap();
+        let s = read(&layout).unwrap();
+        assert_eq!(s.last_index_reached_at, "2026-09-15T10:00:00Z");
+        assert_eq!(s.last_index_build, 32);
+        assert_eq!(s.index_build_changed_at, "2026-09-15T10:00:00Z");
+        // A cached pass: the reach time stays, the build is the same, nothing moves.
+        stamp_index_freshness(&layout, "2026-09-16T10:00:00Z", false, Some(32)).unwrap();
+        let s = read(&layout).unwrap();
+        assert_eq!(s.last_index_reached_at, "2026-09-15T10:00:00Z");
+        assert_eq!(s.index_build_changed_at, "2026-09-15T10:00:00Z");
+        assert_eq!(s.updated_at, "2026-09-16T10:00:00Z");
+        // A reached pass on a newer build: both move.
+        stamp_index_freshness(&layout, "2026-09-17T10:00:00Z", true, Some(33)).unwrap();
+        let s = read(&layout).unwrap();
+        assert_eq!(s.last_index_reached_at, "2026-09-17T10:00:00Z");
+        assert_eq!(s.last_index_build, 33);
+        assert_eq!(s.index_build_changed_at, "2026-09-17T10:00:00Z");
+        // No index in hand: the build fields are untouched.
+        stamp_index_freshness(&layout, "2026-09-18T10:00:00Z", true, None).unwrap();
+        let s = read(&layout).unwrap();
+        assert_eq!(s.last_index_build, 33);
+        assert_eq!(s.index_build_changed_at, "2026-09-17T10:00:00Z");
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]
@@ -260,6 +384,9 @@ mod tests {
             outcome: "up to date".into(),
             seams: Vec::new(),
             last_success_at: "2026-06-29T00:00:00Z".into(),
+            last_index_reached_at: String::new(),
+            last_index_build: 0,
+            index_build_changed_at: String::new(),
             programs,
         };
         write(&l, &s).unwrap();
@@ -297,6 +424,50 @@ mod tests {
         let _ = std::fs::remove_dir_all(&l.prefix);
     }
 
+    /// The same promise on the FAILING path (2026-09-16). The temp name carries this
+    /// process's pid, so a write or rename that fails stranded `status.toml.tmp-<pid>`
+    /// in the prefix root — a name nothing has ever swept: neither `gc` nor `doctor`
+    /// scans for it, and the next pass runs under a new pid, so the leftovers do not
+    /// even overwrite each other. A machine whose disk stays full writes status
+    /// several times per pass and left one more file behind on every pass,
+    /// unreclaimable, for as long as the disk stayed full. Staged with the one failure
+    /// a test can force deterministically: a `status.toml` that is a DIRECTORY, so the
+    /// bytes reach the temp and the rename is what refuses.
+    #[cfg(unix)]
+    #[test]
+    fn failed_write_reclaims_its_temp() {
+        let l = layout("failed-write");
+        std::fs::create_dir(l.status()).unwrap();
+        let error = write(
+            &l,
+            &Status {
+                schema: 1,
+                ..Default::default()
+            },
+        )
+        .expect_err("a rename onto a directory cannot succeed");
+        // EISDIR — 21 on every unix this ships to. Pinning it keeps the test honest:
+        // the bytes DID reach the temp and the rename is what refused, which is
+        // precisely the state that used to strand the temp. An error raised before the
+        // temp was ever created would prove nothing.
+        assert_eq!(
+            error.raw_os_error(),
+            Some(21),
+            "the staged failure must be the rename's, not an earlier one: {error}"
+        );
+        let leftovers: Vec<_> = std::fs::read_dir(&l.prefix)
+            .unwrap()
+            .filter_map(Result::ok)
+            .filter(|e| e.file_name().to_string_lossy().contains(".tmp-"))
+            .map(|e| e.file_name())
+            .collect();
+        assert!(
+            leftovers.is_empty(),
+            "a failed status write must reclaim its temp, not strand it: {leftovers:?}"
+        );
+        let _ = std::fs::remove_dir_all(&l.prefix);
+    }
+
     #[test]
     fn read_absent_or_corrupt_is_none() {
         let l = layout("absent");
@@ -307,6 +478,41 @@ mod tests {
         let error = read_checked(&l).unwrap_err();
         assert_eq!(error.kind(), io::ErrorKind::InvalidData);
         assert!(error.to_string().contains("status.toml is invalid"));
+        let _ = std::fs::remove_dir_all(&l.prefix);
+    }
+
+    /// A writer that REBUILDS the record must not answer one it could not READ by
+    /// replacing it. `read` reports an absent record and an unreadable one identically,
+    /// so the stamps used to seed from a default and rename a single-field record over
+    /// the operator's rows, `seams` and `last_success_at` — silently, from one diagnostic
+    /// write inside a failed pass.
+    #[test]
+    fn rewriting_writers_refuse_an_unreadable_record() {
+        let l = layout("unreadable");
+        assert_eq!(
+            seed_for_rewrite(&l).unwrap().schema,
+            1,
+            "a virgin store seeds a fresh record: absent is not unreadable"
+        );
+        let corrupt = "schema = 1\nseams = [\"rustup:trust\"]\nthis is not valid toml {{{\n";
+        std::fs::write(l.status(), corrupt).unwrap();
+        assert_eq!(
+            seed_for_rewrite(&l).unwrap_err().kind(),
+            io::ErrorKind::InvalidData
+        );
+        assert!(
+            stamp_success(&l, "2026-09-16T00:00:00Z").is_err(),
+            "the success stamp declines rather than rewriting"
+        );
+        assert!(
+            stamp_index_freshness(&l, "2026-09-16T00:00:00Z", true, Some(7)).is_err(),
+            "the freshness stamp declines rather than rewriting"
+        );
+        assert_eq!(
+            std::fs::read_to_string(l.status()).unwrap(),
+            corrupt,
+            "the bytes an operator can still salvage are left exactly as they were"
+        );
         let _ = std::fs::remove_dir_all(&l.prefix);
     }
 
@@ -360,6 +566,9 @@ mod tests {
             outcome: "up to date".into(),
             seams: vec!["rustup:trust".into()],
             last_success_at: String::new(),
+            last_index_reached_at: String::new(),
+            last_index_build: 0,
+            index_build_changed_at: String::new(),
             programs,
         };
         write(&l, &s).unwrap();

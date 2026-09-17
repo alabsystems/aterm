@@ -533,6 +533,18 @@ pub fn remove_edge_tokens(sock_dir: &Path, child_sid: &SessionId) {
     let _ = std::fs::remove_file(edge_path(sock_dir, child_sid));
 }
 
+/// The HOSTING pid a session's discovery entry records (`pid <n>`), or `None`
+/// when there is no entry, it is unreadable, or it predates the `pid` line.
+///
+/// The one fact [`crate::identity_claim`] needs to answer "is some OTHER live
+/// instance already serving this id?" without dialing a same-uid-writable path.
+/// A pid alone grants nothing and reveals nothing, which is why this reads the
+/// line rather than the `sock` one.
+pub fn graph_entry_host_pid(sock_dir: &Path, sid: &SessionId) -> Option<u32> {
+    let body = std::fs::read_to_string(graph_path(sock_dir, sid)).ok()?;
+    aterm_types::control_socket::graph_entry_pid(&body)
+}
+
 /// Read a child's discovery entry: `(sock_path, nonce)` or `None` if absent /
 /// malformed. PURE parse split out for testing.
 pub fn read_graph_entry(sock_dir: &Path, sid: &SessionId) -> Option<(String, LaunchNonce)> {

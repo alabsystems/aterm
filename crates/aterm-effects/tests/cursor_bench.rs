@@ -37,7 +37,6 @@ fn config(style: GlowStyle) -> GlowConfig {
         beam: false,
         head_dx: 0.5,
         pack: None,
-        wake_persist_s: aterm_effects::cursor_glow::RAINBOW_WAKE_PERSIST,
     }
 }
 

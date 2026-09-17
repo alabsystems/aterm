@@ -122,6 +122,63 @@ pub struct SessionRecord {
     /// and nothing about it can refuse the adoption.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub control: Option<String>,
+    /// FROZEN PATH (additive, absent ⇒ `false`; 2026-09-16): this session's shell
+    /// was spawned by a build whose sessions do not heal their PATH — it has no
+    /// `<prefix>/agents/` in front, so `claude`/`codex` in it are the foreign
+    /// copies — and the outgoing process KNEW that (it adopted the shell as such
+    /// from an older build). Carried per session so the fact survives a SECOND
+    /// handoff: the manifest's [`SessionHandoff::outgoing_build`] alone would
+    /// say "a build that heals wrote this" and the still-frozen shell would be
+    /// counted as covered. `false` is not written, so an older reader sees the
+    /// wire it always saw.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub frozen_path: bool,
+}
+
+/// THE BUILD WHOSE SESSIONS ALWAYS HAVE THE MANAGED `agents/` ON PATH
+/// (2026-09-16), and how the successor recognises the one before it. Owner, that
+/// day, of the window's status row reading "what `claude` and `codex` run in new
+/// tabs": "HEY! this is a bad experience. aterm atpkg DID install the latest but
+/// it didn't make them available for me. instead, it is telling me to open a new
+/// tab. NO! all the latest and best MUST WORK IN THE SAME TAB with live update!"
+/// The tab in the screenshot was a zsh spawned at 10:44:24 by the PREVIOUS build
+/// (0.86.0, build 1789468652, started 10:44:32 — the shell was ADOPTED across the
+/// seamless update); `<prefix>/agents/` and the shell hooks were created at
+/// 10:46 by the new build's first pass, and nothing an already-running shell
+/// does learns about them: its PATH is frozen. From this build on, the spawn
+/// seam ensures `agents/` EXISTS at launch (`spawn::managed_agents_dir`) so
+/// every session — the very first tab on a fresh machine included — has it in
+/// front of the PATH it is spawned with, and the shell integration re-asserts
+/// the order and sources the hook as atpkg lays it.
+///
+/// A session handed off by a build that wrote no [`SessionHandoff::outgoing_build`]
+/// at all — the old→new handoff that introduced the field, by definition — is
+/// FROZEN: the row must not claim "this one too" for it, and names the in-place
+/// remedy (sourcing the atpkg hook in that tab; `status_bars::HookDialect`).
+///
+/// PRESENCE, NOT A NUMBER (review, 2026-09-16). The first cut compared
+/// `outgoing_build` against a hand-picked epoch of that day (1789585000, 11:56
+/// PDT), on the argument that build numbers are the cutter's ledger claims
+/// stamped from committer epochs and so rise monotonically. They do — but
+/// `crates/aterm-gui/build.rs` stamps a DEV build from HEAD's committer epoch
+/// too ("0" only without git), and HEAD at authoring time was 1789580066, BELOW
+/// that bar: a dev build of this very change — or a release cut in the minutes
+/// after review — would have handed off with a number under it and marked every
+/// adopted tab frozen, falsely, and the per-record carry would have made the
+/// false mark stick through every later handoff. So the constant is gone and
+/// the field's PRESENCE is the evidence: it is written by exactly the builds
+/// that heal their sessions' PATH.
+///
+/// Whether a manifest written by `outgoing_build` hands off sessions whose
+/// PATH is frozen without `agents/`. ABSENT MEANS PREDATES, PRESENT MEANS HEALS:
+/// the field is written by exactly the builds whose sessions have `agents/` in
+/// front from launch, so the one manifest without it is the old build's, and the
+/// number itself is never compared (the doc above says why a numeric bar was
+/// wrong). A shell such a build itself adopted frozen rides the per-record
+/// [`SessionRecord::frozen_path`] instead.
+#[must_use]
+pub fn predates_path_self_heal(outgoing_build: Option<u64>) -> bool {
+    outgoing_build.is_none()
 }
 
 /// The screen half of the seamless handoff: the checkpoint's scalar projection
@@ -250,6 +307,15 @@ pub struct SessionHandoff {
     /// could not be carried cannot lower it.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub next_turn_id: Option<u64>,
+    /// OUTGOING BUILD (additive, absent tolerated; 2026-09-16): the build
+    /// number of the process that wrote this manifest — the OLD binary of the
+    /// update, by construction. The incoming side reads it to know whether the
+    /// sessions it adopts have a frozen PATH without `<prefix>/agents/`
+    /// ([`predates_path_self_heal`]; presence, never the number): ABSENT
+    /// is exactly the handoff from the build before this field existed, and
+    /// reads as "predates". A plain scalar an older reader skips.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub outgoing_build: Option<u64>,
 }
 
 // ⚠ LOAD-BEARING WIRE FORMAT — DO NOT "CLEAN UP" THIS SERIALIZATION.
@@ -304,6 +370,12 @@ impl SessionHandoff {
             connections,
             // Stamped by the handoff worker, which writes the manifest.
             next_turn_id: None,
+            // THIS build wrote the manifest: its PRESENCE tells the successor the
+            // shells it adopts had `agents/` in front from launch
+            // (`predates_path_self_heal`); the number is a record, never compared.
+            // A dev build writes HEAD's committer epoch (`build.rs`), `0` only
+            // without git — either way the field is there.
+            outgoing_build: Some(crate::running_build_number()),
             sessions: handles
                 .into_iter()
                 .map(|h| {
@@ -332,6 +404,9 @@ impl SessionHandoff {
                         attention: meta.attention.clone(),
                         // Attached by the seamless writer with its sidecar.
                         control: None,
+                        // A shell this process itself adopted frozen goes on
+                        // frozen: the fact rides per record, not per manifest.
+                        frozen_path: store.has_frozen_path(h.local_id),
                     }
                 })
                 .collect(),
@@ -629,6 +704,15 @@ pub struct SessionStore {
     /// the reader's EOF and the pane's teardown (indefinitely under `--hold`),
     /// which is exactly the window this table spans.
     exit_codes: HashMap<u64, i32>,
+    /// Sessions whose shell has a FROZEN PATH — spawned by a build before
+    /// the self-healing sessions (2026-09-16) and adopted across the update(s) since,
+    /// so `<prefix>/agents/` is not in front and `claude`/`codex` in them are
+    /// the foreign copies (2026-09-16). Marked at adoption by
+    /// `App::register_session`, cleared by the deregister, projected into the
+    /// next handoff manifest by [`SessionHandoff::from_store`], and counted for
+    /// the managed-current row ([`Self::frozen_path_tabs`]). A side table for
+    /// the same reason `exit_codes` is one: the handle's constructors are many.
+    frozen_path: std::collections::HashSet<u64>,
 }
 
 /// Shared handle to the registry, cloned into the control thread alongside the
@@ -704,6 +788,44 @@ impl SessionStore {
         });
     }
 
+    /// Mark the session with local id `local_id` as having a FROZEN PATH (see the
+    /// field): an adopted shell that predates the self-healing sessions, or
+    /// one the outgoing process carried as frozen. Idempotent; an unknown id is
+    /// remembered too (the registration may follow in the same spawn seam).
+    pub fn mark_frozen_path(&mut self, local_id: u64) {
+        self.frozen_path.insert(local_id);
+    }
+
+    /// Whether `local_id` was marked frozen ([`Self::mark_frozen_path`]) — what the
+    /// next handoff manifest carries per record.
+    #[must_use]
+    pub fn has_frozen_path(&self, local_id: u64) -> bool {
+        self.frozen_path.contains(&local_id)
+    }
+
+    /// HOW MANY LIVE TABS STILL RUN A FROZEN SHELL: marked frozen, still
+    /// registered, and with no exit status noted (a shell that exited under
+    /// `--hold` is not a tab a person can source the hook in). The managed-current
+    /// row takes this count at post time (2026-09-16), so the "N tabs from before
+    /// this update" note leaves when those tabs do — WHEN THEY CLOSE, and not
+    /// before (review, 2026-09-16): sourcing the hook in such a tab, the remedy
+    /// the note names, is not reported back by the shell, so the mark is never
+    /// lowered by the remedy itself and the count is an upper bound until the
+    /// tab is gone. Same for a mark that was conservative to begin with (a tab
+    /// the old build opened after the hooks existed; a tab this build spawned
+    /// and a rollback-then-update handed back without `outgoing_build` — see
+    /// `seamless::take_incoming`): the hook there is a no-op, the tab still
+    /// counts, and closing it is what retires the note. Honest as a bound, and
+    /// cheap; a shell proving itself unfrozen (an OSC from the live path) is
+    /// the design that would lower it, not taken this day.
+    #[must_use]
+    pub fn frozen_path_tabs(&self) -> usize {
+        self.frozen_path
+            .iter()
+            .filter(|id| self.by_local.contains_key(id) && !self.exit_codes.contains_key(id))
+            .count()
+    }
+
     /// Note the exited child's status for the session with local id `local_id`,
     /// ahead of its deregistration. The shell-exit path calls this the instant
     /// the status is answerable (`Wake::Exit`, before teardown reaps and discards
@@ -759,6 +881,8 @@ impl SessionStore {
         // duplicate deregister must not leave a stale code to be pinned on a
         // session that later reuses the local id.
         let exit_code = self.exit_codes.remove(&local_id);
+        // A closed frozen tab is no longer a tab the row must name.
+        self.frozen_path.remove(&local_id);
         let sid = self.by_local.remove(&local_id)?;
         // The death mark, written WHILE the handle is still registered: the
         // timeline is Arc-shared, so a holder that kept the ctx (pool teardown
@@ -1184,6 +1308,101 @@ mod tests {
         let mut h = handle_alive(local_id, parent);
         h.state = state;
         h
+    }
+
+    /// THE FROZEN-PATH CARRY (2026-09-16; the owner's adopted tab). A manifest
+    /// WITHOUT `outgoing_build` — the one the build before this field writes —
+    /// reads as "predates": every session in it is frozen. A manifest this build
+    /// writes carries its own build number and, per record, the shells it
+    /// itself adopted frozen; `false` is not on the wire, so an older reader
+    /// sees the wire it always saw. PRESENCE IS THE WHOLE TEST (review,
+    /// 2026-09-16): the first cut also compared the number against a hand-picked
+    /// epoch (1789585000), and a dev build of this change — stamped from HEAD's
+    /// committer epoch, below that bar — would have marked every tab it handed
+    /// off frozen; so the build THIS tree stamps, the owner's 0.86.0 number, the
+    /// epoch itself and `0` all read as healing once the field is there.
+    #[test]
+    fn the_frozen_path_carry_reads_absent_as_predates_and_rides_per_record() {
+        assert!(
+            predates_path_self_heal(None),
+            "absent: the old build wrote it"
+        );
+        assert!(
+            !predates_path_self_heal(Some(crate::running_build_number())),
+            "a dev build of this tree ({}) wrote the field, so it heals",
+            crate::running_build_number()
+        );
+        assert!(
+            !predates_path_self_heal(Some(1_789_468_652)),
+            "a number below the anchor with the field present still heals: presence is the test"
+        );
+        assert!(!predates_path_self_heal(Some(1_789_584_999)));
+        assert!(!predates_path_self_heal(Some(1_789_585_000)));
+        assert!(
+            !predates_path_self_heal(Some(0)),
+            "an unnumbered build carries the field"
+        );
+
+        // The old wire: no `outgoing_build`, no `frozen_path`.
+        let old_wire = "schema = 1
+
+[[sessions]]
+local_id = 3
+sid = \"s-old\"
+state = \"alive\"
+title = \"zsh\"
+";
+        let read = SessionHandoff::from_toml(old_wire).expect("this build reads an old manifest");
+        assert_eq!(read.outgoing_build, None);
+        assert!(predates_path_self_heal(read.outgoing_build));
+        assert!(
+            !read.sessions[0].frozen_path,
+            "the per-record flag defaults off"
+        );
+
+        // This build's wire: its own number, and the frozen shell it adopted.
+        let mut store = SessionStore::default();
+        store.register(handle(0, None));
+        store.register(handle(1, None));
+        store.mark_frozen_path(1);
+        let manifest = SessionHandoff::from_store(&store);
+        assert_eq!(manifest.outgoing_build, Some(crate::running_build_number()));
+        assert_eq!(
+            manifest
+                .sessions
+                .iter()
+                .map(|r| r.frozen_path)
+                .collect::<Vec<_>>(),
+            vec![false, true]
+        );
+        let wire = manifest.to_toml().expect("serializes");
+        assert!(wire.contains("outgoing_build = "), "{wire}");
+        assert_eq!(wire.matches("frozen_path = true").count(), 1, "{wire}");
+        assert!(
+            !wire.contains("frozen_path = false"),
+            "false stays off the wire: {wire}"
+        );
+        assert!(manifest.roundtrips());
+
+        // The count the row takes: registered, frozen, not exited; a close clears it.
+        assert_eq!(store.frozen_path_tabs(), 1);
+        store.mark_frozen_path(1);
+        assert_eq!(store.frozen_path_tabs(), 1, "idempotent");
+        store.note_exit_code(1, Some(0));
+        assert_eq!(
+            store.frozen_path_tabs(),
+            0,
+            "an exited shell is not a tab to exec in"
+        );
+        assert!(store.has_frozen_path(1), "but the fact is still carried");
+        store.deregister_local(1);
+        assert!(!store.has_frozen_path(1));
+        assert_eq!(store.frozen_path_tabs(), 0);
+        // An id marked before its registration counts once it is registered.
+        store.mark_frozen_path(9);
+        assert_eq!(store.frozen_path_tabs(), 0);
+        store.register(handle(9, None));
+        assert_eq!(store.frozen_path_tabs(), 1);
     }
 
     #[test]

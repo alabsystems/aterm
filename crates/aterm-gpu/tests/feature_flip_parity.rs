@@ -34,11 +34,18 @@ use common::{backends, max_channel_delta_frame as max_channel_delta};
 // $ATERM_FONT is always set, so it can no longer be inferred from the
 // environment (the old per-test `env::var(..).is_err()` probe could also read a
 // sibling test's export and silently downgrade a real failure to a SKIP).
+//
+// DISCOVERY DOES NOT READ $ATERM_FONT, only WRITES it. $ATERM_FONT is a
+// production setting that outranks `font_family` in config, so reading it here
+// let a developer's own font preference displace the committed fixture. The
+// override is the dedicated $ATERM_LIGATURE_TEST_FONT; the export below is
+// unchanged, because pointing both renderers at the resolved font is this
+// helper's actual job.
 fn ligature_test_font() -> Option<(&'static std::path::Path, bool)> {
     static FONT: std::sync::OnceLock<Option<(std::path::PathBuf, bool)>> =
         std::sync::OnceLock::new();
     FONT.get_or_init(|| {
-        let from_env = std::env::var("ATERM_FONT")
+        let from_env = std::env::var("ATERM_LIGATURE_TEST_FONT")
             .ok()
             .map(std::path::PathBuf::from)
             .filter(|p| p.exists());
@@ -78,7 +85,9 @@ fn live_ligature_flip_changes_gpu_pixels_and_keeps_parity() {
 
     // Resolves AND exports $ATERM_FONT, once per process (see ligature_test_font).
     if ligature_test_font().is_none() {
-        eprintln!("SKIP: no ligature test font (set ATERM_FONT or add the repo fixture)");
+        eprintln!(
+            "SKIP: no ligature test font (set ATERM_LIGATURE_TEST_FONT or add the repo fixture)"
+        );
         return;
     }
 
@@ -182,7 +191,7 @@ fn live_font_feature_flip_reaches_gpu_pixels() {
         if is_fixture {
             panic!("the bundled fixture's `zero` feature did not reach GPU pixels");
         }
-        eprintln!("SKIP: $ATERM_FONT has no observable `zero` feature; parity-only");
+        eprintln!("SKIP: the resolved ligature font has no observable `zero` feature; parity-only");
     }
 
     // Parity holds under the live feature config (the core invariant either way).

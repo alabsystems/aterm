@@ -73,6 +73,8 @@ pub(super) fn pre_carry_parse(toml: &str) -> Option<SessionHandoff> {
         window: old.window,
         connections: old.connections,
         next_turn_id: None,
+        // That build wrote no number: its shells predate the healing sessions.
+        outgoing_build: None,
         sessions: old
             .sessions
             .into_iter()
@@ -89,6 +91,7 @@ pub(super) fn pre_carry_parse(toml: &str) -> Option<SessionHandoff> {
                 role: r.role,
                 attention: r.attention,
                 control: None,
+                frozen_path: false,
             })
             .collect(),
     })
@@ -668,6 +671,7 @@ fn manifests_cross_between_the_two_shapes_both_ways() {
         window: None,
         connections: Vec::new(),
         next_turn_id: Some(1234),
+        outgoing_build: Some(crate::running_build_number()),
         sessions: vec![SessionRecord {
             local_id: 0,
             sid: "s-0".to_string(),
@@ -681,6 +685,7 @@ fn manifests_cross_between_the_two_shapes_both_ways() {
             role: None,
             attention: None,
             control: Some(handoff_carry::stamp(b"{}")),
+            frozen_path: true,
         }],
     };
     let wire = new.to_toml().unwrap();
@@ -691,8 +696,14 @@ fn manifests_cross_between_the_two_shapes_both_ways() {
 
     let old_wire = aterm_toml::to_string(&old).unwrap();
     assert!(!old_wire.contains("control") && !old_wire.contains("next_turn_id"));
+    assert!(!old_wire.contains("outgoing_build") && !old_wire.contains("frozen_path"));
     let read = SessionHandoff::from_toml(&old_wire).expect("this build reads an old manifest");
     assert_eq!(read.next_turn_id, None);
+    assert_eq!(
+        read.outgoing_build, None,
+        "absent: the old build's wire predates"
+    );
+    assert!(!read.sessions[0].frozen_path);
     assert_eq!(read.sessions[0].control, None);
     assert_eq!(read.sessions[0].screen.as_ref(), Some(&screen));
     assert_eq!(

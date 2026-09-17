@@ -69,22 +69,29 @@ struct PaletteLayout {
 /// whole available viewport; the command card remains content-height, width-capped, and
 /// centred within it. Tiny windows retain at least a two-cell-wide card before margins
 /// collapse, and height clamps to the rows that actually exist.
-fn palette_layout(state: &PaletteState, g: &SettingsGeom) -> PaletteLayout {
+fn palette_layout_for_count(count: usize, g: &SettingsGeom) -> PaletteLayout {
     let tray_w = (g.cols as f32 * g.cw).max(0.0);
     let tray_h = (g.panel_rows as f32 * g.ch).max(0.0);
     let desired_margin = (g.cw * 2.0).max(16.0);
     let max_margin = (tray_w * 0.5 - g.cw.max(0.0)).max(0.0);
     let margin = desired_margin.min(max_margin);
     let card_w = (tray_w - margin * 2.0).clamp(0.0, MAX_CARD_WIDTH);
-    let card_rows = state.wanted_rows().min(g.panel_rows);
+    let card_rows = (CHROME_ROWS + count.clamp(1, MAX_CMD_ROWS)).min(g.panel_rows);
     let card_h = (card_rows as f32 * g.ch).clamp(0.0, tray_h);
     let card_x = ((tray_w - card_w) * 0.5).max(0.0);
     let card_y = ((tray_h - card_h) * 0.5).max(0.0);
     PaletteLayout {
         card: (card_x, card_y, card_w, card_h),
         card_rows,
-        body_rows: state.body().min(card_rows.saturating_sub(CHROME_ROWS)),
+        body_rows: count
+            .min(MAX_CMD_ROWS)
+            .min(card_rows.saturating_sub(CHROME_ROWS)),
     }
+}
+
+#[cfg(test)]
+fn palette_layout(state: &PaletteState, g: &SettingsGeom) -> PaletteLayout {
+    palette_layout_for_count(state.filtered_count(), g)
 }
 
 /// Exact native reducer destination captured when its command row enters the palette.
@@ -597,42 +604,50 @@ impl PaletteState {
     /// also covers plain substrings).
     ///
     /// PERF: the haystack is streamed and lowercased lazily rather than built with `format!`.
-    /// This is called a linear number of times per pointer event (hit testing walks slots, and
-    /// each layout derivation asks for `wanted_rows` + `body`), and the palette carries ~40–60
-    /// rows, so the two `String`s per row this used to allocate dominated pointer motion while
-    /// the modal was open. The query is still lowercased once per call, not once per row.
+    /// Count-only and single-row callers use the iterator directly; they do not need to
+    /// allocate the full list. The query is lowercased once per scan, not once per row.
     pub(crate) fn filtered(&self) -> Vec<usize> {
+        self.filtered_indices().collect()
+    }
+
+    fn filtered_indices(&self) -> impl Iterator<Item = usize> + '_ {
         let q = self.query.to_ascii_lowercase();
-        (0..self.rows.len())
-            .filter(|&i| {
-                let r = &self.rows[i];
-                let hay = r
-                    .label
-                    .chars()
-                    .chain("  ".chars())
-                    .chain(r.section.chars())
-                    .map(|c| c.to_ascii_lowercase());
-                fuzzy_subsequence(&q, hay)
-            })
-            .collect()
+        (0..self.rows.len()).filter(move |&i| {
+            let r = &self.rows[i];
+            let hay = r
+                .label
+                .chars()
+                .chain("  ".chars())
+                .chain(r.section.chars())
+                .map(|c| c.to_ascii_lowercase());
+            fuzzy_subsequence(&q, hay)
+        })
+    }
+
+    fn filtered_count(&self) -> usize {
+        if self.query.is_empty() {
+            self.rows.len()
+        } else {
+            self.filtered_indices().count()
+        }
     }
 
     /// The visible command band height: the filtered count, capped at [`MAX_CMD_ROWS`]. The
     /// single value the painter, the scroll clamp, and [`Self::move_selection`] agree on.
     fn body(&self) -> usize {
-        self.filtered().len().min(MAX_CMD_ROWS)
+        self.filtered_count().min(MAX_CMD_ROWS)
     }
 
     /// Move the cursor by `delta` over the FILTERED set (wrapping), keeping it on-screen.
     pub(crate) fn move_selection(&mut self, delta: isize) {
         self.pointer_over = None;
         self.pointer_armed = None;
-        let n = self.filtered().len();
+        let n = self.filtered_count();
         if n == 0 {
             return;
         }
         self.selected = (self.selected as isize + delta).rem_euclid(n as isize) as usize;
-        self.clamp_scroll();
+        self.clamp_scroll_for_count(n);
     }
 
     /// Scroll the visible filtered band without wrapping. The selected row keeps its
@@ -641,8 +656,8 @@ impl PaletteState {
     /// cancels any armed click; the app immediately re-hit-tests the stationary pointer
     /// against the newly painted rows.
     pub(crate) fn scroll_by(&mut self, delta: isize) -> bool {
-        let n = self.filtered().len();
-        let body = self.body();
+        let n = self.filtered_count();
+        let body = n.min(MAX_CMD_ROWS);
         let before = (
             self.selected,
             self.scroll,
@@ -659,7 +674,7 @@ impl PaletteState {
             let relative = self.selected.saturating_sub(self.scroll).min(body - 1);
             self.scroll = self.scroll.saturating_add_signed(delta).min(max_scroll);
             self.selected = (self.scroll + relative).min(n - 1);
-            self.clamp_scroll();
+            self.clamp_scroll_for_count(n);
         }
         before
             != (
@@ -680,20 +695,21 @@ impl PaletteState {
     }
 
     fn select_filtered_index(&mut self, idx: usize) {
-        let n = self.filtered().len();
+        let n = self.filtered_count();
         if n == 0 {
             return;
         }
         self.selected = idx.min(n - 1);
-        self.clamp_scroll();
+        self.clamp_scroll_for_count(n);
     }
 
     /// Hover a filtered row, moving the visible selection wash with the pointer. `None`
     /// means the modal still owns the pointer but it is outside a painted command row.
     pub(crate) fn pointer_hover(&mut self, idx: Option<usize>) -> bool {
         let target = idx.and_then(|idx| {
-            let visible = self.filtered();
-            visible.get(idx).map(|&row| self.rows[row].action.clone())
+            self.filtered_indices()
+                .nth(idx)
+                .map(|row| self.rows[row].action.clone())
         });
         let before = (self.selected, self.scroll, self.pointer_over.clone());
         if let Some(idx) = idx {
@@ -720,8 +736,9 @@ impl PaletteState {
         let armed = self.pointer_armed.take();
         changed |= armed.is_some();
         let enabled = idx.is_some_and(|idx| {
-            let visible = self.filtered();
-            visible.get(idx).is_some_and(|&row| self.rows[row].enabled)
+            self.filtered_indices()
+                .nth(idx)
+                .is_some_and(|row| self.rows[row].enabled)
         });
         let activate = enabled && armed.is_some() && armed == self.pointer_over;
         (changed, activate)
@@ -734,8 +751,11 @@ impl PaletteState {
     /// Keep `selected` within `[scroll, scroll + body)` and `scroll` within bounds — the
     /// same discipline the Settings body uses, so painter and cursor never diverge.
     fn clamp_scroll(&mut self) {
-        let n = self.filtered().len();
-        let body = self.body();
+        self.clamp_scroll_for_count(self.filtered_count());
+    }
+
+    fn clamp_scroll_for_count(&mut self, n: usize) {
+        let body = n.min(MAX_CMD_ROWS);
         if self.selected >= n {
             self.selected = n.saturating_sub(1);
         }
@@ -757,8 +777,7 @@ impl PaletteState {
     /// The typed target the cursor's row dispatches, or `None` when the filtered list is
     /// empty or the selected row is disabled.
     pub(crate) fn selected_target(&self) -> Option<PaletteTarget> {
-        let vis = self.filtered();
-        let &idx = vis.get(self.selected)?;
+        let idx = self.filtered_indices().nth(self.selected)?;
         let row = &self.rows[idx];
         row.enabled.then(|| row.action.clone())
     }
@@ -774,8 +793,9 @@ impl PaletteState {
     /// The overlay height (rows) the card wants: the title + query chrome, the (capped)
     /// command band, and the hint footer. Never `0` (at least one command band row) so the
     /// splice always has a card to paint.
+    #[cfg(test)]
     pub(crate) fn wanted_rows(&self) -> usize {
-        CHROME_ROWS + self.filtered().len().clamp(1, MAX_CMD_ROWS)
+        CHROME_ROWS + self.filtered_count().clamp(1, MAX_CMD_ROWS)
     }
 
     /// `(scroll, total, visible)` for `controls front`: rows scrolled past, the full row
@@ -1057,7 +1077,7 @@ impl PaletteState {
         let slot = usize::try_from(node.0 & u64::from(u32::MAX))
             .ok()?
             .checked_sub(1)?;
-        (self.a11y_node_id(slot) == node && slot < self.filtered().len()).then_some(slot)
+        (self.a11y_node_id(slot) == node && slot < self.filtered_count()).then_some(slot)
     }
 }
 
@@ -1180,12 +1200,7 @@ pub(crate) fn palette_row_rect(
     palette_row_rect_in(&palette_layout(state, g), g, slot)
 }
 
-/// `palette_row_rect` against an ALREADY-derived layout. `palette_layout` costs two
-/// `PaletteState::filtered()` derivations (`wanted_rows` + `body`), and each of those
-/// allocates two `String`s per palette row — so re-deriving it once per slot inside a hit
-/// test made a single pointer motion do ~30x the filtering work of the frame that painted
-/// those same rows. The layout is a pure function of `(state, g)` and neither moves during
-/// the scan, so hoisting it is a plain common-subexpression elimination.
+/// `palette_row_rect` against an already-derived layout, shared by every visible slot.
 fn palette_row_rect_in(
     layout: &PaletteLayout,
     g: &SettingsGeom,
@@ -1211,13 +1226,13 @@ pub(crate) fn palette_row_hit(
     x: f32,
     y: f32,
 ) -> Option<usize> {
-    let visible = state.filtered();
-    let layout = palette_layout(state, g);
+    let count = state.filtered_count();
+    let layout = palette_layout_for_count(count, g);
     for slot in 0..layout.body_rows {
         let (rx, ry, rw, rh) = palette_row_rect_in(&layout, g, slot)?;
         if x >= rx && x < rx + rw && y >= ry && y < ry + rh {
             let filtered = state.scroll + slot;
-            return visible.get(filtered).map(|_| filtered);
+            return (filtered < count).then_some(filtered);
         }
     }
     None
@@ -1252,7 +1267,8 @@ pub(crate) fn fuzzy_subsequence(needle: &str, haystack: impl Iterator<Item = cha
 pub(crate) fn palette_tray(state: &PaletteState, g: &SettingsGeom, theme: Theme) -> TrayInput {
     let r = Roles::from_theme(theme);
     let (cw, ch, px) = (g.cw, g.ch, g.font_px);
-    let layout = palette_layout(state, g);
+    let vis = state.filtered();
+    let layout = palette_layout_for_count(vis.len(), g);
     let (card_x, card_y, card_w, card_h) = layout.card;
     let radius = (ch * 0.6).min(14.0);
     let mut prims: Vec<DrawPrim> = vec![
@@ -1351,7 +1367,6 @@ pub(crate) fn palette_tray(state: &PaletteState, g: &SettingsGeom, theme: Theme)
     }
 
     // Pinned query row: a framed field with the live filter + a "shown of total" count.
-    let vis = state.filtered();
     let qy = card_y + ch; // row 1
     prims.push(DrawPrim::Stroke {
         x: card_x + cw * 1.5,

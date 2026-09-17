@@ -601,6 +601,13 @@ pub struct GcReport {
     /// reported "nothing to reclaim". The batteries-included seed made that routine
     /// rather than rare: every first run parks an archive there for minutes by design.
     pub swept_staging: Vec<(String, Vec<String>)>,
+    /// Exec roots (`<prefix>/compat/trust/<n>`, [`crate::compat`]) removed because their
+    /// build is gone or no longer needs one, and the dot debris a killed rebuild left.
+    /// Its own category for the reason `swept_staging` is: a stray root is a clone that
+    /// keeps a reclaimed build's blocks allocated, outside `store/`.
+    pub swept_exec_roots: Vec<PathBuf>,
+    /// What the exec-root sweep could not remove, one sentence each.
+    pub exec_root_errors: Vec<String>,
 }
 
 /// Reclaim superseded builds per program: the live build + one rollback are kept, the rest
@@ -628,21 +635,32 @@ pub fn run(layout: &Layout) -> GcReport {
     run_keeping_pinned_partials(layout, &|_| None)
 }
 
-/// [`run`], with the staging sweep sparing — per program — the single `.part` whose asset
-/// name matches the program's CURRENT pinned artifact (`pinned_asset` maps a program name
-/// to that asset file name, from the caller's resolved signed index; `None` spares
-/// nothing for that program).
+/// [`run`], with the staging sweep sparing — per program — the `.part` AND the complete
+/// archive whose asset name matches the program's CURRENT pinned artifact (`pinned_asset`
+/// maps a program name to that asset file name, from the caller's resolved signed index;
+/// `None` spares nothing for that program).
 ///
-/// Why: gc runs at the end of every install/update pass, and the staging sweep used to
-/// remove EVERY regular file under `staging/<program>/` — `.part` included — so a program
-/// whose download failed mid-pass lost its resume state to that same pass's closing gc and
-/// the next pass refetched from byte 0. Resume-across-passes survived only a process kill.
-/// The keep rule is `flow::sweep_foreign_partials`' at-most-one bound, expressed as an
-/// exact file-name match (`<pinned asset>.part` — a directory holds at most one file of
-/// that name, so "at most one spared partial per program" holds by construction).
-/// Superseded builds' partials are still swept, and everything spared here remains
-/// reclaimable by the standalone [`run`] — a killed download never permanently strands
-/// bytes.
+/// Why the `.part`: gc runs at the end of every install/update pass, and the staging sweep
+/// used to remove EVERY regular file under `staging/<program>/` — `.part` included — so a
+/// program whose download failed mid-pass lost its resume state to that same pass's closing
+/// gc and the next pass refetched from byte 0. Resume-across-passes survived only a process
+/// kill.
+///
+/// Why the complete `<asset>`: the same guarantee, for a member that did NOT fail. A
+/// coherence group aborts all-or-nothing and discards every staged sibling's extracted
+/// tree, so without this a tuple that failed on its third member re-downloaded the first
+/// two — the biggest of them a multi-gigabyte toolchain — on every retry, and a flaky link
+/// could keep it from ever converging. `flow`'s group transaction keeps a staged member's
+/// verified archive when the tuple aborts, and the next pass re-stages from it after
+/// re-checking the signed sha256 + `tree_root` ([`crate::flow::carried_archive`]); this is
+/// the sweep agreeing not to undo that between the two passes.
+///
+/// The keep rule is `flow::sweep_foreign_partials`' at-most-one bound, expressed as exact
+/// file-name matches (a directory holds at most one file of each name, so "at most one
+/// spared archive and one spared partial per program" holds by construction). Superseded
+/// builds' archives and partials are still swept, and everything spared here remains
+/// reclaimable by the standalone [`run`] — neither a killed download nor an aborted tuple
+/// ever permanently strands bytes.
 ///
 /// Trust posture: `pinned_asset` only ever SHRINKS the sweep, never extends it — it can
 /// keep a file the pass was about to finish, but cannot make gc delete anything the plain
@@ -737,10 +755,15 @@ pub fn run_keeping_pinned_partials(
             let Ok(entries) = std::fs::read_dir(program.path()) else {
                 continue;
             };
-            // The one file this program's sweep spares: `<pinned asset>.part`, the resume
-            // state the next pass continues from. Exact-name match, so at most one file
-            // per program can ever be spared.
-            let keep = pinned_asset(&name).map(|asset| format!("{asset}.part"));
+            // The files this program's sweep spares, both keyed to its CURRENT pinned
+            // asset: `<asset>.part`, the resume state an interrupted transfer left, and
+            // `<asset>` itself — the complete, signature-verified archive an aborted
+            // coherence group carried past its stage so the next pass can re-stage that
+            // member without re-downloading it (`flow::carried_archive`). Exact-name
+            // matches, so at most one file of each name per program can ever be spared.
+            let pinned = pinned_asset(&name);
+            let keep_part = pinned.as_ref().map(|asset| format!("{asset}.part"));
+            let keep_archive = pinned;
             let mut gone: Vec<String> = Vec::new();
             for e in entries.filter_map(Result::ok) {
                 // Regular files only: never follow a symlink out of the prefix, and
@@ -752,7 +775,7 @@ pub fn run_keeping_pinned_partials(
                 // come from the signed manifest, which is UTF-8), so it is swept —
                 // unreported, exactly as before.
                 let entry_name = e.file_name().into_string().ok();
-                if keep.is_some() && keep == entry_name {
+                if entry_name.is_some() && (keep_archive == entry_name || keep_part == entry_name) {
                     continue;
                 }
                 if std::fs::remove_file(e.path()).is_ok()
@@ -776,12 +799,23 @@ pub fn run_keeping_pinned_partials(
         crate::provisional::prune(layout);
     }
 
+    // LAST, over the store as this pass left it: the exec roots (`crate::compat`). Every
+    // discard above already took its build's root through `store::discard_build`; this
+    // is for the root that outlived its build some other way — a removal that failed
+    // part-way, a build an older client reclaimed, a build that stopped needing one — and
+    // for the dot debris a killed rebuild left. A root holds clones of its build's
+    // files, so a stray one keeps a reclaimed build's gigabytes allocated with nothing
+    // under `store/` to show for them.
+    let exec_roots = crate::compat::sweep(layout);
+
     GcReport {
         swept_staging,
         reclaimed,
         swept_partial: swept_partial.into_iter().collect(),
         swept_scratch: swept_scratch.into_iter().collect(),
         diverged: live.into_diverged(),
+        swept_exec_roots: exec_roots.swept,
+        exec_root_errors: exec_roots.errors,
     }
 }
 
@@ -1645,21 +1679,24 @@ mod tests {
 
     /// THE resume-across-passes survival rule (R4): gc closes every install/update pass,
     /// so a failed download's `.part` used to die to that same pass's sweep and the next
-    /// pass refetched from byte 0. The pass-closing form spares exactly the pinned
-    /// artifact's partial — superseded partials, finished-asset debris, and other
-    /// programs' files are swept exactly as before.
+    /// pass refetched from byte 0. The pass-closing form spares exactly the PINNED
+    /// artifact's two files — its `.part` (an interrupted transfer's resume state) and the
+    /// complete `<asset>` itself (an aborted coherence group's carried archive, which the
+    /// next pass re-stages that member from instead of re-downloading it). Superseded
+    /// partials, superseded-asset debris, and other programs' files are swept as before.
     #[test]
-    fn the_pass_closing_sweep_spares_the_live_pinned_partial_only() {
+    fn the_pass_closing_sweep_spares_the_live_pinned_archive_and_partial_only() {
         let l = layout("staging-keep");
         let staging = l.staging_dir("ay");
         std::fs::create_dir_all(&staging).unwrap();
         let pinned = staging.join("ay-18.tar.zst.part");
+        let carried = staging.join("ay-18.tar.zst");
         let superseded = staging.join("ay-17.tar.zst.part");
         let debris = staging.join("ay-17.tar.zst");
         let other = l.staging_dir("ny");
         std::fs::create_dir_all(&other).unwrap();
         let unpinned = other.join("ny-7.tar.zst.part");
-        for p in [&pinned, &superseded, &debris, &unpinned] {
+        for p in [&pinned, &carried, &superseded, &debris, &unpinned] {
             std::fs::write(p, b"x").unwrap();
         }
 
@@ -1671,8 +1708,16 @@ mod tests {
             pinned.exists(),
             "the pinned partial is the next pass's resume state"
         );
+        assert!(
+            carried.exists(),
+            "the pinned COMPLETE archive is an aborted tuple's carry — the next pass \
+             re-stages that member from it rather than re-downloading a multi-GB asset"
+        );
         assert!(!superseded.exists(), "a superseded partial is still swept");
-        assert!(!debris.exists(), "a stranded complete asset is still swept");
+        assert!(
+            !debris.exists(),
+            "a SUPERSEDED complete asset is still swept — only the pinned one is spared"
+        );
         assert!(
             !unpinned.exists(),
             "a program the caller pins nothing for is fully swept"
@@ -1699,6 +1744,10 @@ mod tests {
         assert!(
             !pinned.exists(),
             "a plain `gc` still reclaims the spared partial"
+        );
+        assert!(
+            !carried.exists(),
+            "…and the spared archive: an aborted tuple never permanently strands bytes"
         );
         let _ = std::fs::remove_dir_all(&l.prefix);
     }

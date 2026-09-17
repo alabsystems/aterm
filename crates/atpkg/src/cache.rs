@@ -52,11 +52,12 @@
 //! the suppression an authority serving the index could always perform by withholding.
 
 use std::fs;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 use serde::{Deserialize, Serialize};
 
 use crate::select::Candidate;
+use crate::store::Layout;
 
 /// The one schema version this build writes and the ONLY one it reads. See the
 /// fail-closed check in `read_doc`.
@@ -119,13 +120,44 @@ struct CacheDoc {
 /// A file-backed index cache under the hardened prefix.
 pub struct IndexCache {
     path: PathBuf,
+    /// The layout whose PREFIX this cache lives in, when it has one — the source of the
+    /// mode [`IndexCache::store`] creates and hardens the cache's parent with.
+    ///
+    /// The parent IS `layout.prefix` (`<prefix>/index-cache.toml`), so the mode is not a
+    /// detail of the cache: `store` used to harden it `0700` unconditionally, which under
+    /// a root-owned SYSTEM prefix is the failure [`Layout::ensure_dir`] exists to prevent
+    /// — root writes such a prefix and EVERY user must traverse and execute out of it, so
+    /// it is published `0755`. A `0700` system prefix installs a toolchain only root can
+    /// run and fails at the first non-root invocation with a bare `Permission denied`.
+    /// `store` runs at the START of every resolve and nothing later in a pass widens the
+    /// prefix back, so the unconditional hardening re-entered that regression (7d968b2fe)
+    /// through the cache writer.
+    ///
+    /// `None` is a cache that is NOT under an install prefix (the path-only
+    /// [`IndexCache::new`]): private state, hardened `0700` as before.
+    layout: Option<Layout>,
 }
 
 impl IndexCache {
-    /// A cache backed by `path` (typically `<prefix>/index-cache.toml`).
+    /// A cache backed by `path`, with NO prefix shape to follow: `store` hardens the
+    /// parent directory `0700`. The cache of an install prefix must be built with
+    /// [`IndexCache::for_layout`] instead — that is the only constructor whose parent
+    /// gets the mode the prefix shape calls for.
     #[must_use]
     pub fn new(path: PathBuf) -> Self {
-        Self { path }
+        Self { path, layout: None }
+    }
+
+    /// The `<prefix>/index-cache.toml` cache of `layout` — the constructor every install
+    /// path uses. Carries the layout so `store` creates and hardens the prefix through
+    /// [`Layout::ensure_dir`] (system ⇒ `0755`, `$HOME` ⇒ `0700`) rather than a hardcoded
+    /// `0700`; see the `layout` field.
+    #[must_use]
+    pub fn for_layout(layout: &Layout) -> Self {
+        Self {
+            path: layout.prefix.join("index-cache.toml"),
+            layout: Some(layout.clone()),
+        }
     }
 
     /// Persist `candidates` tagged with `source_id`, each stamped with the matching
@@ -133,7 +165,8 @@ impl IndexCache {
     /// from; pass `&[]` when the fetcher cannot supply one). Never clobbers a good cache
     /// with an empty "success" (an empty candidate set is not stored). Best-effort — any
     /// error is swallowed so a cache-write failure never fails an install. Written `0600`
-    /// via temp + rename so a reader never sees a half-written cache.
+    /// via temp + rename so a reader never sees a half-written cache; a failure of either
+    /// step unlinks the temp rather than stranding it at the prefix root.
     ///
     /// The identities are stored ONLY when they line up 1:1 with the bytes they describe
     /// and every one is present and bounded. Anything else stores EMPTY identities, which
@@ -211,8 +244,11 @@ impl IndexCache {
             return;
         };
         // The cache is written at the very START of an install, before the flow creates any
-        // prefix dir — harden/create the (vetted) parent so the first fetch is cached too.
-        if crate::platform::ensure_private_dir(parent).is_err() {
+        // prefix dir — create/harden the (vetted) parent so the first fetch is cached too,
+        // with the mode the PREFIX SHAPE calls for. The parent here IS `layout.prefix`, so
+        // hardening it `0700` unconditionally published a root-owned SYSTEM prefix
+        // owner-only on every resolve — and nothing later in the pass widens it back.
+        if self.ensure_parent(parent).is_err() {
             return;
         }
         // Already exactly what is on disk ⇒ nothing left to write. The install flow
@@ -231,11 +267,34 @@ impl IndexCache {
             return;
         }
         let tmp = parent.join(format!(".index-cache.tmp-{}", std::process::id()));
+        // EITHER failure takes the temp with it, exactly as `progress::write_now` does.
+        // `fs::write` creates the inode before it fills it, so an ENOSPC/EDQUOT mid-write
+        // leaves a file behind even though the write "failed", and a rename that cannot
+        // land (a cache path that is a directory) strands the whole temp. The name carries
+        // the PID, so each failing process would strand a DISTINCT file at the PREFIX ROOT
+        // - which nothing sweeps: `gc` walks `store/` and `staging/`, never the root. They
+        // would accumulate for the life of the prefix, unreported by `doctor`, and the
+        // condition that creates them is a full disk. Best-effort stays best-effort: the
+        // cache write is still skipped silently and never fails the install.
         if fs::write(&tmp, text.as_bytes()).is_err() {
+            let _ = fs::remove_file(&tmp);
             return;
         }
         let _ = crate::platform::harden_file(&tmp);
-        let _ = fs::rename(&tmp, &self.path);
+        if fs::rename(&tmp, &self.path).is_err() {
+            let _ = fs::remove_file(&tmp);
+        }
+    }
+
+    /// Create and harden the directory the cache file lives in, with the mode its PREFIX
+    /// SHAPE calls for — [`Layout::ensure_dir`] when this cache belongs to a layout (the
+    /// install paths), private `0700` when it does not. See the `layout` field for why a
+    /// cache writer gets to decide nothing here on its own.
+    fn ensure_parent(&self, parent: &Path) -> std::io::Result<()> {
+        match &self.layout {
+            Some(layout) => layout.ensure_dir(parent),
+            None => crate::platform::ensure_private_dir(parent),
+        }
     }
 
     /// Load the cached candidates IFF the cache's recorded source == `source_id` (the
@@ -497,6 +556,38 @@ mod tests {
         std::os::unix::fs::symlink(&target, &p).unwrap();
         assert!(IndexCache::new(p.clone()).load("any").is_none());
         let _ = fs::remove_dir_all(p.parent().unwrap());
+    }
+
+    /// THE LEAK: `store` writes `<prefix>/.index-cache.tmp-<pid>` and renames it over the
+    /// cache, and a rename that cannot land left that temp on disk — the failure was
+    /// ignored with a bare `let _`. Here the cache path is a DIRECTORY, so `rename` is
+    /// `EISDIR`; the same stranding is what an `ENOSPC`/`EDQUOT` mid-write reaches, since
+    /// `fs::write` creates the inode before it fills it. The name carries the PID, so
+    /// every failing process stranded a DISTINCT file at the PREFIX ROOT — which no sweep
+    /// walks (`gc` lists `store/` and `staging/`), so they accumulated for the life of the
+    /// prefix with `aterm pkg doctor` reporting nothing to reclaim.
+    #[test]
+    fn a_store_that_cannot_land_leaves_no_temp_behind() {
+        let p = tmp("tmp-leak");
+        let parent = p.parent().unwrap().to_path_buf();
+        fs::create_dir(&p).unwrap();
+        let c = IndexCache::new(p.clone());
+        c.store("github:o/r", &[cand("v1")], &[]);
+        assert!(
+            p.is_dir(),
+            "the un-renamable cache path is left exactly as it was"
+        );
+        let strays: Vec<String> = fs::read_dir(&parent)
+            .unwrap()
+            .filter_map(Result::ok)
+            .map(|e| e.file_name().to_string_lossy().into_owned())
+            .filter(|name| name.starts_with(".index-cache.tmp-"))
+            .collect();
+        assert!(
+            strays.is_empty(),
+            "a store that cannot land must not strand its temp at the prefix root: {strays:?}"
+        );
+        let _ = fs::remove_dir_all(&parent);
     }
 
     /// THE HIT PATH, both directions. A cache stamped with identities is served WITHOUT
@@ -770,5 +861,106 @@ mod tests {
             );
         }
         let _ = fs::remove_dir_all(p.parent().unwrap());
+    }
+
+    /// The permission bits of an existing directory, for the prefix-shape assertions.
+    #[cfg(unix)]
+    fn mode_of(p: &Path) -> u32 {
+        fs::metadata(p).unwrap().permissions().mode() & 0o777
+    }
+
+    /// A layout whose prefix chain is root-owned — the SYSTEM shape — WITHOUT creating
+    /// anything: [`Layout::is_system_prefix`] reads the on-disk chain and skips a
+    /// component that does not exist yet, so a never-created path under a root-owned
+    /// `/opt` reads as the system shape for an unprivileged process too. `None` when this
+    /// machine offers no root-owned candidate, and then the caller skips.
+    #[cfg(unix)]
+    fn system_shaped_layout(label: &str) -> Option<Layout> {
+        ["/opt", "/usr/lib", "/var/lib", "/usr/local"]
+            .into_iter()
+            .map(|parent| Layout {
+                prefix: Path::new(parent)
+                    .join(format!("atpkg-cache-{label}-{}", std::process::id())),
+            })
+            .find(|layout| !layout.prefix.exists() && layout.is_system_prefix())
+    }
+
+    /// THE REGRESSION (7d968b2fe, re-entered through the cache writer): `store` hardened
+    /// its parent — which IS `layout.prefix` — to `0700` on every resolve, i.e. at the
+    /// start of every install and update pass. Under a root-owned SYSTEM prefix that is
+    /// the documented catastrophe: root writes such a prefix and EVERY user must traverse
+    /// and execute out of it, so [`Layout::ensure_dir`] publishes it `0755`; a `0700` one
+    /// installs a toolchain nobody but root can run, and no later step widens it back
+    /// (the only `ensure_dir(&prefix)` calls run at lock time and on the pin verbs, both
+    /// BEFORE the flow resolves).
+    ///
+    /// Proving it unprivileged takes the two halves apart, because no non-root process
+    /// can create a directory under a root-owned chain: the LAYOUT is system-shaped (a
+    /// never-created path under root-owned `/opt`), while the file the cache writes lives
+    /// in a temp dir we can actually write. `ensure_dir` takes the mode from the PREFIX
+    /// shape, so the mode the parent comes out at is exactly the decision under test —
+    /// `0700` before this routing, `0755` after.
+    #[cfg(unix)]
+    #[test]
+    fn a_system_shaped_prefix_leaves_the_cache_parent_traversable() {
+        let Some(layout) = system_shaped_layout("sys") else {
+            return; // no root-owned chain here; the $HOME half below still runs
+        };
+        let system_path = layout.prefix.clone();
+        let p = tmp("sys-parent");
+        let parent = p.parent().unwrap().to_path_buf();
+        // Start from the private mode, so only the routing under test can widen it.
+        fs::set_permissions(&parent, std::fs::Permissions::from_mode(0o700)).unwrap();
+        let cache = IndexCache {
+            path: p.clone(),
+            layout: Some(layout),
+        };
+        cache.store("github:o/r", &[cand("v1")], &[]);
+        assert!(
+            cache.load("github:o/r").is_some(),
+            "the cache is still written — this changes the DIRECTORY mode, nothing else"
+        );
+        assert_eq!(
+            mode_of(&parent),
+            0o755,
+            "a system prefix's cache parent must stay traversable by every user, not root-only"
+        );
+        assert!(
+            !system_path.exists(),
+            "the fixture reads the chain and creates nothing under it"
+        );
+        let _ = fs::remove_dir_all(&parent);
+    }
+
+    /// The other half, and the guard against over-correcting: a `$HOME`-shaped prefix's
+    /// cache parent stays PRIVATE `0700`. The store is that user's own state there, and
+    /// `is_system_prefix` asks the FILESYSTEM — a user-owned temp prefix is never the
+    /// system shape, so nothing here may widen it.
+    #[cfg(unix)]
+    #[test]
+    fn a_home_shaped_prefix_keeps_the_cache_parent_private() {
+        let p = tmp("home-parent");
+        let parent = p.parent().unwrap().to_path_buf();
+        fs::set_permissions(&parent, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let layout = Layout {
+            prefix: parent.clone(),
+        };
+        assert!(
+            !layout.is_system_prefix(),
+            "a user-owned temp prefix is never the system shape"
+        );
+        let cache = IndexCache::for_layout(&layout);
+        assert_eq!(
+            cache.path, p,
+            "for_layout addresses <prefix>/index-cache.toml"
+        );
+        cache.store("github:o/r", &[cand("v1")], &[]);
+        assert!(cache.load("github:o/r").is_some(), "the cache is written");
+        assert_eq!(
+            mode_of(&parent),
+            0o700,
+            "a $HOME prefix's cache parent is private state and stays 0700"
+        );
+        let _ = fs::remove_dir_all(&parent);
     }
 }

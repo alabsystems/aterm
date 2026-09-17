@@ -1,9 +1,9 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! The single modal-overlay slot for transient and compatibility surfaces. About,
-//! Update, and the command Palette share one card slot, one rasterize/composite call, and
-//! one `RepaintKey::settings_fp` term. Rather than parallel `Option` fields on
+//! The single modal-overlay slot for the in-grid surfaces: the command Palette, the
+//! connection card, the session picker and the connection map share one card slot, one
+//! rasterize/composite call, and one `RepaintKey::settings_fp` term. Rather than parallel `Option` fields on
 //! `WindowState` (whose mutual exclusion had to be enforced by hand, and whose on_key gate
 //! ordering was a latent "hidden overlay swallows keys" bug), they collapse into one
 //! [`Overlay`] enum. Mutual exclusion is now STRUCTURAL — one slot can only hold one
@@ -18,13 +18,11 @@
 
 use aterm_render::Theme;
 
-use crate::about::AboutState;
 use crate::conn_card::ConnCardState;
 use crate::connection_map::ConnectionMapState;
 use crate::palette::PaletteState;
 use crate::session_picker::SessionPickerState;
 use crate::settings::{PreviewCtx, SettingsGeom, SettingsState};
-use crate::update_screen::UpdateState;
 use crate::widget::TrayInput;
 
 /// The paint/lifecycle contract shared by every overlay surface. `tray` and
@@ -41,15 +39,15 @@ pub(crate) trait OverlayModel {
 
     /// Paint the surface as a [`TrayInput`] card of pure [`crate::widget::DrawPrim`]s
     /// — the PIXELS, captured WYSIWYG through the SACRED `composite_tray` path.
-    /// (Settings/Palette paint a frosted top band; About paints an opaque floating
-    /// dialog — the card rect in the returned `TrayInput` tells the splice where.)
+    /// (Settings/Palette paint a frosted top band; a floating card returns its own rect
+    /// in the `TrayInput`, which tells the splice where.)
     /// `ctx` carries App-tracked host facts the pure painters cannot know: Settings
-    /// reads the OS appearance, About reads the display scale; Palette ignores it.
+    /// reads the OS appearance; Palette ignores it.
     fn tray(&self, geom: &SettingsGeom, theme: Theme, ctx: PreviewCtx) -> TrayInput;
 
     /// The `controls front` truncation signal: `(scroll, total, visible)` — rows scrolled
     /// past the top, the full model row count, and rows actually shown on the card. Read
-    /// from the SAME `&self` as the tray. Non-scrolling surfaces (About/Update) return
+    /// from the SAME `&self` as the tray. A non-scrolling surface returns
     /// `(0, total, visible)`.
     fn scroll_extent(&self) -> (usize, usize, usize);
     /// The cross-platform accessibility tree ([`accesskit::TreeUpdate`]) for this surface,
@@ -80,56 +78,13 @@ impl OverlayModel for SettingsState {
     }
 }
 
-impl OverlayModel for AboutState {
-    fn fingerprint(&self) -> u64 {
-        AboutState::fingerprint(self)
-    }
-    fn wanted_rows(&self, avail: usize) -> usize {
-        // The About dialog floats CENTRED like a native window, so its tray spans the
-        // whole frame (transparent outside the card); the card itself is content-sized
-        // by `about_layout` and clamps to whatever height is actually available.
-        avail
-    }
-    fn tray(&self, geom: &SettingsGeom, theme: Theme, ctx: PreviewCtx) -> TrayInput {
-        crate::about::about_tray(self, geom, theme, ctx.scale)
-    }
-    fn scroll_extent(&self) -> (usize, usize, usize) {
-        AboutState::scroll_extent(self)
-    }
-    #[cfg(a11y_tree)]
-    fn a11y(&self) -> accesskit::TreeUpdate {
-        crate::about::about_a11y(self)
-    }
-}
-
-impl OverlayModel for UpdateState {
-    fn fingerprint(&self) -> u64 {
-        UpdateState::fingerprint(self)
-    }
-    fn wanted_rows(&self, avail: usize) -> usize {
-        // Floats CENTRED like About, so its tray spans the frame (transparent outside the
-        // card); the card is content-sized by `update_layout` and clamps to `avail`.
-        avail
-    }
-    fn tray(&self, geom: &SettingsGeom, theme: Theme, _ctx: PreviewCtx) -> TrayInput {
-        crate::update_screen::update_tray(self, geom, theme)
-    }
-    fn scroll_extent(&self) -> (usize, usize, usize) {
-        UpdateState::scroll_extent(self)
-    }
-    #[cfg(a11y_tree)]
-    fn a11y(&self) -> accesskit::TreeUpdate {
-        crate::update_screen::update_a11y(self)
-    }
-}
-
 impl OverlayModel for PaletteState {
     fn fingerprint(&self) -> u64 {
         PaletteState::fingerprint(self)
     }
     fn wanted_rows(&self, avail: usize) -> usize {
-        // The card is content-sized but floats centred like About, so its geometry needs
-        // the whole viewport. `palette_layout` retains the natural command-row height.
+        // The card is content-sized but floats centred, so its geometry needs the whole
+        // viewport. `palette_layout` retains the natural command-row height.
         avail
     }
     fn tray(&self, geom: &SettingsGeom, theme: Theme, _ctx: PreviewCtx) -> TrayInput {
@@ -212,11 +167,7 @@ impl OverlayModel for SessionPickerState {
 pub(crate) enum OverlayKind {
     #[cfg(test)]
     Settings,
-    #[cfg(test)]
-    About,
     Palette,
-    #[cfg(test)]
-    Update,
     /// The anchored connection confirm/configure card (design §3.3 + §2.5).
     ConnCard,
     /// The session picker (design §2.3/§2.5 — the connect/configure/disconnect
@@ -235,11 +186,7 @@ impl OverlayKind {
         match self {
             #[cfg(test)]
             OverlayKind::Settings => "settings",
-            #[cfg(test)]
-            OverlayKind::About => "about",
             OverlayKind::Palette => "menu",
-            #[cfg(test)]
-            OverlayKind::Update => "update",
             OverlayKind::ConnCard => "conn-card",
             OverlayKind::SessionPicker => "session-picker",
             OverlayKind::ConnectionMap => "connections",
@@ -255,15 +202,7 @@ pub(crate) enum Overlay {
     /// input regression tests. Shipping Settings is always a native tab app.
     #[cfg(test)]
     Settings(SettingsState),
-    /// Retired modal, retained only for its low-level regression tests. Shipping
-    /// About is the native Settings `/about` route.
-    #[cfg(test)]
-    About(AboutState),
     Palette(PaletteState),
-    /// Retired modal, retained only for its low-level regression tests. Shipping
-    /// Software Update is the native Settings `/updates` route.
-    #[cfg(test)]
-    Update(UpdateState),
     /// The connection confirm/configure card (design §3.3 + §2.5) — ONE shared
     /// component behind the drop popover and the Configure… sheet, anchored
     /// like the tab menu. Native macOS hosts this same card in the content
@@ -290,11 +229,7 @@ impl Overlay {
         let tag: u64 = match self {
             #[cfg(test)]
             Overlay::Settings(_) => 1,
-            #[cfg(test)]
-            Overlay::About(_) => 2,
             Overlay::Palette(_) => 3,
-            #[cfg(test)]
-            Overlay::Update(_) => 4,
             Overlay::ConnCard(_) => 5,
             Overlay::SessionPicker(_) => 6,
             Overlay::ConnectionMap(_) => 7,
@@ -308,11 +243,7 @@ impl Overlay {
         match self {
             #[cfg(test)]
             Overlay::Settings(s) => s,
-            #[cfg(test)]
-            Overlay::About(a) => a,
             Overlay::Palette(p) => p,
-            #[cfg(test)]
-            Overlay::Update(u) => u,
             Overlay::ConnCard(c) => c,
             Overlay::SessionPicker(p) => p,
             Overlay::ConnectionMap(m) => m,
@@ -328,11 +259,7 @@ impl Overlay {
         match self {
             #[cfg(test)]
             Overlay::Settings(s) => s,
-            #[cfg(test)]
-            Overlay::About(a) => a,
             Overlay::Palette(p) => p,
-            #[cfg(test)]
-            Overlay::Update(u) => u,
             Overlay::ConnCard(c) => c,
             Overlay::SessionPicker(p) => p,
             Overlay::ConnectionMap(m) => m,
@@ -344,11 +271,7 @@ impl Overlay {
         match self {
             #[cfg(test)]
             Overlay::Settings(_) => OverlayKind::Settings,
-            #[cfg(test)]
-            Overlay::About(_) => OverlayKind::About,
             Overlay::Palette(_) => OverlayKind::Palette,
-            #[cfg(test)]
-            Overlay::Update(_) => OverlayKind::Update,
             Overlay::ConnCard(_) => OverlayKind::ConnCard,
             Overlay::SessionPicker(_) => OverlayKind::SessionPicker,
             Overlay::ConnectionMap(_) => OverlayKind::ConnectionMap,
@@ -387,35 +310,26 @@ mod tests {
         // them. We assert the wrapper formula over identical inner values.
         for inner in [0u64, 1, 42, u64::MAX, 0x00FF_00FF_00FF_00FF] {
             let s = (1u64.rotate_left(56) ^ inner) | 1;
-            let a = (2u64.rotate_left(56) ^ inner) | 1;
             let p = (3u64.rotate_left(56) ^ inner) | 1;
-            assert_ne!(s, a, "settings vs about collide at inner={inner:#x}");
+            let c = (5u64.rotate_left(56) ^ inner) | 1;
             assert_ne!(s, p, "settings vs palette collide at inner={inner:#x}");
-            assert_ne!(a, p, "about vs palette collide at inner={inner:#x}");
+            assert_ne!(s, c, "settings vs conn-card collide at inner={inner:#x}");
+            assert_ne!(p, c, "palette vs conn-card collide at inner={inner:#x}");
             assert_ne!(s, 0, "settings fp must be nonzero");
-            assert_ne!(a, 0, "about fp must be nonzero");
             assert_ne!(p, 0, "palette fp must be nonzero");
+            assert_ne!(c, 0, "conn-card fp must be nonzero");
         }
 
         // And over real, live models (whose inner hashes will differ too).
         let settings = Overlay::Settings(SettingsState::from_config(
             &crate::app_config::Config::default(),
         ));
-        let about = Overlay::About(AboutState::new());
         let palette = Overlay::Palette(PaletteState::new());
-        let (fs, fa, fp) = (
-            settings.fingerprint(),
-            about.fingerprint(),
-            palette.fingerprint(),
-        );
-        assert_ne!(fs, fa);
+        let (fs, fp) = (settings.fingerprint(), palette.fingerprint());
         assert_ne!(fs, fp);
-        assert_ne!(fa, fp);
         assert_ne!(fs, 0);
-        assert_ne!(fa, 0);
         assert_ne!(fp, 0);
         assert_eq!(settings.kind(), OverlayKind::Settings);
-        assert_eq!(about.kind(), OverlayKind::About);
         assert_eq!(palette.kind(), OverlayKind::Palette);
     }
 
@@ -429,9 +343,7 @@ mod tests {
         let cfg = crate::app_config::Config::default();
         let cases = [
             Overlay::Settings(SettingsState::from_config(&cfg)),
-            Overlay::About(AboutState::new()),
             Overlay::Palette(PaletteState::new()),
-            Overlay::Update(UpdateState::from_status(1, "1.0", None, false)),
             Overlay::ConnCard(ConnCardState::new(
                 crate::WindowId(0),
                 aterm_session::SessionId::new("s-a"),

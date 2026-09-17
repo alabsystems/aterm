@@ -379,19 +379,30 @@ unsafe impl Encode for *mut std::ffi::c_uchar {
 ///
 /// ```text
 /// clang -arch arm64  : @encode(BOOL*) = "^B"   (BOOL is _Bool)
-/// clang -arch x86_64 : @encode(BOOL*) = "*"    (BOOL is signed char, so
-///                                               BOOL* IS char*, which the
-///                                               runtime spells "*")
+/// clang -arch x86_64 : @encode(BOOL*) = "^c"   (BOOL is signed char, but
+///                                               clang encodes the BOOL
+///                                               typedef itself, never the
+///                                               char* it aliases)
 /// ```
 ///
-/// The arm64 figure is execution-measured; the x86_64 figure is CODEGEN-proved
-/// (`clang -arch x86_64 -S`, reading the emitted string literal), because this
-/// box cannot execute that slice.
+/// Both figures are execution-measured. The x86_64 one used to read `"*"`,
+/// "codegen-proved" from the literal `clang -arch x86_64 -S` emits for
+/// `signed char *` — and `@encode(signed char *)` IS `*`. But `@encode` keeps
+/// the `BOOL` typedef's pointer as `^` plus `BOOL`'s own `c` instead of folding
+/// it into the `char *` special case, so `@encode(BOOL *)` is `^c` — and that
+/// is what Foundation's compiled methods carry. Measured on an Intel Mac
+/// (macOS 13.7.8, Apple clang 14.0.3): `@encode(BOOL *)` = `^c`,
+/// `@encode(signed char *)` = `*`, and
+/// `-[NSFileManager fileExistsAtPath:isDirectory:]` = `c32@0:8@16^c24`. A
+/// block or method that spelled its `BOOL *` as `*` disagreed with every
+/// framework signature it was matched against. `tests/adversary_w2d.rs` reads
+/// argument 3 of that method back from the runtime and compares it with this
+/// constant, on whichever arch the tests run.
 #[cfg(target_arch = "aarch64")]
 const BOOL_PTR_ENCODING: &str = "^B";
 /// See the `aarch64` arm.
 #[cfg(not(target_arch = "aarch64"))]
-const BOOL_PTR_ENCODING: &str = "*";
+const BOOL_PTR_ENCODING: &str = "^c";
 
 // `BOOL *` — the `stop` out-parameter of every `enumerate…UsingBlock:` in
 // Foundation, and the shape a block takes it in. Spelling it `*mut bool` in

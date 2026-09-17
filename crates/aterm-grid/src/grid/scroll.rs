@@ -44,6 +44,12 @@ impl Grid {
     ///
     /// Used by `scroll_to_bottom` and defensive offset resets in operations
     /// that require `display_offset == 0` for row arithmetic.
+    ///
+    /// MACHINE motion, so it deliberately does NOT bump `reader_live_bottom_gen`: most
+    /// of its callers (IL/DL, ED, the unscroll, the `scroll_up` family) are forcing
+    /// the precondition their own row arithmetic needs, not reporting a reader's
+    /// gesture. The reader's End press is `scroll_to_bottom`, the one-line wrapper
+    /// below, which bumps for itself.
     pub(crate) fn reset_display_offset_with_damage(&mut self) {
         let old_offset = self.storage.display_offset;
         if old_offset == 0 {
@@ -65,10 +71,51 @@ impl Grid {
         let visible_rows = self.storage.visible_rows;
         self.storage.mark_content_scroll(visible_rows, n);
     }
+
+    /// Record that the READER just brought the viewport DOWN to the live bottom.
+    ///
+    /// The one bump site for `reader_live_bottom_gen` (see its field doc). Called
+    /// with the offset read immediately BEFORE a reader-facing viewport primitive
+    /// ran, it advances the generation on exactly the transition the audit-#7
+    /// exception in [`crate::grid::scrollback_offload`] is written about: non-zero
+    /// to zero, by the reader's hand.
+    ///
+    /// Both halves of the condition carry weight. `before != 0` is why an End at a
+    /// viewport already pinned to the live bottom records nothing — a gesture that
+    /// moved nothing is not evidence of a choice. `after == 0` is why a reader who
+    /// scrolls UP and stops records nothing either: they did not choose the live
+    /// bottom, so if something later puts them there it was the machine, and the
+    /// machine's 0 is precisely what the consumer must not mistake for theirs.
+    fn note_reader_descent_to_live_bottom(&mut self, before: usize) {
+        if before != 0 && self.storage.display_offset == 0 {
+            self.storage.reader_live_bottom_gen += 1;
+        }
+    }
+
+    /// Force the viewport to the live bottom for the duration of an OUTPUT BATCH
+    /// (SCR-1's prologue), to be undone by [`Self::repin_display_offset`].
+    ///
+    /// Identical motion to [`Self::scroll_to_bottom`] and deliberately a different
+    /// entry point: this one is the MACHINE satisfying the `display_offset == 0`
+    /// precondition every VT row-arithmetic path downstream of `row_index` needs,
+    /// and it re-pins the reader afterwards, so the round trip must stay invisible
+    /// to `reader_live_bottom_gen`. Calling the reader's `scroll_to_bottom` here would
+    /// file a >0 → 0 descent on every batch of output that arrives while someone is
+    /// reading history — measured: `before=20 forced=0 after=20` — and the
+    /// audit-#7 guard would then read ordinary `tail -f` traffic as the reader
+    /// pressing End.
+    pub fn pin_viewport_to_live_for_output_batch(&mut self) {
+        self.reset_display_offset_with_damage();
+        debug_assert_eq!(self.storage.display_offset, 0);
+    }
+
     /// Scroll the display by delta lines.
     ///
     /// Positive delta = scroll up (show older content).
     /// Negative delta = scroll down (show newer content).
+    ///
+    /// READER motion: bumps `reader_live_bottom_gen` when it lands the viewport on
+    /// the live bottom from above (see `note_reader_descent_to_live_bottom`).
     ///
     /// ENSURES: self.storage.display_offset <= self.storage.scrollback_lines()
     pub fn scroll_display(&mut self, delta: i32) {
@@ -85,6 +132,7 @@ impl Grid {
         let dmg =
             compute_display_offset_damage(old_offset, self.storage.display_offset, self.rows());
         self.storage.damage.apply_display_offset_damage(dmg);
+        self.note_reader_descent_to_live_bottom(old_offset);
         debug_assert!(self.storage.display_offset <= self.storage.scrollback_lines());
     }
 
@@ -96,6 +144,11 @@ impl Grid {
     /// in view, the new offset is `prev_offset + lines_added`, clamped to
     /// `scrollback_lines()` so `display_offset <= scrollback_lines()` holds even
     /// when eviction discarded some of those lines.
+    ///
+    /// MACHINE motion — the epilogue half of the pin dance whose prologue is
+    /// [`Self::pin_viewport_to_live_for_output_batch`] — so it does NOT bump
+    /// `reader_live_bottom_gen`: the pair restores a reading position the reader never
+    /// left, and a generation that counted it would call `tail -f` a gesture.
     ///
     /// ENSURES: self.storage.display_offset <= self.storage.scrollback_lines()
     pub fn repin_display_offset(&mut self, prev_offset: usize, lines_added: u64) {
@@ -119,6 +172,9 @@ impl Grid {
     /// visible rows: only the top N rows are marked dirty. Falls back to
     /// `mark_full()` for large scrolls.
     ///
+    /// READER motion: bumps `reader_live_bottom_gen` when it lands the viewport on
+    /// the live bottom from above (see `note_reader_descent_to_live_bottom`).
+    ///
     /// ENSURES: self.storage.display_offset == self.storage.scrollback_lines()
     pub fn scroll_to_top(&mut self) {
         let target = self.storage.scrollback_lines();
@@ -127,6 +183,7 @@ impl Grid {
 
         let dmg = compute_display_offset_damage(old_offset, target, self.rows());
         self.storage.damage.apply_display_offset_damage(dmg);
+        self.note_reader_descent_to_live_bottom(old_offset);
         debug_assert_eq!(self.storage.display_offset, self.storage.scrollback_lines());
     }
 
@@ -135,10 +192,19 @@ impl Grid {
     /// Uses targeted row-level damage instead of `mark_full()`:
     /// only the newly-exposed bottom rows are marked dirty.
     ///
+    /// READER motion — the End press — so it bumps `reader_live_bottom_gen`, but only
+    /// when the viewport was not already at the live bottom. An End that moves
+    /// nothing records nothing; see [`Self::note_reader_descent_to_live_bottom`]. The
+    /// MACHINE's identical motion goes through
+    /// [`Self::pin_viewport_to_live_for_output_batch`] or straight to
+    /// [`Self::reset_display_offset_with_damage`] instead.
+    ///
     /// ENSURES: self.storage.display_offset == 0
     #[inline]
     pub fn scroll_to_bottom(&mut self) {
+        let before = self.storage.display_offset;
         self.reset_display_offset_with_damage();
+        self.note_reader_descent_to_live_bottom(before);
         debug_assert_eq!(self.storage.display_offset, 0);
     }
 
@@ -150,6 +216,17 @@ impl Grid {
     /// of scrollback. Same targeted display-offset damage as
     /// [`scroll_display`](Self::scroll_display); a no-op (no damage) when the
     /// resolved offset is unchanged.
+    ///
+    /// READER motion: bumps `reader_live_bottom_gen` when it lands the viewport on
+    /// the live bottom from above (see `note_reader_descent_to_live_bottom`).
+    ///
+    /// Its one MACHINE caller — a rows-only resize re-anchoring the viewport on the
+    /// line it was showing (`reflow.rs`) — needs no separate entry point, and that
+    /// is structural rather than lucky: `Grid::resize` zeroes `display_offset`
+    /// before it rewraps anything and nothing raises it again before the re-anchor,
+    /// so the re-anchor can only ever move the viewport UP, never descend to the
+    /// live bottom. (Asserted across the whole grid and core suites while this was
+    /// written; the zeroing is `reflow.rs`'s own line, right under `prev_anchor`.)
     ///
     /// ENSURES: self.storage.display_offset <= self.storage.scrollback_lines()
     pub fn scroll_to_absolute_row(&mut self, target_abs_row: u64) {
@@ -170,6 +247,7 @@ impl Grid {
         self.storage.display_offset = new_offset;
         let dmg = compute_display_offset_damage(old_offset, new_offset, self.rows());
         self.storage.damage.apply_display_offset_damage(dmg);
+        self.note_reader_descent_to_live_bottom(old_offset);
         debug_assert!(self.storage.display_offset <= self.storage.scrollback_lines());
     }
 
@@ -177,6 +255,11 @@ impl Grid {
     ///
     /// Call this after operations that may reduce scrollback size
     /// (e.g., truncation) to maintain the DisplayOffsetValid invariant.
+    ///
+    /// MACHINE motion — history went away under the viewport — so it does NOT bump
+    /// `reader_live_bottom_gen`. This is the exact write the reflow-offload bug turned
+    /// on its reader: a clamp is the terminal taking the reader's place away, never
+    /// the reader choosing to leave it.
     ///
     /// Uses targeted row-level damage when the clamping delta is smaller than
     /// visible rows: only the bottom N rows are marked dirty.

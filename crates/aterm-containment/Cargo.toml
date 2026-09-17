@@ -15,8 +15,15 @@ default = []
 # TOML-based allowlist parsing (`AllowlistConfig::from_toml_str` /
 # `AllowlistConfig::from_toml_file`). Off by default so `aterm-core`'s build
 # tree does not pull `aterm-toml` + `serde` through this crate when consumers only
-# use `AllowlistConfig` via struct literals (#7729). Binary consumers that
-# load TOML allowlist files (aterm-daemon) opt in explicitly.
+# use `AllowlistConfig` via struct literals (#7729).
+#
+# NOTHING IN THE WORKSPACE TURNS IT ON, and that is not an oversight: `src/lib.rs`
+# records the whole allowlist module as a policy/proof artifact with no production
+# caller (`init_allowlist` is never invoked, no gate site consults `is_*_allowed`),
+# pending the reader-loop hook. The feature is the opt-in that hook's binary will
+# use. It previously named `aterm-daemon` as that consumer; that crate no longer
+# exists (`src/lib.rs` and `src/output_filter.rs` both say so), so it is not named
+# here as if it did.
 allowlist-toml = ["dep:aterm-toml"]
 
 [dependencies]

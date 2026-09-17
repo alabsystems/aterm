@@ -15,6 +15,7 @@ use sctk::reexports::protocols::wp::relative_pointer::zv1::client::zwp_relative_
 use sctk::reexports::protocols::wp::text_input::zv3::client::zwp_text_input_v3::ZwpTextInputV3;
 
 use sctk::data_device_manager::data_device::DataDevice;
+use sctk::primary_selection::device::PrimarySelectionDevice;
 use sctk::seat::pointer::{ThemeSpec, ThemedPointer};
 use sctk::seat::{Capability as SeatCapability, SeatHandler, SeatState};
 
@@ -62,6 +63,19 @@ pub struct WinitSeatState {
     /// from `state.rs` (startup seats) and `new_seat` (later seats).
     pub(crate) data_device: Option<DataDevice>,
 
+    /// The primary-selection device bound on the seat (see `clipboard.rs`).
+    /// `None` when the compositor has no `zwp_primary_selection_device_manager_v1`.
+    pub(crate) primary_device: Option<PrimarySelectionDevice>,
+
+    /// The newest serial the seat's keyboard handed this client (enter, key,
+    /// modifiers) — what a clipboard copy gives `set_selection`. See `clipboard.rs`.
+    pub(crate) latest_keyboard_serial: u32,
+
+    /// Whether the seat's keyboard is currently ON one of this client's surfaces
+    /// — set by `wl_keyboard.enter`, cleared by `wl_keyboard.leave`. Read by
+    /// [`Self::holds_keyboard_focus`]; see `clipboard.rs` for why a copy needs it.
+    keyboard_entered: bool,
+
     /// The current modifiers state on the seat.
     modifiers: ModifiersState,
 
@@ -72,6 +86,38 @@ pub struct WinitSeatState {
 impl WinitSeatState {
     pub fn new() -> Self {
         Default::default()
+    }
+
+    /// The newest input serial this seat gave the client, across its keyboard
+    /// and pointer — `0` when it never has (the compositor would refuse a
+    /// `set_selection` with it, so a copy is not attempted).
+    pub(crate) fn latest_serial(&self) -> u32 {
+        let pointer = self
+            .pointer
+            .as_ref()
+            .map(|pointer| {
+                let data = pointer.pointer().winit_data();
+                data.latest_button_serial().max(data.latest_enter_serial())
+            })
+            .unwrap_or_default();
+        self.latest_keyboard_serial.max(pointer)
+    }
+
+    /// Whether this client holds the seat's keyboard focus — the fact a clipboard
+    /// copy is gated on, because a compositor hands a selection only to the client
+    /// its keyboard is on (measured; see `clipboard.rs`).
+    ///
+    /// A seat that has bound NO keyboard answers `true`: there is no focus on it to
+    /// hold, and a gate that read `false` there would refuse every copy made on a
+    /// pointer-only seat.
+    pub(crate) fn holds_keyboard_focus(&self) -> bool {
+        self.keyboard_state.is_none() || self.keyboard_entered
+    }
+
+    /// `wl_keyboard.enter` / `.leave` for this seat: the keyboard arrived on one of
+    /// our surfaces, or left them.
+    pub(crate) fn set_keyboard_entered(&mut self, entered: bool) {
+        self.keyboard_entered = entered;
     }
 }
 
@@ -203,6 +249,9 @@ impl SeatHandler for WinitState {
             },
             SeatCapability::Keyboard => {
                 seat_state.keyboard_state = None;
+                // The keyboard is gone, so it is on none of our surfaces; a later
+                // one re-binds and re-enters before it hands out another serial.
+                seat_state.set_keyboard_entered(false);
                 self.on_keyboard_destroy(&seat.id());
             },
             _ => (),
@@ -220,6 +269,9 @@ impl SeatHandler for WinitState {
         // already present at startup get theirs in `WinitState::new`.)
         if let Some(manager) = self.data_device_manager_state.as_ref() {
             seat_state.data_device = Some(manager.get_data_device(queue_handle, &seat));
+        }
+        if let Some(manager) = self.primary_selection_manager_state.as_ref() {
+            seat_state.primary_device = Some(manager.get_selection_device(queue_handle, &seat));
         }
         self.seats.insert(seat.id(), seat_state);
     }

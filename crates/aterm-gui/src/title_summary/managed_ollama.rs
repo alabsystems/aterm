@@ -1014,6 +1014,25 @@ pub(super) fn managed_ollama_command(
     command.current_dir(home);
     #[cfg(unix)]
     configure_dedicated_process_session(&mut command);
+    // BELOW THE TYPING BAND (2026-09-15). The daemon's answer is a tab label, yet
+    // it started at pri 31 — the band of the program being typed into — because
+    // the worker thread's `Role::Background` does not cross the spawn. It cannot
+    // take `qos::command`'s `taskpolicy` wrapper: `attest_running_managed_ollama`
+    // checks this pid's code the moment `spawn` returns, when a wrapped pid may
+    // still be running taskpolicy's image. So the forked child demotes itself
+    // before exec, and every runner it starts inherits that.
+    #[cfg(unix)]
+    {
+        use std::os::unix::process::CommandExt as _;
+        // SAFETY: `demote_forked_child` is one async-signal-safe syscall and
+        // allocates nothing.
+        unsafe {
+            command.pre_exec(|| {
+                crate::qos::demote_forked_child();
+                Ok(())
+            });
+        }
+    }
     command
         .stdin(std::process::Stdio::null())
         .stdout(std::process::Stdio::null())

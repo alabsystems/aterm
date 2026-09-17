@@ -37,7 +37,7 @@ use aterm_core::terminal::Terminal;
 use aterm_render::{FireMode, FirePatch, Theme, WindowCpu};
 
 mod common;
-use common::{backends, bb, gg, max_channel_delta, rr};
+use common::{assert_byte_exact, backends, bb, gg, max_channel_delta, rr};
 
 /// Summed-RGB luminance proxy (monotone per channel, so ordering is exact).
 fn luma(p: u32) -> i32 {
@@ -392,9 +392,12 @@ fn over_ink_fire_byte_exact_over_dark_and_light_frames() {
             input.fire_patch.len()
         );
         if gpu.additive_is_byte_exact() {
-            assert_eq!(
-                delta, 0,
-                "({label}) ink-fire must be BYTE-EXACT CPU==GPU (got {delta})"
+            assert_byte_exact(
+                "over_ink_fire_byte_exact_over_dark_and_light_frames",
+                &format!("fire Over ({label})"),
+                &gpu,
+                delta,
+                format_args!("({label}) ink-fire must be BYTE-EXACT CPU==GPU (got {delta})"),
             );
         } else {
             eprintln!("SKIP byte-exact Over fire gate ({label}): downlevel sRGB offscreen");

@@ -243,6 +243,61 @@ pub fn split_graphemes(s: &str) -> impl Iterator<Item = Grapheme<'_>> {
     })
 }
 
+/// THE NUMBER OF GRID CELLS A TERMINAL LAYS `grapheme` OUT IN.
+///
+/// This is NOT [`grapheme_display_width`], and the difference is the whole
+/// point. That function answers "how wide does this cluster look", is
+/// documented to return 0, 1 or 2, and is right about emoji. The terminal grid
+/// answers a different question, because it does not allocate cells per
+/// CLUSTER — it advances the cursor per CHARACTER as it writes
+/// (`aterm_core`'s `handler_write`), with a stateful exception for emoji, where
+/// VS16 widens, VS15 narrows, and ZWJ and skin-tone modifiers fold back into the
+/// preceding cell.
+///
+/// So the rule, measured against the real grid rather than derived:
+///
+/// * an EMOJI cluster occupies its cluster display width — the folding cases;
+/// * everything else occupies the SUM of its characters' widths.
+///
+/// The second half is what three separate call sites got wrong. A Devanagari
+/// conjunct `na + virama + da + vowel-II` is ONE cluster under UAX#29 GB9c, and
+/// the grid paints it in THREE cells (`न्`, `द`, `ी`) because it advances per
+/// character. Every model that charged the cluster 1 or 2 put every later column
+/// on that row to the LEFT of the text actually painted — so a find-bar
+/// highlight covered a blank cell and dropped the match's last character, and a
+/// copied selection extracted a different run of cells than the one highlighted.
+///
+/// Measured agreement with the grid, 2026-09-16, on ASCII, CJK, Latin+combining,
+/// Devanagari `ka+II`, Devanagari and Bengali conjuncts, keycap, ZWJ family,
+/// skin-tone, regional-indicator flag, VS15 text and VS16 emoji — see
+/// `aterm-core/tests/grid_column_agreement.rs`, which drives the REAL grid and
+/// is the authority this function is checked against.
+///
+/// Unlike its neighbour this can exceed 2, because the grid can.
+#[must_use]
+pub fn grapheme_grid_columns(grapheme: &str) -> usize {
+    // A KEYCAP IS A FOLDING SEQUENCE THAT `is_emoji_grapheme` DOES NOT CLAIM.
+    // `1 + VS16 + U+20E3` is painted in 2 cells like any other emoji, but the
+    // classifier answers `false` for it, so it fell to the per-character sum and
+    // was charged 1 — measured against the grid, not assumed. U+20E3 COMBINING
+    // ENCLOSING KEYCAP appears in no other construction, so naming it here is
+    // exact rather than a heuristic.
+    let folds = is_emoji_grapheme(grapheme) || grapheme.contains('\u{20E3}');
+    if folds {
+        grapheme_display_width(grapheme)
+    } else {
+        grapheme.chars().map(unicode_tables::char_width).sum()
+    }
+}
+
+/// [`grapheme_grid_columns`] summed over `s`'s grapheme clusters: the number of
+/// grid cells a terminal lays the whole string out in.
+#[must_use]
+pub fn str_grid_columns(s: &str) -> usize {
+    use crate::GraphemeClusters;
+    s.graphemes().map(grapheme_grid_columns).sum()
+}
+
 /// Check if a grapheme cluster is primarily an emoji.
 ///
 /// This detects emoji including:

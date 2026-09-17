@@ -53,6 +53,7 @@ pub(crate) struct MetalWindowSurface {
     worker: Option<DrawableWorker>,
     ready: Option<Result<OwnedDrawable, AcquireRefusal>>,
     completed_wait_ns: Option<u64>,
+    completed_queue_ns: Option<u64>,
 }
 
 // The holder permits retirement without changing the borrow-shaped Frame API.
@@ -113,6 +114,7 @@ impl MetalWindowSurface {
             worker: None,
             ready: None,
             completed_wait_ns: None,
+            completed_queue_ns: None,
         })
     }
 
@@ -131,6 +133,7 @@ impl MetalWindowSurface {
             worker: None,
             ready: None,
             completed_wait_ns: None,
+            completed_queue_ns: None,
         })
     }
 
@@ -210,6 +213,15 @@ impl MetalWindowSurface {
         self.completed_wait_ns.take()
     }
 
+    /// The latest completed acquisition's QUEUE span — admission until the
+    /// worker dequeued it. Published beside, never inside,
+    /// [`Self::take_completed_acquire_wait_ns`]: the two legs have different
+    /// causes (this one is scheduling, that one is CoreAnimation) and folding
+    /// them together would make either unreadable.
+    pub(crate) fn take_completed_acquire_queue_ns(&mut self) -> Option<u64> {
+        self.completed_queue_ns.take()
+    }
+
     fn collect_acquire(&mut self) {
         let Some(completed) = self.worker.as_mut().and_then(AcquireWorker::try_take) else {
             return;
@@ -217,6 +229,10 @@ impl MetalWindowSurface {
         match completed.outcome {
             AcquireOutcome::Ready(output) => {
                 self.completed_wait_ns = Some(output.wait_ns);
+                // Paired with the wait, so `n_acquire_queue == n_acquire` and
+                // the two legs of one acquisition are always readable
+                // together. Terminal outcomes book neither.
+                self.completed_queue_ns = Some(completed.queue_ns);
                 if result_is_current(completed.generation, self.generation, false) {
                     self.ready = Some(output.drawable.ok_or_else(|| AcquireRefusal::AcquireNil {
                         detail: format!(
@@ -1058,7 +1074,7 @@ mod tests {
             .texture_2d(PixelFormat::Rgba8Unorm, CW, CH, usage)
             .expect("offscreen");
         let grey = vec![0x60u8; CW * CH * 4];
-        // SAFETY: fresh shared texture, tight stride.
+        // SAFETY: fresh managed texture, tight stride.
         unsafe {
             ffi::texture_upload(
                 offscreen.obj(),

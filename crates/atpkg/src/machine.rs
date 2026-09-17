@@ -28,6 +28,26 @@ pub const UNIVERSAL_CONTROL_REVERT: &str = "defaults -currentHost delete \
 /// The `machine-settings:` entry for a Universal Control change (contract string).
 pub const UNIVERSAL_CONTROL_ENTRY: &str = "universal-control disabled";
 
+/// What one `defaults -currentHost read` answered about one key.
+///
+/// ABSENT AND UNUSABLE ARE NOT THE SAME ANSWER (2026-09-15). Both used to arrive as
+/// `None`, so a `defaults` that could not be run, was killed at its deadline, or
+/// answered something this module does not understand was reported to the user as the
+/// OS DEFAULT: "the cursor roams to other Macs and iPads", with Apply offered as if the
+/// machine had been measured. It had not been. A key that is absent is a measurement —
+/// `defaults` exits 1 with empty output to say "does not exist", which IS the OS
+/// default — and anything else is the absence of one.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum KeyRead {
+    /// The key holds a value this module understands.
+    Value(bool),
+    /// The key is not set: the documented "does not exist" answer.
+    Absent,
+    /// Nothing could be learned: `defaults` would not run, took too long, or said
+    /// something unreadable.
+    Unusable,
+}
+
 /// Universal Control's two per-host switches, as read.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub struct UniversalControlState {
@@ -35,6 +55,29 @@ pub struct UniversalControlState {
     pub disable: Option<bool>,
     /// `DisableMagicEdges`: `Some(true)` = no screen-edge hand-off.
     pub magic_edges: Option<bool>,
+    /// Both keys were actually MEASURED — a value, or a documented absence. `false`
+    /// when either read was [`KeyRead::Unusable`], and then neither `Option` above may
+    /// be read as "the OS default".
+    pub measured: bool,
+}
+
+impl UniversalControlState {
+    /// Fold the port's two answers.
+    #[must_use]
+    pub const fn from_reads(reads: [KeyRead; 2]) -> Self {
+        const fn value(read: KeyRead) -> Option<bool> {
+            match read {
+                KeyRead::Value(v) => Some(v),
+                KeyRead::Absent | KeyRead::Unusable => None,
+            }
+        }
+        Self {
+            disable: value(reads[0]),
+            magic_edges: value(reads[1]),
+            measured: !matches!(reads[0], KeyRead::Unusable)
+                && !matches!(reads[1], KeyRead::Unusable),
+        }
+    }
 }
 
 impl UniversalControlState {
@@ -50,26 +93,68 @@ impl UniversalControlState {
     /// `warn` when the pass is about to change it, `ok` when the policy says leave.
     #[must_use]
     pub fn doctor_line(&self, policy: UniversalControlPolicy) -> String {
+        if !self.measured {
+            // Never "the OS default": nothing was measured, and the remedy is the same
+            // either way, so say what is true and name the command that would tell us.
+            return match policy {
+                UniversalControlPolicy::Off => "warn — Universal Control could not be read \
+                     on this host (`defaults -currentHost read com.apple.universalcontrol` did \
+                     not answer), so whether it is on here is unknown; a pass writes both keys \
+                     anyway ([machine] universal_control = \"off\") — now: `aterm pkg machine \
+                     apply`"
+                    .to_string(),
+                UniversalControlPolicy::Leave => {
+                    "ok — Universal Control could not be read on this host, and [machine] \
+                     universal_control = \"leave\" means nothing would be written either way"
+                        .to_string()
+                }
+            };
+        }
         if self.disabled() {
+            // THE REVERT ALONE DOES NOT HOLD. With the default policy every later pass
+            // disables it again first thing, so a line that offers only the two
+            // `defaults delete`s sends the reader to a change that lasts until the next
+            // launch. The command stays byte-identical ([`UNIVERSAL_CONTROL_REVERT`] is
+            // a contract string); what follows it is the half that makes it stick.
+            let keep = match policy {
+                UniversalControlPolicy::Off => {
+                    " — and set [machine] universal_control = \"leave\", or the next pass \
+                     disables it again"
+                }
+                UniversalControlPolicy::Leave => "",
+            };
             return format!(
                 "ok — Universal Control is disabled on this host (cursor and keyboard stay \
-                 on this Mac); revert: {UNIVERSAL_CONTROL_REVERT}"
+                 on this Mac); revert: {UNIVERSAL_CONTROL_REVERT}{keep}"
             );
         }
+        // A HALF-DISABLED HOST IS NOT AT THE OS DEFAULT. One key set is a state someone
+        // (or a previous half-finished pass) made, and calling it the default while the
+        // parenthetical says which key IS set contradicted itself in one sentence.
+        let posture = if self.partial() {
+            format!("half disabled{}", self.partial_note())
+        } else {
+            "at the OS default (the cursor roams to other Macs and iPads on this Apple \
+             account)"
+                .to_string()
+        };
         match policy {
             UniversalControlPolicy::Off => format!(
-                "warn — Universal Control is at the OS default (the cursor roams to other \
-                 Macs and iPads on this Apple account){}; every pass disables it first thing \
+                "warn — Universal Control is {posture}; every pass disables it first thing \
                  ([machine] universal_control = \"off\") — now: `aterm pkg machine apply`; \
-                 keep it: universal_control = \"leave\"",
-                self.partial_note()
+                 keep it: universal_control = \"leave\""
             ),
             UniversalControlPolicy::Leave => format!(
-                "ok — Universal Control left at the OS default{} ([machine] \
-                 universal_control = \"leave\")",
-                self.partial_note()
+                "ok — Universal Control left {posture} ([machine] universal_control = \"leave\")"
             ),
         }
+    }
+
+    /// Exactly one of the two keys is set: a state no default has and no complete pass
+    /// leaves.
+    #[must_use]
+    pub fn partial(&self) -> bool {
+        !self.disabled() && (self.disable == Some(true) || self.magic_edges == Some(true))
     }
 
     /// `, Disable set but not DisableMagicEdges` style note for a half state.
@@ -109,7 +194,7 @@ pub fn parse_defaults_bool(stdout: &[u8]) -> Option<bool> {
 /// testable against a fake and the tests never touch the machine.
 pub trait UniversalControlPort {
     /// `[Disable, DisableMagicEdges]` as [`crate::platform::universal_control_state`].
-    fn state(&self) -> [Option<bool>; 2];
+    fn state(&self) -> [KeyRead; 2];
     /// Write both keys true; `true` iff both writes succeeded.
     fn disable(&self) -> bool;
 }
@@ -119,7 +204,7 @@ pub trait UniversalControlPort {
 pub struct SystemDefaults;
 
 impl UniversalControlPort for SystemDefaults {
-    fn state(&self) -> [Option<bool>; 2] {
+    fn state(&self) -> [KeyRead; 2] {
         crate::platform::universal_control_state()
     }
     fn disable(&self) -> bool {
@@ -130,11 +215,7 @@ impl UniversalControlPort for SystemDefaults {
 /// Read the state through `port`.
 #[must_use]
 pub fn universal_control_state(port: &dyn UniversalControlPort) -> UniversalControlState {
-    let [disable, magic_edges] = port.state();
-    UniversalControlState {
-        disable,
-        magic_edges,
-    }
+    UniversalControlState::from_reads(port.state())
 }
 
 /// What one pass did about Universal Control.
@@ -227,6 +308,12 @@ impl UniversalControlState {
     /// distinction the doctor makes is carried by `disable_read`'s prose, not here.
     #[must_use]
     pub fn posture(&self) -> UcPosture {
+        // An UNMEASURED read is `Unknown`, which is the variant's whole purpose: before
+        // this, a `defaults` that would not run reported the OS default and the card
+        // told the user the cursor roams, on no evidence.
+        if !self.measured {
+            return UcPosture::Unknown;
+        }
         match (self.disable, self.magic_edges) {
             (Some(true), Some(true)) => UcPosture::Disabled,
             (Some(true), _) | (_, Some(true)) => UcPosture::Partial,
@@ -294,6 +381,12 @@ pub struct MachineState {
     pub scan_complete: bool,
     /// The synthetic-home rule's answer.
     pub home: HomePosture,
+    /// The config file exists and does not parse, so neither opt-out could be read and
+    /// nothing may be applied ([`crate::config::MachineConfig::unreadable`]).
+    ///
+    /// OPTIONAL IN THE RECORD, and `false` when absent, so a reader from before this key
+    /// existed keeps working and a record written by one still parses here.
+    pub config_unreadable: bool,
 }
 
 /// What is left for an apply to do, if anything.
@@ -335,7 +428,9 @@ impl MachineState {
     /// What an apply would still do on this machine.
     #[must_use]
     pub fn next(&self) -> Option<MachineNext> {
-        if self.home != HomePosture::Account {
+        // Nothing is next when nothing may be applied: a synthetic home, or a config
+        // whose opt-outs could not be read.
+        if self.home != HomePosture::Account || self.config_unreadable {
             return None;
         }
         machine_next(
@@ -369,7 +464,14 @@ pub fn machine_state_line(s: &MachineState) -> String {
             "partial"
         },
         s.home.as_str(),
-    )
+    ) + if s.config_unreadable {
+        // APPENDED, NEVER INSERTED: every key before this one keeps its place, so a
+        // reader that predates the key sees the record it has always seen and this one
+        // is simply ignored by it (`parse_machine_state` skips unknown keys).
+        "; config=unreadable"
+    } else {
+        ""
+    }
 }
 
 /// Parse a [`machine_state_line`] body. Every field required, order free, unknown
@@ -386,6 +488,7 @@ pub fn parse_machine_state(body: &str) -> Option<MachineState> {
     let mut migratable = None;
     let mut scan = None;
     let mut home = None;
+    let mut config_unreadable = false;
     for pair in body.split(';') {
         let Some((k, v)) = pair.trim().split_once('=') else {
             continue;
@@ -412,6 +515,9 @@ pub fn parse_machine_state(body: &str) -> Option<MachineState> {
                 }
             }
             "home" => home = HomePosture::parse(v),
+            // Optional: absent means readable, which is what every record written
+            // before this key existed means.
+            "config" => config_unreadable = v == "unreadable",
             _ => {}
         }
     }
@@ -424,6 +530,7 @@ pub fn parse_machine_state(body: &str) -> Option<MachineState> {
         would_migrate: migratable?,
         scan_complete: scan?,
         home: home?,
+        config_unreadable,
     })
 }
 
@@ -438,6 +545,8 @@ mod tests {
         edges: Cell<Option<bool>>,
         writes: Cell<u32>,
         write_ok: bool,
+        /// `defaults` itself could not answer — the read that taught us nothing.
+        unusable: bool,
     }
 
     impl Fake {
@@ -447,13 +556,21 @@ mod tests {
                 edges: Cell::new(edges),
                 writes: Cell::new(0),
                 write_ok: true,
+                unusable: false,
             }
         }
     }
 
     impl UniversalControlPort for Fake {
-        fn state(&self) -> [Option<bool>; 2] {
-            [self.disable.get(), self.edges.get()]
+        fn state(&self) -> [KeyRead; 2] {
+            let read = |v: Option<bool>| {
+                if self.unusable {
+                    KeyRead::Unusable
+                } else {
+                    v.map_or(KeyRead::Absent, KeyRead::Value)
+                }
+            };
+            [read(self.disable.get()), read(self.edges.get())]
         }
         fn disable(&self) -> bool {
             self.writes.set(self.writes.get() + 1);
@@ -533,6 +650,7 @@ mod tests {
     #[test]
     fn doctor_words_carry_the_revert_and_the_opt_out() {
         let off = UniversalControlState {
+            measured: true,
             disable: Some(true),
             magic_edges: Some(true),
         };
@@ -544,7 +662,10 @@ mod tests {
             "defaults -currentHost delete com.apple.universalcontrol Disable; \
              defaults -currentHost delete com.apple.universalcontrol DisableMagicEdges"
         );
-        let default = UniversalControlState::default();
+        // The OS default is a MEASURED state: both keys absent, both reads answered.
+        let default = UniversalControlState::from_reads([KeyRead::Absent, KeyRead::Absent]);
+        assert!(default.measured);
+        assert_eq!(default.posture(), UcPosture::Default);
         let line = default.doctor_line(UniversalControlPolicy::Off);
         assert!(line.starts_with("warn — "), "{line}");
         // The promise, and the door: "first thing" is the 2026-09-14 fix (the apply used
@@ -564,7 +685,39 @@ mod tests {
         let line = default.doctor_line(UniversalControlPolicy::Leave);
         assert!(line.starts_with("ok — "), "{line}");
         assert!(line.contains("left at the OS default"), "{line}");
+
+        // A READ THAT DID NOT HAPPEN SAYS SO. `UniversalControlState::default()` is the
+        // unmeasured value, and it must never render as the OS default.
+        let unread = UniversalControlState::default();
+        assert!(!unread.measured);
+        assert_eq!(unread.posture(), UcPosture::Unknown);
+        for (policy, lead) in [
+            (UniversalControlPolicy::Off, "warn — "),
+            (UniversalControlPolicy::Leave, "ok — "),
+        ] {
+            let line = unread.doctor_line(policy);
+            assert!(line.starts_with(lead), "{line}");
+            assert!(line.contains("could not be read"), "{line}");
+            assert!(
+                !line.contains("the cursor roams to other"),
+                "an unread host must not be described as the measured default: {line}"
+            );
+        }
+
+        // A HALF-DISABLED HOST IS NOT THE DEFAULT, whatever the policy says.
+        let half_measured =
+            UniversalControlState::from_reads([KeyRead::Value(true), KeyRead::Absent]);
+        for policy in [UniversalControlPolicy::Off, UniversalControlPolicy::Leave] {
+            let line = half_measured.doctor_line(policy);
+            assert!(line.contains("half disabled"), "{line}");
+            assert!(
+                !line.contains("at the OS default"),
+                "one key set is not the default: {line}"
+            );
+            assert!(line.contains("Disable is set"), "{line}");
+        }
         let half = UniversalControlState {
+            measured: true,
             disable: Some(true),
             magic_edges: None,
         };
@@ -601,6 +754,7 @@ mod tests {
                         would_migrate: 3,
                         scan_complete: home != HomePosture::Mismatch,
                         home,
+                        config_unreadable: uc == UcPosture::Unknown,
                     };
                     let line = machine_state_line(&s);
                     assert_eq!(parse_machine_state(&line), Some(s.clone()), "{line}");
@@ -621,6 +775,7 @@ mod tests {
     #[test]
     fn universal_control_posture_reads_both_keys() {
         let at = |d, e| UniversalControlState {
+            measured: true,
             disable: d,
             magic_edges: e,
         };
@@ -688,8 +843,36 @@ mod tests {
             would_migrate: 3,
             scan_complete: true,
             home: HomePosture::Mismatch,
+            config_unreadable: false,
         };
         assert_eq!(s.next(), None);
+        // The other refusal: a config that does not parse cannot say whether either
+        // setting was switched off, so there is nothing to offer either.
+        assert_eq!(
+            MachineState {
+                home: HomePosture::Account,
+                config_unreadable: true,
+                ..s.clone()
+            }
+            .next(),
+            None,
+            "an unreadable config offers no next step"
+        );
+        // A record written before the key existed parses, and means "readable".
+        let older = "universal-control=default; policy=off; noindex=true; spotlight-exposed=3; \
+                     spotlight-hidden=0; spotlight-migratable=3; scan=complete; home=account";
+        let parsed = parse_machine_state(older).expect("the older record still parses");
+        assert!(!parsed.config_unreadable);
+        assert!(parsed.next().is_some());
+        // And the new key round-trips.
+        let flagged = MachineState {
+            home: HomePosture::Account,
+            config_unreadable: true,
+            ..s.clone()
+        };
+        let line = machine_state_line(&flagged);
+        assert!(line.ends_with("; config=unreadable"), "{line}");
+        assert_eq!(parse_machine_state(&line), Some(flagged));
         assert!(
             MachineState {
                 home: HomePosture::Account,

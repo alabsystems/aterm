@@ -323,6 +323,8 @@ pub fn admit_roster(
         return Err(Reject::Disabled);
     }
     // STEPS 2–3 — signature length, then the master crypto.
+    #[cfg(test)]
+    MASTER_VERIFIES.with(|c| c.set(c.get() + 1));
     let verified: VerifiedRoster = verify_roster(&anchor.keys(), raw, sig).map_err(from_roster)?;
     let master_index = verified.master_index();
     // STEPS 4–5 — parse ONLY from the verified wrapper (no public constructor), which
@@ -338,6 +340,16 @@ pub fn admit_roster(
         now_unix,
         master_index,
     })
+}
+
+#[cfg(test)]
+thread_local! {
+    /// Test-only counter behind `select`'s "one admission per distinct roster" tests:
+    /// incremented where [`admit_roster`] commits to the master Ed25519 check — the cost
+    /// a candidate carrying an already-weighed roster used to pay all over again.
+    /// Thread-local so libtest's per-test threads don't race a shared global;
+    /// `#[cfg(test)]` so it never ships.
+    static MASTER_VERIFIES: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
 }
 
 impl TrustedRoster {
@@ -586,6 +598,15 @@ pub(crate) mod testkit {
         Anchor::of(vec![pubkey_b64(&MASTER_SEED)], 0)
     }
 
+    /// How many master Ed25519 verifies [`admit_roster`] has run on THIS thread.
+    ///
+    /// Read it as a DELTA around the call under test: libtest may run several tests on
+    /// one thread, so the absolute number means nothing and the difference means
+    /// everything.
+    pub(crate) fn master_verifies() -> usize {
+        super::MASTER_VERIFIES.with(|c| c.get())
+    }
+
     /// The admitted roster generation, through the real chain.
     pub(crate) fn trusted_roster() -> TrustedRoster {
         let (bytes, sig) = published_roster();
@@ -744,9 +765,39 @@ impl Floor {
         // cannot be taken it degrades to best-effort (never a false reject — the
         // rollback decision is still made against the value `read_floor()` returns).
         let _lock = self.acquire_file_lock();
-        let recorded = self.read_floor();
+        let (recorded, corrupt) = self.read_floor_reported();
         if index_build < recorded {
             return (Err(Reject::Rollback), None);
+        }
+        // NOTHING TO PERSIST is not the same thing as "persist it anyway". A touch that
+        // advances nothing is the overwhelmingly common case — every
+        // `resolve_verified_index` observes the roster generation it just admitted, so a
+        // 6-hour tick over an UNCHANGED index takes this path five times — and it would
+        // otherwise re-publish bytes already on disk: a `0600` temp file, `sync_all` on
+        // it, a `rename`, and a `sync_all` on the parent directory. On Apple targets both
+        // syncs are `fcntl(F_FULLFSYNC)`, a full drive flush each, so an idle store paid
+        // ten drive flushes and five atomic replaces per pass to write down a number it
+        // already held — including on the GUI-adjacent seed lane, which resolves the
+        // sealed index before it asks whether there is any work to do.
+        //
+        // The skip is taken ONLY when the file already carries a value at or above the
+        // one being recorded, so the durable floor afterwards is exactly what the write
+        // would have left: the monotonic guarantee, the lock, and the `Ok(())` decision
+        // are untouched. Two cases deliberately fall through to the write:
+        //   * `corrupt` — the file exists but does not read as a floor, so `recorded` is
+        //     the fail-open `0` and the ratchet must RE-ARM by rewriting it (the heal
+        //     `a_corrupt_floor_file_is_detected_and_still_reads_as_first_contact` pins),
+        //     at `index_build == 0` as much as above it;
+        //   * a floor not yet published `0644` — a store written before the
+        //     world-readable move (docs/AUDIT-nux-first-open-toolchain-2026-08-31.md)
+        //     must still be migrated, or a non-root reader under a SYSTEM prefix goes on
+        //     reading it as "first contact" forever.
+        // What the skip gives up is re-trying the BEST-EFFORT directory sync of an
+        // earlier rename. The floor value itself is already durable either way (its own
+        // `sync_all` is not best-effort), and a directory sync that failed once is not
+        // repaired by a rename that no longer happens.
+        if !corrupt && index_build <= recorded && self.is_published() {
+            return (Ok(()), None);
         }
         // Durable advance under the lock; never downgrades the recorded value, and a
         // failure is REPORTED (never a reject — see `check_and_record`'s doc).
@@ -819,6 +870,14 @@ impl Floor {
     /// window reopens with nobody told. The classification is separated so a test can
     /// pin "corrupt is detected AND still reads 0" without scraping stderr.
     fn read_floor(&self) -> u64 {
+        self.read_floor_reported().0
+    }
+
+    /// [`Self::read_floor`]'s value AND its corruption verdict — the same read, the same
+    /// stderr report, for the one caller that must branch on `corrupt` as well: a file
+    /// that will not read as a floor has to be REWRITTEN even when the value being
+    /// recorded advances nothing, because `recorded` came back as the fail-open `0`.
+    fn read_floor_reported(&self) -> (u64, bool) {
         let (value, corrupt) = self.read_floor_classified();
         if corrupt {
             eprintln!(
@@ -828,7 +887,21 @@ impl Floor {
                 self.path.display()
             );
         }
-        value
+        (value, corrupt)
+    }
+
+    /// Whether the floor file is already published at the mode every reader needs
+    /// (`0644` — see [`Self::write`]). `false` when it cannot be stat'd at all, so an
+    /// absent floor always takes the write path. A platform without POSIX bits reports
+    /// `0` from `permission_mode` and has nothing to migrate, so it reads as published.
+    fn is_published(&self) -> bool {
+        match std::fs::symlink_metadata(&self.path) {
+            Ok(meta) => {
+                let mode = crate::platform::permission_mode(&meta) & 0o777;
+                mode == 0 || mode == 0o644
+            }
+            Err(_) => false,
+        }
     }
 
     /// `(recorded floor, corrupt)`: `corrupt` is true iff the file EXISTS but did not
@@ -852,8 +925,6 @@ impl Floor {
     /// and `rename` it
     /// over the target so a reader never sees a half-written floor.
     fn write(&self, value: u64) -> io::Result<()> {
-        use std::io::Write as _;
-
         let parent = self.path.parent().unwrap_or_else(|| Path::new("."));
         let meta = std::fs::metadata(parent)?;
         if !crate::platform::dir_meta_is_private(&meta) {
@@ -876,8 +947,40 @@ impl Floor {
                 .unwrap_or("floor"),
             std::process::id()
         ));
+        // ONE exit for the whole staged sequence, so no failure can walk out past the
+        // cleanup below.
+        if let Err(error) = self.stage_and_publish(&tmp, value) {
+            // A persist failure is REPORTED, never fatal, and `check_and_record` runs on
+            // every accepted pass — so a condition that keeps failing (ENOSPC on the
+            // store volume, the case the freespace preflight exists for) would otherwise
+            // leave one `<floor>.<pid>.tmp` per pid beside each of the three floors,
+            // forever: nothing else sweeps this name (atpkg's other sweeps match `.tmp-`
+            // and `atpkg-*.tmp`, and `gc` has never heard of it). The removal is itself
+            // best-effort — the error worth propagating is the failed persist, not a
+            // failed tidy-up.
+            let _ = std::fs::remove_file(&tmp);
+            return Err(error);
+        }
+        // Best-effort directory sync so the rename itself survives a power loss. The
+        // floor value is already safe either way (old value or new, never torn).
+        if let Ok(dir) = std::fs::File::open(parent) {
+            let _ = dir.sync_all();
+        }
+        Ok(())
+    }
+
+    /// Stage `value` into `tmp` (`0600`, durably synced), publish it `0644`, and
+    /// `rename` it over the floor.
+    ///
+    /// Split out of [`Self::write`] so the sequence has a SINGLE failure exit: every
+    /// `?` here returns to one caller, which removes the temp before propagating, so
+    /// a failed persist never leaves a `<floor>.<pid>.tmp` sibling behind (the same
+    /// discipline `atpkg-keys`' staged writer keeps).
+    fn stage_and_publish(&self, tmp: &Path, value: u64) -> io::Result<()> {
+        use std::io::Write as _;
+
         {
-            let mut f = crate::platform::open_create_write(&tmp, 0o600)?;
+            let mut f = crate::platform::open_create_write(tmp, 0o600)?;
             f.write_all(value.to_string().as_bytes())?;
             // The advance must be DURABLE, not merely renamed: a rename of bytes still
             // in the page cache can, after a power loss, expose a correctly-named empty
@@ -898,14 +1001,8 @@ impl Floor {
         //
         // WRITE authority is unchanged: it rests on ownership of this file and on the
         // `dir_meta_is_private` check above, neither of which 0644 touches.
-        crate::platform::set_mode(&tmp, 0o644)?;
-        std::fs::rename(&tmp, &self.path)?;
-        // Best-effort directory sync so the rename itself survives a power loss. The
-        // floor value is already safe either way (old value or new, never torn).
-        if let Ok(dir) = std::fs::File::open(parent) {
-            let _ = dir.sync_all();
-        }
-        Ok(())
+        crate::platform::set_mode(tmp, 0o644)?;
+        std::fs::rename(tmp, &self.path)
     }
 }
 
@@ -1487,6 +1584,88 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
+    /// A RATCHET TOUCH THAT ADVANCES NOTHING DOES NOT REWRITE THE FILE.
+    ///
+    /// `check_and_record` used to re-publish the floor on every accept, equal values
+    /// included — a temp file, `sync_all` on it, a `rename`, and a `sync_all` on the
+    /// parent directory, both syncs being `fcntl(F_FULLFSYNC)` (a full drive flush) on
+    /// Apple targets. An unchanged store takes this path five times per update pass, so
+    /// the steady state cost ten drive flushes and five atomic replaces to write down a
+    /// number the file already held.
+    ///
+    /// The witness is a HARD LINK taken before the touch: `write` publishes by
+    /// temp+`rename`, so a rewrite leaves the link on the old inode while the path gets a
+    /// new one. Comparing the two live inodes (never a remembered number) can be fooled
+    /// by inode reuse in neither direction.
+    ///
+    /// MUTATION: drop the `index_build <= recorded` early return in
+    /// `check_and_record_classified` and the first inode assertion fails; drop the
+    /// `!corrupt` or the `is_published()` conjunct and the heal/migrate assertions fail.
+    #[cfg(unix)]
+    #[test]
+    fn an_unchanged_floor_is_not_rewritten() {
+        use std::os::unix::fs::MetadataExt as _;
+        let dir = private_tmp_dir("floor-noop");
+        let path = dir.join("roster.floor");
+        let floor = Floor::new(path.clone());
+        assert_eq!(floor.check_and_record(4), Ok(()));
+
+        let witness = dir.join("witness");
+        std::fs::hard_link(&path, &witness).unwrap();
+        let ino = |p: &Path| std::fs::metadata(p).unwrap().ino();
+        assert_eq!(
+            ino(&path),
+            ino(&witness),
+            "precondition: the witness is the same file"
+        );
+
+        // The every-6-hours no-op tick: the recorded value is already 4, so there is
+        // nothing to make durable and no atomic replace happens.
+        assert_eq!(floor.check_and_record(4), Ok(()));
+        assert_eq!(
+            ino(&path),
+            ino(&witness),
+            "an unchanged floor must not be re-published (temp + 2 fsyncs + rename)"
+        );
+        assert_eq!(
+            floor.current(),
+            4,
+            "and the value is of course still recorded"
+        );
+        // Nothing needed persisting, so there is no persist failure to report either.
+        assert_eq!(floor.check_and_record_classified(4), (Ok(()), None));
+        assert_eq!(ino(&path), ino(&witness));
+
+        // NON-VACUITY: a genuine advance is still published durably...
+        assert_eq!(floor.check_and_record(5), Ok(()));
+        assert_ne!(ino(&path), ino(&witness), "an advance must reach the disk");
+        assert_eq!(Floor::new(path.clone()).current(), 5);
+
+        // ...and so is a floor that is not yet `0644`. A store written before the
+        // world-readable move must be migrated even on a touch that records nothing new,
+        // or a non-root reader under a SYSTEM prefix goes on seeing "first contact"
+        // (docs/AUDIT-nux-first-open-toolchain-2026-08-31.md).
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600)).unwrap();
+        assert_eq!(floor.check_and_record(5), Ok(()));
+        assert_eq!(
+            std::fs::metadata(&path).unwrap().permissions().mode() & 0o777,
+            0o644,
+            "a legacy 0600 floor is re-published readable even at an unchanged value"
+        );
+
+        // ...and so is a CORRUPT file: it reads as the fail-open 0, so the ratchet has to
+        // re-arm by rewriting it even at `index_build` 0, where nothing "advances".
+        std::fs::write(&path, b"not-a-floor").unwrap();
+        assert_eq!(floor.read_floor_classified(), (0, true));
+        assert_eq!(floor.check_and_record(0), Ok(()));
+        assert_eq!(
+            floor.read_floor_classified(),
+            (0, false),
+            "corruption is HEALED, never skipped over as 'nothing to persist'"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
     /// The SAME `Floor` primitive now also carries the roster's `roster_seq` ratchet
     /// (`<prefix>/roster.floor`), so the replay defence a roster generation gets is the
     /// one the index has been getting all along — one implementation, one set of teeth.
@@ -1659,6 +1838,48 @@ mod tests {
         assert_eq!(decision, Ok(()));
         assert_eq!(persist_failure, None);
         assert_eq!(Floor::new(path).current(), 8);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A persist that fails AFTER the temp exists must not leave the temp behind.
+    ///
+    /// The sibling `<floor>.<pid>.tmp` is named for the writing process, so a store
+    /// volume that keeps refusing the write — ENOSPC on the prefix, the exact condition
+    /// the freespace preflight exists for — otherwise accumulates one file per pid
+    /// beside each of the three floors (`floor`, `floor.gen`, `roster.floor`), written
+    /// by a `check_and_record` that runs on EVERY pass and only ever reports the lost
+    /// advance. Nothing sweeps them: atpkg's temp sweeps match `.tmp-` and
+    /// `atpkg-*.tmp`, and `gc` has never heard of this name.
+    #[test]
+    fn a_failed_floor_persist_removes_its_temp_file() {
+        let dir = private_tmp_dir("floor-temp-litter");
+        let path = dir.join("index_build.floor");
+        // A DIRECTORY standing where the floor file goes: the temp is created, written,
+        // synced and published 0644, and only the final `rename` fails. That is the
+        // shape of every post-create failure (a short `write_all`, a failed `sync_all`,
+        // a failed `set_mode`), reached without having to fill a disk.
+        std::fs::create_dir(&path).unwrap();
+        let floor = Floor::new(path.clone());
+        let (decision, persist_failure) = floor.check_and_record_classified(9);
+        assert_eq!(
+            decision,
+            Ok(()),
+            "a persist failure never rejects a passed check"
+        );
+        assert!(
+            persist_failure.is_some(),
+            "precondition: this fixture must make the persist fail"
+        );
+
+        let litter: Vec<String> = std::fs::read_dir(&dir)
+            .unwrap()
+            .map(|entry| entry.unwrap().file_name().to_string_lossy().into_owned())
+            .filter(|name| name.ends_with(".tmp"))
+            .collect();
+        assert!(
+            litter.is_empty(),
+            "a failed persist left its temp behind: {litter:?}"
+        );
         let _ = std::fs::remove_dir_all(&dir);
     }
 

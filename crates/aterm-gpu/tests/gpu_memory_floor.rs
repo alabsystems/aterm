@@ -80,6 +80,24 @@ fn suballocator_reserves_a_terminal_sized_floor() {
     };
     let (adapter, backend) = gpu.adapter();
     let Some((used, reserved, blocks)) = gpu.allocator_reserved() else {
+        // A SKIP-BY-RETURN REPORTS `ok`, so this arm has to prove it is the
+        // legitimate one. `allocator_reserved` answers `None` by COMPILE-TIME
+        // cfg — a build without `wgpu_arm` has no suballocator report surface at
+        // all (Metal's armed resources are shared-storage exact-size mints) — not
+        // by runtime discovery. So on a build that HAS the arm, a `None` here is
+        // the report itself regressing, and this gate would go on reporting `ok`
+        // while guarding nothing. That matters: this file is the standing gate
+        // against a MEASURED 192 MiB-of-driver-heap-for-24 MiB-of-resources
+        // regression, and a gate that cannot fail is not a gate.
+        assert!(
+            !cfg!(wgpu_arm) || backend.eq_ignore_ascii_case("metal"),
+            "{backend} produced no suballocator report, and it is not the one \
+             backend known to have none. Metal mints shared-storage exact-size \
+             resources and exposes no report surface; every other backend on a \
+             `wgpu_arm` build must produce one, so a `None` here is the report \
+             regressing and this gate would go on reporting `ok` while guarding \
+             nothing"
+        );
         eprintln!("SKIP: {backend} exposes no suballocator report");
         return;
     };

@@ -1055,24 +1055,6 @@ impl App {
                 ws.reported_buttons &= !1u8;
             }
         }
-        // An ABOUT text-selection drag settles too (a missed release — focus loss
-        // mid-sweep): finish WITHOUT the release path's copy-on-select/link-open —
-        // a settle is housekeeping, not a user gesture.
-        let settled = self
-            .windows
-            .get_mut(&wid)
-            .and_then(|ws| ws.about_mut())
-            .is_some_and(|a| {
-                if !a.dragging() {
-                    return false;
-                }
-                let _ = a.disarm_link();
-                let _ = a.sel_finish();
-                true
-            });
-        if settled && let Some(w) = self.windows.get(&wid).and_then(|ws| ws.os_window.as_ref()) {
-            w.request_redraw();
-        }
     }
 
     /// Cmd-C: copy the selected text to the system clipboard (`pbcopy`).
@@ -2867,10 +2849,24 @@ impl App {
         y: f64,
         parked: Option<crate::link_target::LinkHover>,
     ) {
-        // Pointer motion is not typing. It stays dark, and as a newer user
-        // boundary it closes an older swallowed key's licence even when
-        // chrome/modal handling returns locally.
-        self.clear_move_license(wid);
+        // A drag owns a user gesture, including one consumed by chrome below.
+        // Plain hover owns no terminal input: clearing here used to revoke an
+        // in-flight key before its echo, even for identical-pixel events and
+        // tracking-OFF hover. Actual mouse reports retire the licence at the
+        // input seam, where their byte receipt distinguishes DEC1003 motion
+        // from DEC1000/1002's byte-silent buttonless motion.
+        if self.windows.get(&wid).is_some_and(|ws| {
+            ws.selecting
+                || ws.held_mouse_button.is_some()
+                || ws.divider_drag.is_some()
+                || ws.strip_drag.is_some()
+        }) || self
+            .conn_drag
+            .as_ref()
+            .is_some_and(|drag| !drag.native && drag.src_window == wid)
+        {
+            self.clear_move_license(wid);
+        }
         // THE SAME PIXEL AGAIN (G14). macOS synthesises a `CursorMoved` at the
         // pointer's current position before EVERY wheel event (winit's
         // `scrollWheel:` calls `mouse_motion` first, with no compare against
@@ -3004,21 +3000,7 @@ impl App {
         // held, motion scrubs the working colour continuously — the overlay is
         // modal, so the gesture stops here (no hover/selection path below runs).
         if self.settings_wheel_drag_motion(wid, x, y) {
-            return;
-        }
-        // ABOUT MODAL: while the dialog is open, motion belongs to it — grow an
-        // in-flight text-selection drag, else track its hover cursor (pointer over
-        // the site link, I-beam over selectable text). The modal swallows the motion
-        // (no grid hover, terminal selection, or PTY mouse report underneath) — but
-        // the cell caches still refresh: the first click after a KEYBOARD close
-        // (Esc/Enter, no intervening motion) must not act on the pre-open cell.
-        if self
-            .windows
-            .get(&wid)
-            .is_some_and(|ws| ws.about().is_some())
-        {
-            self.refresh_mouse_cell(wid, geom, x, y);
-            let _ = self.on_about_motion(wid, x, y);
+            self.clear_move_license(wid);
             return;
         }
         // Native tabs own the full content region below host tab chrome. Track
@@ -3274,10 +3256,10 @@ impl App {
         // terminal-mutex acquisition (behind the PTY reader's slice) solely to
         // re-read the mouse mode and answer `TrackingOff`. Read the mode from the
         // session's lock-free mirror instead and stop here, keeping the arm's one
-        // remaining effect (`last_mouse_side`); `clear_move_license` at the top
-        // already performed its `clear_typed` pair. The seam still runs for
-        // every motion that has work: a tracking app's report, or a live
-        // selection drag (`drag_selection`).
+        // remaining effect (`last_mouse_side`). A byte-silent hover preserves
+        // the pending key's licence. The seam still runs for every motion that
+        // has work: a tracking app's report, or a live selection drag
+        // (`drag_selection`).
         let tracking = self
             .front_terminal(wid)
             .and_then(|front| self.pool.get(front.session))
@@ -4355,53 +4337,6 @@ impl App {
             }
             return;
         }
-        // ABOUT MODAL: the native-window-styled About dialog. A left press on the
-        // title-bar close dot / OK closes it, on the byline's site link opens the
-        // browser, and anywhere else on the card anchors a TEXT-SELECTION drag (the
-        // release settles it — `App::on_about_press`/`on_about_release`). Every
-        // mouse gesture is swallowed while it is open — exactly like Settings above —
-        // so the dialog is truly modal. A swallowed left RELEASE still settles any
-        // in-flight TERMINAL drag (belt to `about_enter`'s braces): a divider/selection
-        // drag whose release the modal ate must not keep dragging on pointer motion.
-        if self
-            .windows
-            .get(&wid)
-            .is_some_and(|ws| ws.about().is_some())
-        {
-            if button == WinitMouseButton::Left {
-                if pressed {
-                    self.on_about_press(wid);
-                } else {
-                    self.on_about_release(wid);
-                    self.settle_pointer_drags(wid);
-                }
-            }
-            return;
-        }
-        // SOFTWARE UPDATE MODAL: the own-rendered update dialog. A left press on the close
-        // dot / Close closes it, on Check runs a fresh check, on Apply Now applies
-        // the staged build. Every gesture is swallowed while open (truly modal), and a
-        // swallowed left RELEASE still settles any in-flight drag (as with About above).
-        if self
-            .windows
-            .get(&wid)
-            .is_some_and(|ws| ws.update_screen().is_some())
-        {
-            if button == WinitMouseButton::Left {
-                if pressed {
-                    let (px, py) = self
-                        .windows
-                        .get(&wid)
-                        .map_or((0.0, 0.0), |ws| ws.last_cursor_px);
-                    if let Some(hit) = self.update_hit_at(wid, px, py) {
-                        self.update_screen_click(wid, hit);
-                    }
-                } else {
-                    self.settle_pointer_drags(wid);
-                }
-            }
-            return;
-        }
         // THE STATUS BARS are chrome rows: a press on one opens the lane's own
         // deliberate surface (the durable record the bar points at) and is
         // consumed — like the strip, and unlike the retired floating card, this
@@ -5397,6 +5332,250 @@ fn pet_wake_wanted(
     };
     let (cw, ch) = (cell.0.max(1) as f64, cell.1.max(1) as f64);
     (pointer_px.0 - sx).abs() >= cw || (pointer_px.1 - sy).abs() >= ch
+}
+
+#[cfg(all(test, unix))]
+mod pointer_license_tests {
+    use super::PointerAction;
+    use crate::cursor_glow::Geom;
+    use crate::input::{InputEvent, InputOutcome, PixelOffset, Source};
+    use crate::{App, WindowId, term_lock};
+    use aterm_core::selection::{SelectionSide, SelectionType};
+    use aterm_session::sink::SinkWriter;
+    use aterm_types::keyboard::{Key, KeyEventType, Modifiers};
+    use std::io::{ErrorKind, Read};
+    use std::os::unix::net::UnixStream;
+    use std::sync::Arc;
+    use std::time::Instant;
+
+    fn fixture(mode: u16) -> (App, UnixStream, Geom) {
+        let (reader, writer) = UnixStream::pair().expect("private input observer");
+        reader.set_nonblocking(true).unwrap();
+        let mut app =
+            App::headless_for_test_with_sink(Arc::new(SinkWriter::new_owned(writer.into())));
+        app.config.cursor_trail = Some(true);
+        app.config.cursor_trail_style = Some("rainbow kitty".to_owned());
+        app.recompute_sparkle();
+        let wid = WindowId(0);
+        let term = app.front_terminal(wid).unwrap().term.clone();
+        if mode != 0 {
+            term_lock(&term).process(format!("\x1b[?{mode}h\x1b[?1006h").as_bytes());
+        }
+        app.pointer_cmd(PointerAction::Move { row: 2, col: 3 })
+            .unwrap();
+        let geom = Geom {
+            cw: 8,
+            ch: 16,
+            rows: 24,
+            cols: 80,
+            origin_x: 0,
+            origin_y: 0,
+            win_w: 640,
+            win_h: 384,
+            head: 0,
+        };
+        let cfg = app.glow_config();
+        app.windows.get_mut(&wid).unwrap().cursor_glow.tick(
+            Some((0, 0)),
+            Instant::now(),
+            &cfg,
+            geom,
+            &mut Vec::new(),
+        );
+        (app, reader, geom)
+    }
+
+    fn read_input(reader: &mut UnixStream) -> Vec<u8> {
+        let mut bytes = [0; 128];
+        match reader.read(&mut bytes) {
+            Ok(n) => bytes[..n].to_vec(),
+            Err(e) if e.kind() == ErrorKind::WouldBlock => Vec::new(),
+            Err(e) => panic!("reading input: {e}"),
+        }
+    }
+
+    fn press(app: &mut App) {
+        assert_eq!(
+            app.input(
+                WindowId(0),
+                InputEvent::Key {
+                    key: Key::Character('a'),
+                    mods: Modifiers::empty(),
+                    base_layout: None,
+                    event_type: KeyEventType::Press,
+                },
+                Source::Human,
+            ),
+            InputOutcome::Ok,
+        );
+    }
+
+    fn echo(app: &mut App, geom: Geom) -> (u64, &'static str, bool) {
+        let wid = WindowId(0);
+        let term = app.front_terminal(wid).unwrap().term.clone();
+        term_lock(&term).process(b"a");
+        let cursor = term_lock(&term).cursor();
+        let cfg = app.glow_config();
+        let ws = app.windows.get_mut(&wid).unwrap();
+        let mut out = Vec::new();
+        ws.cursor_glow.tick(
+            Some((cursor.row, cursor.col)),
+            Instant::now(),
+            &cfg,
+            geom,
+            &mut out,
+        );
+        (
+            ws.cursor_glow.spawns(),
+            ws.cursor_glow.admission_log().last().unwrap().licence,
+            !out.is_empty() || !ws.cursor_glow.under_quads().is_empty(),
+        )
+    }
+
+    /// Drive the real key, pointer router/input seam, wire, and delayed terminal
+    /// echo. DEC1000/1002 are tracking modes with byte-silent buttonless motion;
+    /// DEC1003 reports motion and must retire the pending typed licence.
+    #[test]
+    fn byte_silent_pointer_preserves_the_keys_delayed_echo() {
+        let wid = WindowId(0);
+        let model = aterm_spec::derive::cursor_hint_license_model();
+        // Pin the existing gesture boundary independently: clearing a hint
+        // leaves earned echo credits alive, so a delayed +1 may still paint
+        // as `inflight`. Reported motion must match this existing behavior.
+        let (mut control, _reader, geom) = fixture(0);
+        press(&mut control);
+        control.clear_move_license(wid);
+        let cleared_echo = echo(&mut control, geom);
+        assert_eq!(cleared_echo, (1, "inflight", true));
+        for controller in [false, true] {
+            for mode in [0, 1000, 1002, 1003] {
+                for same_pixel in [false, true] {
+                    let (mut app, mut reader, geom) = fixture(mode);
+                    let _ = read_input(&mut reader);
+                    press(&mut app);
+                    assert_eq!(read_input(&mut reader), b"a");
+                    let mut before = model.init_state();
+                    assert!(model.fire("PressArmsLicense", &mut before));
+                    assert!(app.windows[&wid].cursor_glow.move_licensed(Instant::now()));
+                    let col = if same_pixel { 3 } else { 4 };
+                    if controller {
+                        assert_eq!(
+                            app.input(
+                                wid,
+                                InputEvent::MouseMove {
+                                    buttons: 3,
+                                    row: 2,
+                                    col,
+                                    mods: 0,
+                                    side: SelectionSide::Left,
+                                    px_off: PixelOffset::default(),
+                                },
+                                Source::Controller {
+                                    op: aterm_session::Op::WriteInput
+                                },
+                            ),
+                            InputOutcome::Ok,
+                        );
+                    } else {
+                        app.pointer_cmd(PointerAction::Move { row: 2, col })
+                            .unwrap();
+                    }
+                    let reported = mode == 1003 && (controller || !same_pixel);
+                    let bytes = read_input(&mut reader);
+                    assert_eq!(
+                        bytes.is_empty(),
+                        !reported,
+                        "{mode}/{controller}/{same_pixel}"
+                    );
+                    if reported {
+                        assert!(bytes.starts_with(b"\x1b[<35;"), "{bytes:?}");
+                    }
+                    let ws = &app.windows[&wid];
+                    let live = ws.cursor_glow.move_licensed(Instant::now());
+                    assert_eq!(live, !reported, "{mode}/{controller}/{same_pixel}");
+                    assert_eq!(ws.cursor_trail.move_licensed(Instant::now()), !reported);
+                    assert_eq!(
+                        echo(&mut app, geom),
+                        if reported {
+                            cleared_echo
+                        } else {
+                            (1, "key", true)
+                        },
+                        "echo admission {mode}/{controller}/{same_pixel}",
+                    );
+                    // Run external conformance after the echo, so verifier time
+                    // cannot age the real pending key before its test frame.
+                    if mode == 0 && !controller && !same_pixel {
+                        let mut after = before.clone();
+                        after.insert("hint", i64::from(live));
+                        let (ok, why) = aterm_spec::verify::validate_transition_tiered(
+                            &model,
+                            &[],
+                            &before,
+                            &after,
+                            Some("ByteSilentPointerPreservesLicense"),
+                            "plain pointer hover",
+                        );
+                        assert!(ok, "{why}");
+                        // Historical mutation: the route's unconditional clear.
+                        let mut erased = after;
+                        erased.insert("hint", 0);
+                        let (ok, _) = aterm_spec::verify::validate_transition_tiered(
+                            &model,
+                            &[],
+                            &before,
+                            &erased,
+                            Some("ByteSilentPointerPreservesLicense"),
+                            "hover-clear negative control",
+                        );
+                        assert!(!ok, "the model must reject a hover that loses the key");
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn pointer_gestures_still_retire_the_pending_typed_license() {
+        for local_selection in [false, true] {
+            let (mut app, mut reader, _) = fixture(0);
+            let wid = WindowId(0);
+            press(&mut app);
+            assert_eq!(read_input(&mut reader), b"a");
+            if local_selection {
+                app.begin_selection(wid, SelectionType::Simple);
+                app.pointer_cmd(PointerAction::Move { row: 2, col: 5 })
+                    .unwrap();
+            } else {
+                // A controller's held-button motion is a gesture even without
+                // a local selection and without a terminal tracking report.
+                assert_eq!(
+                    app.input(
+                        wid,
+                        InputEvent::MouseMove {
+                            buttons: 0,
+                            row: 2,
+                            col: 5,
+                            mods: 0,
+                            side: SelectionSide::Left,
+                            px_off: PixelOffset::default(),
+                        },
+                        Source::Controller {
+                            op: aterm_session::Op::WriteInput
+                        }
+                    ),
+                    InputOutcome::Ok
+                );
+            }
+            assert_eq!(app.windows[&wid].selecting, local_selection);
+            assert!(
+                read_input(&mut reader).is_empty(),
+                "tracking-OFF drag stays local"
+            );
+            assert!(!app.windows[&wid].cursor_glow.move_licensed(Instant::now()));
+            assert!(!app.windows[&wid].cursor_trail.move_licensed(Instant::now()));
+        }
+    }
 }
 
 #[cfg(test)]

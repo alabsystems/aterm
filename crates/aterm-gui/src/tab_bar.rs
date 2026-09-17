@@ -3847,9 +3847,12 @@ fn cut_core(title: &str, shared: usize) -> &str {
 /// `0` — nothing to shed — for a title with no separator, an empty clause, or a
 /// clause that is the whole title (a shed must leave a subject behind).
 ///
-/// `pub(crate)` for ONE reason: `title_summary`'s own test composes a tab label
-/// and splits it back through this function, so the seam the two subsystems
-/// share is pinned from the composing side too, in both title formats.
+/// `pub(crate)` for TWO reasons, both on the composing side of the seam:
+/// `title_summary`'s own test composes a tab label and splits it back through
+/// this function, so the seam the two subsystems share is pinned from both
+/// sides in both title formats; and `title_summary::whole_label` splits a strip
+/// label on this same seam to cap each half for the surfaces that paint a label
+/// whole (the strip itself receives the title uncapped).
 pub(crate) fn state_clause_bytes(title: &str) -> usize {
     let Some(at) = title.rfind(crate::title_summary::TAB_LABEL_SEPARATOR) else {
         return 0;
@@ -5911,6 +5914,149 @@ pub(crate) mod pixel_band {
             assert!(
                 sorted.windows(2).all(|p| p[0] < p[1]),
                 "refs stay sorted by column"
+            );
+            crate::tray_raster::clear_ui_fonts_for_test();
+        }
+
+        /// A CJK TITLE IS A BAND TITLE. Reproduced on glass: a tab named in
+        /// CJK drew ~15 px low and cut by the seam rule, because the chrome's
+        /// three faces carry no ideograph and [`strip_band_run_coverable`]
+        /// handed the whole segment to the cell lane — whose unit of vertical
+        /// placement is the cell, so the glyph landed on the CELL baseline, a
+        /// half-lip below the band's cap-centred labels, under the seam
+        /// underline and the accent rule. With the terminal's own parsed chain
+        /// face admitted as the chrome's coverage rung, the title stays in the
+        /// pixel band: one image over its columns, the ideographs centred
+        /// with their Latin neighbour and clear of the card's bottom edge.
+        #[test]
+        fn a_cjk_title_stays_in_the_band_and_centres_with_its_latin_neighbour() {
+            if !crate::tray_raster::install_chrome_fonts_with_cjk_chain_for_test()
+                || !with_ui_faces()
+            {
+                crate::tray_raster::clear_ui_fonts_for_test();
+                return;
+            }
+            let title = "日本語 shell";
+            assert!(
+                crate::tray_raster::strip_band_run_coverable(title),
+                "the chrome stack draws every char of the title"
+            );
+            let metadata = plain(2);
+            let segments = layout_segments_with_metadata(80, 2, &metadata, 0, false);
+            let titles = vec!["alpha".to_string(), title.to_string()];
+            let input = band(
+                &segments,
+                &titles,
+                &metadata,
+                StripPaint::default(),
+                geometry(80, 1),
+            );
+            let rows = raster_band(&input, &[]).expect("band");
+            let (rgba, w, h) = image_of(&rows);
+            let seg = segments[1];
+            let probe = usize::from(seg.start_col) + 1;
+            assert!(
+                rows[0]
+                    .iter()
+                    .any(|(c, r)| *c == probe && Arc::ptr_eq(&r.image, &rows[0][0].1.image)),
+                "the CJK segment is band-covered, not a fallback range"
+            );
+            // Where the pen put the label: the band centres the run in its
+            // span by the very measure the pen advances with.
+            let layout = tab_content_layout(&seg, metadata[1]);
+            let label_px = band_label_px(h as f32, 1.0);
+            let measure =
+                |s: &str| crate::tray_raster::ui_text_width_for(TextFace::Ui, s, label_px);
+            let x0 = f32::from(layout.title_start) * CELL_W as f32;
+            let span_px = f32::from(layout.title_end - layout.title_start) * CELL_W as f32 - 1.0;
+            let x = ((span_px - measure(title)) * 0.5).max(0.0) + x0;
+            let cjk_end = x + measure("日本語");
+            let latin_start = x + measure("日本語 ");
+            let colors = strip_colors_with_active(Theme::default(), None);
+            let surfaces = [colors.band_bg, colors.active_bg, colors.chip_bg];
+            let cjk = ink_bbox_off_surfaces(
+                &rgba,
+                w,
+                h,
+                x.floor() as usize,
+                cjk_end.ceil() as usize,
+                &surfaces,
+            )
+            .expect("the ideographs ink");
+            let latin = ink_bbox_off_surfaces(
+                &rgba,
+                w,
+                h,
+                latin_start.floor() as usize,
+                usize::from(layout.title_end) * CELL_W,
+                &surfaces,
+            )
+            .expect("the Latin inks");
+            let centre = |b: (usize, usize, usize, usize)| (b.1 + b.3) as f32 * 0.5;
+            assert!(
+                (centre(cjk) - centre(latin)).abs() <= 2.0,
+                "CJK ink {cjk:?} centres at {} while the Latin's {latin:?} centres at {}",
+                centre(cjk),
+                centre(latin)
+            );
+            let d = BandDesign::resolve(&input.geometry, h, label_px);
+            assert!(
+                (cjk.3 as f32) <= d.card_bot - 1.0,
+                "CJK ink {cjk:?} reaches the card's bottom edge {}",
+                d.card_bot
+            );
+            assert!(
+                (cjk.1 as f32) >= d.card_top,
+                "CJK ink {cjk:?} escapes the card's top edge {}",
+                d.card_top
+            );
+            crate::tray_raster::clear_ui_fonts_for_test();
+        }
+
+        /// UNTIL THE CHAIN FACE LANDS, THE CELL LANE KEEPS THE TITLE. The
+        /// coverage rung admits only a face some renderer has already parsed
+        /// — the chrome never pays a 20 MB parse on the UI thread — so a CJK
+        /// title's first frames take the cell lane exactly as shipped, and
+        /// the band re-rasters once the terminal's own draw of the ideograph
+        /// lands the parse (`strip_band_font_epoch_moves_when_a_chain_face_lands`).
+        #[test]
+        fn a_cjk_title_falls_to_the_cell_lane_until_the_chain_face_lands() {
+            // A settled cascade with NO chain face: the embedded primary alone.
+            let mut renderer = aterm_render::Renderer::from_bytes(
+                aterm_render::embedded_font(),
+                14.0,
+                Theme::default(),
+            )
+            .expect("embedded renderer");
+            renderer.set_runtime_font_discovery(false);
+            crate::tray_raster::install_settled_chrome_fonts_for_test(renderer);
+            if !with_ui_faces() {
+                return;
+            }
+            let title = "日本語 shell";
+            assert!(
+                !crate::tray_raster::strip_band_run_coverable(title),
+                "no loaded face carries the ideographs yet"
+            );
+            let metadata = plain(2);
+            let segments = layout_segments_with_metadata(80, 2, &metadata, 0, false);
+            let titles = vec!["alpha".to_string(), title.to_string()];
+            let input = band(
+                &segments,
+                &titles,
+                &metadata,
+                StripPaint::default(),
+                geometry(80, 1),
+            );
+            let rows = raster_band(&input, &[]).expect("band");
+            let covered = |col: u16| rows[0].iter().any(|(c, _)| *c == usize::from(col));
+            assert!(
+                covered(segments[0].start_col + 1),
+                "the Latin segment is band-covered"
+            );
+            assert!(
+                !covered(segments[1].start_col + 1),
+                "the CJK segment is left to the cell lane"
             );
             crate::tray_raster::clear_ui_fonts_for_test();
         }
@@ -9025,6 +9171,244 @@ mod tests {
             .into_iter()
             .map(|(_, label)| label)
             .collect()
+    }
+
+    /// THE DEEP-SIBLINGS DEFECT, end to end: the chrome cap
+    /// (`title_summary::description::MAX_CHROME_TITLE_GRAPHEMES`) used to run
+    /// on every strip label BEFORE this pass fits it, as a HEAD cut — so tabs
+    /// whose cwds agree past the cap and differ in the leaf reached the twin
+    /// re-cut as byte-identical strings, and no tail cut can recover a tail a
+    /// cut already threw away (the negative control below). The strip surface
+    /// now composes with no cap at all (`ChromeSurface::TabStrip`), so this
+    /// pass sees the whole title and each chip names its own leaf.
+    #[test]
+    fn deep_sibling_cwds_past_the_chrome_cap_stay_tellable_apart() {
+        use crate::app_config::{Config, TitleFormat};
+        use crate::title_summary::{ChromeSurface, Coordinator};
+        use aterm_grapheme::GraphemeClusters as _;
+
+        let coordinator = Coordinator::new(None);
+        let config = Config::default();
+        let shared = format!("user@m17-tower: ~/{}", "ab/".repeat(40));
+        let raw: Vec<String> = ["deep-one", "deep-two"]
+            .iter()
+            .map(|leaf| format!("{shared}{leaf}"))
+            .collect();
+        let titles: Vec<String> = raw
+            .iter()
+            .map(|title| {
+                coordinator.compose(
+                    None,
+                    title,
+                    None,
+                    TitleFormat::Title,
+                    &config,
+                    ChromeSurface::TabStrip,
+                )
+            })
+            .collect();
+        // FIXTURE GUARD: both are past the cap, and the strip receives them
+        // WHOLE — byte-identical to the raw titles, no mark.
+        assert!(raw.iter().all(|t| t.graphemes().count() > 96), "{raw:?}");
+        assert_eq!(titles, raw);
+        let segments = layout_segments(80, titles.len(), 0, false);
+        let labels = seated_labels(&segments, &titles, 0);
+        assert_eq!(labels.len(), 2, "{labels:?}");
+        assert_ne!(labels[0], labels[1], "{labels:?}");
+        assert!(labels[0].contains("deep-one"), "{labels:?}");
+        assert!(labels[1].contains("deep-two"), "{labels:?}");
+
+        // NEGATIVE CONTROL: the old head cut at the cap's width (any head cut
+        // shorter than the shared prefix does the same). Both raw titles
+        // collapse to one string, and this pass — correctly — finds nothing
+        // to tell apart: neither chip can name its leaf.
+        let head_cut: Vec<String> = raw
+            .iter()
+            .map(|title| {
+                let head: String = title.graphemes().take(96).collect();
+                format!("{head}…")
+            })
+            .collect();
+        assert_eq!(head_cut[0], head_cut[1]);
+        let labels = seated_labels(&segments, &head_cut, 0);
+        assert!(
+            labels.iter().all(|label| !label.contains("deep-")),
+            "{labels:?}"
+        );
+    }
+
+    /// Two worktree checkouts of one repo, shells in the same deep
+    /// subdirectory: the titles differ only in the worktree id, INSIDE the
+    /// window a middle cut at the cap discards (`[48, N-48)`) and the head
+    /// cut's window had kept. A cap that keeps `head…tail` fixes the leaf
+    /// shape above by collapsing this one — it trades regions, it does not
+    /// remove the cause — so the strip must receive the whole title, and its
+    /// own pairwise shed then keeps exactly the id. Both of the owner's
+    /// shapes: the bare cwd rung (a local prompt's `user@host:` is shed
+    /// upstream) at 80 columns, and a prompt-set title carrying it at 60, 120
+    /// and 240.
+    #[test]
+    fn worktree_siblings_that_differ_inside_the_middle_cut_stay_tellable_apart() {
+        use crate::app_config::{Config, TitleFormat};
+        use crate::title_summary::{ChromeSurface, Coordinator, whole_label};
+        use aterm_grapheme::GraphemeClusters as _;
+
+        let coordinator = Coordinator::new(None);
+        let config = Config::default();
+        let cases: [(&str, &str, &str, &str, &[u16]); 2] = [
+            (
+                "~/src/github.com/alabsystems/aterm/.claude/worktrees/lane-bec3123b-89c-10/crates/aterm-gui/src/title_summary/fixtures/model",
+                "~/src/github.com/alabsystems/aterm/.claude/worktrees/lane-bec3123b-89c-25/crates/aterm-gui/src/title_summary/fixtures/model",
+                "10",
+                "25",
+                &[80],
+            ),
+            (
+                "user@m17-tower: ~/aterm/.claude/worktrees/lane-bec3123b-89c-10/crates/aterm-gui/src/title_summary/description.rs",
+                "user@m17-tower: ~/aterm/.claude/worktrees/lane-bec3123b-89c-11/crates/aterm-gui/src/title_summary/description.rs",
+                "89c-10",
+                "89c-11",
+                &[60, 120, 240],
+            ),
+        ];
+        let head_cut = |t: &str| format!("{}…", t.graphemes().take(96).collect::<String>());
+        for (one, two, own, other, widths) in cases {
+            let raw = [one.to_string(), two.to_string()];
+            // FIXTURE GUARD: past the cap, equal in length, differing only
+            // inside the middle cut's window — so the middle cut (the one the
+            // whole-string surfaces still take, `whole_label`) collapses the
+            // pair, while the head cut did not.
+            let n = one.graphemes().count();
+            assert!(n > 96 && two.graphemes().count() == n, "{one:?}");
+            let at = one
+                .graphemes()
+                .zip(two.graphemes())
+                .position(|(a, b)| a != b)
+                .expect("the pair differs");
+            assert!((48..n - 48).contains(&at), "differs at {at} of {n}");
+            assert_eq!(
+                whole_label(one),
+                whole_label(two),
+                "the middle cut collapses the pair"
+            );
+            assert_ne!(head_cut(one), head_cut(two), "the head cut told them apart");
+            let titles: Vec<String> = raw
+                .iter()
+                .map(|t| {
+                    coordinator.compose(
+                        None,
+                        t,
+                        None,
+                        TitleFormat::Title,
+                        &config,
+                        ChromeSurface::TabStrip,
+                    )
+                })
+                .collect();
+            assert_eq!(titles, raw, "the strip receives the whole titles");
+            let cut: Vec<String> = raw.iter().map(|t| whole_label(t).into_owned()).collect();
+            for &cols in widths {
+                let segments = layout_segments(cols, 2, 0, false);
+                let labels = seated_labels(&segments, &titles, 0);
+                assert_eq!(labels.len(), 2, "{cols} cols: {labels:?}");
+                assert_ne!(labels[0], labels[1], "{cols} cols: {labels:?}");
+                assert!(
+                    labels[0].contains(own) && !labels[0].contains(other),
+                    "{cols} cols: {labels:?}"
+                );
+                assert!(
+                    labels[1].contains(other) && !labels[1].contains(own),
+                    "{cols} cols: {labels:?}"
+                );
+                // NEGATIVE CONTROL: the middle-cut strings — what the strip
+                // was handed under the cap — leave neither chip able to name
+                // its worktree at any of these widths.
+                let labels = seated_labels(&segments, &cut, 0);
+                assert!(
+                    labels
+                        .iter()
+                        .all(|label| !label.contains(own) && !label.contains(other)),
+                    "{cols} cols: {labels:?}"
+                );
+            }
+        }
+    }
+
+    /// The finding's own wording — "differ only past that point" — past the
+    /// head cut's window AND past the middle cut's: two client trees whose
+    /// paths agree for 101 graphemes and end alike. Every fixed cut at the
+    /// cap collapses them (both negative controls); the strip, handed the
+    /// whole titles, keeps the one component that differs.
+    #[test]
+    fn deep_siblings_that_differ_past_both_cuts_stay_tellable_apart() {
+        use crate::app_config::{Config, TitleFormat};
+        use crate::title_summary::{ChromeSurface, Coordinator, whole_label};
+        use aterm_grapheme::GraphemeClusters as _;
+
+        let coordinator = Coordinator::new(None);
+        let config = Config::default();
+        let raw = [
+            "~/work/clients/acme-corporation/platform/monorepo/services/payments/ledger/src/main/java/com/example/alpha/internal/handlers/impl/validation/rules/default/v2".to_string(),
+            "~/work/clients/acme-corporation/platform/monorepo/services/payments/ledger/src/main/java/com/example/bravo/internal/handlers/impl/validation/rules/default/v2".to_string(),
+        ];
+        let n = raw[0].graphemes().count();
+        let at = raw[0]
+            .graphemes()
+            .zip(raw[1].graphemes())
+            .position(|(a, b)| a != b)
+            .expect("the pair differs");
+        assert!(at >= 96 && at < n - 48, "differs at {at} of {n}");
+        let head_cut = |t: &str| format!("{}…", t.graphemes().take(96).collect::<String>());
+        assert_eq!(
+            head_cut(&raw[0]),
+            head_cut(&raw[1]),
+            "the head cut collapses them"
+        );
+        assert_eq!(
+            whole_label(&raw[0]),
+            whole_label(&raw[1]),
+            "the middle cut collapses them"
+        );
+        let titles: Vec<String> = raw
+            .iter()
+            .map(|t| {
+                coordinator.compose(
+                    None,
+                    t,
+                    None,
+                    TitleFormat::Title,
+                    &config,
+                    ChromeSurface::TabStrip,
+                )
+            })
+            .collect();
+        assert_eq!(titles, raw, "the strip receives the whole titles");
+        let segments = layout_segments(80, 2, 0, false);
+        let labels = seated_labels(&segments, &titles, 0);
+        assert_eq!(labels.len(), 2, "{labels:?}");
+        assert_ne!(labels[0], labels[1], "{labels:?}");
+        assert!(
+            labels[0].contains("alpha") && !labels[0].contains("bravo"),
+            "{labels:?}"
+        );
+        assert!(
+            labels[1].contains("bravo") && !labels[1].contains("alpha"),
+            "{labels:?}"
+        );
+        for cut in [
+            raw.iter().map(|t| head_cut(t)).collect::<Vec<_>>(),
+            raw.iter()
+                .map(|t| whole_label(t).into_owned())
+                .collect::<Vec<_>>(),
+        ] {
+            let labels = seated_labels(&segments, &cut, 0);
+            assert!(
+                labels
+                    .iter()
+                    .all(|label| !label.contains("alpha") && !label.contains("bravo")),
+                "{labels:?}"
+            );
+        }
     }
 
     /// THE FOUR-IDENTICAL-TABS DEFECT, fixed at the pass that owns it: four

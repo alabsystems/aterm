@@ -457,3 +457,482 @@ fn offload_window_lazy_buffer_is_bounded() {
     );
     grid.assert_invariants();
 }
+
+/// Build a tiered grid whose history is SOFT-WRAPPED at `cols`: `n` logical lines
+/// of `cols + 30` chars, so each occupies two rows at `cols` and exactly one once
+/// the width passes their length — a widen that genuinely unwraps.
+fn tiered_grid_with_wrapped_history(rows: u16, cols: u16, n: u16) -> Grid {
+    let sb: ScrollbackStorage = Scrollback::new(64, 512, 8_000_000).into();
+    let mut grid = Grid::with_tiered_scrollback(rows, cols, 8, sb);
+    let width = cols as usize + 30;
+    for i in 0..n {
+        grid.set_cursor(rows - 1, 0);
+        let mut text = format!("L{i}-");
+        while text.len() < width {
+            text.push('x');
+        }
+        for c in text.chars() {
+            grid.write_char(c);
+        }
+        grid.line_feed();
+        grid.carriage_return();
+    }
+    grid
+}
+
+/// The reported gesture, at its commonest: a reader scrolled back into a shell log
+/// of SHORT lines changes the window WIDTH. Nothing wraps at either width, so the
+/// row numbering is identical on both sides of the resize and the reader must still
+/// be looking at exactly the same line, character for character.
+///
+/// Before the fix the detach emptied all three history layers into the job, the
+/// synchronous resize clamped `display_offset` against the resulting ZERO, and
+/// re-attach read that self-inflicted 0 as "the reader pressed End" and declined to
+/// restore — the viewport teleported 150 rows down to the live prompt.
+#[test]
+fn offload_width_change_keeps_an_unwrapped_reader_on_the_same_line() {
+    let (rows, cols) = (10u16, 80u16);
+    let sb: ScrollbackStorage = Scrollback::new(64, 512, 8_000_000).into();
+    let mut grid = Grid::with_tiered_scrollback(rows, cols, 8, sb);
+    for i in 0..500 {
+        short_line(&mut grid, rows, &format!("H{i}"));
+    }
+    grid.scroll_display(150);
+    assert_eq!(grid.display_offset(), 150, "precondition: 150 rows up");
+    let top_before = grid
+        .row_text(0)
+        .expect("top visible row")
+        .trim_end()
+        .to_string();
+    assert!(
+        top_before.starts_with('H'),
+        "precondition: the reader is on a history line, not a blank ({top_before:?})"
+    );
+
+    let pending = grid
+        .resize_offloading_scrollback(rows, 60)
+        .expect("offload job");
+    let reflowed = pending.reflow();
+    grid.reattach_reflowed_scrollback(reflowed);
+
+    assert_eq!(
+        grid.display_offset(),
+        150,
+        "a width change that rewraps nothing must leave the reader exactly where \
+         they were, not snap them to the live bottom"
+    );
+    assert_eq!(
+        grid.row_text(0).expect("top visible row").trim_end(),
+        top_before,
+        "the reader must still be reading the same line after the resize"
+    );
+    grid.assert_invariants();
+}
+
+/// The same gesture on WRAPPED content — scroll back through a build log, then
+/// widen to see the long lines. The widen unwraps history (the retained row count
+/// halves), so no exact anchor exists; the contract is the CLAMPED pre-resize
+/// offset, which still leaves the reader in history rather than at the live prompt.
+#[test]
+fn offload_widen_keeps_the_scrolled_back_reader_in_history() {
+    let (rows, cols) = (10u16, 80u16);
+    let mut grid = tiered_grid_with_wrapped_history(rows, cols, 300);
+    grid.scroll_display(150);
+    assert_eq!(grid.display_offset(), 150, "precondition: 150 rows up");
+
+    let pending = grid
+        .resize_offloading_scrollback(rows, cols + 40)
+        .expect("offload job");
+    let reflowed = pending.reflow();
+    grid.reattach_reflowed_scrollback(reflowed);
+
+    let sb = grid.scrollback_lines();
+    assert_eq!(
+        grid.display_offset(),
+        150usize.min(sb),
+        "the widen must leave the reader at their clamped pre-resize offset \
+         (scrollback={sb})"
+    );
+    let seen: String = (0..rows)
+        .filter_map(|r| grid.row_text(r))
+        .collect::<Vec<_>>()
+        .join("\n");
+    assert!(
+        !seen.contains("L299-"),
+        "the newest history line must not be on screen — the reader was 150 rows \
+         above it:\n{seen}"
+    );
+    grid.assert_invariants();
+}
+
+/// RFL-3's follow-up detach removes the store (and drains the lazy buffer) with no
+/// resize to re-clamp behind it, so the same law applies: the viewport must never be
+/// left pointing past the end of the history that is still HOME, and the reader's
+/// position must come back when the converging pass re-attaches.
+#[test]
+fn redetach_clamps_the_viewport_and_still_restores_the_reader() {
+    let (rows, cols) = (10u16, 80u16);
+    let mut grid = tiered_grid_with_wrapped_history(rows, cols, 300);
+    grid.scroll_display(150);
+    assert_eq!(grid.display_offset(), 150, "precondition: 150 rows up");
+
+    // Width change A detaches; a superseding width change B lands mid-flight, so
+    // re-attach converges with one more detach at the settled width (RFL-3).
+    let pending = grid
+        .resize_offloading_scrollback(rows, cols + 40)
+        .expect("offload job A");
+    grid.resize(rows, cols + 20); // supersedes: detaches nothing, rewraps the ring
+    let reflowed = pending.reflow();
+    let follow = grid
+        .reattach_reflowed_scrollback_or_redetach(reflowed)
+        .expect("stale width must converge with a follow-up job");
+
+    assert!(
+        grid.display_offset() <= grid.scrollback_lines(),
+        "the follow-up detach must re-clamp the viewport to the history still home \
+         (offset={}, scrollback={})",
+        grid.display_offset(),
+        grid.scrollback_lines()
+    );
+
+    let done = follow.reflow();
+    assert!(
+        grid.reattach_reflowed_scrollback_or_redetach(done)
+            .is_none(),
+        "the converging pass ran at the settled width"
+    );
+    let sb = grid.scrollback_lines();
+    assert_eq!(
+        grid.display_offset(),
+        150usize.min(sb),
+        "the reader's position must survive the converging pass too (scrollback={sb})"
+    );
+    grid.assert_invariants();
+}
+
+/// The audit-#7 exception is a SIGNAL, and a signal needs a baseline. Pressing End
+/// at a viewport the detach has already pinned to the live bottom moves nothing and
+/// therefore says nothing — so the restore still runs. Pinned deliberately: reading
+/// that indistinguishable 0 as the reader's own choice is exactly the misattribution
+/// that threw every scrolled-back reader to the live prompt on every width change.
+#[test]
+fn offload_window_end_at_an_already_pinned_bottom_is_not_a_signal() {
+    let (rows, cols) = (10u16, 80u16);
+    let sb: ScrollbackStorage = Scrollback::new(64, 512, 8_000_000).into();
+    let mut grid = Grid::with_tiered_scrollback(rows, cols, 8, sb);
+    for i in 0..500 {
+        short_line(&mut grid, rows, &format!("H{i}"));
+    }
+    grid.scroll_display(150);
+
+    let pending = grid
+        .resize_offloading_scrollback(rows, 60)
+        .expect("offload job");
+    // Short lines rewrap into nothing, so the detach left the viewport at 0 already.
+    assert_eq!(
+        grid.display_offset(),
+        0,
+        "precondition: the detach itself pinned the viewport to the live bottom"
+    );
+    grid.scroll_to_bottom(); // a no-op End press: it moves nothing
+    let reflowed = pending.reflow();
+    grid.reattach_reflowed_scrollback(reflowed);
+
+    assert_eq!(
+        grid.display_offset(),
+        150,
+        "an End that moved nothing is not evidence the reader chose the bottom"
+    );
+    grid.assert_invariants();
+}
+
+/// And the third: `abort_reflow_offload` discards the lazy buffer when the worker
+/// dies, so the window output a reader had scrolled up over stops existing. The
+/// viewport must come back down with it, not keep addressing rows no layer holds.
+#[test]
+fn abort_reclamps_the_viewport_when_the_staged_window_output_is_discarded() {
+    let (rows, cols) = (10u16, 80u16);
+    let sb: ScrollbackStorage = Scrollback::new(64, 512, 8_000_000).into();
+    let mut grid = Grid::with_tiered_scrollback(rows, cols, 8, sb);
+    for i in 0..500 {
+        short_line(&mut grid, rows, &format!("H{i}"));
+    }
+
+    let pending = grid
+        .resize_offloading_scrollback(rows, 60)
+        .expect("offload job");
+    // Window output stages into the lazy buffer (the store is out with the job);
+    // the reader scrolls up over it.
+    for i in 0..200 {
+        short_line(&mut grid, rows, &format!("W{i}"));
+    }
+    grid.scroll_to_top();
+    let deep = grid.display_offset();
+    assert!(
+        deep > 100,
+        "precondition: the reader is up over the staged window output ({deep})"
+    );
+
+    drop(pending); // the worker panicked: this reflow will never re-attach
+    grid.abort_reflow_offload();
+
+    assert!(
+        grid.display_offset() <= grid.scrollback_lines(),
+        "the abort discarded the staged window output, so the viewport must be \
+         re-clamped to the history that is left (offset={}, scrollback={})",
+        grid.display_offset(),
+        grid.scrollback_lines()
+    );
+    grid.assert_invariants();
+}
+
+/// A reader who MOVED the viewport during the window and ended at the live bottom
+/// chose the live bottom — on the WIDEN axis, where a detach-time offset baseline
+/// is blind.
+///
+/// Wheel up over the output that streamed in during the reflow, then wheel back
+/// down to live. Both moves are real (offset 0 -> 20 -> 0), both are the reader's,
+/// and the second is the descent audit #7 exists to honor. Nothing about the two
+/// ENDPOINTS says so — the reader starts and finishes at 0, and the offset the
+/// detach left is 0 too on every widen — so only a record of the window itself can
+/// tell this apart from a reader who never touched anything.
+#[test]
+fn offload_window_reader_who_moved_then_returned_to_live_chose_it() {
+    let (rows, cols) = (10u16, 80u16);
+    let sb: ScrollbackStorage = Scrollback::new(64, 512, 8_000_000).into();
+    let mut grid = Grid::with_tiered_scrollback(rows, cols, 8, sb);
+    for i in 0..500 {
+        short_line(&mut grid, rows, &format!("H{i}"));
+    }
+    grid.scroll_display(150);
+
+    let pending = grid
+        .resize_offloading_scrollback(rows, cols + 40)
+        .expect("offload job");
+    assert_eq!(
+        grid.display_offset(),
+        0,
+        "precondition: the widen's detach clamped the viewport to the live bottom, \
+         so the detach-time offset carries no signal at all"
+    );
+    for i in 0..50 {
+        short_line(&mut grid, rows, &format!("W{i}"));
+    }
+    grid.scroll_display(20); // wheel up over the window's output
+    assert_eq!(grid.display_offset(), 20, "the reader really moved");
+    grid.scroll_display(-20); // and wheel back down to the live bottom
+    assert_eq!(grid.display_offset(), 0);
+
+    let reflowed = pending.reflow();
+    grid.reattach_reflowed_scrollback(reflowed);
+
+    assert_eq!(
+        grid.display_offset(),
+        0,
+        "a reader who moved the viewport during the window and ended at the live \
+         bottom chose it — do not yank them back into history (audit #7)"
+    );
+    grid.assert_invariants();
+}
+
+/// The same law reached by the other gesture: scroll up over the streaming output,
+/// then press End. The position the reader descends FROM only exists because window
+/// output staged into the lazy buffer, so it is invisible to any baseline sampled at
+/// the detach — and the content under it is real, which this test checks before
+/// pressing End.
+#[test]
+fn offload_window_end_after_scrolling_over_window_output_is_honored() {
+    let (rows, cols) = (10u16, 80u16);
+    let sb: ScrollbackStorage = Scrollback::new(64, 512, 8_000_000).into();
+    let mut grid = Grid::with_tiered_scrollback(rows, cols, 8, sb);
+    for i in 0..500 {
+        short_line(&mut grid, rows, &format!("H{i}"));
+    }
+    grid.scroll_display(150);
+
+    let pending = grid
+        .resize_offloading_scrollback(rows, 60)
+        .expect("offload job");
+    for i in 0..200 {
+        short_line(&mut grid, rows, &format!("W{i}"));
+    }
+    grid.scroll_display(50);
+    assert_eq!(grid.display_offset(), 50, "the reader really moved");
+    assert_eq!(
+        grid.row_text(0).expect("top visible row").trim_end(),
+        "W141",
+        "precondition: the scrolled-up viewport is showing REAL window output, so \
+         the position the reader descends from is one they could see"
+    );
+    grid.scroll_to_bottom(); // End, and it moves the viewport 50 rows
+
+    let reflowed = pending.reflow();
+    grid.reattach_reflowed_scrollback(reflowed);
+
+    assert_eq!(
+        grid.display_offset(),
+        0,
+        "an End that moved the viewport 50 rows is the reader choosing the live \
+         bottom, whatever the detach had left behind (audit #7)"
+    );
+    grid.assert_invariants();
+}
+
+/// And inside RFL-3's CONVERGING window, which has its own detach and so its own
+/// baseline: the reader's End there must be honored exactly the same way.
+#[test]
+fn redetach_window_end_after_scrolling_over_window_output_is_honored() {
+    let (rows, cols) = (10u16, 80u16);
+    let mut grid = tiered_grid_with_wrapped_history(rows, cols, 300);
+    grid.scroll_display(150);
+
+    // Width change A detaches; a superseding width change B lands mid-flight, so the
+    // re-attach converges with one more detach at the settled width (RFL-3).
+    let pending = grid
+        .resize_offloading_scrollback(rows, cols + 40)
+        .expect("offload job A");
+    grid.resize(rows, cols + 20); // supersedes: detaches nothing, rewraps the ring
+    let reflowed = pending.reflow();
+    let follow = grid
+        .reattach_reflowed_scrollback_or_redetach(reflowed)
+        .expect("stale width must converge with a follow-up job");
+
+    // The SECOND window: output streams, the reader scrolls up over it, then End.
+    for i in 0..200 {
+        short_line(&mut grid, rows, &format!("W{i}"));
+    }
+    grid.scroll_display(50);
+    assert_eq!(grid.display_offset(), 50, "the reader really moved");
+    grid.scroll_to_bottom();
+
+    let done = follow.reflow();
+    assert!(
+        grid.reattach_reflowed_scrollback_or_redetach(done)
+            .is_none(),
+        "the converging pass ran at the settled width"
+    );
+    assert_eq!(
+        grid.display_offset(),
+        0,
+        "the converging window carries its own gesture baseline, so the reader's \
+         End is honored there too (audit #7)"
+    );
+    grid.assert_invariants();
+}
+
+/// A reader who scrolled UP during the window did not choose the live bottom — so
+/// when the MACHINE afterwards puts them there, the restore must still run.
+///
+/// This is why the descent record is `non-zero -> zero`, not "the offset changed".
+/// Under the looser reading this reader's wheel-up counts as "the reader touched the
+/// viewport", a height drag lands mid-window and re-anchors them onto the live
+/// bottom, and the two together are read as an End press: the restore is skipped and
+/// they finish at the prompt. Same misattribution as the bug this all started with,
+/// just sourced from the resize instead of from the detach.
+#[test]
+fn offload_window_reader_who_only_scrolled_up_did_not_choose_the_bottom() {
+    let (rows, cols) = (10u16, 80u16);
+    let sb: ScrollbackStorage = Scrollback::new(64, 512, 8_000_000).into();
+    let mut grid = Grid::with_tiered_scrollback(rows, cols, 8, sb);
+    for i in 0..500 {
+        short_line(&mut grid, rows, &format!("H{i}"));
+    }
+    grid.scroll_display(150);
+
+    let pending = grid
+        .resize_offloading_scrollback(rows, 60)
+        .expect("offload job");
+    for i in 0..50 {
+        short_line(&mut grid, rows, &format!("W{i}"));
+    }
+    grid.scroll_display(4); // the reader stops here and touches nothing else
+    assert_eq!(grid.display_offset(), 4);
+    let gen_after_reader = grid.storage.reader_live_bottom_gen;
+
+    // A height drag lands mid-window: growing the viewport by 4 rows pulls the
+    // anchored line down to the live bottom all on its own.
+    grid.resize(rows + 4, 60);
+    assert_eq!(
+        grid.display_offset(),
+        0,
+        "precondition: the re-anchor alone put the viewport at the live bottom"
+    );
+    assert_eq!(
+        grid.storage.reader_live_bottom_gen, gen_after_reader,
+        "a resize re-anchoring the viewport is machine motion, and the reader only \
+         went UP — neither is a descent to the live bottom"
+    );
+
+    let reflowed = pending.reflow();
+    grid.reattach_reflowed_scrollback(reflowed);
+
+    let sb_after = grid.scrollback_lines();
+    assert_eq!(
+        grid.display_offset(),
+        150usize.min(sb_after),
+        "the reader never chose the live bottom — the resize put them there, so the \
+         restore must still run (scrollback={sb_after})"
+    );
+    grid.assert_invariants();
+}
+
+/// SCR-1's output pin dance — force the viewport to live for the duration of a
+/// batch, then re-pin the reader onto the same content — is the MACHINE moving the
+/// viewport twice and the reader moving it zero times.
+///
+/// It routes a genuine >0 -> 0 descent through the grid on every batch of output
+/// that arrives while someone is reading history, so a gesture record taken at
+/// `reset_display_offset_with_damage` (or anywhere the dance passes through) would
+/// call `tail -f` an End press. Pinned here because the offload guard's whole claim
+/// is that its baseline separates the reader from the machine.
+#[test]
+fn output_batch_pin_dance_is_not_a_reader_gesture() {
+    let (rows, cols) = (10u16, 80u16);
+    let sb: ScrollbackStorage = Scrollback::new(64, 512, 8_000_000).into();
+    let mut grid = Grid::with_tiered_scrollback(rows, cols, 8, sb);
+    for i in 0..500 {
+        short_line(&mut grid, rows, &format!("H{i}"));
+    }
+
+    grid.scroll_display(20); // the reader goes UP: real, but not a descent
+    let after_reader = grid.storage.reader_live_bottom_gen;
+
+    // Exactly what `Terminal::process` does around a batch (processing.rs) and what
+    // `flatten_restored_display_offset` does on an rmcup (handler_dec.rs).
+    let pinned = grid.display_offset();
+    grid.pin_viewport_to_live_for_output_batch();
+    assert_eq!(
+        grid.display_offset(),
+        0,
+        "the prologue forces the precondition"
+    );
+    grid.repin_display_offset(pinned, 0);
+    assert_eq!(
+        grid.display_offset(),
+        20,
+        "the epilogue puts the reader back"
+    );
+
+    assert_eq!(
+        grid.storage.reader_live_bottom_gen, after_reader,
+        "the machine's force-to-live-and-back must be invisible to the reader's \
+         viewport-gesture record"
+    );
+
+    // …while the reader's own End at the same offset is not.
+    grid.scroll_to_bottom();
+    assert_eq!(
+        grid.storage.reader_live_bottom_gen,
+        after_reader + 1,
+        "an End that moved the viewport IS a gesture"
+    );
+    // And one that moves nothing still is not.
+    grid.scroll_to_bottom();
+    assert_eq!(
+        grid.storage.reader_live_bottom_gen,
+        after_reader + 1,
+        "an End at a viewport already pinned to the live bottom moves nothing and \
+         says nothing"
+    );
+    grid.assert_invariants();
+}

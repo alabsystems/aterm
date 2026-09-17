@@ -349,7 +349,9 @@ impl TerminalHandler<'_> {
                 self.style.bce_bg_rgb(),
             );
             self.grid.erase_screen();
-            // DECCOLM toggle clears DECDWL/DECDHL line attributes (#7497).
+            // DECCOLM toggle clears DECDWL/DECDHL line attributes (#7497). The
+            // ED 2 above now resets them too; this stays for the same reason RIS
+            // keeps its call — the guarantee is DECCOLM's own, not the erase's.
             self.grid.clear_line_attributes();
             // Per VT420 spec and xterm, DECCOLM toggle resets tab stops
             // to default every-8-column pattern.

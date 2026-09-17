@@ -406,6 +406,28 @@ impl CellExtra {
         }
     }
 
+    /// The underline colour in the PACKED `0xTT_XXXXXX` form — the exact inverse
+    /// of [`set_underline_color_u32`](Self::set_underline_color_u32).
+    ///
+    /// `0x02_0000II` for an indexed colour (so it still re-resolves against the
+    /// live palette after a round trip), `0x01_RRGGBB` for an explicit RGB one,
+    /// `None` when no SGR 58 colour is set. The indexed form is checked first
+    /// because `set_underline_color_u32` clears `HAS_UNDERLINE_COLOR` when it
+    /// stores an index, so the two are never both present.
+    ///
+    /// This is the form scrollback carries and the form the wide-spacer mirror
+    /// copies, so a colour crosses either boundary without being flattened to
+    /// RGB on the way.
+    #[must_use]
+    #[inline]
+    pub fn underline_color_u32(&self) -> Option<u32> {
+        if let Some(index) = self.underline_color_idx {
+            return Some(0x02_00_00_00 | u32::from(index));
+        }
+        let [r, g, b] = self.underline_color()?;
+        Some(0x01_00_00_00 | (u32::from(r) << 16) | (u32::from(g) << 8) | u32::from(b))
+    }
+
     /// Whether the underline color is an indexed palette color (#7445).
     ///
     /// When true, [`underline_color_index`](Self::underline_color_index) returns

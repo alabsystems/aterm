@@ -35,7 +35,7 @@ use aterm_core::terminal::Terminal;
 use aterm_render::{BeamClip, RibbonVertex, Theme, WindowCpu};
 
 mod common;
-use common::{backends, bb, gg, max_channel_delta, rr};
+use common::{assert_byte_exact, backends, bb, gg, max_channel_delta, rr};
 
 fn luma(p: u32) -> i32 {
     rr(p) + gg(p) + bb(p)
@@ -643,9 +643,14 @@ fn source_over_glow_under_is_byte_exact_and_leaves_the_additive_half_alone() {
         input.glow_under.iter().filter(|q| q.alpha > 0).count()
     );
     if gpu.additive_is_byte_exact() {
-        assert_eq!(
-            delta, 0,
-            "a source-over glow_under field must be BYTE-EXACT CPU==GPU (got {delta})"
+        assert_byte_exact(
+            "source_over_glow_under_is_byte_exact_and_leaves_the_additive_half_alone",
+            "source-over glow_under field",
+            &gpu,
+            delta,
+            format_args!(
+                "a source-over glow_under field must be BYTE-EXACT CPU==GPU (got {delta})"
+            ),
         );
     } else {
         eprintln!("SKIP byte-exact source-over gate: downlevel sRGB offscreen (linear blend)");
@@ -779,9 +784,12 @@ fn ribbon_beam_v_train_is_byte_exact_cpu_vs_gpu() {
     let delta = max_channel_delta(&cpu_train.pixels, &gpu_train.pixels);
     eprintln!("ribbon_beam_v trains CPU vs GPU max per-channel delta = {delta}");
     if gpu.additive_is_byte_exact() {
-        assert_eq!(
-            delta, 0,
-            "a ribbon_beam_v train must be BYTE-EXACT CPU==GPU (got {delta})"
+        assert_byte_exact(
+            "ribbon_beam_v_train_is_byte_exact_cpu_vs_gpu",
+            "ribbon_beam_v trains",
+            &gpu,
+            delta,
+            format_args!("a ribbon_beam_v train must be BYTE-EXACT CPU==GPU (got {delta})"),
         );
     } else {
         eprintln!("SKIP byte-exact ribbon_beam_v gate: downlevel sRGB offscreen");
@@ -818,9 +826,14 @@ fn ribbon_beam_v_train_is_byte_exact_cpu_vs_gpu() {
     let delta = max_channel_delta(&cpu_b, &gpu_b);
     eprintln!("damaged-path ribbon_beam_v CPU vs GPU max per-channel delta = {delta}");
     if gpu.additive_is_byte_exact() {
-        assert_eq!(
-            delta, 0,
-            "a moved ribbon_beam_v train via the cached path must be BYTE-EXACT CPU==GPU (got {delta})"
+        assert_byte_exact(
+            "ribbon_beam_v_train_is_byte_exact_cpu_vs_gpu",
+            "damaged-path ribbon_beam_v",
+            &gpu,
+            delta,
+            format_args!(
+                "a moved ribbon_beam_v train via the cached path must be BYTE-EXACT CPU==GPU (got {delta})"
+            ),
         );
     } else {
         eprintln!("SKIP damaged-path byte-exact ribbon_beam_v gate: downlevel sRGB offscreen");

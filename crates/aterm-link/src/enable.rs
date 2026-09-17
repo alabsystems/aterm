@@ -1041,6 +1041,12 @@ fn command_value_end(lines: &[&str], at: usize) -> usize {
 /// existing table replaced (every other key and table kept), or a new table
 /// appended. `false` when the file already says exactly that.
 ///
+/// AND `receipts = true` WRITTEN ONCE, when the table has no `receipts` key
+/// at all: round 15's receipts (R8) are ON in the config this command writes,
+/// so a fresh `aterm fabric on` acks senders out of the box. A key the
+/// operator has set — either way — is never touched, which is what makes
+/// `receipts = false` a setting rather than a race with the next `on`.
+///
 /// # Errors
 ///
 /// A file that is not valid TOML (it is left alone, and the error named), or a
@@ -1050,8 +1056,9 @@ fn command_value_end(lines: &[&str], at: usize) -> usize {
 pub fn set_fabric_command(text: &str, cmd: &str) -> Result<(String, bool), String> {
     // A file the app itself could not parse is not edited line by line into a
     // file it still cannot parse: the refusal names the parse error instead.
+    let receipts_missing = fabric::receipts_in_toml(text)?.is_none();
     if let Some(current) = fabric::command_in_toml(text)? {
-        if current == cmd {
+        if current == cmd && !receipts_missing {
             return Ok((text.to_string(), false));
         }
     }
@@ -1066,11 +1073,15 @@ pub fn set_fabric_command(text: &str, cmd: &str) -> Result<(String, bool), Strin
         );
     }
     let new_line = format!("command = {}", toml_str(cmd));
-    let mut out: Vec<String> = Vec::with_capacity(lines.len() + 4);
+    let receipts_line = "receipts = true";
+    let mut out: Vec<String> = Vec::with_capacity(lines.len() + 5);
     match table {
         Some((start, end)) => {
             out.extend(lines[..=start].iter().map(|l| (*l).to_string()));
             out.push(new_line);
+            if receipts_missing {
+                out.push(receipts_line.to_string());
+            }
             let mut i = start + 1;
             while i < end {
                 if is_command_line(lines[i]) {
@@ -1093,6 +1104,7 @@ pub fn set_fabric_command(text: &str, cmd: &str) -> Result<(String, bool), Strin
             out.push("[fabric]".to_string());
             out.push("# Written by `aterm fabric on`. Remove with `aterm fabric off`.".to_string());
             out.push(new_line);
+            out.push(receipts_line.to_string());
         }
     }
     let mut joined = out.join("\n");
@@ -3183,8 +3195,10 @@ mod tests {
     }
 
     /// THE CONFIG EDIT keeps every other table and key, replaces only the
-    /// `command` key (single- or multi-line), appends a table when there is
-    /// none, and is a no-op when the file already says the command.
+    /// `command` key (single- or multi-line) — adding `receipts = true` once
+    /// when the table has no such key (round 15, R8) — appends a table when
+    /// there is none, and is a no-op when the file already says the command
+    /// and has a `receipts` key of its own, whichever way it is set.
     #[test]
     fn the_config_edit_touches_only_the_command_key() {
         let cmd = "aterm link serve --fleet local --broker /b.sock";
@@ -3193,23 +3207,33 @@ mod tests {
         assert!(changed);
         assert_eq!(
             after,
-            format!("font_px = 12.0\n\n[fabric]\ncommand = \"{cmd}\"\n# a comment\npresence = \"meta\"\n\n[keys]\nx = 1\n")
+            format!("font_px = 12.0\n\n[fabric]\ncommand = \"{cmd}\"\nreceipts = true\n# a comment\npresence = \"meta\"\n\n[keys]\nx = 1\n")
         );
         assert_eq!(fabric::command_in_toml(&after), Ok(Some(cmd.to_string())));
+        assert_eq!(fabric::receipts_in_toml(&after), Ok(Some(true)));
         // Idempotent.
         assert!(!set_fabric_command(&after, cmd).expect("ok").1);
+        // AN OPERATOR'S `receipts = false` STANDS: the same command over it is
+        // a no-op, and a changed command keeps it.
+        let off = format!("[fabric]\ncommand = \"{cmd}\"\nreceipts = false\n");
+        assert!(!set_fabric_command(&off, cmd).expect("ok").1);
+        let (after, _) =
+            set_fabric_command(&off, "aterm link serve --fleet x --broker /y").expect("ok");
+        assert_eq!(fabric::receipts_in_toml(&after), Ok(Some(false)));
+        assert_eq!(after.matches("receipts").count(), 1);
         // A multi-line command is replaced whole.
         let multi = "[fabric]\ncommand = \"\"\"aterm link serve --fleet x \\\n   --broker /y\"\"\"\nk = 1\n[z]\n";
         let (after, _) = set_fabric_command(multi, cmd).expect("ok");
         assert_eq!(
             after,
-            format!("[fabric]\ncommand = \"{cmd}\"\nk = 1\n[z]\n")
+            format!("[fabric]\ncommand = \"{cmd}\"\nreceipts = true\nk = 1\n[z]\n")
         );
         // No table: appended after a blank line, with the note.
         let (after, changed) = set_fabric_command("font_px = 1.0\n", cmd).expect("ok");
         assert!(changed);
         assert!(after.starts_with("font_px = 1.0\n\n[fabric]\n# Written by `aterm fabric on`"));
         assert_eq!(fabric::command_in_toml(&after), Ok(Some(cmd.to_string())));
+        assert_eq!(fabric::receipts_in_toml(&after), Ok(Some(true)));
         let (after, _) = set_fabric_command("", cmd).expect("ok");
         assert!(after.starts_with("[fabric]\n"));
         // A file that is not TOML is refused, not edited.

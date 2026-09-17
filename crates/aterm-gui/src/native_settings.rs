@@ -736,6 +736,19 @@ impl SettingsViewState {
         self.result_page_limit.set(Some(limit));
     }
 
+    /// THE ONE COUNT. A results page bounds the page-scroll reducer with the
+    /// number of slices IT will index, recorded by the renderer that authors
+    /// the page and beside the pager it builds from that same number. Settings'
+    /// field pages used to compute one speculative count for three different
+    /// renderers, and every disagreement was a user-visible defect: a count the
+    /// portrait fit decided while the landscape page indexed one slice more
+    /// lost that page's LAST result, and a page that recorded three slices
+    /// while authoring no pager at all hid two of the Window page's three
+    /// settings behind an unsignposted wheel gesture.
+    fn record_result_total(&self, total: usize) {
+        self.record_result_page_limit(total.saturating_sub(1));
+    }
+
     fn invalidate_result_page_limit(&self) {
         self.result_page_limit.set(None);
     }
@@ -2461,13 +2474,14 @@ impl SettingsApp {
                     // A second press starts no second worker. Walking the
                     // folders in sequence is the whole design (§3.5): a second
                     // worker would stack a second system dialog.
-                    view.feedback =
-                        Some("aterm is already asking macOS about these folders.".to_string());
+                    view.feedback = Some(
+                        "aterm is already asking macOS about the items listed here.".to_string(),
+                    );
                 } else {
                     view.consent_warmup_requests = 1;
                     view.feedback = Some(
-                        "Asking macOS about these folders one at a time. macOS decides when it \
-                         puts its question on screen."
+                        "Asking macOS about the items listed here, one at a time. macOS decides \
+                         when it puts its question on screen."
                             .to_string(),
                     );
                 }
@@ -3492,17 +3506,12 @@ fn native_advanced_effect(key: &str) -> Option<AdvancedEffectPath> {
         // Manual, so a user whose only complaint is "too bright" had no slider
         // to move and had to file a bug instead.
         | prefs::EDIT_CURSOR_TRAIL_INTENSITY
-        // THE RAINBOW WAKE dial (2026-08-10, with the walking pet becoming the
-        // shipped default). Same audit finding as the intensity slider one line
-        // up, and for the same reason: it already ships, it is already consumed
-        // every frame — `Config::cursor_trail_wake_persist_or_default` →
-        // `CursorGlowInputs::wake_persist_s` → `GlowConfig::wake_persist_s`,
-        // which `cursor_glow` reads when it lays the typing plume — it is
-        // clamped 0..=1500 ms at the resolver, and it was reachable only by
-        // hand-editing `aterm.toml`. It is also the ONLY tuning knob that
-        // belongs to the cat rather than to the trail engine, so a Cursor Kitty
-        // page without it would be a page with nothing on it but a picker.
-        | prefs::EDIT_CURSOR_TRAIL_WAKE_MS => Some(Effect::CursorAndMotion),
+        // THE RAINBOW WAKE dial was added here on 2026-08-10 on the strength
+        // of "it is already consumed every frame … which `cursor_glow` reads
+        // when it lays the typing plume". That had stopped being true by
+        // 2026-09-06 and nobody moved the row; `cursor_trail_wake_ms` is
+        // retired (2026-09-16) and the arm is gone with it.
+        => Some(Effect::CursorAndMotion),
         prefs::EDIT_WINDOW_PADDING | prefs::EDIT_WINDOW_PADDING_TOP => Some(Effect::WindowRuntime),
         prefs::EDIT_SCROLLBACK
         | prefs::EDIT_SEARCH_HISTORY_LINES
@@ -5158,11 +5167,6 @@ fn renderer_preview_spec_for_key_with_font(
         intensity: field_number(state, prefs::EDIT_CURSOR_TRAIL_INTENSITY, 1.0_f32),
         radius: field_number(state, prefs::EDIT_CURSOR_TRAIL_RADIUS, 0.6_f32),
         ring: field_bool(state, prefs::EDIT_CURSOR_TRAIL_RING, true),
-        // The typing-wake dial is authored in MILLISECONDS of recent travel (the
-        // unit a person can reason about); the engine wants seconds.
-        wake_persist_s: field_number(state, prefs::EDIT_CURSOR_TRAIL_WAKE_MS, 300_u64).min(1_500)
-            as f32
-            / 1000.0,
     };
     if !serious_preview_suppression && focused_key == prefs::EDIT_CURSOR_FIRE_SHIMMER {
         // This control is dormant for every non-Fire trail. Give it a bounded
@@ -10328,6 +10332,12 @@ fn settings_fields_landscape_page(
         + manual_search_slices
         + manual_overrides.len()
         + fields.len();
+    // THE ONE COUNT ([`SettingsViewState::record_result_total`]). This page is
+    // one result wide, so `total` is both what its pager names and what bounds
+    // wheel/arrow/PageDown — recorded here, by the renderer that indexes it,
+    // rather than inferred by the caller from a portrait fit test the side-by-
+    // side page never takes.
+    state.record_result_total(total);
     if total == 0 {
         return vec![
             UiNode::new(
@@ -10615,11 +10625,27 @@ fn settings_fields_page(
         )
     });
 
-    let result_slices = fields.len()
-        + usize::from(manual_matches > 0)
-        + manual_overrides.len()
-        + usize::from(preview_disclosure);
-    state.record_result_page_limit(result_slices.saturating_sub(1));
+    // THE ONE COUNT ([`SettingsViewState::record_result_total`]), portrait
+    // spelling: the stacked page indexes its leading disclosures and then its
+    // rows, and every pager it authors below reports this same `total`. The
+    // macOS-access and This Mac cards are NOT slices here — the portrait page
+    // never pages past them, it draws them above the rows on page 0 — so
+    // counting them, as the single speculative count this replaces did, bought
+    // Security up to two trailing pages that repeat its last row. The landscape
+    // renderer, which does index those cards, records its own total instead.
+    // Both the floor below and the landscape page record theirs after this, so
+    // the page actually authored always has the last word.
+    let preview_slices = usize::from(preview_disclosure);
+    let search_manual_slices = usize::from(global_search && manual_matches > 0);
+    let leading_slices = preview_slices
+        + search_manual_slices
+        + if modified_only {
+            manual_overrides.len()
+        } else {
+            0
+        };
+    let portrait_total = fields.len() + leading_slices;
+    state.record_result_total(portrait_total);
 
     if compact_smart_title_health && !fields.is_empty() {
         // Short landscape and maximum Dynamic Type can fit the truthful
@@ -10627,7 +10653,24 @@ fn settings_fields_page(
         // duplicate page/group headings around them. Keep both primary pieces
         // on glass and let the ordinary page-scroll reducer select subsequent
         // controls; the compact toolbar continues to name the route.
-        let (_, index, field) = fields[state.page_scroll.min(fields.len() - 1)];
+        //
+        // THE ONE COUNT: this page indexes `fields` and nothing else, and a
+        // window it bounds needs the pager for exactly the reason the shed
+        // ladder below never sheds one — it is the pointer and assistive-
+        // technology escape hatch for every row this page is holding back.
+        // Authoring the count without it is what left the shipped default
+        // 80×24 window (a 744×420 viewport) showing 1 of the Window page's 3
+        // settings with no Prev/Next, no range, and 207 px of bare page under
+        // it — 195 of that inside the page's own insets, against the 49 a
+        // pager and its gap cost. The escape hatch yields only where the body
+        // it has left cannot
+        // seat one — at 2× Dynamic Type on a 568×320 host the card and the
+        // whole control are the owner's pinned pair and there is nothing left
+        // to give.
+        let total = fields.len();
+        state.record_result_total(total);
+        let offset = state.page_scroll.min(total - 1);
+        let (_, index, field) = fields[offset];
         let mut row = setting_row(
             state,
             index,
@@ -10640,7 +10683,32 @@ fn settings_fields_page(
             &mut row,
             settings_group_text_width(cx.viewport, SettingsWidth::Compact, false),
         );
-        return vec![smart_title_health_card(state, true), row];
+        let gap = settings_page_gap(state, SettingsWidth::Compact, cx.viewport);
+        // The page node's own content box: `page` pads it with
+        // `responsive_page_insets`, whose compact vertical measure is
+        // `compact_page_vertical_inset`.
+        let floor_body = (if compact_status_dock_required(state, cx.viewport) {
+            cx.viewport.height
+        } else {
+            cx.viewport.height - settings_status_bars_height(state)
+        } - compact_header_height(state, cx.viewport)
+            - 2.0 * compact_page_vertical_inset(cx.viewport.height))
+        .max(0.0);
+        let floor_used =
+            smart_title_health_height(true) + gap + SettingsWidth::Compact.row_height();
+        let mut page = vec![smart_title_health_card(state, true)];
+        if total > 1 && floor_used + gap + page_navigation_height() <= floor_body {
+            page.push(page_navigation_node(
+                "settings/results-window",
+                "settings/results-range",
+                "settings",
+                offset,
+                offset + 1,
+                total,
+            ));
+        }
+        page.push(row);
+        return page;
     }
 
     if let Some(budget) = compact_budget
@@ -10893,8 +10961,6 @@ fn settings_fields_page(
         } else {
             leading_used(true, false, true) + first_row_extra <= body_height
         };
-        let preview_slices = usize::from(preview_disclosure);
-        let search_manual_slices = usize::from(global_search && manual_matches > 0);
         let leading_slices = preview_slices + search_manual_slices;
         if state.page_scroll >= leading_slices && !fields.is_empty() {
             let start = state
@@ -10923,15 +10989,6 @@ fn settings_fields_page(
     } else if !shedding {
         (true, subtitle, true, true)
     } else {
-        let preview_slices = usize::from(preview_disclosure);
-        let search_manual_slices = usize::from(global_search && manual_matches > 0);
-        let leading_slices = preview_slices
-            + search_manual_slices
-            + if modified_only {
-                manual_overrides.len()
-            } else {
-                0
-            };
         let start = state
             .page_scroll
             .saturating_sub(leading_slices)
@@ -11073,7 +11130,6 @@ fn settings_fields_page(
         return out;
     }
 
-    let preview_slices = usize::from(preview_disclosure);
     // The Manual editor result is result #1 of a global search. On a compact
     // host it keeps its own bounded virtual slice (tight page budgets), but a
     // Medium/Wide page has the room to list it INLINE above the native rows —
@@ -11098,7 +11154,6 @@ fn settings_fields_page(
     }
     let inline_manual_result = inline_manual_result && width != SettingsWidth::Compact;
 
-    let search_manual_slices = usize::from(global_search && manual_matches > 0);
     let manual_offset = state
         .page_scroll
         .saturating_sub(preview_slices + search_manual_slices);
@@ -11129,13 +11184,6 @@ fn settings_fields_page(
         return out;
     }
 
-    let leading_slices = preview_slices
-        + search_manual_slices
-        + if modified_only {
-            manual_overrides.len()
-        } else {
-            0
-        };
     let field_offset = state.page_scroll.saturating_sub(leading_slices);
     let start = field_offset.min(fields.len().saturating_sub(1));
     // The inline Manual card occupies authored height ahead of the first
@@ -11150,7 +11198,10 @@ fn settings_fields_page(
     let end = start.saturating_add(visible_count).min(fields.len());
     let native_total = fields.len();
     let leading_results = leading_slices;
-    let total = native_total + leading_results;
+    // The very count this page recorded above, so the window it reports and the
+    // window the reducer may reach are one number, not two.
+    let total = portrait_total;
+    debug_assert_eq!(total, native_total + leading_results);
     // An inline Manual result is PAINTED on this page, so the window the
     // pager reports opens at the card (result #1), not past it.
     let range_start = if inline_manual_result {
@@ -11653,12 +11704,6 @@ const GPU_POST_EFFECT_KEYS: &[&str] = &[
 const TRAIL_TUNING_KEYS: &[&str] = &[
     prefs::EDIT_CURSOR_TRAIL_MS,
     prefs::EDIT_CURSOR_TRAIL_LENGTH,
-    // The rainbow WAKE dial. It rides `GlowConfig`, which `glow_config` builds
-    // with `enabled: cursor_trail_or_default() && …`, so with the master off the
-    // glow never spawns and the plume length reaches nothing. It only became a
-    // native row on 2026-08-10 (see `native_advanced_effect`); before that it was
-    // Manual-only and so never owed a disclosure.
-    prefs::EDIT_CURSOR_TRAIL_WAKE_MS,
     prefs::EDIT_CURSOR_TRAIL_INTENSITY,
     prefs::EDIT_CURSOR_TRAIL_RADIUS,
     prefs::EDIT_CURSOR_TRAIL_RING,
@@ -13499,27 +13544,31 @@ impl MacosAccessCopy {
     }
 }
 
-/// The folder's display name, derived from the consent module's own token
+/// The item's display name, taken from the consent module's own string table
 /// rather than typed here. `native_settings.rs` holds no protected-folder
 /// literal of any shape (`tools/grep_guard.sh` B13).
+///
+/// It was a capitalisation of the config token until the roster grew a member
+/// whose name is not a folder's: "app-data" title-cases to something no human
+/// wrote, so the label is now the module's to say.
 fn macos_access_folder_label(folder: Folder) -> String {
-    let token = folder.as_str();
-    let mut chars = token.chars();
-    chars.next().map_or_else(String::new, |first| {
-        first.to_uppercase().chain(chars).collect()
-    })
+    folder.label().to_string()
 }
 
-/// A service class in words, from the verb's token. The three folder classes
-/// go through [`macos_access_folder_label`] so this file still holds no
-/// protected-folder literal of any shape (`tools/grep_guard.sh` B13).
+/// A service class in words, from the verb's token. Every class the consent
+/// roster knows goes through [`macos_access_folder_label`] so this file still
+/// holds no protected-folder literal of any shape (`tools/grep_guard.sh` B13).
+///
+/// `app-data` is no longer spelled here: it is a roster member now, so
+/// [`Folder::parse`] answers it and the one string table says it once. The
+/// remaining arms are coverage classes nothing warms up — they have no
+/// promptable roster entry of their own.
 fn macos_access_service_label(service: &str) -> String {
     match Folder::parse(service) {
         Some(folder) => macos_access_folder_label(folder),
         None => match service {
             "network-volumes" => "Network drives".to_string(),
             "removable-volumes" => "Removable drives".to_string(),
-            "app-data" => "Other applications' data".to_string(),
             "file-provider-domains" => "Cloud-storage folders (File Provider)".to_string(),
             other => other.to_string(),
         },
@@ -13528,15 +13577,19 @@ fn macos_access_service_label(service: &str) -> String {
 
 /// One warm-up row in words. `Denied` is the only one that carries a verdict,
 /// and it carries §3.7's exact sentence.
-const fn macos_access_row_label(row: crate::consent_warmup::WarmupRow) -> &'static str {
+///
+/// The noun comes from the item ("this folder", "this data"), so the sentence
+/// stays true for a roster member that is not a folder of the human's.
+fn macos_access_row_label(folder: Folder, row: crate::consent_warmup::WarmupRow) -> String {
     match row {
-        crate::consent_warmup::WarmupRow::Unknown => "not asked by this aterm process",
-        crate::consent_warmup::WarmupRow::Asking => "asking\u{2026}",
-        crate::consent_warmup::WarmupRow::Allowed => "allowed",
-        crate::consent_warmup::WarmupRow::Denied => {
-            "denied \u{2014} macOS is not asking again for this folder"
-        }
-        crate::consent_warmup::WarmupRow::Error => "could not be read",
+        crate::consent_warmup::WarmupRow::Unknown => "not asked by this aterm process".to_string(),
+        crate::consent_warmup::WarmupRow::Asking => "asking\u{2026}".to_string(),
+        crate::consent_warmup::WarmupRow::Allowed => "allowed".to_string(),
+        crate::consent_warmup::WarmupRow::Denied => format!(
+            "denied \u{2014} macOS is not asking again for this {}",
+            folder.noun()
+        ),
+        crate::consent_warmup::WarmupRow::Error => "could not be read".to_string(),
     }
 }
 
@@ -13720,7 +13773,7 @@ pub(crate) fn macos_access_copy(access: &MacosAccess) -> MacosAccessCopy {
             format!(
                 "{} \u{2014} {}",
                 macos_access_folder_label(*folder),
-                macos_access_row_label(*row)
+                macos_access_row_label(*folder, *row)
             )
         })
         .collect::<Vec<_>>();
@@ -15071,14 +15124,47 @@ fn about_page(
         }),
     )
     .layout(Layout::default().height(Length::Fixed(status_height)));
+    // The byline says WHO and WHERE FROM: author · company · site
+    // (`alab.systems`, the `site` row — owner, 2026-09-14) wherever that whole
+    // line fits, then author · company, then the author alone. The narrow
+    // large-type column keeps the author alone outright. Fit is MEASURED, never
+    // guessed from the width class: the line paints at the Body step (13pt ×
+    // text scale) in the UI face, in the hero column the renderer really gives
+    // it — About's page content at its own maximum, less the side pager beside
+    // a landscape compact section, less the hero's 24pt padding pair. A 286.5pt
+    // phone column at 1× is 206.5pt against the full line's ~223pt, which is
+    // exactly where the site used to clip. The site is never lost: it is the
+    // Project row, and one tap away on "Open Project Site".
+    let site = value("site", "");
+    let byline = if large_type_narrow {
+        "Andrew Yates".to_string()
+    } else {
+        let beside_pager = compact_budget
+            .filter(|budget| budget.side_by_side_pager)
+            .map_or(0.0, |_| compact_side_pager_width() + 10.0);
+        let identity_width = (settings_page_content_width(
+            viewport_width,
+            width,
+            page_maximum(SettingsRoute::About, width),
+        ) - beside_pager
+            - 48.0)
+            .max(48.0);
+        let px = 13.0 * text_scale;
+        let fits = |line: &str| crate::tray_raster::ui_text_width(line, px) <= identity_width;
+        let author_company = crate::build_info::AUTHOR_COMPANY_BYLINE;
+        let full = format!("{author_company} \u{00b7} {site}");
+        if !site.is_empty() && fits(&full) {
+            full
+        } else if fits(author_company) {
+            author_company.to_string()
+        } else {
+            "Andrew Yates".to_string()
+        }
+    };
     let capabilities = UiNode::new(
         "about/byline",
         UiContent::Text(TextSpec {
-            text: if large_type_narrow {
-                "Andrew Yates".to_string()
-            } else {
-                crate::build_info::AUTHOR_COMPANY_BYLINE.to_string()
-            },
+            text: byline,
             role: SemanticRole::Text,
             style: StyleRef::Success,
         }),
@@ -17371,6 +17457,26 @@ fn packages_sections(_packages: &PackagesProjection) -> usize {
 /// admin rows — so the Extras and Needs-admin groups are never the part elided.
 const MAX_PACKAGE_PROGRAM_ROWS: usize = 16;
 
+/// The budget one program-row line gets before it wraps, per layout, in the wrap's
+/// units — average lowercase glyphs (`packages_screen::glyph_advance`, 2026-09-15; from
+/// the 2026-09-14 incident — a ~700-character refusal ellipsized to one line, its `fix:`
+/// clause the part cut). The rows paint at the Caption step (11px × text scale,
+/// `SemanticRole::Status`), and `SettingsWidth` is chosen on the scale-divided viewport,
+/// so one budget per width holds at every text scale. The painter measured the rows at
+/// 402pt (the 474pt compact test viewport), ≈720pt (the 760pt medium page less the
+/// card's padding) and 944pt (the 1280pt wide viewport), and a unit of the advance
+/// table is at most 0.35pt at 1× on the incident's own lines — so 402/0.35/20 ≈ 57,
+/// 720/0.35/20 ≈ 103, 944/0.35/20 ≈ 135, each taken a little under. The painter's
+/// ellipsis stays the last resort for a pathological line, never the layout; the paint
+/// audit in the tests measures the claim.
+fn packages_reason_wrap_chars(width: SettingsWidth) -> usize {
+    match width {
+        SettingsWidth::Compact => 56,
+        SettingsWidth::Medium => 100,
+        SettingsWidth::Wide => 132,
+    }
+}
+
 /// One line of the Packages program list: a group heading, a program row (its
 /// canonical state verbatim), or the overflow/empty/loading line — plus, on a row
 /// that offers one, the Install control the line carries beside its text.
@@ -17380,6 +17486,10 @@ struct ProgramLine {
     text: String,
     heading: bool,
     install: Option<ProgramInstall>,
+    /// A wrapped continuation of the row above it: one line of a long reason
+    /// (`packages_screen::reason_lines`). Text only, full width; the compact page
+    /// gives it neither a label nor a control.
+    continuation: bool,
 }
 
 /// The Install control on a program row: the action id the reducer admits and the
@@ -17401,14 +17511,17 @@ fn packages_group_slug(group: crate::packages_screen::RowGroup) -> &'static str 
 /// The grouped program list — Default set, Extras (vendor · license · size, an Install
 /// control per extra awaiting consent), Needs admin (who installs it; an Install control
 /// that runs the osascript door on macOS, the terminal command elsewhere). Pure: the
-/// wide page, the compact page and the row counts all read this one derivation.
-fn packages_program_lines(packages: &PackagesProjection) -> Vec<ProgramLine> {
+/// wide page, the compact page and the row counts all read this one derivation. `width`
+/// sets the character budget a long reason wraps to (`packages_reason_wrap_chars`);
+/// a state that fits rides inline, exactly as before.
+fn packages_program_lines(packages: &PackagesProjection, width: SettingsWidth) -> Vec<ProgramLine> {
     use crate::packages_screen::RowGroup;
     let plain = |key: &str, text: String| ProgramLine {
         key: key.to_string(),
         text,
         heading: false,
         install: None,
+        continuation: false,
     };
     if !packages.observed {
         return vec![plain(
@@ -17448,6 +17561,7 @@ fn packages_program_lines(packages: &PackagesProjection) -> Vec<ProgramLine> {
                 text: group.heading().to_string(),
                 heading: true,
                 install: None,
+                continuation: false,
             });
         }
         for row in rows {
@@ -17460,7 +17574,14 @@ fn packages_program_lines(packages: &PackagesProjection) -> Vec<ProgramLine> {
                 text.push_str("  ·  build ");
                 text.push_str(&build.to_string());
             }
-            if !row.state.is_empty() {
+            // A state that fits the row rides inline, VERBATIM — the canonical spellings,
+            // byte-for-byte as before. One that does not (the 2026-09-14 ~700-character
+            // refusal) moves BELOW its row as continuation lines, fix first, so nothing
+            // of it meets the painter's ellipsis.
+            let reason =
+                crate::packages_screen::reason_lines(&row.state, packages_reason_wrap_chars(width));
+            let inline_state = reason.len() == 1;
+            if inline_state && !row.state.is_empty() {
                 text.push_str("  ·  ");
                 text.push_str(&row.state);
             }
@@ -17500,7 +17621,22 @@ fn packages_program_lines(packages: &PackagesProjection) -> Vec<ProgramLine> {
                 text,
                 heading: false,
                 install,
+                continuation: false,
             });
+            if !inline_state {
+                lines.extend(
+                    reason
+                        .into_iter()
+                        .enumerate()
+                        .map(|(index, text)| ProgramLine {
+                            key: format!("packages/programs/{}/reason/{}", row.name, index + 1),
+                            text,
+                            heading: false,
+                            install: None,
+                            continuation: true,
+                        }),
+                );
+            }
         }
     }
     let total = packages.programs.len();
@@ -17602,9 +17738,39 @@ fn package_program_display_name(name: &str) -> String {
 /// The compact page's atomic item count for the program list: every line (headings
 /// and the overflow line included) plus one item per Install control, which the
 /// compact page stacks under its row.
-fn packages_program_row_count(packages: &PackagesProjection) -> usize {
-    let lines = packages_program_lines(packages);
+fn packages_program_row_count(packages: &PackagesProjection, width: SettingsWidth) -> usize {
+    let lines = packages_program_lines(packages, width);
     lines.len() + lines.iter().filter(|line| line.install.is_some()).count()
+}
+
+/// A wrapped reason line on the atomic compact page: full width, no label column —
+/// the 36% a status row spends on its label would put a 64-character line back under
+/// the painter's ellipsis, the cut the wrap exists to prevent (2026-09-15).
+fn compact_packages_reason_line(key: String, text: String) -> (UiNode, f32) {
+    let height = scaled_control_height();
+    (
+        UiNode::new(
+            key.clone(),
+            UiContent::Group(GroupSpec::new("Managed program reason").style(StyleRef::Secondary)),
+        )
+        .layout(
+            Layout::row()
+                .height(Length::Fixed(height))
+                .padding(Insets::symmetric(8.0, 4.0)),
+        )
+        .children(vec![
+            UiNode::new(
+                format!("{key}/value"),
+                UiContent::Text(TextSpec {
+                    text,
+                    role: SemanticRole::Status,
+                    style: StyleRef::Primary,
+                }),
+            )
+            .layout(Layout::default().width(Length::Fill).height(Length::Fill)),
+        ]),
+        height,
+    )
 }
 
 fn packages_has_service_line(packages: &PackagesProjection) -> bool {
@@ -17613,7 +17779,7 @@ fn packages_has_service_line(packages: &PackagesProjection) -> bool {
         && (!packages.index_source.is_empty() || !packages.root_fingerprint.is_empty())
 }
 
-fn packages_compact_sections(packages: &PackagesProjection) -> usize {
+fn packages_compact_sections(packages: &PackagesProjection, width: SettingsWidth) -> usize {
     // Summary, THREE actions (check / install / remove), optional manager provenance,
     // three maintenance switches, live updater status, consent explanation, and every
     // bounded managed-program row.
@@ -17627,7 +17793,7 @@ fn packages_compact_sections(packages: &PackagesProjection) -> usize {
         + 3
         + 1
         + 1
-        + packages_program_row_count(packages)
+        + packages_program_row_count(packages, width)
 }
 
 fn compact_packages_summary(packages: &PackagesProjection) -> (UiNode, f32) {
@@ -18177,7 +18343,7 @@ fn packages_page(
         )
         .layout(Layout::default().height(Length::Fixed(programs_heading_height))),
     ];
-    let program_lines = packages_program_lines(packages);
+    let program_lines = packages_program_lines(packages, width);
     let program_rows = program_lines.len();
     program_children.extend(
         program_lines
@@ -18289,6 +18455,10 @@ fn packages_page(
                 compact_note_height,
             ));
             for line in program_lines {
+                if line.continuation {
+                    items.push(compact_packages_reason_line(line.key, line.text));
+                    continue;
+                }
                 let label = if line.heading {
                     "Program group"
                 } else {
@@ -18311,7 +18481,7 @@ fn packages_page(
                 items,
                 section_height,
             );
-            debug_assert_eq!(sections.len(), packages_compact_sections(packages));
+            debug_assert_eq!(sections.len(), packages_compact_sections(packages, width));
             let total = sections.len();
             state.record_result_page_limit(total.saturating_sub(1));
             let section = state.page_scroll.min(total.saturating_sub(1));
@@ -18517,8 +18687,12 @@ fn route_subtitle(route: SettingsRoute, width: SettingsWidth) -> &'static str {
         SettingsRoute::CursorMotion => {
             "Cursor form, motion policy, visual trails, and every sound aterm makes."
         }
+        // The second clause was "and how far its rainbow wake reaches" — the
+        // page's promise of the `cursor_trail_wake_ms` dial, retired 2026-09-16
+        // because nothing read it. A subtitle that describes a control the page
+        // does not have is the same defect as the control itself.
         SettingsRoute::CursorKitty => {
-            "The companion that walks your line, and how far its rainbow wake reaches."
+            "The companion that walks your line, and the art it walks it with."
         }
         SettingsRoute::WindowTabs => {
             "Window geometry, title and Description formatting, live Activity, and chrome."
@@ -18910,7 +19084,7 @@ mod tests {
         } else {
             "true"
         };
-        let cases: [(&str, &str); 58] = [
+        let cases: [(&str, &str); 57] = [
             (prefs::EDIT_THEME, "Nord"),
             (prefs::EDIT_FOREGROUND, "#00FF66"),
             (prefs::EDIT_BACKGROUND, "#101820"),
@@ -18960,10 +19134,6 @@ mod tests {
             (prefs::EDIT_CURSOR_TRAIL_INTENSITY, "0.25"),
             (prefs::EDIT_CURSOR_TRAIL_RADIUS, "1.2"),
             (prefs::EDIT_CURSOR_TRAIL_RING, "false"),
-            // The typing wake is authored in ms of recent travel; `0` is
-            // the reachable OFF end of its slider, so it is both the
-            // clearest pixel delta and the setting worth pinning.
-            (prefs::EDIT_CURSOR_TRAIL_WAKE_MS, "0"),
             (prefs::EDIT_CURSOR_TRAIL_COLOR, "#FF5A7D"),
             (prefs::EDIT_CURSOR_TRAIL_ACCENT, "#00E5FF"),
             (prefs::EDIT_CURSOR_NYAN_SPRITE, "candidate-cat.png"),
@@ -19085,13 +19255,6 @@ mod tests {
             //   halo), while the preview's bounded script deliberately types
             //   single-cell moves only. Making these four body-observable
             //   requires scripting a jump into the preview motion.
-            // - cursor_trail_wake_ms is PARSED BUT INERT since the previous
-            //   rainbow kitty's deletion (2026-09-06, `RAINBOW-KITTY-V2.md`
-            //   §17.3 phase 7): it still reaches `GlowConfig::wake_persist_s`
-            //   (pinned by `the_rainbow_wake_row_lands_on_the_kitty_page_and_
-            //   reaches_the_glow`), and no style reads that field any more —
-            //   the v1 wake walk was its only consumer. The row's disclosure
-            //   is in `app_config::Config::cursor_trail_wake_ms`.
             let body_exempt = matches!(
                 key,
                 prefs::EDIT_MERGED_LIGATURES
@@ -19099,7 +19262,6 @@ mod tests {
                     | prefs::EDIT_CURSOR_TRAIL_RADIUS
                     | prefs::EDIT_CURSOR_TRAIL_RING
                     | prefs::EDIT_CURSOR_TRAIL_ACCENT
-                    | prefs::EDIT_CURSOR_TRAIL_WAKE_MS
             )
             // - font_thicken is CoreText FONT SMOOTHING at raster time;
             //   `Renderer::set_font_thicken` is a no-op beyond recording the
@@ -21251,10 +21413,20 @@ mod tests {
         let mut access = access_fixture(FdaState::Denied, DrClass::Identity, FdaScope::Unknown);
         access.warmup_rows = denied_rows();
         let copy = macos_access_copy(&access);
-        for line in &copy.folders {
+        assert_eq!(copy.folders.len(), Folder::ALL.len(), "{:?}", copy.folders);
+        for (line, folder) in copy.folders.iter().zip(Folder::ALL) {
+            // §3.7's sentence, with the NOUN the item takes: the three folders
+            // are folders of the human's, and the fourth is another app's data.
             assert!(
-                line.contains("macOS is not asking again for this folder"),
+                line.contains(&format!(
+                    "macOS is not asking again for this {}",
+                    folder.noun()
+                )),
                 "a denied row must say exactly that: {line}"
+            );
+            assert!(
+                line.starts_with(folder.label()),
+                "a row names its item first: {line}"
             );
         }
         assert!(
@@ -22534,6 +22706,376 @@ mod tests {
                     control.key.as_str(),
                     control.rect
                 );
+            }
+        }
+    }
+
+    /// Settings' own runtime health card, as the Window page carries it.
+    fn window_page_health() -> TitleSummaryHealth {
+        TitleSummaryHealth {
+            state: TitleSummaryRuntimeState::Builtin,
+            provider: crate::app_config::TitleSummaryProvider::Builtin,
+            model: None,
+            endpoint: None,
+            locality: TitleSummaryLocality::NotApplicable,
+            managed_install_present: false,
+            model_ready: true,
+            last_error: None,
+            next_retry_after: None,
+            next_refresh_after: Some(std::time::Duration::from_secs(15)),
+            timeout: None,
+            proxy_mode: None,
+            ca_file: None,
+        }
+    }
+
+    /// Every pager status a Settings page prints, as `(key, total)`: the results
+    /// window's `"1–2 of 3"` and the section pager's `"Page 1 of 3"`. Parsed
+    /// strictly — a label only counts when both sides are numbers — so this
+    /// reads the page the way a user does instead of trusting a key name.
+    fn pager_totals(compiled: &crate::native_ui::CompiledUi) -> Vec<(String, usize)> {
+        compiled
+            .semantics
+            .iter()
+            .filter_map(|node| {
+                let (window, total) = node.label.rsplit_once(" of ")?;
+                let total = total.trim().parse::<usize>().ok()?;
+                let numbered = window
+                    .strip_prefix("Page ")
+                    .map(|page| page.trim().parse::<usize>().is_ok())
+                    .unwrap_or_else(|| {
+                        window.split_once('\u{2013}').is_some_and(|(first, last)| {
+                            first.trim().parse::<usize>().is_ok()
+                                && last.trim().parse::<usize>().is_ok()
+                        })
+                    });
+                numbered.then(|| (node.key.as_str().to_string(), total))
+            })
+            .collect()
+    }
+
+    /// Paint, hit target and semantics describe the same rectangle, inside the
+    /// window. A page may hold a row back; it may not promise one it clips.
+    fn assert_whole(
+        compiled: &crate::native_ui::CompiledUi,
+        key: &str,
+        height: f32,
+        hit: bool,
+        context: &str,
+    ) {
+        let node = compiled
+            .semantic(&UiKey::new(key))
+            .unwrap_or_else(|| panic!("{context}: {key} is missing"));
+        let paint = compiled
+            .paint
+            .iter()
+            .find(|paint| paint.key == node.key)
+            .unwrap_or_else(|| panic!("{context}: {key} has no painted geometry"));
+        assert_eq!(
+            paint.rect, node.rect,
+            "{context}: {key} is partially clipped"
+        );
+        if hit {
+            let region = compiled
+                .hits
+                .iter()
+                .find(|region| region.key == node.key)
+                .unwrap_or_else(|| panic!("{context}: {key} has no hit target"));
+            assert_eq!(
+                region.rect, node.rect,
+                "{context}: {key} hit geometry diverges"
+            );
+        }
+        assert!(
+            node.rect.bottom() <= height + 0.01,
+            "{context}: {key} falls outside the window: {:?}",
+            node.rect
+        );
+    }
+
+    /// THE SHIPPED DEFAULT WINDOW. 80×24 is a 744×420 app viewport, a compact
+    /// host under the Smart Titles floor: the truthful runtime card and ONE
+    /// whole native control, with `page_scroll` bounded by the Window page's
+    /// three settings. That bound is a promise about what the page is holding
+    /// back, so the page owes the window's pager — the pointer and assistive-
+    /// technology escape hatch the shed ladder below the floor is forbidden to
+    /// remove. Without it "Window top padding (px)" and "Restore session at
+    /// launch" existed only behind an unsignposted wheel gesture: no Prev/Next,
+    /// no range, nothing in the semantic tree to reach them with, and 195 px of
+    /// bare page under the one row that was drawn.
+    ///
+    /// The floor may still drop the escape hatch where the body it has left
+    /// cannot seat one; the second half pins that exception against the pager's
+    /// OWN height rather than a guess.
+    #[test]
+    fn the_default_window_page_pages_the_settings_its_count_promises() {
+        let (mut runtime, instance, view) = setup();
+        {
+            let Some(AppViewState::Settings(state)) = runtime.view_state_mut(view) else {
+                unreachable!()
+            };
+            state.navigate(SettingsRoute::WindowTabs);
+            state.replace_title_summary_health(window_page_health());
+        }
+        let cx = view_cx_at(744.0, 420.0);
+        let compiled = compile_settings_view(&runtime, instance, view, &cx);
+        compiled.validate_parity().unwrap();
+        let context = "the default 744×420 Window page";
+        assert_eq!(
+            pager_totals(&compiled),
+            vec![("settings/results-range".to_string(), 3)],
+            "{context} must report the window its page-scroll bound promises"
+        );
+        assert_eq!(
+            compiled
+                .semantic(&UiKey::new("settings/results-range"))
+                .unwrap()
+                .label,
+            "1–1 of 3"
+        );
+        assert_whole(
+            &compiled,
+            "settings/smart-titles/health",
+            420.0,
+            false,
+            context,
+        );
+        assert_whole(
+            &compiled,
+            "settings/results-window/next",
+            420.0,
+            true,
+            context,
+        );
+        assert_whole(
+            &compiled,
+            "settings/control/window_padding",
+            420.0,
+            true,
+            context,
+        );
+        assert!(
+            compiled
+                .semantic(&UiKey::new("settings/results-window/next"))
+                .unwrap()
+                .state
+                .unwrap()
+                .enabled,
+            "{context}: Next reaches the settings this page holds back"
+        );
+
+        // The pager's own action, through the reducer the wheel and PageDown
+        // share: the bound it reads is the count the page recorded.
+        let mut reached = vec!["settings/control/window_padding".to_string()];
+        for (page, key) in [
+            (2, "settings/control/window_padding_top"),
+            (3, "settings/control/restore_session"),
+        ] {
+            runtime
+                .dispatch(
+                    instance,
+                    view,
+                    AppEvent::Action(ActionInvocation {
+                        id: ActionId::new("settings/page-down"),
+                        value: None,
+                    }),
+                )
+                .unwrap();
+            let compiled = compile_settings_view(&runtime, instance, view, &cx);
+            compiled.validate_parity().unwrap();
+            assert_eq!(
+                compiled
+                    .semantic(&UiKey::new("settings/results-range"))
+                    .unwrap()
+                    .label,
+                format!("{page}–{page} of 3"),
+                "{context}: Next page {page}"
+            );
+            assert_whole(&compiled, key, 420.0, true, context);
+            assert_whole(
+                &compiled,
+                "settings/smart-titles/health",
+                420.0,
+                false,
+                context,
+            );
+            reached.push(key.to_string());
+        }
+        assert_eq!(
+            reached,
+            vec![
+                "settings/control/window_padding".to_string(),
+                "settings/control/window_padding_top".to_string(),
+                "settings/control/restore_session".to_string(),
+            ],
+            "every Window setting has a page of its own"
+        );
+
+        // THE EXCEPTION, MEASURED. A 744×240 host seats the card and one whole
+        // control with 36 px to spare — less than the pager's own 44 px and the
+        // page gap it would need. The floor keeps both pinned pieces and stays
+        // silent, and this is the only licence it has to.
+        {
+            let Some(AppViewState::Settings(state)) = runtime.view_state_mut(view) else {
+                unreachable!()
+            };
+            state.page_scroll = 0;
+        }
+        let cx = view_cx_at(744.0, 240.0);
+        let compiled = compile_settings_view(&runtime, instance, view, &cx);
+        compiled.validate_parity().unwrap();
+        let context = "the 744×240 Window floor";
+        assert_whole(
+            &compiled,
+            "settings/smart-titles/health",
+            240.0,
+            false,
+            context,
+        );
+        assert_whole(
+            &compiled,
+            "settings/control/window_padding",
+            240.0,
+            true,
+            context,
+        );
+        assert!(
+            pager_totals(&compiled).is_empty(),
+            "{context} has no room for a pager: {:?}",
+            pager_totals(&compiled)
+        );
+        let page = compiled
+            .semantic(&UiKey::new("settings/page/window-tabs"))
+            .expect("the Window page");
+        let lowest = compiled
+            .paint
+            .iter()
+            .filter(|paint| paint.key != page.key && page.rect.contains(paint.rect.x, paint.rect.y))
+            .map(|paint| paint.rect.bottom())
+            .fold(page.rect.y, f32::max);
+        let free = page.rect.bottom() - lowest;
+        assert!(
+            free < page_navigation_height()
+                + settings_page_gap(
+                    {
+                        let Some(AppViewState::Settings(state)) = runtime.view_state(view) else {
+                            unreachable!()
+                        };
+                        state
+                    },
+                    SettingsWidth::Compact,
+                    cx.viewport,
+                ),
+            "{context} dropped the escape hatch with {free} px of body left"
+        );
+    }
+
+    /// ONE COUNT PER PAGE. A Settings page bounds the page-scroll reducer with
+    /// the number of slices IT indexes, and prints that same number in its
+    /// pager — so Prev/Next, the wheel, PageDown and the assistive tree can
+    /// never disagree with the label about how many results exist. Three
+    /// renderers used to read one speculative count computed by their caller:
+    /// a portrait fit test decided the slice count for the side-by-side
+    /// landscape page, which indexes its renderer demonstration as a slice of
+    /// its own, and every short-landscape search page stopped one result short
+    /// of the total it printed ("7–7 of 8", with result 8 on no page at all).
+    ///
+    /// The sweep is route-independent and reads the printed label, not the
+    /// arithmetic, so it cannot re-derive the bug it is checking for.
+    #[test]
+    fn every_settings_page_bounds_the_reducer_with_the_count_its_pager_reports() {
+        const CHILD: &str = "ATERM_SETTINGS_PAGER_COUNT_RUNG";
+        const EXACT: &str = "native_settings::tests::every_settings_page_bounds_the_reducer_with_the_count_its_pager_reports";
+        let Some(rung) = std::env::var_os(CHILD) else {
+            for rung in ["1.0", "1.25", "2.0"] {
+                let status = std::process::Command::new(std::env::current_exe().unwrap())
+                    .args(["--exact", EXACT, "--nocapture"])
+                    .env(CHILD, rung)
+                    .env("RUST_TEST_THREADS", "1")
+                    .status()
+                    .expect("launch isolated Dynamic Type rung");
+                assert!(status.success(), "Dynamic Type rung {rung}");
+            }
+            return;
+        };
+        let scale: f32 = rung.to_string_lossy().parse().expect("rung is a number");
+        crate::native_appearance::install_preferences(
+            crate::native_appearance::AppearancePreferences {
+                text_scale: scale,
+                ..crate::native_appearance::current_preferences()
+            },
+        );
+        let (mut runtime, instance, view) = setup();
+        {
+            let Some(AppViewState::Settings(state)) = runtime.view_state_mut(view) else {
+                unreachable!()
+            };
+            state.replace_title_summary_health(window_page_health());
+        }
+        // Every width class, both sides of the compact/persistent-navigation
+        // boundary, and heights from the window minimum (164×98,
+        // `app_window.rs`) through the short-landscape band, the shipped
+        // default 744×420, the grid row above it, and a roomy desktop page.
+        const WIDTHS: [f32; 6] = [320.0, 480.0, 744.0, 760.0, 1040.0, 1200.0];
+        const HEIGHTS: [f32; 9] = [98.0, 200.0, 240.0, 320.0, 420.0, 437.0, 522.0, 700.0, 900.0];
+        // A global search is the one state where the caller's fit test and the
+        // renderer that ran disagreed; "" walks the plain category pages. The
+        // search page is route-independent (one Search Results page answers
+        // every route), so the queries walk it once rather than sixteen times.
+        for (query, routes) in [
+            ("", SettingsRoute::ALL.as_slice()),
+            ("cursor", &[SettingsRoute::Home]),
+            ("font", &[SettingsRoute::Home]),
+            ("padding", &[SettingsRoute::Home]),
+        ] {
+            for route in routes.iter().copied() {
+                for width in WIDTHS {
+                    for height in HEIGHTS {
+                        let cx = view_cx_at(width, height);
+                        {
+                            let Some(AppViewState::Settings(state)) = runtime.view_state_mut(view)
+                            else {
+                                unreachable!()
+                            };
+                            state.navigate(route);
+                            state.search = query.to_string();
+                            state.page_scroll = 0;
+                        }
+                        for page in 0..8 {
+                            {
+                                let Some(AppViewState::Settings(state)) =
+                                    runtime.view_state_mut(view)
+                                else {
+                                    unreachable!()
+                                };
+                                state.search = query.to_string();
+                                state.page_scroll = page;
+                            }
+                            let compiled = compile_settings_view(&runtime, instance, view, &cx);
+                            let Some(AppViewState::Settings(state)) = runtime.view_state(view)
+                            else {
+                                unreachable!()
+                            };
+                            let limit = state.result_page_limit.get();
+                            for (key, total) in pager_totals(&compiled) {
+                                assert_eq!(
+                                    limit,
+                                    Some(total.saturating_sub(1)),
+                                    "{scale}× {} {width}×{height} page {page}: {key} names \
+                                     {total} results while the reducer stops at {limit:?}",
+                                    if query.is_empty() {
+                                        route.path()
+                                    } else {
+                                        "search"
+                                    }
+                                );
+                            }
+                            if limit.is_some_and(|limit| page >= limit) {
+                                break;
+                            }
+                        }
+                    }
+                }
             }
         }
     }
@@ -23892,23 +24434,18 @@ mod tests {
         }
         let cx = view_cx_at(1_024.0, 768.0);
         let compiled = compile_settings_view(&runtime, instance, view, &cx);
-        for (key, why) in [
-            (
-                prefs::EDIT_CURSOR_TRAIL_STYLE,
-                "the companion picker is the reason this page exists",
-            ),
-            (
-                prefs::EDIT_CURSOR_TRAIL_WAKE_MS,
-                "the rainbow wake dial is the cat's own tuning row",
-            ),
-        ] {
-            assert!(
-                compiled
-                    .semantic(&UiKey::new(format!("settings/control/{key}")))
-                    .is_some(),
-                "{key}: {why}"
-            );
-        }
+        // One row, because there is one: the companion picker is the reason
+        // this page exists. It was a two-row sweep until `cursor_trail_wake_ms`
+        // was retired (2026-09-16).
+        assert!(
+            compiled
+                .semantic(&UiKey::new(format!(
+                    "settings/control/{}",
+                    prefs::EDIT_CURSOR_TRAIL_STYLE
+                )))
+                .is_some(),
+            "the companion picker must paint on the Cursor Kitty page"
+        );
 
         let outcome = runtime
             .dispatch(
@@ -23944,63 +24481,90 @@ mod tests {
         );
     }
 
-    /// The wake dial became a native row on 2026-08-10; prove it reaches the
-    /// ENGINE, not merely the form. `cursor_trail_wake_ms` must arrive at
+    /// THE RETIRED TYPING-WAKE ROW IS OFF THE KITTY PAGE, AND OFF EVERY OTHER
+    /// ONE. Its predecessor here — `the_rainbow_wake_row_lands_on_the_kitty_page
+    /// _and_reaches_the_glow` — asserted the dial "must arrive at
     /// `GlowConfig::wake_persist_s` — the field `cursor_glow` reads when it lays
-    /// the typing plume — and must carry the honest "Inactive · Cursor trail
-    /// Off" disclosure the rest of the trail surface carries. A row that only
-    /// round-trips through TOML is the inert switch this repo has been burned by.
+    /// the typing plume", and it went on passing for ten days after the v2
+    /// rewrite deleted that reader, because arriving at a field is not being
+    /// read. This is the same law pointed the honest way: the key is a RETIRED
+    /// config key, it is not an editable field anywhere, and the Cursor Kitty
+    /// page's content is its showcase card.
     #[test]
-    fn the_rainbow_wake_row_lands_on_the_kitty_page_and_reaches_the_glow() {
+    fn the_retired_typing_wake_key_is_no_longer_a_settings_row_anywhere() {
+        let retired = crate::native_config_language::retired_config_key("cursor_trail_wake_ms")
+            .expect("the typing-wake dial is a retired config key");
+        assert_eq!(retired.feature, "Rainbow kitty typing wake");
+        assert_eq!(retired.effect_label, "No effect");
+        assert!(crate::native_config_language::is_compatibility_only_key(
+            "cursor_trail_wake_ms"
+        ));
+        assert!(
+            crate::native_config_language::config_schema_entry("cursor_trail_wake_ms").is_none(),
+            "a retired key is not an active Manual schema entry"
+        );
+        assert!(
+            prefs::editable_fields(&Config::default())
+                .iter()
+                .all(|field| field.key != "cursor_trail_wake_ms"),
+            "a retired key must not be an editable row on any page"
+        );
+        assert!(
+            !prefs::VISUAL_PREVIEW_KEYS.contains(&"cursor_trail_wake_ms"),
+            "a preview key must move something on the glass"
+        );
+    }
+
+    /// THE CURSOR KITTY PAGE IS ITS SHOWCASE CARD. Retiring the wake dial left
+    /// the page with no ordinary registry row at all, and that is correct: the
+    /// companion picker is the reason the page exists (`cursor_kitty_card`),
+    /// and the only other key filed here — `cursor_nyan_sprite` — is a
+    /// filesystem-backed asset source Manual owns. This pins the shape so the
+    /// page can never quietly become empty: the section holds exactly those two
+    /// keys, neither paints an ordinary row, and the card paints.
+    #[test]
+    fn the_cursor_kitty_page_is_its_showcase_card() {
+        let filed = prefs::VISUAL_PREVIEW_KEYS
+            .iter()
+            .copied()
+            .filter(|key| prefs::section_of(key) == prefs::Section::CursorKitty)
+            .collect::<Vec<_>>();
         assert_eq!(
-            prefs::section_of(prefs::EDIT_CURSOR_TRAIL_WAKE_MS),
-            prefs::Section::CursorKitty
+            filed,
+            vec![
+                prefs::EDIT_CURSOR_TRAIL_STYLE,
+                prefs::EDIT_CURSOR_NYAN_SPRITE
+            ],
+            "the cat's page holds the companion picker and the kitty art, and nothing else"
         );
         assert_eq!(
             SettingsRoute::CursorKitty.section(),
             Some(prefs::Section::CursorKitty),
             "the route and the section must agree or the page paints empty"
         );
-        assert!(
-            settings_field_is_visible(prefs::EDIT_CURSOR_TRAIL_WAKE_MS, false, false),
-            "a Manual-only key would leave the page with nothing but a card"
-        );
-        assert_eq!(
-            prefs::group_of(prefs::EDIT_CURSOR_TRAIL_WAKE_MS).0,
-            "Rainbow wake"
-        );
-        assert!(
-            prefs::group_footnote("Rainbow wake")
-                .is_some_and(|note| note.contains("0 hides the plume"))
-        );
+        for key in filed {
+            assert!(
+                !settings_field_is_visible(key, false, false),
+                "{key} paints no ordinary row: the card owns this page"
+            );
+        }
 
-        let config: Config = aterm_toml::from_str("cursor_trail_wake_ms = 900\n").unwrap();
-        let glow = crate::app_config::resolve_cursor_glow(
-            crate::app_config::CursorGlowInputs {
-                enabled: true,
-                color: None,
-                accent: None,
-                duration_ms: 260,
-                length: 24,
-                intensity: 0.7,
-                radius: 0.6,
-                ring: true,
-                wake_persist_s: config.cursor_trail_wake_persist_or_default(),
-            },
-            crate::app_config::resolve_trail_presentation(
-                config.cursor_trail_style_raw(),
-                &crate::app_config::TrailPackCatalog::default(),
-            ),
-            0x00FF_FFFF,
-            true,
-            0x00C8_D3F5,
-            0x001A_1B26,
-            0.5,
-        );
+        let (mut runtime, instance, view) = setup();
+        {
+            let Some(AppViewState::Settings(state)) = runtime.view_state_mut(view) else {
+                unreachable!();
+            };
+            state.navigate(SettingsRoute::CursorKitty);
+        }
+        let compiled = compile_settings_view(&runtime, instance, view, &view_cx_at(1_024.0, 768.0));
         assert!(
-            (glow.wake_persist_s - 0.9).abs() < 1e-6,
-            "the saved dial must reach the engine's plume length, got {}",
-            glow.wake_persist_s
+            compiled
+                .semantic(&UiKey::new(format!(
+                    "settings/control/{}",
+                    prefs::EDIT_CURSOR_TRAIL_STYLE
+                )))
+                .is_some(),
+            "the companion picker is what makes this page non-empty"
         );
     }
 
@@ -24603,6 +25167,9 @@ mod tests {
             outcome: "up to date".to_string(),
             seams: Vec::new(),
             last_success_at: String::new(),
+            last_index_reached_at: String::new(),
+            last_index_build: 0,
+            index_build_changed_at: String::new(),
             programs,
         };
         let mut service = crate::packages_screen::PackagesService::new();
@@ -24667,6 +25234,9 @@ mod tests {
             outcome: "up to date".to_string(),
             seams: Vec::new(),
             last_success_at: String::new(),
+            last_index_reached_at: String::new(),
+            last_index_build: 0,
+            index_build_changed_at: String::new(),
             programs,
         };
         let mut service = crate::packages_screen::PackagesService::new();
@@ -24706,6 +25276,7 @@ mod tests {
             would_migrate,
             scan_complete: true,
             home,
+            config_unreadable: false,
         }
     }
 
@@ -24723,6 +25294,9 @@ mod tests {
                 outcome: "up to date".to_string(),
                 seams: Vec::new(),
                 last_success_at: String::new(),
+                last_index_reached_at: String::new(),
+                last_index_build: 0,
+                index_build_changed_at: String::new(),
                 programs: std::collections::BTreeMap::new(),
             }),
             &[],
@@ -24879,6 +25453,9 @@ mod tests {
             outcome: "up to date".to_string(),
             seams: Vec::new(),
             last_success_at: String::new(),
+            last_index_reached_at: String::new(),
+            last_index_build: 0,
+            index_build_changed_at: String::new(),
             programs,
         };
         let mut service = crate::packages_screen::PackagesService::new();
@@ -24998,6 +25575,143 @@ mod tests {
     /// (enabled exactly when the verdict says something is left to do); and it is
     /// absent from Modified and from a global search. On a short landscape window
     /// it is a slice of its own, never shed.
+    /// THE OTHER DOOR THE PROMISE OFFERS. "Apply now" exists as a button on the card
+    /// AND as a palette command; the command had no test at all, so its id, its title,
+    /// its enabled bit and its absence off the Security route were free to drift.
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn the_security_route_offers_the_machine_apply_command_in_the_palette() {
+        use atpkg::machine::{HomePosture, UcPosture};
+        let (mut runtime, instance, view) = setup();
+        let command_named = |runtime: &NativeRuntime, view| {
+            runtime
+                .commands(instance, view)
+                .unwrap()
+                .into_iter()
+                .find(|command| command.id.as_str() == "machine/apply")
+        };
+        // Another route: absent, however the machine reads.
+        assert!(runtime.replace_settings_packages(
+            live_packages_state_with_machine(
+                None,
+                Ok(machine_state_fixture(
+                    UcPosture::Default,
+                    2,
+                    HomePosture::Account
+                )),
+            ),
+            2,
+        ));
+        {
+            let Some(AppViewState::Settings(state)) = runtime.view_state_mut(view) else {
+                unreachable!();
+            };
+            state.navigate(SettingsRoute::Packages);
+        }
+        assert!(
+            command_named(&runtime, view).is_none(),
+            "the command belongs to Security"
+        );
+
+        // Security, with something to apply: offered and ENABLED.
+        {
+            let Some(AppViewState::Settings(state)) = runtime.view_state_mut(view) else {
+                unreachable!();
+            };
+            state.navigate(SettingsRoute::Security);
+        }
+        let offered = command_named(&runtime, view).expect("Security offers it");
+        assert_eq!(offered.title, "This Mac: Apply Machine Settings Now");
+        assert!(offered.enabled, "something is left to apply");
+
+        // Nothing left to apply: still offered (the card is there), but disabled —
+        // the same bit the button reads, so the two doors never disagree.
+        assert!(runtime.replace_settings_packages(
+            live_packages_state_with_machine(
+                None,
+                Ok(machine_state_fixture(
+                    UcPosture::Disabled,
+                    0,
+                    HomePosture::Account
+                )),
+            ),
+            3,
+        ));
+        let settled = command_named(&runtime, view).expect("still offered");
+        assert!(!settled.enabled, "nothing to apply ⇒ nothing to press");
+    }
+
+    /// THE PAGE LIMIT MUST COUNT EVERY SLICE THE RENDERER DRAWS. The landscape pager
+    /// bounds `page_scroll` by `record_result_page_limit`, and that count omitted the
+    /// macOS-access and This Mac cards — which the renderer DOES count as slices — so on
+    /// a window that pages, the rows after them could not be reached: on Security, that
+    /// is the two `[machine]` switches, the whole point of the card above them.
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn the_landscape_pager_reaches_the_last_security_row_with_both_cards_present() {
+        use aterm_containment::FdaScope;
+        use atpkg::machine::{HomePosture, UcPosture};
+        let (mut runtime, instance, view) = setup();
+        {
+            let Some(AppViewState::Settings(state)) = runtime.view_state_mut(view) else {
+                unreachable!();
+            };
+            state.navigate(SettingsRoute::Security);
+            assert!(state.replace_macos_access(access_fixture(
+                FdaState::Denied,
+                DrClass::Identity,
+                FdaScope::Unknown
+            )));
+        }
+        assert!(runtime.replace_settings_packages(
+            live_packages_state_with_machine(
+                None,
+                Ok(machine_state_fixture(
+                    UcPosture::Default,
+                    2,
+                    HomePosture::Account
+                )),
+            ),
+            3,
+        ));
+        let cx = view_cx_at(624.0, 348.0);
+        // Page through with the PAGE-DOWN ACTION, not by writing `page_scroll`: the
+        // limit is what clamps that reducer, so a test that sets the field directly
+        // cannot see a limit that is too small.
+        let mut seen: std::collections::BTreeSet<String> = std::collections::BTreeSet::new();
+        for page in 0..64 {
+            if page > 0 {
+                runtime
+                    .dispatch(
+                        instance,
+                        view,
+                        AppEvent::Action(ActionInvocation {
+                            id: ActionId::new("settings/page-down"),
+                            value: None,
+                        }),
+                    )
+                    .unwrap();
+            }
+            let compiled = compile_settings_view(&runtime, instance, view, &cx);
+            compiled.validate_parity().unwrap();
+            let rows: Vec<String> = compiled
+                .semantics
+                .iter()
+                .filter(|node| node.key.as_str().starts_with("settings/row/"))
+                .map(|node| node.key.as_str().to_string())
+                .collect();
+            // No early break: the first pages are the two cards and carry no control
+            // row at all, which is exactly the shape that made the old limit too short.
+            seen.extend(rows);
+        }
+        for key in ["machine.universal_control", "machine.spotlight_noindex"] {
+            assert!(
+                seen.iter().any(|row| row.contains(key)),
+                "paging never reached {key}: {seen:?}"
+            );
+        }
+    }
+
     #[test]
     fn the_security_page_paints_the_machine_card_only_on_macos_once_observed() {
         use atpkg::machine::{HomePosture, UcPosture};
@@ -25103,7 +25817,7 @@ mod tests {
                 .semantic(&UiKey::new("settings/machine/next"))
                 .unwrap()
                 .label
-                .starts_with("Nothing to apply")
+                .starts_with("Nothing an apply can do")
         );
         assert!(
             compiled
@@ -25626,6 +26340,184 @@ mod tests {
         );
     }
 
+    /// A live packages snapshot whose one program carries `state` VERBATIM — the shape
+    /// of the 2026-09-14 incident when `state` is the recorded refusal.
+    fn packages_state_with_program_state(state: &str) -> PackagesState {
+        let mut programs = std::collections::BTreeMap::new();
+        programs.insert(
+            "ay".to_string(),
+            atpkg::ProgramStatus {
+                installed_build: Some(1971),
+                state: state.to_string(),
+                tree_root: String::new(),
+            },
+        );
+        let status = atpkg::Status {
+            schema: 1,
+            updated_at: "2026-09-14T00:00:00Z".to_string(),
+            enabled: true,
+            index_source: "alabsystems/aterm".to_string(),
+            outcome: "install failed".to_string(),
+            seams: Vec::new(),
+            last_success_at: String::new(),
+            last_index_reached_at: String::new(),
+            last_index_build: 0,
+            index_build_changed_at: String::new(),
+            programs,
+        };
+        let mut service = crate::packages_screen::PackagesService::new();
+        let sequence = service.begin(None).unwrap();
+        assert!(service.finish(
+            sequence,
+            crate::packages_screen::PackagesWorkerCompletion::refresh(
+                crate::packages_screen::PackagesStatusReport::from_parts(
+                    true,
+                    true,
+                    "fp".to_string(),
+                    Some(&status),
+                    &[],
+                ),
+            ),
+        ));
+        service.state(true, true, true, false, true)
+    }
+
+    /// 2026-09-14: the install pass recorded a ~700-character `error: stage: …` state
+    /// whose `fix:` clause came LAST; the row ellipsized it to one line, cutting exactly
+    /// the fix. Now the fix leads, whole, on continuation lines under its row at every
+    /// width — measured by the painter, not just the character budget — and a short
+    /// state still paints byte-for-byte as before.
+    #[test]
+    fn packages_long_reason_rows_put_the_fix_first_and_keep_short_states_stable() {
+        let incident = format!(
+            "error: stage: {}",
+            atpkg::lay::tracked_refusal("run the helper", "launchd job exited 78")
+        );
+        assert!(
+            incident.chars().count() > 600,
+            "{}",
+            incident.chars().count()
+        );
+        let fix_at = incident
+            .find(" fix: ")
+            .expect("atpkg spells the remedy ` fix: `");
+        let fix_clause = &incident[fix_at + " fix: ".len()..];
+        let widths = [
+            SettingsWidth::Compact,
+            SettingsWidth::Medium,
+            SettingsWidth::Wide,
+        ];
+
+        // The common case: one line, the canonical state inline, identical at every width.
+        let short = packages_state_with_program_state("managed 1971 \u{2014} pinned by index 41")
+            .projection();
+        for width in widths {
+            let lines = packages_program_lines(&short, width);
+            assert_eq!(lines.len(), 1, "{width:?}");
+            assert_eq!(
+                lines[0].text,
+                "ay  \u{b7}  build 1971  \u{b7}  managed 1971 \u{2014} pinned by index 41",
+                "{width:?}"
+            );
+            assert!(!lines[0].continuation);
+            assert_eq!(packages_program_row_count(&short, width), 1);
+        }
+
+        // The incident: the state leaves the row, and the fix is the first line under it.
+        let long = packages_state_with_program_state(&incident).projection();
+        for width in widths {
+            let budget = packages_reason_wrap_chars(width);
+            let lines = packages_program_lines(&long, width);
+            assert_eq!(lines[0].key, "packages/programs/ay");
+            assert_eq!(lines[0].text, "ay  \u{b7}  build 1971", "{width:?}");
+            assert!(!lines[0].continuation && lines[0].install.is_none());
+            let reason: Vec<String> = lines[1..].iter().map(|line| line.text.clone()).collect();
+            assert_eq!(
+                reason,
+                crate::packages_screen::reason_lines(&incident, budget),
+                "{width:?}"
+            );
+            for (index, line) in lines[1..].iter().enumerate() {
+                assert!(line.continuation && line.install.is_none() && !line.heading);
+                assert_eq!(
+                    line.key,
+                    format!("packages/programs/ay/reason/{}", index + 1)
+                );
+                // The wrap measures glyph ADVANCE, not characters (a line of narrow
+                // glyphs may hold more than `budget` of them); the paint audit below is
+                // what says the line fits the row.
+                assert!(
+                    line.text.chars().count() <= budget * 5 / 4,
+                    "{width:?}: {:?}",
+                    line.text
+                );
+            }
+            assert!(
+                lines[1]
+                    .text
+                    .starts_with("fix: unset ATPKG_REFUSE_TRACKED_INSTALL"),
+                "{width:?}: {:?}",
+                lines[1].text
+            );
+            let fix_lines: Vec<&str> = reason
+                .iter()
+                .map(String::as_str)
+                .take_while(|line| {
+                    !line.starts_with("error: stage:") && !line.starts_with('\u{2026}')
+                })
+                .collect();
+            assert_eq!(
+                fix_lines.join(" "),
+                format!("fix: {fix_clause}"),
+                "{width:?}: nothing of the fix is cut"
+            );
+            assert_eq!(packages_program_row_count(&long, width), lines.len());
+        }
+
+        // Painted, every continuation line fits its box at the compact and the wide
+        // viewport — the painter's own overflow audit, not the character budget.
+        for (viewport_width, viewport_height) in [(474.0_f32, 658.0_f32), (1_280.0, 800.0)] {
+            let (mut runtime, instance, view) = setup();
+            assert!(
+                runtime.replace_settings_packages(packages_state_with_program_state(&incident), 2)
+            );
+            let cx = view_cx_at(viewport_width, viewport_height);
+            let mut reason_audit = Vec::new();
+            for page in 0..16 {
+                let Some(AppViewState::Settings(state)) = runtime.view_state_mut(view) else {
+                    unreachable!();
+                };
+                state.navigate(SettingsRoute::Packages);
+                state.page_scroll = page;
+                let compiled = compile_settings_view(&runtime, instance, view, &cx);
+                let painted: Vec<String> = compiled
+                    .paint_audit_lines()
+                    .into_iter()
+                    .filter(|line| line.contains("paint-text key=\"packages/programs/ay/reason/"))
+                    .collect();
+                if !painted.is_empty() {
+                    reason_audit = painted;
+                    break;
+                }
+            }
+            assert!(
+                reason_audit
+                    .iter()
+                    .any(|line| line.contains("packages/programs/ay/reason/1")),
+                "{viewport_width}: the fix line paints:\n{}",
+                reason_audit.join("\n")
+            );
+            assert!(
+                reason_audit
+                    .iter()
+                    .all(|line| line.contains("overflow=false")
+                        && !line.contains("clip-truncated=true")),
+                "{viewport_width}:\n{}",
+                reason_audit.join("\n")
+            );
+        }
+    }
+
     /// The grouped program list and its controls (§17.2 states verbatim; S9's extras
     /// with vendor · license · size; §17.8's door): a store with a default member, an
     /// extra awaiting consent and the two admin rows derives three group headings, an
@@ -25668,6 +26560,9 @@ mod tests {
                 outcome: "up to date".to_string(),
                 seams: Vec::new(),
                 last_success_at: String::new(),
+                last_index_reached_at: String::new(),
+                last_index_build: 0,
+                index_build_changed_at: String::new(),
                 programs,
             };
             let mut service = crate::packages_screen::PackagesService::new();
@@ -25689,7 +26584,7 @@ mod tests {
 
         // The derivation every rendering reads.
         let projection = grouped_state().projection();
-        let lines = packages_program_lines(&projection);
+        let lines = packages_program_lines(&projection, SettingsWidth::Wide);
         let keys: Vec<&str> = lines.iter().map(|line| line.key.as_str()).collect();
         assert_eq!(
             keys,
@@ -25753,14 +26648,14 @@ mod tests {
             );
         }
         assert_eq!(
-            packages_program_row_count(&projection),
+            packages_program_row_count(&projection, SettingsWidth::Wide),
             lines.len() + if cfg!(target_os = "macos") { 3 } else { 1 },
             "the compact page stacks one item per control"
         );
         // One group needs no heading — the single-member store reads as before.
         let single = live_packages_state(None).projection();
         assert_eq!(
-            packages_program_lines(&single)
+            packages_program_lines(&single, SettingsWidth::Wide)
                 .iter()
                 .map(|line| line.key.as_str())
                 .collect::<Vec<_>>(),
@@ -29871,7 +30766,8 @@ mod tests {
             // Packages uses the same stable atomic-page contract for status,
             // both actions, all three maintenance switches, and every bounded program.
             let packages_state = live_packages_state(None);
-            let packages_total = packages_compact_sections(&packages_state.projection());
+            let packages_total =
+                packages_compact_sections(&packages_state.projection(), SettingsWidth::Compact);
             let (mut runtime, instance, view) = setup();
             assert!(runtime.replace_settings_packages(packages_state, 2));
             {
@@ -32308,7 +33204,8 @@ mod tests {
         );
 
         let compact_packages_state = live_packages_state(None);
-        let compact_total = packages_compact_sections(&compact_packages_state.projection());
+        let compact_total =
+            packages_compact_sections(&compact_packages_state.projection(), SettingsWidth::Compact);
         let (mut compact_runtime, compact_instance, compact_view) = setup();
         assert!(compact_runtime.replace_settings_packages(compact_packages_state, 2));
         let mut compact_consent = None;
@@ -35440,18 +36337,13 @@ enabled = true
         // reaches this box as a per-row disclosure instead — the reasoning is
         // recorded in full at `prefs::SOUND_MENU_KEYS`.
         //
-        // THE RAINBOW WAKE DIAL (2026-08-10): +1 on every platform. Same
-        // conscious decision as the intensity slider above, taken for the same
-        // reason: `cursor_trail_wake_ms` has shipped for a long time, is
-        // carried every frame through `GlowConfig::wake_persist_s` (read by
-        // no style since the v1 deletion, 2026-09-06 — parsed but inert, see
-        // `Config::cursor_trail_wake_ms`), is clamped at the resolver, and
-        // was reachable only from Manual — and it is the ONE
-        // tuning knob that belongs to the cursor kitty rather than to the trail
-        // engine, so the cat's new page would otherwise carry a picker and
-        // nothing else. Its live consumer is pinned by
-        // `the_rainbow_wake_row_lands_on_the_kitty_page_and_reaches_the_glow`,
-        // and its trail-master disclosure by the `TRAIL_TUNING_KEYS` sweep.
+        // THE RAINBOW WAKE DIAL was +1 on every platform from 2026-08-10 to
+        // 2026-09-16, admitted on "carried every frame through
+        // `GlowConfig::wake_persist_s`" and kept after that stopped being true.
+        // It is retired; the count is one lower on every platform, and the
+        // Cursor Kitty page carries its picker card and nothing else — which
+        // `native_config_language::RETIRED_CONFIG_KEYS` and
+        // `the_cursor_kitty_page_is_its_showcase_card` now say out loud.
         // THE TYPING-MOMENTUM GLOW (2026-09-08): +1 on every platform. The
         // owner asked for it by name ("the blinking cursor is annoying, I want
         // some momentum glow for typing faster that cools down"), it ships
@@ -35471,11 +36363,11 @@ enabled = true
         assert_eq!(
             ordinary_count,
             if cfg!(target_os = "macos") {
-                58
+                57
             } else if cfg!(windows) {
-                53
+                52
             } else {
-                51
+                50
             },
             // +1 on every platform (2026-08-21): allow_osc52_query became an
             // ordinary Advanced switch when the GUI's clipboard callback
@@ -35524,11 +36416,11 @@ enabled = true
             // the one control the owner named first, and the only one every
             // other row in the box is scaled by.
             ("Sound", prefs::EDIT_TRAIL_SOUND_VOLUME),
-            // The Cursor Kitty page's one group box. (Its "Companion" caption
-            // belongs to `cursor_trail_style`, a Top Setting the ordinary form
-            // never draws, so that caption is not an ordinary group and needs
-            // no witness — the showcase card owns that row.)
-            ("Rainbow wake", prefs::EDIT_CURSOR_TRAIL_WAKE_MS),
+            // The Cursor Kitty page contributes NO ordinary group box. Its
+            // "Companion" caption belongs to `cursor_trail_style`, a Top
+            // Setting the ordinary form never draws — the showcase card owns
+            // that row — and its one real box, "Rainbow wake", went with the
+            // retired dial (2026-09-16).
         ];
         if cfg!(target_os = "macos") {
             group_witnesses.push(("Transparency", prefs::EDIT_BACKGROUND_OPACITY));
@@ -35571,9 +36463,6 @@ enabled = true
             // The Sound box's footnote must name what the VOLUME slider does
             // and does not reach — the reason the bell needed its own row.
             ("Sound", "Volume"),
-            // The wake box must say what `0` does: a bare 0..1500 dial reads as
-            // "off means no cat", and it does not.
-            ("Rainbow wake", "0 hides the plume"),
         ] {
             if ordinary_groups.contains(group) {
                 let note = prefs::group_footnote(group)
@@ -35606,14 +36495,32 @@ enabled = true
             let Some(section) = route.section() else {
                 continue;
             };
-            assert!(
-                fields.iter().any(|field| {
-                    prefs::section_of(field.key) == section
-                        && settings_field_is_visible(field.key, false, false)
-                }),
-                "{} must not be an empty Advanced destination",
-                route.label()
-            );
+            let has_ordinary_row = fields.iter().any(|field| {
+                prefs::section_of(field.key) == section
+                    && settings_field_is_visible(field.key, false, false)
+            });
+            if !has_ordinary_row {
+                // AN EMPTY DESTINATION IS THE DEFECT; A ROWLESS ONE IS NOT THE
+                // SAME THING. This asked "does the route own a visible ordinary
+                // field" as a proxy for "does the route show the user
+                // anything", and the proxy held only while every destination
+                // was built out of registry rows. Cursor Kitty is not: its
+                // content is the companion showcase card (`cursor_kitty_card`,
+                // which "can never be shed outright"), and its two filed keys
+                // are a Top Setting and a Manual-only asset path. The proxy
+                // also passed this page for six weeks while its one row was
+                // `cursor_trail_wake_ms`, a dial nothing read — so it was
+                // admitting an empty page and is now about to refuse a full
+                // one. The exception is therefore enumerated, not widened, and
+                // the card itself is pinned by
+                // `the_cursor_kitty_page_is_its_showcase_card`.
+                assert_eq!(
+                    route,
+                    SettingsRoute::CursorKitty,
+                    "{} must not be an empty Advanced destination",
+                    route.label()
+                );
+            }
         }
 
         let predictive = fields
@@ -38178,7 +39085,33 @@ enabled = true
                         .map(|field| field.key.to_string())
                         .collect::<BTreeSet<_>>()
                 };
-                assert!(!expected.is_empty(), "{} has curated fields", route.label());
+                if expected.is_empty() {
+                    // A ROUTE WITH NO ORDINARY ROWS IS NOT A VACUOUS RUN — but
+                    // it must be a KNOWN one. Cursor Kitty's content is its
+                    // companion showcase card (`cursor_kitty_card`): both keys
+                    // filed there are drawn by something other than the
+                    // ordinary registry, so this sweep — which checks that
+                    // every registry row is reachable, with an unelided label,
+                    // at 2x on a 320pt page — has nothing of its own to check
+                    // and would otherwise pass vacuously.
+                    //
+                    // The guard was `assert!(!expected.is_empty())`, which
+                    // measured "does this page have rows" as a proxy for "does
+                    // this page have content". That proxy failed the moment the
+                    // page's one row (the retired `cursor_trail_wake_ms`) was a
+                    // row for nothing. So: the empty set is admitted for
+                    // exactly this route and no other, and the thing that
+                    // actually makes it non-empty is pinned where it belongs,
+                    // by `the_cursor_kitty_page_is_its_showcase_card`.
+                    assert_eq!(
+                        route,
+                        SettingsRoute::CursorKitty,
+                        "{} lost every curated field: a page with no rows must be a page \
+                         whose content is a card, and only Cursor Kitty is one",
+                        route.label()
+                    );
+                    continue;
+                }
                 let cx = view_cx_at(320.0, 568.0);
                 let mut reached = BTreeSet::new();
                 for page in 0..=expected.len() {
@@ -38374,13 +39307,18 @@ enabled = true
             let byline = compiled
                 .semantic(&UiKey::new("about/byline"))
                 .expect("native About exposes its attribution semantically");
-            assert_eq!(byline.label, "By Andrew Yates \u{00b7} ALab");
+            // Author · company · site — where aterm comes from, on the hero itself.
+            let want = format!(
+                "By Andrew Yates \u{00b7} ALab \u{00b7} {}",
+                aterm_types::identity::SITE
+            );
+            assert_eq!(byline.label, want);
             assert!(compiled.paint.iter().any(|node| {
                 node.key == UiKey::new("about/byline")
                     && matches!(
                         &node.content,
                         UiContent::Text(TextSpec { text, .. })
-                            if text == "By Andrew Yates \u{00b7} ALab"
+                            if *text == want
                     )
             }));
             assert!(
@@ -38388,6 +39326,159 @@ enabled = true
                     .semantic(&UiKey::new("about/provenance/row/company"))
                     .is_none(),
                 "company is part of the shared byline, not build metadata"
+            );
+        }
+    }
+
+    /// The byline steps down a fixed ladder — author · company · site, then
+    /// author · company, then the author alone — to the longest form its hero
+    /// column really fits, so no width or text scale ever paints it elided. The
+    /// site joined the line on 2026-09-14 and clipped a 286.5pt phone column at
+    /// 1× ("…alab.sy…", 223.2pt required against 206.5pt available). Every
+    /// scale runs as its own child process: the text scale is process-global.
+    #[test]
+    fn native_about_byline_steps_down_to_the_longest_form_its_column_fits() {
+        const CHILD: &str = "ATERM_ABOUT_BYLINE_FIT_CHILD";
+        const SCALE: &str = "ATERM_ABOUT_BYLINE_FIT_SCALE";
+        const EXACT: &str = "native_settings::tests::native_about_byline_steps_down_to_the_longest_form_its_column_fits";
+        if std::env::var_os(CHILD).is_none() {
+            for scale in ["1.0", "1.5", "2.0"] {
+                let status = std::process::Command::new(std::env::current_exe().unwrap())
+                    .args(["--exact", EXACT, "--nocapture"])
+                    .env(CHILD, "1")
+                    .env(SCALE, scale)
+                    .env("RUST_TEST_THREADS", "1")
+                    .status()
+                    .expect("launch isolated About byline fit audit");
+                assert!(
+                    status.success(),
+                    "About byline fit audit failed at {scale}×"
+                );
+            }
+            return;
+        }
+
+        let scale = std::env::var(SCALE).unwrap().parse::<f32>().unwrap();
+        crate::native_appearance::install_preferences(
+            crate::native_appearance::AppearancePreferences {
+                text_scale: scale,
+                ..crate::native_appearance::current_preferences()
+            },
+        );
+        let author_company = crate::build_info::AUTHOR_COMPANY_BYLINE;
+        let full = format!("{author_company} \u{00b7} {}", aterm_types::identity::SITE);
+        let ladder = [full.as_str(), author_company, "Andrew Yates"];
+        // The byline is Text/Success: the Body step, 13pt × scale, UI face.
+        let px = 13.0 * scale;
+        let (mut runtime, instance, view) = setup();
+        runtime
+            .dispatch(
+                instance,
+                view,
+                AppEvent::Action(ActionInvocation {
+                    id: route_action(SettingsRoute::About),
+                    value: None,
+                }),
+            )
+            .unwrap();
+        let byline_at = |width: f32, height: f32| {
+            let cx = view_cx_at(width, height);
+            let compiled = runtime
+                .render(instance, view, &cx)
+                .unwrap()
+                .compile(cx.viewport)
+                .unwrap();
+            let node = compiled
+                .paint
+                .iter()
+                .find(|node| node.key == UiKey::new("about/byline"))?;
+            let UiContent::Text(spec) = &node.content else {
+                panic!("{width}x{height} at {scale}×: the byline is a text node");
+            };
+            let audit = compiled
+                .paint_audit_lines()
+                .into_iter()
+                .find(|line| line.starts_with("paint-text key=\"about/byline\" "))
+                .expect("the renderer audits the byline's fit");
+            let large_type_narrow = compiled.paint.iter().any(|node| {
+                node.key == UiKey::new("about/eyebrow")
+                    && matches!(
+                        &node.content,
+                        UiContent::Text(TextSpec { text, .. }) if text == "NATIVE APP"
+                    )
+            });
+            let label = compiled
+                .semantic(&UiKey::new("about/byline"))
+                .map(|semantic| semantic.label.clone());
+            Some((
+                spec.text.clone(),
+                node.rect.width,
+                audit,
+                large_type_narrow,
+                label,
+            ))
+        };
+
+        let mut rungs_seen = [0usize; 3];
+        // 336pt tall puts a 480-760pt compact host in the landscape pager,
+        // where the hero shares its row with the fixed-width side pager.
+        for height in [558.0_f32, 336.0, 400.0, 820.0] {
+            let mut width = 240.0_f32;
+            while width <= 1_320.0 {
+                if let Some((text, available, audit, large_type_narrow, _)) =
+                    byline_at(width, height)
+                {
+                    let context = format!("{width}x{height} at {scale}×");
+                    let rung = ladder
+                        .iter()
+                        .position(|form| *form == text)
+                        .unwrap_or_else(|| panic!("{context}: {text:?} is not a byline form"));
+                    assert!(
+                        audit.contains(" overflow=false "),
+                        "{context}: the byline paints truncated: {audit}"
+                    );
+                    assert!(
+                        crate::tray_raster::ui_text_width(&text, px) <= available,
+                        "{context}: {text:?} is wider than its {available}pt column"
+                    );
+                    if large_type_narrow {
+                        assert_eq!(
+                            rung, 2,
+                            "{context}: large-type narrow keeps the author alone"
+                        );
+                    } else if rung > 0 {
+                        let longer = ladder[rung - 1];
+                        assert!(
+                            crate::tray_raster::ui_text_width(longer, px) > available,
+                            "{context}: {longer:?} fits the {available}pt column, yet the byline painted {text:?}"
+                        );
+                    }
+                    rungs_seen[rung] += 1;
+                }
+                width += 7.5;
+            }
+        }
+        assert!(
+            rungs_seen[0] > 0,
+            "the sweep paints the whole byline somewhere at {scale}×: {rungs_seen:?}"
+        );
+
+        if scale == 1.0 {
+            let (text, available, audit, _, label) =
+                byline_at(286.5, 558.0).expect("the phone About hero paints its byline");
+            assert_eq!(
+                text, author_company,
+                "the phone column keeps author and company"
+            );
+            assert_eq!(label.as_deref(), Some(author_company));
+            assert!(
+                (available - 206.5).abs() < 0.05,
+                "phone byline column: {available}"
+            );
+            assert!(audit.contains(" overflow=false "), "{audit}");
+            assert!(
+                rungs_seen[1] > 0,
+                "the 1× sweep crosses from the whole byline to author and company: {rungs_seen:?}"
             );
         }
     }
@@ -38475,7 +39566,7 @@ enabled = true
             "page 1 of a wide search must list native result rows, not only the Manual card"
         );
         assert!(
-            rows.iter().any(|key| key.ends_with("cursor_trail_wake_ms")),
+            rows.iter().any(|key| key.ends_with("cursor_trail_style")),
             "the ranked native match paints on page 1: {rows:?}"
         );
         // The window the pager/summary reports covers what is actually painted:

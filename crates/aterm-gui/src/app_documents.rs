@@ -5003,6 +5003,53 @@ mod tests {
         let _ = fs::remove_dir_all(dir);
     }
 
+    /// NumLock off, the keypad 1 is KP_End. Through the real key path
+    /// (`App::on_key` -> `keymap::build_key_input` -> `App::input`) the
+    /// editor receives `NumpadEnd` — the identity DECKPAM and kitty need on
+    /// the PTY side — and the native reducer folds it onto End, so the caret
+    /// moves to the line end exactly as the same press did before the seam
+    /// told the keypad apart (when the reducer's `_ => None` arm swallowed
+    /// it instead).
+    #[test]
+    fn numlock_off_keypad_end_moves_the_editor_caret_to_the_line_end() {
+        let dir = std::env::temp_dir().join(format!(
+            "aterm-config-editor-keypad-end-{}",
+            std::process::id()
+        ));
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("aterm.toml");
+        fs::write(&path, "win").unwrap();
+        let mut app = App::headless_for_test();
+        let wid = WindowId(0);
+        app.ensure_and_open_config_editor_path_in_window(wid, &path)
+            .unwrap();
+        let (_, view) = app.active_native_view(wid).unwrap();
+        assert_eq!(
+            editor_buffer(&app, view).primary_selection(),
+            &crate::native_editor::Selection { anchor: 0, head: 0 },
+            "a freshly opened document starts at the top"
+        );
+
+        app.on_key(
+            wid,
+            winit::event::KeyEvent::synthetic_for_test(
+                winit::keyboard::PhysicalKey::Code(winit::keyboard::KeyCode::Numpad1),
+                winit::keyboard::Key::Named(winit::keyboard::NamedKey::End),
+                None,
+                winit::keyboard::KeyLocation::Numpad,
+                winit::event::ElementState::Pressed,
+                false,
+            ),
+        );
+        assert_eq!(
+            editor_buffer(&app, view).primary_selection(),
+            &crate::native_editor::Selection { anchor: 3, head: 3 },
+            "KP_End is End to the editor: the caret is at the line end"
+        );
+        let _ = fs::remove_dir_all(dir);
+    }
+
     #[test]
     fn config_completion_round_trips_through_the_native_editor_workspace() {
         let dir = std::env::temp_dir().join(format!(

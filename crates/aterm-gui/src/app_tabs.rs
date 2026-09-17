@@ -1273,7 +1273,7 @@ impl App {
                     authored_description.as_deref(),
                     title_format,
                     title_config,
-                    crate::title_summary::TAB_LABEL_SEPARATOR,
+                    crate::title_summary::ChromeSurface::TabStrip,
                 )
             })
             .collect()
@@ -2017,9 +2017,15 @@ impl App {
     /// held ONLY that one tab it becomes empty and is CLOSED — a "merge the source's
     /// last tab into the next window". A no-op with fewer than two windows (nowhere to
     /// move the tab).
-    pub(crate) fn migrate_active_tab_to_next_window(&mut self) {
+    ///
+    /// Returns the REASON it declined rather than `()`. Every bail below is a
+    /// state the user can actually be in, and the menu seam
+    /// (`invoke_menu_action_by_name`) used to answer OK for all of them — a
+    /// silent success for work that never happened. Key-path callers, for which
+    /// a refusal has nowhere to go, discard it explicitly.
+    pub(crate) fn migrate_active_tab_to_next_window(&mut self) -> Result<(), &'static str> {
         let Some(wid_a) = self.frontmost_window else {
-            return;
+            return Err("no window is focused");
         };
         // The next window after A in id order, wrapping to the first. Every window is
         // now a normal mixed-tab host; there is no Settings-only accessory kind.
@@ -2029,24 +2035,27 @@ impl App {
             .next()
             .map(|(k, _)| *k)
             .or_else(|| self.windows.keys().next().copied());
-        let Some(wid_b) = dest else { return };
+        let Some(wid_b) = dest else {
+            return Err("there is no other window to move the tab to");
+        };
         if wid_b == wid_a {
-            return; // never move a tab onto its own window (also: sole terminal window)
+            // never move a tab onto its own window (also: sole terminal window)
+            return Err("there is no other window to move the tab to");
         }
         // Pull A's canonical active tab. A terminal tab additionally moves its
         // compatibility PaneTree; native content never acquires a sentinel tree.
         let (stable_tab, terminal_index, tree) = {
             let Some(ws) = self.windows.get(&wid_a) else {
-                return;
+                return Err("the focused window is gone");
             };
             let Some(stable_tab) = ws.tab_set.active().cloned() else {
-                return;
+                return Err("this window has no active tab to move");
             };
             let terminal_index =
                 terminal_projection_index(&ws.tab_set, &self.view_store, stable_tab.id);
             let tree = terminal_index.and_then(|index| ws.layouts.get(index).cloned());
             if terminal_index.is_some() && tree.is_none() {
-                return;
+                return Err("this tab's pane layout is missing, so it cannot be moved");
             }
             (stable_tab, terminal_index, tree)
         };
@@ -2116,6 +2125,7 @@ impl App {
              migrate_active_tab_to_next_window: {}",
             self.structural_invariant_violation().unwrap_or_default(),
         );
+        Ok(())
     }
 
     /// "Open Active Session in New Window" (Cmd-Shift-O / Window ▸ Open Session in New
@@ -2255,9 +2265,28 @@ impl App {
     /// which is what drove the tree deep enough to mint off-grid panes.
     #[cfg(any(test, feature = "bench-support"))]
     pub(crate) fn split_active_stub_tab_dir(&mut self, wid: WindowId, dir: pane::SplitDir) -> u64 {
+        self.split_active_stub_tab_dir_with_sink(
+            wid,
+            dir,
+            std::sync::Arc::new(aterm_session::sink::SinkWriter::new(-1)),
+        )
+    }
+
+    /// [`Self::split_active_stub_tab_dir`] with a caller-provided sink for the NEW
+    /// pane's session, so a test can observe bytes crossing that pane's own egress
+    /// boundary — a window-level mirror reports silence for a session the window
+    /// is showing but not fronting, which is exactly the DEC 1004 focus-report
+    /// case (the pane that LOST the keyboard is the one with something to say).
+    #[cfg(any(test, feature = "bench-support"))]
+    pub(crate) fn split_active_stub_tab_dir_with_sink(
+        &mut self,
+        wid: WindowId,
+        dir: pane::SplitDir,
+        sink: std::sync::Arc<aterm_session::sink::SinkWriter>,
+    ) -> u64 {
         let sid = self.next_session_id;
         self.next_session_id += 1;
-        let stub = crate::stub_session(sid);
+        let stub = crate::stub_session_with_sink(sid, sink);
         Self::register_session(&self.store, &stub, None);
         self.view_store
             .insert_terminal(sid)
@@ -3197,11 +3226,12 @@ impl App {
     /// reuses the EXISTING command path — `New` => [`Self::open_tab`] (same as File ▸
     /// New Tab / the toolbar "+"), `Select(n)` => [`Self::switch_tab`], `Next`/`Prev`
     /// => [`Self::cycle_tab`] — so the verb adds no parallel tab logic. With no front
-    /// window (impossible in a real run) it reports `(0, 0)`.
-    pub(crate) fn apply_tab_cmd(&mut self, action: TabAction) -> (usize, usize) {
+    /// window it REFUSES rather than reporting the `(0, 0)` it used to, which a
+    /// caller reads as a tab count.
+    pub(crate) fn apply_tab_cmd(&mut self, action: TabAction) -> Result<(usize, usize), String> {
         match self.frontmost_window {
             Some(front) => self.apply_tab_cmd_in(front, action),
-            None => (0, 0),
+            None => Err("no window is focused".to_string()),
         }
     }
 
@@ -3211,21 +3241,76 @@ impl App {
     /// delegates to (`open_tab_in` / `switch_tab_in` / `cycle_tab_in` /
     /// `close_tab_via_verb` / `move_tab`), so the aimed verb adds no
     /// parallel tab logic either; an unknown `wid` reports `(0, 0)`.
-    pub(crate) fn apply_tab_cmd_in(&mut self, wid: WindowId, action: TabAction) -> (usize, usize) {
+    ///
+    /// REFUSALS REACH THE WIRE. This used to return the post-state pair and
+    /// nothing else, so `cmd_tab` minted `OK <active> <count>` from it no matter
+    /// what happened — and two different declines hid behind that OK. An
+    /// out-of-range index was a silent no-op whose reply, for `move`, is
+    /// BYTE-IDENTICAL to an honoured move; and a tab host that refused the close
+    /// (a native document waiting on a durable checkpoint) had its reason dropped
+    /// by `close_tab_at`, whose `bool` means "was the last canonical tab", not
+    /// "it closed". The GUI user was told both times, through the tab's attention
+    /// indicator and banner; the socket caller was told `OK`.
+    ///
+    /// The index checks are done HERE rather than inside each command path
+    /// because those paths are shared with the keyboard, menu and tab-strip
+    /// gestures, where a stale index IS an ordinary no-op and must stay one. It
+    /// is only the wire that needs to hear about it.
+    pub(crate) fn apply_tab_cmd_in(
+        &mut self,
+        wid: WindowId,
+        action: TabAction,
+    ) -> Result<(usize, usize), String> {
+        // An unknown window keeps its documented `(0, 0)`: the aimed verb
+        // resolves the window before it gets here (`hosting_window`), so this is
+        // an internal contract, not a wire answer.
+        let Some(count) = self.windows.get(&wid).map(|ws| ws.tab_set.len()) else {
+            return Ok((0, 0));
+        };
+        let no_such = |i: usize| format!("no tab at index {i}: this window has {count}");
+        // A refusal raised anywhere beneath this action lands in the same channel
+        // the menu `invoke` seam uses; clear it first so an EARLIER action's
+        // refusal is never reported against this one.
+        self.pending_action_refusal = None;
         match action {
             TabAction::New => self.open_tab_in(wid),
-            TabAction::Select(n) => self.switch_tab_in(wid, n),
+            TabAction::Select(n) => {
+                if n >= count {
+                    return Err(no_such(n));
+                }
+                self.switch_tab_in(wid, n);
+            }
             TabAction::Next => self.cycle_tab_in(wid, true),
             TabAction::Prev => self.cycle_tab_in(wid, false),
-            TabAction::Close(which) => self.close_tab_via_verb(wid, which),
-            TabAction::Move { from, to } => self.move_tab(wid, from, to),
+            TabAction::Close(which) => {
+                if let Some(i) = which
+                    && i >= count
+                {
+                    return Err(no_such(i));
+                }
+                self.close_tab_via_verb(wid, which);
+            }
+            TabAction::Move { from, to } => {
+                if from >= count {
+                    return Err(no_such(from));
+                }
+                if to >= count {
+                    return Err(no_such(to));
+                }
+                // `from == to` is not a refusal: the arrangement the caller asked
+                // for is the one that holds.
+                self.move_tab(wid, from, to);
+            }
+        }
+        if let Some(why) = self.pending_action_refusal.take() {
+            return Err(why);
         }
         // Report the canonical mixed-tab state. The terminal-only `TabIndex` is a
         // compatibility projection and can have a different count/index whenever
         // native tabs are present.
-        self.windows.get(&wid).map_or((0, 0), |ws| {
+        Ok(self.windows.get(&wid).map_or((0, 0), |ws| {
             (ws.tab_set.active_index().unwrap_or(0), ws.tab_set.len())
-        })
+        }))
     }
 
     /// Close window `wid`'s tab `which` (or its ACTIVE tab when `None`) for the
@@ -3356,11 +3441,24 @@ impl App {
         // its tab is gone.
         self.reap_stale_rename_edit(wid);
         let titles = self.tab_titles(wid);
+        // WHOLE-STRING SURFACES. `titles` are the strip's labels — composed
+        // with no title cap, because the strip fits them itself, sibling-aware
+        // (`ChromeSurface::TabStrip`). Everything pushed from here paints a
+        // label with no fit of its own — the native toolbar's chip and its
+        // accessibility string, the tooltip / context-menu header, the `tabs`
+        // and `chrome` introspection lines — so those take the cap here, once
+        // (`whole_labels`: borrowed, no allocation, unless a label is actually
+        // past it). The strip's own vector is what this function returns for
+        // the in-grid fingerprint, and what the drift cache
+        // (`tab_chrome_titles`) compares against the resolved rung; both keep
+        // the uncapped label, or a long clean title would never compare equal
+        // to itself and every epoch tick would rebuild the chrome.
+        let chrome_titles = crate::title_summary::whole_labels(&titles);
         // Composed per-tab chrome (tooltip + context-menu model) rides the same
         // refresh: epoch-cached, so a steady prompt pays one leaf-lock read per
         // terminal tab (see `composed_session_chrome`), and the strip receives
         // titles/metadata/chrome as ONE consistent snapshot.
-        let ext = self.tab_chrome_ext(wid, &titles);
+        let ext = self.tab_chrome_ext(wid, &chrome_titles);
         // The §4 connection mark rides the same consistent snapshot: stamped
         // from the live edge tables here, so `metadata` below carries it to
         // both strips (and into the in-grid fingerprint) at once.
@@ -3386,11 +3484,12 @@ impl App {
         // `tab_strip` machine proves can't happen. (`titles.len()` == tab count.)
         if let Some(ws) = self.windows.get_mut(&wid) {
             ws.strip_shadow.set((titles.len(), active));
-            // This is the exact title vector passed to native chrome below. Cache it
-            // at the existing push point so a later background spinner phase can be
-            // rejected before `refresh_window_tabs` takes every tab's terminal lock
-            // and allocates another title/tooltip/metadata set. Structural refreshes
-            // also land here, ensuring the first post-switch phase is coalescible.
+            // This is the strip's exact title vector (the toolbar below receives
+            // its whole-string projection). Cache it at the existing push point so
+            // a later background spinner phase can be rejected before
+            // `refresh_window_tabs` takes every tab's terminal lock and allocates
+            // another title/tooltip/metadata set. Structural refreshes also land
+            // here, ensuring the first post-switch phase is coalescible.
             ws.tab_title_epochs
                 .retain(|sid, _| label_sessions.contains(&Some(*sid)));
             ws.tab_chrome_titles
@@ -3407,14 +3506,14 @@ impl App {
             // cannot faithfully shadow chrome when two distinct tabs view the
             // same pooled session and resolve different fallbacks under parser
             // contention. Inspection is tab-addressed, so retain and update the
-            // exact per-tab title vector independently.
+            // exact per-tab vector handed to the toolbar independently.
             ws.tab_chrome_titles_by_tab
                 .retain(|tab_id, _| ids.contains(tab_id));
             for ((tab_id, session), title) in ids
                 .iter()
                 .copied()
                 .zip(label_sessions.iter().copied())
-                .zip(&titles)
+                .zip(chrome_titles.iter())
             {
                 let entry = ws
                     .tab_chrome_titles_by_tab
@@ -3428,7 +3527,7 @@ impl App {
             self.apprt.set_toolbar_tabs(
                 handle,
                 crate::platform::ToolbarTabsModel {
-                    titles: &titles,
+                    titles: &chrome_titles,
                     ids: &ids,
                     metadata: &metadata,
                     tooltips: &tooltips,
@@ -4590,8 +4689,11 @@ impl App {
             return Vec::new();
         };
         let titles = self.tab_titles(wid);
-        let label = titles.get(index).map_or("", String::as_str);
-        self.composed_session_chrome(wid, session, label).menu
+        // The menu header paints the label WHOLE — the same projection
+        // `refresh_window_tabs` hands the tooltip composer, so the two callers
+        // of one chrome cache agree on the label they key it with.
+        let label = crate::title_summary::whole_label(titles.get(index).map_or("", String::as_str));
+        self.composed_session_chrome(wid, session, &label).menu
     }
 
     /// C5 — pop the tab context menu over tab `index` of `wid`, anchored at
@@ -4717,16 +4819,19 @@ impl App {
         true
     }
 
-    /// C5 — the KEYBOARD entry point (Shift+F10 / the Menu key): pop the
-    /// context menu for the window's ACTIVE tab, anchored at that chip's own
-    /// left edge rather than at a pointer that was never involved.
+    /// C5 — the KEYBOARD entry point (the Menu key by default; Shift+F10 too
+    /// under `tab_menu_chord = "on"`): pop the context menu for the window's
+    /// ACTIVE tab, anchored at that chip's own left edge rather than at a
+    /// pointer that was never involved.
     ///
-    /// This is what makes the popup usable without a mouse, and on Windows it
-    /// is not a nicety: Shift+F10 is the OS-wide "show the context menu for the
-    /// focused thing" chord, and a surface that has a right-click menu but no
-    /// keyboard route to it is unreachable for anyone driving by keyboard.
-    /// Returns whether a menu opened, so the caller can let the chord fall
-    /// through when it did not (a native app tab, no strip, no tabs).
+    /// This is what makes the popup usable without a mouse, and it is not a
+    /// nicety: a surface that has a right-click menu but no keyboard route to
+    /// it is unreachable for anyone driving by keyboard. The Menu key is the
+    /// default spelling because no legacy keyboard mode delivers it to an
+    /// application; Shift+F10 (the OS-wide Windows chord) is terminfo `kf22`,
+    /// so it is claimed only when a config asks. Returns whether a menu opened,
+    /// so the caller can let the chord fall through when it did not (a native
+    /// app tab, no strip, no tabs).
     ///
     /// Its real callers are the two in-grid-strip chord arms (Windows and
     /// Linux) — `on_key`'s and the convergence seam's `tab_menu_input_event` —
@@ -4901,6 +5006,14 @@ impl App {
                 tab: tab_id,
             },
         )) {
+            // DEFERRED, not done: the mutation is queued onto the pending
+            // handoff's teardown and applied once that cancellation lands. The
+            // tab count a caller reads right now is the UNCHANGED one, so
+            // answering `OK <active> <count>` would read as "closed, and here is
+            // the state". Say what actually happened instead.
+            self.pending_action_refusal = Some(
+                "tab close deferred: a pending update handoff is being cancelled first".to_string(),
+            );
             return false;
         }
         if is_native {
@@ -4909,11 +5022,21 @@ impl App {
             }
             return match self.close_active_native_tab(wid) {
                 Ok(()) => canonical_count == 1,
-                Err(_) => {
+                Err(why) => {
                     // Keep the refused tab selected: its app-owned banner and
                     // the exact recovery palette explain why topology stayed
                     // intact. Restoring the prior tab made close look inert.
                     self.resync_active_or_window(wid);
+                    // AND SAY WHY, for the seams that mint a reply. `bool` here
+                    // means "was the last canonical tab", never "it closed" (see
+                    // this function's own doc), so every caller that treated
+                    // `false` as a quiet no-op threw this sentence away — and
+                    // `tab close` answered `OK <active> <count>` over it while
+                    // the GUI user got the banner. The two refusals this arm
+                    // collapses ("waiting for a durable checkpoint" and the
+                    // update-child rollback deferral) are distinct and both
+                    // actionable, so the reason travels rather than the bool.
+                    self.pending_action_refusal = Some(why);
                     false
                 }
             };
@@ -5611,6 +5734,70 @@ mod mixed_tab_tests {
         assert!(app.structural_invariants_ok());
     }
 
+    /// THE `tab` VERB SAYS WHEN IT DID NOTHING. Every `tab` action funnelled
+    /// through one post-state read, so `cmd_tab` minted `OK <active> <count>`
+    /// whatever happened. Two declines hid behind that: an out-of-range index
+    /// (for `move`, the OK is BYTE-IDENTICAL to an honoured move), and a tab host
+    /// that refused the close.
+    ///
+    /// Each refusal is paired with its POSITIVE control in the same test, because
+    /// "always refuses" would pass a one-sided version of this and be a worse bug
+    /// than the silence it replaces.
+    #[test]
+    fn an_out_of_range_tab_action_refuses_instead_of_reporting_ok() {
+        let mut app = App::headless_for_test();
+        let wid = WindowId(0);
+        // `open_tab_in` cannot stage this: it needs a real `proxy` to spawn a
+        // PTY and returns having done NOTHING under the headless harness, which
+        // left the fixture with one tab and no destination for the move below.
+        // `push_stub_tab` is the harness's own second-tab idiom.
+        app.push_stub_tab(wid, crate::stub_session(app.next_session_id));
+        let count = app.windows[&wid].tab_set.len();
+        assert!(count >= 2, "two tabs so a real move has somewhere to go");
+
+        // SELECT past the end: a silent no-op that reported the unchanged state.
+        let why = app
+            .apply_tab_cmd_in(wid, TabAction::Select(count))
+            .expect_err("an index no tab holds must refuse");
+        assert!(why.contains(&format!("index {count}")), "{why:?}");
+
+        // CLOSE past the end.
+        let why = app
+            .apply_tab_cmd_in(wid, TabAction::Close(Some(count + 3)))
+            .expect_err("closing an index no tab holds must refuse");
+        assert!(why.contains("no tab at index"), "{why:?}");
+
+        // MOVE past the end — the case whose OK was indistinguishable from a
+        // move that really happened.
+        let why = app
+            .apply_tab_cmd_in(
+                wid,
+                TabAction::Move {
+                    from: 0,
+                    to: count + 1,
+                },
+            )
+            .expect_err("moving to an index no tab holds must refuse");
+        assert!(why.contains("no tab at index"), "{why:?}");
+
+        // POSITIVE CONTROLS: the same verbs, in range, must still act.
+        assert_eq!(
+            app.apply_tab_cmd_in(wid, TabAction::Select(0)),
+            Ok((0, count)),
+            "an in-range select still reports the state"
+        );
+        assert_eq!(
+            app.apply_tab_cmd_in(wid, TabAction::Move { from: 0, to: 1 }),
+            Ok((1, count)),
+            "an in-range move still reports the state"
+        );
+        // ...and a close in range really closes.
+        let after = app
+            .apply_tab_cmd_in(wid, TabAction::Close(Some(0)))
+            .expect("an in-range close acts");
+        assert_eq!(after.1, count - 1, "the tab count really moved");
+    }
+
     #[test]
     fn background_whole_tab_and_settings_control_close_focus_blocker_and_recovery() {
         let mut app = App::headless_for_test();
@@ -5621,7 +5808,19 @@ mod mixed_tab_tests {
         app.switch_tab_in(wid, 0);
         assert!(app.active_native_view(wid).is_none());
 
-        assert_eq!(app.apply_tab_cmd(TabAction::Close(Some(1))), (1, 2));
+        // THE REFUSED CLOSE TRAVELS AS A REASON. This used to read `Ok((1, 2))`
+        // — the verb's old shape, which minted an OK carrying the UNCHANGED
+        // count over a close the host had declined. Since the `tab` verb learned
+        // to refuse, the same decline is an `Err` naming the blocker, and every
+        // consequence below (the recovery surface, the surviving pair, the
+        // re-focused draft) is unchanged.
+        let why = app
+            .apply_tab_cmd(TabAction::Close(Some(1)))
+            .expect_err("a settings draft declines the close");
+        assert!(
+            why.contains("not ready to close"),
+            "the refusal names the blocker: {why:?}"
+        );
         assert_eq!(app.active_native_view(wid), Some((instance, settings)));
         assert_exact_settings_close_recovery(&app, wid);
         assert_eq!(app.windows[&wid].tab_set.len(), 2);
@@ -5892,7 +6091,7 @@ mod mixed_tab_tests {
         assert_ne!(shared_view, original_view);
         assert_eq!(app.pool.views(0), Some(2));
 
-        app.migrate_active_tab_to_next_window();
+        let _ = app.migrate_active_tab_to_next_window();
         assert_eq!(app.windows.len(), 1, "the emptied share window closes");
         assert!(app.windows.contains_key(&source));
         assert_eq!(app.frontmost_window, Some(source));
@@ -6330,7 +6529,7 @@ mod mixed_tab_tests {
         // projection deliberately still contains only terminal index zero.
         assert_eq!(
             app.apply_tab_cmd(TabAction::Select(1)),
-            (1, 2),
+            Ok((1, 2)),
             "control status reports canonical mixed-tab active/count"
         );
         assert_eq!(app.windows[&wid].tabs, TabIndex::new(0, 1));
@@ -6361,7 +6560,7 @@ mod mixed_tab_tests {
         // sibling. The compatibility projection becomes genuinely empty.
         assert_eq!(
             app.apply_tab_cmd(TabAction::Close(Some(0))),
-            (0, 1),
+            Ok((0, 1)),
             "Settings survives as the sole canonical tab"
         );
         let ws = &app.windows[&wid];
@@ -6452,7 +6651,7 @@ mod mixed_tab_tests {
 
         // The same stable native tab can migrate into an existing terminal
         // window; closing its now-empty source still moves no terminal session.
-        app.migrate_active_tab_to_next_window();
+        let _ = app.migrate_active_tab_to_next_window();
         assert_eq!(app.windows.len(), 1);
         let ws = &app.windows[&source];
         assert_eq!(ws.tab_set.active_id(), Some(native_id));
@@ -6506,7 +6705,7 @@ mod mixed_tab_tests {
             0
         );
         assert_eq!(app.windows[&wid].tabs.active, 1);
-        assert_eq!(app.apply_tab_cmd(TabAction::Select(0)), (0, 3));
+        assert_eq!(app.apply_tab_cmd(TabAction::Select(0)), Ok((0, 3)));
         assert!(app.active_handle.lock().unwrap().is_none());
     }
 

@@ -33,12 +33,19 @@
 //! A `re=` is NEVER AN INPUT TO AN AUTHORITY DECISION. That is the whole of the
 //! claim, and it is deliberately narrower than "read in one place": `re=` is
 //! read for the auditor in [`replay`], where it is causality and authority for
-//! nobody, and it is read as CORRELATION at the delivery seam and by the two
-//! renderers — [`bridge::Bridge::deliver_record`] forwards it onto the
-//! `deliver` line, `aterm-gui`'s `fabric` resolves it against the recipient's
-//! OWN outbound posts into the `re-id=` a reader sees, and [`mirror`] and
-//! [`tui`] print it. A correlation label is not a permission: none of those
-//! readers can grant, apply, admit or deliver anything on the strength of one,
+//! nobody, and it is read as CORRELATION at the delivery seam, by the two
+//! renderers, and by the deadline machinery — [`bridge::Bridge::deliver_record`]
+//! forwards it onto the `deliver` line (and reads it to SETTLE the deadline it
+//! names and to flag a reply that arrives after `expired` as `late=1`),
+//! [`bridge::Bridge::expire_deadlines`] reads the asker's own lane to learn
+//! whether an `answer`/`report`/`ack` carrying it arrived before it publishes a
+//! verdict, this crate's own [`fabric`] report reads it to fold `answer`s
+//! against overdue asks for the `aterm fabric` WARNINGS, `aterm-gui`'s `fabric`
+//! resolves it against the recipient's OWN outbound posts into the `re-id=` a
+//! reader sees, and [`mirror`] and [`tui`] print it. A correlation label is not
+//! a permission — a deadline verdict is a notification, never a keystroke or an
+//! admission: none of those readers can grant, apply, admit or deliver anything
+//! on the strength of one,
 //! and a `re=` a sender chose can therefore point a rendered row at an
 //! unrelated post of the recipient's — which is why the row also carries the
 //! sender's trust label, and why nothing downstream may treat `re-id=` as
@@ -164,7 +171,7 @@ mod tests {
         // EVERY MODULE THAT READS A BODY'S `re=` MUST BE NAMED. `body` is the
         // codec itself and `replay`/`bridge` are named in prose above; the rest
         // are named by module. A new reader fails here until the sentence grows.
-        let named = ["replay", "bridge", "mirror", "tui"];
+        let named = ["replay", "bridge", "mirror", "tui", "fabric"];
         for (module, source) in [
             ("bridge", include_str!("bridge.rs")),
             ("mirror", include_str!("mirror.rs")),

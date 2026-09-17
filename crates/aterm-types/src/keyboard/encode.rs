@@ -77,21 +77,55 @@ pub fn encode_key_with_layout(
 ) -> Vec<u8> {
     // Kitty folds keypad keys onto their non-keypad equivalents unless the
     // app opted into telling them apart (disambiguate) or into the dedicated
-    // KP numbers report-all-keys uses. The fold applies ONLY inside kitty
-    // semantics: with no kitty flag active the legacy encoder owns keypad
-    // keys (DECKPAM SS3 forms), which the fold must not disturb.
+    // KP numbers report-all-keys uses — the spec's legacy rule: "All keypad
+    // keys are reported as their equivalent non-keypad keys. To distinguish
+    // these, use the disambiguate flag." `Key::main_block_twin` is that fold,
+    // digits and operators included: a physical KP_5 reaches this encoder as
+    // `Numpad5` now, and under a kitty mode without disambiguate it must be
+    // the `5` kitty sends (a text press, a text repeat), not a dedicated
+    // `CSI 57404 u`. The fold applies ONLY inside kitty semantics: with no
+    // kitty flag active the legacy encoder owns keypad keys (DECKPAM SS3
+    // forms), which the fold must not disturb.
+    //
+    // …AND NOT UNDER DECKPAM, whichever flags are set. The fold answers "the
+    // app has not asked to tell the keypad from the main block" — but setting
+    // application keypad mode IS that request, spelled in the legacy encoding
+    // the fold is folding INTO. Folding there threw the mode away and sent the
+    // main row's `5` for a KP_5 an SS3-reading application had explicitly
+    // asked to hear as `ESC O u`; the legacy encoder, not the fold, owns a
+    // keypad key while DECKPAM is set. (SHIFT still cancels application keypad
+    // mode inside that encoder, so a Shift+KP_5 is the same `5` either way.)
+    //
+    // …AND THE FOLD REACHES THE KITTY ENCODER ONLY. A KEYPAD KEY DOES NOT
+    // COMPOSE. The twin is the kitty NAME for the key — the code and the text
+    // the CSI-u report carries — not a re-spelling of the press for the legacy
+    // encoder. Handed to `encode_legacy`, the folded `Key::Character('5')` runs
+    // the MAIN ROW's shift/ctrl tables (`shifted_character`, `ctrl_character`)
+    // and Shift+KP_5 came out `%`, Ctrl+KP_5 came out 0x1D — glyphs no keypad
+    // has ever typed, and only because an unrelated kitty REPORTING flag was
+    // on. On the keypad SHIFT selects the other level (xkb's KEYPAD type is
+    // `map[Shift] = Level2`, so a NumLock-OFF Shift+KP_5 IS KP_5 and arrives
+    // here as `Numpad5` + SHIFT), and xterm's rule is that SHIFT only cancels
+    // application keypad mode — it never composes a keypad glyph. So the
+    // legacy fallback keeps the ORIGINAL keypad key and `encode_numpad` owns
+    // its bytes, which is the same rule `associated_text_codepoints` states
+    // for the twin's glyph one screen down. `modifiers` is passed through
+    // UNTOUCHED on both paths: the kitty modifier field still carries the
+    // SHIFT bit (`CSI 53;6u` for Ctrl+Shift+KP_5), and the legacy keypad
+    // encoder wants SHIFT to cancel DECKPAM.
     let folded = if mode.intersects(KeyboardMode::KITTY_PROTOCOL_FLAGS)
         && !mode.contains(KeyboardMode::DISAMBIGUATE_ESC_CODES)
         && !mode.contains(KeyboardMode::REPORT_ALL_KEYS_AS_ESC)
+        && !mode.contains(KeyboardMode::APP_KEYPAD)
     {
-        fold_numpad_key(key)
+        key.main_block_twin()
     } else {
         None
     };
-    let key = folded.as_ref().unwrap_or(key);
+    let kitty_key = folded.as_ref().unwrap_or(key);
 
-    if should_encode_kitty_event(key, modifiers, mode, event_type) {
-        return encode_kitty(key, modifiers, mode, event_type, base_layout_key);
+    if should_encode_kitty_event(kitty_key, modifiers, mode, event_type) {
+        return encode_kitty(kitty_key, modifiers, mode, event_type, base_layout_key);
     }
 
     // For release events without Kitty protocol, return nothing
@@ -110,33 +144,6 @@ pub fn encode_key_with_layout(
     }
 
     encode_legacy(key, modifiers, mode)
-}
-
-/// The keypad key's non-keypad equivalent (`None` = no fold), per the kitty
-/// spec's legacy rule: "All keypad keys are reported as their equivalent
-/// non-keypad keys. To distinguish these, use the disambiguate flag." Keys
-/// with no non-keypad equivalent (NumpadEqual/Separator/Begin, digits,
-/// operators) are unchanged — digits/operators arrive as `Key::Character`
-/// from the hosts anyway.
-// Skip: the `Key` inspection walks table slices / iterators (absent std
-// bodies). Exhaustively unit-tested against the kitty/xterm specs.
-#[cfg_attr(trust_verify, trust::skip)]
-fn fold_numpad_key(key: &Key) -> Option<Key> {
-    let Key::Named(named) = key else { return None };
-    Some(Key::Named(match named {
-        NamedKey::NumpadEnter => NamedKey::Enter,
-        NamedKey::NumpadArrowUp => NamedKey::ArrowUp,
-        NamedKey::NumpadArrowDown => NamedKey::ArrowDown,
-        NamedKey::NumpadArrowLeft => NamedKey::ArrowLeft,
-        NamedKey::NumpadArrowRight => NamedKey::ArrowRight,
-        NamedKey::NumpadHome => NamedKey::Home,
-        NamedKey::NumpadEnd => NamedKey::End,
-        NamedKey::NumpadPageUp => NamedKey::PageUp,
-        NamedKey::NumpadPageDown => NamedKey::PageDown,
-        NamedKey::NumpadInsert => NamedKey::Insert,
-        NamedKey::NumpadDelete => NamedKey::Delete,
-        _ => return None,
-    }))
 }
 
 /// Modifier and lock keys, mirroring kitty's `is_modifier_key`: the spec
@@ -613,7 +620,33 @@ fn associated_text_codepoints(
                 Some(vec![text as u32])
             }
         }
-        Key::Named(_) => None,
+        // A KEYPAD GLYPH KEY REPORTS THE TEXT IT TYPES. `REPORT_ASSOCIATED_TEXT`
+        // answers "what did this press put on the screen", and for KP_5, KP_.
+        // and KP_+ that is `5`, `.` and `+` — the main-block twin's character.
+        // They used to arrive from the hosts as `Key::Character` and reported
+        // their glyph; since the winit seam resolves the physical keypad they
+        // arrive as `Key::Named(Numpad5)` and fell to this arm's `None`, so the
+        // keypad's text silently vanished from the report while its dedicated
+        // `CSI 57404 u` number stayed. Only the TEXT field consults the twin —
+        // the key code stays the keypad's own, which is the whole point of the
+        // mode that turned this on.
+        //
+        // The twin's glyph is reported AS IS, with no shift/caps table: those
+        // compose a MAIN-BLOCK character key (`'5'` under Shift is `'%'`), and
+        // no keypad key composes. SHIFT on the keypad picks a LEVEL, not a
+        // glyph: with NumLock ON a shifted keypad 5 is KP_Begin, a different
+        // key, which this arm then answers `None` for because `NumpadBegin`
+        // has no twin; with NumLock OFF the same press is KP_5 itself (xkb's
+        // KEYPAD type is `map[Shift] = Level2`, the level that holds the
+        // digit) and reports `5`. Either way the shift table never runs — the
+        // rule `encode_key_with_layout` keeps by handing the legacy encoder
+        // the keypad key rather than this twin. The keypad's named keys
+        // (`NumpadEnter`, `NumpadEnd`) fold to named twins and carry no text,
+        // exactly as `Enter` and `End` do.
+        Key::Named(_) => match key.main_block_twin() {
+            Some(Key::Character(glyph)) if !glyph.is_control() => Some(vec![glyph as u32]),
+            _ => None,
+        },
     }
 }
 

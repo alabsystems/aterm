@@ -333,7 +333,39 @@ mod tests {
             "the refusal names the lock path: {msg}"
         );
         drop(guard);
-        let reacquired = try_lock_store(&b).expect("released lock is takeable again");
+        // THE RELEASE IS POLLED, NOT SAMPLED ONCE (2026-09-17). `drop` closes
+        // THIS process's last descriptor for the lock file — but `flock` is
+        // released only when every descriptor on that open file description is
+        // closed, and a `fork`/`posix_spawn` anywhere else in this test binary
+        // copies every open descriptor into the child, which holds them until
+        // it `exec`s (`FD_CLOEXEC` closes at exec, never at fork). So a lock
+        // this thread released a microsecond ago can still read as HELD for the
+        // length of someone else's spawn.
+        //
+        // MEASURED, not inferred: a 30-line probe that locks, drops and
+        // immediately re-locks one file, with one sibling thread doing nothing
+        // but `Command::new("/usr/bin/true").status()`, hits `WouldBlock` on
+        // the FIRST re-lock. This test failed exactly that way in the workspace
+        // `--tests` run of 2026-09-17 ("released lock is takeable again:
+        // Contended(…)") and passed 5/5 alone.
+        //
+        // The CLAIM IS UNCHANGED — a released lock must become takeable, and a
+        // release that never took effect still fails this test, loudly, naming
+        // the last refusal. Only the instant it must be visible is relaxed, by
+        // exactly the thing that delays it.
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        let reacquired = loop {
+            match try_lock_store(&b) {
+                Ok(g) => break g,
+                Err(e) => {
+                    assert!(
+                        std::time::Instant::now() < deadline,
+                        "a released store lock never became takeable again: {e:?}"
+                    );
+                    std::thread::sleep(std::time::Duration::from_millis(20));
+                }
+            }
+        };
         drop(reacquired);
         let _ = std::fs::remove_dir_all(&a.prefix);
     }
@@ -361,6 +393,41 @@ mod tests {
             assert_eq!(mode & 0o777, 0o600, "store.lock is 0600");
         }
         drop(guard);
+        let _ = std::fs::remove_dir_all(&l.prefix);
+    }
+
+    /// TAKING THE LOCK AGAIN MOVES NOTHING ON THE PREFIX. The prefix is an ancestor of every
+    /// store build and every exec root, and tippy snapshots each ancestor's ctime: the lock's
+    /// `ensure_dir(prefix)` used to re-`chmod` it to `0700` and re-`setxattr` the backup
+    /// exclusion on every acquisition, and each of those moves `st_ctime` even when it writes
+    /// the value already there (measured on APFS, 2026-09-15) — so every `repair` and `gc`
+    /// aborted a tippy in flight. A second acquisition now leaves the prefix's ctime and
+    /// mtime alone; the control proves a same-mode `chmod` is visible to the stamps, and a
+    /// mode that drifted is still hardened back.
+    #[cfg(unix)]
+    #[test]
+    fn a_second_store_lock_moves_no_stamp_on_the_prefix() {
+        use std::os::unix::fs::MetadataExt;
+        let l = temp_layout("nochurn");
+        drop(try_lock_store(&l).expect("first acquisition"));
+        let stamp = || {
+            let m = std::fs::symlink_metadata(&l.prefix).unwrap();
+            (m.ctime(), m.ctime_nsec(), m.mtime(), m.mtime_nsec())
+        };
+        let before = stamp();
+        std::thread::sleep(std::time::Duration::from_millis(20));
+        drop(try_lock_store(&l).expect("second acquisition"));
+        assert_eq!(
+            stamp(),
+            before,
+            "re-taking the lock moved the prefix's stamps"
+        );
+        std::fs::set_permissions(&l.prefix, std::fs::Permissions::from_mode(0o700)).unwrap();
+        assert_ne!(stamp(), before, "control: a same-mode chmod moves ctime");
+        std::fs::set_permissions(&l.prefix, std::fs::Permissions::from_mode(0o750)).unwrap();
+        drop(try_lock_store(&l).expect("third acquisition"));
+        let mode = std::fs::symlink_metadata(&l.prefix).unwrap().mode();
+        assert_eq!(mode & 0o7777, 0o700, "a drifted mode is hardened");
         let _ = std::fs::remove_dir_all(&l.prefix);
     }
 

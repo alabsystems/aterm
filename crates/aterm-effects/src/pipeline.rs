@@ -48,7 +48,7 @@ use aterm_render::{
 };
 
 use crate::companion::{CompanionOwner, CompanionRung, ContrastFallback, GlowOwnership, PetFacts};
-use crate::cursor_glow::{CursorGlow, Geom, GlowConfig, GlowStyle, RAINBOW_WAKE_PERSIST};
+use crate::cursor_glow::{CursorGlow, Geom, GlowConfig, GlowStyle};
 use crate::cursor_trail::{CursorTrail, TrailConfig, TypingCadence};
 use crate::host::{
     CaptureMode, ChromeGeom, FrameGeom, HostFrameInput, PressOutcome, SingFacts, TerminalFacts,
@@ -391,7 +391,6 @@ impl EffectsPipeline {
                 beam: true,
                 head_dx: 0.5,
                 pack: None,
-                wake_persist_s: RAINBOW_WAKE_PERSIST,
             },
             glow_color_from_cursor: true,
             glow_accent_from_cursor: true,
@@ -931,8 +930,8 @@ impl EffectsPipeline {
             // The classic wake's colour face is a spelling too, and re-derives
             // here for the same reason — keep aligned with the native resolver.
             classic_mono: crate::cursor_glow::GlowStyle::style_names_classic_mono(style),
-            // CARRIED FORWARD, not reset — the same discipline `pack` and
-            // `wake_persist_s` follow below. A reconfigure between two frames
+            // CARRIED FORWARD, not reset — the same discipline `pack` follows
+            // below. A reconfigure between two frames
             // must not clobber a ground the fold already resolved, or a live
             // light theme would flip to the dark default for one frame.
             theme_fg: self.glow_cfg.theme_fg,
@@ -968,9 +967,6 @@ impl EffectsPipeline {
             } else {
                 None
             },
-            // The host's typing-wake preference survives a reconfigure exactly
-            // like its intensity/colour choices do.
-            wake_persist_s: self.glow_cfg.wake_persist_s,
         };
         if !enabled {
             self.glow.reset();

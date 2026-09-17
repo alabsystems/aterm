@@ -286,44 +286,6 @@ pub fn seed() -> String {
     s
 }
 
-/// The seed body measured from the LIVE tree: the same rows `--update` writes
-/// into an empty checkout, for a caller that wants the text without running the
-/// verb. The verb itself does NOT come through here — [`run`] has already
-/// measured by the time it knows the file is empty, so [`unarmed`] renders from
-/// that measurement instead of taking a second one.
-pub fn seed_from_live(root: &Path) -> Result<String, String> {
-    let live = measure(root)?;
-    let mut rows = Vec::new();
-    for (scope, metric) in seed_shape(&live) {
-        let Some(&ceiling) = live.values.get(&(scope.clone(), metric.clone())) else {
-            continue;
-        };
-        rows.push(Row {
-            scope,
-            metric,
-            ceiling,
-            regress_reason: None,
-        });
-    }
-    if !live.unavailable.is_empty() {
-        return Err(format!(
-            "refusing to seed {BUDGET_PATH} from an incomplete measurement — {} could not be \
-             resolved ({}). A ceiling seeded from a partial survey is a ceiling nobody can \
-             trust; fix the cell first, or seed by hand from `cargo forge survey`",
-            live.unavailable
-                .keys()
-                .cloned()
-                .collect::<Vec<_>>()
-                .join(", "),
-            live.unavailable
-                .values()
-                .next()
-                .map_or(String::new(), Clone::clone)
-        ));
-    }
-    Ok(render(&rows))
-}
-
 /// The armed rows, in file order: the third-party facts per cell, then the lock
 /// and patch facts.
 fn seed_shape(live: &Live) -> Vec<(String, String)> {

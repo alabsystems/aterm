@@ -16,8 +16,15 @@
 #     `--no-run`, and the same with `--tests`.
 #   * exception 2: the driver builds row's three children (the redraw build,
 #     the smoke build, and the eight objc examples in one invocation).
-#   * exception 3 (2026-09-14): the sealed lane builds its own GUI before
-#     running the bridge test; it never borrows MainTarget's rebuilding GUI.
+#   * exception 3 (2026-09-14): the sealed fabric rung's two children, in the
+#     driver lane (<root>/target-drivers, 8) — its suite drives the aterm-gui
+#     it finds in the dir it was compiled into, so it first runs the smokes'
+#     `build -q -p aterm-gui -p aterm-ctl` there (a third copy of that line),
+#     then `test -p aterm-link --features sealed --test two_nodes_sealed`.
+#   * exception 4 (2026-09-16): the atpkg publish tooling's build child, in the
+#     same lane — `build -q -p atpkg`, the binary its end-to-end pack suite
+#     drives through $ATPKG. Until then the row was Lane::Pure at t0 and drove
+#     whatever `<root>/target/debug/atpkg` a PREVIOUS run had left.
 # `<inherited>` means the child got the test process's own value.
 targo CARGO_TARGET_DIR=<inherited> CARGO_BUILD_JOBS=<inherited> RUSTDOC=<inherited> ATERM_SEARCH_REGEX_LANE=<inherited> -- --unverified build --workspace
 targo CARGO_TARGET_DIR=<inherited> CARGO_BUILD_JOBS=<inherited> RUSTDOC=<stage2>/trustdoc ATERM_SEARCH_REGEX_LANE=<inherited> -- --unverified test --doc --workspace --no-fail-fast
@@ -45,5 +52,6 @@ targo CARGO_TARGET_DIR=<root>/target-xtask CARGO_BUILD_JOBS=4 RUSTDOC=<inherited
 targo CARGO_TARGET_DIR=<root>/tools/freeze-safety-gate/target CARGO_BUILD_JOBS=<inherited> RUSTDOC=<inherited> ATERM_SEARCH_REGEX_LANE=<inherited> -- --unverified build --manifest-path tools/freeze-safety-gate/Cargo.toml
 targo-tippy CARGO_TARGET_DIR=<root>/target-tippy CARGO_BUILD_JOBS=<inherited> RUSTDOC=<inherited> ATERM_SEARCH_REGEX_LANE=<inherited> -- --workspace --all-targets --keep-going -- -D warnings
 targo-tippy CARGO_TARGET_DIR=<root>/target-tippy CARGO_BUILD_JOBS=<inherited> RUSTDOC=<inherited> ATERM_SEARCH_REGEX_LANE=<inherited> -- -p aterm-gui -p aterm-scrollback --features aterm-gui/bench-support,aterm-gui/control-conformance,aterm-scrollback/disk-tier --all-targets --keep-going -- -D warnings
-targo CARGO_TARGET_DIR=<root>/target-sealed CARGO_BUILD_JOBS=4 RUSTDOC=<inherited> ATERM_SEARCH_REGEX_LANE=<inherited> -- --unverified build -p aterm-gui --bin aterm-gui
-targo CARGO_TARGET_DIR=<root>/target-sealed CARGO_BUILD_JOBS=4 RUSTDOC=<inherited> ATERM_SEARCH_REGEX_LANE=<inherited> -- --unverified test -p aterm-link --features sealed --test two_nodes_sealed --no-fail-fast
+targo CARGO_TARGET_DIR=<root>/target-drivers CARGO_BUILD_JOBS=8 RUSTDOC=<inherited> ATERM_SEARCH_REGEX_LANE=<inherited> -- --unverified build -q -p aterm-gui -p aterm-ctl
+targo CARGO_TARGET_DIR=<root>/target-drivers CARGO_BUILD_JOBS=8 RUSTDOC=<inherited> ATERM_SEARCH_REGEX_LANE=<inherited> -- --unverified test -p aterm-link --features sealed --test two_nodes_sealed --no-fail-fast
+targo CARGO_TARGET_DIR=<root>/target-drivers CARGO_BUILD_JOBS=8 RUSTDOC=<inherited> ATERM_SEARCH_REGEX_LANE=<inherited> -- --unverified build -q -p atpkg

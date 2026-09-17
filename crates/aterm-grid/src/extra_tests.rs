@@ -10,14 +10,6 @@ use aterm_hash::FxHashMap;
 // =============================================================================
 
 impl CellExtra {
-    /// Get the underline color as legacy u32 format.
-    #[must_use]
-    fn underline_color_u32(&self) -> Option<u32> {
-        self.underline_color().map(|[r, g, b]| {
-            0x01_000000 | (u32::from(r) << 16) | (u32::from(g) << 8) | u32::from(b)
-        })
-    }
-
     /// Clear all combining characters.
     fn clear_combining(&mut self) {
         self.combining.clear();
@@ -531,6 +523,21 @@ fn underline_color_u32_roundtrip() {
     assert_eq!(extra.underline_color_u32(), None);
     assert_eq!(extra.underline_color(), None);
     assert!(!extra.has_data());
+
+    // The INDEXED form (0x02) must survive the round trip as an index, not be
+    // flattened to a resolved triple — an indexed SGR 58 colour re-resolves
+    // against the live palette at draw time, and the wide-spacer mirror copies
+    // this packed value so both halves of one character keep re-resolving
+    // together. Until this test stopped shadowing the production getter with an
+    // RGB-only helper, nothing covered this branch.
+    extra.set_underline_color_u32(Some(0x02_000005));
+    assert_eq!(extra.underline_color_u32(), Some(0x02_000005));
+    assert_eq!(extra.underline_color_index(), Some(5));
+    assert_eq!(
+        extra.underline_color(),
+        None,
+        "storing an index clears the RGB slot on purpose"
+    );
 }
 
 #[test]

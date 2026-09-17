@@ -7509,6 +7509,7 @@ mod native_damage_tests {
             input.cursor_color = 0x00AB_CDEF;
             input.base_y = i64::MAX;
             input.absolute_row_revision = u64::MAX;
+            input.history_renumber_epoch = u64::MAX;
         }
 
         assert!(app.prepare_heterogeneous_input_scratch(wid).is_some());
@@ -7519,6 +7520,14 @@ mod native_damage_tests {
         assert_eq!(
             window.input_scratch.absolute_row_revision,
             pane.absolute_row_revision
+        );
+        // Both row-identity stamps travel together: a width reflow renumbers
+        // history without touching the footer revision, so a projection that
+        // carried only the revision would hand the find overlay a fresh-looking
+        // key for a frame whose rows moved.
+        assert_eq!(
+            window.input_scratch.history_renumber_epoch,
+            pane.history_renumber_epoch
         );
         assert!(window.input_scratch.base_y > 0, "fixture scrolled");
 
@@ -7547,11 +7556,19 @@ mod native_damage_tests {
             input.cursor_color = 0x00AB_CDEF;
             input.base_y = 99;
             input.absolute_row_revision = 99;
+            input.history_renumber_epoch = 99;
         }
         assert!(app.prepare_heterogeneous_input_scratch(wid).is_some());
         let input = &app.windows[&wid].input_scratch;
         assert_eq!(input.cursor_color, aterm_core::render::COLOR_UNSET);
-        assert_eq!((input.base_y, input.absolute_row_revision), (0, 0));
+        assert_eq!(
+            (
+                input.base_y,
+                input.absolute_row_revision,
+                input.history_renumber_epoch
+            ),
+            (0, 0, 0)
+        );
         assert!(
             !input.cursor_visible,
             "an unfocused terminal cannot leak its cursor into a native-focused frame"
@@ -10384,6 +10401,248 @@ mod fallback_convergence_tests {
             (false, false),
             "not converging: no re-arm, no invalidate"
         );
+    }
+}
+
+/// THE BAND'S LANDING SCHEDULES ITSELF (Windows + Linux). A CJK tab title's
+/// first frame takes the strip's cell lane — drawn low and cut by the seam —
+/// and the present of that very frame parses the chain face the chrome then
+/// draws with. Nothing else asks for the frame after: no install, no
+/// `RepaintKey` term, no blink on a steady cursor. These pin that the
+/// post-present follow-up asks for it, and asks exactly once.
+#[cfg(all(test, any(windows, target_os = "linux")))]
+mod strip_band_landing_tests {
+    use super::*;
+    use crate::tab_bar::TabHit;
+
+    /// One composed frame up to the present, as the redraw builds it: the
+    /// front terminal's cells into the window's scratch, then the strip spliced
+    /// above them (the cold `splice_tab_strip` refills the titles the hot path
+    /// shares with the RepaintKey).
+    fn compose(app: &mut App, wid: WindowId) {
+        let (rows, cols) = {
+            let ws = &app.windows[&wid];
+            (ws.rows, ws.cols)
+        };
+        let terminal = app
+            .front_terminal(wid)
+            .expect("front terminal")
+            .term
+            .clone();
+        {
+            let ws = app.windows.get_mut(&wid).expect("window");
+            let mut term = term_lock(&terminal);
+            term.resize(rows, cols);
+            term.cell_frame_into(&mut ws.input_scratch, usize::from(rows), usize::from(cols));
+        }
+        app.splice_tab_strip(wid);
+    }
+
+    /// The present's raster of the composed frame through the app's OWN CPU
+    /// renderer — the live terminal engine whose chain cells the chrome's seed
+    /// shares. This is where a cell-lane ideograph parses its chain face.
+    fn present_raster(app: &mut App, wid: WindowId) {
+        let App {
+            windows, backend, ..
+        } = app;
+        let ws = windows.get(&wid).expect("window");
+        let Backend::Cpu(renderer) = backend.ready_mut() else {
+            panic!("headless test backend is CPU")
+        };
+        let _ = renderer.render_input(&ws.input_scratch);
+    }
+
+    /// Whether the cached band covers strip column `col` with the band image.
+    fn band_covers(app: &App, wid: WindowId, col: usize) -> bool {
+        let band = &app.windows[&wid].cached_strip_band;
+        let Some(row) = band.first() else {
+            return false;
+        };
+        let Some((_, first)) = row.first() else {
+            return false;
+        };
+        row.iter()
+            .any(|(c, r)| *c == col && Arc::ptr_eq(&r.image, &first.image))
+    }
+
+    /// The real post-present follow-up, windowless.
+    fn finalize(app: &mut App, wid: WindowId) {
+        let plan = app.active_visible_leaf_plan(wid).expect("visible plan");
+        app.finalize_successful_present(
+            wid,
+            crate::metrics::StartupPresentTiming::collapsed(Instant::now()),
+            0,
+            None,
+            SuccessfulPresentRoute::Terminal,
+            crate::VisibleContentRoute::Terminal { composed: false },
+            HostVisualState::default(),
+            &plan,
+        );
+    }
+
+    /// Two composed frames of a CJK-titled strip with a steady cursor and NO
+    /// other stimulus between them — the only thing that runs between the two
+    /// is the first frame's present and its follow-up. Frame 1 is the defect's
+    /// frame (cell lane); its present parses the chain face; the follow-up
+    /// re-arms and requests a redraw; frame 2 is a band title, under a band key
+    /// that differs from frame 1's by the epoch term alone; and the follow-up
+    /// after frame 2 asks for nothing more.
+    #[test]
+    fn a_cjk_title_lands_in_the_band_on_the_next_frame_with_no_other_stimulus() {
+        let Some(path) = crate::tray_raster::cjk_chain_face_path_for_test() else {
+            return;
+        };
+        let mut app = App::headless_for_test();
+        let wid = WindowId(0);
+        app.tab_strip_rows = 1;
+        // The first present is behind us: the follow-up must not re-seed the
+        // chrome over the seed installed below.
+        app.first_present_done = true;
+        // A second tab, titled as the finding names it (OSC 0 with CJK), with
+        // its cursor pinned steady by DECSCUSR — the blink clock is not armed.
+        let session = crate::stub_session(app.next_session_id);
+        app.push_stub_tab(wid, session);
+        let terminal = app
+            .front_terminal(wid)
+            .expect("front terminal")
+            .term
+            .clone();
+        {
+            let mut term = term_lock(&terminal);
+            term.process("\x1b[2 q\x1b]0;日本語 shell\x07".as_bytes());
+            assert!(
+                !crate::blink_clock_armed(term.cursor_visible(), term.cursor_style(), false),
+                "a steady cursor: the blink clock is not armed"
+            );
+        }
+        // The live renderer is the app's own backend. The chrome's seed is a
+        // fork of its SEALED generation over the same chain cells — the
+        // window's order (seal, then fork) — installed dormant: no worker, so
+        // nothing can land through the store; only the terminal's draw can.
+        let seed = {
+            let App {
+                backend,
+                font_px,
+                theme,
+                ..
+            } = &mut app;
+            let Backend::Cpu(renderer) = backend.ready_mut() else {
+                panic!("headless test backend is CPU")
+            };
+            renderer.set_runtime_font_discovery(false);
+            renderer.set_config_fallback_fonts(&[path.to_string()]);
+            let _ = renderer.seal_admitted_font_sources();
+            renderer
+                .fork_semantic_surface(*font_px, *theme)
+                .expect("a sealed generation forks")
+        };
+        crate::tray_raster::install_dormant_chrome_fonts_for_test(seed);
+        crate::tray_raster::prepare_ui_fonts_for_direct_view_test();
+        if !crate::tray_raster::strip_band_ui_ready() {
+            crate::tray_raster::clear_ui_fonts_for_test();
+            return;
+        }
+
+        // FRAME 1: the chain face is unparsed, the title is not coverable, and
+        // the segment goes to the cell lane — the defect's frame.
+        compose(&mut app, wid);
+        let seg = app.windows[&wid]
+            .tab_segments
+            .iter()
+            .find(|s| matches!(s.kind, TabHit::Select(1)))
+            .copied()
+            .expect("the CJK tab's segment");
+        let probe = usize::from(seg.start_col) + 1;
+        let first_key = app.windows[&wid].strip_band_key;
+        assert!(
+            !band_covers(&app, wid, probe),
+            "frame 1: the CJK segment is the cell lane's (the chain face is unparsed)"
+        );
+        // Its present: the strip cells raster through the live renderer, whose
+        // draw of the ideograph parses the chain face into the shared cell…
+        present_raster(&mut app, wid);
+        // …and stamps the frame's key, as every real present does — the
+        // early-out that would swallow a bare redraw request.
+        {
+            let key =
+                crate::early_out_tests::frame_key(&mut term_lock(&terminal), false, false, None);
+            app.windows
+                .get_mut(&wid)
+                .expect("window")
+                .stamp_present_decision(key);
+        }
+        assert!(app.windows[&wid].last_present.is_some());
+        // The post-present follow-up, the real one: it notices the landing and
+        // re-arms the frame.
+        finalize(&mut app, wid);
+        assert!(
+            app.windows[&wid].last_present.is_none(),
+            "the follow-up cleared the retained key after the first present"
+        );
+        // The request edge, on the seam the follow-up fired through (the
+        // decision stands until the next splice re-reads the epoch).
+        let mut requests = 0;
+        assert!(app.rearm_for_strip_band_landing(wid, || requests += 1));
+        assert_eq!(
+            requests, 1,
+            "a redraw was requested after the first present"
+        );
+
+        // FRAME 2, with nothing else having happened — no keystroke, no output,
+        // no focus change, no blink: the splice misses the band cache on the
+        // epoch alone and the title is a band title.
+        compose(&mut app, wid);
+        let second_key = app.windows[&wid].strip_band_key;
+        assert_eq!(
+            (first_key.0, first_key.1, first_key.2, first_key.3),
+            (second_key.0, second_key.1, second_key.2, second_key.3),
+            "the geometry terms did not move"
+        );
+        assert_ne!(
+            first_key.4, second_key.4,
+            "the landing moved the band key's epoch term"
+        );
+        assert!(
+            band_covers(&app, wid, probe),
+            "frame 2: the CJK segment is band-covered"
+        );
+        // Converged: the splice cached the live epoch, so the follow-up asks for
+        // nothing — one extra frame per landing, never a loop.
+        let mut requests = 0;
+        assert!(!app.rearm_for_strip_band_landing(wid, || requests += 1));
+        assert_eq!(requests, 0, "a settled band requests no frame");
+        crate::tray_raster::clear_ui_fonts_for_test();
+    }
+
+    /// The follow-up is a no-op wherever there is no landing: a window whose
+    /// strip is off never wrote a band key (the zero sentinel is not a stale
+    /// epoch), and a settled band's re-read is not a landing — otherwise an
+    /// idle window would churn presents.
+    #[test]
+    fn no_landing_no_rearm() {
+        let mut app = App::headless_for_test();
+        let wid = WindowId(0);
+        let renderer = aterm_render::Renderer::from_bytes(
+            aterm_render::embedded_font(),
+            14.0,
+            aterm_render::Theme::default(),
+        )
+        .expect("embedded renderer");
+        crate::tray_raster::install_dormant_chrome_fonts_for_test(renderer);
+        let mut requests = 0;
+        app.tab_strip_rows = 0;
+        assert!(
+            !app.rearm_for_strip_band_landing(wid, || requests += 1),
+            "no strip: nothing to land"
+        );
+        app.tab_strip_rows = 1;
+        compose(&mut app, wid);
+        assert!(
+            !app.rearm_for_strip_band_landing(wid, || requests += 1),
+            "a settled band's re-read is not a landing"
+        );
+        assert_eq!(requests, 0);
+        crate::tray_raster::clear_ui_fonts_for_test();
     }
 }
 
@@ -17503,6 +17762,7 @@ fn fill_divider_grid_cells<T>(
     dst.display_offset = 0;
     dst.base_y = 0;
     dst.absolute_row_revision = 0;
+    dst.history_renumber_epoch = 0;
     dst.scroll_frac_px = 0;
     dst.grid_top_row = 0;
     dst.grid_bot_row = 0;
@@ -19315,7 +19575,11 @@ mod composed_cursor_effect_advance_tests {
     /// nothing at all. Both splits (one offset each), a three-pane layout
     /// (both offsets at once) and a zoomed leaf, and the band deliberately
     /// left on a row the caret has LEFT, which is the only row read through
-    /// `witness_row_buf` rather than through the caret's own probe.
+    /// `witness_row_buf` rather than through the caret's own probe. Then the
+    /// 2026-09-16 shape law from this side: a lone glyph changed strictly
+    /// inside the standing band is not evidence and the band stays whole; the
+    /// same change at the band's last cell is a suffix and retires — which is
+    /// also the proof the witness was fed at all.
     #[test]
     fn the_composed_witness_reads_the_focused_pane_s_own_rows_and_columns() {
         for axis in [
@@ -19364,14 +19628,45 @@ mod composed_cursor_effect_advance_tests {
                  retired light the owner earned"
             );
 
-            // …and ONE changed glyph on that same abandoned row, written
-            // without disturbing the caret, IS seen. The non-vacuity arm: the
-            // witness is fed, it is fed the right cells, and it still fires.
+            // THE SHAPE LAW, THROUGH THE COMPOSED PATH (`Witness::shape_verdicts`,
+            // 2026-09-16: nothing leaves the middle of a standing run). ONE glyph
+            // changed strictly INSIDE the run — the fifth cell, `o` → `X`, one
+            // of ten recorded cells with letters lit either side — is NOT
+            // evidence: the band stays whole and the counter stays at zero. This
+            // is the shape both arms below wrote until 6ffc8f973, and went red
+            // against.
             term_lock(&term).process(b"\x1b7\x1b[6;5HX\x1b8");
+            let t = composed_idle(&mut app, wid, t, 32);
+            assert_eq!(
+                composed_ribbon_row(&app, wid, win_row),
+                live,
+                "{axis:?}: a lone interior glyph change punched a hole in a \
+                 standing run"
+            );
+            assert_eq!(
+                composed_ribbon_retired(&app, wid),
+                0,
+                "{axis:?}: a lone interior glyph change retired a standing run"
+            );
+
+            // …and ONE changed glyph at the END of that same run, written
+            // without disturbing the caret, IS seen: a name reaching the run's
+            // last recorded cell is a suffix and stands. The non-vacuity arm for
+            // everything above: the witness is fed, fed the right cells, and
+            // fires. A starved witness passes the interior arm for the wrong
+            // reason and fails here. EXACTLY ONE cell retires: the not-evidence
+            // clause has a second half — "the records catch up", the interior
+            // record takes the glyph standing there now (455647294) — and a
+            // witness that drops it names the fifth cell AGAIN alongside the
+            // last, a shape that reaches the run's end and stands, and retires
+            // TWO. `> 0` swallowed that; `== 1` pins both halves.
+            term_lock(&term).process(b"\x1b7\x1b[6;11HX\x1b8");
             let _ = composed_idle(&mut app, wid, t, 32);
-            assert!(
-                composed_ribbon_retired(&app, wid) > 0,
-                "{axis:?}: the witness never saw the glyph change"
+            assert_eq!(
+                composed_ribbon_retired(&app, wid),
+                1,
+                "{axis:?}: the witness never saw the glyph change, or the \
+                 interior record did not take the glyph standing there"
             );
         }
     }
@@ -19401,8 +19696,10 @@ mod composed_cursor_effect_advance_tests {
                 Vec::new(),
                 Vec::new(),
             );
-            // The grid now differs from the cells this frame extracted.
-            term_lock(&term).process(b"\x1b7\x1b[6;5HX\x1b8");
+            // The grid now differs from the cells this frame extracted — at the
+            // run's last recorded cell, an END of the run, where a lone changed
+            // glyph is evidence under the 2026-09-16 shape law (see the test above).
+            term_lock(&term).process(b"\x1b7\x1b[6;11HX\x1b8");
             assert!(!sample.witness_stamp.matches(&term_lock(&term)));
             assert!(
                 app.splice_focused_composed_cursor_effects_sampled_with_plan(
@@ -19814,12 +20111,10 @@ mod composed_cursor_effect_advance_tests {
         let retained_at = t0 + Duration::from_millis(37);
         let next_trail_tick = t0 + Duration::from_secs(3);
         let last_trail_fire = t0 + Duration::from_millis(2);
-        let last_effect_pump_at = t0 + Duration::from_millis(3);
         let predictor_deadline = {
             let window = app.windows.get_mut(&wid).expect("test window");
             window.next_trail_tick = Some(next_trail_tick);
             window.last_trail_fire = Some(last_trail_fire);
-            window.last_effect_pump_at = Some(last_effect_pump_at);
             window
                 .predictor
                 .set_mode(crate::predict::PredictMode::Always);
@@ -19854,7 +20149,6 @@ mod composed_cursor_effect_advance_tests {
             assert_eq!(window.cursor_glow.admission_tally(), before);
             assert_eq!(window.next_trail_tick, Some(next_trail_tick));
             assert_eq!(window.last_trail_fire, Some(last_trail_fire));
-            assert_eq!(window.last_effect_pump_at, Some(last_effect_pump_at));
             assert_eq!(window.predictor.next_deadline(), Some(predictor_deadline));
         }
         assert!(
@@ -19869,7 +20163,6 @@ mod composed_cursor_effect_advance_tests {
         assert_eq!(window.cursor_glow.admission_tally(), before);
         assert_eq!(window.next_trail_tick, Some(next_trail_tick));
         assert_eq!(window.last_trail_fire, Some(last_trail_fire));
-        assert_eq!(window.last_effect_pump_at, Some(last_effect_pump_at));
         assert_eq!(window.predictor.next_deadline(), Some(predictor_deadline));
 
         for term in &terms {
@@ -24490,7 +24783,34 @@ impl App {
         }
         for id in self.window_terminal_sessions(wid) {
             if let Some(s) = self.pool.get(id) {
-                term_lock(&s.term).set_cell_pixel_size(px.0, px.1);
+                let grid = {
+                    let mut term = term_lock(&s.term);
+                    term.set_cell_pixel_size(px.0, px.1);
+                    (term.rows(), term.cols())
+                };
+                // THE PTY LEARNS IT TOO. This used to write the ENGINE only, and
+                // the sole post-spawn writer of the winsize PIXEL fields sat
+                // downstream of `resize_panes`' unchanged-dims `continue` — so
+                // two ordinary states left `ws_xpixel`/`ws_ypixel` wrong for the
+                // life of the session, and a tool that sizes its output from
+                // `ioctl(TIOCGWINSZ)` (an image protocol, a plotting TUI) read
+                // them:
+                //
+                // * THE BOOT SESSION. A windowed launch spawns the first session
+                //   with `cell_px: None`, because the backend build is still in
+                //   flight, so its winsize opens at 0x0. The backend join reaches
+                //   HERE to correct the engine — and the correction stopped at the
+                //   engine, leaving the first tab answering 0x0 forever.
+                // * A CELL-BOX CHANGE THAT KEEPS rows/cols. A font zoom or a DPI
+                //   migration that lands on the same grid: `apply_term_resize`
+                //   calls this and then returns early, never reaching the one PTY
+                //   pixel write.
+                //
+                // Writing the SAME rows/cols with new pixels is the point: the
+                // grid did not move, the cell box did. This is memoized on
+                // `cell_px_reported` above, so it runs only when the cell box
+                // actually changes and cannot churn SIGWINCH per frame.
+                aterm_pty::resize_with_cell_px(s.master, grid.0, grid.1, Some(px));
             }
         }
         if let Some(ws) = self.windows.get_mut(&wid) {
@@ -24783,13 +25103,17 @@ impl App {
     /// `Key | Text | KeySequence` arm — for both input sources, physical and
     /// control-socket).
     ///
-    /// KNOWN GAP, do not read the line above as more than it says: the stamp is
-    /// on that arm ONLY. `InputEvent::Paste` takes `App::input_paste`, which
-    /// does not stamp — so `ctl paste`, the TEXT phase of `ctl turn`, Cmd-V and
-    /// the X11 async paste worker arm no wake, and an unfocused window pasted
-    /// into is still hard-zeroed. See item 2 of
-    /// `docs/EFFECTS-AND-WAKE-FOLLOWUPS-2026-08-24.md`; the repair belongs in
-    /// `app_input.rs`.
+    /// A PASTE ARMS IT TOO, and has since 2026-08-25 (`fdb701cecc`): the
+    /// `InputEvent::Paste` arm of `App::input_to_session` stamps before
+    /// dispatching to `App::input_paste`, and that arm is the ONLY caller of
+    /// `input_paste`, so `ctl paste`, the TEXT phase of `ctl turn`, Cmd-V and
+    /// the X11 async paste worker all reach it. This line read "KNOWN GAP …
+    /// still hard-zeroed" for three weeks after the gap was closed, which is
+    /// how a reader is sent to re-fix a fixed thing; the three claims are
+    /// pinned now by
+    /// `app_input::pet_console_input_tests::the_typed_wake_is_armed_by_a_controller_key_and_a_paste_but_not_a_bare_modifier`
+    /// (item 16 of `docs/EFFECTS-AND-WAKE-FOLLOWUPS-2026-08-24.md`), so a
+    /// future regression is a red test rather than a stale comment.
     ///
     /// W11b demotes an unfocused window because BACKGROUND motion is pure
     /// decoration — but a window RECEIVING typed input is being driven, and
@@ -25121,7 +25445,6 @@ impl App {
                 intensity: self.config.cursor_trail_intensity_or_default(),
                 radius: self.config.cursor_trail_radius_or_default(),
                 ring: self.config.cursor_trail_ring_or_default(),
-                wake_persist_s: self.config.cursor_trail_wake_persist_or_default(),
             },
             presentation,
             self.theme.cursor,
@@ -27698,6 +28021,7 @@ impl App {
             // as fresh (mirrors the pure-split compose path's reset).
             window.input_scratch.base_y = 0;
             window.input_scratch.absolute_row_revision = 0;
+            window.input_scratch.history_renumber_epoch = 0;
             window.input_scratch.selection = aterm_core::selection::TextSelection::new();
         }
 
@@ -27836,6 +28160,8 @@ impl App {
                             window.input_scratch.base_y = cache.staged_input.base_y;
                             window.input_scratch.absolute_row_revision =
                                 cache.staged_input.absolute_row_revision;
+                            window.input_scratch.history_renumber_epoch =
+                                cache.staged_input.history_renumber_epoch;
                         }
                         if leaf.focused
                             && cache.staged_input.cursor_visible
@@ -28547,7 +28873,14 @@ impl App {
         // read back over the control socket's `metrics` verb. `render_ns` is
         // causal CPU wall time (compose plus raster/copy or GPU submit); surface
         // acquisition and final-present waits remain in `redraw_total`.
-        metrics::record_present(present_latency_ns, render_ns, startup_timing);
+        // THIS window's pending keystroke only: a present in another window (its
+        // own streaming output) must not close a key typed here.
+        metrics::record_present(
+            present_latency_ns,
+            render_ns,
+            startup_timing,
+            self.windows.get_mut(&id).map(|ws| &mut ws.pending_input),
+        );
 
         // There is deliberately NO font-coverage warm here any more. The
         // `aterm-font-warm` thread this hook used to spawn read EVERY system
@@ -28677,6 +29010,71 @@ impl App {
                 }
             }
         }
+        // THE PIXEL BAND's own landing (Windows + Linux), the third follow-up:
+        // a chain face the strip's cell lane parsed DURING this present. The
+        // band's cache key read the chrome-font epoch BEFORE the raster, so
+        // the frame that just went to glass is the cell-lane frame; nothing
+        // else asks for the next one (the parse passes through no install,
+        // the band key is no `RepaintKey` term, and the fallback poll above
+        // watches only the discovery parse). Same re-arm shape as that poll.
+        #[cfg(any(windows, target_os = "linux"))]
+        self.rearm_for_strip_band_landing(id, || {
+            if let Some(window) = window {
+                window.request_redraw();
+            }
+        });
+    }
+
+    /// The pixel band's post-present landing check (Windows + Linux). A tab
+    /// title the chrome's own faces cannot draw — CJK, until the terminal has
+    /// parsed its chain face — takes the strip's CELL lane, and it is that very
+    /// raster, inside the present, that parses the face into the chain cell the
+    /// chrome's semantic seed shares (`Renderer::ready_fallback_faces`). The
+    /// band's cache key ([`crate::tray_raster::strip_band_font_epoch`]) was
+    /// read by `splice_tab_strip_with` BEFORE the raster, so the frame just
+    /// presented drew the title low on the cell baseline, cut by the seam —
+    /// the defect — and would stay so until an unrelated stimulus: a keystroke,
+    /// output, a focus change, or the blink clock, which a steady cursor
+    /// (`cursor_blink = false`, a DECSCUSR steady style) never arms.
+    ///
+    /// So the landing schedules itself here: when the live epoch differs from
+    /// the one the window's band was rastered under, clear `last_present` (the
+    /// content early-out has no term for the band key and would swallow a bare
+    /// request on an otherwise idle screen — the same law as
+    /// [`fallback_convergence_action`]), drop the GPU present cache (the damage
+    /// diff cannot see the band's pixels change under identical cells), and
+    /// request the next frame, whose splice re-reads the epoch, misses the
+    /// band cache, and re-rasters the title into the band. That splice caches
+    /// the new epoch, so the frame after finds them equal: one extra frame per
+    /// landing, never a loop. A window with no strip never wrote a band key
+    /// and asks nothing. The read is the splice's own: a `try_recv` and a few
+    /// atomic loads under the chrome-font lock.
+    ///
+    /// The request goes through a callback so the edge is testable without an
+    /// OS window (`request_recovery_redraw`'s seam); returns whether it fired.
+    #[cfg(any(windows, target_os = "linux"))]
+    fn rearm_for_strip_band_landing(
+        &mut self,
+        id: WindowId,
+        request_redraw: impl FnOnce(),
+    ) -> bool {
+        if self.tab_strip_rows == 0 {
+            return false;
+        }
+        let Some(state) = self.windows.get_mut(&id) else {
+            return false;
+        };
+        if crate::tray_raster::strip_band_font_epoch() == state.strip_band_key.4 {
+            return false;
+        }
+        if let Some(PresentTarget::Gpu { window_gpu, .. } | PresentTarget::Virtual { window_gpu }) =
+            &mut state.present
+        {
+            window_gpu.invalidate_present();
+        }
+        state.last_present = None;
+        request_redraw();
+        true
     }
 
     /// Bind the exact zoom-aware visible route to the coordinate space its next
@@ -30027,7 +30425,7 @@ impl App {
             // Invalid asset disables the companion and remains diagnosable; no
             // presentation path expands a path, reads a file, or decodes PNG.
             // O(1) scalar sync (no ledger scan/I/O). `on_collect` fires from
-            // the favourite-pin path only (`favourite_kitty`); this tick's
+            // the favourite-pin path only (`favourite_kitty_checked`); this tick's
             // ambient drain below records to the ledger and can never repoint
             // the companion (owner rulings, 2026-08-07 and 2026-08-17).
             // TWO-PATH RULE (owner: switching character mid-flight is
@@ -32543,7 +32941,7 @@ impl App {
                         has_description.then_some(authored_description.as_str()),
                         self.config.tab_title_format_or_default(),
                         &self.config,
-                        crate::title_summary::TAB_LABEL_SEPARATOR,
+                        crate::title_summary::ChromeSurface::TabStrip,
                         slot,
                     );
                 }
@@ -33076,6 +33474,26 @@ impl App {
                     // Publish before inspecting success/failure or replacing a
                     // lost GPU target. Every real acquire gets one sample;
                     // an early refusal that never acquired gets none.
+                    // THE ARMED GPU PARK, PUBLISHED. The renderer books the
+                    // main thread's `waitUntilCompleted` time (the Submit-A
+                    // pipelining wait + the pending-ring drain) separately from
+                    // its work timer, so it no longer inflates `raster_submit_ns`
+                    // below. Publish it here, beside the acquire park and on the
+                    // same either-outcome rule, so a GPU-contention stall is
+                    // NAMED instead of hiding in `redraw_total`.
+                    if let Some(parked_ns) = window_gpu.take_gpu_park_sample_ns() {
+                        metrics::note_gpu_park(parked_ns);
+                    }
+                    // THE DRAWABLE WORKER'S QUEUE LEG, on the same
+                    // either-outcome rule as the two above. The acquire wait
+                    // published below is measured inside the worker, so it
+                    // cannot see how long the worker took to be scheduled —
+                    // the span during which this thread was parked on
+                    // `AcquirePending`. Booked here so a starved worker is
+                    // NAMED rather than arriving as unexplained input latency.
+                    if let Some(queued_ns) = window_gpu.take_acquire_queue_sample_ns() {
+                        metrics::note_acquire_queue(queued_ns);
+                    }
                     let reported = report_gpu_surface_present(
                         result,
                         window_gpu.take_acquire_wait_sample_ns(),
@@ -33441,7 +33859,10 @@ impl App {
         // output→present pipeline wait is milliseconds; SECONDS means the stamp
         // aged through an interval nobody was watching — a miniaturized window,
         // a sleep/wake gap. Booking those would inflate max/p99 with exactly the
-        // artifact the per-window attribution exists to kill.
+        // artifact the per-window attribution exists to kill. The cap is only the
+        // backstop: an occlusion under 5 s is caught by the reveal-clear below,
+        // because `on_occlusion_changed` forgets `last_visible_views` on the
+        // window's reveal edge.
         const PRESENT_LATENCY_CAP_NS: u64 = 5_000_000_000;
         let now = self.lat_epoch.elapsed().as_nanos() as u64;
         // REVEAL-CLEAR — the artifact's real seam. A stamp armed while its pane
@@ -34011,6 +34432,7 @@ impl App {
             if focused {
                 ws.input_scratch.base_y = ws.pane_scratch.base_y;
                 ws.input_scratch.absolute_row_revision = ws.pane_scratch.absolute_row_revision;
+                ws.input_scratch.history_renumber_epoch = ws.pane_scratch.history_renumber_epoch;
                 focused_cursor_rgb = Some(terminal_cursor_rgb(&term));
                 let live_viewport = term.grid().display_offset() == 0;
                 capture_focus = Some(TerminalCaptureFocus {
@@ -36764,6 +37186,7 @@ impl App {
         // with PTY output before extraction).
         ws.input_scratch.base_y = 0;
         ws.input_scratch.absolute_row_revision = 0;
+        ws.input_scratch.history_renumber_epoch = 0;
         let mut focus_title: Arc<str> = Arc::from("");
         let mut painted_pred = false;
         let mut focus_pred_last: Option<(u16, u16)> = None;
@@ -36853,6 +37276,7 @@ impl App {
                 // scalar sample as the cells/effect tick.
                 ws.input_scratch.base_y = ws.pane_scratch.base_y;
                 ws.input_scratch.absolute_row_revision = ws.pane_scratch.absolute_row_revision;
+                ws.input_scratch.history_renumber_epoch = ws.pane_scratch.history_renumber_epoch;
                 ws.input_scratch.cursor_color = focus_cursor_rgb
                     .map_or(aterm_core::render::COLOR_UNSET, aterm_render::rgb_to_u32);
                 let pred_paint = if pmode == crate::predict::PredictMode::Off {
@@ -37825,12 +38249,15 @@ impl App {
         // to SEARCH-time base_y (SearchState.match_base_y); re-anchoring by
         // `delta = base_y_now − match_base_y` keeps the highlight on its line when output
         // scrolled the grid since the search (mirrors search_apply_current).
-        let Some((base_y_now, frame_absolute_row_revision)) = self.windows.get(&wid).map(|ws| {
-            (
-                ws.input_scratch.base_y,
-                ws.input_scratch.absolute_row_revision,
-            )
-        }) else {
+        let Some((base_y_now, frame_absolute_row_revision, frame_history_renumber_epoch)) =
+            self.windows.get(&wid).map(|ws| {
+                (
+                    ws.input_scratch.base_y,
+                    ws.input_scratch.absolute_row_revision,
+                    ws.input_scratch.history_renumber_epoch,
+                )
+            })
+        else {
             return;
         };
         // In a SPLIT, matches are keyed to the FOCUSED pane's grid, but the composite tiles
@@ -37860,16 +38287,33 @@ impl App {
         } else {
             0
         };
-        let (match_base_y, match_absolute_row_revision) = self
+        let (match_base_y, match_absolute_row_revision, match_history_renumber_epoch) = self
             .windows
             .get(&wid)
             .and_then(|ws| ws.search.as_ref())
-            .map_or((0, 0), |s| (s.match_base_y, s.match_absolute_row_revision));
-        // A protected-footer splice changes absolute rows piecewise. Until the UI
-        // recomputes, the cached match coordinates cannot safely be mapped into this
-        // frame with a uniform delta. Keep the bar visible, but fail closed for every
-        // geometry-dependent use of those cached rows.
-        let stale_absolute_rows = frame_absolute_row_revision != match_absolute_row_revision;
+            .map_or((0, 0, 0), |s| {
+                (
+                    s.match_base_y,
+                    s.match_absolute_row_revision,
+                    s.match_history_renumber_epoch,
+                )
+            });
+        // TWO WAYS A CACHED MATCH ROW DIES, AND THE TINT MUST REFUSE BOTH.
+        // A protected-footer splice changes absolute rows piecewise
+        // (`absolute_row_revision`). A WIDTH reflow — an edge drag, a font zoom, a
+        // divider move — rewraps history and renumbers every retained row wholesale
+        // (`history_renumber_epoch`), and it moves the footer revision NOT AT ALL.
+        // Gating on the footer revision alone is what let a measured Ctrl-= with the
+        // bar open on "P09=" paint a four-cell box on "P05=" — same width, same
+        // column, same shape — while the real hit sat four rows down untinted and the
+        // bar still read "Find: P09=" 1/1. Neither change is a uniform `base_y`
+        // delta, so until the UI recomputes the cached coordinates cannot be mapped
+        // into this frame at all. Keep the bar visible, but fail closed for every
+        // geometry-dependent use of those cached rows — the same law
+        // `finalize_resize` already applies to the text selection, which a width
+        // change drops outright.
+        let stale_absolute_rows = frame_absolute_row_revision != match_absolute_row_revision
+            || frame_history_renumber_epoch != match_history_renumber_epoch;
         let delta = base_y_now.saturating_sub(match_base_y);
         // IME-2: while the find field OWNS an in-flight composition
         // ([`crate::app_input::PreeditOwner::Find`] — the render-time twin of
@@ -40129,6 +40573,12 @@ fn release_reflow_seat_and_replace() {
 /// workers — at most `reflow_worker_ceiling()` of them, which is the whole
 /// point.
 fn reflow_worker_main() {
+    // Reflow is `Responsive` work by name in qos.rs, and this worker is also
+    // under that module's FLOOR rule: it holds `REFLOW_POOL`, which the main
+    // thread takes on every settle to submit the next pane. Undeclared it ran at
+    // the inherited DEFAULT — below its own class, and low enough to be
+    // descheduled holding that lock with the resizing UI thread queued behind it.
+    crate::qos::set_self(crate::qos::Role::Responsive);
     let mut seat = ReflowWorkerSeat { seated: true };
     loop {
         let handoff = {
@@ -40180,6 +40630,66 @@ mod reflow_pool_tests {
     use std::sync::atomic::{AtomicUsize, Ordering};
     use std::sync::{Arc, Condvar, Mutex};
     use std::time::{Duration, Instant};
+
+    /// THE LIVE CLASS a pooled rewrap actually runs at, read from inside a real
+    /// pool job rather than inferred from the spawn site.
+    ///
+    /// A new pthread does NOT inherit its creator's class, so a worker that
+    /// declares nothing reads `QOS_CLASS_DEFAULT` (0x15) — the band the program
+    /// being typed into runs in, and BELOW the `USER_INITIATED` class `qos.rs`
+    /// names for reflow. That is the wrong side of the UI thread twice over: the
+    /// human is waiting for their scrollback, and the worker holds `REFLOW_POOL`,
+    /// which the main thread takes to submit the next pane of the same settle.
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn a_pooled_rewrap_runs_at_user_initiated_not_the_inherited_band() {
+        // SAFETY: `qos_class_self` is libpthread's, part of `libSystem`, linked
+        // into every process on this platform. It reads only the calling thread's
+        // own requested class and takes no arguments.
+        unsafe extern "C" {
+            fn qos_class_self() -> u32;
+        }
+        /// `QOS_CLASS_USER_INITIATED` as `<sys/qos.h>` spells it.
+        const USER_INITIATED_RAW: u32 = 0x19;
+
+        let seen = Arc::new((Mutex::new(None::<u32>), Condvar::new()));
+        let posted = Arc::clone(&seen);
+        let stranded = reflow_pool_submit(ReflowHandoff {
+            run: Box::new(move || {
+                // SAFETY: see the extern above.
+                let class = unsafe { qos_class_self() };
+                let (lock, cv) = &*posted;
+                *lock.lock().unwrap_or_else(|p| p.into_inner()) = Some(class);
+                cv.notify_all();
+            }),
+            inline: Box::new(|| {}),
+            priority: true,
+        });
+        // No worker could be started (thread/FD exhaustion): the inline arm would
+        // read THIS thread's class, which is not what is under test.
+        if !stranded.is_empty() {
+            return;
+        }
+
+        let (lock, cv) = &*seen;
+        let mut class = lock.lock().unwrap_or_else(|p| p.into_inner());
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while class.is_none() {
+            let left = deadline.saturating_duration_since(Instant::now());
+            assert!(!left.is_zero(), "no pooled worker drove the job");
+            let (next, _) = cv
+                .wait_timeout(class, left)
+                .unwrap_or_else(|p| p.into_inner());
+            class = next;
+        }
+        let class = class.expect("the job posted its class");
+        assert_eq!(
+            class, USER_INITIATED_RAW,
+            "an aterm-reflow worker ran at QoS class {class:#x}, not USER_INITIATED \
+             ({USER_INITIATED_RAW:#x}) — a rewrap the human is waiting on, holding \
+             the pool lock, below the class qos.rs gives it"
+        );
+    }
 
     /// THE POOL'S TWO CONTRACTS, both pinned here because MPT-1's whole claim
     /// rests on them: every submitted job is driven EXACTLY ONCE (nothing is
@@ -42207,6 +42717,263 @@ mod find_bar_splice_tests {
         );
     }
 
+    /// Screen rows carrying the highlight-all tint, in frame order.
+    fn tinted_rows(app: &App, wid: WindowId, hi: [u8; 3]) -> Vec<usize> {
+        app.windows[&wid]
+            .input_scratch
+            .cells
+            .iter()
+            .enumerate()
+            .filter(|(_, row)| row.iter().any(|cell| cell.bg == hi))
+            .map(|(idx, _)| idx)
+            .collect()
+    }
+
+    /// THE SECOND WAY A CACHED MATCH ROW DIES — and the one the footer revision
+    /// cannot see.
+    ///
+    /// A WIDTH reflow (an edge drag, a font zoom, a divider move) rewraps
+    /// retained history: the same text occupies a different number of rows, so
+    /// every retained row's absolute key slides. That moves no
+    /// `absolute_row_revision` at all, so gating the tint on the footer revision
+    /// alone was no gate. Measured on glass at 80x24 with the bar open on
+    /// "P09=" and one Ctrl-=: `find status` still said row 15, the grid now had
+    /// "P09=" on row 11, and a four-cell box sat squarely on "P05=" — same
+    /// width, same column, same shape — while the bar read "Find: P09=" 1/1. A
+    /// wrong line asserted as the match is the one outcome the overlay must not
+    /// produce, so it fails closed until the search recomputes, exactly as
+    /// `finalize_resize` drops the text selection.
+    #[test]
+    fn find_bar_suppresses_matches_a_width_reflow_renumbered() {
+        let mut app = App::headless_for_test();
+        let wid = WindowId(0);
+        let term = app.pool.get(0).expect("session 0").term.clone();
+        let cols = app.windows[&wid].cols;
+        // Twelve uniquely tagged lines, each long enough to soft-wrap at the
+        // starting width and deep enough to push history into scrollback: the
+        // rows a narrowing rewrap renumbers, and the shape that makes a stale
+        // landing hit a DIFFERENT, match-shaped token rather than blank space.
+        {
+            let tail = "-".repeat(usize::from(cols) + usize::from(cols) / 2);
+            let mut t = term_lock(&term);
+            for i in 1..=12u32 {
+                t.process(format!("P{i:02}={tail}\r\n").as_bytes());
+            }
+        }
+        app.search_enter();
+        seed_query(&mut app, wid, "P09=");
+        app.search_recompute();
+        assert_eq!(
+            app.windows[&wid].search.as_ref().unwrap().matches.len(),
+            1,
+            "fixture: exactly one hit"
+        );
+
+        let hi = highlight_bg();
+        fill_scratch(&mut app, wid);
+        app.splice_find_bar(wid);
+        let lit_before = tinted_rows(&app, wid, hi);
+        assert_eq!(lit_before.len(), 1, "baseline tints exactly one row");
+        assert!(
+            row_text(&app, wid, lit_before[0]).starts_with("P09="),
+            "baseline tint is on the text that matched: {:?}",
+            row_text(&app, wid, lit_before[0])
+        );
+
+        // The reflow, with NO output behind it — the bare geometry change an
+        // edge drag or a font zoom is.
+        let (term_rows, term_cols) = {
+            let t = term_lock(&term);
+            (t.rows(), t.cols())
+        };
+        let epoch_before = term_lock(&term).grid().history_renumber_epoch();
+        let revision_before = term_lock(&term).absolute_row_revision();
+        let narrower = term_cols.saturating_sub(9).max(8);
+        term_lock(&term).resize(term_rows, narrower);
+        app.windows.get_mut(&wid).unwrap().cols = narrower;
+        assert!(
+            term_lock(&term).grid().history_renumber_epoch() > epoch_before,
+            "fixture: the width rewrap renumbers retained history"
+        );
+        assert_eq!(
+            term_lock(&term).absolute_row_revision(),
+            revision_before,
+            "...and the footer revision, the tint's only former gate, does not move"
+        );
+
+        fill_scratch(&mut app, wid);
+        app.splice_find_bar(wid);
+
+        // The bar itself stays up — the panel is not what went wrong.
+        let field = field_row_text(&app, wid);
+        assert!(
+            field.contains("Find: ") && field.contains("P09="),
+            "a reflow does not hide the panel: {field:?}"
+        );
+        // THE LAW: a painted tint asserts "this text matched your query", so
+        // every lit row must still hold the query.
+        for row in tinted_rows(&app, wid, hi) {
+            let text = row_text(&app, wid, row);
+            assert!(
+                text.contains("P09="),
+                "the tint claims screen row {row} matched the query, but it reads {text:?}"
+            );
+        }
+        // And the whole batch is refused until a recompute, because a rewrap is
+        // not a uniform `base_y` delta and there is nothing honest to re-anchor.
+        assert!(
+            tinted_rows(&app, wid, hi).is_empty(),
+            "renumbered match rows cannot tint a post-reflow frame"
+        );
+        assert_eq!(
+            app.windows[&wid].find_bar_match_work, 0,
+            "the gate skips the cached match walk outright"
+        );
+
+        // A recompute is the repair, and it puts the tint back on the real hit.
+        app.search_recompute();
+        fill_scratch(&mut app, wid);
+        app.splice_find_bar(wid);
+        let lit_after = tinted_rows(&app, wid, hi);
+        assert_eq!(
+            lit_after.len(),
+            1,
+            "the recomputed batch tints one row again"
+        );
+        assert!(
+            row_text(&app, wid, lit_after[0]).starts_with("P09="),
+            "...and it is the line that actually matched: {:?}",
+            row_text(&app, wid, lit_after[0])
+        );
+    }
+
+    /// THE OTHER HALF OF THE SAME TRIGGER — a width reflow with NOTHING in
+    /// scrollback.
+    ///
+    /// The sibling above seeds twelve wrapped lines into a 24-row grid, so the
+    /// rewrap really does splice rows back into history and the epoch moves at
+    /// `scrollback_reflow.rs`'s bump. That is the EASY half. After a `clear`, in
+    /// a fresh tab, or in any session whose output still fits on screen, the
+    /// off-screen history is empty: the rewrap touches only the live grid, every
+    /// splice-site bump early-returns (`prepend_ring_scrollback_lines` on
+    /// `kept.is_empty()`, `fill_viewport_deficit_from_history` on a zero
+    /// deficit, `note_bottom_end_renumbered` on a rows-only trim) — and the text
+    /// under every absolute row still slid, because the same six logical lines
+    /// need eighteen rows at the narrower width where twelve did before. The
+    /// tint was replayed verbatim onto whatever the rewrap moved into those
+    /// cells.
+    ///
+    /// The repair is in the grid, not here: `resize_with_reflow_mode` raises
+    /// `history_renumber_epoch` for EVERY width rewrap, which is what its own
+    /// comment ("A WIDTH reflow renumbers rows wholesale") has always claimed.
+    /// This test is the empty-scrollback fixture that says so through the real
+    /// splice.
+    #[test]
+    fn find_bar_suppresses_matches_a_viewport_only_width_reflow_moved() {
+        let mut app = App::headless_for_test();
+        let wid = WindowId(0);
+        let term = app.pool.get(0).expect("session 0").term.clone();
+        let cols = app.windows[&wid].cols;
+        // Six lines, each 1.5 screens wide: two rows apiece at the starting
+        // width, three after the halving — eighteen rows, still inside a 24-row
+        // viewport, so NOTHING is ever pushed off the top into history.
+        {
+            let tail = "-".repeat(usize::from(cols) + usize::from(cols) / 2 - 4);
+            let mut t = term_lock(&term);
+            for i in 1..=6u32 {
+                t.process(format!("Q{i:02}={tail}\r\n").as_bytes());
+            }
+        }
+        assert_eq!(
+            term_lock(&term).grid().scrollback_lines(),
+            0,
+            "fixture: the whole point is a reflow with an EMPTY scrollback — \
+             nothing here may cross the live/history boundary"
+        );
+
+        app.search_enter();
+        seed_query(&mut app, wid, "Q05=");
+        app.search_recompute();
+        assert_eq!(
+            app.windows[&wid].search.as_ref().unwrap().matches.len(),
+            1,
+            "fixture: exactly one hit"
+        );
+
+        let hi = highlight_bg();
+        fill_scratch(&mut app, wid);
+        app.splice_find_bar(wid);
+        let lit_before = tinted_rows(&app, wid, hi);
+        assert_eq!(lit_before.len(), 1, "baseline tints exactly one row");
+        assert!(
+            row_text(&app, wid, lit_before[0]).starts_with("Q05="),
+            "baseline tint is on the text that matched: {:?}",
+            row_text(&app, wid, lit_before[0])
+        );
+
+        // A PURE width drag: rows constant, no output behind it.
+        let (term_rows, term_cols) = {
+            let t = term_lock(&term);
+            (t.rows(), t.cols())
+        };
+        let revision_before = term_lock(&term).absolute_row_revision();
+        let narrower = (term_cols / 2).max(8);
+        term_lock(&term).resize(term_rows, narrower);
+        app.windows.get_mut(&wid).unwrap().cols = narrower;
+        assert_eq!(
+            term_lock(&term).grid().scrollback_lines(),
+            0,
+            "fixture: the rewrap still spliced nothing into history — this is \
+             the half the splice-site epoch bumps cannot see"
+        );
+        assert_eq!(
+            term_lock(&term).absolute_row_revision(),
+            revision_before,
+            "...and the footer revision, the tint's only former gate, does not move"
+        );
+
+        fill_scratch(&mut app, wid);
+        app.splice_find_bar(wid);
+
+        // The bar itself stays up — the panel is not what went wrong.
+        let field = field_row_text(&app, wid);
+        assert!(
+            field.contains("Find: ") && field.contains("Q05="),
+            "a reflow does not hide the panel: {field:?}"
+        );
+        // THE LAW: a painted tint asserts "this text matched your query", so
+        // every lit row must still hold the query. Before the grid bump this
+        // failed with the tint on a "Q03=" row while "Q05=" sat further down
+        // untinted — the report's own wrong-token shape, at a different width.
+        for row in tinted_rows(&app, wid, hi) {
+            let text = row_text(&app, wid, row);
+            assert!(
+                text.contains("Q05="),
+                "the tint claims screen row {row} matched the query, but it reads {text:?}"
+            );
+        }
+        assert!(
+            tinted_rows(&app, wid, hi).is_empty(),
+            "renumbered match rows cannot tint a post-reflow frame"
+        );
+
+        // A recompute is the repair, and it puts the tint back on the real hit.
+        app.search_recompute();
+        fill_scratch(&mut app, wid);
+        app.splice_find_bar(wid);
+        let lit_after = tinted_rows(&app, wid, hi);
+        assert_eq!(
+            lit_after.len(),
+            1,
+            "the recomputed batch tints one row again"
+        );
+        assert!(
+            row_text(&app, wid, lit_after[0]).starts_with("Q05="),
+            "...and it is the line that actually matched: {:?}",
+            row_text(&app, wid, lit_after[0])
+        );
+    }
+
     /// CONTRAST FLOOR (#8): a non-current highlighted match whose fg is close to the
     /// highlight tint is lifted to a legible contrast (WCAG floor), while the CURRENT
     /// match's fg is left untouched — the renderer paints the full selection over it and
@@ -42577,7 +43344,7 @@ mod find_bar_splice_tests {
             app.search_last_query, "hit",
             "accept remembered the query for recall"
         );
-        let (accepted_session, _, accepted_row, accepted_start, accepted_end) = app
+        let (accepted_session, _, _, accepted_row, accepted_start, accepted_end) = app
             .search_last_anchor
             .expect("accept retained the absolute current-match anchor");
         assert_eq!(accepted_session, 0, "anchor is bound to session 0");
@@ -42586,7 +43353,7 @@ mod find_bar_splice_tests {
         // Standard Cmd-G after Enter closed the bar must reopen the accepted
         // query and continue strictly AFTER that match, not silently no-op or
         // restart on the same first hit.
-        app.search_find_again(true);
+        let _ = app.search_find_again(true);
         let resumed = app.windows[&wid]
             .search
             .as_ref()
@@ -42621,7 +43388,7 @@ mod find_bar_splice_tests {
         app.frontmost_window = Some(second);
         let second_term = app.pool.get(1).expect("session 1").term.clone();
         term_lock(&second_term).process(b"hit alpha\r\nhit beta");
-        app.search_find_again(true);
+        let _ = app.search_find_again(true);
         let search = app.windows[&second]
             .search
             .as_ref()
@@ -42630,6 +43397,69 @@ mod find_bar_splice_tests {
         assert_eq!(
             search.current, 0,
             "foreign absolute coordinates are ignored; forward search starts at the first local match"
+        );
+    }
+
+    /// THE SAME MISTAKE, ONE SURFACE OVER: Cmd-G's parked anchor is an ABSOLUTE
+    /// row, and it was gated on the protected-footer revision alone.
+    ///
+    /// A width reflow renumbers retained history wholesale and leaves that
+    /// revision exactly where it was, so the parked row stopped naming the line
+    /// it was taken from while still passing the gate — and Find Next resumed
+    /// "strictly after" a line the reader never accepted. The anchor is refused
+    /// on either stamp now, and a refused anchor resumes where an anchorless
+    /// Cmd-G always did: the first forward hit.
+    #[test]
+    fn find_again_refuses_an_absolute_anchor_a_width_reflow_renumbered() {
+        let mut app = App::headless_for_test();
+        let wid = WindowId(0);
+        let term = app.pool.get(0).expect("session 0").term.clone();
+        let cols = app.windows[&wid].cols;
+        // Wrapped, scrolled-back history: the rows a narrowing rewrap renumbers.
+        {
+            let tail = "-".repeat(usize::from(cols) + usize::from(cols) / 2);
+            let mut t = term_lock(&term);
+            for i in 0..12u32 {
+                let mark = if matches!(i, 1 | 5 | 9) { "hit" } else { "pad" };
+                t.process(format!("{mark}{i:02}={tail}\r\n").as_bytes());
+            }
+        }
+        app.search_enter();
+        seed_query(&mut app, wid, "hit");
+        app.search_recompute();
+        app.search_step(true);
+        app.search_accept();
+        let (_, accepted_revision, accepted_epoch, ..) = app
+            .search_last_anchor
+            .expect("accept parks the absolute current-match anchor");
+
+        let (term_rows, term_cols) = {
+            let t = term_lock(&term);
+            (t.rows(), t.cols())
+        };
+        let narrower = term_cols.saturating_sub(9).max(8);
+        term_lock(&term).resize(term_rows, narrower);
+        app.windows.get_mut(&wid).unwrap().cols = narrower;
+        assert_eq!(
+            term_lock(&term).absolute_row_revision(),
+            accepted_revision,
+            "fixture: the reflow moves no footer revision — the old gate sees nothing"
+        );
+        assert!(
+            term_lock(&term).grid().history_renumber_epoch() > accepted_epoch,
+            "fixture: …while the renumber epoch, which does see it, advanced"
+        );
+
+        app.search_find_again(true)
+            .expect("Find Next resumes the accepted query");
+        let resumed = app.windows[&wid]
+            .search
+            .as_ref()
+            .expect("Find Next reopened the accepted query");
+        assert_eq!(resumed.query, "hit");
+        assert_eq!(
+            resumed.current, 0,
+            "a renumbered absolute anchor is ignored; forward search starts at the first hit"
         );
     }
 
@@ -45138,11 +45968,13 @@ mod status_bars_visual_tests {
 
         // 1. The pass row, with the two R6 rows queued behind it.
         app.status_bars.toolchain_installed(
-            "\u{2713} ALab toolchain installed: claude, codex \u{2014} open a new tab to use them",
+            "\u{2713} ALab toolchain installed: claude, codex \u{2014} claude and codex already run in every aterm tab, this one too",
             now,
         );
         app.status_bars.toolchain_managed_current(
             "claude 2.1.267 (build 2026091001); codex 0.154.0 (build 2026091001)",
+            0,
+            true,
             now,
         );
         app.status_bars.toolchain_machine_settings(
@@ -47167,6 +47999,95 @@ mod cell_pixel_size_tests {
             real,
             "the join must correct the boot session before any frame"
         );
+    }
+
+    /// AND THE PTY LEARNS IT TOO. The sibling above pins that the backend join
+    /// corrects the boot session's ENGINE. It did not correct the PTY: the only
+    /// post-spawn writer of the winsize PIXEL fields sat downstream of
+    /// `resize_panes`' unchanged-dims `continue`, so the first tab answered
+    /// `ioctl(TIOCGWINSZ)` with `ws_xpixel = ws_ypixel = 0` for its whole life —
+    /// and a tool that sizes its output from that (an inline-image protocol, a
+    /// plotting TUI) read the zeros.
+    ///
+    /// Driven on a REAL pty, because the defect is in what the kernel holds, not
+    /// in what the engine believes. The seed assertion is the point: it proves
+    /// the 0x0 state this is supposed to correct actually exists first, so a
+    /// pass cannot come from a fixture that was already right.
+    #[cfg(unix)]
+    #[test]
+    fn the_backend_join_teaches_the_boot_ptys_winsize_its_cell_box() {
+        fn winsize_of(master: i32) -> libc::winsize {
+            // SAFETY: `winsize` is four integers; zeroed is valid, and
+            // `TIOCGWINSZ` fills it for an open pty master.
+            let mut ws: libc::winsize = unsafe { std::mem::zeroed() };
+            assert_eq!(
+                unsafe { libc::ioctl(master, libc::TIOCGWINSZ, &mut ws) },
+                0,
+                "TIOCGWINSZ"
+            );
+            ws
+        }
+
+        let (mut master, mut slave) = (-1i32, -1i32);
+        // SAFETY: `openpty` fills the two out-params; the optional name/termios/
+        // winsize pointers are null.
+        let rc = unsafe {
+            libc::openpty(
+                &mut master,
+                &mut slave,
+                std::ptr::null_mut(),
+                std::ptr::null_mut(),
+                std::ptr::null_mut(),
+            )
+        };
+        assert_eq!(rc, 0, "openpty");
+
+        let mut app = App::headless_for_test();
+        let wid = WindowId(0);
+        window_with_a_big_cell(&mut app, wid);
+        app.pool
+            .sessions
+            .get_mut(&0)
+            .expect("session 0")
+            .session
+            .master = master;
+
+        // The windowed cold-launch seed: `spawn_session(.., cell_px: None, ..)`.
+        aterm_pty::resize_with_cell_px(master, 24, 80, None);
+        let seeded = winsize_of(master);
+        assert_eq!(
+            (seeded.ws_xpixel, seeded.ws_ypixel),
+            (0, 0),
+            "the boot seed really does open at 0x0 — without this the test could \
+             pass on a pty that was never wrong"
+        );
+
+        // The correction seam the backend join reaches.
+        app.windows
+            .get_mut(&wid)
+            .expect("window 0")
+            .cell_px_reported = None;
+        app.sync_cell_pixel_size(wid);
+
+        let px = app
+            .spawn_cell_px(wid)
+            .expect("a joined backend has metrics");
+        let corrected = winsize_of(master);
+        assert_eq!(
+            (corrected.ws_xpixel, corrected.ws_ypixel),
+            (
+                px.0.saturating_mul(corrected.ws_col),
+                px.1.saturating_mul(corrected.ws_row)
+            ),
+            "the pty's pixel fields must be the cell box times the grid the \
+             engine is on"
+        );
+
+        // SAFETY: both fds were opened by `openpty` above and are still open.
+        unsafe {
+            libc::close(master);
+            libc::close(slave);
+        }
     }
 
     /// WIRING FENCE. `spawn_session`'s `cell_px` is positional, so the compiler

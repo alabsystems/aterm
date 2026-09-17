@@ -221,6 +221,10 @@ pub fn materialize_from_line(line: &Line, cols: u16) -> MaterializedRow {
     // Restore inline images from Line into extras.
     restore_images(&mut row.extras, line, cols);
 
+    // LAST: the spacer mirror reads what the restores above just wrote, so it
+    // must run after all of them.
+    mirror_wide_spacer_extras(&row.cells, &mut row.extras);
+
     row
 }
 
@@ -467,6 +471,9 @@ pub(in crate::grid) fn materialize_from_row_extras(
         );
     }
     restore_image_spans(&mut out.extras, &extras.images, cols);
+    // Same final step as the `Line` round trip, for the same reason: the ring
+    // fast path must produce the byte-identical row or it is not a fast path.
+    mirror_wide_spacer_extras(&out.cells, &mut out.extras);
 
     #[cfg(any(test, feature = "testing"))]
     super::count_ring_fast_materialize();
@@ -712,8 +719,12 @@ fn place_cell(
 
         if is_wide && col + 1 < cols {
             row.cells[col as usize] = cell;
+            // The spacer inherits the lead's rendition (`wide_continuation_of`
+            // carries the law and the measurement). Scroll-off conversion drops
+            // spacers and re-derives them here, so a bare role bit would strip
+            // SGR 7 off every wide glyph the moment its row left the screen.
             row.cells[(col + 1) as usize] =
-                Cell::with_style(' ', fg, bg, CellFlags::WIDE_CONTINUATION);
+                Cell::with_style(' ', fg, bg, cell_flags.wide_continuation_of());
             col.saturating_add(2)
         } else if !is_wide {
             row.cells[col as usize] = cell;
@@ -725,7 +736,7 @@ fn place_cell(
         if col + 1 < cols {
             row.cells[col as usize] = Cell::with_style(c, fg, bg, cell_flags);
             row.cells[(col + 1) as usize] =
-                Cell::with_style(' ', fg, bg, CellFlags::WIDE_CONTINUATION);
+                Cell::with_style(' ', fg, bg, cell_flags.wide_continuation_of());
             col.saturating_add(2)
         } else {
             col
@@ -733,6 +744,84 @@ fn place_cell(
     } else {
         row.cells[col as usize] = Cell::with_style(c, fg, bg, cell_flags);
         col.saturating_add(1)
+    }
+}
+
+/// Mirror a wide lead's rendition-valued EXTRAS onto its continuation spacer.
+///
+/// The companion to [`CellFlags::wide_continuation_of`](crate::CellFlags::wide_continuation_of),
+/// and required by it. That carries the lead's rendition FLAGS to a re-derived
+/// spacer; this carries the two rendition VALUES that do not fit in the flag word
+/// and that those flags SELECT:
+///
+/// - the truecolor fg/bg — a `PackedColor` holds only a "look in the overflow
+///   table" sentinel, and the 24-bit triple lives in the `CellExtra`;
+/// - the SGR 58 underline colour, which the renderer reads only when the
+///   `UNDERLINE` bit is set (`render_cells.rs`).
+///
+/// Without it the flags select colours the spacer does not have, and turning the
+/// flag bit on is what makes the absence visible. Measured on 2026-09-16, both
+/// halves of the same defect: `\x1b[4;58:2::0:255:0m中` scrolled off drew a green
+/// underline under the character's left half and a default-foreground one under
+/// its right — the very column seam the flag fix set out to close, reopened in
+/// history as a colour discontinuity; and `\x1b[38;2;255;0;0;48;2;0;0;255;7m中`
+/// scrolled off put `fg=[0,0,0] bg=[229,229,229]` in the spacer against a live
+/// `fg=[0,0,255] bg=[255,0,0]` — a bright near-white block where the glyph's
+/// right half belongs, because the spacer inherited INVERSE and then swapped a
+/// colour pair it had not been given.
+///
+/// ## Why this is DERIVED and not serialized
+///
+/// A `Line` is a per-CHARACTER representation: [`is_spacer`] columns carry no
+/// text and no `CellAttrs`, because a double-width character is ONE character.
+/// There is no slot to serialize a spacer's colours into without changing the
+/// stored format — and deriving also heals history that an older build already
+/// wrote, which a format change could not.
+///
+/// ## Why "only where absent"
+///
+/// A span-shaped extra can already cover the spacer legitimately: a hyperlink
+/// span's `end_col` is the next NON-spacer column, so it spans the pair by
+/// construction. Copying only into an empty slot leaves every such value alone
+/// and makes the pass idempotent.
+///
+/// Extended flags (bits 11-13) need no mirroring: they live in the cell's own
+/// flag word, inside `SPACER_RENDITION_MASK`, so `wide_continuation_of` has
+/// already carried them.
+///
+/// O(cols): one flag test per column and at most one map insert per spacer.
+fn mirror_wide_spacer_extras(cells: &[crate::Cell], extras: &mut FxHashMap<u16, CellExtra>) {
+    if extras.is_empty() {
+        return;
+    }
+    for idx in 1..cells.len() {
+        // The SAME predicate the extractor used to DROP this column, so the
+        // columns healed here are exactly the columns that lost their extras.
+        if !is_spacer(cells, idx) {
+            continue;
+        }
+        let (Ok(lead), Ok(spacer)) = (u16::try_from(idx - 1), u16::try_from(idx)) else {
+            break;
+        };
+        let Some(src) = extras.get(&lead) else {
+            continue;
+        };
+        let fg = src.fg_rgb();
+        let bg = src.bg_rgb();
+        let underline = src.underline_color_u32();
+        if fg.is_none() && bg.is_none() && underline.is_none() {
+            continue;
+        }
+        let dst = extras.entry(spacer).or_default();
+        if fg.is_some() && dst.fg_rgb().is_none() {
+            dst.set_fg_rgb(fg);
+        }
+        if bg.is_some() && dst.bg_rgb().is_none() {
+            dst.set_bg_rgb(bg);
+        }
+        if underline.is_some() && dst.underline_color_u32().is_none() {
+            dst.set_underline_color_u32(underline);
+        }
     }
 }
 

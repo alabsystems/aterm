@@ -2293,7 +2293,9 @@ pub fn check_and_stage(current_build: u64, source: &Source) -> Result<Option<Str
             detail: error.clone(),
         });
     }
-    if let Some(staging) = Staging::resolve() {
+    if check_leaves_a_receipt(&result, rate_limited())
+        && let Some(staging) = Staging::resolve()
+    {
         crate::check_receipt::record(
             &staging,
             current_build,
@@ -2303,6 +2305,40 @@ pub fn check_and_stage(current_build: u64, source: &Source) -> Result<Option<Str
         );
     }
     result
+}
+
+/// Whether the check that just ended owes the shared check receipt a stamp.
+///
+/// ONLY A CHECK THAT REACHED THE CHANNEL LEAVES ONE (2026-09-15). The receipt's
+/// contract is its module doc's first line — "completed network checks have their
+/// own receipt" — and every reader leans on it: `crate::checker_skip_for` skips
+/// this interval's network check on it machine-wide, and `crate::last_check_at` /
+/// `status.toml`'s `checked_at` advertise it as when this channel was last asked
+/// (`last_check_at`'s own doc: never "a check that has not run on this channel").
+/// Stamping it from the failing exits broke both, because a failed check also
+/// reveals no lane (`note_readable` is never reached): `dedup_window_base` then
+/// keeps the process on the slow WEB base (30 min → a 21-minute window) while its
+/// own cadence still ticks on the 75 s token base, so the process re-read its OWN
+/// failure stamp and logged "another aterm process completed this interval's
+/// update check" — measured 2026-09-13, with no second aterm process on the
+/// machine — and `aterm-ctl update status` showed a last-check time for a check
+/// that never reached GitHub. `Cadence::hold_remaining`'s cap (15 min) only
+/// thinned the repeats; it did not make the line true. A failure is bounded by
+/// each process's own backoff ladder (`cadence::Cadence::failed`), which is what
+/// that ladder is for.
+///
+/// A DEFERRAL IS NOT A FAILURE and still records. Every rate-limit exit ends the
+/// check with `Ok`: a 429 on the token LIST falls through to the unmetered host
+/// (`Listing::RateLimited`), and the asset legs book `record_asset_deferral` and
+/// return `Ok(None)`. So `is_ok()` already keeps the machine-wide retreat and the
+/// server hold it carries. The deferral flag is read rather than assumed: the
+/// hold epoch is the server's OWN fact about this IP, so an exit that books one
+/// and then fails must still leave it on the ledger for every sibling.
+fn check_leaves_a_receipt(
+    result: &Result<Option<String>, String>,
+    recorded_a_deferral: bool,
+) -> bool {
+    result.is_ok() || recorded_a_deferral
 }
 
 /// The acquisition half of [`check_and_stage_inner`]: pick the lane from the source and
@@ -7974,6 +8010,39 @@ mod tests {
         assert!(!text.contains("rotate"), "{text}");
         let text = unreadable_explanation(404, &mirror, Some(&unprovisioned()));
         assert!(text.contains("no update token is provisioned"), "{text}");
+    }
+
+    /// A FAILED CHECK IS NOT A COMPLETED ONE (2026-09-15). The receipt is what the
+    /// machine-wide checker gate reads to skip an interval, and what `checked_at`
+    /// reports as the last time this channel was asked. A check that ended in a
+    /// transport error asked nobody: stamping it made the failing process re-read
+    /// its own stamp and log "another aterm process completed this interval's
+    /// update check" (nineteen times in forty minutes on 2026-09-13, one process,
+    /// one DNS failure), because a failed check reveals no lane and so is deduped
+    /// against the 30-minute web base while its cadence still ticks on 75 s.
+    #[test]
+    fn only_a_check_that_reached_the_channel_leaves_a_receipt() {
+        assert!(
+            check_leaves_a_receipt(&Ok(None), false),
+            "up to date is a completed check and must dedup the siblings"
+        );
+        assert!(
+            check_leaves_a_receipt(&Ok(Some("0.86.0".into())), false),
+            "a staged build is a completed check"
+        );
+        assert!(
+            !check_leaves_a_receipt(
+                &Err("dns error: nodename nor servname provided".into()),
+                false
+            ),
+            "a resolver failure reached no channel: it must not stamp the receipt \
+             every checker on this machine reads as this interval's completed check"
+        );
+        assert!(
+            check_leaves_a_receipt(&Err("the release host closed the connection".into()), true),
+            "a recorded deferral's machine-wide retreat (and its held_until) is kept \
+             even when the leg that followed the fallback failed"
+        );
     }
 
     /// A RATE-LIMITED TOKEN LANE FALLS TO THE UNMETERED HOST (2026-09-14, audit

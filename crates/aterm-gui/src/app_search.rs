@@ -264,13 +264,14 @@ pub(crate) fn apply_field_edit(text: &mut String, cursor: &mut usize, edit: Sear
 /// Drop the find highlight only when the output that invalidated the match vector
 /// could actually have moved the text under it.
 ///
-/// The three stamps the find bar keeps (`results_dirty`, `match_absolute_row_revision`,
-/// `match_content_seq`) answer ONE question: "may I still use this match vector to
-/// compute a row and a column". They are not evidence about the HIGHLIGHT, which since
-/// the selection-custody work is maintained by `post_process` itself — a uniform scroll
-/// remaps the anchors, a piecewise splice remaps or destroys them, and a damage band
-/// that overlaps them clears them. By the time the GUI runs, the selection is already
-/// correct or already gone.
+/// The four stamps the find bar keeps (`results_dirty`,
+/// `match_absolute_row_revision`, `match_history_renumber_epoch`,
+/// `match_content_seq`) answer ONE question: "may I still use this match vector
+/// to compute a row and a column". They are not evidence about the HIGHLIGHT,
+/// which since the selection-custody work is maintained by `post_process`
+/// itself — a uniform scroll remaps the anchors, a piecewise splice remaps or
+/// destroys them, and a damage band that overlaps them clears them. By the time
+/// the GUI runs, the selection is already correct or already gone.
 ///
 /// So the band that matters is the MUTABLE one: rows at or below `live_top_abs` are the
 /// live screen, which the streaming write can have overwritten cell-by-cell under an
@@ -377,6 +378,18 @@ pub(crate) struct SearchState {
     /// corrected by a single `base_y` delta, so output handling recomputes the
     /// active search whenever this revision changes.
     pub(crate) match_absolute_row_revision: u64,
+    /// `Grid::history_renumber_epoch()` when [`Self::matches`] was computed.
+    ///
+    /// THE STAMP THE FOOTER REVISION CANNOT STAND IN FOR. A width reflow — an
+    /// edge drag, a font zoom, a divider move — rewraps history and renumbers
+    /// every retained row WHOLESALE, and it moves no `absolute_row_revision` at
+    /// all. Measured with the bar open on "P09=" and one Ctrl-=: `matches` still
+    /// said row 15, the grid now had "P09=" on row 11, and the tint painted a
+    /// four-cell box squarely on "P05=" while the bar read "Find: P09=" 1/1.
+    /// Every consumer of a stored match row therefore fails closed on THIS
+    /// stamp as well — the same law `Terminal::finalize_resize` already applies
+    /// to the text selection, which a width change drops outright.
+    pub(crate) match_history_renumber_epoch: u64,
     /// Terminal content generation captured with [`Self::matches`]. Ordinary
     /// streaming output changes this even when absolute-row coordinates remain
     /// uniform; the output wake marks the batch dirty so stale matches are never
@@ -683,13 +696,23 @@ pub(crate) fn map_matches(matches: &[SearchMatch], base_y: i64) -> Vec<(i32, u16
 }
 
 impl App {
+    /// `(row geometry died, content moved)` for the open find, or `None` when
+    /// nothing is being searched.
+    ///
+    /// The first term folds BOTH ways a stored row number dies: the piecewise
+    /// protected-footer splice (`absolute_row_revision`) and the wholesale
+    /// history renumbering a width reflow performs (`history_renumber_epoch`),
+    /// which moves the footer revision not at all. They are one bit because
+    /// every caller does the same thing with them — refuse to re-anchor, and
+    /// re-aim the Emacs point at the buffer edge.
     fn search_stamp_mismatch(&self, wid: crate::WindowId) -> Option<(bool, bool)> {
         let ws = self.windows.get(&wid)?;
         let search = ws.search.as_ref()?;
         let terminal = ws.front_terminal()?;
         let term = term_lock(&terminal.term);
         Some((
-            term.absolute_row_revision() != search.match_absolute_row_revision,
+            term.absolute_row_revision() != search.match_absolute_row_revision
+                || term.grid().history_renumber_epoch() != search.match_history_renumber_epoch,
             term.content_seq() != search.match_content_seq,
         ))
     }
@@ -1024,6 +1047,7 @@ impl App {
             truncated,
             base_y,
             absolute_row_revision,
+            history_renumber_epoch,
             content_seq,
             cols,
             consistent,
@@ -1034,7 +1058,7 @@ impl App {
             // — which takes the same lock class. The arms are exclusive, but a
             // tripwire that cannot see exclusivity is satisfied by a guard
             // whose scope is a function — which is also simply clearer.
-            let (base_y, row_rev, seq, cols) = empty_query_term_snapshot(&term);
+            let (base_y, row_rev, epoch, seq, cols) = empty_query_term_snapshot(&term);
             (
                 Vec::new(),
                 None,
@@ -1042,6 +1066,7 @@ impl App {
                 false,
                 base_y,
                 row_rev,
+                epoch,
                 seq,
                 cols,
                 true,
@@ -1078,6 +1103,7 @@ impl App {
                     search.results.incomplete,
                     search.base_y,
                     search.absolute_row_revision,
+                    search.history_renumber_epoch,
                     search.content_seq,
                     search.cols,
                     search.consistent,
@@ -1093,6 +1119,7 @@ impl App {
                         false,
                         i64::try_from(terminal.grid().base_y()).unwrap_or(i64::MAX),
                         terminal.absolute_row_revision(),
+                        terminal.grid().history_renumber_epoch(),
                         terminal.content_seq(),
                         usize::from(terminal.grid().cols()),
                         true,
@@ -1112,6 +1139,7 @@ impl App {
             s.point_match = None;
             s.match_base_y = base_y;
             s.match_absolute_row_revision = absolute_row_revision;
+            s.match_history_renumber_epoch = history_renumber_epoch;
             s.match_content_seq = content_seq;
             s.results_dirty = false;
             s.regex_error = regex_error;
@@ -1129,20 +1157,27 @@ impl App {
 
     /// Invalidate an open search when the focused terminal emits output.
     ///
-    /// A protected-footer splice changes absolute coordinates piecewise; all
-    /// mutations mark the result batch dirty and clear its selection. The next
-    /// search edit/repeat rebuilds once from the latest generation, avoiding one
+    /// A protected-footer splice changes absolute coordinates piecewise and a
+    /// width reflow renumbers retained history wholesale; all mutations mark the
+    /// result batch dirty and clear its selection. The next search edit/repeat
+    /// rebuilds once from the latest generation, avoiding one
     /// expensive scan per output chunk while guaranteeing stale coordinates are
     /// never navigated.
     pub(crate) fn search_refresh_for_output(&mut self, session: u64) {
         let Some(wid) = self.frontmost_window else {
             return;
         };
-        let Some((expected_revision, expected_content_seq)) = self
+        let Some((expected_revision, expected_epoch, expected_content_seq)) = self
             .windows
             .get(&wid)
             .and_then(|ws| ws.search.as_ref())
-            .map(|search| (search.match_absolute_row_revision, search.match_content_seq))
+            .map(|search| {
+                (
+                    search.match_absolute_row_revision,
+                    search.match_history_renumber_epoch,
+                    search.match_content_seq,
+                )
+            })
         else {
             return;
         };
@@ -1164,7 +1199,8 @@ impl App {
         let Ok(term) = terminal.term.try_lock() else {
             return;
         };
-        let revision_stale = term.absolute_row_revision() != expected_revision;
+        let revision_stale = term.absolute_row_revision() != expected_revision
+            || term.grid().history_renumber_epoch() != expected_epoch;
         let content_stale = term.content_seq() != expected_content_seq;
         drop(term);
         if revision_stale || content_stale {
@@ -1183,24 +1219,28 @@ impl App {
             return;
         };
         let rows = ws.rows;
-        let (mat, match_base_y, match_revision, match_seq, dirty, search_title) = match &ws.search {
-            Some(s) => (
-                s.current_match(),
-                s.match_base_y,
-                s.match_absolute_row_revision,
-                s.match_content_seq,
-                s.results_dirty,
-                s.window_title(),
-            ),
-            None => return,
-        };
+        let (mat, match_base_y, match_revision, match_epoch, match_seq, dirty, search_title) =
+            match &ws.search {
+                Some(s) => (
+                    s.current_match(),
+                    s.match_base_y,
+                    s.match_absolute_row_revision,
+                    s.match_history_renumber_epoch,
+                    s.match_content_seq,
+                    s.results_dirty,
+                    s.window_title(),
+                ),
+                None => return,
+            };
         {
             let mut term = term_lock(&terminal.term);
             if dirty
                 || term.absolute_row_revision() != match_revision
+                || term.grid().history_renumber_epoch() != match_epoch
                 || term.content_seq() != match_seq
             {
-                // A protected-footer insertion is piecewise: applying this stale
+                // A protected-footer insertion is piecewise and a width reflow
+                // renumbers retained history wholesale: applying this stale
                 // match with a uniform base_y delta could select unrelated text;
                 // ordinary edits can invalidate the columns. Fail closed until
                 // the output wake/next navigation refreshes the batch. The REFUSAL is
@@ -1358,6 +1398,7 @@ impl App {
         if let Some(search) = self.windows.get_mut(&wid).and_then(|ws| ws.search.as_mut()) {
             search.match_base_y = point.base_y;
             search.match_absolute_row_revision = point.absolute_row_revision;
+            search.match_history_renumber_epoch = point.history_renumber_epoch;
             search.match_content_seq = point.content_seq;
             search.results_dirty = false;
             if let Some(mapped) = mapped {
@@ -1420,31 +1461,43 @@ impl App {
     /// is open this is an ordinary step. After Enter accepted and closed it,
     /// reopen the last accepted query and resume strictly after/before its
     /// absolute match anchor, wrapping when content changed or an edge is hit.
-    pub(crate) fn search_find_again(&mut self, forward: bool) {
+    ///
+    /// Returns the REASON it declined when there is nothing to step — no open
+    /// bar and no remembered query — rather than succeeding silently: the menu
+    /// seam reports that refusal instead of answering OK for a search that never
+    /// ran. Key-path callers, for which a refusal has nowhere to go, discard it
+    /// explicitly.
+    pub(crate) fn search_find_again(&mut self, forward: bool) -> Result<(), &'static str> {
         if self.front().is_some_and(|ws| ws.search.is_some()) {
             self.search_step(forward);
-            return;
+            return Ok(());
         }
         if self.search_last_query.is_empty() {
-            return;
+            return Err("there is no search to step \u{2014} find something first");
         }
 
         let query = self.search_last_query.clone();
-        let session_revision = self
+        // BOTH row-identity stamps, not just the footer revision: a width reflow
+        // renumbers retained history wholesale and leaves `absolute_row_revision`
+        // exactly where it was, so an anchor gated on that alone resumes Cmd-G
+        // from a line that no longer carries that number.
+        let session_identity = self
             .frontmost_window
             .and_then(|wid| self.front_terminal(wid))
             .map(|terminal| {
+                let term = term_lock(&terminal.term);
                 (
                     terminal.session,
-                    term_lock(&terminal.term).absolute_row_revision(),
+                    term.absolute_row_revision(),
+                    term.grid().history_renumber_epoch(),
                 )
             });
         let anchor = self
             .search_last_anchor
-            .filter(|(anchor_session, anchor_revision, ..)| {
-                Some((*anchor_session, *anchor_revision)) == session_revision
+            .filter(|(anchor_session, anchor_revision, anchor_epoch, ..)| {
+                Some((*anchor_session, *anchor_revision, *anchor_epoch)) == session_identity
             })
-            .map(|(_, _, row, start, end)| (row, start, end));
+            .map(|(_, _, _, row, start, end)| (row, start, end));
         self.search_enter_direction(forward);
         if let Some(search) = self.front_mut().and_then(|ws| ws.search.as_mut()) {
             search.set_query(query);
@@ -1454,6 +1507,7 @@ impl App {
             }
         }
         self.search_recompute_from_anchor(anchor.is_some());
+        Ok(())
     }
 
     /// `^S`/`^R` in find mode (emacs isearch-repeat): step to the next (`forward`) /
@@ -1641,15 +1695,20 @@ impl App {
                 let anchor = s
                     .current_match()
                     .map(|(row, start, end)| (s.match_base_y + i64::from(row), start, end));
-                (s.query.clone(), s.match_absolute_row_revision, anchor)
+                (
+                    s.query.clone(),
+                    s.match_absolute_row_revision,
+                    s.match_history_renumber_epoch,
+                    anchor,
+                )
             });
-        if let Some((q, revision, anchor)) = accepted
+        if let Some((q, revision, epoch, anchor)) = accepted
             && !q.is_empty()
         {
             self.search_last_query = q;
             self.search_last_anchor = session
                 .zip(anchor)
-                .map(|(session, (row, start, end))| (session, revision, row, start, end));
+                .map(|(session, (row, start, end))| (session, revision, epoch, row, start, end));
         }
         // ⏎ is a user EXIT: the origin has served its purpose and must not outlive it,
         // or the next ⌘F would silently inherit this find's origin instead of the
@@ -1911,14 +1970,15 @@ impl FindStatus {
 }
 
 /// The empty-query snapshot of `search_recompute_from_anchor_in`: base row,
-/// row revision, content sequence, grid width — taken and released under one
-/// short guard. A FREE fn so the OB-7 lock census sees the guard end here (see
-/// the call site's comment).
-fn empty_query_term_snapshot(term: &std::sync::Mutex<Terminal>) -> (i64, u64, u64, usize) {
+/// row revision, history renumber epoch, content sequence, grid width — taken
+/// and released under one short guard. A FREE fn so the OB-7 lock census sees
+/// the guard end here (see the call site's comment).
+fn empty_query_term_snapshot(term: &std::sync::Mutex<Terminal>) -> (i64, u64, u64, u64, usize) {
     let terminal = term_lock(term);
     (
         i64::try_from(terminal.grid().base_y()).unwrap_or(i64::MAX),
         terminal.absolute_row_revision(),
+        terminal.grid().history_renumber_epoch(),
         terminal.content_seq(),
         usize::from(terminal.grid().cols()),
     )

@@ -1720,19 +1720,16 @@ impl crate::App {
         if gated {
             return Vec::new();
         }
-        let due: Vec<(u64, i32, i32)> = self
-            .pool
-            .iter()
-            .filter(|session| self.session_status.due(session.id, now))
-            .map(|session| (session.id, session.master, session.pid))
-            .collect();
         let mut changed = Vec::new();
-        for (id, master, pid) in due {
-            let Some(session) = self.pool.get(id) else {
-                self.session_status.note_skipped(id, now);
+        // The sweep never changes pool membership: borrow each due session
+        // directly instead of collecting ids, looking them up again, and
+        // cloning its terminal Arc on every observation interval.
+        for session in self.pool.iter() {
+            let id = session.id;
+            if !self.session_status.due(id, now) {
                 continue;
-            };
-            let term = session.term.clone();
+            }
+            let (master, pid) = (session.master, session.pid);
             // Real PTY-output age from the session's existing activity atomic —
             // overwritten for EVERY consumed burst and never cleared by
             // presentation, so a hidden pane's output still ages honestly.
@@ -1751,7 +1748,7 @@ impl crate::App {
             // (`note_skipped`): without it `next_due` never advances on this
             // path, and `next_wake`'s structural clamp — which floors every
             // armed instant at `next_due` — has nothing to floor against.
-            let Ok(guard) = term.try_lock() else {
+            let Ok(guard) = session.term.try_lock() else {
                 self.session_status.note_skipped(id, now);
                 continue;
             };

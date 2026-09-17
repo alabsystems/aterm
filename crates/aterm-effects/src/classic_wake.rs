@@ -651,7 +651,6 @@ mod tests {
             beam: true,
             head_dx: 0.5,
             pack: None,
-            wake_persist_s: 0.0,
             ribbon_tall: false,
             ribbon_flat: false,
             classic_mono: false,

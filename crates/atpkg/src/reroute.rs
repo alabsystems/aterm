@@ -734,7 +734,11 @@ pub fn lay(layout: &Layout) -> io::Result<()> {
     // directory before the first stub lands in it — the job writes in order.
     let mut files = Vec::new();
     let marker = dir.join(DIR_MARKER_FILE);
-    if !marker.is_file() {
+    if marker_needs_lay(
+        marker.is_file(),
+        || crate::provenance::carries_provenance(&marker),
+        crate::lay::lay_clears_provenance,
+    ) {
         files.push(crate::lay::Executable::new(
             &marker,
             format!("{STUB_MARKER}\n"),
@@ -747,16 +751,21 @@ pub fn lay(layout: &Layout) -> io::Result<()> {
         match std::fs::symlink_metadata(&path) {
             Err(_) => {} // absent: ours to claim
             Ok(_) if is_reroute_stub(&path) => {
-                // Ours already. Byte-identical and untagged: nothing to lay — this
-                // runs at every session spawn and every pass end, and re-laying eight
-                // identical files meant a launchd job (and, from a tagged app, a
-                // whole-bundle copy) per GUI launch, plus the chance for a lane that
-                // could not run to replace a CLEAN stub with a tagged one under the
-                // in-process fallback (audit 2026-09-14). A body that differs — the
-                // embedded atpkg path moved with a relocation or a self-update — or
-                // a stub that carries the tag is rewritten as before.
+                // Ours already. Byte-identical: nothing to lay — this runs at every
+                // session spawn and every pass end, and re-laying eight identical files
+                // meant a launchd job (and, from a tagged app, a whole-bundle copy) per
+                // GUI launch, plus the chance for a lane that could not run to replace a
+                // CLEAN stub with a tagged one under the in-process fallback (audit
+                // 2026-09-14). A body that differs — the embedded atpkg path moved with a
+                // relocation or a self-update — is rewritten as before, and so is a stub
+                // that carries the tag, but only when this pass could lay it clean: the
+                // same rule as the pending stubs' ([`crate::stub::identical_stub_needs_relay`]),
+                // because a rewrite that lands tagged again repairs nothing.
                 if std::fs::read(&path).is_ok_and(|have| have == body.as_bytes())
-                    && !crate::provenance::carries_provenance(&path)
+                    && !crate::stub::identical_stub_needs_relay(
+                        || crate::provenance::carries_provenance(&path),
+                        crate::lay::lay_clears_provenance,
+                    )
                 {
                     continue;
                 }
@@ -785,6 +794,32 @@ pub fn lay(layout: &Layout) -> io::Result<()> {
         }
     }
     Ok(())
+}
+
+/// Whether [`lay`] puts the marker file in this pass's list: when it is ABSENT, and when
+/// it CARRIES THE TAG and this pass can lay it clean — the stubs' own rule
+/// ([`crate::stub::identical_stub_needs_relay`]), applied to the ninth file of the
+/// directory.
+///
+/// Until 2026-09-16 the marker was laid only when absent. It is written by the same lane
+/// as the stubs, mode `0755`, so `aterm pkg doctor` counts it among the directory's
+/// executables and names `aterm pkg repair` as the fix for a tagged one — and `repair`
+/// never touched it, because it was there. A marker laid tagged before the untracked
+/// lane existed (every one 0.85.0 laid in-process from a tracked app) stayed tagged for
+/// ever, under a warn whose remedy could not clear it (measured on the owner's machine:
+/// `1 of 9 shim(s) in …/reroute carry com.apple.provenance (e.g. .atpkg-reroute-dir)`
+/// through three repairs). The rewrite is the lane's temp-and-`rename(2)`, so a walk
+/// racing it never sees the directory unmarked; a rewrite the lane cannot land clean is
+/// skipped, for the reason the stubs skip theirs.
+///
+/// Both closures are lazy, as the stubs' are: the xattr is read only when the marker
+/// exists, and the tracking probe only when it is tagged.
+pub(crate) fn marker_needs_lay(
+    exists: bool,
+    tagged: impl FnOnce() -> bool,
+    lay_clears_tag: impl FnOnce() -> bool,
+) -> bool {
+    !exists || crate::stub::identical_stub_needs_relay(tagged, lay_clears_tag)
 }
 
 /// Remove every stub that is ours; the directory goes too once it is empty.
@@ -958,7 +993,10 @@ fn direct_args(source_verb: Option<SourceVerb>, args: &[String]) -> Vec<String> 
 }
 
 fn exec_branded(layout: &Layout, upstream: &str, branded: &str, args: &[String]) -> ExitCode {
-    let Some(target) = crate::which(layout, branded) else {
+    // `exec_path`, not `which`: this execs the tool without its shim, so it has to take
+    // the exec root the shim's guard would (`crate::compat` — a trust build whose tippy
+    // refuses the store's own `bin/rustc` copy lints only from there).
+    let Some(target) = crate::ops::exec_path(layout, branded) else {
         eprintln!(
             "aterm: '{upstream}' reroutes to '{branded}', which is not installed here — opening aterm provisions the toolset (`aterm pkg install <program>` for one program); {NO_REROUTE_ENV}=1 restores upstream '{upstream}'."
         );
@@ -1288,6 +1326,30 @@ mod tests {
         );
         assert!(body.contains(NO_REROUTE_ENV), "{body}");
         assert!(body.ends_with("exit 2\n"), "{body}");
+    }
+
+    /// The marker follows the stubs' tag rule: laid when absent; re-laid when it carries
+    /// the tag AND the lane can clear it; left alone when clean, and when a rewrite would
+    /// land tagged again (no lane) — the case that used to keep doctor's warn open with
+    /// `repair` named as the fix that never fixed it. The probes are never consulted for
+    /// an absent marker, and the tracking probe never for a clean one.
+    #[test]
+    fn the_marker_is_relaid_when_tagged_only_if_the_lane_clears_it() {
+        assert!(marker_needs_lay(
+            false,
+            || unreachable!("absent: no xattr read"),
+            || { unreachable!("absent: no tracking probe") }
+        ));
+        assert!(!marker_needs_lay(
+            true,
+            || false,
+            || { unreachable!("clean: no tracking probe") }
+        ));
+        assert!(marker_needs_lay(true, || true, || true));
+        assert!(
+            !marker_needs_lay(true, || true, || false),
+            "a rewrite that lands tagged again clears nothing"
+        );
     }
 
     #[test]

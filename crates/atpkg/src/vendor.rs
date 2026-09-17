@@ -1073,6 +1073,28 @@ pub fn foreign_copies_on_path(prefix: &Path, bin: &str, path_var: Option<&OsStr>
     out
 }
 
+/// Whether the managed `agents/` directory ([`crate::store::Layout::agents_dir`]) is on
+/// `path_var` at all — as spelled or as an entry resolves; absolute entries only, like
+/// every walk here. The AGENT PROGRAMS' shadow wording (2026-09-16) tells the two
+/// shell-local truths apart with it: a `PATH` with no `agents/` (a shell from before the
+/// install) and one that has it BEHIND the foreign copy.
+#[must_use]
+pub fn agents_dir_on_path(prefix: &Path, path_var: Option<&OsStr>) -> bool {
+    let Some(path_var) = path_var else {
+        return false;
+    };
+    let agents = prefix.join("agents");
+    let agents_real = std::fs::canonicalize(&agents).unwrap_or_else(|_| agents.clone());
+    std::env::split_paths(path_var).any(|dir| {
+        !dir.as_os_str().is_empty()
+            && dir.is_absolute()
+            && (dir == agents
+                || dir == agents_real
+                || std::fs::canonicalize(&dir)
+                    .is_ok_and(|real| real == agents || real == agents_real))
+    })
+}
+
 /// Probe `path_var` (a `PATH` value) for an executable named `bin`, skipping every
 /// RELATIVE entry (it names the current directory, not a system) and every directory the
 /// managed `prefix` owns (its `bin/` shims, its store) — and skipping a hit whose RESOLVED
@@ -2343,5 +2365,42 @@ mod tests {
             None
         );
         let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// `agents/` on PATH or not (2026-09-16): as spelled, as it resolves, absolute
+    /// entries only — the fact the agent programs' shadow wording tells one shell's two
+    /// truths apart with.
+    #[test]
+    fn agents_dir_on_path_sees_the_dir_as_spelled_or_resolved_and_absolute_only() {
+        let prefix =
+            std::env::temp_dir().join(format!("atpkg-vendor-agents-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&prefix);
+        std::fs::create_dir_all(prefix.join("agents")).unwrap();
+        let agents = prefix.join("agents");
+        assert!(!agents_dir_on_path(&prefix, None));
+        let without =
+            std::env::join_paths([prefix.join("bin"), PathBuf::from("/usr/bin")]).unwrap();
+        assert!(!agents_dir_on_path(&prefix, Some(&without)));
+        let with = std::env::join_paths([PathBuf::from("/usr/bin"), agents.clone()]).unwrap();
+        assert!(
+            agents_dir_on_path(&prefix, Some(&with)),
+            "anywhere on PATH counts"
+        );
+        let relative = std::ffi::OsString::from("agents:/usr/bin");
+        assert!(
+            !agents_dir_on_path(&prefix, Some(&relative)),
+            "a relative entry never counts"
+        );
+        #[cfg(unix)]
+        {
+            let link = prefix.join("agents-link");
+            std::os::unix::fs::symlink(&agents, &link).unwrap();
+            let via_link = std::env::join_paths([link]).unwrap();
+            assert!(
+                agents_dir_on_path(&prefix, Some(&via_link)),
+                "as it resolves"
+            );
+        }
+        let _ = std::fs::remove_dir_all(&prefix);
     }
 }
